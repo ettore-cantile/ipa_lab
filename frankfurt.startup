@@ -70,4 +70,18 @@ ip link set eth2 up
 ip addr add 10.0.0.242/30 dev eth3
 ip link set eth3 up
 service frr restart
+
+# --- BPF/eBPF FIX: mount host kernel modules and install correct headers ---
 mount --bind /lib/modules /lib/modules
+KERNEL=$(uname -r)
+mkdir -p /lib/modules/${KERNEL}
+if [ ! -e /lib/modules/${KERNEL}/build ]; then
+    SRC=$(ls /usr/src/ 2>/dev/null | grep "linux-headers-${KERNEL}" | head -1)
+    if [ -n "$SRC" ]; then
+        ln -s /usr/src/${SRC} /lib/modules/${KERNEL}/build
+    else
+        apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y linux-headers-${KERNEL} 2>/dev/null || true
+        SRC=$(ls /usr/src/ 2>/dev/null | grep "linux-headers-${KERNEL}" | head -1)
+        [ -n "$SRC" ] && ln -s /usr/src/${SRC} /lib/modules/${KERNEL}/build
+    fi
+fi
