@@ -1,0 +1,72 @@
+# Startup configuration generated automatically
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.disable_ipv6=1
+sed -i 's/zebra=no/zebra=yes/g' /etc/frr/daemons
+sed -i 's/ospfd=no/ospfd=yes/g' /etc/frr/daemons
+cat << 'EOF' > /etc/frr/frr.conf
+frr defaults traditional
+router ospf
+ network 10.0.0.0/8 area 0
+EOF
+chown frr:frr /etc/frr/frr.conf
+ip addr add 10.255.255.22/32 dev lo
+ip link set lo up
+echo '10.255.255.1 aachen' >> /etc/hosts
+echo '10.255.255.2 augsburg' >> /etc/hosts
+echo '10.255.255.3 bayreuth' >> /etc/hosts
+echo '10.255.255.4 berlin' >> /etc/hosts
+echo '10.255.255.5 bielefeld' >> /etc/hosts
+echo '10.255.255.6 braunschweig' >> /etc/hosts
+echo '10.255.255.7 bremen' >> /etc/hosts
+echo '10.255.255.8 bremerhaven' >> /etc/hosts
+echo '10.255.255.9 chemnitz' >> /etc/hosts
+echo '10.255.255.10 darmstadt' >> /etc/hosts
+echo '10.255.255.11 dortmund' >> /etc/hosts
+echo '10.255.255.12 dresden' >> /etc/hosts
+echo '10.255.255.13 duesseldorf' >> /etc/hosts
+echo '10.255.255.14 erfurt' >> /etc/hosts
+echo '10.255.255.15 essen' >> /etc/hosts
+echo '10.255.255.16 flensburg' >> /etc/hosts
+echo '10.255.255.17 frankfurt' >> /etc/hosts
+echo '10.255.255.18 freiburg' >> /etc/hosts
+echo '10.255.255.19 fulda' >> /etc/hosts
+echo '10.255.255.20 giessen' >> /etc/hosts
+echo '10.255.255.21 greifswald' >> /etc/hosts
+echo '10.255.255.22 hamburg' >> /etc/hosts
+echo '10.255.255.23 hannover' >> /etc/hosts
+echo '10.255.255.24 kaiserslautern' >> /etc/hosts
+echo '10.255.255.25 karlsruhe' >> /etc/hosts
+echo '10.255.255.26 kassel' >> /etc/hosts
+echo '10.255.255.27 kempten' >> /etc/hosts
+echo '10.255.255.28 kiel' >> /etc/hosts
+echo '10.255.255.29 koblenz' >> /etc/hosts
+echo '10.255.255.30 koeln' >> /etc/hosts
+echo '10.255.255.31 konstanz' >> /etc/hosts
+echo '10.255.255.32 leipzig' >> /etc/hosts
+echo '10.255.255.33 magdeburg' >> /etc/hosts
+echo '10.255.255.34 mannheim' >> /etc/hosts
+echo '10.255.255.35 muenchen' >> /etc/hosts
+echo '10.255.255.36 muenster' >> /etc/hosts
+echo '10.255.255.37 norden' >> /etc/hosts
+echo '10.255.255.38 nuernberg' >> /etc/hosts
+echo '10.255.255.39 oldenburg' >> /etc/hosts
+echo '10.255.255.40 osnabrueck' >> /etc/hosts
+echo '10.255.255.41 passau' >> /etc/hosts
+echo '10.255.255.42 regensburg' >> /etc/hosts
+echo '10.255.255.43 saarbruecken' >> /etc/hosts
+echo '10.255.255.44 schwerin' >> /etc/hosts
+echo '10.255.255.45 siegen' >> /etc/hosts
+echo '10.255.255.46 stuttgart' >> /etc/hosts
+echo '10.255.255.47 trier' >> /etc/hosts
+echo '10.255.255.48 ulm' >> /etc/hosts
+echo '10.255.255.49 wesel' >> /etc/hosts
+echo '10.255.255.50 wuerzburg' >> /etc/hosts
+ip addr add 10.0.0.153/30 dev eth0
+ip link set eth0 up
+ip addr add 10.0.0.166/30 dev eth1
+ip link set eth1 up
+ip addr add 10.0.0.170/30 dev eth2
+ip link set eth2 up
+ip addr add 10.0.0.174/30 dev eth3
+ip link set eth3 up
+service frr restart
