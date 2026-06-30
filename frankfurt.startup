@@ -70,3 +70,4 @@ ip link set eth2 up
 ip addr add 10.0.0.242/30 dev eth3
 ip link set eth3 up
 service frr restart
+mount --bind /lib/modules /lib/modules
