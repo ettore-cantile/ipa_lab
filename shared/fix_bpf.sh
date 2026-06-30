@@ -1,9 +1,8 @@
 #!/bin/bash
-# fix_bpf.sh — eseguito automaticamente da frankfurt.startup
+# fix_bpf.sh — eseguito da frankfurt.startup ad ogni avvio del container.
 # Risolve il mismatch tra kernel host (es. 7.0.0-22-generic Ubuntu)
-# e gli header Debian installati nell'immagine (es. 6.1.0-49-amd64).
-# BCC ha bisogno di trovare /lib/modules/$(uname -r)/build per compilare;
-# questo script crea quel symlink puntando agli header già presenti.
+# e gli header Debian nell'immagine (es. 6.1.0-49-amd64).
+# BCC cerca /lib/modules/$(uname -r)/build con include/linux/kconfig.h dentro.
 
 KERNEL=$(uname -r)
 echo "[fix_bpf] Host kernel: ${KERNEL}"
@@ -11,47 +10,53 @@ echo "[fix_bpf] Host kernel: ${KERNEL}"
 HEADER_DIR="/lib/modules/${KERNEL}"
 mkdir -p "${HEADER_DIR}"
 
-if [ -e "${HEADER_DIR}/build" ]; then
-    echo "[fix_bpf] ${HEADER_DIR}/build already exists, nothing to do."
+if [ -e "${HEADER_DIR}/build" ] && [ -f "${HEADER_DIR}/build/include/linux/kconfig.h" ]; then
+    echo "[fix_bpf] Headers already OK at ${HEADER_DIR}/build"
     exit 0
 fi
 
-# 1) Cerca headers ESATTI per questo kernel
-EXACT=$(ls /usr/src/ 2>/dev/null | grep -E "linux-headers-${KERNEL}$" | head -1)
-if [ -n "${EXACT}" ]; then
-    ln -sf "/usr/src/${EXACT}" "${HEADER_DIR}/build"
-    echo "[fix_bpf] Exact match: ${HEADER_DIR}/build -> /usr/src/${EXACT}"
-    exit 0
+# Trova il miglior header disponibile: preferisci versione -amd64 (non meta)
+# con include/linux/kconfig.h presente (merged da -common nel Dockerfile)
+BEST=""
+for d in $(ls /usr/src/ 2>/dev/null | grep 'linux-headers-' | grep -v 'common$' | sort -r); do
+    if [ -f "/usr/src/${d}/include/linux/kconfig.h" ]; then
+        BEST="${d}"
+        break
+    fi
+done
+
+# Se kconfig.h non c'è ancora, prova a copiarlo dal pacchetto -common
+if [ -z "${BEST}" ]; then
+    for d in $(ls /usr/src/ 2>/dev/null | grep 'linux-headers-' | grep -v 'common$' | sort -r); do
+        COMMON=$(ls /usr/src/ 2>/dev/null | grep 'linux-headers-' | grep 'common$' | head -1)
+        if [ -n "${COMMON}" ]; then
+            cp -rn "/usr/src/${COMMON}/include" "/usr/src/${d}/include" 2>/dev/null || true
+            if [ -f "/usr/src/${d}/include/linux/kconfig.h" ]; then
+                BEST="${d}"
+                break
+            fi
+        fi
+    done
 fi
 
-# 2) Fallback: usa il primo header disponibile in /usr/src (es. 6.1.0-49-amd64)
-# BCC compila bytecode eBPF che non dipende dalla versione esatta del kernel
-# quando si usano feature standard (tc, XDP di base, socket filters).
-FALLBACK=$(ls /usr/src/ 2>/dev/null | grep 'linux-headers-' | grep -v '\-common$' | head -1)
-if [ -n "${FALLBACK}" ]; then
-    ln -sf "/usr/src/${FALLBACK}" "${HEADER_DIR}/build"
-    echo "[fix_bpf] Fallback symlink: ${HEADER_DIR}/build -> /usr/src/${FALLBACK}"
-    # Assicura anche che esista il percorso che gcc cerca
-    ALT_DIR="/lib/modules/${FALLBACK#linux-headers-}"
-    if [ ! -e "${ALT_DIR}/build" ] && [ "${ALT_DIR}" != "${HEADER_DIR}" ]; then
-        mkdir -p "${ALT_DIR}"
-        ln -sf "/usr/src/${FALLBACK}" "${ALT_DIR}/build"
+# Ultimo fallback: qualsiasi header in /usr/src
+if [ -z "${BEST}" ]; then
+    BEST=$(ls /usr/src/ 2>/dev/null | grep 'linux-headers-' | grep -v 'common$' | head -1)
+fi
+
+if [ -n "${BEST}" ]; then
+    # Rimuovi symlink vecchio se esiste ma era rotto
+    rm -f "${HEADER_DIR}/build"
+    ln -sf "/usr/src/${BEST}" "${HEADER_DIR}/build"
+    echo "[fix_bpf] Symlink: ${HEADER_DIR}/build -> /usr/src/${BEST}"
+    # Verifica finale
+    if [ -f "${HEADER_DIR}/build/include/linux/kconfig.h" ]; then
+        echo "[fix_bpf] OK: kconfig.h found, BCC should compile successfully."
+    else
+        echo "[fix_bpf] WARNING: kconfig.h still missing. BPF may fail."
     fi
     exit 0
 fi
 
-# 3) Ultimo resort: prova apt
-echo "[fix_bpf] No headers found in /usr/src, trying apt..."
-apt-get update -qq 2>/dev/null
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    linux-headers-amd64 linux-kbuild-6.1 2>/dev/null || true
-
-FALLBACK2=$(ls /usr/src/ 2>/dev/null | grep 'linux-headers-' | grep -v '\-common$' | head -1)
-if [ -n "${FALLBACK2}" ]; then
-    ln -sf "/usr/src/${FALLBACK2}" "${HEADER_DIR}/build"
-    echo "[fix_bpf] apt fallback: ${HEADER_DIR}/build -> /usr/src/${FALLBACK2}"
-    exit 0
-fi
-
-echo "[fix_bpf] ERROR: could not set up kernel headers. BPF compilation may fail."
+echo "[fix_bpf] ERROR: no usable kernel headers found in /usr/src/"
 exit 1
