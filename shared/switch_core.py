@@ -7,12 +7,25 @@ import ctypes
 import sys
 
 # ---------------------------------------------------------------------------
-# Selezione file pesi:
-#   Metodo 1 (PTQ, default): weights.json          -> python3 switch_core.py
-#   Metodo 2 (QAT):          weights_method2.json  -> python3 switch_core.py weights_method2.json
+# Selezione metodo tramite argomento:
+#
+#   Metodo 1 (PTQ) — default:
+#     python3 switch_core.py
+#     - Kernel:        pesi int8 da weights.json
+#     - Control plane: pesi float originali da weights_float.json
+#     - Effetto:       il disallineamento float->int8 causa TABLE MISS reali
+#                      che dimostrano l'errore di quantizzazione PTQ.
+#
+#   Metodo 2 (QAT):
+#     python3 switch_core.py weights_method2.json
+#     - Kernel:        pesi int8 da weights_method2.json
+#     - Control plane: stessi pesi int8/128 (il QAT li ha gia' ottimizzati
+#                      per sopravvivere alla quantizzazione)
+#     - Effetto:       zero miss, dimostra la superiorita' del QAT.
 # ---------------------------------------------------------------------------
 WEIGHTS_FILE = sys.argv[1] if len(sys.argv) > 1 else "weights.json"
 WEIGHTS_PATH = f"/shared/{WEIGHTS_FILE}"
+IS_PTQ = (WEIGHTS_FILE == "weights.json")
 
 # --- Kernel Space (eBPF C Code) ---
 program = """
@@ -44,8 +57,6 @@ struct fwd_action {
 
 BPF_HASH(model_cache, __u8, struct model_data, 256);
 BPF_HASH(fwd_table, __u64, struct fwd_action, 256);
-
-// Array per le statistiche: Indice 0 = REDIRECT, Indice 1 = TABLE MISS
 BPF_ARRAY(pkt_stats, __u64, 2);
 
 #define SCALE_SHIFT 7
@@ -68,19 +79,16 @@ int ipa_switch(struct xdp_md *ctx) {
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;
 
-    // 1. Controllo Cache
     __u8 target_model = ipa->model_id;
     struct model_data *m = model_cache.lookup(&target_model);
     if (!m || m->is_valid == 0) return XDP_PASS;
 
-    // 2. Estrazione feature dal pacchetto
     long long iv[4];
     iv[0] = ipa->model_id;
     iv[1] = ip->ttl;
     iv[2] = ctx->ingress_ifindex;
     iv[3] = ipa->input_size;
 
-    // 3. Inferenza int8 nel data plane
     long long output_raw = 0;
     output_raw += iv[0] * (long long)(signed char)m->weights[0];
     output_raw += iv[1] * (long long)(signed char)m->weights[1];
@@ -89,9 +97,7 @@ int ipa_switch(struct xdp_md *ctx) {
 
     __u64 output = (__u64)(output_raw >> SCALE_SHIFT);
 
-    // 4. Table Lookup
     struct fwd_action *action = fwd_table.lookup(&output);
-
     if (action != NULL) {
         int key = 0;
         __u64 *val = pkt_stats.lookup(&key);
@@ -108,19 +114,18 @@ int ipa_switch(struct xdp_md *ctx) {
 }
 """
 
-# --- User Space ---
 print("IPA Switch Iniziato!")
-print(f"Pesi selezionati: {WEIGHTS_FILE}")
+print(f"Metodo: {'1 - PTQ (weights.json + weights_float.json)' if IS_PTQ else '2 - QAT (weights_method2.json)'}")
 
 b = BPF(text=program)
 fn = b.load_func("ipa_switch", BPF.XDP)
 
-ingress_iface = "eth1"
-egress_iface  = "eth2"
+ingress_iface  = "eth1"
+egress_iface   = "eth2"
 egress_ifindex = socket.if_nametoindex(egress_iface)
 
-# --- Carica pesi int8 nel kernel
-print(f"Caricamento pesi da {WEIGHTS_PATH} ...")
+# --- Carica pesi int8 nel kernel (uguale per entrambi i metodi)
+print(f"Caricamento pesi int8 da {WEIGHTS_PATH} ...")
 with open(WEIGHTS_PATH, "r") as f:
     integer_weights = json.load(f)
 
@@ -132,7 +137,7 @@ for i in range(min(len(integer_weights), 100)):
 cache[cache.Key(42)] = my_model
 print("Modello 42 caricato nella Cache eBPF!")
 
-# --- Preparazione azione di inoltro
+# --- Azione di inoltro
 fwd = b.get_table("fwd_table")
 my_action = fwd.Leaf()
 my_action.ifindex = egress_ifindex
@@ -143,34 +148,42 @@ for i in range(6):
     my_action.dst_mac[i] = dst_mac[i]
 
 # ---------------------------------------------------------------------------
-# Popolamento fwd_table — control plane
+# Control plane: calcolo chiavi fwd_table
 #
-# Il control plane deve calcolare la stessa chiave che produrra' il kernel.
-# Il kernel usa: output = (sum(iv[i] * int8(w[i]))) >> SCALE_SHIFT
-# Per replicarlo esattamente usiamo ctypes.c_int8 che fa lo stesso cast.
+# Metodo 1 (PTQ): usa i pesi FLOAT ORIGINALI (pre-quantizzazione).
+#   Il modello float avrebbe calcolato ideal_raw con la precisione piena;
+#   il kernel invece usa int8, quindi per alcuni TTL la chiave diverge
+#   -> TABLE MISS reale che riflette l'errore di quantizzazione PTQ.
 #
-# Metodo 1 (PTQ, weights.json):
-#   I pesi int8 sono il risultato di round(float * 128) con clamp.
-#   Il control plane usa int8/128 come approssimazione dei float originali.
-#   L'errore di arrotondamento PTQ puo' causare alcuni TABLE MISS per certi TTL.
-#
-# Metodo 2 (QAT, weights_method2.json):
-#   I pesi sono stati ottimizzati durante il training per minimizzare l'errore
-#   di quantizzazione. Il control plane usa int8/128 e combacia col kernel
-#   -> zero miss garantiti.
+# Metodo 2 (QAT): usa int8/128, identico al kernel per costruzione.
+#   Il QAT ha gia' ottimizzato i pesi affinche' int8/128 ~= float originale
+#   -> zero miss.
 # ---------------------------------------------------------------------------
 print("Popolamento fwd_table...")
 if_index_eth1 = socket.if_nametoindex(ingress_iface)
-SCALE_SHIFT = 7
+SCALE_SHIFT   = 7
 
-# Replica esatta del cast (signed char) del kernel
-cp_weights = [ctypes.c_int8(int(w)).value / 128.0 for w in integer_weights[:4]]
-print(f"  Pesi control plane (int8/128): {[f'{w:.4f}' for w in cp_weights]}")
+if IS_PTQ:
+    float_path = "/shared/weights_float.json"
+    if not os.path.exists(float_path):
+        print(f"[ERRORE] {float_path} non trovato!")
+        print("Esegui prima: python3 /shared/extract_weights.py")
+        sys.exit(1)
+    with open(float_path, "r") as f:
+        all_floats = json.load(f)
+    cp_weights = all_floats[:4]
+    print(f"  [PTQ] Pesi float originali: {[f'{w:.6f}' for w in cp_weights]}")
+    int8_equiv  = [ctypes.c_int8(int(w)).value / 128.0 for w in integer_weights[:4]]
+    print(f"  [PTQ] Equivalenti int8/128:  {[f'{w:.6f}' for w in int8_equiv]}")
+    print(f"  [PTQ] Errore di quant.:      {[f'{abs(a-b):.6f}' for a,b in zip(cp_weights, int8_equiv)]}")
+else:
+    cp_weights = [ctypes.c_int8(int(w)).value / 128.0 for w in integer_weights[:4]]
+    print(f"  [QAT] Pesi int8/128: {[f'{w:.6f}' for w in cp_weights]}")
 
 for test_ttl in range(30, 65):
-    iv_test = [42, test_ttl, if_index_eth1, 4]
-    ideal_raw = sum(iv * fw for iv, fw in zip(iv_test, cp_weights))
-    expected_key = int(ideal_raw * 128) >> SCALE_SHIFT  # equivalente a int(ideal_raw)
+    iv_test    = [42, test_ttl, if_index_eth1, 4]
+    ideal_raw  = sum(iv * fw for iv, fw in zip(iv_test, cp_weights))
+    expected_key = int(ideal_raw * 128) >> SCALE_SHIFT
     fwd[ctypes.c_ulonglong(expected_key)] = my_action
 
 print("Regole di inoltro caricate per TTL 30-64.")
@@ -184,7 +197,6 @@ except Exception as e:
     print(f"Errore XDP: {e}")
 
 stats = b.get_table("pkt_stats")
-
 print("\nIn ascolto di pacchetti... (Ctrl+C per fermare)")
 print(f"{'REDIRECT (Fast Path)':<25} | {'PASS (Table Miss)':<25}")
 print("-" * 55)
