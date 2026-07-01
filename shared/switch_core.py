@@ -6,6 +6,7 @@ import os
 import ctypes
 import subprocess
 import re
+import sys
 
 # ---------------------------------------------------------------------------
 # Topology reference (from lab.conf) for Frankfurt:
@@ -31,6 +32,19 @@ FORWARD_DESTINATIONS = [
 #              output      = output_raw >> SCALE_SHIFT
 # ---------------------------------------------------------------------------
 SCALE_SHIFT = 7   # 2^7 = 128
+
+# ---------------------------------------------------------------------------
+# Weights file selection:
+#   Method 1 (default): weights.json
+#   Method 2           : weights_method2.json
+#
+#   Usage:
+#     python switch_core.py                        -> uses weights.json (method 1)
+#     python switch_core.py weights.json           -> uses weights.json (method 1)
+#     python switch_core.py weights_method2.json   -> uses weights_method2.json (method 2)
+# ---------------------------------------------------------------------------
+WEIGHTS_FILE = sys.argv[1] if len(sys.argv) > 1 else "weights.json"
+WEIGHTS_PATH = f"/shared/{WEIGHTS_FILE}"
 
 # --- Kernel Space (eBPF C Code) ---
 program = r"""
@@ -266,9 +280,10 @@ fn = b.load_func("ipa_switch", BPF.XDP)
 
 print("IPA Switch avviato!")
 print(f"Quantizzazione: int8 via (signed char) cast, SCALE_FACTOR=128 (SCALE_SHIFT={SCALE_SHIFT})")
+print(f"Pesi selezionati: {WEIGHTS_FILE}")
 
-print("Caricamento pesi da /shared/weights.json ...")
-with open("/shared/weights.json", "r") as f:
+print(f"Caricamento pesi da {WEIGHTS_PATH} ...")
+with open(WEIGHTS_PATH, "r") as f:
     integer_weights = json.load(f)
 
 # Carica nel kernel: i valori in weights.json sono gia' int8 clampati [-128,+127].
