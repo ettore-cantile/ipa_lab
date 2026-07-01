@@ -24,17 +24,28 @@ model.load_state_dict(torch.load("frr_germany50_5_model_4x2.pt"))
 SCALE_FACTOR = 128   # 2^7  =>  shift right di 7 bit nel kernel
 
 integer_weights = []
+float_weights = []
 
 for param in model.parameters():
     for weight_float in param.data.view(-1).tolist():
+        # Salva il peso float originale (prima della quantizzazione)
+        float_weights.append(weight_float)
+
         weight_int = int(round(weight_float * SCALE_FACTOR))
         # Clamp a int8: se il peso float supera +-1 viene saturato, non wrappato
         weight_int = max(-128, min(127, weight_int))
         integer_weights.append(weight_int)
 
+# Pesi quantizzati int8 -> usati dal kernel eBPF
 with open("weights.json", "w") as f:
     json.dump(integer_weights, f)
 
+# Pesi float originali -> usati dal control plane Python per il lookup preciso
+with open("weights_float.json", "w") as f:
+    json.dump(float_weights, f)
+
 print(f"SCALE_FACTOR = {SCALE_FACTOR}  (shift = 7 bit nel kernel eBPF)")
 print(f"Extraction complete! Saved {len(integer_weights)} weights to weights.json")
-print(f"Range effettivo: min={min(integer_weights)}  max={max(integer_weights)}")
+print(f"Float weights saved to weights_float.json ({len(float_weights)} values)")
+print(f"Range int8 effettivo: min={min(integer_weights)}  max={max(integer_weights)}")
+print(f"Range float originale: min={min(float_weights):.4f}  max={max(float_weights):.4f}")
