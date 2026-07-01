@@ -16,9 +16,10 @@ WEIGHTS_PATH = f"/shared/{WEIGHTS_FILE}"
 IS_PTQ = (WEIGHTS_FILE == "weights.json")
 
 # --- Kernel Space (eBPF C Code) ---
-# Il SCALE_FACTOR non e' piu' uno shift fisso (>> 7):
-# viene letto dal campo 'scaling' dell'IPA header e usato come divisore intero.
-# Cio' permette qualsiasi SCALE_FACTOR calcolato automaticamente.
+# Il verifier eBPF NON supporta la divisione con segno (sdiv).
+# Soluzione: sommiamo un offset fisso (OFFSET = 100000) a output_raw per
+# renderlo sempre positivo, poi usiamo divisione unsigned (__u64).
+# Il control plane applica lo stesso offset prima di calcolare la chiave.
 program = """
 #include <uapi/linux/if_ether.h>
 #include <uapi/linux/ip.h>
@@ -50,6 +51,9 @@ struct fwd_action {
 BPF_HASH(model_cache, __u8, struct model_data, 256);
 BPF_HASH(fwd_table, __u64, struct fwd_action, 256);
 BPF_ARRAY(pkt_stats, __u64, 2);
+
+// Offset per rendere output_raw sempre >= 0 prima della divisione unsigned
+#define OUTPUT_OFFSET 100000ULL
 
 int ipa_switch(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -88,8 +92,9 @@ int ipa_switch(struct xdp_md *ctx) {
     output_raw += iv[2] * (long long)(signed char)m->weights[2];
     output_raw += iv[3] * (long long)(signed char)m->weights[3];
 
-    // Divisione intera per SCALE_FACTOR (non piu' shift fisso)
-    __u64 output = (__u64)(output_raw / (long long)scale);
+    // Rendi output_raw >= 0 aggiungendo offset, poi divisione UNSIGNED
+    __u64 output_u = (__u64)(output_raw + (long long)(OUTPUT_OFFSET * scale));
+    __u64 output   = output_u / (__u64)scale;
 
     struct fwd_action *action = fwd_table.lookup(&output);
     if (action != NULL) {
@@ -123,7 +128,7 @@ print(f"Caricamento pesi int8 da {WEIGHTS_PATH} ...")
 with open(WEIGHTS_PATH, "r") as f:
     integer_weights = json.load(f)
 
-# --- Determina SCALE_FACTOR
+# --- Determina SCALE_FACTOR e pesi del control plane
 if IS_PTQ:
     float_path = "/shared/weights_float.json"
     if not os.path.exists(float_path):
@@ -139,16 +144,17 @@ if IS_PTQ:
     print(f"  [PTQ] Equivalenti int8/SF:  {[f'{w:.6f}' for w in int8_equiv]}")
     print(f"  [PTQ] Errore di quant.:     {[f'{abs(a-b):.6f}' for a,b in zip(cp_weights, int8_equiv)]}")
 else:
-    # Metodo 2 QAT: SCALE_FACTOR=128 (training con clamp [-1,+1])
     SCALE_FACTOR = 128
     cp_weights   = [ctypes.c_int8(int(w)).value / SCALE_FACTOR for w in integer_weights[:4]]
     print(f"  [QAT] SCALE_FACTOR = {SCALE_FACTOR}")
     print(f"  [QAT] Pesi int8/128: {[f'{w:.6f}' for w in cp_weights]}")
 
-# --- Popola model_cache con pesi + scale_factor
+# --- Popola model_cache
+OFFSET = 100000  # stesso valore del #define nel kernel
+
 cache    = b.get_table("model_cache")
 my_model = cache.Leaf()
-my_model.is_valid    = 1
+my_model.is_valid     = 1
 my_model.scale_factor = SCALE_FACTOR
 for i in range(min(len(integer_weights), 100)):
     my_model.weights[i] = ctypes.c_uint8(integer_weights[i]).value
@@ -165,14 +171,19 @@ for i in range(6):
     my_action.src_mac[i] = src_mac[i]
     my_action.dst_mac[i] = dst_mac[i]
 
-# --- Popolamento fwd_table
+# ---------------------------------------------------------------------------
+# Popolamento fwd_table — replica ESATTA del calcolo kernel con offset.
+# Kernel:  output = (output_raw + OFFSET * scale) / scale
+#        = output_raw/scale + OFFSET
+# Quindi: expected_key = int(ideal_raw) + OFFSET
+# ---------------------------------------------------------------------------
 print("Popolamento fwd_table...")
 if_index_eth1 = socket.if_nametoindex(ingress_iface)
 
 for test_ttl in range(30, 65):
     iv_test      = [42, test_ttl, if_index_eth1, 4]
     ideal_raw    = sum(iv * fw for iv, fw in zip(iv_test, cp_weights))
-    expected_key = int(ideal_raw * SCALE_FACTOR) // SCALE_FACTOR
+    expected_key = int(ideal_raw) + OFFSET
     fwd[ctypes.c_ulonglong(expected_key)] = my_action
 
 print("Regole di inoltro caricate per TTL 30-64.")
