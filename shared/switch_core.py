@@ -6,15 +6,26 @@ import os
 import ctypes
 import subprocess
 import re
-import threading
 
 # ---------------------------------------------------------------------------
 # Topology reference (from lab.conf) for Frankfurt:
-#   eth0 <-> l15 <-> koblenz
-#   eth1 <-> l59 <-> darmstadt   (packet arrives HERE from Darmstadt)
-#   eth2 <-> l60 <-> giessen
-#   eth3 <-> l61 <-> fulda
+#   eth0 <-> l15 <-> koblenz      (WEST  - wrong direction)
+#   eth1 <-> l59 <-> darmstadt    (SOUTH - ingress from sender)
+#   eth2 <-> l60 <-> giessen      (NORTH - forward)
+#   eth3 <-> l61 <-> fulda        (EAST  - forward)
+#
+# Correct egress: eth2 or eth3 (never eth0 or eth1).
+# We detect it dynamically via the OSPF routing table.
 # ---------------------------------------------------------------------------
+
+# Loopback IPs of nodes reachable via the FORWARD direction from Frankfurt.
+# Used to query `ip route get` and discover the correct egress interface.
+FORWARD_DESTINATIONS = [
+    "10.255.255.20",  # giessen  (eth2)
+    "10.255.255.19",  # fulda    (eth3)
+    "10.255.255.26",  # kassel
+    "10.255.255.23",  # hannover
+]
 
 # --- Kernel Space (eBPF C Code) ---
 program = r"""
@@ -43,8 +54,18 @@ struct fwd_action {
     __u8 dst_mac[6];
 };
 
+/* Perf event for user-space logging */
+struct log_event {
+    u32  ingress_ifindex;
+    u8   model_id;
+    s64  output;
+    u32  egress_ifindex;
+    u8   verdict;   /* 0=PASS_no_model 1=PASS_no_rule 2=REDIRECT */
+};
+
 BPF_HASH(model_cache, __u8, struct model_data, 256);
 BPF_HASH(fwd_table, long long, struct fwd_action, 256);
+BPF_PERF_OUTPUT(events);
 
 int ipa_switch(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -52,7 +73,6 @@ int ipa_switch(struct xdp_md *ctx) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
-
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
 
     struct iphdr *ip = (void *)(eth + 1);
@@ -66,13 +86,14 @@ int ipa_switch(struct xdp_md *ctx) {
     struct ipa_hdr *ipa = (void *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;
 
-    __u8 mid = ipa->model_id;
-    bpf_trace_printk("[IPA] pkt ricevuto su ifindex=%d model_id=%d\n",
-                     ctx->ingress_ifindex, mid);
+    struct log_event evt = {};
+    evt.ingress_ifindex = ctx->ingress_ifindex;
+    evt.model_id        = ipa->model_id;
 
-    struct model_data *m = model_cache.lookup(&mid);
+    struct model_data *m = model_cache.lookup(&ipa->model_id);
     if (m == NULL || m->is_valid != 1) {
-        bpf_trace_printk("[IPA] PASS: modello %d non trovato in cache\n", mid);
+        evt.verdict = 0;
+        events.perf_submit(ctx, &evt, sizeof(evt));
         return XDP_PASS;
     }
 
@@ -82,16 +103,19 @@ int ipa_switch(struct xdp_md *ctx) {
     output += iv[1] * (int)m->weights[1];
     output += iv[2] * (int)m->weights[2];
     output += iv[3] * (int)m->weights[3];
-
-    bpf_trace_printk("[IPA] output inferenza = %lld\n", output);
+    evt.output = output;
 
     struct fwd_action *action = fwd_table.lookup(&output);
     if (action == NULL) {
-        bpf_trace_printk("[IPA] PASS: nessuna regola per output=%lld\n", output);
+        evt.verdict = 1;
+        events.perf_submit(ctx, &evt, sizeof(evt));
         return XDP_PASS;
     }
 
-    bpf_trace_printk("[IPA] REDIRECT -> ifindex=%d\n", action->ifindex);
+    evt.egress_ifindex = action->ifindex;
+    evt.verdict        = 2;
+    events.perf_submit(ctx, &evt, sizeof(evt));
+
     __builtin_memcpy(eth->h_source, action->src_mac, 6);
     __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
     return bpf_redirect(action->ifindex, 0);
@@ -99,25 +123,26 @@ int ipa_switch(struct xdp_md *ctx) {
 """
 
 # ---------------------------------------------------------------------------
-# trace_pipe reader: stampa i log eBPF direttamente sul terminale
+# Perf event callback — called for every IPA packet
 # ---------------------------------------------------------------------------
-def trace_pipe_reader():
-    """Legge /sys/kernel/debug/tracing/trace_pipe e stampa solo le righe IPA."""
-    try:
-        with open("/sys/kernel/debug/tracing/trace_pipe", "rb") as pipe:
-            while True:
-                line = pipe.readline()
-                if not line:
-                    time.sleep(0.01)
-                    continue
-                decoded = line.decode("utf-8", errors="replace").rstrip()
-                if "[IPA]" in decoded:
-                    # Estrai solo la parte dopo il timestamp per output pulito
-                    # Formato kernel: "    <...>-PID   [CPU] .... TIMESTAMP: msg"
-                    idx = decoded.find("[IPA]")
-                    print(f"\033[96m[TRACE] {decoded[idx:]}\033[0m", flush=True)
-    except Exception as e:
-        print(f"[WARN] trace_pipe non disponibile: {e}")
+VERDICTS = {0: "PASS (modello non trovato)",
+            1: "PASS (nessuna regola fwd)",
+            2: "REDIRECT"}
+
+def handle_event(cpu, data, size):
+    evt = b["events"].event(data)
+    ingress_name = socket.if_indextoname(evt.ingress_ifindex) \
+                   if evt.ingress_ifindex else "?"
+    msg = (f"\033[96m[TRACE] ifindex_in={evt.ingress_ifindex}({ingress_name})"
+           f"  model_id={evt.model_id}"
+           f"  output={evt.output}")
+    if evt.verdict == 2:
+        egress_name = socket.if_indextoname(evt.egress_ifindex) \
+                      if evt.egress_ifindex else "?"
+        msg += f"  -> REDIRECT ifindex={evt.egress_ifindex}({egress_name})"
+    else:
+        msg += f"  -> {VERDICTS[evt.verdict]}"
+    print(msg + "\033[0m", flush=True)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -149,37 +174,54 @@ def probe_arp(iface):
     except Exception:
         pass
 
-def resolve_egress(all_ifaces, ingress_iface):
-    candidates = [i for i in all_ifaces if i != ingress_iface]
-    for iface in candidates:
-        mac = get_neighbor_mac(iface)
-        if mac:
-            print(f"  Neighbour in ARP cache su {iface}: {':'.join(f'{b:02x}' for b in mac)}")
-            return iface, mac
-    print("  ARP cache vuota, ping in corso...")
-    for iface in candidates:
-        probe_arp(iface)
-    for iface in candidates:
-        mac = get_neighbor_mac(iface)
-        if mac:
-            print(f"  Neighbour MAC risolto su {iface}: {':'.join(f'{b:02x}' for b in mac)}")
-            return iface, mac
-    iface = candidates[0]
-    print(f"  [WARN] MAC non trovato, uso broadcast su {iface}")
-    return iface, [0xFF]*6
-
-def detect_ingress_iface(all_ifaces, sender_loopback="10.255.255.10"):
+def route_get_iface(dest_ip, all_ifaces):
+    """Return the local interface the kernel would use to reach dest_ip."""
     try:
-        out = subprocess.check_output(["ip", "route", "get", sender_loopback], text=True)
+        out = subprocess.check_output(["ip", "route", "get", dest_ip], text=True)
         m = re.search(r"dev (\S+)", out)
         if m and m.group(1) in all_ifaces:
-            print(f"  Ingress rilevato via routing: {m.group(1)}")
             return m.group(1)
     except Exception:
         pass
+    return None
+
+def detect_ingress_iface(all_ifaces, sender_loopback="10.255.255.10"):
+    iface = route_get_iface(sender_loopback, all_ifaces)
+    if iface:
+        print(f"  Ingress rilevato via routing: {iface}")
+        return iface
     fallback = "eth1"
     print(f"  [WARN] Impossibile rilevare ingress, default: {fallback}")
     return fallback
+
+def detect_egress_iface(all_ifaces, ingress_iface, forward_dests):
+    """
+    Query the OSPF routing table for each FORWARD_DESTINATION.
+    Pick the first result that is NOT the ingress interface.
+    This guarantees we forward in the correct topological direction.
+    """
+    for dest in forward_dests:
+        iface = route_get_iface(dest, all_ifaces)
+        if iface and iface != ingress_iface:
+            print(f"  Egress rilevato via routing verso {dest}: {iface}")
+            return iface
+    # Fallback: any non-ingress interface
+    candidates = [i for i in all_ifaces if i != ingress_iface]
+    print(f"  [WARN] Routing non ha risolto egress, uso fallback: {candidates[0]}")
+    return candidates[0]
+
+def resolve_mac(iface):
+    """Get neighbour MAC on iface, probing ARP if needed."""
+    mac = get_neighbor_mac(iface)
+    if mac:
+        return mac
+    print(f"  ARP cache vuota su {iface}, ping in corso...")
+    probe_arp(iface)
+    mac = get_neighbor_mac(iface)
+    if mac:
+        return mac
+    print(f"  [WARN] MAC non trovato su {iface}, uso broadcast")
+    return [0xFF] * 6
 
 def calculate_expected_output(weights, input_vector):
     output = 0
@@ -212,14 +254,16 @@ print("Modello 42 caricato nel kernel.")
 all_ifaces = [i for i in os.listdir('/sys/class/net/') if i != 'lo']
 print(f"Interfacce: {all_ifaces}")
 
-# 3. Ingress
+# 3. Ingress (dove arriva il pacchetto da Darmstadt)
 ingress_iface = detect_ingress_iface(all_ifaces, sender_loopback="10.255.255.10")
 print(f"Ingress (da Darmstadt): {ingress_iface}")
 
-# 4. Egress
-egress_iface, dst_mac = resolve_egress(all_ifaces, ingress_iface)
+# 4. Egress (direzione FORWARD, via routing OSPF)
+egress_iface = detect_egress_iface(all_ifaces, ingress_iface, FORWARD_DESTINATIONS)
 egress_ifindex = socket.if_nametoindex(egress_iface)
 src_mac = get_iface_mac(egress_iface)
+dst_mac = resolve_mac(egress_iface)
+
 print(f"Egress: {egress_iface} (ifindex={egress_ifindex})")
 print(f"  src_mac: {':'.join(f'{b:02x}' for b in src_mac)}")
 print(f"  dst_mac: {':'.join(f'{b:02x}' for b in dst_mac)}")
@@ -239,7 +283,7 @@ for i in range(6):
 fwd[fwd.Key(MYSTERY_NUMBER)] = my_action
 print(f"Regola: output={MYSTERY_NUMBER} -> {egress_iface} (ifindex={egress_ifindex})")
 
-# 7. Attach XDP
+# 7. Attach XDP a tutte le interfacce
 print(f"\nAttach XDP alle interfacce: {all_ifaces}")
 for iface in all_ifaces:
     try:
@@ -248,14 +292,13 @@ for iface in all_ifaces:
     except Exception as e:
         print(f"  ERRORE attach su {iface}: {e}")
 
-# 8. Avvia thread lettore di trace_pipe
-t = threading.Thread(target=trace_pipe_reader, daemon=True)
-t.start()
+# 8. Registra callback perf buffer (no debugfs needed)
+b["events"].open_perf_buffer(handle_event)
 print("\nIn ascolto... log eBPF in tempo reale (Ctrl+C per fermare)\n")
 
 try:
     while True:
-        time.sleep(1)
+        b.perf_buffer_poll(timeout=100)
 except KeyboardInterrupt:
     print("\nDetach XDP...")
     for iface in all_ifaces:
