@@ -13,13 +13,8 @@ import re
 #   eth1 <-> l59 <-> darmstadt    (SOUTH - ingress from sender)
 #   eth2 <-> l60 <-> giessen      (NORTH - forward)
 #   eth3 <-> l61 <-> fulda        (EAST  - forward)
-#
-# Correct egress: eth2 or eth3 (never eth0 or eth1).
-# We detect it dynamically via the OSPF routing table.
 # ---------------------------------------------------------------------------
 
-# Loopback IPs of nodes reachable via the FORWARD direction from Frankfurt.
-# Used to query `ip route get` and discover the correct egress interface.
 FORWARD_DESTINATIONS = [
     "10.255.255.20",  # giessen  (eth2)
     "10.255.255.19",  # fulda    (eth3)
@@ -54,13 +49,13 @@ struct fwd_action {
     __u8 dst_mac[6];
 };
 
-/* Perf event for user-space logging */
 struct log_event {
     u32  ingress_ifindex;
     u8   model_id;
     s64  output;
     u32  egress_ifindex;
-    u8   verdict;   /* 0=PASS_no_model 1=PASS_no_rule 2=REDIRECT */
+    u8   verdict;   /* 0=PASS_no_model  1=PASS_no_rule  2=REDIRECT */
+    u64  ts_ns;     /* ktime_get_ns() at redirect time */
 };
 
 BPF_HASH(model_cache, __u8, struct model_data, 256);
@@ -89,6 +84,7 @@ int ipa_switch(struct xdp_md *ctx) {
     struct log_event evt = {};
     evt.ingress_ifindex = ctx->ingress_ifindex;
     evt.model_id        = ipa->model_id;
+    evt.ts_ns           = bpf_ktime_get_ns();
 
     struct model_data *m = model_cache.lookup(&ipa->model_id);
     if (m == NULL || m->is_valid != 1) {
@@ -122,23 +118,17 @@ int ipa_switch(struct xdp_md *ctx) {
 }
 """
 
-# ---------------------------------------------------------------------------
-# Perf event callback — called for every IPA packet
-# ---------------------------------------------------------------------------
 VERDICTS = {0: "PASS (modello non trovato)",
             1: "PASS (nessuna regola fwd)",
             2: "REDIRECT"}
 
 def handle_event(cpu, data, size):
     evt = b["events"].event(data)
-    ingress_name = socket.if_indextoname(evt.ingress_ifindex) \
-                   if evt.ingress_ifindex else "?"
+    ingress_name = socket.if_indextoname(evt.ingress_ifindex) if evt.ingress_ifindex else "?"
     msg = (f"\033[96m[TRACE] ifindex_in={evt.ingress_ifindex}({ingress_name})"
-           f"  model_id={evt.model_id}"
-           f"  output={evt.output}")
+           f"  model_id={evt.model_id}  output={evt.output}")
     if evt.verdict == 2:
-        egress_name = socket.if_indextoname(evt.egress_ifindex) \
-                      if evt.egress_ifindex else "?"
+        egress_name = socket.if_indextoname(evt.egress_ifindex) if evt.egress_ifindex else "?"
         msg += f"  -> REDIRECT ifindex={evt.egress_ifindex}({egress_name})"
     else:
         msg += f"  -> {VERDICTS[evt.verdict]}"
@@ -152,30 +142,67 @@ def get_iface_mac(iface):
         return [int(b, 16) for b in f.read().strip().split(":")]
 
 def get_neighbor_mac(iface):
-    try:
-        out = subprocess.check_output(["ip", "neigh", "show", "dev", iface], text=True)
-        for line in out.splitlines():
-            m = re.search(r"lladdr ([0-9a-fA-F:]{17})", line)
-            if m:
-                return [int(b, 16) for b in m.group(1).split(":")]
-    except Exception as e:
-        print(f"  [WARN] ip neigh failed on {iface}: {e}")
+    """Read ARP table for iface via ip neigh and arp -n, return first MAC found."""
+    for cmd in (
+        ["ip", "neigh", "show", "dev", iface],
+        ["arp", "-n", "-i", iface],
+    ):
+        try:
+            out = subprocess.check_output(cmd, text=True)
+            for line in out.splitlines():
+                m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", line)
+                if m:
+                    return [int(b, 16) for b in m.group(1).split(":")]
+        except Exception:
+            pass
     return None
 
-def probe_arp(iface):
+def probe_arp(iface, rounds=1):
+    """
+    Populate ARP cache using two strategies:
+    1. ping all hosts in the /30 subnet
+    2. arping (unicast ARP probe) to each candidate IP
+    """
     try:
         out = subprocess.check_output(["ip", "-4", "addr", "show", iface], text=True)
-        m = re.search(r"inet (\d+\.\d+\.\d+)\.\d+/\d+", out)
-        if m:
-            prefix = m.group(1)
-            for last in range(1, 4):
-                subprocess.call(["ping", "-c", "1", "-W", "1", f"{prefix}.{last}"],
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", out)
+        if not m:
+            return
+        my_ip = m.group(1)
+        prefix = ".".join(my_ip.split(".")[:3])
+        candidates = [f"{prefix}.{x}" for x in range(1, 5) if f"{prefix}.{x}" != my_ip]
+
+        for _ in range(rounds):
+            # Strategy 1: ping
+            for ip in candidates:
+                subprocess.call(["ping", "-c", "1", "-W", "1", ip],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if get_neighbor_mac(iface):
+                return
+            # Strategy 2: arping
+            for ip in candidates:
+                subprocess.call(["arping", "-c", "2", "-w", "2", "-I", iface, ip],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if get_neighbor_mac(iface):
+                return
+            time.sleep(0.5)
     except Exception:
         pass
 
+def resolve_mac(iface, retries=3):
+    """Get neighbour MAC on iface, probing with ping+arping if needed."""
+    for attempt in range(1, retries + 1):
+        mac = get_neighbor_mac(iface)
+        if mac:
+            print(f"  MAC risolto su {iface} (tentativo {attempt}): "
+                  f"{':'.join(f'{b:02x}' for b in mac)}")
+            return mac
+        print(f"  Tentativo {attempt}/{retries}: ARP vuoto su {iface}, probe in corso...")
+        probe_arp(iface, rounds=1)
+    print(f"  [WARN] MAC non trovato su {iface} dopo {retries} tentativi, uso broadcast")
+    return [0xFF] * 6
+
 def route_get_iface(dest_ip, all_ifaces):
-    """Return the local interface the kernel would use to reach dest_ip."""
     try:
         out = subprocess.check_output(["ip", "route", "get", dest_ip], text=True)
         m = re.search(r"dev (\S+)", out)
@@ -190,38 +217,18 @@ def detect_ingress_iface(all_ifaces, sender_loopback="10.255.255.10"):
     if iface:
         print(f"  Ingress rilevato via routing: {iface}")
         return iface
-    fallback = "eth1"
-    print(f"  [WARN] Impossibile rilevare ingress, default: {fallback}")
-    return fallback
+    print(f"  [WARN] Impossibile rilevare ingress, default: eth1")
+    return "eth1"
 
 def detect_egress_iface(all_ifaces, ingress_iface, forward_dests):
-    """
-    Query the OSPF routing table for each FORWARD_DESTINATION.
-    Pick the first result that is NOT the ingress interface.
-    This guarantees we forward in the correct topological direction.
-    """
     for dest in forward_dests:
         iface = route_get_iface(dest, all_ifaces)
         if iface and iface != ingress_iface:
             print(f"  Egress rilevato via routing verso {dest}: {iface}")
             return iface
-    # Fallback: any non-ingress interface
     candidates = [i for i in all_ifaces if i != ingress_iface]
-    print(f"  [WARN] Routing non ha risolto egress, uso fallback: {candidates[0]}")
+    print(f"  [WARN] Routing non ha risolto egress, fallback: {candidates[0]}")
     return candidates[0]
-
-def resolve_mac(iface):
-    """Get neighbour MAC on iface, probing ARP if needed."""
-    mac = get_neighbor_mac(iface)
-    if mac:
-        return mac
-    print(f"  ARP cache vuota su {iface}, ping in corso...")
-    probe_arp(iface)
-    mac = get_neighbor_mac(iface)
-    if mac:
-        return mac
-    print(f"  [WARN] MAC non trovato su {iface}, uso broadcast")
-    return [0xFF] * 6
 
 def calculate_expected_output(weights, input_vector):
     output = 0
@@ -237,7 +244,6 @@ fn = b.load_func("ipa_switch", BPF.XDP)
 
 print("IPA Switch avviato!")
 
-# 1. Carica pesi
 print("Caricamento pesi da /shared/weights.json ...")
 with open("/shared/weights.json", "r") as f:
     integer_weights = json.load(f)
@@ -250,30 +256,30 @@ for i in range(min(len(integer_weights), 100)):
 cache[cache.Key(42)] = my_model
 print("Modello 42 caricato nel kernel.")
 
-# 2. Interfacce
 all_ifaces = [i for i in os.listdir('/sys/class/net/') if i != 'lo']
 print(f"Interfacce: {all_ifaces}")
 
-# 3. Ingress (dove arriva il pacchetto da Darmstadt)
 ingress_iface = detect_ingress_iface(all_ifaces, sender_loopback="10.255.255.10")
 print(f"Ingress (da Darmstadt): {ingress_iface}")
 
-# 4. Egress (direzione FORWARD, via routing OSPF)
 egress_iface = detect_egress_iface(all_ifaces, ingress_iface, FORWARD_DESTINATIONS)
 egress_ifindex = socket.if_nametoindex(egress_iface)
 src_mac = get_iface_mac(egress_iface)
-dst_mac = resolve_mac(egress_iface)
+dst_mac = resolve_mac(egress_iface, retries=3)
 
 print(f"Egress: {egress_iface} (ifindex={egress_ifindex})")
 print(f"  src_mac: {':'.join(f'{b:02x}' for b in src_mac)}")
 print(f"  dst_mac: {':'.join(f'{b:02x}' for b in dst_mac)}")
 
-# 5. MYSTERY_NUMBER
+if all(b == 0xFF for b in dst_mac):
+    print("  [WARN] dst_mac e' broadcast. Esegui:")
+    print(f"         ping -c3 <IP_di_giessen_su_{egress_iface}>")
+    print("         poi riavvia switch_core.py per usare il MAC corretto.")
+
 input_vector = [1, 64, 1, 1]
 MYSTERY_NUMBER = calculate_expected_output(integer_weights, input_vector)
 print(f"MYSTERY_NUMBER = {MYSTERY_NUMBER}")
 
-# 6. Installa regola di forwarding
 fwd = b.get_table("fwd_table")
 my_action = fwd.Leaf()
 my_action.ifindex = egress_ifindex
@@ -283,7 +289,6 @@ for i in range(6):
 fwd[fwd.Key(MYSTERY_NUMBER)] = my_action
 print(f"Regola: output={MYSTERY_NUMBER} -> {egress_iface} (ifindex={egress_ifindex})")
 
-# 7. Attach XDP a tutte le interfacce
 print(f"\nAttach XDP alle interfacce: {all_ifaces}")
 for iface in all_ifaces:
     try:
@@ -292,7 +297,6 @@ for iface in all_ifaces:
     except Exception as e:
         print(f"  ERRORE attach su {iface}: {e}")
 
-# 8. Registra callback perf buffer (no debugfs needed)
 b["events"].open_perf_buffer(handle_event)
 print("\nIn ascolto... log eBPF in tempo reale (Ctrl+C per fermare)\n")
 
