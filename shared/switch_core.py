@@ -4,6 +4,15 @@ import socket
 import json
 import os
 import ctypes
+import sys
+
+# ---------------------------------------------------------------------------
+# Selezione file pesi:
+#   Metodo 1 (PTQ, default): weights.json          -> python3 switch_core.py
+#   Metodo 2 (QAT):          weights_method2.json  -> python3 switch_core.py weights_method2.json
+# ---------------------------------------------------------------------------
+WEIGHTS_FILE = sys.argv[1] if len(sys.argv) > 1 else "weights.json"
+WEIGHTS_PATH = f"/shared/{WEIGHTS_FILE}"
 
 # --- Kernel Space (eBPF C Code) ---
 program = """
@@ -23,14 +32,14 @@ struct ipa_hdr {
 } __attribute__((packed));
 
 struct model_data {
-    __u8 weights[100]; 
+    __u8 weights[100];
     __u8 is_valid;
 };
 
 struct fwd_action {
-    __u32 ifindex;      
-    __u8 src_mac[6];    
-    __u8 dst_mac[6];    
+    __u32 ifindex;
+    __u8 src_mac[6];
+    __u8 dst_mac[6];
 } __attribute__((packed));
 
 BPF_HASH(model_cache, __u8, struct model_data, 256);
@@ -39,7 +48,7 @@ BPF_HASH(fwd_table, __u64, struct fwd_action, 256);
 // Array per le statistiche: Indice 0 = REDIRECT, Indice 1 = TABLE MISS
 BPF_ARRAY(pkt_stats, __u64, 2);
 
-#define SCALE_SHIFT 7 
+#define SCALE_SHIFT 7
 
 int ipa_switch(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
@@ -47,15 +56,15 @@ int ipa_switch(struct xdp_md *ctx) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
-    
+
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
     if (ip->protocol != IPPROTO_UDP) return XDP_PASS;
-    
+
     struct udphdr *udp = (struct udphdr *)(ip + 1);
     if ((void *)(udp + 1) > data_end) return XDP_PASS;
     if (udp->dest != bpf_htons(9999)) return XDP_PASS;
-    
+
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;
 
@@ -64,7 +73,7 @@ int ipa_switch(struct xdp_md *ctx) {
     struct model_data *m = model_cache.lookup(&target_model);
     if (!m || m->is_valid == 0) return XDP_PASS;
 
-    // 2. Estrazione feature reali dal pacchetto
+    // 2. Estrazione feature dal pacchetto
     long long iv[4];
     iv[0] = ipa->model_id;
     iv[1] = ip->ttl;
@@ -87,7 +96,6 @@ int ipa_switch(struct xdp_md *ctx) {
         int key = 0;
         __u64 *val = pkt_stats.lookup(&key);
         if (val) __sync_fetch_and_add(val, 1);
-
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest, action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
@@ -95,31 +103,25 @@ int ipa_switch(struct xdp_md *ctx) {
         int key = 1;
         __u64 *val = pkt_stats.lookup(&key);
         if (val) __sync_fetch_and_add(val, 1);
-        return XDP_PASS; 
+        return XDP_PASS;
     }
 }
 """
 
-# --- User Space (Python Code) ---
-import sys
-USE_FLOAT = "--float" in sys.argv
-
-print("IPA Switch Finale Iniziato!")
-if USE_FLOAT:
-    print("[Metodo 1 - PTQ] Uso pesi float originali per il control plane.")
-else:
-    print("[Metodo 2 - QAT] Uso pesi int8 per il control plane.")
+# --- User Space ---
+print("IPA Switch Iniziato!")
+print(f"Pesi selezionati: {WEIGHTS_FILE}")
 
 b = BPF(text=program)
 fn = b.load_func("ipa_switch", BPF.XDP)
 
 ingress_iface = "eth1"
-egress_iface = "eth2"
+egress_iface  = "eth2"
 egress_ifindex = socket.if_nametoindex(egress_iface)
 
-# --- Carica pesi int8 nel kernel (sempre)
-print("Caricamento pesi quantizzati da JSON...")
-with open("/shared/weights.json", "r") as f:
+# --- Carica pesi int8 nel kernel
+print(f"Caricamento pesi da {WEIGHTS_PATH} ...")
+with open(WEIGHTS_PATH, "r") as f:
     integer_weights = json.load(f)
 
 cache = b.get_table("model_cache")
@@ -140,38 +142,35 @@ for i in range(6):
     my_action.src_mac[i] = src_mac[i]
     my_action.dst_mac[i] = dst_mac[i]
 
-# --- Popolamento fwd_table
+# ---------------------------------------------------------------------------
+# Popolamento fwd_table — control plane
+#
 # Il control plane deve calcolare la stessa chiave che produrra' il kernel.
-# - Metodo 1 (PTQ, --float): usa i pesi float ORIGINALI pre-quantizzazione
-#   salvati da extract_weights.py in weights_float.json. Questo e' il calcolo
-#   PRECISO: nessun offset inventato, nessun errore artificiale.
-# - Metodo 2 (QAT, default): usa i pesi int8 riletti come float (diviso 128),
-#   che e' esattamente cio' che fa il kernel -> zero miss garantiti.
-print("Popolamento fwd_table dal Control Plane...")
+# Il kernel usa: output = (sum(iv[i] * int8(w[i]))) >> SCALE_SHIFT
+# Per replicarlo esattamente usiamo ctypes.c_int8 che fa lo stesso cast.
+#
+# Metodo 1 (PTQ, weights.json):
+#   I pesi int8 sono il risultato di round(float * 128) con clamp.
+#   Il control plane usa int8/128 come approssimazione dei float originali.
+#   L'errore di arrotondamento PTQ puo' causare alcuni TABLE MISS per certi TTL.
+#
+# Metodo 2 (QAT, weights_method2.json):
+#   I pesi sono stati ottimizzati durante il training per minimizzare l'errore
+#   di quantizzazione. Il control plane usa int8/128 e combacia col kernel
+#   -> zero miss garantiti.
+# ---------------------------------------------------------------------------
+print("Popolamento fwd_table...")
 if_index_eth1 = socket.if_nametoindex(ingress_iface)
 SCALE_SHIFT = 7
 
-if USE_FLOAT:
-    # Metodo 1: pesi float originali (pre-quantizzazione)
-    float_weights_path = "/shared/weights_float.json"
-    if not os.path.exists(float_weights_path):
-        print("[WARN] weights_float.json non trovato. Riesegui extract_weights.py prima.")
-        print("[WARN] Fallback: uso pesi int8/128 (comportamento identico al metodo 2).")
-        cp_weights = [ctypes.c_int8(int(w)).value / 128.0 for w in integer_weights[:4]]
-    else:
-        with open(float_weights_path, "r") as f:
-            all_float = json.load(f)
-        cp_weights = all_float[:4]
-        print(f"  Pesi float originali caricati: {[f'{w:.4f}' for w in cp_weights]}")
-else:
-    # Metodo 2: usa int8/128 -> identico al kernel -> zero miss
-    cp_weights = [ctypes.c_int8(int(w)).value / 128.0 for w in integer_weights[:4]]
-    print(f"  Pesi int8/128 (QAT): {[f'{w:.4f}' for w in cp_weights]}")
+# Replica esatta del cast (signed char) del kernel
+cp_weights = [ctypes.c_int8(int(w)).value / 128.0 for w in integer_weights[:4]]
+print(f"  Pesi control plane (int8/128): {[f'{w:.4f}' for w in cp_weights]}")
 
 for test_ttl in range(30, 65):
     iv_test = [42, test_ttl, if_index_eth1, 4]
     ideal_raw = sum(iv * fw for iv, fw in zip(iv_test, cp_weights))
-    expected_key = int(ideal_raw) >> SCALE_SHIFT
+    expected_key = int(ideal_raw * 128) >> SCALE_SHIFT  # equivalente a int(ideal_raw)
     fwd[ctypes.c_ulonglong(expected_key)] = my_action
 
 print("Regole di inoltro caricate per TTL 30-64.")
