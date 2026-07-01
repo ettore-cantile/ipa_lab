@@ -25,10 +25,10 @@ FORWARD_DESTINATIONS = [
 # ---------------------------------------------------------------------------
 # Quantization constants — must match extract_weights.py
 #   SCALE_FACTOR = 128 = 2^7  =>  SCALE_SHIFT = 7
-#   Weights are stored as int8_t in the kernel.
-#   Inference: output_raw = sum(iv[i] * (int8_t)w[i])
-#              output_scaled = output_raw >> SCALE_SHIFT
-#   The fwd_table key and MYSTERY_NUMBER are both output_scaled.
+#   Weights are stored as __u8 in the struct (BCC requirement).
+#   Signed interpretation is done via (signed char) cast in the arithmetic.
+#   Inference: output_raw = sum(iv[i] * (signed char)w[i])
+#              output      = output_raw >> SCALE_SHIFT
 # ---------------------------------------------------------------------------
 SCALE_SHIFT = 7   # 2^7 = 128
 
@@ -49,7 +49,7 @@ struct ipa_hdr {
 } __attribute__((packed));
 
 struct model_data {
-    __s8 weights[100];   /* int8_t: signed, range [-128,+127] */
+    __u8 weights[100];   /* stored as uint8; read as (signed char) in arithmetic */
     __u8 is_valid;
 };
 
@@ -106,15 +106,18 @@ int ipa_switch(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    /* Fixed-point inference: weights are int8_t, scale = 2^SCALE_SHIFT */
+    /* Fixed-point inference:
+       weights[] are __u8 but represent int8 values (two's complement).
+       Cast to (signed char) before multiplication to get the correct sign.
+       scale = 2^SCALE_SHIFT = 128 */
     long long iv[4] = {1, 64, 1, 1};
     long long output_raw = 0;
-    output_raw += iv[0] * (int)((__s8)m->weights[0]);
-    output_raw += iv[1] * (int)((__s8)m->weights[1]);
-    output_raw += iv[2] * (int)((__s8)m->weights[2]);
-    output_raw += iv[3] * (int)((__s8)m->weights[3]);
+    output_raw += iv[0] * (long long)(signed char)m->weights[0];
+    output_raw += iv[1] * (long long)(signed char)m->weights[1];
+    output_raw += iv[2] * (long long)(signed char)m->weights[2];
+    output_raw += iv[3] * (long long)(signed char)m->weights[3];
 
-    /* Divide by scale factor via arithmetic right shift */
+    /* Arithmetic right shift divides by 128 */
     long long output = output_raw >> SCALE_SHIFT;
 
     evt.output_raw = output_raw;
@@ -243,19 +246,15 @@ def detect_egress_iface(all_ifaces, ingress_iface, forward_dests):
 def calculate_expected_output(weights, input_vector, scale_shift=SCALE_SHIFT):
     """
     Replica esatta di cio' che fa il kernel eBPF:
-      1. Interpreta ogni peso come int8 (signed, clamp [-128,+127])
-      2. Calcola output_raw = sum(iv[i] * int8(w[i]))
-      3. Divide per 2^scale_shift via arithmetic right shift
-    Il risultato e' la chiave usata nella fwd_table.
+      1. I pesi sono in weights.json come interi int8 (gia' clampati a [-128,+127]).
+         ctypes.c_int8 li rilegge come signed esattamente come (signed char) nel kernel.
+      2. output_raw = sum(iv[i] * int8(w[i]))
+      3. output = output_raw >> scale_shift  (arithmetic right shift = divide by 128)
     """
     output_raw = 0
     for iv, w in zip(input_vector, weights):
-        # Interpreta w come int8 signed (come fa il kernel con __s8)
-        w_s8 = max(-128, min(127, int(w)))  # clamp per sicurezza
-        if w_s8 > 127:
-            w_s8 -= 256  # converte uint8 overflow in signed (non dovrebbe servire post-clamp)
+        w_s8 = ctypes.c_int8(int(w)).value   # stesso comportamento di (signed char) nel kernel
         output_raw += iv * w_s8
-    # Arithmetic right shift (Python >> su interi signed e' gia' aritmetico)
     output = output_raw >> scale_shift
     return output_raw, output
 
@@ -266,20 +265,22 @@ b = BPF(text=program)
 fn = b.load_func("ipa_switch", BPF.XDP)
 
 print("IPA Switch avviato!")
-print(f"Quantizzazione: int8, SCALE_FACTOR=128 (SCALE_SHIFT={SCALE_SHIFT})")
+print(f"Quantizzazione: int8 via (signed char) cast, SCALE_FACTOR=128 (SCALE_SHIFT={SCALE_SHIFT})")
 
 print("Caricamento pesi da /shared/weights.json ...")
 with open("/shared/weights.json", "r") as f:
     integer_weights = json.load(f)
 
+# Carica nel kernel: i valori in weights.json sono gia' int8 clampati [-128,+127].
+# BCC vuole __u8, quindi i negativi vengono convertiti in unsigned (es. -42 -> 214)
+# tramite ctypes.c_uint8; il kernel li ri-interpreta come signed con (signed char).
 cache = b.get_table("model_cache")
 my_model = cache.Leaf()
 my_model.is_valid = 1
 for i in range(min(len(integer_weights), 100)):
-    # Carica come int8 (signed) — clamp per sicurezza
-    my_model.weights[i] = max(-128, min(127, integer_weights[i]))
+    my_model.weights[i] = ctypes.c_uint8(integer_weights[i]).value
 cache[cache.Key(42)] = my_model
-print("Modello 42 caricato nel kernel (pesi int8).")
+print("Modello 42 caricato nel kernel (pesi come __u8, letti come signed char nel C).")
 
 all_ifaces = [i for i in os.listdir('/sys/class/net/') if i != 'lo']
 print(f"Interfacce: {all_ifaces}")
@@ -297,19 +298,19 @@ print(f"  src_mac: {':'.join(f'{b:02x}' for b in src_mac)}")
 print(f"  dst_mac: {':'.join(f'{b:02x}' for b in dst_mac)}")
 
 if all(b == 0xFF for b in dst_mac):
-    print(f"  [WARN] dst_mac e' broadcast. Esegui 'ping -c3 <IP_giessen_su_{egress_iface}>'"
+    print(f"  [WARN] dst_mac e' broadcast. Esegui 'ping -c3 <IP_vicino_su_{egress_iface}>'"
           " poi riavvia switch_core.py.")
 
 # Calcola MYSTERY_NUMBER con la stessa logica del kernel
 input_vector = [1, 64, 1, 1]
 output_raw, MYSTERY_NUMBER = calculate_expected_output(integer_weights, input_vector)
-print(f"output_raw    = {output_raw}  (prima dello shift)")
+print(f"output_raw     = {output_raw}  (prima dello shift)")
 print(f"MYSTERY_NUMBER = {MYSTERY_NUMBER}  (output_raw >> {SCALE_SHIFT})")
 
-# Verifica semantica: confronto con float originale
-float_output = sum(iv * (w / 128.0) for iv, w in zip(input_vector, integer_weights[:4]))
-print(f"Output float equivalente: {float_output:.4f}  "
-      f"(MYSTERY_NUMBER/128 = {MYSTERY_NUMBER/128:.4f})")
+# Controllo semantica: float equivalente
+float_output = sum(iv * (ctypes.c_int8(int(w)).value / 128.0)
+                   for iv, w in zip(input_vector, integer_weights[:4]))
+print(f"Output float equiv: {float_output:.4f}  (MYSTERY_NUMBER/128 = {MYSTERY_NUMBER/128:.4f})")
 
 fwd = b.get_table("fwd_table")
 my_action = fwd.Leaf()
