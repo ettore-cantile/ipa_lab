@@ -267,7 +267,7 @@ def calculate_expected_output(weights, input_vector, scale_shift=SCALE_SHIFT):
     """
     output_raw = 0
     for iv, w in zip(input_vector, weights):
-        w_s8 = ctypes.c_int8(int(w)).value   # stesso comportamento di (signed char) nel kernel
+        w_s8 = ctypes.c_int8(int(w)).value
         output_raw += iv * w_s8
     output = output_raw >> scale_shift
     return output_raw, output
@@ -286,9 +286,6 @@ print(f"Caricamento pesi da {WEIGHTS_PATH} ...")
 with open(WEIGHTS_PATH, "r") as f:
     integer_weights = json.load(f)
 
-# Carica nel kernel: i valori in weights.json sono gia' int8 clampati [-128,+127].
-# BCC vuole __u8, quindi i negativi vengono convertiti in unsigned (es. -42 -> 214)
-# tramite ctypes.c_uint8; il kernel li ri-interpreta come signed con (signed char).
 cache = b.get_table("model_cache")
 my_model = cache.Leaf()
 my_model.is_valid = 1
@@ -316,13 +313,11 @@ if all(b == 0xFF for b in dst_mac):
     print(f"  [WARN] dst_mac e' broadcast. Esegui 'ping -c3 <IP_vicino_su_{egress_iface}>'"
           " poi riavvia switch_core.py.")
 
-# Calcola MYSTERY_NUMBER con la stessa logica del kernel
 input_vector = [1, 64, 1, 1]
 output_raw, MYSTERY_NUMBER = calculate_expected_output(integer_weights, input_vector)
 print(f"output_raw     = {output_raw}  (prima dello shift)")
 print(f"MYSTERY_NUMBER = {MYSTERY_NUMBER}  (output_raw >> {SCALE_SHIFT})")
 
-# Controllo semantica: float equivalente
 float_output = sum(iv * (ctypes.c_int8(int(w)).value / 128.0)
                    for iv, w in zip(input_vector, integer_weights[:4]))
 print(f"Output float equiv: {float_output:.4f}  (MYSTERY_NUMBER/128 = {MYSTERY_NUMBER/128:.4f})")
@@ -336,13 +331,17 @@ for i in range(6):
 fwd[fwd.Key(MYSTERY_NUMBER)] = my_action
 print(f"Regola installata: output={MYSTERY_NUMBER} -> {egress_iface} (ifindex={egress_ifindex})")
 
-print(f"\nAttach XDP alle interfacce: {all_ifaces}")
-for iface in all_ifaces:
-    try:
-        b.attach_xdp(iface, fn, flags=2)
-        print(f"  XDP attaccato a {iface}")
-    except Exception as e:
-        print(f"  ERRORE attach su {iface}: {e}")
+# ---------------------------------------------------------------------------
+# FIX: attach XDP SOLO sull'interfaccia ingress per evitare loop.
+# Se XDP venisse attaccato anche sull'egress (eth2), il pacchetto rediretto
+# verrebbe riprocessato all'infinito da eth2 -> redirect su eth2 -> loop.
+# ---------------------------------------------------------------------------
+print(f"\nAttach XDP solo su interfaccia ingress: {ingress_iface}")
+try:
+    b.attach_xdp(ingress_iface, fn, flags=2)
+    print(f"  XDP attaccato a {ingress_iface}")
+except Exception as e:
+    print(f"  ERRORE attach su {ingress_iface}: {e}")
 
 b["events"].open_perf_buffer(handle_event)
 print("\nIn ascolto... log eBPF in tempo reale (Ctrl+C per fermare)\n")
@@ -352,8 +351,7 @@ try:
         b.perf_buffer_poll(timeout=100)
 except KeyboardInterrupt:
     print("\nDetach XDP...")
-    for iface in all_ifaces:
-        try:
-            b.remove_xdp(iface, flags=2)
-        except Exception:
-            pass
+    try:
+        b.remove_xdp(ingress_iface, flags=2)
+    except Exception:
+        pass
