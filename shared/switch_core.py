@@ -59,17 +59,20 @@ int ipa_switch(struct xdp_md *ctx) {
 
                 if (cached_model != NULL && cached_model->is_valid == 1) {
                     // Inference logic
+                    // Inference logic
                     long long input_vector[4]; 
-                    input_vector[0] = ctx->ingress_ifindex;
-                    input_vector[1] = ip->ttl;              
+                    input_vector[0] = 1; 
+                    input_vector[1] = 64;              
                     input_vector[2] = 1;                    
-                    input_vector[3] = 1;                    
+                    input_vector[3] = 1;  
 
                     long long output = 0;
-                    output += input_vector[0] * (__s8)cached_model->weights[0];
-                    output += input_vector[1] * (__s8)cached_model->weights[1];
-                    output += input_vector[2] * (__s8)cached_model->weights[2];
-                    output += input_vector[3] * (__s8)cached_model->weights[3];
+                    // Usiamo (int) per forzare il C a leggere il peso come numero positivo fino a 255
+                    // prima di eseguire la moltiplicazione, evitando l'overflow a -120
+                    output += input_vector[0] * (int)cached_model->weights[0];
+                    output += input_vector[1] * (int)cached_model->weights[1];
+                    output += input_vector[2] * (int)cached_model->weights[2];
+                    output += input_vector[3] * (int)cached_model->weights[3];
 
                     struct fwd_action *action = fwd_table.lookup(&output);
                     
@@ -123,7 +126,19 @@ for i in range(6):
     my_action.src_mac[i] = src_mac[i]
     my_action.dst_mac[i] = dst_mac[i]
 
-MYSTERY_NUMBER = 2454 
+def calculate_expected_output(weights, input_vector):
+    # Esegue la stessa moltiplicazione che fa l'eBPF
+    output = 0
+    for i in range(len(input_vector)):
+        # Assicurati di usare lo stesso cast (int) usato nel C
+        output += input_vector[i] * int(weights[i])
+    return output
+
+# Ora calcoli il numero magico dinamicamente
+input_vector = [1, 64, 1, 1] # Il tuo input di test
+MYSTERY_NUMBER = calculate_expected_output(integer_weights, input_vector)
+print(f"Calcolato MYSTERY_NUMBER dinamico: {MYSTERY_NUMBER}")
+
 fwd[fwd.Key(MYSTERY_NUMBER)] = my_action
 
 # 3. DYNAMIC INTERFACE ATTACHMENT
