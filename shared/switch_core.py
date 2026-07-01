@@ -22,6 +22,16 @@ FORWARD_DESTINATIONS = [
     "10.255.255.23",  # hannover
 ]
 
+# ---------------------------------------------------------------------------
+# Quantization constants — must match extract_weights.py
+#   SCALE_FACTOR = 128 = 2^7  =>  SCALE_SHIFT = 7
+#   Weights are stored as int8_t in the kernel.
+#   Inference: output_raw = sum(iv[i] * (int8_t)w[i])
+#              output_scaled = output_raw >> SCALE_SHIFT
+#   The fwd_table key and MYSTERY_NUMBER are both output_scaled.
+# ---------------------------------------------------------------------------
+SCALE_SHIFT = 7   # 2^7 = 128
+
 # --- Kernel Space (eBPF C Code) ---
 program = r"""
 #include <uapi/linux/if_ether.h>
@@ -39,7 +49,7 @@ struct ipa_hdr {
 } __attribute__((packed));
 
 struct model_data {
-    __u8 weights[100];
+    __s8 weights[100];   /* int8_t: signed, range [-128,+127] */
     __u8 is_valid;
 };
 
@@ -52,15 +62,18 @@ struct fwd_action {
 struct log_event {
     u32  ingress_ifindex;
     u8   model_id;
-    s64  output;
+    s64  output_raw;    /* sum before >> SCALE_SHIFT */
+    s64  output;        /* sum >> SCALE_SHIFT  = fwd_table key */
     u32  egress_ifindex;
-    u8   verdict;   /* 0=PASS_no_model  1=PASS_no_rule  2=REDIRECT */
-    u64  ts_ns;     /* ktime_get_ns() at redirect time */
+    u8   verdict;       /* 0=PASS_no_model  1=PASS_no_rule  2=REDIRECT */
+    u64  ts_ns;
 };
 
 BPF_HASH(model_cache, __u8, struct model_data, 256);
 BPF_HASH(fwd_table, long long, struct fwd_action, 256);
 BPF_PERF_OUTPUT(events);
+
+#define SCALE_SHIFT 7
 
 int ipa_switch(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -93,13 +106,19 @@ int ipa_switch(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
+    /* Fixed-point inference: weights are int8_t, scale = 2^SCALE_SHIFT */
     long long iv[4] = {1, 64, 1, 1};
-    long long output = 0;
-    output += iv[0] * (int)m->weights[0];
-    output += iv[1] * (int)m->weights[1];
-    output += iv[2] * (int)m->weights[2];
-    output += iv[3] * (int)m->weights[3];
-    evt.output = output;
+    long long output_raw = 0;
+    output_raw += iv[0] * (int)((__s8)m->weights[0]);
+    output_raw += iv[1] * (int)((__s8)m->weights[1]);
+    output_raw += iv[2] * (int)((__s8)m->weights[2]);
+    output_raw += iv[3] * (int)((__s8)m->weights[3]);
+
+    /* Divide by scale factor via arithmetic right shift */
+    long long output = output_raw >> SCALE_SHIFT;
+
+    evt.output_raw = output_raw;
+    evt.output     = output;
 
     struct fwd_action *action = fwd_table.lookup(&output);
     if (action == NULL) {
@@ -126,7 +145,8 @@ def handle_event(cpu, data, size):
     evt = b["events"].event(data)
     ingress_name = socket.if_indextoname(evt.ingress_ifindex) if evt.ingress_ifindex else "?"
     msg = (f"\033[96m[TRACE] ifindex_in={evt.ingress_ifindex}({ingress_name})"
-           f"  model_id={evt.model_id}  output={evt.output}")
+           f"  model_id={evt.model_id}"
+           f"  output_raw={evt.output_raw}  output={evt.output}")
     if evt.verdict == 2:
         egress_name = socket.if_indextoname(evt.egress_ifindex) if evt.egress_ifindex else "?"
         msg += f"  -> REDIRECT ifindex={evt.egress_ifindex}({egress_name})"
@@ -142,7 +162,6 @@ def get_iface_mac(iface):
         return [int(b, 16) for b in f.read().strip().split(":")]
 
 def get_neighbor_mac(iface):
-    """Read ARP table for iface via ip neigh and arp -n, return first MAC found."""
     for cmd in (
         ["ip", "neigh", "show", "dev", iface],
         ["arp", "-n", "-i", iface],
@@ -158,11 +177,6 @@ def get_neighbor_mac(iface):
     return None
 
 def probe_arp(iface, rounds=1):
-    """
-    Populate ARP cache using two strategies:
-    1. ping all hosts in the /30 subnet
-    2. arping (unicast ARP probe) to each candidate IP
-    """
     try:
         out = subprocess.check_output(["ip", "-4", "addr", "show", iface], text=True)
         m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", out)
@@ -171,15 +185,12 @@ def probe_arp(iface, rounds=1):
         my_ip = m.group(1)
         prefix = ".".join(my_ip.split(".")[:3])
         candidates = [f"{prefix}.{x}" for x in range(1, 5) if f"{prefix}.{x}" != my_ip]
-
         for _ in range(rounds):
-            # Strategy 1: ping
             for ip in candidates:
                 subprocess.call(["ping", "-c", "1", "-W", "1", ip],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if get_neighbor_mac(iface):
                 return
-            # Strategy 2: arping
             for ip in candidates:
                 subprocess.call(["arping", "-c", "2", "-w", "2", "-I", iface, ip],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -190,7 +201,6 @@ def probe_arp(iface, rounds=1):
         pass
 
 def resolve_mac(iface, retries=3):
-    """Get neighbour MAC on iface, probing with ping+arping if needed."""
     for attempt in range(1, retries + 1):
         mac = get_neighbor_mac(iface)
         if mac:
@@ -230,11 +240,24 @@ def detect_egress_iface(all_ifaces, ingress_iface, forward_dests):
     print(f"  [WARN] Routing non ha risolto egress, fallback: {candidates[0]}")
     return candidates[0]
 
-def calculate_expected_output(weights, input_vector):
-    output = 0
-    for i, iv in enumerate(input_vector):
-        output += iv * ctypes.c_uint8(int(weights[i])).value
-    return output
+def calculate_expected_output(weights, input_vector, scale_shift=SCALE_SHIFT):
+    """
+    Replica esatta di cio' che fa il kernel eBPF:
+      1. Interpreta ogni peso come int8 (signed, clamp [-128,+127])
+      2. Calcola output_raw = sum(iv[i] * int8(w[i]))
+      3. Divide per 2^scale_shift via arithmetic right shift
+    Il risultato e' la chiave usata nella fwd_table.
+    """
+    output_raw = 0
+    for iv, w in zip(input_vector, weights):
+        # Interpreta w come int8 signed (come fa il kernel con __s8)
+        w_s8 = max(-128, min(127, int(w)))  # clamp per sicurezza
+        if w_s8 > 127:
+            w_s8 -= 256  # converte uint8 overflow in signed (non dovrebbe servire post-clamp)
+        output_raw += iv * w_s8
+    # Arithmetic right shift (Python >> su interi signed e' gia' aritmetico)
+    output = output_raw >> scale_shift
+    return output_raw, output
 
 # ---------------------------------------------------------------------------
 # Main
@@ -243,6 +266,7 @@ b = BPF(text=program)
 fn = b.load_func("ipa_switch", BPF.XDP)
 
 print("IPA Switch avviato!")
+print(f"Quantizzazione: int8, SCALE_FACTOR=128 (SCALE_SHIFT={SCALE_SHIFT})")
 
 print("Caricamento pesi da /shared/weights.json ...")
 with open("/shared/weights.json", "r") as f:
@@ -252,9 +276,10 @@ cache = b.get_table("model_cache")
 my_model = cache.Leaf()
 my_model.is_valid = 1
 for i in range(min(len(integer_weights), 100)):
-    my_model.weights[i] = integer_weights[i]
+    # Carica come int8 (signed) — clamp per sicurezza
+    my_model.weights[i] = max(-128, min(127, integer_weights[i]))
 cache[cache.Key(42)] = my_model
-print("Modello 42 caricato nel kernel.")
+print("Modello 42 caricato nel kernel (pesi int8).")
 
 all_ifaces = [i for i in os.listdir('/sys/class/net/') if i != 'lo']
 print(f"Interfacce: {all_ifaces}")
@@ -272,13 +297,19 @@ print(f"  src_mac: {':'.join(f'{b:02x}' for b in src_mac)}")
 print(f"  dst_mac: {':'.join(f'{b:02x}' for b in dst_mac)}")
 
 if all(b == 0xFF for b in dst_mac):
-    print("  [WARN] dst_mac e' broadcast. Esegui:")
-    print(f"         ping -c3 <IP_di_giessen_su_{egress_iface}>")
-    print("         poi riavvia switch_core.py per usare il MAC corretto.")
+    print(f"  [WARN] dst_mac e' broadcast. Esegui 'ping -c3 <IP_giessen_su_{egress_iface}>'"
+          " poi riavvia switch_core.py.")
 
+# Calcola MYSTERY_NUMBER con la stessa logica del kernel
 input_vector = [1, 64, 1, 1]
-MYSTERY_NUMBER = calculate_expected_output(integer_weights, input_vector)
-print(f"MYSTERY_NUMBER = {MYSTERY_NUMBER}")
+output_raw, MYSTERY_NUMBER = calculate_expected_output(integer_weights, input_vector)
+print(f"output_raw    = {output_raw}  (prima dello shift)")
+print(f"MYSTERY_NUMBER = {MYSTERY_NUMBER}  (output_raw >> {SCALE_SHIFT})")
+
+# Verifica semantica: confronto con float originale
+float_output = sum(iv * (w / 128.0) for iv, w in zip(input_vector, integer_weights[:4]))
+print(f"Output float equivalente: {float_output:.4f}  "
+      f"(MYSTERY_NUMBER/128 = {MYSTERY_NUMBER/128:.4f})")
 
 fwd = b.get_table("fwd_table")
 my_action = fwd.Leaf()
@@ -287,7 +318,7 @@ for i in range(6):
     my_action.src_mac[i] = src_mac[i]
     my_action.dst_mac[i] = dst_mac[i]
 fwd[fwd.Key(MYSTERY_NUMBER)] = my_action
-print(f"Regola: output={MYSTERY_NUMBER} -> {egress_iface} (ifindex={egress_ifindex})")
+print(f"Regola installata: output={MYSTERY_NUMBER} -> {egress_iface} (ifindex={egress_ifindex})")
 
 print(f"\nAttach XDP alle interfacce: {all_ifaces}")
 for iface in all_ifaces:
