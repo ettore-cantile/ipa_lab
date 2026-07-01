@@ -23,8 +23,10 @@ for node in nodes:
 
 # Prepare basic startup commands (Removed apt-get for instant boot)
 startup_files = {node: [
+    "bash /shared/fix_bpf.sh", # <-- Aggiunto script per risolvere BCC all'avvio
     "sysctl -w net.ipv4.ip_forward=1",
     "sysctl -w net.ipv6.conf.all.disable_ipv6=1",
+    "mount -t debugfs debugfs /sys/kernel/debug", # <-- Aggiunto mount per debugfs
     
     # Wake up the routing daemons
     "sed -i 's/zebra=no/zebra=yes/g' /etc/frr/daemons",
@@ -90,4 +92,4 @@ for node, cmds in startup_files.items():
         f.write("# Startup configuration generated automatically\n")
         f.write("\n".join(cmds) + "\n")
 
-print("Generazione Completata! I nodi si avvieranno istantaneamente con eBPF incluso.")
+print("Generazione Completata! I nodi si avvieranno istantaneamente con eBPF e debugfs inclusi.")

@@ -79,7 +79,7 @@ int ipa_switch(struct xdp_md *ctx) {
                         return bpf_redirect(action->ifindex, 0);
                     }
                 }
-                return XDP_DROP;
+                return XDP_PASS;
             }
         }
     }
@@ -140,9 +140,7 @@ for iface in interfaces:
 print("\nListening for packets... (Ctrl+C to stop)")
 try:
     while True:
-        line = b.trace_readline()
-        if line:
-            print(line.decode('utf-8', 'replace'))
+        time.sleep(1)
 except KeyboardInterrupt:
     for iface in interfaces:
         b.remove_xdp(iface, flags=2)
