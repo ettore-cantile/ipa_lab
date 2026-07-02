@@ -44,13 +44,15 @@ ipa_lab/
 │   ├── switch_core.py          # Entry point: selects and runs the chosen method
 │   ├── ebpf_program.py         # eBPF/XDP C code shared by all methods
 │   ├── common.py               # Shared helpers (load_bpf, populate tables, stats_loop…)
+│   ├── send_ipa.py             # Scapy sender: builds and sends IPA packets
 │   ├── weights.json            # Int8 weights — PTQ (Method 1 & 3)
 │   ├── weights_float.json      # Float weights + scale_factor — PTQ reference
-│   ├── weights_method2.json    # Int8 weights — QAT (Method 2)
+│   ├── weights_method2.json    # Int8 weights — QAT (Method 2 & 4)
 │   └── methods/
 │       ├── method1_ptq.py      # Method 1 — Post-Training Quantization
 │       ├── method2_qat.py      # Method 2 — Quantization-Aware Training
-│       └── method3_openflow.py # Method 3 — OpenFlow-like on-demand CP
+│       ├── method3_openflow.py # Method 3 — OpenFlow-like on-demand CP
+│       └── method4_ipa_demo.py # Method 4 — IPA Demo (model travels in packet)
 ├── execute_pipeline.py          # Training pipeline (PTQ or QAT)
 └── extract_weights.py          # Exports float/int8 weights to JSON
 ```
@@ -68,6 +70,9 @@ python3 /shared/switch_core.py weights_method2.json
 
 # Method 3 — OpenFlow-like
 python3 /shared/switch_core.py weights.json openflow
+
+# Method 4 — IPA Demo (Wow Factor)
+python3 /shared/switch_core.py weights_method2.json ipa_demo
 ```
 
 ---
@@ -95,11 +100,12 @@ Copy `weights.json` (and `weights_float.json` for Method 1/3) into `shared/` bef
 
 ## eBPF Kernel Architecture
 
-`ebpf_program.py` contains the XDP C program shared by all three methods. The kernel:
+`ebpf_program.py` contains the XDP C program shared by all four methods. The kernel:
 
 1. Parses Ethernet → IP → UDP → IPA header from each incoming packet on port 9999.
 2. Looks up the model weights in `model_cache` (keyed by `model_id`).
-3. Computes the forwarding key via integer dot-product:
+3. If the model is **not** in cache, emits a `model_miss_event` to userspace carrying the raw weight bytes extracted from the packet payload (Method 4 only).
+4. Computes the forwarding key via integer dot-product:
 
 ```c
 iv[0] = ipa->model_id;   iv[1] = ip->ttl;
@@ -109,8 +115,8 @@ output_raw = sum(iv[i] * (signed char)weights[i]);
 key        = (output_raw + OUTPUT_OFFSET * scale) / scale;
 ```
 
-4. Looks up `key` in `fwd_table` → redirects with `bpf_redirect()` or sends a `miss_event` to userspace.
-5. Classifies the packet using `valid_keys` (TTL → correct CP key):
+5. Looks up `key` in `fwd_table` → redirects with `bpf_redirect()` or sends a `miss_event` to userspace.
+6. Classifies the packet using `valid_keys` (TTL → correct CP key):
 
 | Result | Condition |
 |---|---|
@@ -191,25 +197,89 @@ Unlike Methods 1/2, this approach scales to **any** IV combination without hardc
 
 ---
 
+### Method 4 — IPA Demo ("Wow Factor")
+
+This is the **core demonstration of the IPA paradigm** as described in IPA_Demo.pdf. It is a direct evolution of Method 3: both start with empty tables and install rules on-demand, but Method 4 takes one step further — the **model itself travels inside the packet payload** and is unknown to the router at boot time.
+
+#### How it works
+
+`model_cache` **and** `fwd_table` start completely empty. No model is pre-loaded, no rules are pre-installed.
+
+When the **first packet** for a new `model_id` arrives:
+1. The kernel detects the model is missing from `model_cache`.
+2. It reads the 4 raw int8 weight bytes embedded in the UDP payload immediately after the IPA header.
+3. It emits a `model_miss_event` to userspace carrying those weights.
+4. The CP extracts the weights, loads them into `model_cache`, and installs the forwarding rule — all in a single callback (~2 ms).
+
+From the **second packet** onwards:
+- The kernel finds the model in cache, computes the key, finds the rule → **TRUE HIT** (<1 ms). The CP is never involved again.
+
+#### Sending packets
+
+```bash
+# First packet — embeds the model weights in the payload
+python3 /shared/send_ipa.py frankfurt 99 /shared/weights_method2.json
+
+# Output on the router:
+# [CP] MODEL MISS | model_id=99 | weights extracted from packet: [42, 35, 127, -58]
+# Model 99 loaded into eBPF cache (scale_factor=128)
+# [CP] model_id=99 LOADED & rule INSTALLED | key=100221 | TTL=64 | elapsed=1.89 ms
+# [CP] Next packets for model_id=99 -> TRUE HIT (<1 ms)
+
+# Subsequent packets — no weights needed, model already in cache
+python3 /shared/send_ipa.py frankfurt 99
+
+# Output on the router:
+# TRUE HIT counter increments directly — CP is silent
+```
+
+#### Why the verifier accepts this
+
+eBPF forbids pointer arithmetic on `data_end`. The weight copy uses **4 fixed-offset reads** with a single bound check instead of a loop:
+
+```c
+__u8 *w = (__u8 *)(ipa + 1);
+if ((void *)(w + 4) > data_end) return XDP_PASS;  // one check
+mev.w0 = w[0]; mev.w1 = w[1]; mev.w2 = w[2]; mev.w3 = w[3];
+```
+
+#### Method 3 vs Method 4
+
+| | Method 3 (OpenFlow) | Method 4 (IPA Demo) |
+|---|---|---|
+| `model_cache` at boot | Pre-populated | **Empty** |
+| `fwd_table` at boot | Empty | Empty |
+| Model source | Local file at boot | **Packet payload** |
+| First packet | Fwd MISS → rule install | **Model MISS → extract + install** |
+| Subsequent packets | TRUE HIT | TRUE HIT |
+| Latency (1st pkt) | ~1 ms | ~2 ms |
+| Latency (2nd+ pkt) | <1 ms | <1 ms |
+
+Method 4 is the proof that the IPA paradigm works end-to-end: the intelligence is in the packet, the router learns it on the fly, and from that moment on it forwards autonomously at kernel speed.
+
+---
+
 ## Comparative Summary
 
-| | Method 1 (PTQ) | Method 2 (QAT) | Method 3 (OpenFlow) |
-|---|---|---|---|
-| **CP weights** | Float originals | Int8 raw | N/A — uses `ev.key` |
-| **CP/kernel alignment** | ✗ Intentional | ✓ Perfect | ✓ Perfect |
-| **Table population** | Static at startup | Static at startup | Dynamic on-demand |
-| **TRUE HIT** | ~0% | ~100% | ~100% post warm-up |
-| **FAKE HIT** | High (PTQ error metric) | 0% | Warm-up only |
-| **MISS** | Medium | 0% | One per new TTL |
-| **Scalability** | Fixed TTL range | Fixed TTL range | Unlimited |
-| **SCALE_FACTOR** | Auto (e.g. 24) | Fixed 128 | Auto (e.g. 24) |
+| | Method 1 (PTQ) | Method 2 (QAT) | Method 3 (OpenFlow) | Method 4 (IPA Demo) |
+|---|---|---|---|---|
+| **CP weights** | Float originals | Int8 raw | N/A — uses `ev.key` | Extracted from packet |
+| **CP/kernel alignment** | ✗ Intentional | ✓ Perfect | ✓ Perfect | ✓ Perfect |
+| **model_cache at boot** | Pre-populated | Pre-populated | Pre-populated | **Empty** |
+| **Table population** | Static at startup | Static at startup | Dynamic on-demand | Dynamic on-demand |
+| **Model source** | Local file | Local file | Local file | **Packet payload** |
+| **TRUE HIT** | ~0% | ~100% | ~100% post warm-up | ~100% post 1st pkt |
+| **FAKE HIT** | High (PTQ error) | 0% | Warm-up only | 0% |
+| **MISS** | Medium | 0% | One per new TTL | One (very first pkt) |
+| **Scalability** | Fixed TTL range | Fixed TTL range | Unlimited | Unlimited |
+| **SCALE_FACTOR** | Auto (e.g. 24) | Fixed 128 | Auto (e.g. 24) | Fixed 128 |
 
 ---
 
 ## Implementation Notes
 
 ### BCC: `__u8`/`__u64` not recognized
-The installed BCC version cannot auto-generate a Python class from `struct miss_event` because it does not recognize kernel types `__u8`, `__u32`, `__u64`. Solution: `MissEvent` is defined manually as a `ctypes.Structure` with `from_buffer_copy()` parsing.
+The installed BCC version cannot auto-generate a Python class from `struct miss_event` because it does not recognize kernel types `__u8`, `__u32`, `__u64`. Solution: `MissEvent` and `ModelMissEvent` are defined manually as `ctypes.Structure` with `from_buffer_copy()` parsing.
 
 ### C struct padding
 The compiler inserts implicit padding in the (non-packed) `miss_event`:
@@ -219,7 +289,10 @@ The compiler inserts implicit padding in the (non-packed) `miss_event`:
 Total: 24 bytes. The Python struct replicates this with `_pack_=1` and explicit `_pad` fields.
 
 ### Float rounding error (±1)
-Computing the key with floats produces results that differ by ±1 from the kernel's integer division. Methods 2 and 3 use `//` (Python integer division) to replicate the C truncation exactly. In Method 1 this divergence is intentional — it is the PTQ error metric.
+Computing the key with floats produces results that differ by ±1 from the kernel's integer division. Methods 2, 3, and 4 use `//` (Python integer division) to replicate the C truncation exactly. In Method 1 this divergence is intentional — it is the PTQ error metric.
+
+### eBPF verifier: no pointer arithmetic on `data_end`
+The eBPF verifier rejects any loop where the bound check involves incrementing a pointer derived from `data_end`. Method 4 avoids this by reading exactly 4 weight bytes at fixed offsets with a single static bound check.
 
 ---
 
