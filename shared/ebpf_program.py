@@ -47,14 +47,21 @@ struct miss_event {
     __u64 key;
 };
 
-/* Emitted when model NOT in model_cache — Method 4 only */
+/*
+ * Emitted when model NOT in model_cache — Method 4 only.
+ * We copy exactly 4 weight bytes using fixed offsets from the payload start.
+ * NO loop, NO pointer arithmetic on data_end -> verifier accepts this.
+ */
 struct model_miss_event {
     __u8  model_id;
     __u8  ttl;
     __u32 ingress_ifindex;
     __u8  input_size;
-    __u8  weights[100];   /* raw payload bytes copied from the packet */
-    __u8  n_weights;      /* how many bytes were copied */
+    __u8  w0;
+    __u8  w1;
+    __u8  w2;
+    __u8  w3;
+    __u8  n_weights;  /* always 4 */
 };
 
 BPF_HASH(model_cache, __u8, struct model_data, 256);
@@ -65,7 +72,6 @@ BPF_PERF_OUTPUT(miss_events);                 // fwd miss  (Methods 3 & 4)
 BPF_PERF_OUTPUT(model_miss_events);           // model miss (Method 4)
 
 #define OUTPUT_OFFSET 100000ULL
-#define MAX_WEIGHTS   100
 
 int ipa_switch(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -88,28 +94,28 @@ int ipa_switch(struct xdp_md *ctx) {
     __u8 target_model = ipa->model_id;
     struct model_data *m = model_cache.lookup(&target_model);
 
-    /* ------------------------------------------------------------------ */
-    /* MODEL MISS: model not in cache.                                      */
-    /* Emit model_miss_event carrying the raw weight bytes from the payload */
-    /* so the CP can extract them and load the model into cache.            */
-    /* ------------------------------------------------------------------ */
+    /* ------------------------------------------------------------------
+     * MODEL MISS: model not in cache.
+     * Copy exactly 4 weight bytes after the IPA header using fixed offsets.
+     * This avoids any loop or pointer arithmetic on data_end,
+     * which the eBPF verifier forbids.
+     * ------------------------------------------------------------------ */
     if (!m || m->is_valid == 0) {
+        __u8 *w = (__u8 *)(ipa + 1);
+        /* Single bound check: need exactly 4 bytes after IPA header */
+        if ((void *)(w + 4) > data_end) return XDP_PASS;
+
         struct model_miss_event mev = {};
         mev.model_id        = ipa->model_id;
         mev.ttl             = ip->ttl;
         mev.ingress_ifindex = ctx->ingress_ifindex;
         mev.input_size      = ipa->input_size;
-
-        /* Copy weight bytes that follow the IPA header in the UDP payload */
-        __u8 *payload = (__u8 *)(ipa + 1);
-        __u8 n = ipa->input_size < MAX_WEIGHTS ? ipa->input_size : MAX_WEIGHTS;
-        mev.n_weights = n;
-        #pragma unroll
-        for (int i = 0; i < MAX_WEIGHTS; i++) {
-            if (i >= n) break;
-            if ((void *)(payload + i + 1) > data_end) break;
-            mev.weights[i] = payload[i];
-        }
+        /* Fixed offset reads: verifier can statically verify each access */
+        mev.w0 = w[0];
+        mev.w1 = w[1];
+        mev.w2 = w[2];
+        mev.w3 = w[3];
+        mev.n_weights = 4;
 
         model_miss_events.perf_submit(ctx, &mev, sizeof(mev));
         return XDP_PASS;
@@ -154,7 +160,6 @@ int ipa_switch(struct xdp_md *ctx) {
         __u64 *val = pkt_stats.lookup(&stat_index);
         if (val) __sync_fetch_and_add(val, 1);
 
-        /* Notify the CP — used by Methods 3 & 4 */
         struct miss_event ev = {};
         ev.model_id        = ipa->model_id;
         ev.ttl             = ip->ttl;
