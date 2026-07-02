@@ -187,7 +187,7 @@ Unlike Methods 1/2, this approach scales to **any** IV combination without hardc
 |---|---|---|
 | 5 (17%) | 14 (47%) | 11 (37%) |
 
-> After convergence (all distinct TTLs seen at least once): TRUE HIT grow steadily, MISS plateau at the number of distinct TTLs in traffic, FAKE HIT drop to 0.
+> After convergence (all distinct TTLs seen at least once): TRUE HIT grow steadily, MISS plateau at the number of distinct TTLs in traffic.
 
 ---
 
