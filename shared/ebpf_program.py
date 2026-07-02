@@ -2,11 +2,12 @@
 ebpf_program.py — Shared C eBPF code used by all methods.
 
 Maps:
-  model_cache   : model_id  -> int8 weights + scale_factor
-  fwd_table     : u64 key -> forwarding action (ifindex + MAC)
-  valid_keys    : u8 ttl  -> correct u64 key (for fake hit detection)
-  miss_events   : perf buffer to the CP (Method 3)
-  pkt_stats     : 3-slot array -> [0]=TRUE HIT  [1]=MISS  [2]=FAKE HIT
+  model_cache        : model_id  -> int8 weights + scale_factor
+  fwd_table          : u64 key -> forwarding action (ifindex + MAC)
+  valid_keys         : u8 ttl  -> correct u64 key (for fake hit detection)
+  miss_events        : perf buffer to the CP (Method 3)
+  model_miss_events  : perf buffer to the CP (Method 4) - fired when model NOT in cache
+  pkt_stats          : 3-slot array -> [0]=TRUE HIT  [1]=MISS  [2]=FAKE HIT
 """
 
 EBPF_PROGRAM = r"""
@@ -37,6 +38,7 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
+/* Emitted when fwd_table MISS (model already in cache) — Methods 3 & 4 */
 struct miss_event {
     __u8  model_id;
     __u8  ttl;
@@ -45,13 +47,25 @@ struct miss_event {
     __u64 key;
 };
 
+/* Emitted when model NOT in model_cache — Method 4 only */
+struct model_miss_event {
+    __u8  model_id;
+    __u8  ttl;
+    __u32 ingress_ifindex;
+    __u8  input_size;
+    __u8  weights[100];   /* raw payload bytes copied from the packet */
+    __u8  n_weights;      /* how many bytes were copied */
+};
+
 BPF_HASH(model_cache, __u8, struct model_data, 256);
 BPF_HASH(fwd_table, __u64, struct fwd_action, 256);
-BPF_HASH(valid_keys, __u8, __u64, 256);   // TTL -> correct CP key
-BPF_ARRAY(pkt_stats, __u64, 3);           // [0]=TRUE HIT [1]=MISS [2]=FAKE HIT
-BPF_PERF_OUTPUT(miss_events);             // used only by Method 3
+BPF_HASH(valid_keys, __u8, __u64, 256);       // TTL -> correct CP key
+BPF_ARRAY(pkt_stats, __u64, 3);               // [0]=TRUE HIT [1]=MISS [2]=FAKE HIT
+BPF_PERF_OUTPUT(miss_events);                 // fwd miss  (Methods 3 & 4)
+BPF_PERF_OUTPUT(model_miss_events);           // model miss (Method 4)
 
 #define OUTPUT_OFFSET 100000ULL
+#define MAX_WEIGHTS   100
 
 int ipa_switch(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -73,7 +87,33 @@ int ipa_switch(struct xdp_md *ctx) {
 
     __u8 target_model = ipa->model_id;
     struct model_data *m = model_cache.lookup(&target_model);
-    if (!m || m->is_valid == 0) return XDP_PASS;
+
+    /* ------------------------------------------------------------------ */
+    /* MODEL MISS: model not in cache.                                      */
+    /* Emit model_miss_event carrying the raw weight bytes from the payload */
+    /* so the CP can extract them and load the model into cache.            */
+    /* ------------------------------------------------------------------ */
+    if (!m || m->is_valid == 0) {
+        struct model_miss_event mev = {};
+        mev.model_id        = ipa->model_id;
+        mev.ttl             = ip->ttl;
+        mev.ingress_ifindex = ctx->ingress_ifindex;
+        mev.input_size      = ipa->input_size;
+
+        /* Copy weight bytes that follow the IPA header in the UDP payload */
+        __u8 *payload = (__u8 *)(ipa + 1);
+        __u8 n = ipa->input_size < MAX_WEIGHTS ? ipa->input_size : MAX_WEIGHTS;
+        mev.n_weights = n;
+        #pragma unroll
+        for (int i = 0; i < MAX_WEIGHTS; i++) {
+            if (i >= n) break;
+            if ((void *)(payload + i + 1) > data_end) break;
+            mev.weights[i] = payload[i];
+        }
+
+        model_miss_events.perf_submit(ctx, &mev, sizeof(mev));
+        return XDP_PASS;
+    }
 
     __u16 scale = m->scale_factor;
     if (scale == 0) return XDP_PASS;
@@ -97,7 +137,7 @@ int ipa_switch(struct xdp_md *ctx) {
     __u64 *correct_key = valid_keys.lookup(&ip->ttl);
 
     if (action != NULL) {
-        // TRUE HIT if the computed key matches the CP key for this TTL
+        /* TRUE HIT if the computed key matches the CP key for this TTL */
         int stat_index = 2; // default: FAKE HIT
         if (correct_key && *correct_key == key) {
             stat_index = 0; // TRUE HIT
@@ -109,11 +149,12 @@ int ipa_switch(struct xdp_md *ctx) {
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     } else {
+        /* FWD MISS: model in cache but no forwarding rule yet */
         int stat_index = 1; // MISS
         __u64 *val = pkt_stats.lookup(&stat_index);
         if (val) __sync_fetch_and_add(val, 1);
 
-        // Notify the CP (Method 3); in other methods the buffer is not consumed
+        /* Notify the CP — used by Methods 3 & 4 */
         struct miss_event ev = {};
         ev.model_id        = ipa->model_id;
         ev.ttl             = ip->ttl;
