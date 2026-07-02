@@ -3,12 +3,8 @@ Metodo 3 — OpenFlow-like (Control Plane on-demand)
 
 fwd_table e valid_keys partono vuote.
 Ad ogni table miss il kernel invia un miss_event al CP via BPF_PERF_OUTPUT.
-Il CP calcola la chiave corretta con i pesi int8/scale (identici al kernel),
-insersice la regola in fwd_table E popola valid_keys.
-
-NOTA BCC: la versione installata non riconosce __u8/__u32/__u64 per la
-generazione automatica della classe evento. MissEvent e' definita manualmente
-con ctypes e il buffer viene parsato con from_buffer_copy().
+Il CP installa la regola on-demand usando aritmetica intera pura,
+identica al calcolo kernel, per evitare mismatch da arrotondamento float.
 
 File pesi: weights.json + weights_float.json
 """
@@ -43,6 +39,23 @@ class MissEvent(ctypes.Structure):
     ]
 
 
+def compute_key_integer(iv: list, int8_weights: list, scale: int) -> int:
+    """
+    Replica ESATTA del calcolo kernel in aritmetica intera pura:
+
+      output_raw  = sum(iv[i] * (signed char)weights[i])   <- interi signed
+      output_u    = (output_raw + OFFSET * scale)           <- unsigned 64
+      key         = output_u // scale                       <- divisione intera
+
+    Nessun float coinvolto: elimina i mismatch da arrotondamento.
+    """
+    output_raw = sum(v * ctypes.c_int8(w).value
+                     for v, w in zip(iv, int8_weights))
+    output_u   = output_raw + OFFSET * scale          # replica OFFSET*scale kernel
+    key        = output_u // scale                    # divisione intera troncata
+    return key
+
+
 def run(weights_file: str = "weights.json"):
     weights_path = f"/shared/{weights_file}"
     float_path   = "/shared/weights_float.json"
@@ -54,16 +67,8 @@ def run(weights_file: str = "weights.json"):
     print(f"  SCALE_FACTOR = {SCALE_FACTOR}")
 
     integer_weights = load_weights(weights_path)
-
-    # -----------------------------------------------------------------------
-    # CHIAVE: il CP usa i pesi IDENTICI al kernel.
-    # Il kernel fa:  output_raw += iv * (signed char)weights[i]
-    # quindi divide per scale_factor con troncamento intero.
-    # I float originali hanno errore di quantizzazione che sposta la chiave.
-    # -----------------------------------------------------------------------
-    cp_weights = [ctypes.c_int8(int(w)).value / SCALE_FACTOR
-                  for w in integer_weights[:4]]
-    print(f"  Pesi CP (int8/scale): {[f'{w:.6f}' for w in cp_weights]}")
+    int8_weights    = [int(w) for w in integer_weights[:4]]  # raw int8, no divisione
+    print(f"  Pesi int8 raw: {int8_weights}")
 
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
@@ -78,23 +83,21 @@ def run(weights_file: str = "weights.json"):
     print("[Metodo 3] fwd_table e valid_keys vuote: popolate on-demand dal CP.")
 
     # ------------------------------------------------------------------
-    # Callback CP: parsing manuale + calcolo chiave con pesi int8/scale
+    # Callback CP: aritmetica intera pura, nessun float
     # ------------------------------------------------------------------
     def handle_miss(cpu, data, size):
         raw = ctypes.cast(data, ctypes.POINTER(ctypes.c_byte * size)).contents
         ev  = MissEvent.from_buffer_copy(raw)
 
         iv     = [ev.model_id, ev.ttl, ev.ingress_ifindex, ev.input_size]
-        ideal  = sum(v * w for v, w in zip(iv, cp_weights))
-        cp_key = int(ideal) + OFFSET
+        cp_key = compute_key_integer(iv, int8_weights, SCALE_FACTOR)
+        match  = "OK" if ev.key == cp_key else f"WARN: kernel={ev.key} cp={cp_key}"
 
         already = any(k.value == cp_key for k in fwd.keys())
         if not already:
             fwd[ctypes.c_ulonglong(cp_key)] = action
             vk[ctypes.c_uint8(ev.ttl)]      = ctypes.c_ulonglong(cp_key)
-            print(f"\n[CP] TTL={ev.ttl} | kernel_key={ev.key} "
-                  f"| cp_key={cp_key} -> INSTALLATA "
-                  f"{'OK' if ev.key == cp_key else 'WARN: key mismatch!'}")
+            print(f"\n[CP] TTL={ev.ttl} | cp_key={cp_key} -> INSTALLATA {match}")
         else:
             print(f"\n[CP] TTL={ev.ttl} | cp_key={cp_key} -> gia' presente")
 
