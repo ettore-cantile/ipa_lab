@@ -3,21 +3,21 @@ Metodo 3 — OpenFlow-like (Control Plane on-demand)
 
 fwd_table e valid_keys partono vuote.
 Ad ogni table miss il kernel invia un miss_event al CP via BPF_PERF_OUTPUT.
-Il CP installa la regola on-demand usando aritmetica intera pura,
-identica al calcolo kernel, per evitare mismatch da arrotondamento float.
+Il CP installa la regola usando direttamente ev.key (la chiave gia' calcolata
+dal kernel) — nessun ricalcolo in user space, zero possibilita' di mismatch.
 
 File pesi: weights.json + weights_float.json
 """
 import ctypes
 import socket
-import json
 import threading
+import json
 from bcc import BPF
 from ebpf_program import EBPF_PROGRAM
 from common import (
     load_bpf, load_weights, build_fwd_action,
     populate_model_cache, attach_xdp, stats_loop,
-    EGRESS_IFACE, OFFSET
+    EGRESS_IFACE
 )
 
 # ---------------------------------------------------------------------------
@@ -39,23 +39,6 @@ class MissEvent(ctypes.Structure):
     ]
 
 
-def compute_key_integer(iv: list, int8_weights: list, scale: int) -> int:
-    """
-    Replica ESATTA del calcolo kernel in aritmetica intera pura:
-
-      output_raw  = sum(iv[i] * (signed char)weights[i])   <- interi signed
-      output_u    = (output_raw + OFFSET * scale)           <- unsigned 64
-      key         = output_u // scale                       <- divisione intera
-
-    Nessun float coinvolto: elimina i mismatch da arrotondamento.
-    """
-    output_raw = sum(v * ctypes.c_int8(w).value
-                     for v, w in zip(iv, int8_weights))
-    output_u   = output_raw + OFFSET * scale          # replica OFFSET*scale kernel
-    key        = output_u // scale                    # divisione intera troncata
-    return key
-
-
 def run(weights_file: str = "weights.json"):
     weights_path = f"/shared/{weights_file}"
     float_path   = "/shared/weights_float.json"
@@ -67,8 +50,6 @@ def run(weights_file: str = "weights.json"):
     print(f"  SCALE_FACTOR = {SCALE_FACTOR}")
 
     integer_weights = load_weights(weights_path)
-    int8_weights    = [int(w) for w in integer_weights[:4]]  # raw int8, no divisione
-    print(f"  Pesi int8 raw: {int8_weights}")
 
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
@@ -83,23 +64,22 @@ def run(weights_file: str = "weights.json"):
     print("[Metodo 3] fwd_table e valid_keys vuote: popolate on-demand dal CP.")
 
     # ------------------------------------------------------------------
-    # Callback CP: aritmetica intera pura, nessun float
+    # Callback CP: usa ev.key (chiave gia' calcolata dal kernel).
+    # Nessun ricalcolo in user space -> zero rischio di mismatch.
     # ------------------------------------------------------------------
     def handle_miss(cpu, data, size):
         raw = ctypes.cast(data, ctypes.POINTER(ctypes.c_byte * size)).contents
         ev  = MissEvent.from_buffer_copy(raw)
 
-        iv     = [ev.model_id, ev.ttl, ev.ingress_ifindex, ev.input_size]
-        cp_key = compute_key_integer(iv, int8_weights, SCALE_FACTOR)
-        match  = "OK" if ev.key == cp_key else f"WARN: kernel={ev.key} cp={cp_key}"
+        key = ev.key   # chiave esatta del kernel, nessun ricalcolo
 
-        already = any(k.value == cp_key for k in fwd.keys())
+        already = any(k.value == key for k in fwd.keys())
         if not already:
-            fwd[ctypes.c_ulonglong(cp_key)] = action
-            vk[ctypes.c_uint8(ev.ttl)]      = ctypes.c_ulonglong(cp_key)
-            print(f"\n[CP] TTL={ev.ttl} | cp_key={cp_key} -> INSTALLATA {match}")
+            fwd[ctypes.c_ulonglong(key)] = action
+            vk[ctypes.c_uint8(ev.ttl)]   = ctypes.c_ulonglong(key)
+            print(f"\n[CP] TTL={ev.ttl} | key={key} -> INSTALLATA")
         else:
-            print(f"\n[CP] TTL={ev.ttl} | cp_key={cp_key} -> gia' presente")
+            print(f"\n[CP] TTL={ev.ttl} | key={key} -> gia' presente")
 
     b["miss_events"].open_perf_buffer(handle_miss)
 
