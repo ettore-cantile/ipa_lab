@@ -1,27 +1,13 @@
 """
 common.py — Funzioni condivise da tutti i metodi.
 
-Funzioni esportate:
-  load_bpf(program_str)                                   -> BPF
-  load_weights(path)                                      -> list[int]
-  build_fwd_action(b, egress_ifindex)                     -> Leaf
-  populate_model_cache(b, model_id, weights, scale)       -> None
-  populate_fwd_and_valid_keys(b, action, cp_weights,
-                              scale_factor, ingress_iface,
-                              integer_arithmetic)          -> None
-  attach_xdp(b, fn, iface)                                -> None
-  detach_xdp(b, iface)                                    -> None
-  stats_loop(b, iface, extra_poll_fn)                     -> None
-
 Nota sul calcolo della chiave:
-  - Metodo 1 (PTQ): usa pesi float originali -> chiave float-troncata
-    Le FAKE HIT emergono naturalmente dall'errore di quantizzazione:
-    il kernel usa int8, il CP usa float -> chiavi divergono -> FAKE HIT.
-    integer_arithmetic=False (default)
-
-  - Metodo 2 (QAT): usa pesi int8/scale -> aritmetica intera pura
-    Kernel e CP allineati -> quasi tutte TRUE HIT.
-    integer_arithmetic=True
+  - Metodo 1 (PTQ) integer_arithmetic=False:
+      usa pesi float originali -> chiave float-troncata
+      diverge dal kernel (int8) -> produce FAKE HIT intenzionali
+  - Metodo 2 (QAT) integer_arithmetic=True:
+      usa pesi int8 raw -> aritmetica intera pura identica al kernel
+      -> quasi tutte TRUE HIT
 """
 import json
 import ctypes
@@ -58,15 +44,26 @@ def build_fwd_action(b: BPF, egress_ifindex: int,
     return action
 
 
+def populate_model_cache(b: BPF, model_id: int,
+                         integer_weights: list, scale_factor: int):
+    cache = b.get_table("model_cache")
+    entry = cache.Leaf()
+    entry.is_valid     = 1
+    entry.scale_factor = scale_factor
+    for i in range(min(len(integer_weights), 100)):
+        entry.weights[i] = ctypes.c_uint8(integer_weights[i]).value
+    cache[cache.Key(model_id)] = entry
+    print(f"Modello {model_id} caricato nella Cache eBPF (scale_factor={scale_factor})")
+
+
 def _compute_key_float(iv: list, cp_weights: list) -> int:
-    """Metodo 1 PTQ: chiave calcolata con pesi float originali.
+    """Metodo 1 PTQ: chiave con pesi float originali.
     Deliberatamente non allineata al kernel -> produce FAKE HIT."""
-    ideal_raw = sum(v * w for v, w in zip(iv, cp_weights))
-    return int(ideal_raw) + OFFSET
+    return int(sum(v * w for v, w in zip(iv, cp_weights))) + OFFSET
 
 
 def _compute_key_integer(iv: list, int8_weights: list, scale: int) -> int:
-    """Metodo 2/3 QAT: aritmetica intera pura, identica al kernel.
+    """Metodo 2/3 QAT: aritmetica intera pura identica al kernel.
     output_raw = sum(iv[i] * (signed char)weights[i])
     key        = (output_raw + OFFSET * scale) // scale"""
     output_raw = sum(v * ctypes.c_int8(w).value
@@ -83,7 +80,7 @@ def populate_fwd_and_valid_keys(b: BPF, action, cp_weights: list,
 
     integer_arithmetic=False (Metodo 1 PTQ):
         cp_weights sono float originali; chiave calcolata con float.
-        Il kernel usera' int8 -> divergenza intenzionale -> FAKE HIT visibili.
+        Divergenza intenzionale rispetto al kernel -> FAKE HIT visibili.
 
     integer_arithmetic=True (Metodo 2 QAT):
         cp_weights sono int8 raw; chiave calcolata con interi puri.
@@ -102,7 +99,7 @@ def populate_fwd_and_valid_keys(b: BPF, action, cp_weights: list,
         fwd[ctypes.c_ulonglong(key)] = action
         vk[ctypes.c_uint8(ttl)]      = ctypes.c_ulonglong(key)
 
-    mode = "intera (QAT)" if integer_arithmetic else "float (PTQ)"
+    mode = "intera/QAT" if integer_arithmetic else "float/PTQ"
     print(f"fwd_table e valid_keys caricati per TTL 30-64 [{mode}].")
 
 
@@ -122,11 +119,6 @@ def detach_xdp(b: BPF, iface: str = INGRESS_IFACE):
 
 def stats_loop(b: BPF, iface: str = INGRESS_IFACE,
                extra_poll_fn=None):
-    """
-    Loop principale. Stampa TRUE HIT / FAKE HIT / MISS in tempo reale.
-    extra_poll_fn: callable opzionale chiamato ogni iterazione
-                  (usato dal Metodo 3 per perf_buffer_poll).
-    """
     stats = b.get_table("pkt_stats")
     print("\nIn ascolto di pacchetti... (Ctrl+C per fermare)")
     print(f"{'TRUE HIT':<22} | {'FAKE HIT':<22} | {'MISS':<20}")
