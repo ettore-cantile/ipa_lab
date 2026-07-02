@@ -3,14 +3,12 @@ Metodo 3 — OpenFlow-like (Control Plane on-demand)
 
 fwd_table e valid_keys partono vuote.
 Ad ogni table miss il kernel invia un miss_event al CP via BPF_PERF_OUTPUT.
-Il CP calcola la chiave corretta con i pesi float, inserisce la regola in
-fwd_table E popola valid_keys, cosi' il kernel puo' classificare correttamente
-i pacchetti successivi come TRUE HIT o FAKE HIT.
+Il CP calcola la chiave corretta con i pesi int8/scale (identici al kernel),
+insersice la regola in fwd_table E popola valid_keys.
 
-NOTA: la versione di BCC installata non riconosce i tipi __u8/__u32/__u64
-per la generazione automatica della classe evento. La struct MissEvent e'
-quindi definita manualmente con ctypes, e il buffer viene parsato con
-ctypes.from_buffer_copy().
+NOTA BCC: la versione installata non riconosce __u8/__u32/__u64 per la
+generazione automatica della classe evento. MissEvent e' definita manualmente
+con ctypes e il buffer viene parsato con from_buffer_copy().
 
 File pesi: weights.json + weights_float.json
 """
@@ -27,29 +25,20 @@ from common import (
 )
 
 # ---------------------------------------------------------------------------
-# Struct ctypes che replica ESATTAMENTE la miss_event del kernel:
-#
-#   struct miss_event {
-#       __u8  model_id;          -> c_uint8   (1 byte)
-#       __u8  ttl;               -> c_uint8   (1 byte)
-#       __u32 ingress_ifindex;   -> c_uint32  (4 byte) -- padding implicito!
-#       __u8  input_size;        -> c_uint8   (1 byte)
-#       __u64 key;               -> c_uint64  (8 byte) -- allineamento a 8
-#   };
-#
-# Il compilatore C inserisce padding dopo ttl (2 byte) e dopo input_size
-# (3 byte + 4 di allineamento) per rispettare l'allineamento di __u64.
-# La struct ctypes deve matchare byte per byte.
+# Struct ctypes che replica byte per byte la miss_event del kernel.
+# Layout con padding esplicito (_pack_=1):
+#   model_id(1) + ttl(1) + pad(2) + ingress_ifindex(4)
+#   + input_size(1) + pad(7) + key(8)  =  24 byte totali
 # ---------------------------------------------------------------------------
 class MissEvent(ctypes.Structure):
-    _pack_ = 1          # nessun padding automatico da ctypes
+    _pack_ = 1
     _fields_ = [
         ("model_id",        ctypes.c_uint8),
         ("ttl",             ctypes.c_uint8),
-        ("_pad0",           ctypes.c_uint8 * 2),   # padding dopo ttl
+        ("_pad0",           ctypes.c_uint8 * 2),
         ("ingress_ifindex", ctypes.c_uint32),
         ("input_size",      ctypes.c_uint8),
-        ("_pad1",           ctypes.c_uint8 * 7),   # padding prima di key
+        ("_pad1",           ctypes.c_uint8 * 7),
         ("key",             ctypes.c_uint64),
     ]
 
@@ -62,10 +51,19 @@ def run(weights_file: str = "weights.json"):
     with open(float_path) as f:
         float_data = json.load(f)
     SCALE_FACTOR = float_data["scale_factor"]
-    cp_weights   = float_data["weights"][:4]
     print(f"  SCALE_FACTOR = {SCALE_FACTOR}")
 
     integer_weights = load_weights(weights_path)
+
+    # -----------------------------------------------------------------------
+    # CHIAVE: il CP usa i pesi IDENTICI al kernel.
+    # Il kernel fa:  output_raw += iv * (signed char)weights[i]
+    # quindi divide per scale_factor con troncamento intero.
+    # I float originali hanno errore di quantizzazione che sposta la chiave.
+    # -----------------------------------------------------------------------
+    cp_weights = [ctypes.c_int8(int(w)).value / SCALE_FACTOR
+                  for w in integer_weights[:4]]
+    print(f"  Pesi CP (int8/scale): {[f'{w:.6f}' for w in cp_weights]}")
 
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
@@ -80,10 +78,9 @@ def run(weights_file: str = "weights.json"):
     print("[Metodo 3] fwd_table e valid_keys vuote: popolate on-demand dal CP.")
 
     # ------------------------------------------------------------------
-    # Callback CP: parsing manuale del buffer con ctypes.from_buffer_copy
+    # Callback CP: parsing manuale + calcolo chiave con pesi int8/scale
     # ------------------------------------------------------------------
     def handle_miss(cpu, data, size):
-        # Parsing sicuro: copia i byte raw in MissEvent
         raw = ctypes.cast(data, ctypes.POINTER(ctypes.c_byte * size)).contents
         ev  = MissEvent.from_buffer_copy(raw)
 
@@ -96,7 +93,8 @@ def run(weights_file: str = "weights.json"):
             fwd[ctypes.c_ulonglong(cp_key)] = action
             vk[ctypes.c_uint8(ev.ttl)]      = ctypes.c_ulonglong(cp_key)
             print(f"\n[CP] TTL={ev.ttl} | kernel_key={ev.key} "
-                  f"| cp_key={cp_key} -> INSTALLATA")
+                  f"| cp_key={cp_key} -> INSTALLATA "
+                  f"{'OK' if ev.key == cp_key else 'WARN: key mismatch!'}")
         else:
             print(f"\n[CP] TTL={ev.ttl} | cp_key={cp_key} -> gia' presente")
 
