@@ -1,6 +1,12 @@
 """
 Metodo 1 — PTQ (Post-Training Quantization)
-La fwd_table viene pre-popolata all'avvio per TTL 30-64.
+
+La fwd_table viene pre-popolata con chiavi calcolate dai pesi FLOAT originali.
+Il kernel usa i pesi int8 -> le chiavi divergono per errore di quantizzazione.
+Questo produce FAKE HIT (pacchetti redirectati sulla chiave sbagliata) e
+MISS (TTL la cui chiave float non collide con nessuna entry).
+E' il comportamento ATTESO del Metodo 1: misura l'impatto della quantizzazione PTQ.
+
 File pesi: weights.json  +  weights_float.json
 """
 import ctypes
@@ -29,7 +35,7 @@ def run(weights_file: str = "weights.json"):
     with open(float_path) as f:
         float_data = json.load(f)
     SCALE_FACTOR = float_data["scale_factor"]
-    cp_weights   = float_data["weights"][:4]
+    cp_weights   = float_data["weights"][:4]   # float originali
 
     integer_weights = load_weights(weights_path)
     int8_equiv = [ctypes.c_int8(int(w)).value / SCALE_FACTOR for w in integer_weights[:4]]
@@ -45,7 +51,11 @@ def run(weights_file: str = "weights.json"):
 
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     action = build_fwd_action(b, egress_ifindex)
-    populate_fwd_and_valid_keys(b, action, cp_weights, SCALE_FACTOR)
+
+    # integer_arithmetic=False: usa float originali per le chiavi
+    # -> divergenza intenzionale rispetto al kernel -> FAKE HIT visibili
+    populate_fwd_and_valid_keys(b, action, cp_weights, SCALE_FACTOR,
+                                integer_arithmetic=False)
 
     attach_xdp(b, fn)
     stats_loop(b)
