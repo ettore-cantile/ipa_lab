@@ -1,6 +1,6 @@
 # IPA Lab — Intelligent PAckets with eBPF
 
-This repository contains the lab implementation of **Intelligent PAckets (IPA)** with an eBPF-accelerated data plane, developed on top of the [Katharà](https://github.com/KatharaFramework/Kathara) network emulator. The goal is to embed compact machine learning models directly inside packet headers and execute per-hop inference to achieve adaptive, mission-driven forwarding decisions — without any control-plane signaling.
+This repository contains the lab implementation of **Intelligent PAckets (IPA)** with an eBPF-accelerated data plane, developed on top of the [Kathara](https://github.com/KatharaFramework/Kathara) network emulator. The goal is to embed compact machine learning models directly inside packet headers and execute per-hop inference to achieve adaptive, mission-driven forwarding decisions — without any control-plane signaling.
 
 The work extends the original proof-of-concept by Polverini, Cianfrani, and Listanti (Sapienza University of Rome / University of Molise) with a kernel-space eBPF/XDP forwarding engine that performs MLP inference at line rate.
 
@@ -32,7 +32,7 @@ The experimental setup uses the **Germany50** topology from the [SNDlib reposito
 | Destination host | `h_dst` attached to **Flensburg** |
 | Max simultaneous failures | 10 |
 
-The topology is imported from `germany50.xml` via `importSNDLib.py`, which also generates the Katharà-compatible `germany_kathara.xml` lab configuration.
+The topology is imported from `germany50.xml` via `importSNDLib.py`, which also generates the Kathara-compatible `germany_kathara.xml` lab configuration.
 
 ---
 
@@ -51,7 +51,7 @@ ipa_lab/
 │       ├── method1_ptq.py      # Method 1 — Post-Training Quantization
 │       ├── method2_qat.py      # Method 2 — Quantization-Aware Training
 │       └── method3_openflow.py # Method 3 — OpenFlow-like on-demand CP
-├── esegui_pipeline.py          # Training pipeline (PTQ or QAT)
+├── execute_pipeline.py          # Training pipeline (PTQ or QAT)
 └── extract_weights.py          # Exports float/int8 weights to JSON
 ```
 
@@ -78,10 +78,10 @@ Run the full pipeline from your local machine (requires Python 3.10+, PyTorch, p
 
 ```bash
 # Method 1 — standard float training (PTQ)
-python esegui_pipeline.py
+python execute_pipeline.py
 
 # Method 2 — Quantization-Aware Training
-python esegui_pipeline.py --method qat
+python execute_pipeline.py --method qat
 ```
 
 The pipeline produces:
@@ -89,7 +89,7 @@ The pipeline produces:
 - `weights.json` — int8 quantized weights for the eBPF switch
 - `weights_float.json` — float weights + `scale_factor` (PTQ reference)
 
-Copy `weights.json` (and `weights_float.json` for Method 1/3) into `shared/` before starting the Katharà lab.
+Copy `weights.json` (and `weights_float.json` for Method 1/3) into `shared/` before starting the Kathara lab.
 
 ---
 

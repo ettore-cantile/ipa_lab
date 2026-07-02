@@ -1,12 +1,12 @@
 """
-Metodo 3 — OpenFlow-like (Control Plane on-demand)
+Method 3 — OpenFlow-like (Control Plane on-demand)
 
-fwd_table e valid_keys partono vuote.
-Ad ogni table miss il kernel invia un miss_event al CP via BPF_PERF_OUTPUT.
-Il CP installa la regola usando direttamente ev.key (la chiave gia' calcolata
-dal kernel) — nessun ricalcolo in user space, zero possibilita' di mismatch.
+fwd_table and valid_keys start empty.
+On every table miss, the kernel sends a miss_event to the CP via BPF_PERF_OUTPUT.
+The CP installs the rule using ev.key directly (the key already computed by the kernel)
+— no user-space recomputation, zero chance of mismatch.
 
-File pesi: weights.json + weights_float.json
+Weights files: weights.json + weights_float.json
 """
 import ctypes
 import socket
@@ -42,7 +42,7 @@ class MissEvent(ctypes.Structure):
 def run(weights_file: str = "weights.json"):
     weights_path = f"/shared/{weights_file}"
     float_path   = "/shared/weights_float.json"
-    print(f"[Metodo 3 - OpenFlow-like] | File pesi: {weights_file}")
+    print(f"[Method 3 - OpenFlow-like] | Weights file: {weights_file}")
 
     with open(float_path) as f:
         float_data = json.load(f)
@@ -61,25 +61,25 @@ def run(weights_file: str = "weights.json"):
     fwd    = b.get_table("fwd_table")
     vk     = b.get_table("valid_keys")
 
-    print("[Metodo 3] fwd_table e valid_keys vuote: popolate on-demand dal CP.")
+    print("[Method 3] fwd_table and valid_keys are empty: populated on-demand by the CP.")
 
     # ------------------------------------------------------------------
-    # Callback CP: usa ev.key (chiave gia' calcolata dal kernel).
-    # Nessun ricalcolo in user space -> zero rischio di mismatch.
+    # CP callback: uses ev.key (key already computed by the kernel).
+    # No user-space recomputation -> zero mismatch risk.
     # ------------------------------------------------------------------
     def handle_miss(cpu, data, size):
         raw = ctypes.cast(data, ctypes.POINTER(ctypes.c_byte * size)).contents
         ev  = MissEvent.from_buffer_copy(raw)
 
-        key = ev.key   # chiave esatta del kernel, nessun ricalcolo
+        key = ev.key   # exact kernel key, no recomputation
 
         already = any(k.value == key for k in fwd.keys())
         if not already:
             fwd[ctypes.c_ulonglong(key)] = action
             vk[ctypes.c_uint8(ev.ttl)]   = ctypes.c_ulonglong(key)
-            print(f"\n[CP] TTL={ev.ttl} | key={key} -> INSTALLATA")
+            print(f"\n[CP] TTL={ev.ttl} | key={key} -> INSTALLED")
         else:
-            print(f"\n[CP] TTL={ev.ttl} | key={key} -> gia' presente")
+            print(f"\n[CP] TTL={ev.ttl} | key={key} -> already present")
 
     b["miss_events"].open_perf_buffer(handle_miss)
 
@@ -91,7 +91,7 @@ def run(weights_file: str = "weights.json"):
                 break
 
     threading.Thread(target=perf_loop, daemon=True).start()
-    print("[Metodo 3] Listener CP attivo.")
+    print("[Method 3] CP listener active.")
 
     attach_xdp(b, fn)
     stats_loop(b)

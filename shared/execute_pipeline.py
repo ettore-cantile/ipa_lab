@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-esegui_pipeline.py
+execute_pipeline.py
 ==================
-Punto di ingresso della pipeline IPA su ogni nodo Kathara.
+IPA pipeline entry point for each Kathara node.
 
-Flusso:
-    1. extract_weights.py  -> legge frr_germany50_5_model_4x2.pt
-                           -> scrive weights.json (pesi int8)
-    2. switch_core.py      -> legge weights.json
-                           -> carica la fwd_table eBPF
-                           -> attacca il programma XDP su eth1
-                           -> fa girare lo switch in loop
+Flow:
+    1. extract_weights.py  -> reads frr_germany50_5_model_4x2.pt
+                           -> writes weights.json (int8 weights)
+    2. switch_core.py      -> reads weights.json
+                           -> loads the eBPF fwd_table
+                           -> attaches the XDP program on eth1
+                           -> runs the switch in a loop
 
-Uso:
-    python3 /shared/esegui_pipeline.py
+Usage:
+    python3 /shared/execute_pipeline.py
 
-Opzionalmente puoi passare il metodo di quantizzazione:
-    python3 /shared/esegui_pipeline.py --method post   # default (Metodo 1)
-    python3 /shared/esegui_pipeline.py --method qat    # Metodo 2 (QAT)
+Optionally pass the quantization method:
+    python3 /shared/execute_pipeline.py --method post   # default (Method 1)
+    python3 /shared/execute_pipeline.py --method qat    # Method 2 (QAT)
 """
 
 import argparse
@@ -26,12 +26,12 @@ import sys
 import runpy
 
 # ------------------------------------------------------------
-# Assicura che shared/ sia nel path (per gli import nei sotto-script)
+# Ensure shared/ is on the import path for sub-scripts
 # ------------------------------------------------------------
 SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
-os.chdir(SHARED_DIR)  # tutti gli script usano path relativi
+os.chdir(SHARED_DIR)  # all scripts use relative paths
 
 
 def main():
@@ -40,43 +40,43 @@ def main():
         "--method",
         choices=["post", "qat"],
         default="post",
-        help="Metodo di quantizzazione: 'post' (default) = Metodo 1, 'qat' = Metodo 2"
+        help="Quantization method: 'post' (default) = Method 1, 'qat' = Method 2"
     )
     args = parser.parse_args()
 
     # ----------------------------------------------------------
-    # Step 1: estrai i pesi interi -> weights.json
+    # Step 1: extract integer weights -> weights.json
     # ----------------------------------------------------------
     print("=" * 60)
-    print(f"[pipeline] Step 1 — estrazione pesi (metodo={args.method})")
+    print(f"[pipeline] Step 1 — extracting weights (method={args.method})")
     print("=" * 60)
 
     if args.method == "qat":
-        # Metodo 2: carica il modello QAT se esiste, altrimenti fallback
+        # Method 2: load the QAT model if it exists, otherwise fallback
         qat_model_path = os.path.join(SHARED_DIR, "frr_qat_model.pt")
         if not os.path.exists(qat_model_path):
-            print(f"[WARNING] {qat_model_path} non trovato, uso il modello Metodo 1.")
+            print(f"[WARNING] {qat_model_path} not found, using Method 1 model.")
         else:
-            # Ridefinisce la variabile d'ambiente letta da extract_weights.py
+            # Redefine the environment variable read by extract_weights.py
             os.environ["FRR_MODEL_PATH"] = qat_model_path
             os.environ["FRR_MODEL_TYPE"] = "qat"
 
-    # Esegue extract_weights.py nello stesso processo
+    # Execute extract_weights.py in the same process
     runpy.run_path(os.path.join(SHARED_DIR, "extract_weights.py"), run_name="__main__")
 
-    # Verifica che weights.json sia stato prodotto
+    # Verify that weights.json was produced
     weights_path = os.path.join(SHARED_DIR, "weights.json")
     if not os.path.exists(weights_path):
-        print("[ERROR] weights.json non generato — esco.")
+        print("[ERROR] weights.json was not generated — exiting.")
         sys.exit(1)
     print(f"[pipeline] weights.json OK ({os.path.getsize(weights_path)} bytes)")
 
     # ----------------------------------------------------------
-    # Step 2: avvia lo switch XDP (loop bloccante)
+    # Step 2: start the XDP switch (blocking loop)
     # ----------------------------------------------------------
     print()
     print("=" * 60)
-    print("[pipeline] Step 2 — avvio switch XDP (switch_core.py)")
+    print("[pipeline] Step 2 — starting XDP switch (switch_core.py)")
     print("=" * 60)
     runpy.run_path(os.path.join(SHARED_DIR, "switch_core.py"), run_name="__main__")
 

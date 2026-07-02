@@ -1,11 +1,11 @@
 """
-Metodo 2 — QAT (Quantization-Aware Training)
+Method 2 — QAT (Quantization-Aware Training)
 
-SCALE_FACTOR fisso = 128. La fwd_table viene pre-popolata con chiavi
-calcolate in aritmetica intera pura (identica al kernel).
-Kernel e CP sono allineati -> quasi tutte TRUE HIT.
+Fixed SCALE_FACTOR = 128. The fwd_table is pre-populated with keys
+computed using pure integer arithmetic (identical to the kernel).
+Kernel and CP are aligned -> nearly all TRUE HITs.
 
-File pesi: weights_method2.json
+Weights file: weights_method2.json
 """
 import ctypes
 import socket
@@ -22,12 +22,12 @@ SCALE_FACTOR = 128
 
 def run(weights_file: str = "weights_method2.json"):
     weights_path = f"/shared/{weights_file}"
-    print(f"[Metodo 2 - QAT] | File pesi: {weights_file}")
+    print(f"[Method 2 - QAT] | Weights file: {weights_file}")
 
     integer_weights = load_weights(weights_path)
     int8_weights    = [int(w) for w in integer_weights[:4]]  # raw int8, no divisione
     print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
-    print(f"  Pesi int8 raw : {int8_weights}")
+    print(f"  Raw int8 weights: {int8_weights}")
 
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)

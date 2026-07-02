@@ -1,12 +1,12 @@
 """
-ebpf_program.py — Codice C eBPF condiviso tra tutti i metodi.
+ebpf_program.py — Shared C eBPF code used by all methods.
 
-Mappe:
-  model_cache   : model_id  -> pesi int8 + scale_factor
-  fwd_table     : chiave u64 -> azione di inoltro (ifindex + MAC)
-  valid_keys    : ttl u8    -> chiave u64 corretta (per rilevare fake hit)
-  miss_events   : perf buffer verso il CP (Metodo 3)
-  pkt_stats     : array 3 slot -> [0]=TRUE HIT  [1]=MISS  [2]=FAKE HIT
+Maps:
+  model_cache   : model_id  -> int8 weights + scale_factor
+  fwd_table     : u64 key -> forwarding action (ifindex + MAC)
+  valid_keys    : u8 ttl  -> correct u64 key (for fake hit detection)
+  miss_events   : perf buffer to the CP (Method 3)
+  pkt_stats     : 3-slot array -> [0]=TRUE HIT  [1]=MISS  [2]=FAKE HIT
 """
 
 EBPF_PROGRAM = r"""
@@ -47,9 +47,9 @@ struct miss_event {
 
 BPF_HASH(model_cache, __u8, struct model_data, 256);
 BPF_HASH(fwd_table, __u64, struct fwd_action, 256);
-BPF_HASH(valid_keys, __u8, __u64, 256);   // TTL -> chiave corretta del CP
+BPF_HASH(valid_keys, __u8, __u64, 256);   // TTL -> correct CP key
 BPF_ARRAY(pkt_stats, __u64, 3);           // [0]=TRUE HIT [1]=MISS [2]=FAKE HIT
-BPF_PERF_OUTPUT(miss_events);             // usato solo dal Metodo 3
+BPF_PERF_OUTPUT(miss_events);             // used only by Method 3
 
 #define OUTPUT_OFFSET 100000ULL
 
@@ -97,7 +97,7 @@ int ipa_switch(struct xdp_md *ctx) {
     __u64 *correct_key = valid_keys.lookup(&ip->ttl);
 
     if (action != NULL) {
-        // TRUE HIT se la chiave calcolata coincide con quella del CP per questo TTL
+        // TRUE HIT if the computed key matches the CP key for this TTL
         int stat_index = 2; // default: FAKE HIT
         if (correct_key && *correct_key == key) {
             stat_index = 0; // TRUE HIT
@@ -113,7 +113,7 @@ int ipa_switch(struct xdp_md *ctx) {
         __u64 *val = pkt_stats.lookup(&stat_index);
         if (val) __sync_fetch_and_add(val, 1);
 
-        // Notifica il CP (Metodo 3); negli altri metodi il buffer non viene letto
+        // Notify the CP (Method 3); in other methods the buffer is not consumed
         struct miss_event ev = {};
         ev.model_id        = ipa->model_id;
         ev.ttl             = ip->ttl;

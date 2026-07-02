@@ -9,10 +9,10 @@ class FastRerouteMLP(nn.Module):
         self.n_classes = n_interfaces + 1  # +1 for DROP class
 
         input_dim = (
-            n_interfaces       # stato delle interfacce di uscita
-            + n_interfaces     # interfaccia di ingresso (one-hot)
-            + 1                # TTL normalizzato
-            + n_nodes          # nodo corrente (one-hot)
+            n_interfaces       # output interface states
+            + n_interfaces     # ingress interface (one-hot)
+            + 1                # normalized TTL
+            + n_nodes          # current node (one-hot)
         )
         print("DIM INPUT: " + str(input_dim))
 

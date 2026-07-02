@@ -1,13 +1,13 @@
 """
-Metodo 1 — PTQ (Post-Training Quantization)
+Method 1 — PTQ (Post-Training Quantization)
 
-La fwd_table viene pre-popolata con chiavi calcolate dai pesi FLOAT originali.
-Il kernel usa i pesi int8 -> le chiavi divergono per errore di quantizzazione.
-Questo produce FAKE HIT (pacchetti redirectati sulla chiave sbagliata) e
-MISS (TTL la cui chiave float non collide con nessuna entry).
-E' il comportamento ATTESO del Metodo 1: misura l'impatto della quantizzazione PTQ.
+The fwd_table is pre-populated with keys computed from original FLOAT weights.
+The kernel uses int8 weights -> keys diverge due to quantization error.
+This produces FAKE HITs (packets redirected on the wrong key) and
+MISSes (TTLs whose float key does not collide with any entry).
+This is the expected Method 1 behavior: it measures the PTQ quantization impact.
 
-File pesi: weights.json  +  weights_float.json
+Weights files: weights.json + weights_float.json
 """
 import ctypes
 import socket
@@ -26,10 +26,10 @@ from common import (
 def run(weights_file: str = "weights.json"):
     weights_path = f"/shared/{weights_file}"
     float_path   = "/shared/weights_float.json"
-    print(f"[Metodo 1 - PTQ] | File pesi: {weights_file}")
+    print(f"[Method 1 - PTQ] | Weights file: {weights_file}")
 
     if not os.path.exists(float_path):
-        print(f"[ERRORE] {float_path} non trovato. Esegui prima extract_weights.py")
+        print(f"[ERROR] {float_path} not found. Run extract_weights.py first.")
         sys.exit(1)
 
     with open(float_path) as f:
@@ -40,9 +40,10 @@ def run(weights_file: str = "weights.json"):
     integer_weights = load_weights(weights_path)
     int8_equiv = [ctypes.c_int8(int(w)).value / SCALE_FACTOR for w in integer_weights[:4]]
     print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
-    print(f"  Pesi float    : {[f'{w:.6f}' for w in cp_weights]}")
-    print(f"  Equiv int8    : {[f'{w:.6f}' for w in int8_equiv]}")
-    print(f"  Errore quant. : {[f'{abs(a-b):.6f}' for a, b in zip(cp_weights, int8_equiv)]}")
+    print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
+    print(f"  Float weights : {[f'{w:.6f}' for w in cp_weights]}")
+    print(f"  Int8 equiv    : {[f'{w:.6f}' for w in int8_equiv]}")
+    print(f"  Quant error   : {[f'{abs(a-b):.6f}' for a, b in zip(cp_weights, int8_equiv)]}")
 
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)

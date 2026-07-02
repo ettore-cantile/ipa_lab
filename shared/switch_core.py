@@ -2,10 +2,10 @@
 """
 IPA Switch - Entry Point
 
-Utilizzo:
-  Metodo 1 (PTQ):           python3 switch_core.py
-  Metodo 2 (QAT):           python3 switch_core.py weights_method2.json
-  Metodo 3 (OpenFlow-like): python3 switch_core.py weights.json openflow
+Usage:
+  Method 1 (PTQ):           python3 switch_core.py
+  Method 2 (QAT):           python3 switch_core.py weights_method2.json
+  Method 3 (OpenFlow-like): python3 switch_core.py weights.json openflow
 """
 import sys
 

@@ -23,10 +23,10 @@ for node in nodes:
 
 # Prepare basic startup commands (Removed apt-get for instant boot)
 startup_files = {node: [
-    "bash /shared/fix_bpf.sh", # <-- Aggiunto script per risolvere BCC all'avvio
+    "bash /shared/fix_bpf.sh", # <-- Added startup script to fix BCC at boot
     "sysctl -w net.ipv4.ip_forward=1",
     "sysctl -w net.ipv6.conf.all.disable_ipv6=1",
-    "mount -t debugfs debugfs /sys/kernel/debug", # <-- Aggiunto mount per debugfs
+    "mount -t debugfs debugfs /sys/kernel/debug", # <-- Added debugfs mount
     
     # Wake up the routing daemons
     "sed -i 's/zebra=no/zebra=yes/g' /etc/frr/daemons",
@@ -62,11 +62,11 @@ for src, tgt in links:
     lab_conf += f"{src}[{ifaces[src]}]=\"{cd_name}\"\n"
     lab_conf += f"{tgt}[{ifaces[tgt]}]=\"{cd_name}\"\n"
 
-    terzo_ottetto = subnet_counter // 64
-    quarto_ottetto = (subnet_counter % 64) * 4
+    third_octet = subnet_counter // 64
+    fourth_octet = (subnet_counter % 64) * 4
     
-    ip_src = f"10.0.{terzo_ottetto}.{quarto_ottetto + 1}/30"
-    ip_tgt = f"10.0.{terzo_ottetto}.{quarto_ottetto + 2}/30"
+    ip_src = f"10.0.{third_octet}.{fourth_octet + 1}/30"
+    ip_tgt = f"10.0.{third_octet}.{fourth_octet + 2}/30"
 
     startup_files[src].append(f"ip addr add {ip_src} dev eth{ifaces[src]}")
     startup_files[src].append(f"ip link set eth{ifaces[src]} up")
@@ -92,4 +92,4 @@ for node, cmds in startup_files.items():
         f.write("# Startup configuration generated automatically\n")
         f.write("\n".join(cmds) + "\n")
 
-print("Generazione Completata! I nodi si avvieranno istantaneamente con eBPF e debugfs inclusi.")
+print("Generation complete! Nodes will boot immediately with eBPF and debugfs enabled.")

@@ -1,13 +1,13 @@
 """
-common.py — Funzioni condivise da tutti i metodi.
+common.py — Shared helpers used by all methods.
 
-Nota sul calcolo della chiave:
-  - Metodo 1 (PTQ) integer_arithmetic=False:
-      usa pesi float originali -> chiave float-troncata
-      diverge dal kernel (int8) -> produce FAKE HIT intenzionali
-  - Metodo 2 (QAT) integer_arithmetic=True:
-      usa pesi int8 raw -> aritmetica intera pura identica al kernel
-      -> quasi tutte TRUE HIT
+Key computation note:
+  - Method 1 (PTQ) integer_arithmetic=False:
+      uses original float weights -> truncated float key
+      diverges from the kernel (int8) -> produces intentional FAKE HITs
+  - Method 2 (QAT) integer_arithmetic=True:
+      uses raw int8 weights -> pure integer arithmetic identical to the kernel
+      -> nearly all TRUE HITs
 """
 import json
 import ctypes
@@ -53,17 +53,17 @@ def populate_model_cache(b: BPF, model_id: int,
     for i in range(min(len(integer_weights), 100)):
         entry.weights[i] = ctypes.c_uint8(integer_weights[i]).value
     cache[cache.Key(model_id)] = entry
-    print(f"Modello {model_id} caricato nella Cache eBPF (scale_factor={scale_factor})")
+    print(f"Model {model_id} loaded into eBPF cache (scale_factor={scale_factor})")
 
 
 def _compute_key_float(iv: list, cp_weights: list) -> int:
-    """Metodo 1 PTQ: chiave con pesi float originali.
-    Deliberatamente non allineata al kernel -> produce FAKE HIT."""
+    """Method 1 PTQ: key computed with original float weights.
+    Deliberately misaligned with the kernel -> produces FAKE HIT."""
     return int(sum(v * w for v, w in zip(iv, cp_weights))) + OFFSET
 
 
 def _compute_key_integer(iv: list, int8_weights: list, scale: int) -> int:
-    """Metodo 2/3 QAT: aritmetica intera pura identica al kernel.
+    """Method 2/3 QAT: pure integer arithmetic identical to the kernel.
     output_raw = sum(iv[i] * (signed char)weights[i])
     key        = (output_raw + OFFSET * scale) // scale"""
     output_raw = sum(v * ctypes.c_int8(w).value
@@ -76,15 +76,15 @@ def populate_fwd_and_valid_keys(b: BPF, action, cp_weights: list,
                                 ingress_iface: str = INGRESS_IFACE,
                                 integer_arithmetic: bool = False):
     """
-    Pre-popola fwd_table e valid_keys per TTL 30-64.
+    Pre-populates fwd_table and valid_keys for TTL 30-64.
 
-    integer_arithmetic=False (Metodo 1 PTQ):
-        cp_weights sono float originali; chiave calcolata con float.
-        Divergenza intenzionale rispetto al kernel -> FAKE HIT visibili.
+    integer_arithmetic=False (Method 1 PTQ):
+        cp_weights are original floats; key is computed with floats.
+        Intentional divergence from the kernel -> visible FAKE HITs.
 
-    integer_arithmetic=True (Metodo 2 QAT):
-        cp_weights sono int8 raw; chiave calcolata con interi puri.
-        Kernel e CP allineati -> TRUE HIT.
+    integer_arithmetic=True (Method 2 QAT):
+        cp_weights are raw int8; key is computed with pure integers.
+        Kernel and CP aligned -> TRUE HIT.
     """
     fwd    = b.get_table("fwd_table")
     vk     = b.get_table("valid_keys")
@@ -100,16 +100,16 @@ def populate_fwd_and_valid_keys(b: BPF, action, cp_weights: list,
         vk[ctypes.c_uint8(ttl)]      = ctypes.c_ulonglong(key)
 
     mode = "intera/QAT" if integer_arithmetic else "float/PTQ"
-    print(f"fwd_table e valid_keys caricati per TTL 30-64 [{mode}].")
+    print(f"fwd_table and valid_keys loaded for TTL 30-64 [{mode}].")
 
 
 def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
-    print(f"Attach XDP su {iface} ...")
+    print(f"Attaching XDP to {iface}...")
     try:
         b.attach_xdp(iface, fn, flags=2)
-        print(f"XDP attaccato a {iface}")
+        print(f"XDP attached to {iface}")
     except Exception as e:
-        print(f"Errore XDP: {e}")
+        print(f"XDP error: {e}")
 
 
 def detach_xdp(b: BPF, iface: str = INGRESS_IFACE):
@@ -120,7 +120,7 @@ def detach_xdp(b: BPF, iface: str = INGRESS_IFACE):
 def stats_loop(b: BPF, iface: str = INGRESS_IFACE,
                extra_poll_fn=None):
     stats = b.get_table("pkt_stats")
-    print("\nIn ascolto di pacchetti... (Ctrl+C per fermare)")
+    print("\nListening for packets... (Ctrl+C to stop)")
     print(f"{'TRUE HIT':<22} | {'FAKE HIT':<22} | {'MISS':<20}")
     print("-" * 70)
     try:
@@ -139,4 +139,4 @@ def stats_loop(b: BPF, iface: str = INGRESS_IFACE,
                 pass
     except KeyboardInterrupt:
         detach_xdp(b, iface)
-        print("\n\nXDP rimosso. Esco.")
+        print("\n\nXDP removed. Exiting.")

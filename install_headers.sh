@@ -1,7 +1,7 @@
 #!/bin/bash
-# install_headers.sh — compatibilità con kernel host diverso dal container
-# Crea il symlink /lib/modules/$(uname -r)/build verso gli header disponibili.
-# Usato come fallback manuale; di norma viene chiamato fix_bpf.sh dallo startup.
+# install_headers.sh — compatibility helper for a host kernel different from the container.
+# Creates the symlink /lib/modules/$(uname -r)/build pointing to available headers.
+# Used as a manual fallback; normally fix_bpf.sh is called from startup.
 
 KERNEL=$(uname -r)
 echo "[*] Host kernel: $KERNEL"
@@ -14,7 +14,7 @@ if [ -e "${HEADER_DIR}/build" ]; then
     exit 0
 fi
 
-# 1) Header esatti
+# 1) Exact matching headers
 SRC_DIR=$(ls /usr/src/ 2>/dev/null | grep -E "linux-headers-${KERNEL}$" | head -1)
 if [ -n "$SRC_DIR" ]; then
     ln -sf "/usr/src/${SRC_DIR}" "${HEADER_DIR}/build"
@@ -22,7 +22,7 @@ if [ -n "$SRC_DIR" ]; then
     exit 0
 fi
 
-# 2) Primo header disponibile (fallback cross-version)
+# 2) First available header set (cross-version fallback)
 SRC_DIR=$(ls /usr/src/ 2>/dev/null | grep 'linux-headers-' | grep -v '\-common$' | head -1)
 if [ -n "$SRC_DIR" ]; then
     ln -sf "/usr/src/${SRC_DIR}" "${HEADER_DIR}/build"

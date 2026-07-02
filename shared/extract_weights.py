@@ -9,15 +9,15 @@ model = FastRerouteMLP(n_interfaces=6, n_nodes=52, hidden_dim=4)
 model.load_state_dict(torch.load("frr_germany50_5_model_4x2.pt"))
 
 # ---------------------------------------------------------------------------
-# Metodo 1 - PTQ: SCALE_FACTOR calcolato automaticamente dal peso massimo.
+# Method 1 - PTQ: SCALE_FACTOR computed automatically from the maximum weight.
 #
 # SCALE_FACTOR = floor(127 / max(|w|))
-# Garantisce che nessun peso superi il range int8 [-128, 127] dopo la
-# moltiplicazione, eliminando il clamp che causava i TABLE MISS.
+# Ensures no weight exceeds int8 range [-128, 127] after multiplication,
+# eliminating clamping that would cause TABLE MISS.
 #
-# Il SCALE_FACTOR viene salvato in weights_float.json insieme ai pesi float
-# originali, e viene scritto nel campo 'scaling' dell'IPA header da send_ipa.
-# Il kernel lo legge dall'header e lo usa come divisore (non piu' shift).
+# The SCALE_FACTOR is saved in weights_float.json along with the original
+# float weights, and is written into the IPA header 'scaling' field by send_ipa.
+# The kernel reads it from the header and uses it as a divisor (instead of shift).
 # ---------------------------------------------------------------------------
 
 all_floats = [w for param in model.parameters() for w in param.data.view(-1).tolist()]
@@ -33,22 +33,22 @@ for w_float in all_floats:
     w_int = max(-128, min(127, w_int))  # safety clamp (non dovrebbe scattare)
     integer_weights.append(w_int)
 
-# Verifica che nessun peso sia stato clampato
+# Verify that no weight was clamped
 clamped = sum(1 for w, wf in zip(integer_weights, all_floats)
               if w != int(round(wf * SCALE_FACTOR)))
 if clamped:
-    print(f"[WARN] {clamped} pesi clampati (max_abs potrebbe non essere il vero massimo)")
+    print(f"[WARN] {clamped} weights clamped (max_abs may not be the true maximum)")
 else:
-    print("Nessun peso clampato. Range int8 rispettato per tutti i pesi.")
+    print("No weights were clamped. int8 range respected for all weights.")
 
-# Pesi int8 -> kernel eBPF
+# int8 weights -> eBPF kernel
 with open("weights.json", "w") as f:
     json.dump(integer_weights, f)
 
-# Pesi float originali + SCALE_FACTOR -> control plane Metodo 1
+# original float weights + SCALE_FACTOR -> control plane for Method 1
 with open("weights_float.json", "w") as f:
     json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
 
-print(f"Saved {len(integer_weights)} int8 weights  -> weights.json")
+print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
 print(f"Saved float weights + scale_factor={SCALE_FACTOR} -> weights_float.json")
-print(f"Range int8: min={min(integer_weights)}  max={max(integer_weights)}")
+print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
