@@ -1,6 +1,12 @@
 """
 ebpf_program.py — Codice C eBPF condiviso tra tutti i metodi.
-Esporta la stringa EBPF_PROGRAM da passare a BPF(text=...).
+
+Mappe:
+  model_cache   : model_id  -> pesi int8 + scale_factor
+  fwd_table     : chiave u64 -> azione di inoltro (ifindex + MAC)
+  valid_keys    : ttl u8    -> chiave u64 corretta (per rilevare fake hit)
+  miss_events   : perf buffer verso il CP (Metodo 3)
+  pkt_stats     : array 3 slot -> [0]=TRUE HIT  [1]=MISS  [2]=FAKE HIT
 """
 
 EBPF_PROGRAM = r"""
@@ -31,7 +37,6 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-// Evento inviato al CP su table miss (usato solo dal Metodo 3)
 struct miss_event {
     __u8  model_id;
     __u8  ttl;
@@ -42,8 +47,9 @@ struct miss_event {
 
 BPF_HASH(model_cache, __u8, struct model_data, 256);
 BPF_HASH(fwd_table, __u64, struct fwd_action, 256);
-BPF_ARRAY(pkt_stats, __u64, 2);   // [0]=redirect  [1]=miss
-BPF_PERF_OUTPUT(miss_events);     // usato solo dal Metodo 3
+BPF_HASH(valid_keys, __u8, __u64, 256);   // TTL -> chiave corretta del CP
+BPF_ARRAY(pkt_stats, __u64, 3);           // [0]=TRUE HIT [1]=MISS [2]=FAKE HIT
+BPF_PERF_OUTPUT(miss_events);             // usato solo dal Metodo 3
 
 #define OUTPUT_OFFSET 100000ULL
 
@@ -88,18 +94,26 @@ int ipa_switch(struct xdp_md *ctx) {
     __u64 key      = output_u / (__u64)scale;
 
     struct fwd_action *action = fwd_table.lookup(&key);
+    __u64 *correct_key = valid_keys.lookup(&ip->ttl);
+
     if (action != NULL) {
-        int s = 0;
-        __u64 *val = pkt_stats.lookup(&s);
+        // TRUE HIT se la chiave calcolata coincide con quella del CP per questo TTL
+        int stat_index = 2; // default: FAKE HIT
+        if (correct_key && *correct_key == key) {
+            stat_index = 0; // TRUE HIT
+        }
+        __u64 *val = pkt_stats.lookup(&stat_index);
         if (val) __sync_fetch_and_add(val, 1);
+
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     } else {
-        int s = 1;
-        __u64 *val = pkt_stats.lookup(&s);
+        int stat_index = 1; // MISS
+        __u64 *val = pkt_stats.lookup(&stat_index);
         if (val) __sync_fetch_and_add(val, 1);
-        // Il Metodo 3 usa questo perf_submit; negli altri metodi e' inerte.
+
+        // Notifica il CP (Metodo 3); negli altri metodi il buffer non viene letto
         struct miss_event ev = {};
         ev.model_id        = ipa->model_id;
         ev.ttl             = ip->ttl;

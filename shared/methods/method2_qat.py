@@ -1,6 +1,6 @@
 """
 Metodo 2 — QAT (Quantization-Aware Training)
-La fwd_table viene pre-popolata con SCALE_FACTOR fisso = 128.
+SCALE_FACTOR fisso = 128. Pre-popola fwd_table e valid_keys.
 File pesi: weights_method2.json
 """
 import ctypes
@@ -9,8 +9,8 @@ from bcc import BPF
 from ebpf_program import EBPF_PROGRAM
 from common import (
     load_bpf, load_weights, build_fwd_action,
-    populate_model_cache, attach_xdp, stats_loop,
-    INGRESS_IFACE, EGRESS_IFACE, OFFSET
+    populate_model_cache, populate_fwd_and_valid_keys,
+    attach_xdp, stats_loop, EGRESS_IFACE
 )
 
 SCALE_FACTOR = 128
@@ -23,8 +23,8 @@ def run(weights_file: str = "weights_method2.json"):
     integer_weights = load_weights(weights_path)
     cp_weights = [ctypes.c_int8(int(w)).value / SCALE_FACTOR
                   for w in integer_weights[:4]]
-    print(f"  SCALE_FACTOR = {SCALE_FACTOR}")
-    print(f"  Pesi int8/128: {[f'{w:.6f}' for w in cp_weights]}")
+    print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
+    print(f"  Pesi int8/128 : {[f'{w:.6f}' for w in cp_weights]}")
 
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
@@ -32,17 +32,8 @@ def run(weights_file: str = "weights_method2.json"):
     populate_model_cache(b, 42, integer_weights, SCALE_FACTOR)
 
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
-    action         = build_fwd_action(b, egress_ifindex)
-    fwd            = b.get_table("fwd_table")
-    if_index_eth1  = socket.if_nametoindex(INGRESS_IFACE)
-
-    print("Popolamento fwd_table (TTL 30-64)...")
-    for ttl in range(30, 65):
-        iv        = [42, ttl, if_index_eth1, 4]
-        ideal_raw = sum(v * w for v, w in zip(iv, cp_weights))
-        key       = int(ideal_raw) + OFFSET
-        fwd[ctypes.c_ulonglong(key)] = action
-    print("fwd_table pronta.")
+    action = build_fwd_action(b, egress_ifindex)
+    populate_fwd_and_valid_keys(b, action, cp_weights, SCALE_FACTOR)
 
     attach_xdp(b, fn)
     stats_loop(b)

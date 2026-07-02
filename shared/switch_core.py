@@ -8,7 +8,6 @@ Utilizzo:
   Metodo 3 (OpenFlow-like): python3 switch_core.py weights.json openflow
 """
 import sys
-from common import load_bpf, load_weights, populate_model_cache, attach_xdp, stats_loop
 
 WEIGHTS_FILE = sys.argv[1] if len(sys.argv) > 1 else "weights.json"
 METHOD_FLAG  = sys.argv[2] if len(sys.argv) > 2 else ""
