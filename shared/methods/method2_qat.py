@@ -20,9 +20,9 @@ from common import (
 SCALE_FACTOR = 128
 
 
-def run(weights_file: str = "weights_method2.json"):
+def run(weights_file: str = "weights_method2.json", model_id: int = 42):
     weights_path = f"/shared/{weights_file}"
-    print(f"[Method 2 - QAT] | Weights file: {weights_file}")
+    print(f"[Method 2 - QAT] | Weights file: {weights_file} | model_id: {model_id}")
 
     integer_weights = load_weights(weights_path)
     int8_weights    = [int(w) for w in integer_weights[:4]]  # raw int8, no divisione
@@ -32,7 +32,7 @@ def run(weights_file: str = "weights_method2.json"):
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
 
-    populate_model_cache(b, 42, integer_weights, SCALE_FACTOR)
+    populate_model_cache(b, model_id, integer_weights, SCALE_FACTOR)
 
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     action = build_fwd_action(b, egress_ifindex)

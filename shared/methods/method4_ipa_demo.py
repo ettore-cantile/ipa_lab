@@ -75,7 +75,7 @@ class ModelMissEvent(ctypes.Structure):
     ]
 
 
-def run(weights_file: str = "weights_method2.json"):
+def run(weights_file: str = "weights_method2.json", model_id: int = 42):
     print("[Method 4 - IPA Demo] | model_cache and fwd_table start EMPTY")
     print("  The model travels in the packet. First packet loads the model (~3 ms).")
     print("  Subsequent packets: TRUE HIT directly from the kernel (<1 ms).")
@@ -85,7 +85,7 @@ def run(weights_file: str = "weights_method2.json"):
     fn = b.load_func("ipa_switch", BPF.XDP)
 
     # model_cache intentionally left EMPTY: the model arrives in the packet
-    # populate_model_cache(b, 42, ...) <- NOT called
+    # populate_model_cache(b, model_id, ...) <- NOT called
 
     # fwd_table intentionally left EMPTY: rules installed on-demand by the CP
     # populate_fwd_and_valid_keys(...)  <- NOT called
@@ -113,9 +113,9 @@ def run(weights_file: str = "weights_method2.json"):
         raw = ctypes.cast(data, ctypes.POINTER(ctypes.c_byte * size)).contents
         ev  = ModelMissEvent.from_buffer_copy(raw)
 
-        model_id = ev.model_id
+        ev_model_id = ev.model_id
 
-        if model_id in loaded_models:
+        if ev_model_id in loaded_models:
             return  # already loaded by a concurrent event
 
         # Reconstruct the weight list from the 4 individual fields
@@ -125,16 +125,16 @@ def run(weights_file: str = "weights_method2.json"):
             ctypes.c_int8(ev.w2).value,
             ctypes.c_int8(ev.w3).value,
         ]
-        print(f"\n[CP] MODEL MISS | model_id={model_id} | "
+        print(f"\n[CP] MODEL MISS | model_id={ev_model_id} | "
               f"weights extracted from packet: {weights}")
 
-        # Load the model into model_cache
-        populate_model_cache(b, model_id, weights, SCALE_FACTOR)
-        loaded_models.add(model_id)
+        # Load the model into model_cache using the model_id from the packet
+        populate_model_cache(b, ev_model_id, weights, SCALE_FACTOR)
+        loaded_models.add(ev_model_id)
 
         # Compute the forwarding key using pure integer arithmetic
         # (identical to the kernel formula) and install the rule at once
-        iv = [model_id, ev.ttl, ev.ingress_ifindex, ev.input_size]
+        iv = [ev_model_id, ev.ttl, ev.ingress_ifindex, ev.input_size]
         output_raw = sum(iv[i] * weights[i] for i in range(4))
         key = (output_raw + OFFSET * SCALE_FACTOR) // SCALE_FACTOR
 
@@ -142,9 +142,9 @@ def run(weights_file: str = "weights_method2.json"):
         vk[ctypes.c_uint8(ev.ttl)]   = ctypes.c_ulonglong(key)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[CP] model_id={model_id} LOADED & rule INSTALLED | "
+        print(f"[CP] model_id={ev_model_id} LOADED & rule INSTALLED | "
               f"key={key} | TTL={ev.ttl} | elapsed={elapsed_ms:.2f} ms")
-        print(f"[CP] Next packets for model_id={model_id} -> TRUE HIT (<1 ms)")
+        print(f"[CP] Next packets for model_id={ev_model_id} -> TRUE HIT (<1 ms)")
 
     # ------------------------------------------------------------------
     # Callback for FWD MISS: model is in cache but forwarding rule missing.

@@ -23,10 +23,10 @@ from common import (
 )
 
 
-def run(weights_file: str = "weights.json"):
+def run(weights_file: str = "weights.json", model_id: int = 42):
     weights_path = f"/shared/{weights_file}"
     float_path   = "/shared/weights_float.json"
-    print(f"[Method 1 - PTQ] | Weights file: {weights_file}")
+    print(f"[Method 1 - PTQ] | Weights file: {weights_file} | model_id: {model_id}")
 
     if not os.path.exists(float_path):
         print(f"[ERROR] {float_path} not found. Run extract_weights.py first.")
@@ -40,7 +40,6 @@ def run(weights_file: str = "weights.json"):
     integer_weights = load_weights(weights_path)
     int8_equiv = [ctypes.c_int8(int(w)).value / SCALE_FACTOR for w in integer_weights[:4]]
     print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
-    print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
     print(f"  Float weights : {[f'{w:.6f}' for w in cp_weights]}")
     print(f"  Int8 equiv    : {[f'{w:.6f}' for w in int8_equiv]}")
     print(f"  Quant error   : {[f'{abs(a-b):.6f}' for a, b in zip(cp_weights, int8_equiv)]}")
@@ -48,7 +47,7 @@ def run(weights_file: str = "weights.json"):
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
 
-    populate_model_cache(b, 42, integer_weights, SCALE_FACTOR)
+    populate_model_cache(b, model_id, integer_weights, SCALE_FACTOR)
 
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     action = build_fwd_action(b, egress_ifindex)

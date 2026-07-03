@@ -39,10 +39,10 @@ class MissEvent(ctypes.Structure):
     ]
 
 
-def run(weights_file: str = "weights.json"):
+def run(weights_file: str = "weights.json", model_id: int = 42):
     weights_path = f"/shared/{weights_file}"
     float_path   = "/shared/weights_float.json"
-    print(f"[Method 3 - OpenFlow-like] | Weights file: {weights_file}")
+    print(f"[Method 3 - OpenFlow-like] | Weights file: {weights_file} | model_id: {model_id}")
 
     with open(float_path) as f:
         float_data = json.load(f)
@@ -54,7 +54,7 @@ def run(weights_file: str = "weights.json"):
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
 
-    populate_model_cache(b, 42, integer_weights, SCALE_FACTOR)
+    populate_model_cache(b, model_id, integer_weights, SCALE_FACTOR)
 
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     action = build_fwd_action(b, egress_ifindex)

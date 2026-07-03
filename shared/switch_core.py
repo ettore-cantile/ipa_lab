@@ -7,11 +7,13 @@ Usage:
   Method 2 (QAT):           python3 switch_core.py weights_method2.json
   Method 3 (OpenFlow-like): python3 switch_core.py weights.json openflow
   Method 4 (IPA Demo):      python3 switch_core.py weights_method2.json ipa_demo
+  Custom model_id:          python3 switch_core.py weights.json openflow 99
 """
 import sys
 
 WEIGHTS_FILE = sys.argv[1] if len(sys.argv) > 1 else "weights.json"
 METHOD_FLAG  = sys.argv[2] if len(sys.argv) > 2 else ""
+MODEL_ID     = int(sys.argv[3]) if len(sys.argv) > 3 else 42
 
 if METHOD_FLAG == "openflow":
     from methods.method3_openflow import run
@@ -22,4 +24,4 @@ elif WEIGHTS_FILE == "weights.json":
 else:
     from methods.method2_qat import run
 
-run(WEIGHTS_FILE)
+run(WEIGHTS_FILE, MODEL_ID)
