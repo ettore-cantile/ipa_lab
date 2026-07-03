@@ -7,7 +7,10 @@ Struttura ipa_hdr letta dal kernel (21 byte fissi, packed):
     model_id        : u8
     model_type      : u8   (0x00 = FC-NN)
     param_size      : u8   (7 = int8/7-bit)
-    scale_factor    : u16  big-endian, letto con bpf_ntohs()
+    scale_factor    : u16  big-endian — presente nell'header ma NON usato
+                           dal kernel per l'inferenza: il kernel usa sempre
+                           m->scale_factor dalla model_cache (caricato dal CP).
+                           Usato solo dal CP nel Method 4 (model_miss_event).
 
   [Model Specifications]  4 byte
     input_size      : u8   (65)
@@ -60,7 +63,8 @@ struct ipa_hdr {
     __u8   model_id;
     __u8   model_type;         /* 0x00 = fully-connected NN          */
     __u8   param_size;         /* 7    = int8 / 7-bit quantization   */
-    __be16 scale_factor;       /* big-endian, leggere con bpf_ntohs()*/
+    __be16 scale_factor;       /* big-endian — letto dal CP nel Method 4,
+                                  NON usato dal kernel per l'inferenza  */
 
     /* Model Specifications (4 byte) */
     __u8   input_size;         /* 65 = 6+6+1+52                      */
@@ -146,8 +150,7 @@ int ipa_switch(struct xdp_md *ctx) {
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;
 
-    __u8  target_model = ipa->model_id;
-    __u16 hdr_scale    = bpf_ntohs(ipa->scale_factor);
+    __u8 target_model = ipa->model_id;
 
     struct model_data *m = model_cache.lookup(&target_model);
 
@@ -173,10 +176,11 @@ int ipa_switch(struct xdp_md *ctx) {
     }
 
     /*
-     * scale_factor: preferisce il valore nell'header IPA (dal pacchetto)
-     * se non zero, altrimenti usa quello memorizzato in cache dal CP.
+     * scale_factor: usa SEMPRE quello dalla model_cache (caricato dal CP).
+     * Il valore nell'header IPA e' ignorato per l'inferenza — serve solo
+     * al CP nel Method 4 per popolare la cache al primo pacchetto.
      */
-    __u16 scale = (hdr_scale != 0) ? hdr_scale : m->scale_factor;
+    __u16 scale = m->scale_factor;
     if (scale == 0) return XDP_PASS;
 
     /* ================================================================

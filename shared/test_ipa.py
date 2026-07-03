@@ -5,17 +5,24 @@ test_ipa.py — Performance tester per IPA switch.
 Usa lo stesso IPA_HDR paper-compliant di send_ipa.py (21 byte fissi).
 Invia N pacchetti con TTL casuale (30-64) e model_id configurabile.
 
+Nota scale_factor nell'header IPA:
+  Il kernel NON usa il scale_factor dall'header per l'inferenza —
+  usa sempre quello della model_cache caricato dal CP.
+  Il campo viene comunque popolato correttamente (default 128) per
+  completezza del formato paper e per il Method 4 (usato dal CP).
+
 Per il Method 4, usare --weights-file: il PRIMO pacchetto embeds i pesi,
 i successivi vengono inviati senza payload (modello gia' in cache).
 
 Usage:
   python3 test_ipa.py [--dest HOST] [--count N] [--delay SEC]
                       [--model-id ID] [--weights-file PATH]
+                      [--scale-factor N]
 Esempi:
   python3 test_ipa.py --dest frankfurt --count 100
-  python3 test_ipa.py --dest frankfurt --count 50 --model-id 99
-  python3 test_ipa.py --dest frankfurt --count 50 --model-id 99 \
-                      --weights-file /shared/weights.json
+  python3 test_ipa.py --dest frankfurt --count 50 --model-id 42
+  python3 test_ipa.py --dest frankfurt --count 50 --model-id 42 \
+                      --weights-file /shared/weights_method2.json
 """
 import argparse
 import time
@@ -61,17 +68,21 @@ parser.add_argument("--dest",         type=str,   default="frankfurt")
 parser.add_argument("--count",        type=int,   default=10)
 parser.add_argument("--delay",        type=float, default=0.0)
 parser.add_argument("--model-id",     type=int,   default=42)
+parser.add_argument("--scale-factor", type=int,   default=128,
+                    help="scale_factor nell'header IPA (default 128). "
+                         "Non influenza l'inferenza del kernel (che usa la cache), "
+                         "ma deve corrispondere a quello usato dal CP nel Method 4.")
 parser.add_argument("--weights-file", type=str,   default=None,
-                    help="Se fornito, il 1° pacchetto embeds i pesi (Method 4)")
+                    help="Se fornito, il 1o pacchetto embeds i pesi (Method 4)")
 args = parser.parse_args()
 
-N        = args.count
-DELAY    = args.delay
-DEST     = args.dest
-MODEL_ID = args.model_id
+N            = args.count
+DELAY        = args.delay
+DEST         = args.dest
+MODEL_ID     = args.model_id
+SCALE_FACTOR = args.scale_factor
 
 weights_payload = b""
-scale_factor    = 128
 if args.weights_file:
     try:
         with open(args.weights_file) as f:
@@ -81,21 +92,15 @@ if args.weights_file:
     except Exception as e:
         print(f"[test_ipa] Warning: {e}")
 
-try:
-    with open("/shared/weights_float.json") as f:
-        scale_factor = json.load(f)["scale_factor"]
-except Exception:
-    pass
-
 print(f"\n[test_ipa] Sending {N} packets to '{DEST}'")
-print(f"  model_id={MODEL_ID} | scale_factor={scale_factor} | "
+print(f"  model_id={MODEL_ID} | scale_factor={SCALE_FACTOR} | "
       f"header=21 byte | weights={'1st pkt only' if weights_payload else 'none'}")
 print()
 
 t_start = time.perf_counter()
 for i in range(N):
     ttl = random.randint(30, 64)
-    ipa_hdr = IPA_HDR(model_id=MODEL_ID, scale_factor=scale_factor)
+    ipa_hdr = IPA_HDR(model_id=MODEL_ID, scale_factor=SCALE_FACTOR)
     packet  = IP(dst=DEST, ttl=ttl) / UDP(dport=9999) / ipa_hdr
 
     if i == 0 and weights_payload:
