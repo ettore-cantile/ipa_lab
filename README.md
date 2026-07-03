@@ -87,17 +87,20 @@ python3 /shared/switch_core.py qat 99
 
 ## Testing
 
+All commands below assume the router node is `frankfurt` and the sender node is `darmstadt`.
+Replace node names and `--model-id` as needed for your topology.
+
 ### Method 1 — PTQ
 
 ```bash
 # Router (frankfurt)
 python3 /shared/switch_core.py ptq
 
-# Sender (darmstadt) — nessun payload di pesi
+# Sender (darmstadt) — no weight payload needed
 python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 ```
 
-**Atteso:** FAKE HIT elevati (errore PTQ), pochi TRUE HIT, qualche MISS.
+**Expected:** high FAKE HIT (PTQ quantization error), few or no TRUE HIT, some MISS.
 
 ---
 
@@ -111,7 +114,7 @@ python3 /shared/switch_core.py qat
 python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 ```
 
-**Atteso:** TRUE HIT ~100%, FAKE HIT = 0, MISS = 0.
+**Expected:** TRUE HIT ~100%, FAKE HIT = 0, MISS = 0.
 
 ---
 
@@ -121,30 +124,31 @@ python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 # Router (frankfurt)
 python3 /shared/switch_core.py openflow
 
-# Sender (darmstadt) — primo round: MISS mentre la fwd_table si popola
+# Sender (darmstadt) — first round: all MISS while fwd_table is being populated
 python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 
-# Sender (darmstadt) — secondo round: TRUE HIT sui TTL gia' visti
+# Sender (darmstadt) — second round: TRUE HIT for TTLs already seen
 python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 ```
 
-**Atteso primo round:** tutti MISS + log `[CP] FWD MISS | TTL=X -> INSTALLED` sul router.
-**Atteso secondo round:** TRUE HIT crescenti, MISS solo per TTL mai visti.
+**Expected first round:** all MISS + router logs `[CP] FWD MISS | TTL=X -> INSTALLED` for each new TTL.
+
+**Expected second round:** TRUE HIT growing, MISS only for TTL values not yet seen.
 
 ---
 
 ### Method 4 — IPA Demo
 
 ```bash
-# Router (frankfurt) — model_cache e fwd_table partono vuote
+# Router (frankfurt) — model_cache and fwd_table start empty
 python3 /shared/switch_core.py ipa_demo
 
-# Sender (darmstadt) — primo pacchetto con pesi nel payload
+# Sender (darmstadt) — first packet carries the model weights in the payload
 python3 /shared/test_ipa.py --dest frankfurt --count 30 \
         --model-id 42 --weights-file /shared/weights_method2.json
 ```
 
-Il primo pacchetto triggera sul router:
+The first packet triggers on the router:
 ```
 [CP] MODEL MISS | model_id=42 | weights extracted from packet: [42, 35, 127, -58]
 [cache] Model 42 loaded | 4 weights | scale_factor=128
@@ -152,23 +156,23 @@ Il primo pacchetto triggera sul router:
 [CP] Next packets for model_id=42 -> TRUE HIT (<1 ms)
 ```
 
-I pacchetti successivi con lo stesso TTL producono TRUE HIT direttamente dal kernel.
-TTL non ancora visti producono `[CP] FWD MISS (safety net)` finché non sono installati.
+Subsequent packets with the same TTL produce TRUE HIT directly from the kernel.
+Unseen TTL values trigger `[CP] FWD MISS (safety net)` until their rules are installed.
 
-**Atteso alla fine:** TRUE HIT crescenti, FAKE HIT = 0.
+**Expected at the end:** TRUE HIT growing, FAKE HIT = 0.
 
 ---
 
-### Invio pacchetto singolo (`send_ipa.py`)
+### Single-packet sender (`send_ipa.py`)
 
 ```bash
-# Pacchetto senza pesi (model gia' in cache)
+# Packet without weights (model already in cache)
 python3 /shared/send_ipa.py frankfurt 42
 
-# Pacchetto con pesi nel payload (Method 4, primo pacchetto)
+# Packet with weights in payload (Method 4, first packet)
 python3 /shared/send_ipa.py frankfurt 42 /shared/weights_method2.json
 
-# model_id personalizzato
+# Custom model_id
 python3 /shared/send_ipa.py frankfurt 99 /shared/weights_method2.json
 ```
 
