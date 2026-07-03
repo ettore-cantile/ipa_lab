@@ -44,10 +44,11 @@ ipa_lab/
 │   ├── switch_core.py          # Entry point: selects and runs the chosen method
 │   ├── ebpf_program.py         # eBPF/XDP C code shared by all methods
 │   ├── common.py               # Shared helpers (load_bpf, populate tables, stats_loop…)
-│   ├── send_ipa.py             # Scapy sender: builds and sends IPA packets
-│   ├── weights.json            # Int8 weights — PTQ (Method 1 & 3)
+│   ├── send_ipa.py             # Scapy sender: builds and sends a single IPA packet
+│   ├── test_ipa.py             # Scapy sender: performance tester (N packets)
+│   ├── weights.json            # Int8 weights — PTQ (Method 1)
 │   ├── weights_float.json      # Float weights + scale_factor — PTQ reference
-│   ├── weights_method2.json    # Int8 weights — QAT (Method 2 & 4)
+│   ├── weights_method2.json    # Int8 weights — QAT (Method 2, 3, 4)
 │   └── methods/
 │       ├── method1_ptq.py      # Method 1 — Post-Training Quantization
 │       ├── method2_qat.py      # Method 2 — Quantization-Aware Training
@@ -61,18 +62,114 @@ ipa_lab/
 
 ## How to Run
 
+All commands are run **inside the Kathara containers** from `/shared`.
+`switch_core.py` is launched on the **router node** (e.g. `frankfurt`);
+`test_ipa.py` is launched on a **sender node** (e.g. `darmstadt`).
+
 ```bash
-# Method 1 — PTQ
-python3 /shared/switch_core.py
+# Method 1 — PTQ (default)
+python3 /shared/switch_core.py ptq
 
 # Method 2 — QAT
-python3 /shared/switch_core.py weights_method2.json
+python3 /shared/switch_core.py qat
 
 # Method 3 — OpenFlow-like
-python3 /shared/switch_core.py weights.json openflow
+python3 /shared/switch_core.py openflow
 
-# Method 4 — IPA Demo (Wow Factor)
-python3 /shared/switch_core.py weights_method2.json ipa_demo
+# Method 4 — IPA Demo
+python3 /shared/switch_core.py ipa_demo
+
+# Custom model_id (any method)
+python3 /shared/switch_core.py qat 99
+```
+
+---
+
+## Testing
+
+### Method 1 — PTQ
+
+```bash
+# Router (frankfurt)
+python3 /shared/switch_core.py ptq
+
+# Sender (darmstadt) — nessun payload di pesi
+python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+```
+
+**Atteso:** FAKE HIT elevati (errore PTQ), pochi TRUE HIT, qualche MISS.
+
+---
+
+### Method 2 — QAT
+
+```bash
+# Router (frankfurt)
+python3 /shared/switch_core.py qat
+
+# Sender (darmstadt)
+python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+```
+
+**Atteso:** TRUE HIT ~100%, FAKE HIT = 0, MISS = 0.
+
+---
+
+### Method 3 — OpenFlow
+
+```bash
+# Router (frankfurt)
+python3 /shared/switch_core.py openflow
+
+# Sender (darmstadt) — primo round: MISS mentre la fwd_table si popola
+python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+
+# Sender (darmstadt) — secondo round: TRUE HIT sui TTL gia' visti
+python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+```
+
+**Atteso primo round:** tutti MISS + log `[CP] FWD MISS | TTL=X -> INSTALLED` sul router.
+**Atteso secondo round:** TRUE HIT crescenti, MISS solo per TTL mai visti.
+
+---
+
+### Method 4 — IPA Demo
+
+```bash
+# Router (frankfurt) — model_cache e fwd_table partono vuote
+python3 /shared/switch_core.py ipa_demo
+
+# Sender (darmstadt) — primo pacchetto con pesi nel payload
+python3 /shared/test_ipa.py --dest frankfurt --count 30 \
+        --model-id 42 --weights-file /shared/weights_method2.json
+```
+
+Il primo pacchetto triggera sul router:
+```
+[CP] MODEL MISS | model_id=42 | weights extracted from packet: [42, 35, 127, -58]
+[cache] Model 42 loaded | 4 weights | scale_factor=128
+[CP] model_id=42 LOADED & rule INSTALLED | key=XXXXX | TTL=YY | elapsed=1.XX ms
+[CP] Next packets for model_id=42 -> TRUE HIT (<1 ms)
+```
+
+I pacchetti successivi con lo stesso TTL producono TRUE HIT direttamente dal kernel.
+TTL non ancora visti producono `[CP] FWD MISS (safety net)` finché non sono installati.
+
+**Atteso alla fine:** TRUE HIT crescenti, FAKE HIT = 0.
+
+---
+
+### Invio pacchetto singolo (`send_ipa.py`)
+
+```bash
+# Pacchetto senza pesi (model gia' in cache)
+python3 /shared/send_ipa.py frankfurt 42
+
+# Pacchetto con pesi nel payload (Method 4, primo pacchetto)
+python3 /shared/send_ipa.py frankfurt 42 /shared/weights_method2.json
+
+# model_id personalizzato
+python3 /shared/send_ipa.py frankfurt 99 /shared/weights_method2.json
 ```
 
 ---
@@ -94,7 +191,7 @@ The pipeline produces:
 - `weights.json` — int8 quantized weights for the eBPF switch
 - `weights_float.json` — float weights + `scale_factor` (PTQ reference)
 
-Copy `weights.json` (and `weights_float.json` for Method 1/3) into `shared/` before starting the Kathara lab.
+Copy `weights.json` (and `weights_float.json` for Method 1) into `shared/` before starting the Kathara lab.
 
 ---
 
@@ -209,9 +306,10 @@ When the **first packet** for a new `model_id` arrives:
 1. The kernel detects the model is missing from `model_cache`.
 2. It reads the 4 raw int8 weight bytes embedded in the UDP payload immediately after the IPA header.
 3. It emits a `model_miss_event` to userspace carrying those weights.
-4. The CP extracts the weights, loads them into `model_cache`, and installs the forwarding rule — all in a single callback (~2 ms).
+4. The CP extracts the weights, loads them into `model_cache`, and installs the forwarding rule for that TTL — all in a single callback (~2 ms).
+5. Subsequent TTL values not yet seen trigger `FWD MISS` → safety net installs rules on-demand.
 
-From the **second packet** onwards:
+From the **second packet** onwards (same TTL):
 - The kernel finds the model in cache, computes the key, finds the rule → **TRUE HIT** (<1 ms). The CP is never involved again.
 
 #### Sending packets
@@ -272,7 +370,7 @@ Method 4 is the proof that the IPA paradigm works end-to-end: the intelligence i
 | **FAKE HIT** | High (PTQ error) | 0% | Warm-up only | 0% |
 | **MISS** | Medium | 0% | One per new TTL | One (very first pkt) |
 | **Scalability** | Fixed TTL range | Fixed TTL range | Unlimited | Unlimited |
-| **SCALE_FACTOR** | Auto (e.g. 24) | Fixed 128 | Auto (e.g. 24) | Fixed 128 |
+| **SCALE_FACTOR** | Fixed 128 | Fixed 128 | Fixed 128 | Fixed 128 |
 
 ---
 
