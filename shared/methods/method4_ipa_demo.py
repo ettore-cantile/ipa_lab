@@ -7,8 +7,10 @@ Al primo pacchetto per un nuovo model_id:
   1. Il kernel rileva che il modello non e' in cache.
   2. Emette un model_miss_event con i 4 byte di pesi dal payload.
   3. Il CP carica i pesi in model_cache (~1-3 ms).
-  4. Il CP installa subito le regole per tutti i TTL 30-64.
-Dai pacchetti successivi: TRUE HIT direttamente dal kernel (<1 ms).
+  4. Il CP installa la regola SOLO per il TTL del primo pacchetto.
+Per i TTL successivi non ancora visti: FWD MISS -> safety net installa
+la regola on-demand (comportamento realistico IPA).
+Dai pacchetti successivi con TTL gia' visti: TRUE HIT (<1 ms).
 
 File usati:
   /shared/weights_method2.json : usato dal sender per il payload
@@ -68,7 +70,9 @@ class ModelMissEvent(ctypes.Structure):
 def run(model_id: int = 42):
     print("[Method 4 - IPA Demo] | model_cache e fwd_table partono VUOTE")
     print("  Il modello viaggia nel pacchetto. Primo pacchetto carica il modello.")
-    print("  Pacchetti successivi: TRUE HIT direttamente dal kernel (<1 ms).")
+    print("  Regola installata solo per il TTL del 1o pacchetto.")
+    print("  TTL successivi non visti: FWD MISS -> safety net on-demand.")
+    print("  Pacchetti successivi per TTL gia' visti: TRUE HIT (<1 ms).")
     print()
 
     b  = load_bpf(EBPF_PROGRAM)
@@ -78,7 +82,6 @@ def run(model_id: int = 42):
     action = build_fwd_action(b, egress_ifindex)
     fwd    = b.get_table("fwd_table")
     vk     = b.get_table("valid_keys")
-    if_idx = socket.if_nametoindex("eth1")
 
     loaded_models = set()
 
@@ -97,24 +100,22 @@ def run(model_id: int = 42):
             ctypes.c_int8(ev.w3).value,
         ]
         print(f"\n[CP] MODEL MISS | model_id={ev.model_id} | "
-              f"weights from packet: {weights}")
+              f"weights extracted from packet: {weights}")
 
         populate_model_cache(b, ev.model_id, weights, SCALE_FACTOR)
         loaded_models.add(ev.model_id)
 
-        # Installa subito le regole per TUTTI i TTL 30-64
-        # cosi' non ci sono FWD MISS successivi
-        for ttl in range(30, 65):
-            iv = [ev.model_id, ttl, if_idx, 65]
-            output_raw = sum(iv[i] * weights[i] for i in range(4))
-            key = (output_raw + OFFSET * SCALE_FACTOR) // SCALE_FACTOR
-            fwd[ctypes.c_ulonglong(key)] = action
-            vk[ctypes.c_uint8(ttl)]      = ctypes.c_ulonglong(key)
+        # Installa la regola SOLO per il TTL del primo pacchetto
+        iv = [ev.model_id, ev.ttl, ev.ingress_ifindex, ev.input_size]
+        output_raw = sum(iv[i] * weights[i] for i in range(4))
+        key = (output_raw + OFFSET * SCALE_FACTOR) // SCALE_FACTOR
+        fwd[ctypes.c_ulonglong(key)] = action
+        vk[ctypes.c_uint8(ev.ttl)]   = ctypes.c_ulonglong(key)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        print(f"[CP] model_id={ev.model_id} LOADED | "
-              f"35 regole TTL 30-64 installate | elapsed={elapsed_ms:.2f} ms")
-        print(f"[CP] Pacchetti successivi per model_id={ev.model_id} -> TRUE HIT (<1 ms)")
+        print(f"[CP] model_id={ev.model_id} LOADED & rule INSTALLED | "
+              f"key={key} | TTL={ev.ttl} | elapsed={elapsed_ms:.2f} ms")
+        print(f"[CP] Next packets for model_id={ev.model_id} -> TRUE HIT (<1 ms)")
 
     def handle_fwd_miss(cpu, data, size):
         raw = ctypes.cast(data, ctypes.POINTER(ctypes.c_byte * size)).contents
