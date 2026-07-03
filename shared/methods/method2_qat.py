@@ -1,13 +1,13 @@
 """
 Method 2 — QAT (Quantization-Aware Training)
 
-Fixed SCALE_FACTOR = 128. The fwd_table is pre-populated with keys
-computed using pure integer arithmetic (identical to the kernel).
-Kernel and CP are aligned -> nearly all TRUE HITs.
+SCALE_FACTOR=128 fisso. La fwd_table e' pre-popolata con chiavi
+calcolate usando aritmetica intera pura (identica al kernel).
+Kernel e CP sono allineati -> quasi tutti TRUE HIT.
 
-Weights file: weights_method2.json
+File usati:
+  /shared/weights_method2.json : pesi int8 (QAT)
 """
-import ctypes
 import socket
 from bcc import BPF
 from ebpf_program import EBPF_PROGRAM
@@ -20,12 +20,12 @@ from common import (
 SCALE_FACTOR = 128
 
 
-def run(weights_file: str = "weights_method2.json", model_id: int = 42):
-    weights_path = f"/shared/{weights_file}"
-    print(f"[Method 2 - QAT] | Weights file: {weights_file} | model_id: {model_id}")
+def run(model_id: int = 42):
+    weights_path = "/shared/weights_method2.json"
+    print(f"[Method 2 - QAT] | model_id: {model_id}")
 
     integer_weights = load_weights(weights_path)
-    int8_weights    = [int(w) for w in integer_weights[:4]]  # raw int8, no divisione
+    int8_weights    = [int(w) for w in integer_weights[:4]]
     print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
     print(f"  Raw int8 weights: {int8_weights}")
 
@@ -37,8 +37,6 @@ def run(weights_file: str = "weights_method2.json", model_id: int = 42):
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     action = build_fwd_action(b, egress_ifindex)
 
-    # integer_arithmetic=True: aritmetica intera pura identica al kernel
-    # -> TRUE HIT attesi
     populate_fwd_and_valid_keys(b, action, int8_weights, SCALE_FACTOR,
                                 integer_arithmetic=True)
 
