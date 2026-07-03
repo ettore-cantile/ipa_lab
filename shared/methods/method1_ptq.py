@@ -8,13 +8,15 @@ MISS (TTL per cui la chiave float non collide con nessuna entry).
 Scopo: misurare l'impatto dell'errore PTQ rispetto al metodo 2 (QAT).
 
 Nota scale_factor:
-  La model_cache viene popolata con SCALE_FACTOR=128 fisso, allineato
-  al kernel. Il CP usa i pesi float originali per calcolare le chiavi
-  della fwd_table (integer_arithmetic=False) -> divergenza intenzionale.
+  SCALE_FACTOR viene letto da weights_float.json, dove extract_weights.py
+  lo ha calcolato come floor(127 / max|w|). Questo e' lo stesso valore
+  usato per quantizzare weights.json -> model_cache e kernel sono allineati.
+  Il CP usa i pesi float originali per le chiavi della fwd_table
+  (integer_arithmetic=False) -> divergenza intenzionale -> FAKE HIT.
 
 File usati:
   /shared/weights.json       : pesi int8 per la model_cache del kernel
-  /shared/weights_float.json : pesi float originali per le chiavi CP
+  /shared/weights_float.json : pesi float originali + scale_factor
 """
 import ctypes
 import socket
@@ -29,8 +31,6 @@ from common import (
     attach_xdp, stats_loop, EGRESS_IFACE
 )
 
-SCALE_FACTOR = 128  # fisso, allineato al kernel
-
 
 def run(model_id: int = 42):
     weights_path = "/shared/weights.json"
@@ -43,12 +43,14 @@ def run(model_id: int = 42):
 
     with open(float_path) as f:
         float_data = json.load(f)
-    cp_weights = float_data["weights"][:4]   # pesi float originali
+
+    SCALE_FACTOR = float_data["scale_factor"]  # calcolato da extract_weights.py
+    cp_weights   = float_data["weights"][:4]   # pesi float originali
 
     integer_weights = load_weights(weights_path)
     int8_equiv = [ctypes.c_int8(int(round(w * SCALE_FACTOR))).value / SCALE_FACTOR
                   for w in cp_weights]
-    print(f"  SCALE_FACTOR  = {SCALE_FACTOR}  (fisso, allineato al kernel)")
+    print(f"  SCALE_FACTOR  = {SCALE_FACTOR}  (da weights_float.json)")
     print(f"  Float weights : {[f'{w:.6f}' for w in cp_weights]}")
     print(f"  Int8 equiv    : {[f'{w:.6f}' for w in int8_equiv]}")
     print(f"  Quant error   : {[f'{abs(a-b):.6f}' for a, b in zip(cp_weights, int8_equiv)]}")
@@ -56,7 +58,6 @@ def run(model_id: int = 42):
     b  = load_bpf(EBPF_PROGRAM)
     fn = b.load_func("ipa_switch", BPF.XDP)
 
-    # Carica i pesi int8 nella cache con scale=128 (identico al kernel)
     populate_model_cache(b, model_id, integer_weights, SCALE_FACTOR)
 
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
