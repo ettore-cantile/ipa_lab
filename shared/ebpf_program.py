@@ -207,17 +207,39 @@ int ipa_switch(struct xdp_md *ctx) {
     __u64 *correct_key         = valid_keys.lookup(&ip->ttl);
 
     if (action != NULL) {
-        int stat_index = 2;  /* FAKE HIT default */
-        if (correct_key && *correct_key == key)
-            stat_index = 0;  /* TRUE HIT */
-        __u64 *val = pkt_stats.lookup(&stat_index);
-        if (val) __sync_fetch_and_add(val, 1);
+        if (correct_key && *correct_key == key) {
+            /* TRUE HIT: valid_keys confirms the key -> forward */
+            int stat_index = 0;
+            __u64 *val = pkt_stats.lookup(&stat_index);
+            if (val) __sync_fetch_and_add(val, 1);
 
-        __builtin_memcpy(eth->h_source, action->src_mac, 6);
-        __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
-        return bpf_redirect(action->ifindex, 0);
+            __builtin_memcpy(eth->h_source, action->src_mac, 6);
+            __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
+            return bpf_redirect(action->ifindex, 0);
+        } else {
+            /*
+             * FAKE HIT: fwd_table has an entry but valid_keys does NOT
+             * confirm this key for the current TTL (hash collision on
+             * the first packet for this TTL).
+             * Treat as miss: record stat, notify CP via miss_event,
+             * and do NOT forward to avoid incorrect redirect.
+             */
+            int stat_index = 2;  /* FAKE HIT */
+            __u64 *val = pkt_stats.lookup(&stat_index);
+            if (val) __sync_fetch_and_add(val, 1);
+
+            struct miss_event ev = {};
+            ev.model_id        = ipa->model_id;
+            ev.ttl             = ip->ttl;
+            ev.ingress_ifindex = ctx->ingress_ifindex;
+            ev.input_size      = ipa->input_size;
+            ev.key             = key;
+            miss_events.perf_submit(ctx, &ev, sizeof(ev));
+            return XDP_PASS;
+        }
     } else {
-        int stat_index = 1;  /* MISS */
+        /* MISS: no entry in fwd_table at all */
+        int stat_index = 1;
         __u64 *val = pkt_stats.lookup(&stat_index);
         if (val) __sync_fetch_and_add(val, 1);
 
