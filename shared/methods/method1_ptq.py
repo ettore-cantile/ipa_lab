@@ -1,22 +1,22 @@
 """
-Method 1 — PTQ (Post-Training Quantization)
+Method 1 - PTQ (Post-Training Quantization)
 
-Il CP popola la fwd_table con chiavi calcolate dai pesi FLOAT originali.
-Il kernel usa i pesi int8 -> le chiavi divergono per errore di quantizzazione.
-Questo produce FAKE HIT (pacchetti reindirizzati su chiave sbagliata) e
-MISS (TTL per cui la chiave float non collide con nessuna entry).
-Scopo: misurare l'impatto dell'errore PTQ rispetto al metodo 2 (QAT).
+The CP populates fwd_table with keys computed from the original FLOAT weights.
+The kernel uses int8 weights -> keys diverge because of quantization error.
+This produces FAKE HIT events (packets redirected on the wrong key) and MISS
+events (TTL values whose float key does not collide with any entry).
+Goal: measure the impact of PTQ error compared with Method 2 (QAT).
 
-Nota scale_factor:
-  SCALE_FACTOR viene letto da weights_float.json, dove extract_weights.py
-  lo ha calcolato come floor(127 / max|w|). Questo e' lo stesso valore
-  usato per quantizzare weights.json -> model_cache e kernel sono allineati.
-  Il CP usa i pesi float originali per le chiavi della fwd_table
-  (integer_arithmetic=False) -> divergenza intenzionale -> FAKE HIT.
+scale_factor note:
+  SCALE_FACTOR is read from weights_float.json, where extract_weights.py
+  computed it as floor(127 / max|w|). This is the same value used to quantize
+  weights.json -> model_cache and kernel are aligned.
+  The CP uses original float weights for fwd_table keys
+  (integer_arithmetic=False) -> intentional divergence -> FAKE HIT.
 
-File usati:
-  /shared/weights.json       : pesi int8 per la model_cache del kernel
-  /shared/weights_float.json : pesi float originali + scale_factor
+Files used:
+  /shared/weights.json       : int8 weights for the kernel model_cache
+  /shared/weights_float.json : original float weights + scale_factor
 """
 import ctypes
 import socket
@@ -44,13 +44,13 @@ def run(model_id: int = 42):
     with open(float_path) as f:
         float_data = json.load(f)
 
-    SCALE_FACTOR = float_data["scale_factor"]  # calcolato da extract_weights.py
-    cp_weights   = float_data["weights"][:4]   # pesi float originali
+    SCALE_FACTOR = float_data["scale_factor"]  # computed by extract_weights.py
+    cp_weights   = float_data["weights"][:4]   # original float weights
 
     integer_weights = load_weights(weights_path)
     int8_equiv = [ctypes.c_int8(int(round(w * SCALE_FACTOR))).value / SCALE_FACTOR
                   for w in cp_weights]
-    print(f"  SCALE_FACTOR  = {SCALE_FACTOR}  (da weights_float.json)")
+    print(f"  SCALE_FACTOR  = {SCALE_FACTOR}  (from weights_float.json)")
     print(f"  Float weights : {[f'{w:.6f}' for w in cp_weights]}")
     print(f"  Int8 equiv    : {[f'{w:.6f}' for w in int8_equiv]}")
     print(f"  Quant error   : {[f'{abs(a-b):.6f}' for a, b in zip(cp_weights, int8_equiv)]}")
@@ -63,8 +63,8 @@ def run(model_id: int = 42):
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     action = build_fwd_action(b, egress_ifindex)
 
-    # integer_arithmetic=False: chiavi calcolate con float originali
-    # -> divergenza rispetto al kernel (che usa int8) -> FAKE HIT visibili
+    # integer_arithmetic=False: keys computed from original floats
+    # -> divergence from the kernel (which uses int8) -> visible FAKE HIT events
     populate_fwd_and_valid_keys(b, action, cp_weights, SCALE_FACTOR,
                                 integer_arithmetic=False)
 

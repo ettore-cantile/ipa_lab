@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-test_ipa.py — Performance tester per IPA switch.
+test_ipa.py - Performance tester for the IPA switch.
 
-Usa lo stesso IPA_HDR paper-compliant di send_ipa.py (21 byte fissi).
-Invia N pacchetti con TTL casuale (30-64) e model_id configurabile.
+Uses the same paper-compliant IPA_HDR as send_ipa.py (21 fixed bytes).
+Sends N packets with random TTL values (30-64) and configurable model_id.
 
-Nota scale_factor nell'header IPA:
-  Il kernel NON usa il scale_factor dall'header per l'inferenza —
-  usa sempre quello della model_cache caricato dal CP.
-  Il campo viene comunque popolato correttamente (default 128) per
-  completezza del formato paper e per il Method 4 (usato dal CP).
+scale_factor note in the IPA header:
+  The kernel does NOT use scale_factor from the header for inference -
+  it always uses the one from model_cache loaded by the CP.
+  The field is still populated correctly (default 128) for paper-format
+  completeness and for Method 4 (used by the CP).
 
-Per il Method 4, usare --weights-file: il PRIMO pacchetto embeds i pesi,
-i successivi vengono inviati senza payload (modello gia' in cache).
+For Method 4, use --weights-file: the FIRST packet embeds the weights,
+and the following packets are sent without payload (model already in cache).
 
 Usage:
   python3 test_ipa.py [--dest HOST] [--count N] [--delay SEC]
                       [--model-id ID] [--weights-file PATH]
                       [--scale-factor N]
-Esempi:
+Examples:
   python3 test_ipa.py --dest frankfurt --count 100
   python3 test_ipa.py --dest frankfurt --count 50 --model-id 42
   python3 test_ipa.py --dest frankfurt --count 50 --model-id 42 \
@@ -69,11 +69,11 @@ parser.add_argument("--count",        type=int,   default=10)
 parser.add_argument("--delay",        type=float, default=0.0)
 parser.add_argument("--model-id",     type=int,   default=42)
 parser.add_argument("--scale-factor", type=int,   default=128,
-                    help="scale_factor nell'header IPA (default 128). "
-                         "Non influenza l'inferenza del kernel (che usa la cache), "
-                         "ma deve corrispondere a quello usato dal CP nel Method 4.")
+                    help="scale_factor in the IPA header (default 128). "
+                         "It does not affect kernel inference (which uses the cache), "
+                         "but it must match the one used by the CP in Method 4.")
 parser.add_argument("--weights-file", type=str,   default=None,
-                    help="Se fornito, il 1o pacchetto embeds i pesi (Method 4)")
+                    help="If provided, the 1st packet embeds the weights (Method 4)")
 args = parser.parse_args()
 
 N            = args.count
@@ -120,4 +120,4 @@ t_end = time.perf_counter()
 elapsed = t_end - t_start
 print(f"\n[test_ipa] Done. {N} pkts in {elapsed:.3f}s "
       f"({N/elapsed:.1f} pkt/s)")
-print("[!] Controlla i contatori TRUE HIT / FAKE HIT / MISS sul router.")
+print("[!] Check the TRUE HIT / FAKE HIT / MISS counters on the router.")

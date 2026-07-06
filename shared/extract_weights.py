@@ -30,7 +30,7 @@ print(f"SCALE_FACTOR = floor(127 / {max_abs:.6f}) = {SCALE_FACTOR}")
 integer_weights = []
 for w_float in all_floats:
     w_int = int(round(w_float * SCALE_FACTOR))
-    w_int = max(-128, min(127, w_int))  # safety clamp (non dovrebbe scattare)
+    w_int = max(-128, min(127, w_int))  # safety clamp (should not trigger)
     integer_weights.append(w_int)
 
 # Verify that no weight was clamped

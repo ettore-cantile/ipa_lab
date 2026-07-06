@@ -1,12 +1,12 @@
 """
-Method 3 — OpenFlow-like (reactive rule installation)
+Method 3 - OpenFlow-like (reactive rule installation)
 
-fwd_table parte VUOTA. Le regole vengono installate dal CP on-demand
-quando arriva un FWD MISS, esattamente come OpenFlow.
-Il primo pacchetto per ogni TTL produce un MISS, i successivi TRUE HIT.
+fwd_table starts EMPTY. Rules are installed by the CP on-demand when a FWD MISS
+arrives, exactly like OpenFlow.
+The first packet for each TTL produces a MISS; the next ones are TRUE HIT.
 
-File usati:
-  /shared/weights_method2.json : pesi int8 (QAT)
+Files used:
+  /shared/weights_method2.json : int8 weights (QAT)
 """
 import ctypes
 import socket

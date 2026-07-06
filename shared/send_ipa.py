@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-send_ipa.py — Invia un pacchetto IPA con header paper-compliant.
+send_ipa.py - Send an IPA packet with a paper-compliant header.
 
-Struttura header IPA (Section III del paper):
+IPA header structure (Section III of the paper):
 
   [Model Description]     5 byte
     model_id        : u8
@@ -27,13 +27,13 @@ Struttura header IPA (Section III del paper):
     n_output_types  : u8   (1)
     out0_code/count : u8,u8  (0x05, 7)   next_hop_or_drop
 
-  [Model Parameters]    319 byte  (payload Raw, int8 serializzati row-by-row)
+  [Model Parameters]    319 byte  (Raw payload, int8 serialized row-by-row)
 
-Totale: 21 byte header fisso + 319 byte pesi = 340 byte (~22.7% di MTU 1500)
+Total: 21-byte fixed header + 319 bytes of weights = 340 bytes (~22.7% of MTU 1500)
 
 Usage:
   python3 send_ipa.py <dst> [model_id] [weights_json]
-Esempi:
+Examples:
   python3 send_ipa.py frankfurt
   python3 send_ipa.py frankfurt 42
   python3 send_ipa.py frankfurt 99 /shared/weights.json
@@ -53,9 +53,9 @@ OUT_NEXT_HOP    = 0x05
 
 class IPA_HDR(Packet):
     """
-    Header IPA paper-compliant — 21 byte fissi.
-    Sezioni: Model Description + Model Specifications +
-             Input Descriptor (4 feature) + Output Descriptor.
+    Paper-compliant IPA header - 21 fixed bytes.
+    Sections: Model Description + Model Specifications +
+              Input Descriptor (4 features) + Output Descriptor.
     """
     name = "IPA_HDR"
     fields_desc = [
@@ -98,7 +98,7 @@ if len(sys.argv) >= 3:
         print("Error: model_id must be an integer.")
         sys.exit(1)
 
-# Pesi opzionali nel payload (Method 4)
+# Optional weights in the payload (Method 4)
 weights_payload = b""
 scale_factor    = 128
 if len(sys.argv) >= 4:
@@ -111,7 +111,7 @@ if len(sys.argv) >= 4:
     except Exception as e:
         print(f"[send_ipa] Warning: could not load weights: {e}")
 
-# Legge scale_factor da weights_float.json se disponibile
+# Read scale_factor from weights_float.json if available
 try:
     with open("/shared/weights_float.json") as f:
         scale_factor = json.load(f)["scale_factor"]

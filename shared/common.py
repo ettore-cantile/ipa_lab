@@ -1,10 +1,10 @@
 """
-common.py — Shared helpers usati da tutti i metodi.
+common.py - Shared helpers used by all methods.
 
-Nota chiave sul campo input_size:
-  Nel nuovo header IPA paper-compliant, input_size=65 (valore reale).
-  Il CP usa iv = [42, ttl, ifindex, 65] per calcolare le chiavi della
-  fwd_table, allineato con il kernel XDP che legge ipa->input_size.
+Key note about the input_size field:
+  In the new paper-compliant IPA header, input_size=65 (actual value).
+  The CP uses iv = [42, ttl, ifindex, 65] to compute fwd_table keys,
+  aligned with the XDP kernel code that reads ipa->input_size.
 """
 import json
 import ctypes
@@ -18,7 +18,7 @@ OFFSET        = 100000
 SRC_MAC       = [0x22, 0x8e, 0x26, 0xbb, 0xdf, 0xf5]
 DST_MAC       = [0x62, 0x45, 0x3d, 0xec, 0xc9, 0x80]
 
-# Numero totale pesi: fc1(260+4) + fc2(16+4) + out(28+7) = 319
+# Total number of weights: fc1(260+4) + fc2(16+4) + out(28+7) = 319
 N_WEIGHTS = 319
 
 
@@ -47,8 +47,8 @@ def build_fwd_action(b: BPF, egress_ifindex: int,
 def populate_model_cache(b: BPF, model_id: int,
                          integer_weights: list, scale_factor: int):
     """
-    Carica i pesi nella BPF map model_cache (capacity: N_WEIGHTS=319).
-    Se la lista e' piu' corta i byte restanti rimangono 0.
+    Load weights into the BPF model_cache map (capacity: N_WEIGHTS=319).
+    If the list is shorter, the remaining bytes stay 0.
     """
     cache = b.get_table("model_cache")
     entry = cache.Leaf()
@@ -63,12 +63,12 @@ def populate_model_cache(b: BPF, model_id: int,
 
 
 def _compute_key_float(iv: list, cp_weights: list) -> int:
-    """Method 1 PTQ: chiave con float originali -> FAKE HIT intenzionale."""
+    """Method 1 PTQ: key from original floats -> intentional FAKE HIT."""
     return int(sum(v * w for v, w in zip(iv, cp_weights))) + OFFSET
 
 
 def _compute_key_integer(iv: list, int8_weights: list, scale: int) -> int:
-    """Method 2/3 QAT: aritmetica intera identica al kernel -> TRUE HIT."""
+    """Method 2/3 QAT: integer arithmetic matching the kernel -> TRUE HIT."""
     output_raw = sum(v * ctypes.c_int8(w).value
                      for v, w in zip(iv, int8_weights))
     return (output_raw + OFFSET * scale) // scale
@@ -79,16 +79,16 @@ def populate_fwd_and_valid_keys(b: BPF, action, cp_weights: list,
                                 ingress_iface: str = INGRESS_IFACE,
                                 integer_arithmetic: bool = False):
     """
-    Pre-popola fwd_table e valid_keys per TTL 30-64.
+    Pre-populate fwd_table and valid_keys for TTL 30-64.
     iv = [model_id=42, ttl, ifindex, input_size=65]
-    input_size=65 riflette il valore reale nel nuovo header IPA.
+    input_size=65 reflects the actual value in the new IPA header.
     """
     fwd    = b.get_table("fwd_table")
     vk     = b.get_table("valid_keys")
     if_idx = socket.if_nametoindex(ingress_iface)
 
     for ttl in range(30, 65):
-        iv = [42, ttl, if_idx, 65]  # input_size=65 (era 4)
+        iv = [42, ttl, if_idx, 65]  # input_size=65 (was 4)
         if integer_arithmetic:
             key = _compute_key_integer(iv, cp_weights, scale_factor)
         else:
@@ -96,8 +96,8 @@ def populate_fwd_and_valid_keys(b: BPF, action, cp_weights: list,
         fwd[ctypes.c_ulonglong(key)] = action
         vk[ctypes.c_uint8(ttl)]      = ctypes.c_ulonglong(key)
 
-    mode = "intera/QAT" if integer_arithmetic else "float/PTQ"
-    print(f"[fwd] fwd_table e valid_keys caricati per TTL 30-64 [{mode}]")
+    mode = "integer/QAT" if integer_arithmetic else "float/PTQ"
+    print(f"[fwd] fwd_table and valid_keys loaded for TTL 30-64 [{mode}]")
 
 
 def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
@@ -111,7 +111,7 @@ def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
 
 def detach_xdp(b: BPF, iface: str = INGRESS_IFACE):
     b.remove_xdp(iface, flags=2)
-    print(f"[xdp] XDP rimosso da {iface}")
+    print(f"[xdp] XDP removed from {iface}")
 
 
 def stats_loop(b: BPF, iface: str = INGRESS_IFACE,

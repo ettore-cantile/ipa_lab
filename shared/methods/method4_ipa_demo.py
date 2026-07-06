@@ -1,25 +1,25 @@
 """
-Method 4 — IPA Demo ("Wow Factor")
+Method 4 - IPA Demo ("Wow Factor")
 
-Il modello viaggia DENTRO il payload del pacchetto.
-model_cache e fwd_table partono VUOTE.
-Al primo pacchetto per un nuovo model_id:
-  1. Il kernel rileva che il modello non e' in cache.
-  2. Emette un model_miss_event con i 4 byte di pesi dal payload.
-  3. Il CP carica i pesi in model_cache (~1-3 ms).
-  4. Il CP installa la regola SOLO per il TTL del primo pacchetto.
-Per i TTL successivi non ancora visti: FWD MISS -> safety net installa
-la regola on-demand (comportamento realistico IPA).
-Dai pacchetti successivi con TTL gia' visti: TRUE HIT (<1 ms).
+The model travels INSIDE the packet payload.
+model_cache and fwd_table start EMPTY.
+On the first packet for a new model_id:
+  1. The kernel detects that the model is not in cache.
+  2. It emits a model_miss_event with the 4 weight bytes from the payload.
+  3. The CP loads the weights into model_cache (~1-3 ms).
+  4. The CP installs the rule ONLY for the first packet's TTL.
+For later TTL values not seen yet: FWD MISS -> the safety net installs
+the rule on-demand (realistic IPA behavior).
+For later packets with already-seen TTL values: TRUE HIT (<1 ms).
 
-File usati:
-  /shared/weights_method2.json : usato dal sender per il payload
-  (non caricato dal CP al boot — arriva nel pacchetto)
+Files used:
+  /shared/weights_method2.json : used by the sender for the payload
+  (not loaded by the CP at boot - it arrives in the packet)
 
-Usage sul router (es. frankfurt):
+Usage on the router (for example, frankfurt):
   python3 /shared/switch_core.py ipa_demo
 
-Usage sul sender:
+Usage on the sender:
   python3 /shared/test_ipa.py --dest frankfurt --count 50 \\
           --model-id 42 --weights-file /shared/weights_method2.json
 """
@@ -68,11 +68,11 @@ class ModelMissEvent(ctypes.Structure):
 
 
 def run(model_id: int = 42):
-    print("[Method 4 - IPA Demo] | model_cache e fwd_table partono VUOTE")
-    print("  Il modello viaggia nel pacchetto. Primo pacchetto carica il modello.")
-    print("  Regola installata solo per il TTL del 1o pacchetto.")
-    print("  TTL successivi non visti: FWD MISS -> safety net on-demand.")
-    print("  Pacchetti successivi per TTL gia' visti: TRUE HIT (<1 ms).")
+    print("[Method 4 - IPA Demo] | model_cache and fwd_table start EMPTY")
+    print("  The model travels in the packet. First packet loads the model.")
+    print("  Rule installed only for the TTL of the 1st packet.")
+    print("  Later unseen TTL values: FWD MISS -> safety net on-demand.")
+    print("  Later packets for already-seen TTL values: TRUE HIT (<1 ms).")
     print()
 
     b  = load_bpf(EBPF_PROGRAM)
@@ -105,7 +105,7 @@ def run(model_id: int = 42):
         populate_model_cache(b, ev.model_id, weights, SCALE_FACTOR)
         loaded_models.add(ev.model_id)
 
-        # Installa la regola SOLO per il TTL del primo pacchetto
+        # Install the rule ONLY for the TTL of the first packet
         iv = [ev.model_id, ev.ttl, ev.ingress_ifindex, ev.input_size]
         output_raw = sum(iv[i] * weights[i] for i in range(4))
         key = (output_raw + OFFSET * SCALE_FACTOR) // SCALE_FACTOR
@@ -137,7 +137,7 @@ def run(model_id: int = 42):
                 break
 
     threading.Thread(target=perf_loop, daemon=True).start()
-    print("[Method 4] CP listeners attivi. In attesa di pacchetti...")
+    print("[Method 4] CP listeners active. Waiting for packets...")
 
     attach_xdp(b, fn)
     stats_loop(b)

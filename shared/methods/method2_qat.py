@@ -1,12 +1,12 @@
 """
-Method 2 — QAT (Quantization-Aware Training)
+Method 2 - QAT (Quantization-Aware Training)
 
-SCALE_FACTOR=128 fisso. La fwd_table e' pre-popolata con chiavi
-calcolate usando aritmetica intera pura (identica al kernel).
-Kernel e CP sono allineati -> quasi tutti TRUE HIT.
+Fixed SCALE_FACTOR=128. fwd_table is pre-populated with keys computed using
+pure integer arithmetic (identical to the kernel).
+Kernel and CP are aligned -> almost all TRUE HIT events.
 
-File usati:
-  /shared/weights_method2.json : pesi int8 (QAT)
+Files used:
+  /shared/weights_method2.json : int8 weights (QAT)
 """
 import socket
 from bcc import BPF

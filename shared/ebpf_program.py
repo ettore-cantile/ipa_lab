@@ -1,16 +1,16 @@
 """
-ebpf_program.py — eBPF/XDP program paper-compliant.
+ebpf_program.py - Paper-compliant eBPF/XDP program.
 
-Struttura ipa_hdr letta dal kernel (21 byte fissi, packed):
+ipa_hdr structure read by the kernel (21 fixed bytes, packed):
 
   [Model Description]     5 byte
     model_id        : u8
     model_type      : u8   (0x00 = FC-NN)
     param_size      : u8   (7 = int8/7-bit)
-    scale_factor    : u16  big-endian — presente nell'header ma NON usato
-                           dal kernel per l'inferenza: il kernel usa sempre
-                           m->scale_factor dalla model_cache (caricato dal CP).
-                           Usato solo dal CP nel Method 4 (model_miss_event).
+    scale_factor    : u16  big-endian - present in the header but NOT used
+                           by the kernel for inference: the kernel always uses
+                           m->scale_factor from model_cache (loaded by the CP).
+                           Only used by the CP in Method 4 (model_miss_event).
 
   [Model Specifications]  4 byte
     input_size      : u8   (65)
@@ -29,14 +29,14 @@ Struttura ipa_hdr letta dal kernel (21 byte fissi, packed):
     n_output_types  : u8
     out0_code/count : u8,u8  (0x05, 7)
 
-Payload dopo l'header: 319 byte di pesi int8 (solo nel primo pacchetto).
+Payload after the header: 319 bytes of int8 weights (only in the first packet).
 
-Nota verifier eBPF:
-  - ipa_hdr ha dimensione FISSA nota a compile-time -> bound check statico OK
-  - model_miss: unico bound check su (ipa+1)+4 byte -> verifier OK
-  - nessun loop su variabili runtime
-  - N_WEIGHTS e' una macro compile-time -> #pragma unroll funzionera'
-    quando si aggiungera' l'inferenza completa
+eBPF verifier note:
+  - ipa_hdr has a FIXED compile-time size -> static bound check OK
+  - model_miss: single bound check on (ipa+1)+4 bytes -> verifier OK
+  - no loops over runtime variables
+  - N_WEIGHTS is a compile-time macro -> #pragma unroll will work
+    when full inference is added
 
 Maps:
   model_cache       : model_id -> weights[319] + scale_factor
@@ -56,15 +56,15 @@ EBPF_PROGRAM = r"""
 #include <uapi/linux/in.h>
 
 /* =============================================================
- * IPA Header paper-compliant — 21 byte fissi (__packed)
+ * Paper-compliant IPA header - 21 fixed bytes (__packed)
  * ============================================================= */
 struct ipa_hdr {
     /* Model Description (5 byte) */
     __u8   model_id;
     __u8   model_type;         /* 0x00 = fully-connected NN          */
     __u8   param_size;         /* 7    = int8 / 7-bit quantization   */
-    __be16 scale_factor;       /* big-endian — letto dal CP nel Method 4,
-                                  NON usato dal kernel per l'inferenza  */
+    __be16 scale_factor;       /* big-endian - read by the CP in Method 4,
+                                  NOT used by the kernel for inference  */
 
     /* Model Specifications (4 byte) */
     __u8   input_size;         /* 65 = 6+6+1+52                      */
@@ -72,19 +72,19 @@ struct ipa_hdr {
     __u8   hidden_layers;      /* 2                                  */
     __u8   neurons_per_layer;  /* 4                                  */
 
-    /* Input Descriptor (9 byte): n_types + 4 coppie (code, count) */
+    /* Input Descriptor (9 byte): n_types + 4 pairs (code, count) */
     __u8   n_feature_types;    /* 4                                  */
     __u8   feat0_code;  __u8   feat0_count;  /* 0x01, 6  link_state  */
     __u8   feat1_code;  __u8   feat1_count;  /* 0x02, 6  ingress_if  */
     __u8   feat2_code;  __u8   feat2_count;  /* 0x03, 1  ttl         */
     __u8   feat3_code;  __u8   feat3_count;  /* 0x04, 52 node_id     */
 
-    /* Output Descriptor (3 byte): n_types + 1 coppia (code, count) */
+    /* Output Descriptor (3 byte): n_types + 1 pair (code, count) */
     __u8   n_output_types;     /* 1                                  */
     __u8   out0_code;   __u8   out0_count;   /* 0x05, 7  next_hop    */
 } __attribute__((packed));
 
-/* Pesi: fc1(260+4) + fc2(16+4) + out(28+7) = 319 */
+/* Weights: fc1(260+4) + fc2(16+4) + out(28+7) = 319 */
 #define N_WEIGHTS 319
 
 struct model_data {
@@ -99,7 +99,7 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-/* Emesso su fwd miss (model in cache, regola mancante) — Methods 3 & 4 */
+/* Emitted on fwd miss (model in cache, missing rule) - Methods 3 & 4 */
 struct miss_event {
     __u8  model_id;
     __u8  ttl;
@@ -109,9 +109,9 @@ struct miss_event {
 };
 
 /*
- * Emesso su model miss (model NON in cache) — Method 4.
- * Copia i primi 4 pesi con accessi a offset FISSO dopo l'header IPA.
- * Bound check unico e statico su 4 byte -> verifier eBPF accetta.
+ * Emitted on model miss (model NOT in cache) - Method 4.
+ * Copies the first 4 weights with FIXED-offset accesses after the IPA header.
+ * Single static bound check over 4 bytes -> accepted by the eBPF verifier.
  */
 struct model_miss_event {
     __u8  model_id;
@@ -146,7 +146,7 @@ int ipa_switch(struct xdp_md *ctx) {
     if ((void *)(udp + 1) > data_end) return XDP_PASS;
     if (udp->dest != bpf_htons(9999)) return XDP_PASS;
 
-    /* Parsing IPA header: dimensione fissa 21 byte -> bound check statico */
+    /* Parse IPA header: fixed 21-byte size -> static bound check */
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;
 
@@ -155,9 +155,9 @@ int ipa_switch(struct xdp_md *ctx) {
     struct model_data *m = model_cache.lookup(&target_model);
 
     /* ================================================================
-     * MODEL MISS: modello non in cache (Method 4).
-     * Legge i primi 4 pesi dal payload con offset fisso.
-     * Bound check unico su 4 byte -> verifier OK.
+     * MODEL MISS: model not in cache (Method 4).
+     * Reads the first 4 weights from the payload at fixed offsets.
+     * Single bound check over 4 bytes -> verifier OK.
      * ================================================================ */
     if (!m || m->is_valid == 0) {
         __u8 *w = (__u8 *)(ipa + 1);
@@ -176,23 +176,23 @@ int ipa_switch(struct xdp_md *ctx) {
     }
 
     /*
-     * scale_factor: usa SEMPRE quello dalla model_cache (caricato dal CP).
-     * Il valore nell'header IPA e' ignorato per l'inferenza — serve solo
-     * al CP nel Method 4 per popolare la cache al primo pacchetto.
+     * scale_factor: ALWAYS use the value from model_cache (loaded by the CP).
+     * The value in the IPA header is ignored for inference - it is only used
+     * by the CP in Method 4 to populate the cache on the first packet.
      */
     __u16 scale = m->scale_factor;
     if (scale == 0) return XDP_PASS;
 
     /* ================================================================
-     * INFERENCE — 4 feature fisse (placeholder per inferenza completa).
+     * INFERENCE - 4 fixed features (placeholder for full inference).
      * input vector: [model_id, ttl, ingress_ifindex, input_size]
-     * L'input_size ora vale 65 (valore reale nel nuovo header).
+     * input_size is now 65 (actual value in the new header).
      * ================================================================ */
     long long iv[4];
     iv[0] = ipa->model_id;
     iv[1] = ip->ttl;
     iv[2] = ctx->ingress_ifindex;
-    iv[3] = ipa->input_size;   /* 65 nel nuovo header */
+    iv[3] = ipa->input_size;   /* 65 in the new header */
 
     long long output_raw = 0;
     output_raw += iv[0] * (long long)(signed char)m->weights[0];
