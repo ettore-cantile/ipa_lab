@@ -1,0 +1,22 @@
+{
+  "models": [
+    {
+      "model_id": 42,
+      "description": "FRR model — germany50, 5 features → 2 actions",
+      "architecture": "5-4-2",
+      "ebpf_src": "src/hardcoded/ebpf/model_42.c",
+      "ebpf_obj": "src/hardcoded/ebpf/model_42.o",
+      "weights_source": "shared/weights.json",
+      "quantization": "INT8",
+      "scale": 128,
+      "jump_table_index": 42,
+      "notes": "Baseline hardcoded model. Weights are placeholder — replace with actual quantized values from shared/extract_weights.py"
+    }
+  ],
+  "dispatcher": {
+    "ebpf_src": "src/hardcoded/ebpf/model_dispatcher.c",
+    "ebpf_obj": "src/hardcoded/ebpf/model_dispatcher.o",
+    "xdp_section": "xdp",
+    "ipa_port": 9999
+  }
+}
