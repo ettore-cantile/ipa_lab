@@ -1,0 +1,17 @@
+{
+  "models": [
+    {
+      "model_id": 42,
+      "description": "FRR Germany50 baseline — 5 features, hidden=4, classes=2, INT8 hardcoded",
+      "ebpf_src": "ebpf/model_42.c",
+      "ebpf_obj": "ebpf/model_42.o",
+      "architecture": {
+        "n_features": 5,
+        "hidden_size": 4,
+        "n_classes": 2
+      },
+      "quantization": "INT8",
+      "weights_source": "../../weights.json"
+    }
+  ]
+}
