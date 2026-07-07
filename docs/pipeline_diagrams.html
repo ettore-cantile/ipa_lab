@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="it" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPA/eBPF Pipeline Block Diagrams</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root,[data-theme="light"]{
+  --bg:#f7f6f2;--surface:#ffffff;--surface2:#f0ede8;
+  --text:#1a1917;--muted:#6b6966;--faint:#b0ada8;
+  --border:rgba(0,0,0,0.10);
+  --primary:#01696f;--primary-hl:#cedcd8;
+  --orange:#c55700;--orange-hl:#ffe4cc;
+  --purple:#6b3fa0;--purple-hl:#e6ddf5;
+  --shadow:0 4px 24px rgba(0,0,0,0.08);
+}
+[data-theme="dark"]{
+  --bg:#111110;--surface:#1c1b19;--surface2:#242321;
+  --text:#d4d2ce;--muted:#7a7876;--faint:#444240;
+  --border:rgba(255,255,255,0.08);
+  --primary:#4f98a3;--primary-hl:#1e3638;
+  --orange:#fdab43;--orange-hl:#3d2a10;
+  --purple:#a878e0;--purple-hl:#2e1d4a;
+  --shadow:0 4px 24px rgba(0,0,0,0.4);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6}
+.top-bar{
+  position:sticky;top:0;z-index:100;
+  background:var(--surface);border-bottom:1px solid var(--border);
+  padding:0.75rem 2rem;display:flex;align-items:center;justify-content:space-between;
+  backdrop-filter:blur(12px);
+}
+.logo{display:flex;align-items:center;gap:0.5rem;font-weight:600;font-size:0.95rem;letter-spacing:-0.01em}
+.logo svg{color:var(--primary)}
+.toggle-btn{
+  background:var(--surface2);border:1px solid var(--border);border-radius:999px;
+  padding:0.35rem 0.75rem;font-size:0.8rem;color:var(--muted);cursor:pointer;
+  transition:all 180ms ease;display:flex;align-items:center;gap:0.4rem;
+}
+.toggle-btn:hover{color:var(--text);border-color:var(--primary)}
+main{max-width:1100px;margin:0 auto;padding:3rem 1.5rem}
+.hero{text-align:center;margin-bottom:3.5rem}
+.hero h1{font-size:clamp(1.5rem,3vw,2.2rem);font-weight:600;letter-spacing:-0.02em;margin-bottom:0.6rem}
+.hero p{color:var(--muted);max-width:60ch;margin:0 auto;font-size:0.95rem}
+.spectrum{
+  display:flex;align-items:center;justify-content:center;gap:0;
+  margin:2rem auto 3rem;max-width:600px;
+}
+.spec-item{flex:1;text-align:center;padding:0.6rem 0.5rem;font-size:0.72rem;font-weight:500}
+.spec-item:first-child{border-radius:8px 0 0 8px}
+.spec-item:last-child{border-radius:0 8px 8px 0}
+.spec-label{font-size:0.65rem;display:block;margin-top:0.1rem;opacity:0.8}
+.spec-1{background:var(--primary-hl);color:var(--primary)}
+.spec-2{background:var(--orange-hl);color:var(--orange)}
+.spec-3{background:var(--purple-hl);color:var(--purple)}
+.cards{display:grid;grid-template-columns:1fr;gap:2.5rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;box-shadow:var(--shadow)}
+.card-header{padding:1.25rem 1.5rem;display:flex;align-items:center;gap:1rem;border-bottom:1px solid var(--border)}
+.card-badge{font-size:0.7rem;font-family:'JetBrains Mono',monospace;font-weight:600;padding:0.2rem 0.6rem;border-radius:999px;white-space:nowrap}
+.badge-1{background:var(--primary-hl);color:var(--primary)}
+.badge-2{background:var(--orange-hl);color:var(--orange)}
+.badge-3{background:var(--purple-hl);color:var(--purple)}
+.card-title{font-weight:600;font-size:1.05rem;letter-spacing:-0.01em}
+.card-subtitle{font-size:0.8rem;color:var(--muted);margin-left:auto;white-space:nowrap}
+.card-body{padding:1.5rem;display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
+@media(max-width:640px){.card-body{grid-template-columns:1fr}}
+.pipeline{display:flex;flex-direction:column;align-items:center;gap:0}
+.p-node{width:100%;max-width:260px;padding:0.55rem 1rem;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.75rem;font-weight:600;text-align:center}
+.pn-dispatch{background:var(--surface2);border:1px solid var(--border);color:var(--text)}
+.pn-packet{background:transparent;border:1px dashed var(--faint);color:var(--muted);font-size:0.7rem}
+.pn-core1{background:var(--primary-hl);border:1px solid var(--primary);color:var(--primary)}
+.pn-core2{background:var(--orange-hl);border:1px solid var(--orange);color:var(--orange)}
+.pn-core3{background:var(--purple-hl);border:1px solid var(--purple);color:var(--purple)}
+.pn-action{background:var(--surface2);border:1px solid var(--border);color:var(--text)}
+.pn-map{background:var(--surface2);border:1px dashed var(--orange);color:var(--orange);font-size:0.68rem}
+.p-arrow{display:flex;flex-direction:column;align-items:center;padding:2px 0}
+.p-arrow svg{color:var(--faint)}
+.p-arrow-label{font-size:0.62rem;color:var(--muted);font-family:'JetBrains Mono',monospace}
+.p-group{display:flex;flex-direction:column;align-items:center;width:100%;border:1px dashed var(--border);border-radius:10px;padding:0.75rem 0.5rem;background:color-mix(in oklab,var(--surface2) 50%,transparent);position:relative}
+.p-group-label{position:absolute;top:-0.55rem;left:50%;transform:translateX(-50%);background:var(--surface);font-size:0.62rem;padding:0 0.5rem;color:var(--muted);font-family:'JetBrains Mono',monospace;white-space:nowrap}
+.pros-cons{display:flex;flex-direction:column;gap:1rem}
+.pc-section h4{font-size:0.8rem;font-weight:600;margin-bottom:0.5rem}
+.pc-section ul{list-style:none;display:flex;flex-direction:column;gap:0.3rem}
+.pc-section li{font-size:0.78rem;color:var(--muted);padding-left:1.2rem;position:relative}
+.pc-section li::before{position:absolute;left:0}
+.pros li::before{content:"\2713";color:var(--primary)}
+.cons li::before{content:"\00D7";color:#c0392b}
+.metrics{margin-top:2.5rem;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.metrics h3{padding:1rem 1.5rem;font-size:0.9rem;border-bottom:1px solid var(--border);font-weight:600}
+table{width:100%;border-collapse:collapse}
+th,td{padding:0.65rem 1.2rem;font-size:0.8rem;text-align:left;border-bottom:1px solid var(--border)}
+th{color:var(--muted);font-weight:500;background:var(--surface2);font-family:'JetBrains Mono',monospace;font-size:0.72rem}
+td:first-child{font-weight:600}
+tr:last-child td{border-bottom:none}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:0.4rem}
+.dot-1{background:var(--primary)}.dot-2{background:var(--orange)}.dot-3{background:var(--purple)}
+</style>
+</head>
+<body>
+<nav class="top-bar">
+  <div class="logo">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+    </svg>
+    IPA / eBPF Design Space
+  </div>
+  <button class="toggle-btn" data-theme-toggle aria-label="Switch theme">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+    </svg>
+    tema
+  </button>
+</nav>
+<main>
+  <div class="hero">
+    <h1>Pipeline Block Diagrams</h1>
+    <p>Tre punti dello spazio di progetto IPA/eBPF, ordinati per trade-off prestazioni &harr; flessibilit&agrave;. Schemi prodotti per la tesi magistrale.</p>
+  </div>
+  <div class="spectrum">
+    <div class="spec-item spec-1">&#127950; Hardcoded<span class="spec-label">max perf &middot; min fless.</span></div>
+    <div class="spec-item spec-2">&#9881; Template<span class="spec-label">bilanciato</span></div>
+    <div class="spec-item spec-3">&#129513; Modulare<span class="spec-label">min perf &middot; max fless.</span></div>
+  </div>
+  <div class="cards">
+    <!-- CARD 1 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-badge badge-1">Livello 1</span>
+        <span class="card-title">Hardcoded Model</span>
+        <span class="card-subtitle">massime prestazioni &middot; minima flessibilit&agrave;</span>
+      </div>
+      <div class="card-body">
+        <div class="pipeline">
+          <div class="p-node pn-packet">[ pacchetto in arrivo ]</div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-dispatch">dispatcher</div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg><span class="p-arrow-label">tail call</span></div>
+          <div class="p-group">
+            <span class="p-group-label">model_&lt;id&gt;.o &mdash; pesi inline</span>
+            <div class="pipeline">
+              <div class="p-node pn-core1" style="max-width:200px;font-size:0.68rem">feature extraction</div>
+              <div class="p-arrow"><svg width="10" height="12" viewBox="0 0 10 12"><path d="M5 0v8M1 5l4 5 4-5" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+              <div class="p-node pn-core1" style="max-width:200px;font-size:0.68rem">pesi hardcoded + inferenza</div>
+              <div class="p-arrow"><svg width="10" height="12" viewBox="0 0 10 12"><path d="M5 0v8M1 5l4 5 4-5" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+              <div class="p-node pn-core1" style="max-width:200px;font-size:0.68rem">argmax</div>
+            </div>
+          </div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-action">action</div>
+        </div>
+        <div class="pros-cons">
+          <div class="pc-section pros"><h4>Vantaggi</h4><ul><li>1 sola tail call totale</li><li>Nessuna map lookup per i pesi</li><li>Codice completamente unrolled</li><li>Nessun passaggio di stato intermedio</li><li>Massime prestazioni assolute</li></ul></div>
+          <div class="pc-section cons"><h4>Svantaggi</h4><ul><li>Ricompila + ricarica per ogni nuovo modello</li><li>Bassa flessibilit&agrave; runtime</li><li>1 programma .o per modello</li></ul></div>
+          <div class="pc-section"><h4 style="color:var(--primary)">Aggiornamento modello</h4><p style="font-size:0.75rem;color:var(--muted);font-family:'JetBrains Mono',monospace;background:var(--surface2);padding:0.5rem 0.75rem;border-radius:6px;margin-top:0.3rem">ricompila &rarr; ricarica .o</p></div>
+        </div>
+      </div>
+    </div>
+    <!-- CARD 2 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-badge badge-2">Livello 2</span>
+        <span class="card-title">Pre-built Architecture Template</span>
+        <span class="card-subtitle">prestazioni intermedie &middot; flessibilit&agrave; media</span>
+      </div>
+      <div class="card-body">
+        <div class="pipeline">
+          <div class="p-node pn-packet">[ pacchetto in arrivo ]</div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-dispatch">dispatcher</div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-map">model_registry[model_id]<br><span style="font-size:0.62rem;opacity:0.8">&rarr; arch_id + weight_offset + &alpha;</span></div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg><span class="p-arrow-label">tail call</span></div>
+          <div class="p-group">
+            <span class="p-group-label">arch_&lt;shape&gt; &mdash; architettura unrolled</span>
+            <div class="pipeline">
+              <div class="p-node pn-core2" style="max-width:200px;font-size:0.68rem">legge pesi da BPF map</div>
+              <div class="p-arrow"><svg width="10" height="12" viewBox="0 0 10 12"><path d="M5 0v8M1 5l4 5 4-5" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+              <div class="p-node pn-core2" style="max-width:200px;font-size:0.68rem">inferenza completa</div>
+              <div class="p-arrow"><svg width="10" height="12" viewBox="0 0 10 12"><path d="M5 0v8M1 5l4 5 4-5" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+              <div class="p-node pn-core2" style="max-width:200px;font-size:0.68rem">argmax</div>
+            </div>
+          </div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-action">action</div>
+        </div>
+        <div class="pros-cons">
+          <div class="pc-section pros"><h4>Vantaggi</h4><ul><li>1 programma per pi&ugrave; modelli (stessa arch.)</li><li>No ricompilazione per cambiare pesi</li><li>Architettura statica/unrolled (verificabile)</li></ul></div>
+          <div class="pc-section cons"><h4>Svantaggi</h4><ul><li>Lettura pesi da map (overhead)</li><li>Solo architetture predefinite</li></ul></div>
+          <div class="pc-section"><h4 style="color:var(--orange)">Aggiornamento modello</h4><p style="font-size:0.75rem;color:var(--muted);font-family:'JetBrains Mono',monospace;background:var(--surface2);padding:0.5rem 0.75rem;border-radius:6px;margin-top:0.3rem">bpf_map_update(weight_map, ...)</p></div>
+        </div>
+      </div>
+    </div>
+    <!-- CARD 3 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-badge badge-3">Livello 3</span>
+        <span class="card-title">Modular Neural Pipeline</span>
+        <span class="card-subtitle">massima flessibilit&agrave; &middot; prestazioni inferiori</span>
+      </div>
+      <div class="card-body">
+        <div class="pipeline">
+          <div class="p-node pn-packet">[ pacchetto in arrivo ]</div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-dispatch">dispatcher</div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-core3">layer block 1<br><span style="font-size:0.65rem;opacity:0.8">N&#8321; &rarr; M&#8321; neurons</span></div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg><span class="p-arrow-label">scratch map + tail call</span></div>
+          <div class="p-node pn-core3">layer block 2<br><span style="font-size:0.65rem;opacity:0.8">N&#8322; &rarr; M&#8322; neurons</span></div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg><span class="p-arrow-label">scratch map + tail call</span></div>
+          <div class="p-node pn-core3">layer block 3<br><span style="font-size:0.65rem;opacity:0.8">N&#8323; &rarr; M&#8323; neurons</span></div>
+          <div class="p-arrow"><svg width="12" height="16" viewBox="0 0 12 16"><path d="M6 0v12M1 8l5 6 5-6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></div>
+          <div class="p-node pn-action">argmax / action</div>
+        </div>
+        <div class="pros-cons">
+          <div class="pc-section pros"><h4>Vantaggi</h4><ul><li>Massimo riuso dei blocchi layer</li><li>Supporta qualsiasi architettura</li><li>Nessuna ricompilazione necessaria</li><li>Massima flessibilit&agrave; runtime</li></ul></div>
+          <div class="pc-section cons"><h4>Svantaggi</h4><ul><li>Pi&ugrave; tail calls per pacchetto</li><li>Map lookup per stato intermedio</li><li>Limite tail calls consecutive (Linux)</li></ul></div>
+          <div class="pc-section"><h4 style="color:var(--purple)">Aggiornamento modello</h4><p style="font-size:0.75rem;color:var(--muted);font-family:'JetBrains Mono',monospace;background:var(--surface2);padding:0.5rem 0.75rem;border-radius:6px;margin-top:0.3rem">cambia sequenza layer + aggiorna pesi</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="metrics">
+    <h3>Tabella Comparativa &mdash; Design Space</h3>
+    <table>
+      <thead><tr><th>Soluzione</th><th>Codice eBPF</th><th>Pesi</th><th>Tail calls</th><th>Stato interm.</th><th>Flessibilit&agrave;</th><th>Prestazioni</th></tr></thead>
+      <tbody>
+        <tr><td><span class="dot dot-1"></span>Hardcoded</td><td>1 per modello</td><td>hardcoded</td><td>1</td><td>nessuno</td><td>bassa</td><td>&#11088;&#11088;&#11088; massime</td></tr>
+        <tr><td><span class="dot dot-2"></span>Template</td><td>1 per architettura</td><td>BPF map</td><td>1</td><td>locale</td><td>media</td><td>&#11088;&#11088; alte</td></tr>
+        <tr><td><span class="dot dot-3"></span>Modulare</td><td>1 per blocco</td><td>BPF map</td><td>&gt;1</td><td>scratch map</td><td>alta</td><td>&#11088; inferiori</td></tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+<script>
+(function(){
+  const btn=document.querySelector('[data-theme-toggle]');
+  const root=document.documentElement;
+  let t=root.getAttribute('data-theme')||'dark';
+  function set(v){t=v;root.setAttribute('data-theme',v);btn.querySelector('svg').innerHTML=v==='dark'?'<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>':'<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>'; }
+  btn.addEventListener('click',()=>set(t==='dark'?'light':'dark'));
+  set(t);
+})();
+</script>
+</body>
+</html>
