@@ -3,16 +3,16 @@
 load_hardcoded.py — Load and attach the hardcoded IPA/eBPF model programs.
 
 Usage:
-    sudo python3 load_hardcoded.py --iface eth0 --model 42 [--config config/hardcoded_models.json]
+    sudo python3 load_hardcoded.py --iface <iface> --model 42 [--config ...]
+    sudo python3 load_hardcoded.py --list-ifaces   # show available interfaces
 
 What it does:
     1. Raises RLIMIT_MEMLOCK to RLIM_INFINITY (required for bpf() syscall)
-    2. Compiles model_dispatcher.c and model_<id>.c with clang/BPF target
-    3. Loads both programs into the kernel via bpftool
-    4. Registers model_<id> in the PROG_ARRAY jump table at index model_id
-    5. Attaches the dispatcher to the XDP hook on the specified interface
-
-Reuses shared/common.py for IPA header utilities.
+    2. Validates that the requested interface exists
+    3. Compiles model_dispatcher.c and model_<id>.c with clang/BPF target
+    4. Loads both programs into the kernel via bpftool
+    5. Registers model_<id> in the PROG_ARRAY jump table at index model_id
+    6. Attaches the dispatcher to the XDP hook on the specified interface
 """
 
 import argparse
@@ -23,9 +23,7 @@ import subprocess
 import sys
 
 # ---------------------------------------------------------------------------
-# RLIMIT_MEMLOCK — must be raised BEFORE any bpf() syscall.
-# libbpf / bpftool need to lock memory for BPF maps and programs.
-# Without this the kernel returns EPERM even when running as root.
+# Raise RLIMIT_MEMLOCK before any bpf() syscall (required by libbpf/bpftool)
 # ---------------------------------------------------------------------------
 def _raise_memlock() -> None:
     try:
@@ -34,28 +32,59 @@ def _raise_memlock() -> None:
             (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
         )
     except ValueError:
-        # Fallback: set a large fixed value (256 MiB) if INFINITY is rejected
         limit = 256 * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_MEMLOCK, (limit, limit))
-        print(f"[warn] RLIMIT_MEMLOCK set to {limit // 1024 // 1024} MiB (INFINITY not allowed)")
+        print(f"[warn] RLIMIT_MEMLOCK set to {limit // 1024 // 1024} MiB")
 
 _raise_memlock()
 
-# Add shared/ to path for reuse of common.py
+# Add shared/ to path
 SHARED_DIR = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'shared')
 sys.path.insert(0, SHARED_DIR)
-
 try:
-    import common  # noqa: F401 — shared IPA utilities
+    import common  # noqa: F401
 except ImportError:
-    print("[warn] shared/common.py not found — IPA utilities unavailable")
+    print("[warn] shared/common.py not found")
 
-EBPF_DIR = os.path.join(os.path.dirname(__file__), '..', 'ebpf')
+EBPF_DIR    = os.path.join(os.path.dirname(__file__), '..', 'ebpf')
 CONFIG_DEFAULT = os.path.join(os.path.dirname(__file__), '..', 'config', 'hardcoded_models.json')
 
 
+# ---------------------------------------------------------------------------
+# Interface helpers
+# ---------------------------------------------------------------------------
+def list_interfaces() -> list[str]:
+    """Return names of all UP network interfaces (excluding loopback)."""
+    ifaces = []
+    net_path = '/sys/class/net'
+    for name in os.listdir(net_path):
+        if name == 'lo':
+            continue
+        operstate_path = os.path.join(net_path, name, 'operstate')
+        try:
+            state = open(operstate_path).read().strip()
+        except OSError:
+            state = 'unknown'
+        ifaces.append((name, state))
+    return ifaces
+
+
+def validate_iface(iface: str) -> None:
+    """Exit with a helpful message if the interface does not exist."""
+    if not os.path.exists(f'/sys/class/net/{iface}'):
+        available = list_interfaces()
+        print(f'[error] Interface "{iface}" not found.', file=sys.stderr)
+        print('[info]  Available interfaces:', file=sys.stderr)
+        for name, state in available:
+            print(f'          {name:20s}  state={state}', file=sys.stderr)
+        print('[hint]  Re-run with --iface <name> using one of the above.', file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# BPF compilation
+# ---------------------------------------------------------------------------
 def compile_bpf(src: str, out: str) -> None:
-    """Compile a BPF C source file to an ELF object."""
     cmd = [
         'clang', '-O2', '-g', '-target', 'bpf',
         '-D__TARGET_ARCH_x86',
@@ -66,64 +95,52 @@ def compile_bpf(src: str, out: str) -> None:
     subprocess.run(cmd, check=True)
 
 
+# ---------------------------------------------------------------------------
+# Load & attach
+# ---------------------------------------------------------------------------
 def load_and_attach(iface: str, model_id: int, config: dict) -> None:
-    """
-    Load dispatcher + model program, wire up the jump table, attach XDP.
-    Uses bpftool + ip-link as portable shell commands.
-    Replace the jump-table update with a proper libbpf binding for production.
-    """
     dispatcher_obj = os.path.join(EBPF_DIR, 'model_dispatcher.o')
-    model_src = os.path.join(EBPF_DIR, f'model_{model_id}.c')
-    model_obj = os.path.join(EBPF_DIR, f'model_{model_id}.o')
+    model_src      = os.path.join(EBPF_DIR, f'model_{model_id}.c')
+    model_obj      = os.path.join(EBPF_DIR, f'model_{model_id}.o')
 
-    # Compile
     compile_bpf(os.path.join(EBPF_DIR, 'model_dispatcher.c'), dispatcher_obj)
     compile_bpf(model_src, model_obj)
 
-    # Pin path for the dispatcher program
     pin_dispatcher = f'/sys/fs/bpf/dispatcher_{iface}'
-    pin_model     = f'/sys/fs/bpf/model_{model_id}'
+    pin_model      = f'/sys/fs/bpf/model_{model_id}'
 
-    # Remove stale pins if present
     for pin in (pin_dispatcher, pin_model):
         if os.path.exists(pin):
             os.remove(pin)
 
-    # Load dispatcher
+    # Load dispatcher into kernel + attach to XDP hook
     print(f'[load] dispatcher → {iface} (XDP)')
+    subprocess.run(['bpftool', 'prog', 'load', dispatcher_obj, pin_dispatcher], check=True)
     subprocess.run(
-        ['bpftool', 'prog', 'load', dispatcher_obj, pin_dispatcher],
-        check=True
-    )
-    subprocess.run(
-        ['ip', 'link', 'set', 'dev', iface, 'xdp',
-         'obj', dispatcher_obj, 'sec', 'xdp'],
+        ['ip', 'link', 'set', 'dev', iface, 'xdp', 'obj', dispatcher_obj, 'sec', 'xdp'],
         check=True
     )
 
     # Load model program
     print(f'[load] model_{model_id} → jump table index {model_id}')
-    subprocess.run(
-        ['bpftool', 'prog', 'load', model_obj, pin_model],
-        check=True
-    )
+    subprocess.run(['bpftool', 'prog', 'load', model_obj, pin_model], check=True)
 
-    # Wire model into the jump table
-    # Get the map id of model_jmp_table from the loaded dispatcher
+    # Wire model into PROG_ARRAY jump table
+    import json as _json
     result = subprocess.run(
         ['bpftool', 'prog', 'show', 'pinned', pin_dispatcher, '--json'],
         capture_output=True, text=True, check=True
     )
-    import json as _json
     prog_info = _json.loads(result.stdout)
     map_ids = prog_info.get('map_ids', [])
     if map_ids:
-        jmp_map_id = map_ids[0]  # model_jmp_table is the only map
-        model_fd_result = subprocess.run(
-            ['bpftool', 'prog', 'show', 'pinned', pin_model, '--json'],
-            capture_output=True, text=True, check=True
+        jmp_map_id = map_ids[0]
+        model_info = _json.loads(
+            subprocess.run(
+                ['bpftool', 'prog', 'show', 'pinned', pin_model, '--json'],
+                capture_output=True, text=True, check=True
+            ).stdout
         )
-        model_info = _json.loads(model_fd_result.stdout)
         model_prog_id = model_info['id']
         subprocess.run(
             ['bpftool', 'map', 'update', 'id', str(jmp_map_id),
@@ -133,21 +150,38 @@ def load_and_attach(iface: str, model_id: int, config: dict) -> None:
         )
         print(f'[ok] Jump table map {jmp_map_id}: index {model_id} → prog id {model_prog_id}')
     else:
-        print('[warn] Could not find model_jmp_table map — update it manually with bpftool')
+        print('[warn] model_jmp_table not found — update manually with bpftool')
 
     print(f'[ok] Hardcoded model {model_id} loaded and attached on {iface}')
+    print(f'[hint] To detach: sudo ip link set dev {iface} xdp off')
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main():
     if os.geteuid() != 0:
-        print('[error] This script must be run as root (sudo)', file=sys.stderr)
+        print('[error] Must be run as root (sudo)', file=sys.stderr)
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description='Load hardcoded IPA/eBPF model')
-    parser.add_argument('--iface', required=True, help='Network interface name')
-    parser.add_argument('--model', type=int, default=42, help='Model ID to load')
+    parser.add_argument('--iface', help='Network interface name')
+    parser.add_argument('--model', type=int, default=42, help='Model ID (default: 42)')
     parser.add_argument('--config', default=CONFIG_DEFAULT, help='Model registry JSON')
+    parser.add_argument('--list-ifaces', action='store_true',
+                        help='List available network interfaces and exit')
     args = parser.parse_args()
+
+    if args.list_ifaces:
+        print('[info] Available interfaces:')
+        for name, state in list_interfaces():
+            print(f'  {name:20s}  state={state}')
+        sys.exit(0)
+
+    if not args.iface:
+        parser.error('--iface is required (use --list-ifaces to see options)')
+
+    validate_iface(args.iface)
 
     with open(args.config) as f:
         config = json.load(f)
