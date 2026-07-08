@@ -136,9 +136,21 @@ def run(
 
     # ------------------------------------------------------------------
     # Step 5: attach XDP on ingress iface
+    #
+    # FIX: attach in SKB/generic mode (XDP_FLAGS_SKB_MODE = 2), NOT native.
+    # The ingress iface here is a veth (Kathara collision domain). A NATIVE
+    # XDP program on one end of a veth pair breaks UNICAST reception from
+    # the peer/bridge: unless XDP is attached to BOTH veth ends, unicast
+    # frames forwarded to the XDP-enabled end are dropped by the veth path
+    # BEFORE the program runs (multicast/broadcast — OSPF/ARP — still flood
+    # through, which is exactly what tcpdump showed: OSPF/ARP arrive, the
+    # unicast UDP:9999 IPA packets do not). Generic/SKB-mode XDP runs after
+    # the normal veth delivery (in netif_receive_skb), so unicast packets
+    # reach the program; bpf_redirect() is supported in generic mode too.
     # ------------------------------------------------------------------
-    b.attach_xdp(iface, fn)
-    print(f"\n[P1-hardcoded] XDP attached to {iface} — running (Ctrl-C to stop)")
+    XDP_FLAGS_SKB_MODE = 2
+    b.attach_xdp(iface, fn, flags=XDP_FLAGS_SKB_MODE)
+    print(f"\n[P1-hardcoded] XDP attached to {iface} (SKB/generic mode) — running (Ctrl-C to stop)")
     print(f"[P1-hardcoded] Design: 0 weight-map lookups, 0 fwd_table lookups, ~780 insns")
     print(f"[P1-hardcoded] Egress port chosen dynamically by inference (best_cls -> switch(cls))")
     print()
@@ -189,7 +201,7 @@ def run(
     except KeyboardInterrupt:
         pass
     finally:
-        b.remove_xdp(iface)
+        b.remove_xdp(iface, flags=XDP_FLAGS_SKB_MODE)
         print(f"\n[P1-hardcoded] XDP removed from {iface}")
         _print_final_stats(b, egress_ifaces)
 

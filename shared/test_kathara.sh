@@ -382,6 +382,29 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
+# Step 4-bis — Ping unicast POST-attach XDP (verifica il fix modalita' SKB)
+#
+# Prova decisiva del turno precedente: lo Step 2c (ping unicast) passava,
+# ma avveniva PRIMA dell'attach XDP. Dopo l'attach, l'UDP unicast non
+# arrivava piu' a frankfurt mentre multicast/broadcast (OSPF/ARP) si':
+# firma di XDP NATIVO su veth che rompe la ricezione unicast dal peer.
+# method4_hardcoded.py ora attacca in modalita' SKB/generic. Qui
+# ri-verifichiamo un ping unicast CON XDP gia' attaccato: se passa, la
+# ricezione unicast funziona in modalita' SKB e i pacchetti UDP dovrebbero
+# a loro volta arrivare (Step 6+). Il nostro XDP fa XDP_PASS su tutto cio'
+# che non e' UDP:9999, quindi l'ICMP passa e frankfurt risponde.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 4-bis] Unicast ping WITH XDP attached (validates SKB-mode fix)...${NC}"
+PING_POST=$(krun darmstadt "ping -c 3 -W 2 ${FRANKFURT_DIRECT} 2>&1 | grep -E 'packets transmitted' | tail -1" | tr -d '\r')
+echo "  ${PING_POST}"
+if echo "${PING_POST}" | grep -qE '3 received|2 received'; then
+    echo "  Unicast reception OK with XDP attached (SKB mode working)."
+else
+    echo -e "${RED}  Unicast still failing with XDP attached — SKB fix insufficient, investigate further.${NC}"
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # Step 5 — Stampa egress ifindex table caricata
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 5] Egress ifindex table (from pipeline log):${NC}"
