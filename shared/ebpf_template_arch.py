@@ -17,8 +17,8 @@ Architecture supported here: 65-4-4-7 (matching the existing model).
 Maps introduced:
   arch_registry   : model_id  -> {arch_id, weight_offset, scale_factor}
   arch_weights    : index     -> int8  (flat weight array, all models concatenated)
-  fwd_table       : u64 key   -> fwd_action   (same as Pipeline 1)
-  valid_keys      : u8  ttl   -> u64 key      (same)
+  fwd_table_t2    : u64 key   -> fwd_action   (same as Pipeline 1)
+  valid_keys_t2   : u8  ttl   -> u64 key      (same)
   pkt_stats_t2    : [0]=HIT [1]=MISS [2]=FAKE (same semantics)
   miss_events_t2  : perf buffer
 
@@ -31,6 +31,13 @@ eBPF verifier notes:
   - Weight accesses use (weight_offset + computed_index) with explicit bound check
   - Intermediate activations are kept in local stack arrays (no map needed)
   - Single tail call: dispatcher -> arch program
+
+Combined compilation note (pipeline_benchmark.py):
+  EBPF_ARCH_65_4_4_7 uses an #ifndef IPA_ARCH_COMBINED guard around all
+  shared declarations (structs, maps, #includes).  When pipeline_benchmark
+  prepends '#define IPA_ARCH_COMBINED 1' and concatenates the two sources
+  into one BCC text, only the arch-specific #defines and the function body
+  are compiled, eliminating duplicate-symbol errors.
 """
 
 # Architecture constants (65-4-4-7 model)
@@ -138,22 +145,22 @@ int ipa_switch_template(struct xdp_md *ctx) {
 # -----------------------------------------------------------------
 # Arch program: 65-4-4-7  (compiled once, shared by all models
 # with this shape).  Reads weights from arch_weights[offset..]
+#
+# IPA_ARCH_COMBINED guard:
+#   When this source is concatenated with EBPF_TEMPLATE_ARCH_DISPATCHER
+#   in pipeline_benchmark.py, the caller prepends:
+#       '#define IPA_ARCH_COMBINED 1\n'
+#   so that the shared declarations (structs, maps, #includes) are skipped
+#   and only the arch-specific #defines + int arch_65_4_4_7() are compiled.
+#   When compiled standalone (method5_template.py) the guard is absent and
+#   the full self-contained source is used as before.
 # -----------------------------------------------------------------
 EBPF_ARCH_65_4_4_7 = r"""
-#include <uapi/linux/if_ether.h>
-#include <uapi/linux/ip.h>
-#include <uapi/linux/udp.h>
-#include <uapi/linux/in.h>
-
-/* Architecture compile-time constants */
+/* Architecture compile-time constants (always needed) */
 #define T2_N_IN    65
 #define T2_N_H1     4
 #define T2_N_H2     4
 #define T2_N_OUT    7
-/* Flat weight layout offsets (relative to weight_offset from registry):
-   fc1_w[0..259], fc1_b[260..263],
-   fc2_w[264..279], fc2_b[280..283],
-   out_w[284..311], out_b[312..318]  */
 #define T2_FC1_W_OFF  0
 #define T2_FC1_B_OFF  260
 #define T2_FC2_W_OFF  264
@@ -161,6 +168,15 @@ EBPF_ARCH_65_4_4_7 = r"""
 #define T2_OUT_W_OFF  284
 #define T2_OUT_B_OFF  312
 #define T2_N_WEIGHTS  319
+#define OUTPUT_OFFSET 100000ULL
+#define RELU(x)  ((x) > 0 ? (x) : 0)
+
+#ifndef IPA_ARCH_COMBINED
+/* ---- standalone includes and declarations (skipped when combined) ---- */
+#include <uapi/linux/if_ether.h>
+#include <uapi/linux/ip.h>
+#include <uapi/linux/udp.h>
+#include <uapi/linux/in.h>
 
 struct ipa_hdr {
     __u8   model_id;
@@ -180,7 +196,6 @@ struct ipa_hdr {
     __u8   out0_code;   __u8 out0_count;
 } __attribute__((packed));
 
-/* packed: same fix as in the dispatcher compilation unit */
 struct arch_entry {
     __u8  arch_id;
     __u32 weight_offset;
@@ -208,9 +223,7 @@ BPF_HASH(fwd_table_t2, __u64, struct fwd_action, 256);
 BPF_HASH(valid_keys_t2, __u8, __u64, 256);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
 BPF_PERF_OUTPUT(miss_events_t2);
-
-#define OUTPUT_OFFSET 100000ULL
-#define RELU(x)  ((x) > 0 ? (x) : 0)
+#endif /* IPA_ARCH_COMBINED */
 
 int arch_65_4_4_7(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -230,23 +243,19 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
     struct arch_entry *entry = arch_registry.lookup(&model_id);
     if (!entry) return XDP_PASS;
 
-    __u32 woff = entry->weight_offset;
+    __u32 woff  = entry->weight_offset;
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
 
-    /* --- Feature extraction (same 4 features as Pipeline 1 for now) ---
-     * Full 65-feature extraction mirrors the original IPA paper and
-     * is identical across all three pipelines; the 4-feature stub here
-     * keeps verifier complexity manageable for demonstration purposes. */
+    /* Feature extraction (4 features used; remaining 61 zeroed) */
     long long iv[T2_N_IN];
-    /* Initialise all features to 0; fill the 4 we have */
     __builtin_memset(iv, 0, sizeof(iv));
     iv[0] = ipa->model_id;
     iv[1] = ip->ttl;
     iv[2] = ctx->ingress_ifindex;
     iv[3] = ipa->input_size;
 
-    /* --- fc1: T2_N_IN -> T2_N_H1 --- */
+    /* fc1: T2_N_IN -> T2_N_H1 */
     long long h1[T2_N_H1];
     #pragma unroll
     for (int j = 0; j < T2_N_H1; j++) {
@@ -264,7 +273,7 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         h1[j] = RELU(acc);
     }
 
-    /* --- fc2: T2_N_H1 -> T2_N_H2 --- */
+    /* fc2: T2_N_H1 -> T2_N_H2 */
     long long h2[T2_N_H2];
     #pragma unroll
     for (int j = 0; j < T2_N_H2; j++) {
@@ -282,7 +291,7 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         h2[j] = RELU(acc);
     }
 
-    /* --- output: T2_N_H2 -> T2_N_OUT, argmax --- */
+    /* output layer: T2_N_H2 -> T2_N_OUT, argmax */
     long long best_val = -9999999LL;
     int best_cls = 0;
     #pragma unroll
@@ -301,7 +310,6 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    /* Encode class as key (same formula as Pipeline 1 for comparability) */
     __u64 key = (__u64)((best_val + (long long)(OUTPUT_OFFSET * scale)) / (__u64)scale);
 
     struct fwd_action *action = fwd_table_t2.lookup(&key);
@@ -313,17 +321,11 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
-    } else if (action != NULL) {
-        /* Fake hit: key exists in fwd_table but TTL does not match valid_keys */
-        int si = 2; __u64 *v = pkt_stats_t2.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
-        struct miss_event_t2 ev = {};
-        ev.model_id = model_id; ev.ttl = ip->ttl;
-        ev.ingress_ifindex = ctx->ingress_ifindex;
-        ev.arch_id = entry->arch_id; ev.key = key;
-        miss_events_t2.perf_submit(ctx, &ev, sizeof(ev));
     } else {
-        int si = 1; __u64 *v = pkt_stats_t2.lookup(&si);
+        /* Both MISS (no action) and FAKE HIT (wrong TTL) go to perf buffer */
+        int fake = (action != NULL) ? 1 : 0;
+        int si   = fake ? 2 : 1;
+        __u64 *v = pkt_stats_t2.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         struct miss_event_t2 ev = {};
         ev.model_id = model_id; ev.ttl = ip->ttl;

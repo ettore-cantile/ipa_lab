@@ -8,6 +8,14 @@ baseline (no live run: it lives in the main branch).
 Measures the experimental metrics from docs/design-space.md:
   Datapath:   throughput (Mpps), CPU%, eBPF instruction count
   Control:    model update latency per pipeline
+
+Combined compilation strategy for Pipeline 2:
+  We prepend '#define IPA_ARCH_COMBINED 1' to EBPF_ARCH_65_4_4_7 before
+  concatenating it with EBPF_TEMPLATE_ARCH_DISPATCHER.  The #ifndef guard
+  in EBPF_ARCH_65_4_4_7 skips the shared struct/map declarations, leaving
+  only the arch-specific #defines and the int arch_65_4_4_7() function.
+  This gives BCC a single compilation unit -> single arch_weights map
+  instance -> load_arch_weights works without KeyError.
 """
 
 import argparse
@@ -42,59 +50,13 @@ from common import (
 
 # ---------------------------------------------------------------------------
 # Pipeline 2 combined source
-# We compile dispatcher + arch program in ONE BCC object so that:
-#   1. There is a single arch_weights BPF_ARRAY (no duplicate-map confusion)
-#   2. BCC can resolve __s8 / signed-char leaf type from the single BTF
-#   3. load_arch_weights writes into the correct map instance
-# The arch entry-point (arch_65_4_4_7) is loaded via b.load_func() and
-# wired into arch_progs[0] — tail call still works because arch_progs is a
-# BPF_PROG_ARRAY and the fd belongs to the same BCC-managed object.
-#
-# Guard: EBPF_ARCH_65_4_4_7 already re-declares all shared structs and maps;
-# to avoid duplicate-symbol errors when concatenated we strip the repeated
-# #include / struct / map declarations using the IPA_ARCH_COMBINED cpp guard.
+# Prepend the guard define so EBPF_ARCH_65_4_4_7's #ifndef block is skipped.
 # ---------------------------------------------------------------------------
-
-# Strip the duplicated header block from EBPF_ARCH_65_4_4_7 when combined.
-# The arch source redeclares ipa_hdr, arch_entry, fwd_action, miss_event_t2
-# and all BPF maps that already exist in the dispatcher source.  We keep only
-# the #define constants and the int arch_65_4_4_7(...) function itself.
-
-def _arch_body_only(src: str) -> str:
-    """Return only the #define constants + int arch_65_4_4_7 function,
-    stripping the duplicated #include / struct / BPF_ARRAY declarations."""
-    lines = src.split("\n")
-    out = []
-    skip_block = False
-    for line in lines:
-        stripped = line.strip()
-        # Skip #include lines
-        if stripped.startswith("#include"):
-            continue
-        # Skip struct / BPF_ARRAY / BPF_HASH / BPF_PROG_ARRAY / BPF_PERF_OUTPUT
-        # lines that are already in the dispatcher
-        if any(stripped.startswith(tok) for tok in (
-            "struct ipa_hdr", "struct arch_entry", "struct fwd_action",
-            "struct miss_event_t2",
-            "BPF_ARRAY(arch_weights", "BPF_HASH(arch_registry",
-            "BPF_PROG_ARRAY(arch_progs",
-            "BPF_HASH(fwd_table_t2", "BPF_HASH(valid_keys_t2",
-            "BPF_ARRAY(pkt_stats_t2", "BPF_PERF_OUTPUT(miss_events_t2",
-            "#define MAX_WEIGHT_ENTRIES", "#define OUTPUT_OFFSET",
-            "#define RELU",
-        )):
-            skip_block = True
-        if skip_block:
-            # A block ends at the closing brace line for struct definitions,
-            # or at the semicolon for single-line macro/BPF_* declarations.
-            if stripped.endswith(";") or stripped == "}" or stripped == "} __attribute__((packed));":
-                skip_block = False
-            continue
-        out.append(line)
-    return "\n".join(out)
-
-
-EBPF_TEMPLATE_COMBINED = EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + _arch_body_only(EBPF_ARCH_65_4_4_7)
+EBPF_TEMPLATE_COMBINED = (
+    EBPF_TEMPLATE_ARCH_DISPATCHER
+    + "\n#define IPA_ARCH_COMBINED 1\n"
+    + EBPF_ARCH_65_4_4_7
+)
 
 
 def _get_ebpf_insn_count(prog_name: str) -> int:
@@ -150,30 +112,29 @@ def benchmark_pipeline(
     print(f"\n=== Benchmarking Pipeline {pipeline_id} ===")
 
     if pipeline_id == 2:
-        # Single combined BCC object — fixes KeyError 'signed char'
         entry_fn   = "ipa_switch_template"
         arch_fn    = "arch_65_4_4_7"
         stats_map  = "pkt_stats_t2"
-        fwd_map, vk_map = "fwd_table_t2", "valid_keys_t2"
+        fwd_map    = "fwd_table_t2"
+        vk_map     = "valid_keys_t2"
 
         t0_load = time.perf_counter()
         b = BPF(text=EBPF_TEMPLATE_COMBINED)
         results["load_time_s"] = round(time.perf_counter() - t0_load, 4)
         print(f"  Load time: {results['load_time_s']*1000:.1f} ms")
 
-        # Populate arch_weights and arch_registry — single object, no KeyError
+        # Single combined object -> single arch_weights map -> no KeyError
         load_arch_weights(b, weights, model_id=42, scale=scale)
 
-        # Load arch function and wire into tail-call map
+        # Wire arch function into the tail-call map
         fn_arch = b.load_func(arch_fn, BPF.XDP)
         b["arch_progs"][ctypes.c_int(0)] = ctypes.c_int(fn_arch.fd)
-
-        arch_b = None  # no separate object needed
 
     elif pipeline_id == 3:
         entry_fn   = "modular_dispatcher"
         stats_map  = "pkt_stats_t3"
-        fwd_map, vk_map = "fwd_table_t3", "valid_keys_t3"
+        fwd_map    = "fwd_table_t3"
+        vk_map     = "valid_keys_t3"
 
         t0_load = time.perf_counter()
         b = BPF(text=EBPF_MODULAR_FULL)
@@ -188,7 +149,6 @@ def benchmark_pipeline(
         chain[ctypes.c_int(0)] = ctypes.c_int(fn_l0.fd)
         chain[ctypes.c_int(1)] = ctypes.c_int(fn_l1.fd)
         chain[ctypes.c_int(2)] = ctypes.c_int(fn_l2.fd)
-        arch_b = None
 
     else:
         print(f"  Unknown pipeline id {pipeline_id}, skipping.")
@@ -241,6 +201,7 @@ def benchmark_pipeline(
     print(f"  Throughput: {tp_mpps:.4f} Mpps")
     print(f"  CPU:        {cpu_pct:.1f}%")
 
+    # Measure model update latency (map write only, no recompile)
     t_upd = time.perf_counter()
     if pipeline_id == 2:
         load_arch_weights(b, weights, model_id=42, scale=scale)
@@ -257,19 +218,19 @@ def benchmark_pipeline(
 
 
 DESIGN_SPACE_TABLE = """
-╔══════════════════════╦══════════════╦══════════╦═══════════╦═══════════════════╦═════════════╦═══════════════════╗
-║ Pipeline             ║ eBPF code    ║ Weights  ║ Tail calls║ Interm. state     ║ Flexibility ║ Exp. performance  ║
-╠══════════════════════╬══════════════╬══════════╬═══════════╬═══════════════════╬═════════════╬═══════════════════╣
-║ 1. Hardcoded         ║ 1/model      ║ hardcoded║ 1         ║ none              ║ low         ║ maximum  [ref]    ║
-║ 2. Arch template     ║ 1/arch shape ║ BPF map  ║ 1         ║ local frame       ║ medium      ║ high/intermediate ║
-║ 3. Modular pipeline  ║ 1/layer      ║ BPF map  ║ N(layers) ║ scratch PERCPU    ║ maximum     ║ lower             ║
-╚══════════════════════╩══════════════╩══════════╩═══════════╩═══════════════════╩═════════════╩═══════════════════╝
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551 Pipeline             \u2551 eBPF code    \u2551 Weights  \u2551 Tail calls\u2551 Interm. state     \u2551 Flexibility \u2551 Exp. performance  \u2551
+\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u256c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
+\u2551 1. Hardcoded         \u2551 1/model      \u2551 hardcoded\u2551 1         \u2551 none              \u2551 low         \u2551 maximum  [ref]    \u2551
+\u2551 2. Arch template     \u2551 1/arch shape \u2551 BPF map  \u2551 1         \u2551 local frame       \u2551 medium      \u2551 high/intermediate \u2551
+\u2551 3. Modular pipeline  \u2551 1/layer      \u2551 BPF map  \u2551 N(layers) \u2551 scratch PERCPU    \u2551 maximum     \u2551 lower             \u2551
+\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2569\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2569\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2569\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2569\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2569\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2569\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
 """
 
 
 def print_summary(results: list) -> None:
     print("\n" + "=" * 70)
-    print("IPA/eBPF Design Space — Benchmark Results")
+    print("IPA/eBPF Design Space \u2014 Benchmark Results")
     print("=" * 70)
     print(DESIGN_SPACE_TABLE)
     print(f"{'Pipeline':<25} {'Throughput (Mpps)':<20} "
@@ -324,54 +285,41 @@ def main():
     if args.weights_json:
         print(f"Loading precomputed weights from {args.weights_json} ...")
         with open(args.weights_json) as f:
-            weights = json.load(f)
-        if isinstance(weights, dict):
-            floats  = weights["weights"]
-            scale   = weights["scale_factor"]
+            weights_data = json.load(f)
+        if isinstance(weights_data, dict):
+            floats = weights_data["weights"]
+            scale  = weights_data["scale_factor"]
             weights = [
                 max(-128, min(127, int(round(wf * scale))))
                 for wf in floats
             ]
             cp4 = floats[:4]
         else:
-            float_path = args.weights_json.replace(
-                "weights.json", "weights_float.json")
-            if os.path.exists(float_path):
-                with open(float_path) as f:
-                    fdata = json.load(f)
-                scale = fdata["scale_factor"]
-                cp4   = fdata["weights"][:4]
-            else:
-                scale = 1
-                cp4   = [w / 127.0 for w in weights[:4]]
-        print(f"  {len(weights)} int8 weights loaded from JSON.")
+            scale   = 128
+            weights = weights_data
+            cp4     = [w / 127.0 for w in weights[:4]]
+        print(f"  {len(weights)} int8 weights loaded.")
     else:
         import warnings
-        from extract_weights import extract_weights_int8
         try:
             import torch
             torch_ok = True
         except ImportError:
             torch_ok = False
             warnings.warn(
-                "torch not available — loading precomputed weights "
-                "from weights.json",
+                "torch not available — auto-loading from /shared/weights.json",
                 RuntimeWarning)
 
         if torch_ok:
-            print(f"Loading weights from {args.model} (requires torch)...")
+            from extract_weights import extract_weights_int8
+            print(f"Loading weights from {args.model} (torch)...")
             weights = extract_weights_int8(args.model)
-            print(f"  {len(weights)} int8 weights loaded.")
             try:
                 from FRR_model import FastRerouteMLP
-                m = FastRerouteMLP(
-                    n_interfaces=6, n_nodes=52, hidden_dim=4)
-                m.load_state_dict(
-                    torch.load(args.model, map_location="cpu"))
-                floats  = [
-                    w for p in m.parameters()
-                    for w in p.data.view(-1).tolist()
-                ]
+                m = FastRerouteMLP(n_interfaces=6, n_nodes=52, hidden_dim=4)
+                m.load_state_dict(torch.load(args.model, map_location="cpu"))
+                floats  = [w for p in m.parameters()
+                           for w in p.data.view(-1).tolist()]
                 max_abs = max(abs(w) for w in floats)
                 scale   = int(127 / max_abs)
                 cp4     = floats[:4]
@@ -379,27 +327,30 @@ def main():
                 scale = 128
                 cp4   = [w / 127.0 for w in weights[:4]]
         else:
-            # Fall back to weights.json next to this script
-            fallback = Path(__file__).parent / "weights.json"
-            if not fallback.exists():
-                print(f"ERROR: no weights.json found at {fallback}.")
-                sys.exit(1)
-            with open(fallback) as f:
-                wdata = json.load(f)
-            if isinstance(wdata, dict):
-                floats  = wdata["weights"]
-                scale   = wdata["scale_factor"]
-                weights = [
-                    max(-128, min(127, int(round(wf * scale))))
-                    for wf in floats
-                ]
-                cp4 = floats[:4]
+            # Auto-fallback: try /shared/weights.json then local weights.json
+            for candidate in ["/shared/weights.json",
+                               str(Path(__file__).parent / "weights.json")]:
+                if os.path.exists(candidate):
+                    with open(candidate) as f:
+                        wdata = json.load(f)
+                    if isinstance(wdata, dict):
+                        floats  = wdata["weights"]
+                        scale   = wdata["scale_factor"]
+                        weights = [
+                            max(-128, min(127, int(round(wf * scale))))
+                            for wf in floats
+                        ]
+                        cp4 = floats[:4]
+                    else:
+                        scale   = 128
+                        weights = wdata
+                        cp4     = [w / 127.0 for w in weights[:4]]
+                    print(f"  {len(weights)} int8 weights from {candidate}")
+                    break
             else:
-                scale   = 128
-                weights = wdata
-                cp4     = [w / 127.0 for w in weights[:4]]
-            print(f"  {len(weights)} int8 weights loaded from "
-                  f"{fallback} (no torch).")
+                print("ERROR: no weights.json found. "
+                      "Use --weights-json <path>.")
+                sys.exit(1)
 
     pipelines = (
         [2, 3]
