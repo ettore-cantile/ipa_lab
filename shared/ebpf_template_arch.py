@@ -66,12 +66,14 @@ struct ipa_hdr {
     __u8   out0_code;   __u8 out0_count;
 } __attribute__((packed));
 
-/* Model registry entry: maps model_id -> arch_id + weight_offset + scale */
+/* Model registry entry: maps model_id -> arch_id + weight_offset + scale
+ * MUST be packed: arch_id (__u8) would otherwise get 3 bytes of implicit
+ * padding before weight_offset (__u32), breaking the Python ctypes mapping. */
 struct arch_entry {
     __u8  arch_id;        /* index into arch_progs tail-call map        */
     __u32 weight_offset;  /* byte offset into arch_weights flat array   */
     __u16 scale_factor;   /* same semantics as model_cache.scale_factor */
-};
+} __attribute__((packed));
 
 struct fwd_action {
     __u32 ifindex;
@@ -125,11 +127,9 @@ int ipa_switch_template(struct xdp_md *ctx) {
     struct arch_entry *entry = arch_registry.lookup(&model_id);
     if (!entry) return XDP_PASS;  /* model not registered */
 
-    /* Store arch_id + weight_offset + scale in the XDP metadata scratch area
-     * so the arch program can read them after the tail call.
-     * We reuse the first 8 bytes of XDP metadata (adjust headroom if needed).
-     * For simplicity in this implementation we encode into a percpu map key.
-     */
+    /* The arch program re-looks up arch_registry[model_id] to retrieve
+     * weight_offset and scale_factor after the tail call.  This is the
+     * simplest verifier-safe approach; no XDP metadata scratch is needed. */
     arch_progs.call(ctx, entry->arch_id);
     return XDP_PASS;  /* tail call failed */
 }
@@ -180,11 +180,12 @@ struct ipa_hdr {
     __u8   out0_code;   __u8 out0_count;
 } __attribute__((packed));
 
+/* packed: same fix as in the dispatcher compilation unit */
 struct arch_entry {
     __u8  arch_id;
     __u32 weight_offset;
     __u16 scale_factor;
-};
+} __attribute__((packed));
 
 struct fwd_action {
     __u32 ifindex;
@@ -313,8 +314,14 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     } else if (action != NULL) {
+        /* Fake hit: key exists in fwd_table but TTL does not match valid_keys */
         int si = 2; __u64 *v = pkt_stats_t2.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
+        struct miss_event_t2 ev = {};
+        ev.model_id = model_id; ev.ttl = ip->ttl;
+        ev.ingress_ifindex = ctx->ingress_ifindex;
+        ev.arch_id = entry->arch_id; ev.key = key;
+        miss_events_t2.perf_submit(ctx, &ev, sizeof(ev));
     } else {
         int si = 1; __u64 *v = pkt_stats_t2.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
@@ -350,11 +357,13 @@ def load_arch_weights(bpf_obj, weights_int8: list, model_id: int = 0, scale: int
         val = c_int8(int(w))
         bpf_obj["arch_weights"][key] = val
 
-    # Register model_id -> arch_entry
+    # _pack_ = 1 ensures the Python struct layout matches the C __attribute__((packed))
+    # definition: no padding between arch_id (1 byte) and weight_offset (4 bytes).
     class ArchEntry(Structure):
-        _fields_ = [("arch_id", c_uint8),
-                    ("weight_offset", c_uint32),
-                    ("scale_factor", c_uint16)]
+        _pack_ = 1
+        _fields_ = [("arch_id",       c_uint8),
+                    ("weight_offset",  c_uint32),
+                    ("scale_factor",   c_uint16)]
 
     entry = ArchEntry(arch_id=arch_id, weight_offset=weight_offset, scale_factor=scale)
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
