@@ -4,12 +4,16 @@
 #
 # Usage: bash shared/test_kathara.sh [hardcoded|template|modular]
 #
-# Fix log:
-#   - INGRESS_IFACE aligned to eth1 (matches common.py / execute_pipeline.py)
-#   - kexec helper replaced with inline kathara exec -- sh -c "..."
-#     to avoid bash-not-found on Debian-slim containers and temp-file races
-#   - Direct link checked first (10.0.0.234); OSPF (10.255.255.17) optional
-#   - Step 10 emits TEST PASSED / TEST FAILED with exit code
+# Interface mapping (lab.conf + darmstadt.startup):
+#   darmstadt[0]="l59" <-> frankfurt[1]="l59"
+#     eth0 = 10.0.0.233/30  INGRESS: IPA packets from frankfurt arrive here
+#     XDP must be attached to eth0
+#   darmstadt[1]="l62" <-> mannheim[0]="l62"
+#     eth1 = 10.0.0.246/30  EGRESS toward mannheim
+#
+# OSPF loopback IPs (from *.startup /etc/hosts):
+#   darmstadt  = 10.255.255.10
+#   frankfurt  = 10.255.255.17
 # =============================================================================
 
 METHOD=${1:-hardcoded}
@@ -18,14 +22,15 @@ PACKET_COUNT=100
 INTERVAL=0.002
 WEIGHTS="/shared/weights.json"
 
+# Direct link: darmstadt eth0 (10.0.0.233) <-> frankfurt eth1 (10.0.0.234)
 FRANKFURT_DIRECT="10.0.0.234"
+# OSPF loopback (available after FRR converges, ~30s)
 FRANKFURT_OSPF="10.255.255.17"
 FRANKFURT_IP="${FRANKFURT_DIRECT}"
 
-# INGRESS_IFACE must match common.py (eth1 = ingress toward frankfurt on l58)
-# XDP is attached to eth1 by execute_pipeline.py.
-# eth0 is the management/loopback-facing interface on darmstadt.
-INGRESS_IFACE="eth1"
+# XDP is attached to the ingress interface toward frankfurt = eth0
+# (darmstadt[0]="l59" in lab.conf, ip 10.0.0.233/30)
+INGRESS_IFACE="eth0"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -38,9 +43,7 @@ echo -e "${GREEN}============================================================${N
 echo
 
 # ---------------------------------------------------------------------------
-# krun NODE CMD  — run CMD inline inside NODE via kathara exec.
-# Uses 'sh -c' to avoid any dependency on bash inside the container and
-# eliminates the temp-file race that kscript + kexec had.
+# krun NODE CMD  — run CMD inside NODE via kathara exec
 # ---------------------------------------------------------------------------
 krun() {
     local node="$1"
@@ -59,6 +62,7 @@ echo
 
 # ---------------------------------------------------------------------------
 # Step 2a — Direct link check (required)
+# darmstadt eth0=10.0.0.233 <-> frankfurt eth1=10.0.0.234  (l59)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2a] Checking direct link darmstadt->frankfurt (${FRANKFURT_DIRECT})...${NC}"
 DIRECT_OK=0
@@ -78,11 +82,13 @@ if [ ${DIRECT_OK} -eq 0 ]; then
     echo
     echo "  Troubleshooting:"
     echo "    1) Verify darmstadt eth0 has 10.0.0.233/30:"
-    echo "         kathara exec darmstadt -- ip addr show"
+    echo "         kathara exec darmstadt -- ip addr show eth0"
     echo "    2) Verify frankfurt  eth1 has 10.0.0.234/30:"
-    echo "         kathara exec frankfurt  -- ip addr show"
-    echo "    3) Confirm lab.conf link: darmstadt[0]=A, frankfurt[1]=A"
+    echo "         kathara exec frankfurt  -- ip addr show eth1"
+    echo "    3) Confirm lab.conf link: darmstadt[0]=l59, frankfurt[1]=l59"
     echo "         (both on the same collision domain)"
+    echo "    4) Check the link is up:"
+    echo "         kathara exec darmstadt -- ip link show eth0"
     echo
     echo "TEST FAILED"
     exit 1
@@ -121,7 +127,7 @@ echo
 
 # ---------------------------------------------------------------------------
 # Step 4 — Load pipeline on darmstadt
-# execute_pipeline.py attaches XDP to INGRESS_IFACE (eth1).
+# XDP attaches to INGRESS_IFACE=eth0 (darmstadt[0]=l59, toward frankfurt)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (iface=${INGRESS_IFACE})...${NC}"
 krun darmstadt "python3 /shared/execute_pipeline.py --method ${METHOD} --iface ${INGRESS_IFACE} --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 & echo \$! > /tmp/pipeline.pid && echo 'Pipeline started'"
@@ -153,6 +159,9 @@ echo
 
 # ---------------------------------------------------------------------------
 # Step 6 — Send IPA packets
+# Packets are sent to frankfurt (FRANKFURT_IP) from darmstadt.
+# They arrive on frankfurt's side of l59, then darmstadt sees the
+# reply/forwarded traffic on its eth0 (INGRESS_IFACE).
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt -> ${FRANKFURT_IP}...${NC}"
 krun darmstadt "python3 /shared/send_ipa.py --dst ${FRANKFURT_IP} --count ${PACKET_COUNT} --model-id ${MODEL_ID} --weights ${WEIGHTS} --interval ${INTERVAL} 2>&1"

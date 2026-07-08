@@ -1,6 +1,12 @@
 """
 common.py - Shared helpers used by all methods.
 
+Interface mapping (from lab.conf + darmstadt.startup):
+  darmstadt[0]="l59" <-> frankfurt[1]="l59"
+    eth0 = 10.0.0.233/30  -> INGRESS: IPA packets arrive from frankfurt here
+  darmstadt[1]="l62" <-> mannheim[0]="l62"
+    eth1 = 10.0.0.246/30  -> EGRESS:  forwarded packets leave toward mannheim
+
 Key note about the input_size field:
   In the new paper-compliant IPA header, input_size=65 (actual value).
   The CP uses iv = [42, ttl, ifindex, 65] to compute fwd_table keys,
@@ -12,8 +18,8 @@ import socket
 import time
 from bcc import BPF
 
-INGRESS_IFACE = "eth1"
-EGRESS_IFACE  = "eth2"
+INGRESS_IFACE = "eth0"   # darmstadt[0]=l59, link to frankfurt (10.0.0.233/30)
+EGRESS_IFACE  = "eth1"   # darmstadt[1]=l62, link to mannheim  (10.0.0.246/30)
 OFFSET        = 100000
 SRC_MAC       = [0x22, 0x8e, 0x26, 0xbb, 0xdf, 0xf5]
 DST_MAC       = [0x62, 0x45, 0x3d, 0xec, 0xc9, 0x80]
