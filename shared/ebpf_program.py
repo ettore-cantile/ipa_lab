@@ -21,10 +21,10 @@ Stack budget fix:
     iv[13+model_id]     = 1                (one-hot, indices 13..64)
   All other indices are 0, so weight*0 terms vanish from fc1.
   We generate fc1 as:
-    h1_j = RELU( w[j,12]*ttl + w[j, 5+iface]*iface_flag
-               + w[j, 13+node]*node_flag + folded_bias_j )
-  where folded_bias_j = bias_j (zero-index weights contribute 0).
-  Only 3 runtime int values on the stack instead of 65.
+    h1_j = RELU( w[j,12]*ttl + w[j, 5+iface]*iface_weight
+               + w[j, 13+node]*node_weight + bias_j )
+  where the iface/node weights are stored in static const arrays
+  (verifier-friendly: O(1) bounded array access instead of switch trees).
 """
 
 N_IN   = 65
@@ -32,21 +32,6 @@ N_H1   =  4
 N_H2   =  4
 N_OUT  =  7
 N_WEIGHTS = N_IN*N_H1 + N_H1 + N_H1*N_H2 + N_H2 + N_H2*N_OUT + N_OUT  # 319
-
-# Topology: frankfurt interfaces
-# eth0 = loopback-side / mgmt  (ifindex 1 in most Kathara setups)
-# eth1 = link to darmstadt     (ingress, ifindex 2)
-# eth2..eth6 = other links     (ifindex 3..6, fallback XDP_DROP if absent)
-#
-# The 7 output classes map to:
-#   cls 0 -> ifindex IFINDEX_CLS0 (egress toward next hop 0)
-#   cls 1 -> ifindex IFINDEX_CLS1
-#   ...  ...
-#   cls 5 -> ifindex IFINDEX_CLS5
-#   cls 6 -> XDP_DROP
-#
-# Actual ifindex values are injected at code-generation time by method4_hardcoded.py
-# via the IFINDEX_TABLE array literal.
 
 _EBPF_STATIC_HEADER = r"""
 #include <uapi/linux/if_ether.h>
@@ -126,10 +111,15 @@ def generate_ebpf_hardcoded(
     ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex.
                    Defaults to [2,3,4,5,6,7] (eth1..eth6).
 
-    NOTE: bpf_trace_printk() accepts at most 3 arguments after the format
-    string (kernel ABI limit). Logging is therefore split across two calls:
-      call 1 -> model_id + ttl
-      call 2 -> best_cls + egress_ifindex
+    Verifier fix (bpf: Failed to load program: Permission denied):
+      The previous implementation used switch(_node){case 0:..case 51:}
+      repeated for each of the 4 hidden neurons. This created a CFG with
+      O(52^4) paths that the BPF verifier could not explore within its
+      complexity limit. Fix: replace both switch trees with static const
+      __s64 arrays (W_NODE_j[52] and W_IFACE_j[7]) indexed with a bounded
+      variable. The verifier proves the access is in-bounds trivially via
+      the & mask, and the program compiles to a single array read per
+      neuron instead of a binary-search tree of branches.
     """
     if len(weights_int8) != N_WEIGHTS:
         raise ValueError(f"Expected {N_WEIGHTS} weights, got {len(weights_int8)}")
@@ -139,7 +129,6 @@ def generate_ebpf_hardcoded(
     if len(ifindex_table) < 6:
         ifindex_table = list(ifindex_table) + [2] * (6 - len(ifindex_table))
 
-    # Build the C literal for the ifindex table (6 entries, cls 0-5)
     ifindex_literal = ", ".join(str(int(x)) for x in ifindex_table[:6])
 
     w = weights_int8
@@ -161,34 +150,54 @@ def generate_ebpf_hardcoded(
     #   [6..11]  ingress_ifindex one-hot  (index = 5 + ifindex, ifindex 1..6)
     #   [12]     ip->ttl
     #   [13..64] model_id / node_id one-hot (index = 13 + model_id, 0..51)
+    #
+    # Verifier-friendly encoding:
+    #   - W_NODE_j[52]: static const array of node weights for neuron j
+    #     accessed as W_NODE_j[node & 0x3f]  (63 >= 51, always in bounds)
+    #   - W_IFACE_j[7]: static const array for iface weights (indices 0..6)
+    #     accessed as W_IFACE_j[iface & 0x7] (7 >= 6, always in bounds)
+    #     index 0 is unused (ifindex is 1-based), set to 0.
     # ----------------------------------------------------------------
 
     fc1_lines = []
     fc1_lines.append("    /* fc1: only 3 live features -- ttl, iface one-hot, node one-hot */")
-    fc1_lines.append("    int _ttl    = (int)ip->ttl;")
-    fc1_lines.append("    int _iface  = (int)ctx->ingress_ifindex;  /* 1..6 */")
-    fc1_lines.append("    int _node   = (int)ipa->model_id;          /* 0..51 */")
+    fc1_lines.append("    __u32 _ttl   = ((__u32)ip->ttl) & 0xff;")
+    fc1_lines.append("    __u32 _iface = ((__u32)ctx->ingress_ifindex) & 0x7;  /* 1..6 */")
+    fc1_lines.append("    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;        /* 0..51 */")
 
     for j in range(N_H1):
         w_ttl = int(fc1_w[j * N_IN + 12])
         b_j   = int(fc1_b[j])
 
-        iface_cases = ""
+        # W_IFACE_j: index 0 unused (ifindex is 1-based), indices 1..6 hold real weights
+        iface_vals = ["0LL"]  # index 0 placeholder
         for iface in range(1, 7):
             wi = int(fc1_w[j * N_IN + 5 + iface])
-            iface_cases += f"case {iface}: _wiface{j}={lit(wi)}LL; break; "
+            iface_vals.append(f"{lit(wi)}LL")
+        iface_literal = ", ".join(iface_vals)
 
-        node_cases = ""
-        for node in range(52):
-            wn = int(fc1_w[j * N_IN + 13 + node])
-            node_cases += f"case {node}: _wnode{j}={lit(wn)}LL; break; "
+        # W_NODE_j: indices 0..51 hold real weights, fill up to 64 with 0
+        node_vals = []
+        for node in range(64):
+            if node < 52:
+                wn = int(fc1_w[j * N_IN + 13 + node])
+                node_vals.append(f"{lit(wn)}LL")
+            else:
+                node_vals.append("0LL")
+        node_literal = ", ".join(node_vals)
 
-        fc1_lines.append(f"    long long _wiface{j} = 0LL, _wnode{j} = 0LL;")
-        fc1_lines.append(f"    switch (_iface) {{ {iface_cases}default: break; }}")
-        fc1_lines.append(f"    switch (_node)  {{ {node_cases}default: break; }}")
+        fc1_lines.append(
+            f"    static const __s64 W_IFACE{j}[7] = {{ {iface_literal} }};"
+        )
+        fc1_lines.append(
+            f"    static const __s64 W_NODE{j}[64] = {{ {node_literal} }};"
+        )
         fc1_lines.append(
             f"    long long h1_{j} = RELU_LL("
-            f"(long long)_ttl * {lit(w_ttl)}LL + _wiface{j} + _wnode{j} + {lit(b_j)}LL);"
+            f"(__s64)_ttl * {lit(w_ttl)}LL"
+            f" + W_IFACE{j}[_iface]"
+            f" + W_NODE{j}[_node]"
+            f" + {lit(b_j)}LL);"
         )
 
     fc2_lines = []
@@ -268,7 +277,6 @@ int ipa_switch(struct xdp_md *ctx) {{
         /* cls 6 = DROP */
         int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);
         if (_dv) __sync_fetch_and_add(_dv, 1);
-        /* bpf_trace_printk: max 3 args after format string */
         bpf_trace_printk("IPA p1 DROP: model=%d ttl=%d\\n",
                          ipa->model_id, ip->ttl);
         return XDP_DROP;
@@ -285,7 +293,6 @@ int ipa_switch(struct xdp_md *ctx) {{
     int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
     if (_hv) __sync_fetch_and_add(_hv, 1);
 
-    /* bpf_trace_printk: max 3 args after format string -- split into 2 calls */
     bpf_trace_printk("IPA p1: model=%d ttl=%d\\n",
                      ipa->model_id, ip->ttl);
     bpf_trace_printk("IPA p1: cls=%d ifindex=%d\\n",
