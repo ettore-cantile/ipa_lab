@@ -7,6 +7,9 @@ Design space position:
   - Pesi hardcoded come letterali nel sorgente C
   - Inferenza: fc1 (65->4, ReLU) + fc2 (4->4, ReLU) + out (4->7, argmax)
   - Una sola tail call, nessuna map lookup per i pesi
+  - Azione hardcodata per classe: best_cls -> ifindex[best_cls]
+    (cls 0-5 = bpf_redirect su iface corrispondente, cls 6 = XDP_DROP)
+  - Nessuna fwd_table, nessuna valid_keys lookup: TRUE HIT = redirect riuscito
 
 Stack budget fix:
   iv[65] as int array  -> 260B (too much)
@@ -29,6 +32,21 @@ N_H1   =  4
 N_H2   =  4
 N_OUT  =  7
 N_WEIGHTS = N_IN*N_H1 + N_H1 + N_H1*N_H2 + N_H2 + N_H2*N_OUT + N_OUT  # 319
+
+# Topology: frankfurt interfaces
+# eth0 = loopback-side / mgmt  (ifindex 1 in most Kathara setups)
+# eth1 = link to darmstadt     (ingress, ifindex 2)
+# eth2..eth6 = other links     (ifindex 3..6, fallback XDP_DROP if absent)
+#
+# The 7 output classes map to:
+#   cls 0 -> ifindex IFINDEX_CLS0 (egress toward next hop 0)
+#   cls 1 -> ifindex IFINDEX_CLS1
+#   ...  ...
+#   cls 5 -> ifindex IFINDEX_CLS5
+#   cls 6 -> XDP_DROP
+#
+# Actual ifindex values are injected at code-generation time by method4_hardcoded.py
+# via the IFINDEX_TABLE array literal.
 
 _EBPF_STATIC_HEADER = r"""
 #include <uapi/linux/if_ether.h>
@@ -60,18 +78,12 @@ struct model_data {
     __u16 scale_factor;
 };
 
-struct fwd_action {
-    __u32 ifindex;
-    __u8  src_mac[6];
-    __u8  dst_mac[6];
-} __attribute__((packed));
-
 struct miss_event {
     __u8  model_id;
     __u8  ttl;
     __u32 ingress_ifindex;
     __u8  input_size;
-    __u64 key;
+    __u8  chosen_cls;
 };
 
 struct model_miss_event {
@@ -84,23 +96,46 @@ struct model_miss_event {
 };
 
 BPF_HASH(model_cache,       __u8,  struct model_data, 256);
-BPF_HASH(fwd_table,         __u64, struct fwd_action, 256);
-BPF_HASH(valid_keys,        __u8,  __u64,             256);
-BPF_ARRAY(pkt_stats,        __u64, 3);
+BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss [2]=drop */
+BPF_ARRAY(cls_stats,        __u64, 7);   /* per-class redirect counter */
 BPF_PERF_OUTPUT(miss_events);
 BPF_PERF_OUTPUT(model_miss_events);
 /* percpu scratch to keep event structs off the stack */
 BPF_PERCPU_ARRAY(ev_scratch,  struct miss_event,        1);
 BPF_PERCPU_ARRAY(mev_scratch, struct model_miss_event,  1);
 
-#define OUTPUT_OFFSET 100000ULL
 #define RELU_LL(x)    ((x) > 0LL ? (x) : 0LL)
 """
 
 
-def generate_ebpf_hardcoded(weights_int8: list, scale: int, model_id: int = 0) -> str:
+def generate_ebpf_hardcoded(
+    weights_int8: list,
+    scale: int,
+    model_id: int = 0,
+    ifindex_table: list = None,
+) -> str:
+    """
+    Generate a self-contained eBPF XDP program for model `model_id`.
+
+    After argmax the program:
+      - reads ifindex from the HARDCODED array IFINDEX_TABLE[best_cls]
+      - cls 0-5: bpf_redirect(ifindex, 0)  -> pkt_stats[0]++, cls_stats[cls]++
+      - cls  6:  XDP_DROP                  -> pkt_stats[2]++
+      - model_cache miss:                  -> pkt_stats[1]++
+
+    ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex.
+                   Defaults to [2,3,4,5,6,7] (eth1..eth6).
+    """
     if len(weights_int8) != N_WEIGHTS:
         raise ValueError(f"Expected {N_WEIGHTS} weights, got {len(weights_int8)}")
+
+    if ifindex_table is None:
+        ifindex_table = [2, 3, 4, 5, 6, 7]   # eth1..eth6 default
+    if len(ifindex_table) < 6:
+        ifindex_table = list(ifindex_table) + [2] * (6 - len(ifindex_table))
+
+    # Build the C literal for the ifindex table (6 entries, cls 0-5)
+    ifindex_literal = ", ".join(str(int(x)) for x in ifindex_table[:6])
 
     w = weights_int8
     fc1_w = w[0           : N_IN*N_H1]
@@ -121,34 +156,23 @@ def generate_ebpf_hardcoded(weights_int8: list, scale: int, model_id: int = 0) -
     #   [6..11]  ingress_ifindex one-hot  (index = 5 + ifindex, ifindex 1..6)
     #   [12]     ip->ttl
     #   [13..64] model_id / node_id one-hot (index = 13 + model_id, 0..51)
-    #
-    # fc1 for neuron j:
-    #   sum_i( w[j,i] * iv[i] )
-    #   = w[j,12]*ttl  +  w[j, 5+iface]*1  +  w[j, 13+node]*1  +  0*(others)
-    #   + bias[j]
-    #
-    # We generate a switch on ingress_ifindex (1..6) and model_id (0..51).
-    # ttl is a runtime int (8-bit, fits easily in a single stack slot).
     # ----------------------------------------------------------------
 
     fc1_lines = []
-    fc1_lines.append("    /* fc1: only 3 live features — ttl, iface one-hot, node one-hot */")
+    fc1_lines.append("    /* fc1: only 3 live features -- ttl, iface one-hot, node one-hot */")
     fc1_lines.append("    int _ttl    = (int)ip->ttl;")
     fc1_lines.append("    int _iface  = (int)ctx->ingress_ifindex;  /* 1..6 */")
     fc1_lines.append("    int _node   = (int)ipa->model_id;          /* 0..51 */")
 
     for j in range(N_H1):
-        # weight for ttl (index 12)
         w_ttl = int(fc1_w[j * N_IN + 12])
         b_j   = int(fc1_b[j])
 
-        # iface branch: w[j, 5+iface] for iface=1..6 (indices 6..11)
         iface_cases = ""
         for iface in range(1, 7):
             wi = int(fc1_w[j * N_IN + 5 + iface])
             iface_cases += f"case {iface}: _wiface{j}={lit(wi)}LL; break; "
 
-        # node branch: w[j, 13+node] for node=0..51 (indices 13..64)
         node_cases = ""
         for node in range(52):
             wn = int(fc1_w[j * N_IN + 13 + node])
@@ -184,6 +208,9 @@ def generate_ebpf_hardcoded(weights_int8: list, scale: int, model_id: int = 0) -
     argmax_src = "\n".join(argmax_lines)
 
     body = f"""
+/* Hardcoded ifindex table: cls 0-5 -> egress ifindex, cls 6 -> DROP */
+static const __u32 IFINDEX_TABLE[6] = {{ {ifindex_literal} }};
+
 int ipa_switch(struct xdp_md *ctx) {{
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -199,7 +226,7 @@ int ipa_switch(struct xdp_md *ctx) {{
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;
 
-    /* model cache check */
+    /* model_cache check: if model not loaded, count as miss and pass */
     struct model_data *m = model_cache.lookup(&ipa->model_id);
     if (!m || m->is_valid == 0) {{
         __u8 *wp = (__u8 *)(ipa + 1);
@@ -215,6 +242,8 @@ int ipa_switch(struct xdp_md *ctx) {{
             mev->n_weights       = 4;
             model_miss_events.perf_submit(ctx, mev, sizeof(*mev));
         }}
+        int _ms = 1; __u64 *_mv = pkt_stats.lookup(&_ms);
+        if (_mv) __sync_fetch_and_add(_mv, 1);
         return XDP_PASS;
     }}
 
@@ -228,54 +257,46 @@ int ipa_switch(struct xdp_md *ctx) {{
 {out_src}
 
 {argmax_src}
-    (void)best_cls;
 
-    __u64 key = (__u64)((best_val +
-        (long long)(OUTPUT_OFFSET * (__u64)scale)) / (__u64)scale);
-
-    struct fwd_action *action      = fwd_table.lookup(&key);
-    __u64             *correct_key = valid_keys.lookup(&ip->ttl);
-
-    if (action != NULL) {{
-        if (correct_key && *correct_key == key) {{
-            int si = 0; __u64 *v = pkt_stats.lookup(&si);
-            if (v) __sync_fetch_and_add(v, 1);
-            __builtin_memcpy(eth->h_source, action->src_mac, 6);
-            __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
-            return bpf_redirect(action->ifindex, 0);
-        }} else {{
-            int si = 2; __u64 *v = pkt_stats.lookup(&si);
-            if (v) __sync_fetch_and_add(v, 1);
-            __u32 _z = 0;
-            struct miss_event *ev = ev_scratch.lookup(&_z);
-            if (ev) {{
-                ev->model_id=ipa->model_id; ev->ttl=ip->ttl;
-                ev->ingress_ifindex=ctx->ingress_ifindex;
-                ev->input_size=ipa->input_size; ev->key=key;
-                miss_events.perf_submit(ctx, ev, sizeof(*ev));
-            }}
-            return XDP_PASS;
-        }}
-    }} else {{
-        int si = 1; __u64 *v = pkt_stats.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
-        __u32 _z = 0;
-        struct miss_event *ev = ev_scratch.lookup(&_z);
-        if (ev) {{
-            ev->model_id=ipa->model_id; ev->ttl=ip->ttl;
-            ev->ingress_ifindex=ctx->ingress_ifindex;
-            ev->input_size=ipa->input_size; ev->key=key;
-            miss_events.perf_submit(ctx, ev, sizeof(*ev));
-        }}
-        return XDP_PASS;
+    /* --- Hardcoded action: class -> egress port (no map lookup) --- */
+    if (best_cls >= 6) {{
+        /* cls 6 = DROP */
+        int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);
+        if (_dv) __sync_fetch_and_add(_dv, 1);
+        bpf_trace_printk("IPA hardcoded: model=%d ttl=%d cls=6 -> DROP\\n",
+                         ipa->model_id, ip->ttl);
+        return XDP_DROP;
     }}
+
+    __u32 egress_ifindex = IFINDEX_TABLE[best_cls];
+
+    /* per-class counter */
+    __u32 _cls = (__u32)best_cls;
+    __u64 *_cv = cls_stats.lookup(&_cls);
+    if (_cv) __sync_fetch_and_add(_cv, 1);
+
+    /* global hit counter */
+    int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
+    if (_hv) __sync_fetch_and_add(_hv, 1);
+
+    bpf_trace_printk("IPA hardcoded: model=%d ttl=%d cls=%d -> ifindex=%d\\n",
+                     ipa->model_id, ip->ttl, best_cls, egress_ifindex);
+
+    return bpf_redirect(egress_ifindex, 0);
 }}
 """
     return _EBPF_STATIC_HEADER + f"\n/* Pipeline 1 — model_id={model_id}, scale={scale} */\n" + body
 
 
-def load_and_generate(model_path: str = "shared/frr_germany50_5_model_4x2.pt",
-                      model_id: int = 0) -> tuple:
+def load_and_generate(
+    model_path: str = "shared/frr_germany50_5_model_4x2.pt",
+    model_id: int = 0,
+    ifindex_table: list = None,
+) -> tuple:
+    """
+    Returns (ebpf_src, weights_int8, scale).
+    ifindex_table is forwarded to generate_ebpf_hardcoded.
+    """
     from extract_weights import extract_weights_int8
     import json, os
     weights_path = os.path.join(os.path.dirname(model_path), "weights_float.json")
@@ -292,7 +313,7 @@ def load_and_generate(model_path: str = "shared/frr_germany50_5_model_4x2.pt",
         max_abs = max(abs(w) for w in floats)
         scale   = int(127 / max_abs)
     weights_int8 = extract_weights_int8(model_path)
-    ebpf_src     = generate_ebpf_hardcoded(weights_int8, scale, model_id)
+    ebpf_src     = generate_ebpf_hardcoded(weights_int8, scale, model_id, ifindex_table)
     return ebpf_src, weights_int8, scale
 
 
