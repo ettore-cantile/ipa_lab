@@ -5,10 +5,13 @@
 # Usage: bash shared/test_kathara.sh [hardcoded|template|modular]
 #
 # kathara exec workaround:
-#   kathara exec NODE -- sh -c "cmd" fails because kathara intercepts -c.
-#   Fix: pipe the command into the container via tee, then run with bash.
-#     echo 'cmd' | kathara exec NODE -- tee /tmp/_k.sh >/dev/null
-#     kathara exec NODE -- bash /tmp/_k.sh
+#   kathara exec intercepts the '-c' flag of 'sh -c', and tee-via-pipe
+#   requires a TTY that kathara does not allocate in non-interactive mode.
+#
+#   Solution: write the command to shared/_krun_<node>.sh on the HOST.
+#   Kathara mounts the lab shared/ dir as /shared/ inside every container,
+#   so 'kathara exec NODE -- bash /shared/_krun_NODE.sh' works with no
+#   '-c' flag and no TTY.
 # =============================================================================
 
 METHOD=${1:-hardcoded}
@@ -22,6 +25,9 @@ FRANKFURT_OSPF="10.255.255.17"
 FRANKFURT_IP="${FRANKFURT_DIRECT}"
 INGRESS_IFACE="eth0"
 
+# Directory where this script lives (= the shared/ dir mounted as /shared/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
@@ -34,28 +40,22 @@ echo
 
 # ---------------------------------------------------------------------------
 # krun NODE CMD
-#   Writes CMD to /tmp/_k.sh inside NODE via tee, then runs it with bash.
-#   This avoids passing '-c' to kathara exec (kathara intercepts it).
+#   Writes CMD to shared/_krun_NODE.sh (visible as /shared/_krun_NODE.sh
+#   inside the container), then runs it via:
+#     kathara exec NODE -- bash /shared/_krun_NODE.sh
+#   Returns the output of CMD.
 # ---------------------------------------------------------------------------
 krun() {
     local node="$1"
     shift
     local cmd="$*"
-    printf '%s\n' "${cmd}" | kathara exec "${node}" -- tee /tmp/_k.sh >/dev/null 2>&1
-    kathara exec "${node}" -- bash /tmp/_k.sh 2>&1
-}
-
-# ---------------------------------------------------------------------------
-# krun_bg NODE CMD
-#   Same but runs CMD in background inside the container.
-# ---------------------------------------------------------------------------
-krun_bg() {
-    local node="$1"
-    shift
-    local cmd="$*"
-    printf '%s\n' "${cmd}" | kathara exec "${node}" -- tee /tmp/_k.sh >/dev/null 2>&1
-    kathara exec "${node}" -- bash /tmp/_k.sh &
-    disown 2>/dev/null || true
+    local tmpscript="${SCRIPT_DIR}/_krun_${node}.sh"
+    printf '#!/bin/bash\n%s\n' "${cmd}" > "${tmpscript}"
+    chmod +x "${tmpscript}"
+    kathara exec "${node}" -- bash /shared/_krun_${node}.sh 2>&1
+    local rc=$?
+    rm -f "${tmpscript}"
+    return ${rc}
 }
 
 echo -e "${YELLOW}[Step 1] Checking Kathara containers...${NC}"
@@ -182,7 +182,7 @@ echo
 # Step 10 — Verify packet counts
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 10] Verifying packet counts...${NC}"
-RECV_LINE=$(krun frankfurt 'if [ ! -f /tmp/recv_ipa.log ]; then echo RECV_COUNT=0; else CNT=$(grep -ci "received\|recv\|packet" /tmp/recv_ipa.log 2>/dev/null || echo 0); echo RECV_COUNT=${CNT}; fi' | grep RECV_COUNT | tr -d '\r')
+RECV_LINE=$(krun frankfurt 'CNT=$(grep -ci "received\|recv\|packet" /tmp/recv_ipa.log 2>/dev/null || echo 0); echo RECV_COUNT=${CNT}' | grep RECV_COUNT | tr -d '\r')
 RECV_COUNT=$(echo "${RECV_LINE}" | grep -oE '[0-9]+$' || echo 0)
 [ -z "${RECV_COUNT}" ] && RECV_COUNT=0
 THRESHOLD=$((PACKET_COUNT * 80 / 100))
