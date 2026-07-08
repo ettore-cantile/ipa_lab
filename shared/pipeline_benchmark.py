@@ -3,7 +3,7 @@ pipeline_benchmark.py  (design-space-docs branch)
 ==================================================
 Comparative benchmark for Pipeline 2 (Arch Template) and Pipeline 3 (Modular).
 Pipeline 1 (Hardcoded) is shown in the summary table as a static reference
-baseline only (no live run: it lives in the main branch).
+baseline (no live run: it lives in the main branch).
 
 Measures the experimental metrics from docs/design-space.md:
   Datapath:   throughput (Mpps), CPU%, eBPF instruction count
@@ -13,6 +13,8 @@ Usage (run as root on the IPA router node):
     python3 pipeline_benchmark.py --iface eth1 --duration 10
     python3 pipeline_benchmark.py --iface eth1 --duration 10 --pipeline 2
     python3 pipeline_benchmark.py --iface eth1 --duration 10 --pipeline 3
+    # Use pre-generated weights.json (no torch required in the container):
+    python3 pipeline_benchmark.py --iface eth1 --weights-json /shared/weights.json
 
 Outputs:
     benchmark_results.json
@@ -37,7 +39,8 @@ except ImportError:
     print("ERROR: BCC not found. Install: apt-get install python3-bpfcc")
     sys.exit(1)
 
-from extract_weights import extract_weights_int8
+# NOTE: extract_weights, FRR_model and torch are imported lazily inside
+# main() so that this module can be imported on machines without torch.
 from ebpf_template_arch import (
     EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_65_4_4_7,
     N_WEIGHTS_T2, load_arch_weights,
@@ -135,7 +138,6 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
     # Populate weights
     if pipeline_id == 2:
         load_arch_weights(b, weights, model_id=42, scale=scale)
-        # Register arch program in tail-call map
         fn_arch = b.load_func(arch_fn, BPF.XDP)
         b["arch_progs"][ctypes.c_int(0)] = ctypes.c_int(fn_arch.fd)
     elif pipeline_id == 3:
@@ -148,10 +150,9 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
         chain[ctypes.c_int(1)] = ctypes.c_int(fn_l1.fd)
         chain[ctypes.c_int(2)] = ctypes.c_int(fn_l2.fd)
 
-    # Forwarding tables
     _populate_fwd(b, fwd_map, vk_map, cp_weights_4, scale)
 
-    # Attach XDP entry point
+    # Attach XDP
     try:
         fn = b.load_func(entry_fn, BPF.XDP)
         b.attach_xdp(iface, fn, 0)
@@ -170,7 +171,7 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
         print(f"  eBPF instructions ({entry_fn}): {insns}")
 
     # Measurement window
-    s0 = _read_pkt_stats(b, stats_map)
+    s0      = _read_pkt_stats(b, stats_map)
     t_start = time.perf_counter()
     cpu0    = time.process_time()
     print(f"  Running for {duration}s...")
@@ -178,12 +179,12 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
         time.sleep(duration)
     except KeyboardInterrupt:
         pass
-    elapsed = time.perf_counter() - t_start
+    elapsed     = time.perf_counter() - t_start
     cpu_elapsed = time.process_time() - cpu0
     s1 = _read_pkt_stats(b, stats_map)
 
-    total = (s1["hit"] + s1["miss"] + s1["fake"]) - \
-            (s0["hit"] + s0["miss"] + s0["fake"])
+    total   = ((s1["hit"] + s1["miss"] + s1["fake"]) -
+               (s0["hit"] + s0["miss"] + s0["fake"]))
     tp_mpps = (total / elapsed) / 1e6 if elapsed > 0 else 0
     cpu_pct = (cpu_elapsed / elapsed) * 100 if elapsed > 0 else 0
 
@@ -234,17 +235,16 @@ def print_summary(results: list) -> None:
     print(f"{'Pipeline':<25} {'Throughput (Mpps)':<20} {'CPU%':<8} "
           f"{'Update (ms)':<14} {'eBPF insns'}")
     print("-" * 78)
-    # Static reference row for Pipeline 1
     print(f"{'1. Hardcoded [ref]':<25} {'N/A (main branch)':<20} {'N/A':<8} "
           f"{'recompile':<14} {'N/A'}")
     for r in results:
-        p    = r.get("pipeline", "?")
-        tp   = r.get("throughput_mpps", "N/A")
-        cpu  = r.get("cpu_pct", "N/A")
-        upd  = r.get("model_update_latency_s")
+        p      = r.get("pipeline", "?")
+        tp     = r.get("throughput_mpps", "N/A")
+        cpu    = r.get("cpu_pct", "N/A")
+        upd    = r.get("model_update_latency_s")
         upd_ms = f"{upd*1000:.2f}" if upd is not None else "N/A"
         insns  = r.get("ebpf_insn_count", "N/A")
-        name = {2: "2. Arch template", 3: "3. Modular pipeline"}.get(p, f"P{p}")
+        name   = {2: "2. Arch template", 3: "3. Modular pipeline"}.get(p, f"P{p}")
         print(f"{name:<25} {str(tp):<20} {str(cpu):<8} {upd_ms:<14} {insns}")
     print()
 
@@ -257,36 +257,74 @@ def main():
     parser = argparse.ArgumentParser(
         description="Benchmark Pipeline 2 (Arch Template) and Pipeline 3 (Modular)."
     )
-    parser.add_argument("--iface",    default=INGRESS_IFACE,
+    parser.add_argument("--iface",       default=INGRESS_IFACE,
                         help=f"XDP interface (default: {INGRESS_IFACE})")
-    parser.add_argument("--duration", type=int, default=10,
+    parser.add_argument("--duration",    type=int, default=10,
                         help="Measurement window in seconds (default: 10)")
-    parser.add_argument("--pipeline", default="all",
+    parser.add_argument("--pipeline",    default="all",
                         help="2, 3, or all (default: all)")
-    parser.add_argument("--model",    default="frr_germany50_5_model_4x2.pt",
-                        help="Path to .pt model file")
-    parser.add_argument("--output",   default="benchmark_results.json")
+    parser.add_argument("--model",       default="frr_germany50_5_model_4x2.pt",
+                        help="Path to .pt model file (requires torch)")
+    parser.add_argument("--weights-json", default=None,
+                        help="Path to precomputed weights.json (skips torch/model load)")
+    parser.add_argument("--output",      default="benchmark_results.json")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
         print("ERROR: must run as root for XDP.")
         sys.exit(1)
 
-    print(f"Loading weights from {args.model} ...")
-    weights = extract_weights_int8(args.model)
-    print(f"  {len(weights)} int8 weights loaded.")
+    # --- Load weights (lazy import of extract_weights / torch) ---
+    if args.weights_json:
+        # Torch-free path: use precomputed weights.json
+        print(f"Loading precomputed weights from {args.weights_json} ...")
+        with open(args.weights_json) as f:
+            weights = json.load(f)
+        if isinstance(weights, dict):
+            # weights_float.json format: re-quantize
+            floats  = weights["weights"]
+            scale   = weights["scale_factor"]
+            weights = [max(-128, min(127, int(round(wf * scale)))) for wf in floats]
+            cp4     = floats[:4]
+        else:
+            # weights.json format: int8 list — we need floats for fwd table
+            # Try to also load weights_float.json for cp4/scale
+            float_path = args.weights_json.replace("weights.json", "weights_float.json")
+            if os.path.exists(float_path):
+                with open(float_path) as f:
+                    fdata = json.load(f)
+                scale = fdata["scale_factor"]
+                cp4   = fdata["weights"][:4]
+            else:
+                # Fallback: derive scale from int8 weights (approximate)
+                scale = 1
+                cp4   = [w / 127.0 for w in weights[:4]]
+        print(f"  {len(weights)} int8 weights loaded from JSON.")
+    else:
+        # Torch path (host with torch installed)
+        from extract_weights import extract_weights_int8
+        print(f"Loading weights from {args.model} (requires torch)...")
+        weights = extract_weights_int8(args.model)
+        print(f"  {len(weights)} int8 weights loaded.")
 
-    # Derive cp_weights_4 (first 4 weights) and scale for fwd table
-    from FRR_model import FastRerouteMLP
-    import torch
-    m = FastRerouteMLP(n_interfaces=6, n_nodes=52, hidden_dim=4)
-    m.load_state_dict(torch.load(args.model))
-    floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
-    max_abs = max(abs(w) for w in floats)
-    scale   = int(127 / max_abs)
-    cp4     = floats[:4]
+        # Derive cp_weights_4 and scale (needs torch)
+        try:
+            import torch
+            from FRR_model import FastRerouteMLP
+            m = FastRerouteMLP(n_interfaces=6, n_nodes=52, hidden_dim=4)
+            m.load_state_dict(torch.load(args.model, map_location="cpu"))
+            floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
+            max_abs = max(abs(w) for w in floats)
+            scale   = int(127 / max_abs)
+            cp4     = floats[:4]
+        except ImportError:
+            print("WARNING: torch not available for cp4/scale derivation. "
+                  "Use --weights-json for full container support.")
+            scale = 1
+            cp4   = [w / 127.0 for w in weights[:4]]
 
-    pipelines = [2, 3] if args.pipeline == "all" else [int(x) for x in args.pipeline.split(",")]
+    pipelines = ([2, 3] if args.pipeline == "all"
+                 else [int(x) for x in args.pipeline.split(",")])
 
     all_results = []
     for pid in pipelines:
