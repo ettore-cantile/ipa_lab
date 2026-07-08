@@ -6,8 +6,9 @@
 #   1. frankfurt carica XDP (Pipeline 1 hardcoded) su eth1 (ingress da darmstadt)
 #   2. darmstadt invia 100 pacchetti IPA UDP:9999 con TTL variabile (30-64)
 #   3. XDP su frankfurt esegue l'inferenza e sceglie la porta di uscita
-#   4. Il test verifica TRUE HIT >= 80% leggendo pkt_stats[0] via bpftool
-#      e stampa la porta di uscita scelta per ogni classe
+#   4. Il test verifica TRUE HIT >= 80% leggendo l'ultima riga di stato
+#      stampata dalla pipeline nel suo log (bpftool non e' disponibile
+#      nei container di questo lab) e stampa la porta scelta per classe
 #
 # Usage: bash shared/test_kathara.sh [hardcoded|template|modular]
 #
@@ -181,103 +182,94 @@ sleep 3
 echo
 
 # ---------------------------------------------------------------------------
-# Step 8 — Leggi pkt_stats da frankfurt via bpftool
+# Step 8 — Leggi le statistiche dal log della pipeline (niente bpftool)
 #
-# Nota: il payload Python viene scritto su file via heredoc (non passato
-# come stringa 'python3 -c "..."') perche' krun() gia' incapsula il comando
-# in un livello di quoting bash; una stringa -c "..." con doppi apici Python
-# annidati (liste, f-string) si scontra con quel livello e produce un file
-# .sh malformato ("syntax error near unexpected token '('"). Un heredoc con
-# delimitatore quotato ('PYEOF') e' scritto letteralmente, senza alcuna
-# espansione/escaping, quindi qualunque quoting Python e' al sicuro.
+# Nota storica: le versioni precedenti di questo step chiamavano `bpftool`
+# per leggere pkt_stats/cls_stats direttamente dalle BPF map. bpftool non e'
+# installato nei container Kathara di questo lab ("No such file or
+# directory: 'bpftool'"), quindi quell'approccio non puo' funzionare qui.
+# method4_hardcoded.py pero' stampa gia' ogni secondo una riga di stato
+# (TRUE HIT / MISS / DROP / cls0..6 / chosen_port) nel suo stesso log
+# (/tmp/pipeline_frankfurt.log) usando `end="\r"` per aggiornarsi in-place:
+# ne basta l'ULTIMA occorrenza per avere lo stato piu recente, senza
+# bisogno di bpftool ne di un handle BCC separato sul processo in corso.
+#
+# Nota quoting: il payload Python e' scritto su file via heredoc (non
+# passato come stringa 'python3 -c "..."') perche' krun() gia' incapsula
+# il comando in un livello di quoting bash; un heredoc con delimitatore
+# quotato ('PYEOF') e' scritto letteralmente, senza alcuna espansione,
+# quindi qualunque quoting Python al suo interno e' al sicuro.
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 8] Reading BPF stats from frankfurt:${NC}"
-cat > "${SCRIPT_DIR}/_stats_pkt.py" <<'PYEOF'
-import subprocess, re, sys
+echo -e "${YELLOW}[Step 8] Reading BPF stats from frankfurt pipeline log:${NC}"
+cat > "${SCRIPT_DIR}/_stats_parse.py" <<'PYEOF'
+import re
+
+LOG = "/tmp/pipeline_frankfurt.log"
 try:
-    out = subprocess.check_output(["bpftool", "map", "show"], text=True)
-    map_id = None
-    for line in out.splitlines():
-        if "pkt_stats" in line:
-            m = re.search(r"^(\d+):", line)
-            if m:
-                map_id = m.group(1)
-    if map_id is None:
-        print("STATS_ERROR: pkt_stats map not found")
-        sys.exit(0)
-    dump = subprocess.check_output(["bpftool", "map", "dump", "id", map_id], text=True)
-    print("BPFTOOL_DUMP=" + dump.replace("\n", "|"))
+    with open(LOG, "r", errors="replace") as f:
+        content = f.read()
 except Exception as e:
     print(f"STATS_ERROR: {e}")
+    raise SystemExit
+
+# The live status line refreshes in place via '\r', not '\n'.
+records = re.split(r"[\r\n]+", content)
+pattern = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+chosen_port=(\S+)\s*$"
+)
+
+last = None
+for line in records:
+    m = pattern.match(line)
+    if m:
+        last = m
+
+if last is None:
+    print("STATS_ERROR: no stats line found in pipeline log yet")
+    raise SystemExit
+
+hit, miss, drop = int(last.group(1)), int(last.group(2)), int(last.group(3))
+cls = [int(last.group(i)) for i in range(4, 11)]
+chosen = last.group(11)
+total = hit + miss + drop
+
+print(f"HIT_COUNT={hit}")
+print(f"MISS_COUNT={miss}")
+print(f"DROP_COUNT={drop}")
+print(f"TOTAL={total}")
+print(f"CHOSEN_PORT={chosen}")
+print()
+print(f"  TRUE HIT  (redirect) : {hit:>8}  ({100*hit/max(total,1):.1f}%)")
+print(f"  MISS      (no cache) : {miss:>8}  ({100*miss/max(total,1):.1f}%)")
+print(f"  DROP      (cls 6)    : {drop:>8}  ({100*drop/max(total,1):.1f}%)")
+print(f"  TOTAL                : {total:>8}")
+print()
+print("  Egress port chosen per class (inference output):")
+cls_labels = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5", "DROP"]
+cls_total = sum(cls) if any(cls) else 1
+for i, cnt in enumerate(cls):
+    label = cls_labels[i] if i < len(cls_labels) else f"cls{i}"
+    bar = "#" * int(30 * cnt / max(cls_total, 1))
+    print(f"    cls {i} -> {label:6s} : {cnt:>6}  {bar}")
 PYEOF
-STATS_OUT=$(krun frankfurt "python3 /shared/_stats_pkt.py")
-echo "  ${STATS_OUT}"
+STATS_FULL=$(krun frankfurt "python3 /shared/_stats_parse.py")
+rm -f "${SCRIPT_DIR}/_stats_parse.py"
+if echo "${STATS_FULL}" | grep -q '^STATS_ERROR'; then
+    echo "  ${STATS_FULL}"
+else
+    echo "${STATS_FULL}" | grep -A3 'TRUE HIT'
+fi
 echo
 
 # ---------------------------------------------------------------------------
-# Step 9 — Leggi cls_stats e stampa porta di uscita per classe
+# Step 9 — Per-class egress port distribution (dallo stesso parse dello Step 8)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 9] Per-class egress port distribution on frankfurt:${NC}"
-cat > "${SCRIPT_DIR}/_stats_cls.py" <<'PYEOF'
-import subprocess, re, sys
-try:
-    out = subprocess.check_output(["bpftool", "map", "show"], text=True)
-    map_id_pkt = None
-    map_id_cls = None
-    for line in out.splitlines():
-        if "pkt_stats" in line:
-            m = re.search(r"^(\d+):", line)
-            if m:
-                map_id_pkt = m.group(1)
-        if "cls_stats" in line:
-            m = re.search(r"^(\d+):", line)
-            if m:
-                map_id_cls = m.group(1)
-
-    def read_array_map(mid):
-        if mid is None:
-            return []
-        dump = subprocess.check_output(["bpftool", "map", "dump", "id", mid], text=True)
-        vals = []
-        for entry in dump.split("key:"):
-            if not entry.strip():
-                continue
-            vm = re.search(r"value: ([\da-f ]+)", entry)
-            if vm:
-                hexbytes = vm.group(1).split()
-                if len(hexbytes) >= 8:
-                    val = int.from_bytes(bytes(int(h, 16) for h in hexbytes[:8]), "little")
-                    vals.append(val)
-        return vals
-
-    pkt = read_array_map(map_id_pkt)
-    cls = read_array_map(map_id_cls)
-
-    hit = pkt[0] if len(pkt) > 0 else 0
-    miss = pkt[1] if len(pkt) > 1 else 0
-    drop = pkt[2] if len(pkt) > 2 else 0
-    total = hit + miss + drop
-
-    print(f"  TRUE HIT  (redirect) : {hit:>8}  ({100*hit/max(total,1):.1f}%)")
-    print(f"  MISS      (no cache) : {miss:>8}  ({100*miss/max(total,1):.1f}%)")
-    print(f"  DROP      (cls 6)    : {drop:>8}  ({100*drop/max(total,1):.1f}%)")
-    print(f"  TOTAL                : {total:>8}")
-    print()
-    print("  Egress port chosen per class (inference output)::")
-    cls_labels = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5", "DROP"]
-    cls_total = sum(cls) if cls else 1
-    for i, cnt in enumerate(cls[:7]):
-        label = cls_labels[i] if i < len(cls_labels) else f"cls{i}"
-        bar = "#" * int(30 * cnt / max(cls_total, 1))
-        print(f"    cls {i} -> {label:6s} : {cnt:>6}  {bar}")
-    print()
-    chosen = cls_labels[cls.index(max(cls))] if cls else "NONE"
-    print(f"CHOSEN_PORT={chosen}")
-    print(f"HIT_COUNT={hit}")
-except Exception as e:
-    print(f"STATS_ERROR: {e}")
-PYEOF
-krun frankfurt "python3 /shared/_stats_cls.py"
+if echo "${STATS_FULL}" | grep -q '^STATS_ERROR'; then
+    echo "  (no data — see Step 8)"
+else
+    echo "${STATS_FULL}" | sed -n '/Egress port/,$p'
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -288,41 +280,12 @@ krun frankfurt 'tail -20 /tmp/pipeline_frankfurt.log 2>/dev/null || echo no-log'
 echo
 
 # ---------------------------------------------------------------------------
-# Step 11 — Verifica finale: TRUE HIT >= 80%
+# Step 11 — Verifica finale: TRUE HIT >= 80%  (riusa STATS_FULL dello Step 8,
+# nessuna nuova chiamata bpftool/krun necessaria)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 11] Final verdict:${NC}"
-cat > "${SCRIPT_DIR}/_stats_hit.py" <<'PYEOF'
-import subprocess, re
-try:
-    out = subprocess.check_output(["bpftool", "map", "show"], text=True)
-    map_id = None
-    for line in out.splitlines():
-        if "pkt_stats" in line:
-            m = re.search(r"^(\d+):", line)
-            if m:
-                map_id = m.group(1)
-    if map_id is None:
-        print("HIT=0")
-    else:
-        dump = subprocess.check_output(["bpftool", "map", "dump", "id", map_id], text=True)
-        vals = []
-        for entry in dump.split("key:"):
-            if not entry.strip():
-                continue
-            vm = re.search(r"value: ([\da-f ]+)", entry)
-            if vm:
-                hexbytes = vm.group(1).split()
-                if len(hexbytes) >= 8:
-                    val = int.from_bytes(bytes(int(h, 16) for h in hexbytes[:8]), "little")
-                    vals.append(val)
-        print(f"HIT={vals[0] if vals else 0}")
-except Exception as e:
-    print("HIT=0")
-PYEOF
-HIT_LINE=$(krun frankfurt "python3 /shared/_stats_hit.py" | grep '^HIT=' | tr -d '\r')
-rm -f "${SCRIPT_DIR}/_stats_pkt.py" "${SCRIPT_DIR}/_stats_cls.py" "${SCRIPT_DIR}/_stats_hit.py"
-
-HIT_COUNT=$(echo "${HIT_LINE}" | grep -oE '[0-9]+$' || echo 0)
+HIT_COUNT=$(echo "${STATS_FULL}" | grep '^HIT_COUNT=' | cut -d= -f2 | tr -d '\r')
+HIT_COUNT=$(echo "${HIT_COUNT}" | grep -oE '^[0-9]+$' || echo 0)
 [ -z "${HIT_COUNT}" ] && HIT_COUNT=0
 THRESHOLD=$((PACKET_COUNT * 80 / 100))
 
