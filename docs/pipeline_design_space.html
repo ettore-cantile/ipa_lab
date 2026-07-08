@@ -305,6 +305,7 @@
     <a href="#metrics">Metriche</a>
     <a href="#update-cost">Costo aggiornamento</a>
     <a href="#formulation">Formulazione</a>
+    <a href="#verifier">Verifier</a>
     <a href="#files">File</a>
   </div>
 </nav>
@@ -640,6 +641,46 @@
         intermediate activations. This maximizes architectural flexibility, but
         introduces additional tail calls and map accesses, thus reducing the
         maximum achievable packet processing rate.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section id="verifier">
+  <div class="container">
+    <div class="section-header">
+      <div class="section-tag">Riscontro pratico</div>
+      <h2>Vincoli del Verifier eBPF</h2>
+      <p>Il Livello 1 (hardcoded) e quello dove "massime prestazioni, zero lookup" e piu difficile da ottenere in pratica: il verifier impone due vincoli che collidono con l'idea di codice completamente unrolled.</p>
+    </div>
+    <div class="metrics-grid" style="margin-bottom:1.5rem;">
+      <div class="metric-card">
+        <div class="metric-icon">&#9646;</div>
+        <div><h4>Stack limit: 512 B</h4><p>Feature vector o tabelle di pesi per-neurone troppo grandi eccedono il budget di stack di un programma eBPF.</p></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon">&#8942;</div>
+        <div><h4>Esplosione del CFG</h4><p>Ramificare (switch/if) su un valore runtime dentro un ciclo per-neurone moltiplica (non somma) i path che il verifier deve esplorare.</p></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon">&#8862;</div>
+        <div><h4>BCC e dati globali</h4><p>Senza CO-RE, BCC non rilocca correttamente array <code style="font-family:var(--font-mono);">static const</code> per XDP: l'indirizzo puo collassare a 0 al load.</p></div>
+      </div>
+    </div>
+    <div class="paper-block">
+      <div class="paper-label">Case study &mdash; Pipeline 1, fc1 (65-4-4-7)</div>
+      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;">
+        Solo 3 feature sono vive per pacchetto (ttl, iface one-hot, node one-hot):
+        il peso associato dipende quindi da un indice runtime limitato
+        (<em>_iface</em> &isin; 1..6, <em>_node</em> &isin; 0..51). Due tentativi sono stati scartati prima della soluzione attuale:
+      </p>
+      <ol style="font-size:13px;color:var(--muted);line-height:1.9;margin:1rem 0 1rem 1.25rem;">
+        <li><strong style="color:var(--red);">switch(_iface)+switch(_node) per neurone</strong> &mdash; con 4 neuroni i path esplorati crescono come (7&middot;52)<sup>4</sup> &asymp; 1.75&times;10<sup>10</sup>, ben oltre il budget di 1.000.000 istruzioni del verifier &rarr; <code style="font-family:var(--font-mono);font-size:11px;background:var(--surface-2);color:var(--red);padding:2px 6px;border-radius:4px;">Permission denied</code>.</li>
+        <li><strong style="color:var(--red);">Array <code style="font-family:var(--font-mono);">static const</code> per neurone</strong>, indicizzati con variabile mascherata &mdash; niente esplosione di path, ma BCC compila questi array come dati globali non rilocati per XDP: la load risultante legge dall'indirizzo 0 &rarr; <code style="font-family:var(--font-mono);font-size:11px;background:var(--surface-2);color:var(--red);padding:2px 6px;border-radius:4px;">R1 invalid mem access 'scalar'</code>.</li>
+        <li><strong style="color:var(--green);">Fix adottato:</strong> un solo <code style="font-family:var(--font-mono);">switch(_iface)</code> e un solo <code style="font-family:var(--font-mono);">switch(_node)</code> per l'intero programma, dove ogni case assegna il contributo per <em>tutti</em> i neuroni insieme. I branch restano O(7+52) indipendentemente dal numero di neuroni, e i valori restano scalari su stack (64&nbsp;B totali) &mdash; nessuna global, nessuna map, preservando la proprieta "zero lookup pesi" del Livello 1.</li>
+      </ol>
+      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--muted);">
+        Dato sperimentale interessante per il paper: il costo della specializzazione massima non e solo prestazionale, ma anche <em>di ingegneria</em> &mdash; richiede una codifica del branching ad-hoc per non violare i limiti del verifier, mentre i Livelli 2 e 3 evitano il problema a monte delegando i pesi a <code style="font-family:var(--font-mono);">BPF_ARRAY</code> map.
       </p>
     </div>
   </div>

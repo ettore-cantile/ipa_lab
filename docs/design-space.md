@@ -153,6 +153,52 @@ The key insight is that flexibility has a *cost* and this cost must be *measured
 - Maximum 33 consecutive tail calls (Linux kernel limit)
 - `BPF_PERCPU_ARRAY` for scratch map avoids lock contention across CPUs
 - All array accesses need explicit bounds checks for the verifier
+- **BPF stack is capped at 512 bytes** per program — large per-neuron
+  lookup tables or unrolled feature vectors overflow this budget
+  (see Pipeline 1 case study below)
+- **CFG path explosion**: branching on a runtime value (`switch`/`if`
+  chains) multiplies the number of paths the verifier must explore.
+  Repeating the same branch *per loop iteration* (e.g. once per hidden
+  neuron) makes this multiplicative across iterations, not additive —
+  it can blow past the verifier's 1,000,000-instruction exploration
+  budget ("Permission denied") well before any real complexity limit
+  is reached
+- **BCC (non-CO-RE) cannot relocate arbitrary global/`.rodata` data**
+  for XDP programs — a `static const` array declared inside a BCC C
+  function is not backed by a real map, so its address may collapse to
+  a literal `0` at load time, and any access is rejected by the
+  verifier ("invalid mem access 'scalar'"). Genuine read-only lookup
+  tables must live in a `BPF_ARRAY` map (as Pipelines 2 and 3 already
+  do), or be avoided entirely on the "hardcoded" path.
+
+#### Case study: Pipeline 1 hardcoded-weight verifier fix
+Encoding `fc1` for the 65-4-4-7 model only needs 3 live features per
+packet (`ttl`, ingress-iface one-hot, node one-hot), so the weight
+associated with each one-hot feature depends on a runtime-bounded index
+(`_iface` ∈ 1..6, `_node` ∈ 0..51). Two implementations were tried and
+rejected before landing on the current one:
+
+1. **`switch(_iface){...}` + `switch(_node){...}` once per hidden
+   neuron.** With `N_H1=4` neurons, the two switches (7 × 52 branches)
+   are repeated 4 times in sequence without ever letting the verifier
+   collapse the state back to a bounded range, so the explored path
+   count grows as `(7·52)^4 ≈ 1.75·10^10` — far past the verifier's
+   budget → load fails with `Permission denied`.
+2. **Per-neuron `static const __s64 W_IFACE_j[7]` / `W_NODE_j[64]`
+   arrays**, indexed with a masked variable. This avoids the path
+   explosion (it's a single array read, not a branch tree), but BCC
+   compiles these `static const` arrays as unrelocated global data for
+   XDP, so the emitted load reads from address `0` → verifier rejects
+   with `R1 invalid mem access 'scalar'`.
+3. **Fix (current code):** emit **one** `switch(_iface)` and **one**
+   `switch(_node)` for the *whole* program, where each `case` assigns
+   the contribution for **all** `N_H1` neurons at once
+   (`w_iface_0..w_iface_{N-1}`, `w_node_0..w_node_{N-1}`). The number of
+   branches stays `O(7 + 52)` regardless of `N_H1` (no multiplicative
+   blow-up), and every value lives in a plain stack scalar (8 ×
+   `long long` = 64 B) — no globals, no maps, no map-lookup overhead.
+   This preserves Pipeline 1's "zero weight-map-lookups" design point
+   while satisfying the verifier.
 
 ### Quantization
 - All pipelines use int8 quantization (7-bit signed) as in the existing codebase

@@ -229,4 +229,18 @@ Basandosi sul ragionamento del professore, il lavoro dovrebbe:
 
 ---
 
+## 8. Riscontro Pratico: Vincoli del Verifier (Pipeline 1)
+
+L'implementazione hardcoded (Livello 1) e quella dove la tesi "massime prestazioni, zero lookup" e piu difficile da ottenere in pratica, perche il verifier eBPF impone due vincoli che collidono direttamente con l'idea di "codice completamente unrolled":
+
+- **Stack limitato a 512 byte per programma** — feature vector o tabelle di pesi troppo grandi per neurone eccedono il budget.
+- **Esplosione del CFG** — ramificare (`switch`/`if`) su un valore runtime *dentro un ciclo per neurone* moltiplica il numero di path che il verifier deve esplorare (non li somma). Con 4 neuroni e due switch da 7 e 52 casi ripetuti per neurone, i path esplorati salgono a `(7*52)^4 ≈ 1.75*10^10`, ben oltre il budget di 1.000.000 istruzioni del verifier → `Permission denied`.
+- **BCC (senza CO-RE) non rilocca correttamente dati globali/`.rodata`** per programmi XDP: un array `static const` dichiarato dentro una funzione BCC non e supportato da una vera map, quindi il suo indirizzo puo collassare a `0` al load, e l'accesso viene rifiutato dal verifier (`invalid mem access 'scalar'`).
+
+**Soluzione adottata:** un solo `switch(_iface)` e un solo `switch(_node)` per l'intero programma (non uno per neurone), dove ogni `case` assegna il contributo per *tutti* i neuroni contemporaneamente. Il numero di branch resta `O(7+52)` indipendentemente dal numero di neuroni, e i valori restano scalari su stack (nessuna global, nessuna map) — preservando la proprieta "zero lookup pesi" del Livello 1 pur passando il verifier.
+
+Questo e un dato sperimentale interessante da riportare nel paper: il costo della specializzazione massima (Livello 1) non e solo prestazionale, ma anche *di ingegneria* — occorre una codifica del branching ad-hoc per non violare i limiti del verifier, mentre i Livelli 2 e 3 evitano il problema a monte delegando i pesi a `BPF_ARRAY` map.
+
+---
+
 *Ultimo aggiornamento: 2026-07-08*

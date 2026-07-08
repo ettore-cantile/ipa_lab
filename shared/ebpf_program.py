@@ -23,8 +23,28 @@ Stack budget fix:
   We generate fc1 as:
     h1_j = RELU( w[j,12]*ttl + w[j, 5+iface]*iface_weight
                + w[j, 13+node]*node_weight + bias_j )
-  where the iface/node weights are stored in static const arrays
-  (verifier-friendly: O(1) bounded array access instead of switch trees).
+
+Verifier history (both fixed; see git log for the failed attempts):
+  1) switch(_iface){...}; switch(_node){...} REPEATED per hidden neuron
+     (once per j in 0..N_H1-1): each neuron's pair of switches multiplies
+     the number of CFG paths the verifier must explore, so the total
+     explodes as O((7*52)^N_H1) ~= 1.75e10 for N_H1=4 -> "Permission
+     denied" (verifier gives up after the 1,000,000-instruction budget).
+  2) Replacing per-neuron switches with per-neuron `static const __s64`
+     lookup arrays (W_IFACEj[7], W_NODEj[64]) avoided the path explosion,
+     but `static const` arrays declared inside a BCC-compiled function are
+     placed in a global/.rodata symbol that BCC's legacy (non-CO-RE)
+     compilation pipeline cannot relocate for XDP programs: the emitted
+     LD_IMM64 address collapses to a literal 0, and the verifier rejects
+     the subsequent load ("R1 invalid mem access 'scalar'").
+  Fix: emit ONE switch(_iface) and ONE switch(_node) TOTAL (not per
+  neuron), each case assigning the per-neuron contribution for ALL
+  N_H1 neurons at once (w_iface_0..w_iface_{N_H1-1} / w_node_0..*).
+  This keeps the same O(7 + 52) ~= 59 branch total regardless of
+  N_H1 (no combinatorial blow-up) and only ever touches plain scalar
+  stack locals (8 x `long long`, 64B) -- no globals, no maps, verifier
+  proves the bound trivially because every case is a concrete constant
+  assignment merging into the same variable.
 """
 
 N_IN   = 65
@@ -111,15 +131,12 @@ def generate_ebpf_hardcoded(
     ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex.
                    Defaults to [2,3,4,5,6,7] (eth1..eth6).
 
-    Verifier fix (bpf: Failed to load program: Permission denied):
-      The previous implementation used switch(_node){case 0:..case 51:}
-      repeated for each of the 4 hidden neurons. This created a CFG with
-      O(52^4) paths that the BPF verifier could not explore within its
-      complexity limit. Fix: replace both switch trees with static const
-      __s64 arrays (W_NODE_j[52] and W_IFACE_j[7]) indexed with a bounded
-      variable. The verifier proves the access is in-bounds trivially via
-      the & mask, and the program compiles to a single array read per
-      neuron instead of a binary-search tree of branches.
+    Verifier fix: see the module docstring "Verifier history" section.
+    A single switch(_iface) and a single switch(_node) (not one per
+    neuron) assign the per-neuron contributions for all N_H1 neurons at
+    once, avoiding both the combinatorial CFG explosion of per-neuron
+    switches and the broken global-array codegen of per-neuron
+    `static const` lookup tables.
     """
     if len(weights_int8) != N_WEIGHTS:
         raise ValueError(f"Expected {N_WEIGHTS} weights, got {len(weights_int8)}")
@@ -151,12 +168,11 @@ def generate_ebpf_hardcoded(
     #   [12]     ip->ttl
     #   [13..64] model_id / node_id one-hot (index = 13 + model_id, 0..51)
     #
-    # Verifier-friendly encoding:
-    #   - W_NODE_j[52]: static const array of node weights for neuron j
-    #     accessed as W_NODE_j[node & 0x3f]  (63 >= 51, always in bounds)
-    #   - W_IFACE_j[7]: static const array for iface weights (indices 0..6)
-    #     accessed as W_IFACE_j[iface & 0x7] (7 >= 6, always in bounds)
-    #     index 0 is unused (ifindex is 1-based), set to 0.
+    # Verifier-friendly encoding: ONE switch(_iface) and ONE switch(_node)
+    # for the WHOLE program (not one pair per neuron). Each case assigns
+    # the per-neuron contribution for all N_H1 neurons simultaneously, so
+    # the CFG only ever has ~7 + ~52 branches total, independent of N_H1 —
+    # no combinatorial explosion, no globals, just plain stack scalars.
     # ----------------------------------------------------------------
 
     fc1_lines = []
@@ -166,37 +182,38 @@ def generate_ebpf_hardcoded(
     fc1_lines.append("    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;        /* 0..51 */")
 
     for j in range(N_H1):
+        fc1_lines.append(f"    long long w_iface_{j} = 0LL, w_node_{j} = 0LL;")
+
+    # Single switch over _iface: sets w_iface_0..w_iface_{N_H1-1} together.
+    fc1_lines.append("    switch (_iface) {")
+    for iface in range(1, 7):
+        assigns = " ".join(
+            f"w_iface_{j} = {lit(int(fc1_w[j * N_IN + 5 + iface]))}LL;"
+            for j in range(N_H1)
+        )
+        fc1_lines.append(f"        case {iface}: {assigns} break;")
+    fc1_lines.append("        default: break;")
+    fc1_lines.append("    }")
+
+    # Single switch over _node: sets w_node_0..w_node_{N_H1-1} together.
+    fc1_lines.append("    switch (_node) {")
+    for node in range(52):
+        assigns = " ".join(
+            f"w_node_{j} = {lit(int(fc1_w[j * N_IN + 13 + node]))}LL;"
+            for j in range(N_H1)
+        )
+        fc1_lines.append(f"        case {node}: {assigns} break;")
+    fc1_lines.append("        default: break;")
+    fc1_lines.append("    }")
+
+    for j in range(N_H1):
         w_ttl = int(fc1_w[j * N_IN + 12])
         b_j   = int(fc1_b[j])
-
-        # W_IFACE_j: index 0 unused (ifindex is 1-based), indices 1..6 hold real weights
-        iface_vals = ["0LL"]  # index 0 placeholder
-        for iface in range(1, 7):
-            wi = int(fc1_w[j * N_IN + 5 + iface])
-            iface_vals.append(f"{lit(wi)}LL")
-        iface_literal = ", ".join(iface_vals)
-
-        # W_NODE_j: indices 0..51 hold real weights, fill up to 64 with 0
-        node_vals = []
-        for node in range(64):
-            if node < 52:
-                wn = int(fc1_w[j * N_IN + 13 + node])
-                node_vals.append(f"{lit(wn)}LL")
-            else:
-                node_vals.append("0LL")
-        node_literal = ", ".join(node_vals)
-
-        fc1_lines.append(
-            f"    static const __s64 W_IFACE{j}[7] = {{ {iface_literal} }};"
-        )
-        fc1_lines.append(
-            f"    static const __s64 W_NODE{j}[64] = {{ {node_literal} }};"
-        )
         fc1_lines.append(
             f"    long long h1_{j} = RELU_LL("
             f"(__s64)_ttl * {lit(w_ttl)}LL"
-            f" + W_IFACE{j}[_iface]"
-            f" + W_NODE{j}[_node]"
+            f" + w_iface_{j}"
+            f" + w_node_{j}"
             f" + {lit(b_j)}LL);"
         )
 
