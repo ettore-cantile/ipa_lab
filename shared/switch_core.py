@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
 """
-IPA Switch - Entry Point
+IPA Switch - Entry Point (design-space-docs branch)
 
-Usage:
-  Method 1 (PTQ):              python3 switch_core.py ptq
-  Method 2 (QAT):              python3 switch_core.py qat
-  Method 3 (OpenFlow-like):    python3 switch_core.py openflow
-  Method 4 (IPA Demo):         python3 switch_core.py ipa_demo
-  Method 5 (Arch Template):    python3 switch_core.py template
-  Method 6 (Modular Pipeline): python3 switch_core.py modular
-  Custom model_id:             python3 switch_core.py openflow 99
+This branch contains only the two new pipelines requested by the professor:
+
+  Pipeline 2 - Pre-built Architectural Template:
+      python3 switch_core.py template
+      python3 switch_core.py template 42     # custom model_id
+
+  Pipeline 3 - Modular Neural Pipeline:
+      python3 switch_core.py modular
+      python3 switch_core.py modular 42
+
+Methods 1-4 (PTQ, QAT, OpenFlow, IPA Demo) live in the main branch.
 """
 import sys
 
-METHOD_FLAG = sys.argv[1] if len(sys.argv) > 1 else "ptq"
+METHOD_FLAG = sys.argv[1] if len(sys.argv) > 1 else "template"
 MODEL_ID    = int(sys.argv[2]) if len(sys.argv) > 2 else 42
 
-if METHOD_FLAG == "openflow":
-    from methods.method3_openflow import run
-elif METHOD_FLAG == "ipa_demo":
-    from methods.method4_ipa_demo import run
-elif METHOD_FLAG == "qat":
-    from methods.method2_qat import run
-elif METHOD_FLAG == "template":
-    from methods.method5_template import run
-elif METHOD_FLAG == "modular":
+if METHOD_FLAG == "modular":
     from methods.method6_modular import run
-else:  # ptq (default)
-    from methods.method1_ptq import run
+else:  # template (default)
+    from methods.method5_template import run
 
 run(MODEL_ID)

@@ -1,105 +1,94 @@
+"""
+extract_weights.py  (design-space-docs branch)
+==============================================
+Extracts int8-quantized weights from the FRR model checkpoint.
+
+When run directly:  produces weights.json and weights_float.json
+When imported:      provides extract_weights_int8() used by pipeline_benchmark.py
+                    and method5/method6.
+
+Architecture fixed to the germany50/5 checkpoint:
+  n_interfaces=6, n_nodes=52, hidden_dim=4
+  -> 319 total int8 weights  (matches N_WEIGHTS in common.py)
+
+Quantization: PTQ with SCALE_FACTOR = floor(127 / max|w|)
+"""
 import torch
 import json
 import os
-import sys
 
 from FRR_model import FastRerouteMLP
 
-# ---------------------------------------------------------------------------
-# Architecture constants — must match the .pt checkpoint
-# frr_germany50_5_model_4x2.pt was trained with n_nodes=52, hidden_dim=4
-# This gives: fc1(65*4+4=264) + fc2(4*4+4=20) + out(4*7+7=35) = 319 weights
-# ---------------------------------------------------------------------------
+# Architecture constants matching frr_germany50_5_model_4x2.pt
 N_INTERFACES = 6
 N_NODES      = 52
 HIDDEN_DIM   = 4
-# Total weights = 319  (same as N_WEIGHTS in common.py)
-
-print("Extracting weights from PyTorch model...")
-
-model = FastRerouteMLP(n_interfaces=N_INTERFACES, n_nodes=N_NODES, hidden_dim=HIDDEN_DIM)
-model.load_state_dict(torch.load("frr_germany50_5_model_4x2.pt"))
-
-# ---------------------------------------------------------------------------
-# Method 1 - PTQ: SCALE_FACTOR computed automatically from the maximum weight.
-#
-# SCALE_FACTOR = floor(127 / max(|w|))
-# Ensures no weight exceeds int8 range [-128, 127] after multiplication,
-# eliminating clamping that would cause TABLE MISS.
-#
-# The SCALE_FACTOR is saved in weights_float.json along with the original
-# float weights, and is written into the IPA header 'scaling' field by send_ipa.
-# The kernel reads it from the header and uses it as a divisor (instead of shift).
-# ---------------------------------------------------------------------------
-
-all_floats = [w for param in model.parameters() for w in param.data.view(-1).tolist()]
-max_abs    = max(abs(w) for w in all_floats)
-SCALE_FACTOR = int(127 / max_abs)
-
-print(f"Max |weight| = {max_abs:.6f}")
-print(f"SCALE_FACTOR = floor(127 / {max_abs:.6f}) = {SCALE_FACTOR}")
-
-integer_weights = []
-for w_float in all_floats:
-    w_int = int(round(w_float * SCALE_FACTOR))
-    w_int = max(-128, min(127, w_int))  # safety clamp (should not trigger)
-    integer_weights.append(w_int)
-
-# Verify that no weight was clamped
-clamped = sum(1 for w, wf in zip(integer_weights, all_floats)
-              if w != int(round(wf * SCALE_FACTOR)))
-if clamped:
-    print(f"[WARN] {clamped} weights clamped (max_abs may not be the true maximum)")
-else:
-    print("No weights were clamped. int8 range respected for all weights.")
-
-# int8 weights -> eBPF kernel
-with open("weights.json", "w") as f:
-    json.dump(integer_weights, f)
-
-# original float weights + SCALE_FACTOR -> control plane for Method 1
-with open("weights_float.json", "w") as f:
-    json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
-
-print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
-print(f"Saved float weights + scale_factor={SCALE_FACTOR} -> weights_float.json")
-print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
+# fc1(65*4+4=264) + fc2(4*4+4=20) + out(4*7+7=35) = 319 weights
 
 
-# ---------------------------------------------------------------------------
-# extract_weights_int8(model_path) — callable API used by pipeline_benchmark.py
-#
-# Returns a flat list of int8 weights for the given .pt checkpoint.
-# Uses the same PTQ logic as above (SCALE_FACTOR = floor(127 / max|w|)).
-# ---------------------------------------------------------------------------
-def extract_weights_int8(model_path: str = "frr_germany50_5_model_4x2.pt") -> list:
+def extract_weights_int8(
+    model_path: str = "frr_germany50_5_model_4x2.pt"
+) -> list:
     """
     Load a FastRerouteMLP checkpoint and return a flat list of int8 weights.
-
-    Architecture is fixed to the germany50/5 model dimensions:
-      n_interfaces=6, n_nodes=52, hidden_dim=4
-    which produces exactly 319 weights matching N_WEIGHTS in common.py.
-
-    Args:
-        model_path: path to the .pt state-dict file
 
     Returns:
         list of int in [-128, 127], length 319
     """
-    _model = FastRerouteMLP(
+    m = FastRerouteMLP(
         n_interfaces=N_INTERFACES,
         n_nodes=N_NODES,
         hidden_dim=HIDDEN_DIM
     )
-    _model.load_state_dict(torch.load(model_path))
+    m.load_state_dict(torch.load(model_path))
 
-    _floats = [w for p in _model.parameters() for w in p.data.view(-1).tolist()]
-    _max_abs = max(abs(w) for w in _floats)
-    _scale   = int(127 / _max_abs)
+    floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
+    max_abs = max(abs(w) for w in floats)
+    scale   = int(127 / max_abs)
 
-    _int8 = []
-    for wf in _floats:
-        wi = int(round(wf * _scale))
-        _int8.append(max(-128, min(127, wi)))
+    return [max(-128, min(127, int(round(wf * scale)))) for wf in floats]
 
-    return _int8
+
+# ---------------------------------------------------------------------------
+# __main__: produce weights.json and weights_float.json for the other scripts
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    MODEL_PATH = os.path.join(os.path.dirname(__file__), "frr_germany50_5_model_4x2.pt")
+    print("Extracting weights from PyTorch model...")
+
+    model = FastRerouteMLP(
+        n_interfaces=N_INTERFACES,
+        n_nodes=N_NODES,
+        hidden_dim=HIDDEN_DIM
+    )
+    model.load_state_dict(torch.load(MODEL_PATH))
+
+    all_floats   = [w for p in model.parameters() for w in p.data.view(-1).tolist()]
+    max_abs      = max(abs(w) for w in all_floats)
+    SCALE_FACTOR = int(127 / max_abs)
+
+    print(f"Max |weight| = {max_abs:.6f}")
+    print(f"SCALE_FACTOR = {SCALE_FACTOR}")
+
+    integer_weights = []
+    for wf in all_floats:
+        wi = int(round(wf * SCALE_FACTOR))
+        integer_weights.append(max(-128, min(127, wi)))
+
+    clamped = sum(
+        1 for w, wf in zip(integer_weights, all_floats)
+        if w != int(round(wf * SCALE_FACTOR))
+    )
+    if clamped:
+        print(f"[WARN] {clamped} weights clamped")
+    else:
+        print("No weights clamped. int8 range respected.")
+
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(out_dir, "weights.json"), "w") as f:
+        json.dump(integer_weights, f)
+    with open(os.path.join(out_dir, "weights_float.json"), "w") as f:
+        json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
+
+    print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
+    print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
