@@ -1,11 +1,23 @@
 import torch
 import json
+import os
+import sys
 
 from FRR_model import FastRerouteMLP
 
+# ---------------------------------------------------------------------------
+# Architecture constants — must match the .pt checkpoint
+# frr_germany50_5_model_4x2.pt was trained with n_nodes=52, hidden_dim=4
+# This gives: fc1(65*4+4=264) + fc2(4*4+4=20) + out(4*7+7=35) = 319 weights
+# ---------------------------------------------------------------------------
+N_INTERFACES = 6
+N_NODES      = 52
+HIDDEN_DIM   = 4
+# Total weights = 319  (same as N_WEIGHTS in common.py)
+
 print("Extracting weights from PyTorch model...")
 
-model = FastRerouteMLP(n_interfaces=6, n_nodes=52, hidden_dim=4)
+model = FastRerouteMLP(n_interfaces=N_INTERFACES, n_nodes=N_NODES, hidden_dim=HIDDEN_DIM)
 model.load_state_dict(torch.load("frr_germany50_5_model_4x2.pt"))
 
 # ---------------------------------------------------------------------------
@@ -52,3 +64,42 @@ with open("weights_float.json", "w") as f:
 print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
 print(f"Saved float weights + scale_factor={SCALE_FACTOR} -> weights_float.json")
 print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
+
+
+# ---------------------------------------------------------------------------
+# extract_weights_int8(model_path) — callable API used by pipeline_benchmark.py
+#
+# Returns a flat list of int8 weights for the given .pt checkpoint.
+# Uses the same PTQ logic as above (SCALE_FACTOR = floor(127 / max|w|)).
+# ---------------------------------------------------------------------------
+def extract_weights_int8(model_path: str = "frr_germany50_5_model_4x2.pt") -> list:
+    """
+    Load a FastRerouteMLP checkpoint and return a flat list of int8 weights.
+
+    Architecture is fixed to the germany50/5 model dimensions:
+      n_interfaces=6, n_nodes=52, hidden_dim=4
+    which produces exactly 319 weights matching N_WEIGHTS in common.py.
+
+    Args:
+        model_path: path to the .pt state-dict file
+
+    Returns:
+        list of int in [-128, 127], length 319
+    """
+    _model = FastRerouteMLP(
+        n_interfaces=N_INTERFACES,
+        n_nodes=N_NODES,
+        hidden_dim=HIDDEN_DIM
+    )
+    _model.load_state_dict(torch.load(model_path))
+
+    _floats = [w for p in _model.parameters() for w in p.data.view(-1).tolist()]
+    _max_abs = max(abs(w) for w in _floats)
+    _scale   = int(127 / _max_abs)
+
+    _int8 = []
+    for wf in _floats:
+        wi = int(round(wf * _scale))
+        _int8.append(max(-128, min(127, wi)))
+
+    return _int8

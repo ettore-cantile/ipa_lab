@@ -15,9 +15,13 @@ Flow:
 Usage:
     python3 /shared/execute_pipeline.py
 
-Optionally pass the quantization method:
-    python3 /shared/execute_pipeline.py --method post   # default (Method 1)
-    python3 /shared/execute_pipeline.py --method qat    # Method 2 (QAT)
+Quantization/design-space method:
+    python3 /shared/execute_pipeline.py --method post       # default (Method 1 PTQ)
+    python3 /shared/execute_pipeline.py --method qat        # Method 2 QAT
+    python3 /shared/execute_pipeline.py --method openflow   # Method 3 OpenFlow
+    python3 /shared/execute_pipeline.py --method ipa_demo   # Method 4 IPA Demo
+    python3 /shared/execute_pipeline.py --method template   # Method 5 Arch Template (Pipeline 2)
+    python3 /shared/execute_pipeline.py --method modular    # Method 6 Modular (Pipeline 3)
 """
 
 import argparse
@@ -38,33 +42,41 @@ def main():
     parser = argparse.ArgumentParser(description="Pipeline IPA: weights extraction + XDP switch")
     parser.add_argument(
         "--method",
-        choices=["post", "qat"],
+        choices=["post", "qat", "openflow", "ipa_demo", "template", "modular"],
         default="post",
-        help="Quantization method: 'post' (default) = Method 1, 'qat' = Method 2"
+        help=(
+            "Design-space method: "
+            "'post' (default) = Method 1 PTQ, "
+            "'qat' = Method 2 QAT, "
+            "'openflow' = Method 3, "
+            "'ipa_demo' = Method 4, "
+            "'template' = Method 5 Arch Template (Pipeline 2), "
+            "'modular' = Method 6 Modular Pipeline (Pipeline 3)"
+        )
     )
     args = parser.parse_args()
 
     # ----------------------------------------------------------
     # Step 1: extract integer weights -> weights.json
+    # (skip for template/modular: they call extract_weights_int8
+    #  directly at runtime, but we still produce weights.json for
+    #  consistency with the rest of the codebase)
     # ----------------------------------------------------------
     print("=" * 60)
     print(f"[pipeline] Step 1 — extracting weights (method={args.method})")
     print("=" * 60)
 
     if args.method == "qat":
-        # Method 2: load the QAT model if it exists, otherwise fallback
         qat_model_path = os.path.join(SHARED_DIR, "frr_qat_model.pt")
         if not os.path.exists(qat_model_path):
             print(f"[WARNING] {qat_model_path} not found, using Method 1 model.")
         else:
-            # Redefine the environment variable read by extract_weights.py
             os.environ["FRR_MODEL_PATH"] = qat_model_path
             os.environ["FRR_MODEL_TYPE"] = "qat"
 
-    # Execute extract_weights.py in the same process
+    # Always run extract_weights to produce weights.json
     runpy.run_path(os.path.join(SHARED_DIR, "extract_weights.py"), run_name="__main__")
 
-    # Verify that weights.json was produced
     weights_path = os.path.join(SHARED_DIR, "weights.json")
     if not os.path.exists(weights_path):
         print("[ERROR] weights.json was not generated — exiting.")
@@ -76,8 +88,22 @@ def main():
     # ----------------------------------------------------------
     print()
     print("=" * 60)
-    print("[pipeline] Step 2 — starting XDP switch (switch_core.py)")
+    print(f"[pipeline] Step 2 — starting XDP switch (method={args.method})")
     print("=" * 60)
+
+    # Map --method to the switch_core.py flag
+    method_flag_map = {
+        "post":     "ptq",
+        "qat":      "qat",
+        "openflow": "openflow",
+        "ipa_demo": "ipa_demo",
+        "template": "template",
+        "modular":  "modular",
+    }
+    switch_flag = method_flag_map[args.method]
+
+    # Inject sys.argv for switch_core.py which reads sys.argv[1]
+    sys.argv = ["switch_core.py", switch_flag]
     runpy.run_path(os.path.join(SHARED_DIR, "switch_core.py"), run_name="__main__")
 
 

@@ -3,11 +3,13 @@
 IPA Switch - Entry Point
 
 Usage:
-  Method 1 (PTQ):           python3 switch_core.py ptq
-  Method 2 (QAT):           python3 switch_core.py qat
-  Method 3 (OpenFlow-like): python3 switch_core.py openflow
-  Method 4 (IPA Demo):      python3 switch_core.py ipa_demo
-  Custom model_id:          python3 switch_core.py openflow 99
+  Method 1 (PTQ):              python3 switch_core.py ptq
+  Method 2 (QAT):              python3 switch_core.py qat
+  Method 3 (OpenFlow-like):    python3 switch_core.py openflow
+  Method 4 (IPA Demo):         python3 switch_core.py ipa_demo
+  Method 5 (Arch Template):    python3 switch_core.py template
+  Method 6 (Modular Pipeline): python3 switch_core.py modular
+  Custom model_id:             python3 switch_core.py openflow 99
 """
 import sys
 
@@ -20,6 +22,10 @@ elif METHOD_FLAG == "ipa_demo":
     from methods.method4_ipa_demo import run
 elif METHOD_FLAG == "qat":
     from methods.method2_qat import run
+elif METHOD_FLAG == "template":
+    from methods.method5_template import run
+elif METHOD_FLAG == "modular":
+    from methods.method6_modular import run
 else:  # ptq (default)
     from methods.method1_ptq import run
 
