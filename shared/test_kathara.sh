@@ -126,15 +126,23 @@ krun frankfurt "nohup python3 /shared/execute_pipeline.py \
     --iface ${FRANKFURT_XDP_IFACE} \
     --model-id ${MODEL_ID} \
     > /tmp/pipeline_frankfurt.log 2>&1 & echo started"
-echo "  Waiting 8s for XDP attach and model_cache population..."
-sleep 8
 echo
 
 # ---------------------------------------------------------------------------
-# Step 4 — Verifica avvio pipeline su frankfurt
+# Step 4 — Attendi avvio pipeline su frankfurt (polling, non uno sleep fisso)
+#
+# Nota: un `sleep 8` fisso qui era intermittente — la compilazione BCC del
+# programma eBPF (clang -target bpf, con gli header del kernel) a volte
+# richiede piu' di 8s, per cui i pacchetti dello Step 6 arrivavano prima
+# che XDP fosse davvero attaccato, con TRUE HIT=0 non per un bug della
+# pipeline ma per una race condition nel test. Fix: polling fino a 40s
+# sulla stessa stringa "XDP attached" gia' usata prima, con uscita
+# immediata su errore/traceback (stesso pattern dello Step 2b per OSPF).
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 4] Pipeline startup check on frankfurt:${NC}"
-STATUS_LINE=$(krun frankfurt 'if [ ! -f /tmp/pipeline_frankfurt.log ]; then
+echo -e "${YELLOW}[Step 4] Waiting for pipeline startup on frankfurt (up to 40s)...${NC}"
+PIPELINE_READY=0
+for i in $(seq 1 40); do
+    STATUS_LINE=$(krun frankfurt 'if [ ! -f /tmp/pipeline_frankfurt.log ]; then
     echo PIPELINE_STATUS=NOT_STARTED
 elif grep -qi "error\|traceback\|exception" /tmp/pipeline_frankfurt.log; then
     echo PIPELINE_STATUS=ERROR
@@ -143,9 +151,25 @@ elif grep -qi "XDP attached" /tmp/pipeline_frankfurt.log; then
 else
     echo PIPELINE_STATUS=STARTING
 fi' | tr -d '\r')
-echo "  ${STATUS_LINE}"
-if echo "${STATUS_LINE}" | grep -q 'ERROR\|NOT_STARTED'; then
-    echo -e "${RED}  Pipeline failed. Full log:${NC}"
+    if echo "${STATUS_LINE}" | grep -q 'PIPELINE_STATUS=OK'; then
+        PIPELINE_READY=1
+        echo "  ${STATUS_LINE}  (ready after ${i}s)"
+        break
+    fi
+    if echo "${STATUS_LINE}" | grep -q 'PIPELINE_STATUS=ERROR'; then
+        echo
+        echo "  ${STATUS_LINE}"
+        echo -e "${RED}  Pipeline failed. Full log:${NC}"
+        krun frankfurt 'cat /tmp/pipeline_frankfurt.log'
+        echo "TEST FAILED"
+        exit 1
+    fi
+    echo -n "."
+    sleep 1
+done
+if [ ${PIPELINE_READY} -eq 0 ]; then
+    echo
+    echo -e "${RED}  Pipeline did not report 'XDP attached' within 40s. Full log:${NC}"
     krun frankfurt 'cat /tmp/pipeline_frankfurt.log'
     echo "TEST FAILED"
     exit 1
