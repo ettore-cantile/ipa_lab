@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-send_ipa.py - Send an IPA packet with a paper-compliant header.
+send_ipa.py - Send IPA packet(s) with paper-compliant header.
+
+Usage (originale, single packet):
+  python3 send_ipa.py <dst> [model_id] [weights_json]
+
+Usage (Kathara test, multi-packet):
+  python3 send_ipa.py --dst frankfurt --count 100 --model-id 0 --weights /shared/weights.json
+  python3 send_ipa.py --dst frankfurt --count 500 --interval 0.002
 
 IPA header structure (Section III of the paper):
 
@@ -29,17 +36,12 @@ IPA header structure (Section III of the paper):
 
   [Model Parameters]    319 byte  (Raw payload, int8 serialized row-by-row)
 
-Total: 21-byte fixed header + 319 bytes of weights = 340 bytes (~22.7% of MTU 1500)
-
-Usage:
-  python3 send_ipa.py <dst> [model_id] [weights_json]
-Examples:
-  python3 send_ipa.py frankfurt
-  python3 send_ipa.py frankfurt 42
-  python3 send_ipa.py frankfurt 99 /shared/weights.json
+Total: 21-byte fixed header + 319 bytes of weights = 340 bytes
 """
 import sys
 import json
+import time
+import argparse
 from scapy.all import send, IP, UDP, Packet, Raw
 from scapy.fields import ByteField, ShortField
 
@@ -84,46 +86,108 @@ class IPA_HDR(Packet):
     ]
 
 
-if len(sys.argv) < 2:
-    print("Usage: python3 send_ipa.py <dst> [model_id] [weights_json]")
-    sys.exit(1)
+def load_weights(weights_file):
+    """Load quantized weights from JSON file, return bytes."""
+    with open(weights_file, "r") as f:
+        weights = json.load(f)
+    if isinstance(weights, dict) and "weights" in weights:
+        weights = weights["weights"]
+    return bytes([w & 0xFF for w in weights])
 
-destination = sys.argv[1]
 
-model_id = 42
-if len(sys.argv) >= 3:
+def load_scale_factor(default=128):
+    """Try to read scale_factor from weights_float.json."""
     try:
-        model_id = int(sys.argv[2])
-    except ValueError:
-        print("Error: model_id must be an integer.")
-        sys.exit(1)
+        with open("/shared/weights_float.json") as f:
+            data = json.load(f)
+            return data.get("scale_factor", default)
+    except Exception:
+        return default
 
-# Optional weights in the payload (Method 4)
-weights_payload = b""
-scale_factor    = 128
-if len(sys.argv) >= 4:
-    weights_file = sys.argv[3]
-    try:
-        with open(weights_file, "r") as f:
-            weights = json.load(f)
-        weights_payload = bytes([w & 0xFF for w in weights])
-        print(f"[send_ipa] Embedding {len(weights_payload)} weight bytes from {weights_file}")
-    except Exception as e:
-        print(f"[send_ipa] Warning: could not load weights: {e}")
 
-# Read scale_factor from weights_float.json if available
-try:
-    with open("/shared/weights_float.json") as f:
-        scale_factor = json.load(f)["scale_factor"]
-except Exception:
-    pass
+def send_packets(dst, model_id=42, weights_file=None, count=1, interval=0.001):
+    """Send `count` IPA packets to destination."""
+    scale_factor = load_scale_factor()
 
-ipa_hdr = IPA_HDR(model_id=model_id, scale_factor=scale_factor)
-packet  = IP(dst=destination) / UDP(dport=9999) / ipa_hdr
-if weights_payload:
-    packet = packet / Raw(load=weights_payload)
+    weights_payload = b""
+    if weights_file:
+        try:
+            weights_payload = load_weights(weights_file)
+            print(f"[send_ipa] Embedding {len(weights_payload)} weight bytes from {weights_file}")
+        except Exception as e:
+            print(f"[send_ipa] Warning: could not load weights: {e}")
 
-print(f"[send_ipa] -> '{destination}' | model_id={model_id} | "
-      f"header=21 byte | payload={len(weights_payload)} byte")
-send(packet, verbose=False)
-print("[send_ipa] Packet sent successfully!")
+    ipa_hdr = IPA_HDR(model_id=model_id, scale_factor=scale_factor)
+    base_pkt = IP(dst=dst) / UDP(dport=9999) / ipa_hdr
+    if weights_payload:
+        base_pkt = base_pkt / Raw(load=weights_payload)
+
+    print(f"[send_ipa] dst='{dst}' model_id={model_id} scale={scale_factor} "
+          f"hdr=21B payload={len(weights_payload)}B count={count} interval={interval}s")
+
+    for i in range(count):
+        send(base_pkt, verbose=False)
+        if interval > 0 and i < count - 1:
+            time.sleep(interval)
+
+    print(f"[send_ipa] Done — sent {count} packet(s) to {dst}")
+
+
+# ---------------------------------------------------------------------------
+# CLI — backward-compatible: se il primo argomento non inizia con '--'
+# si usa la vecchia interfaccia positionale.
+# ---------------------------------------------------------------------------
+def _legacy_mode():
+    """Original positional-argument interface for backward compatibility."""
+    destination = sys.argv[1]
+    model_id = 42
+    if len(sys.argv) >= 3:
+        try:
+            model_id = int(sys.argv[2])
+        except ValueError:
+            print("Error: model_id must be an integer.")
+            sys.exit(1)
+    weights_file = sys.argv[3] if len(sys.argv) >= 4 else None
+    send_packets(dst=destination, model_id=model_id,
+                 weights_file=weights_file, count=1, interval=0)
+
+
+if __name__ == "__main__":
+    # Detect legacy mode: first arg exists and does not start with '--'
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        _legacy_mode()
+        sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        description="Send IPA packet(s) with paper-compliant header.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples (Kathara test):
+  # Single packet (legacy):
+  python3 send_ipa.py frankfurt
+  python3 send_ipa.py frankfurt 42 /shared/weights.json
+
+  # Multi-packet with --method args (new):
+  python3 send_ipa.py --dst frankfurt --count 200 --model-id 0
+  python3 send_ipa.py --dst frankfurt --count 500 --weights /shared/weights.json --interval 0.002
+        """
+    )
+    parser.add_argument("--dst", required=True,
+                        help="Destination hostname or IP (e.g. 'frankfurt' or '10.0.0.234')")
+    parser.add_argument("--model-id", type=int, default=0,
+                        help="Model ID field in IPA header (default: 0)")
+    parser.add_argument("--weights", default=None,
+                        help="Path to quantized weights JSON (e.g. /shared/weights.json)")
+    parser.add_argument("--count", type=int, default=1,
+                        help="Number of packets to send (default: 1)")
+    parser.add_argument("--interval", type=float, default=0.001,
+                        help="Inter-packet interval in seconds (default: 0.001)")
+    args = parser.parse_args()
+
+    send_packets(
+        dst=args.dst,
+        model_id=args.model_id,
+        weights_file=args.weights,
+        count=args.count,
+        interval=args.interval,
+    )
