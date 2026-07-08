@@ -64,6 +64,19 @@ Verifier history (both fixed; see git log for the failed attempts):
      Additionally, the UDP header pointer now uses ip->ihl*4 (the actual
      IP header length) instead of sizeof(struct iphdr)=20, which is
      correct when IP Options are present (ihl > 5).
+
+  5) Feature vector iface one-hot always zero (chosen_port=DROP, 100%):
+     _iface = ctx->ingress_ifindex & 0x7 produced e.g. 655 & 7 = 7,
+     which never matched case 1..6 in switch(_iface), so w_iface_j = 0
+     for all neurons. With the iface contribution silenced, fc1 only
+     saw TTL and node one-hot, which was not enough to produce a valid
+     egress class -- the model defaulted to cls 6 (DROP) on every packet.
+     Fix: emit a preliminary switch(ctx->ingress_ifindex) that maps each
+     hardcoded kernel ifindex (from ifindex_table, resolved at pipeline
+     startup via socket.if_nametoindex) to the logical index 1..6 used
+     by the training feature encoding.  The result is stored in _iface
+     before the existing switch(_iface) that picks w_iface_j, so the
+     rest of fc1 is unchanged.
 """
 
 N_IN   = 65
@@ -210,9 +223,16 @@ def generate_ebpf_hardcoded(
     # ----------------------------------------------------------------
     # Feature vector structure (65 dims, only 3 non-zero at runtime):
     #   [0..5]   unused (always 0)
-    #   [6..11]  ingress_ifindex one-hot  (index = 5 + ifindex, ifindex 1..6)
+    #   [6..11]  ingress_ifindex one-hot  (index = 5 + logical_iface, logical 1..6)
     #   [12]     ip->ttl
     #   [13..64] model_id / node_id one-hot (index = 13 + model_id, 0..51)
+    #
+    # FIX(#5): ctx->ingress_ifindex is the kernel ifindex (e.g. 655 for eth1),
+    # NOT the logical index 1..6 used by the training feature encoding.
+    # We emit a preliminary switch(ctx->ingress_ifindex) that maps each
+    # hardcoded kernel ifindex (from ifindex_table) to its logical index
+    # 1..6, storing the result in _iface.  The existing switch(_iface)
+    # below that picks w_iface_j then works correctly.
     #
     # Verifier-friendly encoding: ONE switch(_iface) and ONE switch(_node)
     # for the WHOLE program (not one pair per neuron). Each case assigns
@@ -223,14 +243,27 @@ def generate_ebpf_hardcoded(
 
     fc1_lines = []
     fc1_lines.append("    /* fc1: only 3 live features -- ttl, iface one-hot, node one-hot */")
-    fc1_lines.append("    __u32 _ttl   = ((__u32)ip->ttl) & 0xff;")
-    fc1_lines.append("    __u32 _iface = ((__u32)ctx->ingress_ifindex) & 0x7;  /* 1..6 */")
-    fc1_lines.append("    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;        /* 0..51 */")
+    fc1_lines.append("    __u32 _ttl  = ((__u32)ip->ttl) & 0xff;")
+    fc1_lines.append("    __u32 _node = ((__u32)ipa->model_id) & 0x3f;  /* 0..51 */")
+
+    # FIX(#5): map kernel ifindex -> logical iface index 1..6
+    # Each entry in ifindex_table[cls] is the kernel ifindex for egress cls;
+    # we need the INGRESS mapping.  The ingress iface for this XDP hook is
+    # whichever interface in ifindex_table the packet actually arrives on.
+    # We emit all 6 possible kernel ifindices as cases; unknown -> _iface=0
+    # (no one-hot contribution, which is equivalent to "iface not in training").
+    fc1_lines.append("    /* FIX(#5): map raw kernel ifindex -> logical 1..6 for one-hot */")
+    fc1_lines.append("    __u32 _iface = 0U;")
+    fc1_lines.append("    switch (ctx->ingress_ifindex) {")
+    for logical_idx, kern_ifindex in enumerate(ifindex_table[:6], start=1):
+        fc1_lines.append(f"        case {int(kern_ifindex)}U: _iface = {logical_idx}U; break;")
+    fc1_lines.append("        default: break;")
+    fc1_lines.append("    }")
 
     for j in range(N_H1):
         fc1_lines.append(f"    long long w_iface_{j} = 0LL, w_node_{j} = 0LL;")
 
-    # Single switch over _iface: sets w_iface_0..w_iface_{N_H1-1} together.
+    # Single switch over _iface (logical 1..6): sets w_iface_0..w_iface_{N_H1-1}.
     fc1_lines.append("    switch (_iface) {")
     for iface in range(1, 7):
         assigns = " ".join(
@@ -278,6 +311,11 @@ def generate_ebpf_hardcoded(
         argmax_lines.append(
             f"    if (out_{k} > best_val) {{ best_val = out_{k}; best_cls = {k}; }}"
         )
+    # Debug: log best_cls and best_val so we can verify without recompiling
+    argmax_lines.append(
+        '    bpf_trace_printk("IPA p1 argmax: cls=%d val=%lld iface=%d\\n",'
+        " best_cls, best_val, _iface);"
+    )
 
     fc1_src    = "\n".join(fc1_lines)
     fc2_src    = "\n".join(fc2_lines)
