@@ -217,6 +217,33 @@ krun frankfurt "ethtool -K ${FRANKFURT_XDP_IFACE} tx off rx off gso off gro off 
 echo
 
 # ---------------------------------------------------------------------------
+# Step 2c — TEST DIFFERENZIALE PER DIMENSIONE (non per protocollo)
+#
+# Ground truth definitiva dai turni di debug: i pacchetti UDP ESCONO da
+# darmstadt (cattura -v/-e conferma checksum valido, MAC dst corretto,
+# offload OFF) ma NON arrivano MAI su frankfurt. L'unica differenza vera
+# tra cio' che passa e cio' che sparisce non e' il protocollo, e' la
+# DIMENSIONE:
+#     ICMP echo        = frame 98 B   -> passa sempre
+#     UDP IPA (340 B)  = frame 382 B  -> sparisce sempre
+# Questo e' il sintomo classico di un MTU troppo basso sul bridge del
+# collision domain (katharanp), NON di un filtro UDP. Test decisivo: un
+# ping con payload GRANDE (frame > 382 B). Se il ping piccolo passa e
+# quello grande no, il problema e' la dimensione/MTU, indipendente da UDP.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 2c] Differential SIZE test (small vs large ping) — is it MTU, not UDP?${NC}"
+echo "  small ping (payload 8B -> ~42B frame):"
+krun darmstadt "ping -c 3 -s 8 -W 2 ${FRANKFURT_DIRECT} 2>&1 | grep -E 'packets transmitted|bytes from' | tail -3"
+echo "  large ping (payload 400B -> ~442B frame, BIGGER than our 382B UDP frame):"
+krun darmstadt "ping -c 3 -s 400 -W 2 ${FRANKFURT_DIRECT} 2>&1 | grep -E 'packets transmitted|bytes from|Frag' | tail -4"
+echo "  medium ping (payload 340B -> ~382B frame, SAME size as the UDP IPA packet):"
+krun darmstadt "ping -c 3 -s 340 -W 2 ${FRANKFURT_DIRECT} 2>&1 | grep -E 'packets transmitted|bytes from' | tail -3"
+echo "  host-side MTU of the l59 collision-domain bridge + its member veths:"
+sudo -n ip -o link show 2>/dev/null | grep -E 'kt-c2a80c7e9bbb|master kt-c2a80c7e9bbb' | grep -oE '(kt-[0-9a-f]+|veth[0-9a-z@]*|mtu [0-9]+)' | tr '\n' ' ' || echo "  (run manually: sudo ip -d link show kt-c2a80c7e9bbb)"
+echo
+echo
+
+# ---------------------------------------------------------------------------
 # Step 2b — OSPF convergence (opzionale, 30s timeout, SOLO informativo)
 #
 # Nota: questo check NON deve determinare l'IP usato per il test (Step 6).
@@ -337,11 +364,21 @@ echo
 # l'intera finestra di invio.
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 5-bis] Capturing real traffic on frankfurt/${FRANKFURT_XDP_IFACE} AND darmstadt/${DARMSTADT_IFACE} with tcpdump (ground truth)...${NC}"
-krun frankfurt "rm -f /tmp/tcpdump_frankfurt.log; nohup timeout 12 tcpdump -l -i ${FRANKFURT_XDP_IFACE} -n -c 300 > /tmp/tcpdump_frankfurt.log 2>&1 & echo tcpdump_started"
-krun darmstadt "rm -f /tmp/tcpdump_darmstadt.log; nohup timeout 12 tcpdump -l -i ${DARMSTADT_IFACE} -n -c 300 'udp port 9999 or icmp' > /tmp/tcpdump_darmstadt.log 2>&1 & echo tcpdump_started"
+echo "  --- MAC addresses (to compare against ARP resolution used by darmstadt's UDP sends) ---"
+krun frankfurt "ip link show ${FRANKFURT_XDP_IFACE} | grep -o 'link/ether [0-9a-f:]*'"
+krun darmstadt "ip neigh show | grep '${FRANKFURT_DIRECT}'"
+echo "  --- MTU on both interfaces (rule out oversized-frame silent drop) ---"
+krun darmstadt "ip link show ${DARMSTADT_IFACE} | grep -o 'mtu [0-9]*'"
+krun frankfurt "ip link show ${FRANKFURT_XDP_IFACE} | grep -o 'mtu [0-9]*'"
+echo "  --- Verifying checksum offload actually got disabled (ethtool -k, not -K) ---"
+krun darmstadt "ethtool -k ${DARMSTADT_IFACE} 2>&1 | grep -E 'tx-checksumming|rx-checksumming|generic-segmentation|generic-receive|tcp-segmentation' || echo 'ethtool -k not available'"
+krun frankfurt "ethtool -k ${FRANKFURT_XDP_IFACE} 2>&1 | grep -E 'tx-checksumming|rx-checksumming|generic-segmentation|generic-receive|tcp-segmentation' || echo 'ethtool -k not available'"
+krun frankfurt "rm -f /tmp/tcpdump_frankfurt.log; nohup timeout 12 tcpdump -e -l -i ${FRANKFURT_XDP_IFACE} -n -c 300 > /tmp/tcpdump_frankfurt.log 2>&1 & echo tcpdump_started"
+krun darmstadt "rm -f /tmp/tcpdump_darmstadt.log; nohup timeout 12 tcpdump -v -e -l -i ${DARMSTADT_IFACE} -n -c 300 'udp port 9999 or icmp' > /tmp/tcpdump_darmstadt.log 2>&1 & echo tcpdump_started"
 sleep 1
 echo "  tcpdump running in background on both ends (up to 12s / 300 packets, -l = line-buffered)"
 echo "  darmstadt filter: 'udp port 9999 or icmp' -- isolates our IPA traffic + ping from OSPF noise"
+echo "  darmstadt capture uses -v: will flag 'bad udp cksum' if checksum offload is still broken"
 echo
 
 # ---------------------------------------------------------------------------
