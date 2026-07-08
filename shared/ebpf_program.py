@@ -255,8 +255,21 @@ def generate_ebpf_hardcoded(
     fc1_lines.append("    /* FIX(#5): map raw kernel ifindex -> logical 1..6 for one-hot */")
     fc1_lines.append("    __u32 _iface = 0U;")
     fc1_lines.append("    switch (ctx->ingress_ifindex) {")
+    # FIX(#6): dedupe by kernel ifindex. On a node where some egress ifaces
+    # don't exist (e.g. frankfurt has no eth4/eth5), _build_ifindex_table
+    # falls those back to eth0's ifindex, producing repeated values in
+    # ifindex_table. Emitting one `case` per entry then yields duplicate
+    # `case <N>:` labels -> "duplicate case value" compile error. Keep only
+    # the FIRST logical index for each distinct kernel ifindex: that first
+    # occurrence is the real interface (e.g. 207 -> eth0 -> logical 1); the
+    # later fallback duplicates are non-existent ifaces no packet arrives on.
+    _seen_ifindex = set()
     for logical_idx, kern_ifindex in enumerate(ifindex_table[:6], start=1):
-        fc1_lines.append(f"        case {int(kern_ifindex)}U: _iface = {logical_idx}U; break;")
+        ki = int(kern_ifindex)
+        if ki in _seen_ifindex:
+            continue
+        _seen_ifindex.add(ki)
+        fc1_lines.append(f"        case {ki}U: _iface = {logical_idx}U; break;")
     fc1_lines.append("        default: break;")
     fc1_lines.append("    }")
 
