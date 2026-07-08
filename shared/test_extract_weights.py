@@ -35,7 +35,6 @@ def run_tests(model_path: str):
     print(f"{YELLOW}[Test 1] extract_weights_int8() — range e lunghezza{NC}")
     total += 1
     try:
-        # Carichiamo dinamicamente per non dipendere da FastRerouteMLP
         import torch
         model, I, H, O = load_pt_dynamic(model_path)
         floats = [w for p in model.parameters() for w in p.data.view(-1).tolist()]
@@ -57,9 +56,6 @@ def run_tests(model_path: str):
     print(f"\n{YELLOW}[Test 2] Scale factor: extract_weights vs compute_scale(){NC}")
     total += 1
     scale_cs = compute_scale(model)  # potenza di 2
-    scale_ew_actual = scale_ew       # floor(127/max_abs)
-    # compute_scale usa la potenza di 2 piu' grande <= floor(127/max_abs)
-    # scale_ew puo' essere diverso ma entrambi devono soddisfare: scale <= 127/max_abs
     both_valid = (scale_cs * max_abs <= 127.0 + 1e-6) and (scale_ew * max_abs <= 127.0 + 1e-6)
     if both_valid:
         ok(f"Entrambi i scale validi: compute_scale={scale_cs} extract_weights={scale_ew} | max|w|={max_abs:.6f}")
@@ -89,23 +85,25 @@ def run_tests(model_path: str):
                 info("  Rigenera con: python3 shared/extract_weights.py")
 
     # --- Test 4: weights_float.json coerenza ---
+    # NON fare total+=1 qui: il blocco interno gestisce gia' 2 assertion (scale + floats).
+    # Se il file non esiste entrambe vengono saltate senza incrementare total.
     print(f"\n{YELLOW}[Test 4] weights_float.json — scale_factor e valori float{NC}")
-    total += 1
     wf_path = os.path.join(shared_dir, 'weights_float.json')
     if not os.path.exists(wf_path):
         info(f"weights_float.json non trovato — test saltato")
-        total -= 1
     else:
         with open(wf_path) as f:
             wf_data = json.load(f)
         saved_scale  = wf_data.get('scale_factor', -1)
         saved_floats = wf_data.get('weights', [])
+
         total += 1
         if saved_scale == scale_ew:
             ok(f"scale_factor in weights_float.json = {saved_scale} == estratto = {scale_ew}")
             passed += 1
         else:
             fail(f"scale_factor mismatch: file={saved_scale} vs live={scale_ew}")
+
         total += 1
         if len(saved_floats) == len(floats):
             max_diff = max(abs(a - b) for a, b in zip(saved_floats, floats))
