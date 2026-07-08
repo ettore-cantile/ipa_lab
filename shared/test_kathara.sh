@@ -126,6 +126,45 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
+# Step 2a-ter — Risolvi anche l'interfaccia di INVIO su darmstadt (stessa
+# ragione: darmstadt ha piu' link (eth0/eth1/eth2) verso vicini diversi in
+# germany50, non si puo' assumere "eth0" per il link verso frankfurt).
+# Usata per la cattura tcpdump lato mittente allo Step 5-bis/7-bis.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 2a-ter] Verifying which real interface on darmstadt sends toward ${FRANKFURT_DIRECT}...${NC}"
+DARMSTADT_IFACE=$(krun darmstadt "ip route get ${FRANKFURT_DIRECT} 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1 | awk '{print \$2}'" | tr -d '\r\n')
+echo "  Outbound interface on darmstadt toward ${FRANKFURT_DIRECT} = ${DARMSTADT_IFACE:-<not found>}"
+if [ -z "${DARMSTADT_IFACE}" ]; then
+    echo -e "${RED}  ERROR: could not resolve darmstadt's outbound interface toward ${FRANKFURT_DIRECT}.${NC}"
+    echo "TEST FAILED"
+    exit 1
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# Step 2a-quater — Disabilita checksum/segmentation offload su entrambe le
+# interfacce (bug noto delle veth Docker/Kathara)
+#
+# Ground truth via tcpdump (turni precedenti di debug): i 100 pacchetti UDP
+# di send_ipa.py escono correttamente da darmstadt/${DARMSTADT_IFACE} (visti
+# nella cattura lato mittente), ma NON arrivano MAI su frankfurt/eth1 --
+# nemmeno a livello di cattura raw (prima ancora di XDP). Nello stesso
+# identico intervallo, ICMP e OSPF (IP raw, non UDP) attraversano il link
+# senza problemi. Questo pattern e' la firma classica del bug di checksum
+# offloading sulle interfacce veth: il kernel mittente calcola un checksum
+# UDP placeholder assumendo che l'"hardware" lo completi (tx-checksumming
+# offload), ma le veth non hanno hardware reale -- il pacchetto viaggia con
+# un checksum invalido e sparisce nel tragitto, mentre ICMP/OSPF non
+# dipendono dallo stesso meccanismo di offload e quindi funzionano.
+# Fix: disabilitare l'offload forza il kernel a calcolare il checksum
+# realmente in software.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 2a-quater] Disabling checksum/segmentation offload on both interfaces (veth offload bug workaround)...${NC}"
+krun darmstadt "ethtool -K ${DARMSTADT_IFACE} tx off rx off gso off gro off tso off 2>&1 || echo 'ethtool not available or unsupported on darmstadt'"
+krun frankfurt "ethtool -K ${FRANKFURT_XDP_IFACE} tx off rx off gso off gro off tso off 2>&1 || echo 'ethtool not available or unsupported on frankfurt'"
+echo
+
+# ---------------------------------------------------------------------------
 # Step 2b — OSPF convergence (opzionale, 30s timeout, SOLO informativo)
 #
 # Nota: questo check NON deve determinare l'IP usato per il test (Step 6).
@@ -245,10 +284,12 @@ echo
 # tcpdump PRIMA che lo Step 6 invii i pacchetti, cosi' la cattura copre
 # l'intera finestra di invio.
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 5-bis] Capturing real traffic on frankfurt/${FRANKFURT_XDP_IFACE} with tcpdump (ground truth)...${NC}"
+echo -e "${YELLOW}[Step 5-bis] Capturing real traffic on frankfurt/${FRANKFURT_XDP_IFACE} AND darmstadt/${DARMSTADT_IFACE} with tcpdump (ground truth)...${NC}"
 krun frankfurt "rm -f /tmp/tcpdump_frankfurt.log; nohup timeout 12 tcpdump -l -i ${FRANKFURT_XDP_IFACE} -n -c 300 > /tmp/tcpdump_frankfurt.log 2>&1 & echo tcpdump_started"
+krun darmstadt "rm -f /tmp/tcpdump_darmstadt.log; nohup timeout 12 tcpdump -l -i ${DARMSTADT_IFACE} -n -c 300 'udp port 9999 or icmp' > /tmp/tcpdump_darmstadt.log 2>&1 & echo tcpdump_started"
 sleep 1
-echo "  tcpdump running in background (up to 12s / 300 packets, -l = line-buffered so the log fills in real time)"
+echo "  tcpdump running in background on both ends (up to 12s / 300 packets, -l = line-buffered)"
+echo "  darmstadt filter: 'udp port 9999 or icmp' -- isolates our IPA traffic + ping from OSPF noise"
 echo
 
 # ---------------------------------------------------------------------------
@@ -274,9 +315,14 @@ sleep 3
 echo
 
 # ---------------------------------------------------------------------------
-# Step 7-bis — Mostra la cattura tcpdump avviata allo Step 5-bis (ground truth)
+# Step 7-bis — Mostra le catture tcpdump avviate allo Step 5-bis (ground truth
+# su ENTRAMBI i lati: se i pacchetti non compaiono nemmeno lato mittente
+# (darmstadt), il problema e' nell'invio, non nel tragitto/nella pipeline)
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 7-bis] tcpdump capture on frankfurt/${FRANKFURT_XDP_IFACE}:${NC}"
+echo -e "${YELLOW}[Step 7-bis] tcpdump capture on darmstadt/${DARMSTADT_IFACE} (sending side, filtered udp:9999+icmp):${NC}"
+krun darmstadt 'cat /tmp/tcpdump_darmstadt.log 2>/dev/null || echo "no capture file"'
+echo
+echo -e "${YELLOW}[Step 7-bis] tcpdump capture on frankfurt/${FRANKFURT_XDP_IFACE} (receiving side):${NC}"
 krun frankfurt 'cat /tmp/tcpdump_frankfurt.log 2>/dev/null || echo "no capture file"'
 echo
 
