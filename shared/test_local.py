@@ -63,11 +63,8 @@ def load_pt_dynamic(path: str) -> tuple:
     """
     state = torch.load(path, map_location='cpu', weights_only=True)
 
-    # Inferisci dimensioni dal checkpoint
-    # fc1.weight shape: (hidden_dim, input_size)
-    # out.weight shape: (output_size, hidden_dim)
-    w1_shape  = state['fc1.weight'].shape   # (hidden, input)
-    out_shape = state['out.weight'].shape   # (output, hidden)
+    w1_shape  = state['fc1.weight'].shape
+    out_shape = state['out.weight'].shape
 
     inferred_input  = w1_shape[1]
     inferred_hidden = w1_shape[0]
@@ -119,7 +116,7 @@ class Method1_Hardcoded:
 
     def update_weights(self, new_model) -> float:
         t0 = time.perf_counter()
-        time.sleep(0.001)  # simula ricompilazione BCC
+        time.sleep(0.001)
         self._copy_weights(new_model)
         return time.perf_counter() - t0
 
@@ -129,40 +126,42 @@ class Method1_Hardcoded:
 # ===========================================================================
 class Method2_Template:
     def __init__(self, model: FRRModel):
-        self.hidden  = model.fc1.out_features
-        self.input   = model.fc1.in_features
-        self.output  = model.out.out_features
-        self.scale   = compute_scale(model)
+        self.hidden = model.fc1.out_features
+        self.input = model.fc1.in_features
+        self.output = model.out.out_features
+        self.scale = compute_scale(model)
         self.weight_map = {}
         self._load(model)
 
-    def _q(self, v): return max(-128, min(127, int(round(v * self.scale))))
+    def _q(self, v):
+        return max(-128, min(127, int(round(v * self.scale))))
 
     def _load(self, model):
         self.scale = compute_scale(model)
         self.hidden = model.fc1.out_features
-        self.input  = model.fc1.in_features
+        self.input = model.fc1.in_features
         self.output = model.out.out_features
         s = model.state_dict()
         idx = 0
-        for key in ['fc1.weight','fc1.bias','fc2.weight','fc2.bias','out.weight','out.bias']:
+        for key in ['fc1.weight', 'fc1.bias', 'fc2.weight', 'fc2.bias', 'out.weight', 'out.bias']:
             for v in s[key].flatten().tolist():
-                self.weight_map[idx] = self._q(v); idx += 1
+                self.weight_map[idx] = self._q(v)
+                idx += 1
 
     def _mat(self, off, r, c):
-        return np.array([self.weight_map[off+i]/self.scale for i in range(r*c)]).reshape(r,c)
+        return np.array([self.weight_map[off + i] / self.scale for i in range(r * c)]).reshape(r, c)
 
     def _bias(self, off, n):
-        return np.array([self.weight_map[off+i]/self.scale for i in range(n)])
+        return np.array([self.weight_map[off + i] / self.scale for i in range(n)])
 
     def infer(self, x):
         H, I, O = self.hidden, self.input, self.output
         off = 0
-        W1 = self._mat(off, H, I); off += H*I
+        W1 = self._mat(off, H, I); off += H * I
         b1 = self._bias(off, H);   off += H
-        W2 = self._mat(off, H, H); off += H*H
+        W2 = self._mat(off, H, H); off += H * H
         b2 = self._bias(off, H);   off += H
-        W3 = self._mat(off, O, H); off += O*H
+        W3 = self._mat(off, O, H); off += O * H
         b3 = self._bias(off, O)
         h1 = np.maximum(0, W1 @ x + b1)
         h2 = np.maximum(0, W2 @ h1 + b2)
@@ -179,38 +178,43 @@ class Method2_Template:
 # ===========================================================================
 class Method3_Modular:
     def __init__(self, model: FRRModel):
-        self.hidden  = model.fc1.out_features
-        self.input   = model.fc1.in_features
-        self.output  = model.out.out_features
-        self.scale   = compute_scale(model)
-        self.lw      = [{}, {}, {}]
+        self.hidden = model.fc1.out_features
+        self.input = model.fc1.in_features
+        self.output = model.out.out_features
+        self.scale = compute_scale(model)
+        self.lw = [{}, {}, {}]
         self._load(model)
 
-    def _q(self, v): return max(-128, min(127, int(round(v * self.scale))))
+    def _q(self, v):
+        return max(-128, min(127, int(round(v * self.scale))))
 
     def _load(self, model, layer_idx=None):
-        self.scale  = compute_scale(model)
+        self.scale = compute_scale(model)
         self.hidden = model.fc1.out_features
-        self.input  = model.fc1.in_features
+        self.input = model.fc1.in_features
         self.output = model.out.out_features
         s = model.state_dict()
         cfg = [
-            ('fc1.weight','fc1.bias', self.hidden, self.input),
-            ('fc2.weight','fc2.bias', self.hidden, self.hidden),
-            ('out.weight','out.bias', self.output, self.hidden),
+            ('fc1.weight', 'fc1.bias', self.hidden, self.input),
+            ('fc2.weight', 'fc2.bias', self.hidden, self.hidden),
+            ('out.weight', 'out.bias', self.output, self.hidden),
         ]
-        layers = [layer_idx] if layer_idx is not None else [0,1,2]
+        layers = [layer_idx] if layer_idx is not None else [0, 1, 2]
         for li in layers:
             wk, bk, rows, cols = cfg[li]
             idx = 0
-            for v in s[wk].flatten().tolist(): self.lw[li][idx]=self._q(v); idx+=1
-            for v in s[bk].flatten().tolist(): self.lw[li][idx]=self._q(v); idx+=1
+            for v in s[wk].flatten().tolist():
+                self.lw[li][idx] = self._q(v)
+                idx += 1
+            for v in s[bk].flatten().tolist():
+                self.lw[li][idx] = self._q(v)
+                idx += 1
 
     def _layer(self, li, x_in, out_size):
         in_size = len(x_in)
         lw = self.lw[li]
-        W = np.array([lw[i]/self.scale for i in range(out_size*in_size)]).reshape(out_size,in_size)
-        b = np.array([lw[out_size*in_size+i]/self.scale for i in range(out_size)])
+        W = np.array([lw[i] / self.scale for i in range(out_size * in_size)]).reshape(out_size, in_size)
+        b = np.array([lw[out_size * in_size + i] / self.scale for i in range(out_size)])
         return W @ x_in + b
 
     def infer(self, x):
@@ -231,10 +235,10 @@ def make_input(input_size=INPUT_SIZE):
     ls = np.random.randint(0, 2, N_INTERFACES).astype(np.float32)
     ii = np.zeros(N_INTERFACES, dtype=np.float32)
     ii[np.random.randint(0, N_INTERFACES)] = 1.0
-    ttl = np.array([np.random.uniform(0,1)], dtype=np.float32)
+    ttl = np.array([np.random.uniform(0, 1)], dtype=np.float32)
     nid = np.zeros(N_NODES, dtype=np.float32)
     nid[np.random.randint(0, N_NODES)] = 1.0
-    base = np.concatenate([ls, ii, ttl, nid])   # 35 features
+    base = np.concatenate([ls, ii, ttl, nid])
     if input_size > len(base):
         base = np.concatenate([base, np.zeros(input_size - len(base), dtype=np.float32)])
     return base[:input_size]
@@ -249,7 +253,7 @@ def pytorch_ref(model, x_np):
 # Test runner
 # ===========================================================================
 def run_tests(model, verbose=False):
-    print(f"\n{YELLOW}=== TEST LOCAL \u2014 IPA Pipeline (3 metodi) ==={NC}\n")
+    print(f"\n{YELLOW}=== TEST LOCAL — IPA Pipeline (3 metodi) ==={NC}\n")
     H = model.fc1.out_features
     I = model.fc1.in_features
     O = model.out.out_features
@@ -266,32 +270,38 @@ def run_tests(model, verbose=False):
     N = 50
     passed = total = 0
 
-    # Test 1: consistency + argmax
     print(f"{YELLOW}[Test 1] Output consistency & argmax ({N} campioni){NC}")
-    mm = {2:0, 3:0}; me = {1:0.0, 2:0.0, 3:0.0}
+    mm = {2: 0, 3: 0}
+    me = {1: 0.0, 2: 0.0, 3: 0.0}
     for _ in range(N):
         x = make_input(I)
         ref = pytorch_ref(model, x)
-        nr  = int(np.argmax(ref))
-        for mid, m in [(1,m1),(2,m2),(3,m3)]:
-            out = m.infer(x)
-            me[mid] = max(me[mid], float(np.max(np.abs(out-ref))))
-        if int(np.argmax(m2.infer(x))) != nr: mm[2] += 1
-        if int(np.argmax(m3.infer(x))) != nr: mm[3] += 1
+        nr = int(np.argmax(ref))
+        o1 = m1.infer(x)
+        o2 = m2.infer(x)
+        o3 = m3.infer(x)
+        me[1] = max(me[1], float(np.max(np.abs(o1 - ref))))
+        me[2] = max(me[2], float(np.max(np.abs(o2 - ref))))
+        me[3] = max(me[3], float(np.max(np.abs(o3 - ref))))
+        if int(np.argmax(o2)) != nr:
+            mm[2] += 1
+        if int(np.argmax(o3)) != nr:
+            mm[3] += 1
 
-    total += 1; passed += 1
+    total += 1
+    passed += 1
     ok(f"Method 1 (hardcoded): argmax 100% corretto | max_err={me[1]:.6f}")
 
-    for mid, name in [(2,'template'),(3,'modular')]:
+    for mid, name in [(2, 'template'), (3, 'modular')]:
         total += 1
-        pct = mm[mid]/N*100
+        pct = mm[mid] / N * 100
         if pct <= 10:
             ok(f"Method {mid} ({name}): argmax {100-pct:.0f}% corretto ({mm[mid]}/{N}) | max_err={me[mid]:.4f}")
             passed += 1
         else:
             fail(f"Method {mid} ({name}): {mm[mid]}/{N} argmax errati | max_err={me[mid]:.4f} | scale={m2.scale}")
 
-    for mid, name, sc in [(2,'template',m2.scale),(3,'modular',m3.scale)]:
+    for mid, name, sc in [(2, 'template', m2.scale), (3, 'modular', m3.scale)]:
         total += 1
         tol = H / sc
         if me[mid] <= tol:
@@ -300,63 +310,77 @@ def run_tests(model, verbose=False):
         else:
             fail(f"Method {mid} ({name}): errore quant. ALTO ({me[mid]:.4f} > {tol:.4f})")
 
-    # Test 2: update latency
     print(f"\n{YELLOW}[Test 2] Weight update latency (10 update){NC}")
-    times = {1:[],2:[],3:[],'3s':[]}
+    times = {1: [], 2: [], 3: [], '3s': []}
     for _ in range(10):
         nm = FRRModel()
-        times[1].append(m1.update_weights(nm)*1000)
-        times[2].append(m2.update_weights(nm)*1000)
-        times[3].append(m3.update_weights(nm)*1000)
-        times['3s'].append(m3.update_weights(nm, layer_idx=2)*1000)
-    for key, lbl in [(1,'Method 1 hardcoded (ricompilazione simulata)'),(2,'Method 2 template  (map update)'),
-                     (3,'Method 3 modular   (tutti i layer)'),('3s','Method 3 modular   (singolo layer hot-swap)')]:
-        avg = sum(times[key])/10
-        info(f"{lbl}: avg={avg:.3f}ms  max={max(times[key]):.3f}ms")
-    total+=1; passed+=1; ok("Update latency misurata")
+        times[1].append(m1.update_weights(nm) * 1000)
+        times[2].append(m2.update_weights(nm) * 1000)
+        times[3].append(m3.update_weights(nm) * 1000)
+        times['3s'].append(m3.update_weights(nm, layer_idx=2) * 1000)
 
-    # Test 3: determinismo
+    for key, lbl in [
+        (1, 'Method 1 hardcoded (ricompilazione simulata)'),
+        (2, 'Method 2 template  (map update)'),
+        (3, 'Method 3 modular   (tutti i layer)'),
+        ('3s', 'Method 3 modular   (singolo layer hot-swap)')
+    ]:
+        avg = sum(times[key]) / 10
+        info(f"{lbl}: avg={avg:.3f}ms  max={max(times[key]):.3f}ms")
+    total += 1
+    passed += 1
+    ok("Update latency misurata")
+
     print(f"\n{YELLOW}[Test 3] Determinismo (100 run){NC}")
     xf = make_input(I)
     rs = {int(np.argmax(m2.infer(xf))) for _ in range(100)}
-    total+=1
-    if len(rs)==1: ok(f"Method 2: deterministico ({list(rs)[0]}) su 100 run"); passed+=1
-    else: fail(f"Method 2: NON deterministico: {rs}")
+    total += 1
+    if len(rs) == 1:
+        ok(f"Method 2: deterministico ({list(rs)[0]}) su 100 run")
+        passed += 1
+    else:
+        fail(f"Method 2: NON deterministico: {rs}")
 
-    # Test 4: consistenza post-update
     print(f"\n{YELLOW}[Test 4] Consistenza post-update{NC}")
     nm = FRRModel()
-    m2.update_weights(nm); m3.update_weights(nm)
-    mp = sum(1 for _ in range(N) if int(np.argmax(m2.infer(make_input(I))))!=int(np.argmax(m3.infer(make_input(I)))))
-    total+=1
-    if mp==0: ok(f"Method 2 e 3 concordano su {N} campioni dopo update"); passed+=1
-    else: fail(f"Method 2 e 3 discordano su {mp}/{N} campioni")
+    m2.update_weights(nm)
+    m3.update_weights(nm)
+    mp = 0
+    for _ in range(N):
+        x = make_input(I)
+        if int(np.argmax(m2.infer(x))) != int(np.argmax(m3.infer(x))):
+            mp += 1
+    total += 1
+    if mp == 0:
+        ok(f"Method 2 e 3 concordano su {N} campioni dopo update")
+        passed += 1
+    else:
+        fail(f"Method 2 e 3 discordano su {mp}/{N} campioni")
 
-    # Test 5: caricamento .pt con dimensioni dinamiche
     print(f"\n{YELLOW}[Test 5] Caricamento modello .pt (dimensioni auto-inferite){NC}")
-    total+=1
-    pt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           'frr_germany50_5_model_4x2.pt')
+    total += 1
+    pt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'frr_germany50_5_model_4x2.pt')
     if os.path.exists(pt_path):
         try:
             loaded, li, lh, lo = load_pt_dynamic(pt_path)
-            x   = make_input(li)
-            nh  = int(np.argmax(pytorch_ref(loaded, x)))
-            sc  = compute_scale(loaded)
+            x = make_input(li)
+            nh = int(np.argmax(pytorch_ref(loaded, x)))
+            sc = compute_scale(loaded)
             ok(f".pt caricato | arch={li}->{lh}->{lh}->{lo} | next-hop={nh} | scale={sc}")
-            passed+=1
+            passed += 1
         except Exception as e:
             fail(f"Errore caricamento .pt: {e}")
     else:
         info(f".pt non trovato ({pt_path}) — test saltato")
-        total-=1
+        total -= 1
 
     print(f"\n{YELLOW}{'='*52}{NC}")
-    color = GREEN if passed==total else RED
+    color = GREEN if passed == total else RED
     print(f"{color} Risultato: {passed}/{total} test passati{NC}")
-    if passed<total: print(f"{RED} Controlla i messaggi [FAIL] sopra{NC}")
+    if passed < total:
+        print(f"{RED} Controlla i messaggi [FAIL] sopra{NC}")
     print(f"{YELLOW}{'='*52}{NC}\n")
-    return passed==total
+    return passed == total
 
 
 def main():
@@ -364,13 +388,18 @@ def main():
     parser.add_argument('--model', type=str, default=None)
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
+
     torch.manual_seed(42)
+    np.random.seed(42)
+
     model = FRRModel()
     pt_path = args.model or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'frr_germany50_5_model_4x2.pt')
+        os.path.dirname(os.path.abspath(__file__)),
+        'frr_germany50_5_model_4x2.pt'
+    )
+
     if os.path.exists(pt_path):
         try:
-            # Carica il modello principale con le sue dimensioni reali
             loaded, li, lh, lo = load_pt_dynamic(pt_path)
             if li == INPUT_SIZE and lh == HIDDEN_DIM:
                 model = loaded
@@ -382,6 +411,7 @@ def main():
             print(f"{YELLOW}[WARN]{NC} {e} — uso pesi casuali")
     else:
         print(f"{YELLOW}[INFO]{NC} Nessun .pt trovato — pesi casuali (seed=42)")
+
     sys.exit(0 if run_tests(model, args.verbose) else 1)
 
 
