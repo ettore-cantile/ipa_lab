@@ -119,8 +119,17 @@ echo
 
 # ---------------------------------------------------------------------------
 # Step 3 — Carica Pipeline 1 su FRANKFURT (XDP su eth1)
+#
+# Pulizia preliminare: un'esecuzione precedente di questo script che sia
+# uscita per timeout (Step 4) lascia execute_pipeline.py ancora vivo in
+# background e/o XDP ancora attaccato su ${FRANKFURT_XDP_IFACE}. Se non
+# lo si ripulisce, la nuova compilazione BCC deve competere per la CPU
+# con quella vecchia (rendendola ancora piu' lenta) e il nuovo attach XDP
+# puo' scontrarsi con quello vecchio. Idempotente: non fa nulla se non
+# c'e' niente da pulire.
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 3] Loading Pipeline 1 (hardcoded) on frankfurt (iface=${FRANKFURT_XDP_IFACE})...${NC}"
+krun frankfurt "pkill -f execute_pipeline.py 2>/dev/null; ip link set dev ${FRANKFURT_XDP_IFACE} xdp off 2>/dev/null; rm -f /tmp/pipeline_frankfurt.log; sleep 1; echo cleaned" > /dev/null
 krun frankfurt "nohup python3 /shared/execute_pipeline.py \
     --method ${METHOD} \
     --iface ${FRANKFURT_XDP_IFACE} \
@@ -132,16 +141,17 @@ echo
 # Step 4 — Attendi avvio pipeline su frankfurt (polling, non uno sleep fisso)
 #
 # Nota: un `sleep 8` fisso qui era intermittente — la compilazione BCC del
-# programma eBPF (clang -target bpf, con gli header del kernel) a volte
-# richiede piu' di 8s, per cui i pacchetti dello Step 6 arrivavano prima
-# che XDP fosse davvero attaccato, con TRUE HIT=0 non per un bug della
-# pipeline ma per una race condition nel test. Fix: polling fino a 40s
-# sulla stessa stringa "XDP attached" gia' usata prima, con uscita
-# immediata su errore/traceback (stesso pattern dello Step 2b per OSPF).
+# programma eBPF (clang -target bpf, con l'intera catena di include del
+# kernel) parte da zero ad ogni avvio e il suo tempo e' variabile a
+# seconda del carico della macchina: si sono osservati sia ~15s sia oltre
+# 40s per lo stesso identico programma. Un timeout di 40s si e' rivelato
+# ancora troppo stretto in pratica. Fix: polling fino a 90s sulla stessa
+# stringa "XDP attached" gia' usata prima, con uscita immediata su
+# errore/traceback (stesso pattern dello Step 2b per OSPF).
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 4] Waiting for pipeline startup on frankfurt (up to 40s)...${NC}"
+echo -e "${YELLOW}[Step 4] Waiting for pipeline startup on frankfurt (up to 90s)...${NC}"
 PIPELINE_READY=0
-for i in $(seq 1 40); do
+for i in $(seq 1 90); do
     STATUS_LINE=$(krun frankfurt 'if [ ! -f /tmp/pipeline_frankfurt.log ]; then
     echo PIPELINE_STATUS=NOT_STARTED
 elif grep -qi "error\|traceback\|exception" /tmp/pipeline_frankfurt.log; then
@@ -169,7 +179,7 @@ fi' | tr -d '\r')
 done
 if [ ${PIPELINE_READY} -eq 0 ]; then
     echo
-    echo -e "${RED}  Pipeline did not report 'XDP attached' within 40s. Full log:${NC}"
+    echo -e "${RED}  Pipeline did not report 'XDP attached' within 90s. Full log:${NC}"
     krun frankfurt 'cat /tmp/pipeline_frankfurt.log'
     echo "TEST FAILED"
     exit 1
