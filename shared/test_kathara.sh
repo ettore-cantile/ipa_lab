@@ -237,6 +237,21 @@ krun frankfurt 'grep -E "cls [0-9]|ifindex" /tmp/pipeline_frankfurt.log 2>/dev/n
 echo
 
 # ---------------------------------------------------------------------------
+# Step 5-bis — Cattura tcpdump di ground-truth su frankfurt/${FRANKFURT_XDP_IFACE}
+#
+# I contatori debug_stats dicono solo cosa succede DOPO che un pacchetto ha
+# raggiunto l'hook XDP. Per distinguere "i pacchetti non arrivano affatto"
+# da "arrivano ma in una forma inattesa", catturiamo il traffico reale con
+# tcpdump PRIMA che lo Step 6 invii i pacchetti, cosi' la cattura copre
+# l'intera finestra di invio.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 5-bis] Capturing real traffic on frankfurt/${FRANKFURT_XDP_IFACE} with tcpdump (ground truth)...${NC}"
+krun frankfurt "rm -f /tmp/tcpdump_frankfurt.log; nohup timeout 12 tcpdump -l -i ${FRANKFURT_XDP_IFACE} -n -c 300 > /tmp/tcpdump_frankfurt.log 2>&1 & echo tcpdump_started"
+sleep 1
+echo "  tcpdump running in background (up to 12s / 300 packets, -l = line-buffered so the log fills in real time)"
+echo
+
+# ---------------------------------------------------------------------------
 # Step 6 — Invia 100 pacchetti IPA da darmstadt con TTL variabile 30-64
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets from darmstadt -> ${FRANKFURT_IP}${NC}"
@@ -256,6 +271,13 @@ echo
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 7] Waiting 3s for XDP to process packets...${NC}"
 sleep 3
+echo
+
+# ---------------------------------------------------------------------------
+# Step 7-bis — Mostra la cattura tcpdump avviata allo Step 5-bis (ground truth)
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 7-bis] tcpdump capture on frankfurt/${FRANKFURT_XDP_IFACE}:${NC}"
+krun frankfurt 'cat /tmp/tcpdump_frankfurt.log 2>/dev/null || echo "no capture file"'
 echo
 
 # ---------------------------------------------------------------------------
