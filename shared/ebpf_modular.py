@@ -336,6 +336,25 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
     struct fwd_action *action = fwd_table_t3.lookup(&key);
     __u64 *correct_key        = valid_keys_t3.lookup(&ip->ttl);
 
+    /* Helper macro to build and submit a miss event */
+    #define EMIT_EVENT() do { \
+        int mid_slot = META_MODEL_ID; \
+        long long *mid_p = scratch_meta.lookup(&mid_slot); \
+        int li_slot = META_LAYER_IDX; \
+        long long *lip = scratch_meta.lookup(&li_slot); \
+        int ttl_slot = META_TTL; \
+        long long *ttlp = scratch_meta.lookup(&ttl_slot); \
+        int if_slot = META_INGRESS_IF; \
+        long long *ifp = scratch_meta.lookup(&if_slot); \
+        struct miss_event_t3 ev = {}; \
+        ev.model_id        = mid_p ? (__u8)(*mid_p) : 0; \
+        ev.ttl             = ttlp  ? (__u8)(*ttlp)  : ip->ttl; \
+        ev.ingress_ifindex = ifp   ? (__u32)(*ifp)  : ctx->ingress_ifindex; \
+        ev.layer_idx       = lip   ? (__u8)(*lip)   : 2; \
+        ev.key             = key; \
+        miss_events_t3.perf_submit(ctx, &ev, sizeof(ev)); \
+    } while (0)
+
     if (action != NULL && correct_key && *correct_key == key) {
         int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
@@ -343,29 +362,17 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     } else if (action != NULL) {
+        /* Fake hit: key found but TTL mismatch -> emit event for CP visibility */
         int si = 2; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
+        EMIT_EVENT();
     } else {
+        /* Miss: key not in fwd_table */
         int si = 1; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
-
-        int mid_slot = META_MODEL_ID;
-        long long *mid_p = scratch_meta.lookup(&mid_slot);
-        int li_slot = META_LAYER_IDX;
-        long long *lip = scratch_meta.lookup(&li_slot);
-        int ttl_slot = META_TTL;
-        long long *ttlp = scratch_meta.lookup(&ttl_slot);
-        int if_slot = META_INGRESS_IF;
-        long long *ifp = scratch_meta.lookup(&if_slot);
-
-        struct miss_event_t3 ev = {};
-        ev.model_id        = mid_p ? (__u8)(*mid_p) : 0;
-        ev.ttl             = ttlp  ? (__u8)(*ttlp)  : ip->ttl;
-        ev.ingress_ifindex = ifp   ? (__u32)(*ifp)  : ctx->ingress_ifindex;
-        ev.layer_idx       = lip   ? (__u8)(*lip)   : 2;
-        ev.key             = key;
-        miss_events_t3.perf_submit(ctx, &ev, sizeof(ev));
+        EMIT_EVENT();
     }
+    #undef EMIT_EVENT
     return XDP_PASS;
 }
 """
@@ -413,6 +420,7 @@ def load_modular_weights(
         bpf_obj["layer_weights"][key] = val
 
     class LayerModelEntry(Structure):
+        _pack_ = 1
         _fields_ = [("scale_factor", c_uint16),
                     ("w_off_fc1",    c_uint32),
                     ("w_off_fc2",    c_uint32),
