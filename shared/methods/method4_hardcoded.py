@@ -169,6 +169,21 @@ def run(
                 + f"   chosen_port={chosen_iface}",
                 end="\r",
             )
+
+            # Diagnostic breakdown of WHY packets never reach pkt_stats
+            # (e.g. all zeros -- wrong protocol/port, or never reaching
+            # eth1 at all). Printed on its own real newline (leading \n
+            # forces a clean line break even after the \r above) so it
+            # survives a plain `tail`/log read, unlike the \r-refreshed
+            # line above.
+            debug_stats = b["debug_stats"]
+            dbg = [debug_stats[i].value for i in range(8)]
+            print(
+                f"\n  DEBUG: seen={dbg[0]} eth_fail={dbg[1]} ip_fail={dbg[2]} "
+                f"not_udp={dbg[3]} udp_fail={dbg[4]} wrong_port={dbg[5]} "
+                f"ipa_fail={dbg[6]} reached_model_cache={dbg[7]}"
+            )
+
             prev_stats = cur_stats
             prev_cls   = cur_cls
     except KeyboardInterrupt:
@@ -201,6 +216,13 @@ def _print_final_stats(b, egress_ifaces):
         print(f"    cls {i} -> {name:6s} : {cnt:>8}  {bar}")
     drop_cnt = cls_stats[6].value if 6 < len(cls_stats) else drop
     print(f"    cls 6 -> DROP   : {drop_cnt:>8}")
+    print()
+    debug_stats = b["debug_stats"]
+    dbg = [debug_stats[i].value for i in range(8)]
+    print("  Debug breakdown (why packets never reached pkt_stats, if 0):")
+    print(f"    seen={dbg[0]} eth_fail={dbg[1]} ip_fail={dbg[2]} not_udp={dbg[3]} "
+          f"udp_fail={dbg[4]} wrong_port={dbg[5]} ipa_fail={dbg[6]} "
+          f"reached_model_cache={dbg[7]}")
     print("=" * 56)
 
 
