@@ -140,7 +140,7 @@ def run(
     b.attach_xdp(iface, fn)
     print(f"\n[P1-hardcoded] XDP attached to {iface} — running (Ctrl-C to stop)")
     print(f"[P1-hardcoded] Design: 0 weight-map lookups, 0 fwd_table lookups, ~780 insns")
-    print(f"[P1-hardcoded] Egress port chosen dynamically by inference (best_cls -> IFINDEX_TABLE[cls])")
+    print(f"[P1-hardcoded] Egress port chosen dynamically by inference (best_cls -> switch(cls))")
     print()
     print(f"  {'TRUE HIT':>12} {'MISS':>10} {'DROP':>10}  {'cls0':>6} {'cls1':>6} {'cls2':>6} {'cls3':>6} {'cls4':>6} {'cls5':>6} {'cls6':>6}")
     print("  " + "-" * 88)

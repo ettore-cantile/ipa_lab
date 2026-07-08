@@ -239,6 +239,10 @@ L'implementazione hardcoded (Livello 1) e quella dove la tesi "massime prestazio
 
 **Soluzione adottata:** un solo `switch(_iface)` e un solo `switch(_node)` per l'intero programma (non uno per neurone), dove ogni `case` assegna il contributo per *tutti* i neuroni contemporaneamente. Il numero di branch resta `O(7+52)` indipendentemente dal numero di neuroni, e i valori restano scalari su stack (nessuna global, nessuna map) — preservando la proprieta "zero lookup pesi" del Livello 1 pur passando il verifier.
 
+**Stesso bug, seconda occorrenza:** il pattern "array `static const` globale indicizzato a runtime" si ripresentava anche dopo l'argmax, in `static const __u32 IFINDEX_TABLE[6]` indicizzato da `best_cls` (0..5) per scegliere l'ifindex di uscita. Stesso sintomo (`R7 invalid mem access 'scalar'`), stessa causa (BCC non riloca dati `static`/globali per XDP), stessa soluzione: `switch (best_cls) { case 0: egress_ifindex = ...; break; ... }`. Qui non c'era rischio di esplosione combinatoria (best_cls e un solo scalare per pacchetto, non ripetuto per neurone) — bastava sostituire l'array con lo switch.
+
+**Lezione generale:** qualunque tabella di lookup `static const`/globale indicizzata da un valore runtime non e sicura sotto BCC per XDP, indipendentemente dalla sua dimensione; la soluzione e sempre "switch sull'indice limitato", non "rimpicciolire l'array".
+
 Questo e un dato sperimentale interessante da riportare nel paper: il costo della specializzazione massima (Livello 1) non e solo prestazionale, ma anche *di ingegneria* — occorre una codifica del branching ad-hoc per non violare i limiti del verifier, mentre i Livelli 2 e 3 evitano il problema a monte delegando i pesi a `BPF_ARRAY` map.
 
 ---

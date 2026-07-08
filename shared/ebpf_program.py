@@ -45,6 +45,13 @@ Verifier history (both fixed; see git log for the failed attempts):
   stack locals (8 x `long long`, 64B) -- no globals, no maps, verifier
   proves the bound trivially because every case is a concrete constant
   assignment merging into the same variable.
+
+  3) The SAME broken-global-array pattern (root cause #2 above) also
+     existed in the post-argmax action code as `static const __u32
+     IFINDEX_TABLE[6]` indexed by `best_cls`. Same symptom ("R7 invalid
+     mem access 'scalar'"), same fix: a `switch (best_cls) { case 0:
+     egress_ifindex = ...; break; ... }` (6 cases, single decision
+     point, no loop -> no explosion risk) replaces the array lookup.
 """
 
 N_IN   = 65
@@ -123,7 +130,7 @@ def generate_ebpf_hardcoded(
     Generate a self-contained eBPF XDP program for model `model_id`.
 
     After argmax the program:
-      - reads ifindex from the HARDCODED array IFINDEX_TABLE[best_cls]
+      - resolves egress_ifindex via switch(best_cls) over hardcoded constants
       - cls 0-5: bpf_redirect(ifindex, 0)  -> pkt_stats[0]++, cls_stats[cls]++
       - cls  6:  XDP_DROP                  -> pkt_stats[2]++
       - model_cache miss:                  -> pkt_stats[1]++
@@ -145,8 +152,6 @@ def generate_ebpf_hardcoded(
         ifindex_table = [2, 3, 4, 5, 6, 7]   # eth1..eth6 default
     if len(ifindex_table) < 6:
         ifindex_table = list(ifindex_table) + [2] * (6 - len(ifindex_table))
-
-    ifindex_literal = ", ".join(str(int(x)) for x in ifindex_table[:6])
 
     w = weights_int8
     fc1_w = w[0           : N_IN*N_H1]
@@ -238,10 +243,12 @@ def generate_ebpf_hardcoded(
     out_src    = "\n".join(out_lines)
     argmax_src = "\n".join(argmax_lines)
 
-    body = f"""
-/* Hardcoded ifindex table: cls 0-5 -> egress ifindex, cls 6 -> DROP */
-static const __u32 IFINDEX_TABLE[6] = {{ {ifindex_literal} }};
+    ifindex_cases = "\n".join(
+        f"        case {cls}: egress_ifindex = {int(ifindex_table[cls])}U; break;"
+        for cls in range(6)
+    )
 
+    body = f"""
 int ipa_switch(struct xdp_md *ctx) {{
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -299,7 +306,15 @@ int ipa_switch(struct xdp_md *ctx) {{
         return XDP_DROP;
     }}
 
-    __u32 egress_ifindex = IFINDEX_TABLE[best_cls];
+    /* egress_ifindex: hardcoded per-class constant (switch, not a global
+     * array -- BCC does not relocate static/global data for XDP programs,
+     * see module docstring "Verifier history"). best_cls is 0..5 here
+     * (>=6 already handled above), so this is a single bounded switch. */
+    __u32 egress_ifindex = 0;
+    switch (best_cls) {{
+{ifindex_cases}
+        default: break;
+    }}
 
     /* per-class counter */
     __u32 _cls = (__u32)best_cls;

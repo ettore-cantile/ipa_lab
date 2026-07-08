@@ -199,6 +199,19 @@ rejected before landing on the current one:
    `long long` = 64 B) — no globals, no maps, no map-lookup overhead.
    This preserves Pipeline 1's "zero weight-map-lookups" design point
    while satisfying the verifier.
+4. **The same broken-global-array pattern reappeared** one step later,
+   in the post-argmax action: `static const __u32 IFINDEX_TABLE[6]`
+   indexed by `best_cls` (0..5). Identical symptom
+   (`R7 invalid mem access 'scalar'`), identical root cause (BCC does
+   not relocate `static`/global data for XDP), identical fix: a
+   `switch (best_cls) { case 0: egress_ifindex = ...; break; ... }`.
+   Since `best_cls` is a single scalar decided once per packet (not
+   iterated per neuron), this switch was never at risk of the CFG
+   explosion from point 1 — it only needed the array-vs-switch fix.
+   **Lesson:** any `static const`/global lookup table indexed by a
+   runtime value is unsafe under BCC for XDP, regardless of table size;
+   the fix is always "switch over the bounded index," not "shrink the
+   array."
 
 ### Quantization
 - All pipelines use int8 quantization (7-bit signed) as in the existing codebase
