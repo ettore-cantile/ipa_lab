@@ -10,74 +10,17 @@ Design space position:
   - Nessuna BPF map lookup per i pesi
   - Codice completamente unrolled (#pragma unroll)
 
-IPA header structure (21 bytes packed):
-  [Model Description]     5 byte
-    model_id        : u8
-    model_type      : u8   (0x00 = FC-NN)
-    param_size      : u8   (7 = int8/7-bit)
-    scale_factor    : u16  big-endian  (usato solo dal CP in Method 4)
-
-  [Model Specifications]  4 byte
-    input_size      : u8   (65)
-    output_size     : u8   (7)
-    hidden_layers   : u8   (2)
-    neurons_per_layer: u8  (4)
-
-  [Input Descriptor]      9 byte
-    n_feature_types : u8
-    feat0_code/count: u8,u8  (0x01, 6)  link_state
-    feat1_code/count: u8,u8  (0x02, 6)  ingress_if
-    feat2_code/count: u8,u8  (0x03, 1)  ttl
-    feat3_code/count: u8,u8  (0x04, 52) node_id
-
-  [Output Descriptor]     3 byte
-    n_output_types  : u8
-    out0_code/count : u8,u8  (0x05, 7)  next_hop
-
-Architecture (frr_germany50_5_model_4x2.pt):
-  fc1 : 65 → 4  (ReLU)   264 params (260 weights + 4 biases)
-  fc2 :  4 → 4  (ReLU)    20 params  (16 weights + 4 biases)
-  out :  4 → 7  (argmax)  35 params  (28 weights + 7 biases)
-  Total: 319 int8 params
-
-eBPF verifier notes:
-  - All loops use #pragma unroll with compile-time bounds → accepted
-  - Input vector iv[] is fixed-size stack array [65] stored as 32-bit ints
-    to stay within the 512-byte BPF stack limit
-  - All weight literals are signed char constants → no map lookup
-  - scale != 0 guard before division
-  - No runtime-variable loop bounds
-  - Instruction count estimate:
-      fc1: 65*4 muls + 4 adds + 4 relu    ≈ 540 insns
-      fc2:  4*4 muls + 4 adds + 4 relu    ≈  60 insns
-      out:  4*7 muls + 7 adds + argmax    ≈ 100 insns
-      header parsing + forward            ≈  80 insns
-      Total ≈ 780 insns — well within 1M limit (kernel ≥ 5.1)
-             and within 4096 limit (kernel ≥ 4.15 with JIT)
-
-Maps:
-  model_cache       : model_id → model_data  (weights NOT used for inference;
-                      kept for Method-4 control-plane model-miss handling)
-  fwd_table         : u64 key → fwd_action
-  valid_keys        : u8 ttl  → u64 key
-  pkt_stats         : [0]=TRUE HIT  [1]=MISS  [2]=FAKE HIT
-  miss_events       : perf buffer (fwd miss)
-  model_miss_events : perf buffer (model miss, Method 4)
+Stack budget (BPF limit = 512 bytes):
+  iv[65] was 260 bytes — moved to BPF_PERCPU_ARRAY(iv_scratch, int, 65)
+  miss_event / model_miss_event — moved to percpu scratch maps
+  Remaining stack: pointers (8*6=48B) + long long vars (8*14=112B) ≈ 160B < 512B
 """
 
-# Architecture constants — must match frr_germany50_5_model_4x2.pt
 N_IN   = 65
 N_H1   =  4
 N_H2   =  4
 N_OUT  =  7
 
-# Weight layout in the flat int8 array:
-#   [0            .. N_IN*N_H1 - 1]          fc1 weights  (260)
-#   [N_IN*N_H1    .. N_IN*N_H1+N_H1-1]       fc1 biases   (  4)
-#   [264          .. 264+N_H1*N_H2-1]         fc2 weights  ( 16)
-#   [280          .. 280+N_H2-1]              fc2 biases   (  4)
-#   [284          .. 284+N_H2*N_OUT-1]        out weights  ( 28)
-#   [312          .. 318]                     out biases   (  7)
 N_WEIGHTS = N_IN*N_H1 + N_H1 + N_H1*N_H2 + N_H2 + N_H2*N_OUT + N_OUT  # 319
 
 
@@ -134,12 +77,17 @@ struct model_miss_event {
     __u8  n_weights;
 };
 
-BPF_HASH(model_cache,       __u8,  struct model_data, 256);
-BPF_HASH(fwd_table,         __u64, struct fwd_action, 256);
-BPF_HASH(valid_keys,        __u8,  __u64,             256);
-BPF_ARRAY(pkt_stats,        __u64, 3);
+BPF_HASH(model_cache,         __u8,  struct model_data,       256);
+BPF_HASH(fwd_table,           __u64, struct fwd_action,       256);
+BPF_HASH(valid_keys,          __u8,  __u64,                   256);
+BPF_ARRAY(pkt_stats,          __u64, 3);
 BPF_PERF_OUTPUT(miss_events);
 BPF_PERF_OUTPUT(model_miss_events);
+
+/* Per-cpu scratch maps to keep large objects off the 512-byte BPF stack */
+BPF_PERCPU_ARRAY(iv_scratch,        int,                      65);
+BPF_PERCPU_ARRAY(ev_scratch,        struct miss_event,         1);
+BPF_PERCPU_ARRAY(mev_scratch,       struct model_miss_event,   1);
 
 #define OUTPUT_OFFSET 100000ULL
 #define RELU_LL(x)    ((x) > 0LL ? (x) : 0LL)
@@ -163,9 +111,32 @@ def generate_ebpf_hardcoded(weights_int8: list, scale: int, model_id: int = 0) -
     def lit(v):
         return str(int(v))
 
+    # Feature extraction: read iv[] from percpu scratch map
+    # Zero the array, then set the relevant indices.
+    feat_lines = []
+    feat_lines.append("    /* --- feature extraction via per-cpu scratch --- */")
+    feat_lines.append("    __u32 _z = 0;")
+    # Zero all 65 slots
+    for i in range(N_IN):
+        feat_lines.append(f"    {{ int *_p = iv_scratch.lookup(&_z); if (_p) {{ __u32 _ki = {i}; int *_pi = iv_scratch.lookup(&_ki); if (_pi) *_pi = 0; }} }}")
+    # Set TTL slot (index 12)
+    feat_lines.append("    { __u32 _ki = 12; int *_p = iv_scratch.lookup(&_ki); if (_p) *_p = (int)ip->ttl; }")
+    # Set ingress_ifindex slot (indices 6..11 for ifindex 1..6)
+    feat_lines.append("    if (ctx->ingress_ifindex >= 1 && ctx->ingress_ifindex <= 6) {")
+    feat_lines.append("        __u32 _ki = 5 + ctx->ingress_ifindex; int *_p = iv_scratch.lookup(&_ki); if (_p) *_p = 1;")
+    feat_lines.append("    }")
+    # Set model_id (node_id) slot (indices 13..64 for model_id 0..51)
+    feat_lines.append("    if (ipa->model_id < 52) {")
+    feat_lines.append("        __u32 _ki = 13 + ipa->model_id; int *_p = iv_scratch.lookup(&_ki); if (_p) *_p = 1;")
+    feat_lines.append("    }")
+    # Read all iv values into local long long variables for fc1
+    for i in range(N_IN):
+        feat_lines.append(f"    long long iv{i}; {{ __u32 _ki = {i}; int *_p = iv_scratch.lookup(&_ki); iv{i} = _p ? (long long)*_p : 0LL; }}")
+
+    # fc1: use iv0..iv64 directly (no array on stack)
     fc1_lines = []
     for j in range(N_H1):
-        terms = " + ".join(f"((long long)iv[{i}]) * {lit(fc1_w[j*N_IN + i])}LL" for i in range(N_IN))
+        terms = " + ".join(f"iv{i} * {lit(fc1_w[j*N_IN + i])}LL" for i in range(N_IN))
         fc1_lines.append(f"    long long h1_{j} = RELU_LL({terms} + {lit(fc1_b[j])}LL);")
 
     fc2_lines = []
@@ -182,20 +153,11 @@ def generate_ebpf_hardcoded(weights_int8: list, scale: int, model_id: int = 0) -
     for k in range(1, N_OUT):
         argmax_lines.append(f"    if (out_{k} > best_val) {{ best_val = out_{k}; best_cls = {k}; }}")
 
-    feat_lines = []
-    feat_lines.append("    int iv[65];")
-    feat_lines.append("    __builtin_memset(iv, 0, sizeof(iv));")
-    feat_lines.append("    iv[12] = (int)ip->ttl;")
-    feat_lines.append("    if (ctx->ingress_ifindex >= 1 && ctx->ingress_ifindex <= 6)")
-    feat_lines.append("        iv[5 + ctx->ingress_ifindex] = 1;")
-    feat_lines.append("    if (ipa->model_id < 52)")
-    feat_lines.append("        iv[13 + ipa->model_id] = 1;")
-
-    fc1_src   = "\n".join(fc1_lines)
-    fc2_src   = "\n".join(fc2_lines)
-    out_src   = "\n".join(out_lines)
-    argmax_src= "\n".join(argmax_lines)
-    feat_src  = "\n".join(feat_lines)
+    fc1_src    = "\n".join(fc1_lines)
+    fc2_src    = "\n".join(fc2_lines)
+    out_src    = "\n".join(out_lines)
+    argmax_src = "\n".join(argmax_lines)
+    feat_src   = "\n".join(feat_lines)
 
     body = f"""
 int ipa_switch(struct xdp_md *ctx) {{
@@ -213,18 +175,22 @@ int ipa_switch(struct xdp_md *ctx) {{
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end)  return XDP_PASS;
 
+    /* Model cache check — use percpu scratch for model_miss_event */
     struct model_data *m = model_cache.lookup(&ipa->model_id);
     if (!m || m->is_valid == 0) {{
         __u8 *wp = (__u8 *)(ipa + 1);
         if ((void *)(wp + 4) > data_end) return XDP_PASS;
-        struct model_miss_event mev = {{}};
-        mev.model_id        = ipa->model_id;
-        mev.ttl             = ip->ttl;
-        mev.ingress_ifindex = ctx->ingress_ifindex;
-        mev.input_size      = ipa->input_size;
-        mev.w0 = wp[0]; mev.w1 = wp[1]; mev.w2 = wp[2]; mev.w3 = wp[3];
-        mev.n_weights       = 4;
-        model_miss_events.perf_submit(ctx, &mev, sizeof(mev));
+        __u32 _z = 0;
+        struct model_miss_event *mev = mev_scratch.lookup(&_z);
+        if (mev) {{
+            mev->model_id        = ipa->model_id;
+            mev->ttl             = ip->ttl;
+            mev->ingress_ifindex = ctx->ingress_ifindex;
+            mev->input_size      = ipa->input_size;
+            mev->w0 = wp[0]; mev->w1 = wp[1]; mev->w2 = wp[2]; mev->w3 = wp[3];
+            mev->n_weights       = 4;
+            model_miss_events.perf_submit(ctx, mev, sizeof(*mev));
+        }}
         return XDP_PASS;
     }}
 
@@ -243,8 +209,8 @@ int ipa_switch(struct xdp_md *ctx) {{
 
     __u64 key = (__u64)((best_val + (long long)(OUTPUT_OFFSET * (__u64)scale)) / (__u64)scale);
 
-    struct fwd_action *action = fwd_table.lookup(&key);
-    __u64 *correct_key        = valid_keys.lookup(&ip->ttl);
+    struct fwd_action *action     = fwd_table.lookup(&key);
+    __u64             *correct_key = valid_keys.lookup(&ip->ttl);
 
     if (action != NULL) {{
         if (correct_key && *correct_key == key) {{
@@ -256,25 +222,31 @@ int ipa_switch(struct xdp_md *ctx) {{
         }} else {{
             int si = 2; __u64 *v = pkt_stats.lookup(&si);
             if (v) __sync_fetch_and_add(v, 1);
-            struct miss_event ev = {{}};
-            ev.model_id        = ipa->model_id;
-            ev.ttl             = ip->ttl;
-            ev.ingress_ifindex = ctx->ingress_ifindex;
-            ev.input_size      = ipa->input_size;
-            ev.key             = key;
-            miss_events.perf_submit(ctx, &ev, sizeof(ev));
+            __u32 _z = 0;
+            struct miss_event *ev = ev_scratch.lookup(&_z);
+            if (ev) {{
+                ev->model_id        = ipa->model_id;
+                ev->ttl             = ip->ttl;
+                ev->ingress_ifindex = ctx->ingress_ifindex;
+                ev->input_size      = ipa->input_size;
+                ev->key             = key;
+                miss_events.perf_submit(ctx, ev, sizeof(*ev));
+            }}
             return XDP_PASS;
         }}
     }} else {{
         int si = 1; __u64 *v = pkt_stats.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
-        struct miss_event ev = {{}};
-        ev.model_id        = ipa->model_id;
-        ev.ttl             = ip->ttl;
-        ev.ingress_ifindex = ctx->ingress_ifindex;
-        ev.input_size      = ipa->input_size;
-        ev.key             = key;
-        miss_events.perf_submit(ctx, &ev, sizeof(ev));
+        __u32 _z = 0;
+        struct miss_event *ev = ev_scratch.lookup(&_z);
+        if (ev) {{
+            ev->model_id        = ipa->model_id;
+            ev->ttl             = ip->ttl;
+            ev->ingress_ifindex = ctx->ingress_ifindex;
+            ev->input_size      = ipa->input_size;
+            ev->key             = key;
+            miss_events.perf_submit(ctx, ev, sizeof(*ev));
+        }}
         return XDP_PASS;
     }}
 }}
