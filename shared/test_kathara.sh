@@ -10,13 +10,8 @@
 #     eth1 = 10.0.0.246/30
 #     eth2 = 10.0.0.250/30
 #
-# UTILIZZO:
-#   Terminale 1 (host o container manager):
-#     bash /shared/test_kathara.sh [hardcoded|template|modular]
-#
-#   Oppure separatamente:
-#     Terminale 1 → su frankfurt:  python3 /shared/recv_ipa.py --timeout 60
-#     Terminale 2 → su darmstadt:  bash /shared/test_kathara.sh hardcoded
+# UTILIZZO (dall'host, dopo kathara lstart):
+#   bash shared/test_kathara.sh [hardcoded|template|modular]
 #
 # REQUISITI:
 #   - kathara lstart deve essere già stato eseguito
@@ -39,16 +34,20 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN} IPA Kathara Test: darmstadt → frankfurt${NC}"
+echo -e "${GREEN} IPA Kathara Test: darmstadt -> frankfurt${NC}"
 echo -e "${GREEN} Pipeline: ${METHOD}  |  model_id=${MODEL_ID}  |  count=${PACKET_COUNT}${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo
 
-# Funzione helper per eseguire comandi nei container Kathara
+# ---------------------------------------------------------------------------
+# Helper: esegui comando in un container Kathara
+# Sintassi corretta: kathara exec <node> <cmd_string>
+# NON usare: kathara exec <node> -- bash -c "..."
+# ---------------------------------------------------------------------------
 kexec() {
     local node=$1
     shift
-    kathara exec "$node" -- bash -c "$*"
+    kathara exec "$node" "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -66,90 +65,92 @@ echo
 # ---------------------------------------------------------------------------
 # STEP 2: Aspetta convergenza OSPF (darmstadt deve pingare frankfurt)
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 2] Waiting for OSPF convergence (darmstadt → frankfurt)...${NC}"
+echo -e "${YELLOW}[Step 2] Waiting for OSPF convergence (darmstadt -> frankfurt)...${NC}"
+CONVERGED=0
 for i in $(seq 1 30); do
-    if kexec darmstadt "ping -c 1 -W 1 10.255.255.17 > /dev/null 2>&1"; then
-        echo "  OSPF converged — frankfurt (10.255.255.17) reachable from darmstadt"
+    if kathara exec darmstadt "ping -c 1 -W 1 10.255.255.17" > /dev/null 2>&1; then
+        echo "  OSPF converged — frankfurt (10.255.255.17) reachable"
+        CONVERGED=1
         break
-    fi
-    if [ $i -eq 30 ]; then
-        echo -e "${YELLOW}  WARNING: frankfurt not reachable via OSPF yet.${NC}"
-        echo    "  Trying direct link (10.0.0.234) instead..."
-        if ! kexec darmstadt "ping -c 1 -W 1 10.0.0.234 > /dev/null 2>&1"; then
-            echo -e "${RED}  ERROR: direct link 10.0.0.234 also unreachable. Check lab.conf.${NC}"
-            exit 1
-        fi
-        echo "  Direct link OK — using 10.0.0.234 as destination"
     fi
     echo -n "."
     sleep 1
 done
+
+if [ $CONVERGED -eq 0 ]; then
+    echo
+    echo -e "${YELLOW}  WARNING: OSPF not converged yet, trying direct link (10.0.0.234)...${NC}"
+    if ! kathara exec darmstadt "ping -c 1 -W 1 10.0.0.234" > /dev/null 2>&1; then
+        echo -e "${RED}  ERROR: direct link 10.0.0.234 also unreachable. Check lab.conf.${NC}"
+        exit 1
+    fi
+    echo "  Direct link OK — 10.0.0.234 reachable"
+fi
 echo
 
 # ---------------------------------------------------------------------------
 # STEP 3: Avvia receiver su frankfurt in background
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 3] Starting IPA receiver on frankfurt...${NC}"
-kexec frankfurt "python3 /shared/recv_ipa.py --timeout 60 --count ${PACKET_COUNT} \
-    > /tmp/recv_ipa.log 2>&1 &" || true
+kathara exec frankfurt \
+    "nohup python3 /shared/recv_ipa.py --timeout 60 --count ${PACKET_COUNT} > /tmp/recv_ipa.log 2>&1 &"
 echo "  recv_ipa.py started on frankfurt (log: /tmp/recv_ipa.log)"
-sleep 1
+sleep 2
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 4: Carica pipeline eBPF su darmstadt
+# STEP 4: Carica pipeline eBPF su darmstadt (background)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 4] Loading eBPF pipeline '${METHOD}' on darmstadt (eth0)...${NC}"
-kexec darmstadt "cd /shared && python3 execute_pipeline.py \
-    --method ${METHOD} \
-    --iface eth0 \
-    --model-id ${MODEL_ID} &"
-echo "  Pipeline started (background), waiting for XDP attach..."
-sleep 3
+kathara exec darmstadt \
+    "nohup python3 /shared/execute_pipeline.py --method ${METHOD} --iface eth0 --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &"
+echo "  Pipeline started — waiting 4s for XDP attach..."
+sleep 4
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 5: Popola fwd_table e valid_keys
+# STEP 5: Popola fwd_table e valid_keys su darmstadt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 5] Populating BPF maps on darmstadt...${NC}"
-kexec darmstadt "python3 /shared/setup_fwd_table.py \
-    --model-id ${MODEL_ID} \
-    --check-reachability"
+kathara exec darmstadt \
+    "python3 /shared/setup_fwd_table.py --model-id ${MODEL_ID}"
 echo
 
 # ---------------------------------------------------------------------------
 # STEP 6: Invia pacchetti IPA da darmstadt a frankfurt
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt → frankfurt...${NC}"
-kexec darmstadt "python3 /shared/send_ipa.py \
-    --dst frankfurt \
-    --count ${PACKET_COUNT} \
-    --model-id ${MODEL_ID} \
-    --weights ${WEIGHTS} \
-    --interval ${INTERVAL}"
+echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt -> frankfurt...${NC}"
+kathara exec darmstadt \
+    "python3 /shared/send_ipa.py --dst frankfurt --count ${PACKET_COUNT} --model-id ${MODEL_ID} --weights ${WEIGHTS} --interval ${INTERVAL}"
 echo
 
 # ---------------------------------------------------------------------------
 # STEP 7: Leggi log dal receiver su frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 7] Results on frankfurt (recv_ipa.log):${NC}"
-sleep 2   # dai tempo al receiver di scrivere gli ultimi pacchetti
-kexec frankfurt "cat /tmp/recv_ipa.log" || echo "  (log not yet available)"
+sleep 2
+kathara exec frankfurt "cat /tmp/recv_ipa.log" || echo "  (log not yet available)"
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 8: Mostra statistiche eBPF dal nodo darmstadt
+# STEP 8: Mostra log pipeline su darmstadt
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 8] eBPF map stats on darmstadt:${NC}"
-kexec darmstadt "bpftool map show 2>/dev/null | grep -E 'name|entries' || \
-    echo '  (bpftool not available or no maps loaded)'"
+echo -e "${YELLOW}[Step 8] Pipeline log on darmstadt:${NC}"
+kathara exec darmstadt "cat /tmp/pipeline.log" || echo "  (no pipeline log yet)"
+echo
+
+# ---------------------------------------------------------------------------
+# STEP 9: Statistiche BPF maps su darmstadt
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 9] BPF map stats on darmstadt:${NC}"
+kathara exec darmstadt \
+    "bpftool map show 2>/dev/null | grep -E 'name|entries' || echo '  (no maps loaded or bpftool unavailable)'"
 echo
 
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN} Test complete!${NC}"
-echo -e "${GREEN} Method: ${METHOD}${NC}"
-echo -e "${GREEN} To compare all 3 pipelines run:${NC}"
-echo -e "${GREEN}   bash /shared/test_kathara.sh hardcoded${NC}"
-echo -e "${GREEN}   bash /shared/test_kathara.sh template${NC}"
-echo -e "${GREEN}   bash /shared/test_kathara.sh modular${NC}"
+echo -e "${GREEN} Test complete! Method: ${METHOD}${NC}"
+echo -e "${GREEN} To run all 3 pipelines:${NC}"
+echo -e "${GREEN}   bash shared/test_kathara.sh hardcoded${NC}"
+echo -e "${GREEN}   bash shared/test_kathara.sh template${NC}"
+echo -e "${GREEN}   bash shared/test_kathara.sh modular${NC}"
 echo -e "${GREEN}============================================================${NC}"
