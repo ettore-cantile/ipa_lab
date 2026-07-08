@@ -125,6 +125,11 @@ def generate_ebpf_hardcoded(
 
     ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex.
                    Defaults to [2,3,4,5,6,7] (eth1..eth6).
+
+    NOTE: bpf_trace_printk() accepts at most 3 arguments after the format
+    string (kernel ABI limit). Logging is therefore split across two calls:
+      call 1 -> model_id + ttl
+      call 2 -> best_cls + egress_ifindex
     """
     if len(weights_int8) != N_WEIGHTS:
         raise ValueError(f"Expected {N_WEIGHTS} weights, got {len(weights_int8)}")
@@ -263,7 +268,8 @@ int ipa_switch(struct xdp_md *ctx) {{
         /* cls 6 = DROP */
         int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);
         if (_dv) __sync_fetch_and_add(_dv, 1);
-        bpf_trace_printk("IPA hardcoded: model=%d ttl=%d cls=6 -> DROP\\n",
+        /* bpf_trace_printk: max 3 args after format string */
+        bpf_trace_printk("IPA p1 DROP: model=%d ttl=%d\\n",
                          ipa->model_id, ip->ttl);
         return XDP_DROP;
     }}
@@ -279,8 +285,11 @@ int ipa_switch(struct xdp_md *ctx) {{
     int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
     if (_hv) __sync_fetch_and_add(_hv, 1);
 
-    bpf_trace_printk("IPA hardcoded: model=%d ttl=%d cls=%d -> ifindex=%d\\n",
-                     ipa->model_id, ip->ttl, best_cls, egress_ifindex);
+    /* bpf_trace_printk: max 3 args after format string -- split into 2 calls */
+    bpf_trace_printk("IPA p1: model=%d ttl=%d\\n",
+                     ipa->model_id, ip->ttl);
+    bpf_trace_printk("IPA p1: cls=%d ifindex=%d\\n",
+                     best_cls, egress_ifindex);
 
     return bpf_redirect(egress_ifindex, 0);
 }}
