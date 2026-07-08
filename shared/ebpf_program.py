@@ -42,7 +42,8 @@ Architecture (frr_germany50_5_model_4x2.pt):
 
 eBPF verifier notes:
   - All loops use #pragma unroll with compile-time bounds → accepted
-  - Input vector iv[] is fixed-size stack array [65]
+  - Input vector iv[] is fixed-size stack array [65] stored as 32-bit ints
+    to stay within the 512-byte BPF stack limit
   - All weight literals are signed char constants → no map lookup
   - scale != 0 guard before division
   - No runtime-variable loop bounds
@@ -80,19 +81,12 @@ N_OUT  =  7
 N_WEIGHTS = N_IN*N_H1 + N_H1 + N_H1*N_H2 + N_H2 + N_H2*N_OUT + N_OUT  # 319
 
 
-# ---------------------------------------------------------------------------
-# Static C template — header, maps, structures
-# (weights are injected by generate_ebpf_hardcoded() below)
-# ---------------------------------------------------------------------------
 _EBPF_STATIC_HEADER = r"""
 #include <uapi/linux/if_ether.h>
 #include <uapi/linux/ip.h>
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
 
-/* =========================================================
- * IPA header — 21 fixed bytes (__packed)
- * ========================================================= */
 struct ipa_hdr {
     __u8   model_id;
     __u8   model_type;
@@ -153,115 +147,50 @@ BPF_PERF_OUTPUT(model_miss_events);
 
 
 def generate_ebpf_hardcoded(weights_int8: list, scale: int, model_id: int = 0) -> str:
-    """
-    Generate a fully hardcoded eBPF XDP program for Pipeline 1.
-
-    All 319 weights are embedded as signed char literals in the C source.
-    No BPF map lookup is performed for weights during inference.
-
-    Args:
-        weights_int8 : flat list of 319 int8 values from extract_weights_int8()
-        scale        : integer scale factor (PTQ, e.g. 128)
-        model_id     : model identifier embedded in the program name comment
-
-    Returns:
-        str: complete BPF C source ready for BPF(text=...) or clang -target bpf
-    """
     if len(weights_int8) != N_WEIGHTS:
         raise ValueError(f"Expected {N_WEIGHTS} weights, got {len(weights_int8)}")
 
-    w = weights_int8  # alias
-
-    # Slice into layers
-    fc1_w  = w[0          : N_IN*N_H1]           # 260
-    fc1_b  = w[N_IN*N_H1  : N_IN*N_H1 + N_H1]   #   4
-    base2  = N_IN*N_H1 + N_H1                     # 264
-    fc2_w  = w[base2       : base2 + N_H1*N_H2]  #  16
-    fc2_b  = w[base2+N_H1*N_H2 : base2+N_H1*N_H2+N_H2]  # 4
-    base3  = base2 + N_H1*N_H2 + N_H2             # 284
-    out_w  = w[base3       : base3 + N_H2*N_OUT]  #  28
-    out_b  = w[base3+N_H2*N_OUT : base3+N_H2*N_OUT+N_OUT]  # 7
+    w = weights_int8
+    fc1_w  = w[0          : N_IN*N_H1]
+    fc1_b  = w[N_IN*N_H1  : N_IN*N_H1 + N_H1]
+    base2  = N_IN*N_H1 + N_H1
+    fc2_w  = w[base2       : base2 + N_H1*N_H2]
+    fc2_b  = w[base2+N_H1*N_H2 : base2+N_H1*N_H2+N_H2]
+    base3  = base2 + N_H1*N_H2 + N_H2
+    out_w  = w[base3       : base3 + N_H2*N_OUT]
+    out_b  = w[base3+N_H2*N_OUT : base3+N_H2*N_OUT+N_OUT]
 
     def lit(v):
-        """Emit a signed C literal: negative values explicit, positive plain."""
-        v = int(v)
-        return str(v)
+        return str(int(v))
 
-    # ------------------------------------------------------------------
-    # Build fc1: h1[j] = ReLU( sum_i(iv[i]*fc1_w[j*N_IN+i]) + fc1_b[j] )
-    # ------------------------------------------------------------------
     fc1_lines = []
     for j in range(N_H1):
-        terms = " + ".join(
-            f"iv[{i}] * {lit(fc1_w[j*N_IN + i])}LL"
-            for i in range(N_IN)
-        )
-        fc1_lines.append(
-            f"    long long h1_{j} = RELU_LL({terms} + {lit(fc1_b[j])}LL);"
-        )
+        terms = " + ".join(f"((long long)iv[{i}]) * {lit(fc1_w[j*N_IN + i])}LL" for i in range(N_IN))
+        fc1_lines.append(f"    long long h1_{j} = RELU_LL({terms} + {lit(fc1_b[j])}LL);")
 
-    # ------------------------------------------------------------------
-    # Build fc2: h2[j] = ReLU( sum_i(h1[i]*fc2_w[j*N_H1+i]) + fc2_b[j] )
-    # ------------------------------------------------------------------
     fc2_lines = []
     for j in range(N_H2):
-        terms = " + ".join(
-            f"h1_{i} * {lit(fc2_w[j*N_H1 + i])}LL"
-            for i in range(N_H1)
-        )
-        fc2_lines.append(
-            f"    long long h2_{j} = RELU_LL({terms} + {lit(fc2_b[j])}LL);"
-        )
+        terms = " + ".join(f"h1_{i} * {lit(fc2_w[j*N_H1 + i])}LL" for i in range(N_H1))
+        fc2_lines.append(f"    long long h2_{j} = RELU_LL({terms} + {lit(fc2_b[j])}LL);")
 
-    # ------------------------------------------------------------------
-    # Build output layer + argmax
-    # out_raw[k] = sum_i(h2[i]*out_w[k*N_H2+i]) + out_b[k]
-    # ------------------------------------------------------------------
     out_lines = []
     for k in range(N_OUT):
-        terms = " + ".join(
-            f"h2_{i} * {lit(out_w[k*N_H2 + i])}LL"
-            for i in range(N_H2)
-        )
-        out_lines.append(
-            f"    long long out_{k} = {terms} + {lit(out_b[k])}LL;"
-        )
+        terms = " + ".join(f"h2_{i} * {lit(out_w[k*N_H2 + i])}LL" for i in range(N_H2))
+        out_lines.append(f"    long long out_{k} = {terms} + {lit(out_b[k])}LL;")
 
-    # Argmax: find best_val and best_cls
-    argmax_lines = [
-        "    long long best_val = out_0;",
-        "    int best_cls = 0;",
-    ]
+    argmax_lines = ["    long long best_val = out_0;", "    int best_cls = 0;"]
     for k in range(1, N_OUT):
-        argmax_lines.append(
-            f"    if (out_{k} > best_val) {{ best_val = out_{k}; best_cls = {k}; }}"
-        )
+        argmax_lines.append(f"    if (out_{k} > best_val) {{ best_val = out_{k}; best_cls = {k}; }}")
 
-    # ------------------------------------------------------------------
-    # Feature extraction: iv[0..64]
-    # Features: 6 link-state (feat0), 6 ingress-if one-hot (feat1),
-    #           1 ttl (feat2), 52 node-id one-hot (feat3).
-    # For now: fill iv with packet-derived values where available, rest 0.
-    # (feat1: ingress_ifindex one-hot; feat2: ttl; others: 0)
-    # This is the canonical stub — extend with actual feature extraction
-    # once the full feature vector is available from the IPA payload.
-    # ------------------------------------------------------------------
     feat_lines = []
-    feat_lines.append("    long long iv[65];")
-    # Zero-fill all features first
+    feat_lines.append("    int iv[65];")
     feat_lines.append("    __builtin_memset(iv, 0, sizeof(iv));")
-    # feat2 (index 12): ttl
-    feat_lines.append("    iv[12] = (long long)ip->ttl;")
-    # feat1 (indices 6..11): ingress_ifindex one-hot (up to 6 ifaces)
+    feat_lines.append("    iv[12] = (int)ip->ttl;")
     feat_lines.append("    if (ctx->ingress_ifindex >= 1 && ctx->ingress_ifindex <= 6)")
-    feat_lines.append("        iv[5 + ctx->ingress_ifindex] = 1LL;")
-    # model_id encodes node: use as node one-hot base (indices 13..64)
+    feat_lines.append("        iv[5 + ctx->ingress_ifindex] = 1;")
     feat_lines.append("    if (ipa->model_id < 52)")
-    feat_lines.append("        iv[13 + ipa->model_id] = 1LL;")
+    feat_lines.append("        iv[13 + ipa->model_id] = 1;")
 
-    # ------------------------------------------------------------------
-    # Assemble full C source
-    # ------------------------------------------------------------------
     fc1_src   = "\n".join(fc1_lines)
     fc2_src   = "\n".join(fc2_lines)
     out_src   = "\n".join(out_lines)
@@ -273,7 +202,6 @@ int ipa_switch(struct xdp_md *ctx) {{
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    /* ---- Header parsing ---- */
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
     struct iphdr *ip = (struct iphdr *)(eth + 1);
@@ -285,7 +213,6 @@ int ipa_switch(struct xdp_md *ctx) {{
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end)  return XDP_PASS;
 
-    /* ---- Model miss (Method 4): model not in cache ---- */
     struct model_data *m = model_cache.lookup(&ipa->model_id);
     if (!m || m->is_valid == 0) {{
         __u8 *wp = (__u8 *)(ipa + 1);
@@ -301,41 +228,21 @@ int ipa_switch(struct xdp_md *ctx) {{
         return XDP_PASS;
     }}
 
-    /* scale guard */
-    __u16 scale = {scale}U;   /* hardcoded PTQ scale — no map lookup */
+    __u16 scale = {scale}U;
     if (scale == 0) return XDP_PASS;
 
-    /* ================================================================
-     * FEATURE EXTRACTION
-     * iv[0..5]  : link_state (feat0_code=0x01, count=6)
-     * iv[6..11] : ingress_if one-hot (feat1_code=0x02, count=6)
-     * iv[12]    : ttl (feat2_code=0x03, count=1)
-     * iv[13..64]: node_id one-hot (feat3_code=0x04, count=52)
-     * ================================================================ */
 {feat_src}
 
-    /* ================================================================
-     * INFERENCE  —  fully unrolled, pesi hardcoded
-     * Pipeline 1: nessuna BPF map lookup per i pesi
-     * ================================================================ */
-
-    /* fc1: 65 → 4  (ReLU) */
 {fc1_src}
 
-    /* fc2: 4 → 4  (ReLU) */
 {fc2_src}
 
-    /* output: 4 → 7 */
 {out_src}
 
-    /* argmax */
 {argmax_src}
 
-    /* key derivation */
-    __u64 key = (__u64)((best_val + (long long)(OUTPUT_OFFSET * (__u64)scale))
-                         / (__u64)scale);
+    __u64 key = (__u64)((best_val + (long long)(OUTPUT_OFFSET * (__u64)scale)) / (__u64)scale);
 
-    /* ---- Forwarding ---- */
     struct fwd_action *action = fwd_table.lookup(&key);
     __u64 *correct_key        = valid_keys.lookup(&ip->ttl);
 
@@ -376,19 +283,7 @@ int ipa_switch(struct xdp_md *ctx) {{
     return _EBPF_STATIC_HEADER + f"\n/* Pipeline 1 — model_id={model_id}, scale={scale} */\n" + body
 
 
-# ---------------------------------------------------------------------------
-# Convenience: generate from the real model checkpoint
-# ---------------------------------------------------------------------------
-def load_and_generate(
-    model_path: str = "shared/frr_germany50_5_model_4x2.pt",
-    model_id: int = 0
-) -> tuple:
-    """
-    Load weights from checkpoint, generate the hardcoded eBPF source.
-
-    Returns:
-        (ebpf_source: str, weights_int8: list, scale: int)
-    """
+def load_and_generate(model_path: str = "shared/frr_germany50_5_model_4x2.pt", model_id: int = 0) -> tuple:
     from extract_weights import extract_weights_int8
     import json, os
 
@@ -398,7 +293,6 @@ def load_and_generate(
             data = json.load(f)
         scale = int(data["scale_factor"])
     else:
-        # Recompute scale from model
         import torch
         from FRR_model import FastRerouteMLP
         m = FastRerouteMLP(n_interfaces=6, n_nodes=52, hidden_dim=4)
@@ -412,26 +306,10 @@ def load_and_generate(
     return ebpf_src, weights_int8, scale
 
 
-# ---------------------------------------------------------------------------
-# Backward-compat alias: EBPF_PROGRAM is now generated at import time
-# using a placeholder weight vector (all zeros).  Actual code should call
-# generate_ebpf_hardcoded(weights, scale) after loading the real model.
-# ---------------------------------------------------------------------------
-EBPF_PROGRAM = generate_ebpf_hardcoded(
-    weights_int8=[0] * N_WEIGHTS,
-    scale=128,
-    model_id=0,
-)
+EBPF_PROGRAM = generate_ebpf_hardcoded(weights_int8=[0] * N_WEIGHTS, scale=128, model_id=0)
 
-
-# ---------------------------------------------------------------------------
-# CLI: print generated C source for inspection / offline compilation
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
     model_path = sys.argv[1] if len(sys.argv) > 1 else "shared/frr_germany50_5_model_4x2.pt"
     src, w, s = load_and_generate(model_path)
     print(src)
-    print(f"\n/* Weights: {len(w)} int8 values, scale={s} */", file=sys.stderr)
-    total_insns_approx = N_IN*N_H1*3 + N_H1 + N_H1*N_H2*3 + N_H2 + N_H2*N_OUT*3 + N_OUT + 80
-    print(f"/* Estimated instruction count: ~{total_insns_approx} */", file=sys.stderr)

@@ -8,17 +8,6 @@ baseline (no live run: it lives in the main branch).
 Measures the experimental metrics from docs/design-space.md:
   Datapath:   throughput (Mpps), CPU%, eBPF instruction count
   Control:    model update latency per pipeline
-
-Usage (run as root on the IPA router node):
-    python3 pipeline_benchmark.py --iface eth1 --duration 10
-    python3 pipeline_benchmark.py --iface eth1 --duration 10 --pipeline 2
-    python3 pipeline_benchmark.py --iface eth1 --duration 10 --pipeline 3
-    # Use pre-generated weights.json (no torch required in the container):
-    python3 pipeline_benchmark.py --iface eth1 --weights-json /shared/weights.json
-
-Outputs:
-    benchmark_results.json
-    benchmark_results_summary.txt
 """
 
 import argparse
@@ -39,11 +28,9 @@ except ImportError:
     print("ERROR: BCC not found. Install: apt-get install python3-bpfcc")
     sys.exit(1)
 
-# NOTE: extract_weights, FRR_model and torch are imported lazily inside
-# main() so that this module can be imported on machines without torch.
 from ebpf_template_arch import (
     EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_65_4_4_7,
-    N_WEIGHTS_T2, load_arch_weights,
+    load_arch_weights,
 )
 from ebpf_modular import (
     EBPF_MODULAR_FULL, load_modular_weights,
@@ -54,16 +41,9 @@ from common import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _get_ebpf_insn_count(prog_name: str) -> int:
     try:
-        out = subprocess.check_output(
-            ["bpftool", "prog", "show", "name", prog_name, "--json"],
-            stderr=subprocess.DEVNULL
-        )
+        out = subprocess.check_output(["bpftool", "prog", "show", "name", prog_name, "--json"], stderr=subprocess.DEVNULL)
         data = json.loads(out)
         if data and "insns_cnt" in data[0]:
             return data[0]["insns_cnt"]
@@ -84,9 +64,7 @@ def _read_pkt_stats(bpf_obj, map_name: str) -> dict:
     return s
 
 
-def _populate_fwd(bpf_obj, fwd_map: str, vk_map: str,
-                  cp_weights: list, scale: int):
-    """Populate forwarding + valid_keys maps using integer key formula."""
+def _populate_fwd(bpf_obj, fwd_map: str, vk_map: str, cp_weights: list, scale: int):
     fwd    = bpf_obj[fwd_map]
     vk     = bpf_obj[vk_map]
     action = fwd.Leaf()
@@ -104,41 +82,36 @@ def _populate_fwd(bpf_obj, fwd_map: str, vk_map: str,
         vk[ctypes.c_uint8(ttl)]      = ctypes.c_ulonglong(key)
 
 
-# ---------------------------------------------------------------------------
-# Benchmark one pipeline
-# ---------------------------------------------------------------------------
-
-def benchmark_pipeline(pipeline_id: int, iface: str,
-                       duration: int, weights: list,
-                       cp_weights_4: list, scale: int) -> dict:
+def benchmark_pipeline(pipeline_id: int, iface: str, duration: int, weights: list, cp_weights_4: list, scale: int) -> dict:
     results = {"pipeline": pipeline_id, "duration_s": duration, "iface": iface}
     print(f"\n=== Benchmarking Pipeline {pipeline_id} ===")
 
     if pipeline_id == 2:
-        src      = EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7
-        entry_fn = "ipa_switch_template"
-        arch_fn  = "arch_65_4_4_7"
-        stats_map = "pkt_stats_t2"
+        entry_src  = EBPF_TEMPLATE_ARCH_DISPATCHER
+        arch_src   = EBPF_ARCH_65_4_4_7
+        entry_fn   = "ipa_switch_template"
+        arch_fn    = "arch_65_4_4_7"
+        stats_map  = "pkt_stats_t2"
         fwd_map, vk_map = "fwd_table_t2", "valid_keys_t2"
     elif pipeline_id == 3:
-        src      = EBPF_MODULAR_FULL
-        entry_fn = "modular_dispatcher"
-        stats_map = "pkt_stats_t3"
+        entry_src  = EBPF_MODULAR_FULL
+        arch_src   = None
+        entry_fn   = "modular_dispatcher"
+        stats_map  = "pkt_stats_t3"
         fwd_map, vk_map = "fwd_table_t3", "valid_keys_t3"
     else:
         print(f"  Unknown pipeline id {pipeline_id}, skipping.")
         return results
 
-    # Load
     t0_load = time.perf_counter()
-    b = BPF(text=src)
+    b = BPF(text=entry_src)
     results["load_time_s"] = round(time.perf_counter() - t0_load, 4)
     print(f"  Load time: {results['load_time_s']*1000:.1f} ms")
 
-    # Populate weights
     if pipeline_id == 2:
         load_arch_weights(b, weights, model_id=42, scale=scale)
-        fn_arch = b.load_func(arch_fn, BPF.XDP)
+        arch_b = BPF(text=arch_src, cflags=["-DIPA_TEMPLATE_ARCH_CHILD=1"])
+        fn_arch = arch_b.load_func(arch_fn, BPF.XDP)
         b["arch_progs"][ctypes.c_int(0)] = ctypes.c_int(fn_arch.fd)
     elif pipeline_id == 3:
         load_modular_weights(b, weights, model_id=42, scale=scale)
@@ -149,10 +122,10 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
         chain[ctypes.c_int(0)] = ctypes.c_int(fn_l0.fd)
         chain[ctypes.c_int(1)] = ctypes.c_int(fn_l1.fd)
         chain[ctypes.c_int(2)] = ctypes.c_int(fn_l2.fd)
+        arch_b = None
 
     _populate_fwd(b, fwd_map, vk_map, cp_weights_4, scale)
 
-    # Attach XDP
     try:
         fn = b.load_func(entry_fn, BPF.XDP)
         b.attach_xdp(iface, fn, 0)
@@ -162,15 +135,15 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
         results["xdp_attached"] = False
         results["note"] = str(e)
         del b
+        if arch_b is not None:
+            del arch_b
         return results
 
-    # Instruction count
     insns = _get_ebpf_insn_count(entry_fn)
     results["ebpf_insn_count"] = insns
     if insns > 0:
         print(f"  eBPF instructions ({entry_fn}): {insns}")
 
-    # Measurement window
     s0      = _read_pkt_stats(b, stats_map)
     t_start = time.perf_counter()
     cpu0    = time.process_time()
@@ -183,8 +156,7 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
     cpu_elapsed = time.process_time() - cpu0
     s1 = _read_pkt_stats(b, stats_map)
 
-    total   = ((s1["hit"] + s1["miss"] + s1["fake"]) -
-               (s0["hit"] + s0["miss"] + s0["fake"]))
+    total   = ((s1["hit"] + s1["miss"] + s1["fake"]) - (s0["hit"] + s0["miss"] + s0["fake"]))
     tp_mpps = (total / elapsed) / 1e6 if elapsed > 0 else 0
     cpu_pct = (cpu_elapsed / elapsed) * 100 if elapsed > 0 else 0
 
@@ -198,7 +170,6 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
     print(f"  Throughput: {tp_mpps:.4f} Mpps")
     print(f"  CPU:        {cpu_pct:.1f}%")
 
-    # Model update latency
     t_upd = time.perf_counter()
     if pipeline_id == 2:
         load_arch_weights(b, weights, model_id=42, scale=scale)
@@ -209,12 +180,10 @@ def benchmark_pipeline(pipeline_id: int, iface: str,
 
     b.remove_xdp(iface, 0)
     del b
+    if arch_b is not None:
+        del arch_b
     return results
 
-
-# ---------------------------------------------------------------------------
-# Summary table
-# ---------------------------------------------------------------------------
 
 DESIGN_SPACE_TABLE = """
 ╔══════════════════════╦══════════════╦══════════╦═══════════╦═══════════════════╦═════════════╦═══════════════════╗
@@ -232,11 +201,9 @@ def print_summary(results: list) -> None:
     print("IPA/eBPF Design Space — Benchmark Results")
     print("=" * 70)
     print(DESIGN_SPACE_TABLE)
-    print(f"{'Pipeline':<25} {'Throughput (Mpps)':<20} {'CPU%':<8} "
-          f"{'Update (ms)':<14} {'eBPF insns'}")
+    print(f"{'Pipeline':<25} {'Throughput (Mpps)':<20} {'CPU%':<8} {'Update (ms)':<14} {'eBPF insns'}")
     print("-" * 78)
-    print(f"{'1. Hardcoded [ref]':<25} {'N/A (main branch)':<20} {'N/A':<8} "
-          f"{'recompile':<14} {'N/A'}")
+    print(f"{'1. Hardcoded [ref]':<25} {'N/A (main branch)':<20} {'N/A':<8} {'recompile':<14} {'N/A'}")
     for r in results:
         p      = r.get("pipeline", "?")
         tp     = r.get("throughput_mpps", "N/A")
@@ -249,46 +216,30 @@ def print_summary(results: list) -> None:
     print()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark Pipeline 2 (Arch Template) and Pipeline 3 (Modular)."
-    )
-    parser.add_argument("--iface",       default=INGRESS_IFACE,
-                        help=f"XDP interface (default: {INGRESS_IFACE})")
-    parser.add_argument("--duration",    type=int, default=10,
-                        help="Measurement window in seconds (default: 10)")
-    parser.add_argument("--pipeline",    default="all",
-                        help="2, 3, or all (default: all)")
-    parser.add_argument("--model",       default="frr_germany50_5_model_4x2.pt",
-                        help="Path to .pt model file (requires torch)")
-    parser.add_argument("--weights-json", default=None,
-                        help="Path to precomputed weights.json (skips torch/model load)")
-    parser.add_argument("--output",      default="benchmark_results.json")
+    parser = argparse.ArgumentParser(description="Benchmark Pipeline 2 (Arch Template) and Pipeline 3 (Modular).")
+    parser.add_argument("--iface", default=INGRESS_IFACE, help=f"XDP interface (default: {INGRESS_IFACE})")
+    parser.add_argument("--duration", type=int, default=10, help="Measurement window in seconds (default: 10)")
+    parser.add_argument("--pipeline", default="all", help="2, 3, or all (default: all)")
+    parser.add_argument("--model", default="frr_germany50_5_model_4x2.pt", help="Path to .pt model file (requires torch)")
+    parser.add_argument("--weights-json", default=None, help="Path to precomputed weights.json (skips torch/model load)")
+    parser.add_argument("--output", default="benchmark_results.json")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
         print("ERROR: must run as root for XDP.")
         sys.exit(1)
 
-    # --- Load weights (lazy import of extract_weights / torch) ---
     if args.weights_json:
-        # Torch-free path: use precomputed weights.json
         print(f"Loading precomputed weights from {args.weights_json} ...")
         with open(args.weights_json) as f:
             weights = json.load(f)
         if isinstance(weights, dict):
-            # weights_float.json format: re-quantize
             floats  = weights["weights"]
             scale   = weights["scale_factor"]
             weights = [max(-128, min(127, int(round(wf * scale)))) for wf in floats]
             cp4     = floats[:4]
         else:
-            # weights.json format: int8 list — we need floats for fwd table
-            # Try to also load weights_float.json for cp4/scale
             float_path = args.weights_json.replace("weights.json", "weights_float.json")
             if os.path.exists(float_path):
                 with open(float_path) as f:
@@ -296,18 +247,14 @@ def main():
                 scale = fdata["scale_factor"]
                 cp4   = fdata["weights"][:4]
             else:
-                # Fallback: derive scale from int8 weights (approximate)
                 scale = 1
                 cp4   = [w / 127.0 for w in weights[:4]]
         print(f"  {len(weights)} int8 weights loaded from JSON.")
     else:
-        # Torch path (host with torch installed)
         from extract_weights import extract_weights_int8
         print(f"Loading weights from {args.model} (requires torch)...")
         weights = extract_weights_int8(args.model)
         print(f"  {len(weights)} int8 weights loaded.")
-
-        # Derive cp_weights_4 and scale (needs torch)
         try:
             import torch
             from FRR_model import FastRerouteMLP
@@ -318,13 +265,11 @@ def main():
             scale   = int(127 / max_abs)
             cp4     = floats[:4]
         except ImportError:
-            print("WARNING: torch not available for cp4/scale derivation. "
-                  "Use --weights-json for full container support.")
+            print("WARNING: torch not available for cp4/scale derivation. Use --weights-json for full container support.")
             scale = 1
             cp4   = [w / 127.0 for w in weights[:4]]
 
-    pipelines = ([2, 3] if args.pipeline == "all"
-                 else [int(x) for x in args.pipeline.split(",")])
+    pipelines = ([2, 3] if args.pipeline == "all" else [int(x) for x in args.pipeline.split(",")])
 
     all_results = []
     for pid in pipelines:
