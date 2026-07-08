@@ -52,6 +52,18 @@ Verifier history (both fixed; see git log for the failed attempts):
      mem access 'scalar'"), same fix: a `switch (best_cls) { case 0:
      egress_ifindex = ...; break; ... }` (6 cases, single decision
      point, no loop -> no explosion risk) replaces the array lookup.
+
+  4) ip->protocol bitfield ambiguity on BCC/Kathara (DBG_NOT_UDP=100%):
+     struct iphdr declares ihl:4,version:4 as a bitfield at byte 0.
+     On BCC with minimal kernel headers inside Kathara containers,
+     Clang's packing of this bitfield can cause ip->protocol (byte 9)
+     to be read at the wrong offset, making ALL UDP packets fail the
+     IPPROTO_UDP check even though tcpdump confirms proto=17.
+     Fix: read protocol via *((__u8 *)ip + 9) -- absolute RFC 791 offset,
+     independent of any struct packing or bitfield layout.
+     Additionally, the UDP header pointer now uses ip->ihl*4 (the actual
+     IP header length) instead of sizeof(struct iphdr)=20, which is
+     correct when IP Options are present (ihl > 5).
 """
 
 N_IN   = 65
@@ -65,6 +77,12 @@ _EBPF_STATIC_HEADER = r"""
 #include <uapi/linux/ip.h>
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
+
+/* Fallback: in some Kathara/minimal-header environments IPPROTO_UDP may
+ * not be defined via the includes above. Hardcode the RFC 791 value. */
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 17
+#endif
 
 struct ipa_hdr {
     __u8   model_id;
@@ -124,7 +142,7 @@ BPF_ARRAY(debug_stats,      __u64, 8);
 #define DBG_SEEN        0   /* ipa_switch invoked at all (very first line) */
 #define DBG_ETH_FAIL    1   /* packet shorter than eth header */
 #define DBG_IP_FAIL     2   /* packet shorter than eth+ip header */
-#define DBG_NOT_UDP     3   /* ip->protocol != IPPROTO_UDP */
+#define DBG_NOT_UDP     3   /* ip_proto != 17 (IPPROTO_UDP) */
 #define DBG_UDP_FAIL    4   /* packet shorter than eth+ip+udp header */
 #define DBG_WRONG_PORT  5   /* udp->dest != 9999 */
 #define DBG_IPA_FAIL    6   /* packet shorter than eth+ip+udp+ipa header */
@@ -281,8 +299,19 @@ int ipa_switch(struct xdp_md *ctx) {{
     if ((void *)(eth + 1) > data_end) {{ dbg_inc(DBG_ETH_FAIL); return XDP_PASS; }}
     struct iphdr   *ip  = (struct iphdr *)(eth + 1);
     if ((void *)(ip  + 1) > data_end) {{ dbg_inc(DBG_IP_FAIL); return XDP_PASS; }}
-    if (ip->protocol != IPPROTO_UDP)  {{ dbg_inc(DBG_NOT_UDP); return XDP_PASS; }}
-    struct udphdr  *udp = (struct udphdr *)(ip + 1);
+
+    /* FIX(#4): read protocol via absolute RFC 791 byte offset (byte 9),
+     * not ip->protocol, to avoid bitfield packing ambiguity in struct iphdr
+     * (ihl:4,version:4 at byte 0) on BCC with minimal Kathara kernel headers.
+     * This is the root cause of DBG_NOT_UDP firing for all UDP packets. */
+    __u8 ip_proto = *((__u8 *)ip + 9);
+    if (ip_proto != 17U) {{ dbg_inc(DBG_NOT_UDP); return XDP_PASS; }}
+
+    /* FIX(#4): compute UDP header pointer from actual ihl*4 (handles IP
+     * Options where ihl > 5), not the fixed sizeof(struct iphdr) = 20. */
+    __u32 _ip_hlen = (((__u8 *)ip)[0] & 0x0fU) << 2U;
+    if (_ip_hlen < 20U) {{ dbg_inc(DBG_IP_FAIL); return XDP_PASS; }}
+    struct udphdr  *udp = (struct udphdr *)((void *)ip + _ip_hlen);
     if ((void *)(udp + 1) > data_end) {{ dbg_inc(DBG_UDP_FAIL); return XDP_PASS; }}
     if (udp->dest != bpf_htons(9999)) {{ dbg_inc(DBG_WRONG_PORT); return XDP_PASS; }}
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
