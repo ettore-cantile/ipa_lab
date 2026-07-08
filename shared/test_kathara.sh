@@ -14,6 +14,11 @@
 # OSPF loopback IPs (from *.startup /etc/hosts):
 #   darmstadt  = 10.255.255.10
 #   frankfurt  = 10.255.255.17
+#
+# kathara exec note:
+#   kathara exec intercepts '-c' as its own flag and tries to re-invoke
+#   itself.  The workaround is --no-deployment-flag=self-execution which
+#   disables that behaviour.  All krun() calls use this flag.
 # =============================================================================
 
 METHOD=${1:-hardcoded}
@@ -22,14 +27,11 @@ PACKET_COUNT=100
 INTERVAL=0.002
 WEIGHTS="/shared/weights.json"
 
-# Direct link: darmstadt eth0 (10.0.0.233) <-> frankfurt eth1 (10.0.0.234)
 FRANKFURT_DIRECT="10.0.0.234"
-# OSPF loopback (available after FRR converges, ~30s)
 FRANKFURT_OSPF="10.255.255.17"
 FRANKFURT_IP="${FRANKFURT_DIRECT}"
 
-# XDP is attached to the ingress interface toward frankfurt = eth0
-# (darmstadt[0]="l59" in lab.conf, ip 10.0.0.233/30)
+# XDP attaches to eth0 (darmstadt[0]=l59, 10.0.0.233/30, toward frankfurt)
 INGRESS_IFACE="eth0"
 
 GREEN='\033[0;32m'
@@ -43,12 +45,14 @@ echo -e "${GREEN}============================================================${N
 echo
 
 # ---------------------------------------------------------------------------
-# krun NODE CMD  — run CMD inside NODE via kathara exec
+# krun NODE CMD
+#   Run CMD inside NODE.  Uses --no-deployment-flag=self-execution so that
+#   kathara does not intercept the '-c' flag of 'sh -c "..."'.
 # ---------------------------------------------------------------------------
 krun() {
     local node="$1"
     shift
-    kathara exec "${node}" -- sh -c "$*"
+    kathara exec --no-deployment-flag=self-execution "${node}" -- sh -c "$*"
 }
 
 echo -e "${YELLOW}[Step 1] Checking Kathara containers...${NC}"
@@ -61,15 +65,14 @@ echo "  frankfurt: UP"
 echo
 
 # ---------------------------------------------------------------------------
-# Step 2a — Direct link check (required)
-# darmstadt eth0=10.0.0.233 <-> frankfurt eth1=10.0.0.234  (l59)
+# Step 2a — Direct link check
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2a] Checking direct link darmstadt->frankfurt (${FRANKFURT_DIRECT})...${NC}"
 DIRECT_OK=0
 for i in $(seq 1 15); do
     RESULT=$(krun darmstadt "ping -c 1 -W 2 ${FRANKFURT_DIRECT} > /dev/null 2>&1 && echo OK || echo FAIL" 2>/dev/null | tr -d '\r\n')
     if [ "${RESULT}" = "OK" ]; then
-        echo "  Direct link ${FRANKFURT_DIRECT} reachable — containers OK"
+        echo "  Direct link ${FRANKFURT_DIRECT} reachable — OK"
         DIRECT_OK=1
         break
     fi
@@ -81,14 +84,9 @@ if [ ${DIRECT_OK} -eq 0 ]; then
     echo -e "${RED}  ERROR: Direct link ${FRANKFURT_DIRECT} unreachable after 15s.${NC}"
     echo
     echo "  Troubleshooting:"
-    echo "    1) Verify darmstadt eth0 has 10.0.0.233/30:"
-    echo "         kathara exec darmstadt -- ip addr show eth0"
-    echo "    2) Verify frankfurt  eth1 has 10.0.0.234/30:"
-    echo "         kathara exec frankfurt  -- ip addr show eth1"
-    echo "    3) Confirm lab.conf link: darmstadt[0]=l59, frankfurt[1]=l59"
-    echo "         (both on the same collision domain)"
-    echo "    4) Check the link is up:"
-    echo "         kathara exec darmstadt -- ip link show eth0"
+    echo "    1) kathara exec darmstadt -- ip addr show eth0  (expect 10.0.0.233/30)"
+    echo "    2) kathara exec frankfurt  -- ip addr show eth1  (expect 10.0.0.234/30)"
+    echo "    3) kathara exec darmstadt -- ping 10.0.0.234    (no -c flag!)"
     echo
     echo "TEST FAILED"
     exit 1
@@ -96,7 +94,7 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
-# Step 2b — OSPF convergence (optional, 30 s timeout)
+# Step 2b — OSPF convergence (optional)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2b] Checking optional OSPF convergence (${FRANKFURT_OSPF}, up to 30s)...${NC}"
 CONVERGED=0
@@ -121,16 +119,15 @@ echo
 # Step 3 — Start IPA receiver on frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 3] Starting IPA receiver on frankfurt...${NC}"
-krun frankfurt "python3 /shared/recv_ipa.py --timeout 60 --count ${PACKET_COUNT} > /tmp/recv_ipa.log 2>&1 & echo \$! > /tmp/recv_ipa.pid && echo 'recv_ipa.py started'"
+krun frankfurt "python3 /shared/recv_ipa.py --timeout 60 --count ${PACKET_COUNT} > /tmp/recv_ipa.log 2>&1 & echo \$! > /tmp/recv_ipa.pid && echo recv_ipa.py started"
 sleep 2
 echo
 
 # ---------------------------------------------------------------------------
 # Step 4 — Load pipeline on darmstadt
-# XDP attaches to INGRESS_IFACE=eth0 (darmstadt[0]=l59, toward frankfurt)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (iface=${INGRESS_IFACE})...${NC}"
-krun darmstadt "python3 /shared/execute_pipeline.py --method ${METHOD} --iface ${INGRESS_IFACE} --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 & echo \$! > /tmp/pipeline.pid && echo 'Pipeline started'"
+krun darmstadt "python3 /shared/execute_pipeline.py --method ${METHOD} --iface ${INGRESS_IFACE} --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 & echo \$! > /tmp/pipeline.pid && echo Pipeline started"
 echo "  Waiting 6s for XDP attach..."
 sleep 6
 echo
@@ -159,11 +156,8 @@ echo
 
 # ---------------------------------------------------------------------------
 # Step 6 — Send IPA packets
-# Packets are sent to frankfurt (FRANKFURT_IP) from darmstadt.
-# They arrive on frankfurt's side of l59, then darmstadt sees the
-# reply/forwarded traffic on its eth0 (INGRESS_IFACE).
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt -> ${FRANKFURT_IP}...${NC}"
+echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets darmstadt -> ${FRANKFURT_IP}...${NC}"
 krun darmstadt "python3 /shared/send_ipa.py --dst ${FRANKFURT_IP} --count ${PACKET_COUNT} --model-id ${MODEL_ID} --weights ${WEIGHTS} --interval ${INTERVAL} 2>&1"
 echo
 
@@ -172,25 +166,25 @@ echo
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 7] Receiver log on frankfurt:${NC}"
 sleep 2
-krun frankfurt "cat /tmp/recv_ipa.log 2>/dev/null || echo '(log not available)'"
+krun frankfurt "cat /tmp/recv_ipa.log 2>/dev/null || echo log not available"
 echo
 
 # ---------------------------------------------------------------------------
 # Step 8 — Pipeline log
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 8] Pipeline log on darmstadt:${NC}"
-krun darmstadt "cat /tmp/pipeline.log 2>/dev/null || echo '(no log)'"
+krun darmstadt "cat /tmp/pipeline.log 2>/dev/null || echo no log"
 echo
 
 # ---------------------------------------------------------------------------
 # Step 9 — BPF map stats
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 9] BPF map stats on darmstadt:${NC}"
-krun darmstadt "bpftool map show 2>/dev/null | grep -E 'name|entries' || echo '(no maps loaded)'"
+krun darmstadt "bpftool map show 2>/dev/null | grep -E 'name|entries' || echo no maps loaded"
 echo
 
 # ---------------------------------------------------------------------------
-# Step 10 — Verify packet counts (TEST PASSED / TEST FAILED)
+# Step 10 — Verify packet counts
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 10] Verifying packet counts...${NC}"
 RECV_LINE=$(krun frankfurt "
