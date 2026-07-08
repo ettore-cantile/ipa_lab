@@ -98,6 +98,33 @@ krun frankfurt "nft list ruleset 2>&1 || echo 'nft not available'"
 echo
 
 # ---------------------------------------------------------------------------
+# Step 1-ter — Dump iptables/Docker a livello HOST (non dentro i container)
+#
+# Step 1-bis ha escluso filtri netfilter DENTRO i due container (policy
+# ACCEPT ovunque, 0 regole, nft assente). Ma questo script gira come bash
+# direttamente sulla macchina che ospita Kathara/Docker -- non dentro un
+# container -- quindi possiamo controllare qui, senza passare da
+# `kathara exec` (che resta confinato nel network namespace del
+# container e non puo' vedere le regole del bridge Docker sull'host).
+# Il pattern osservato (UDP sparisce prima di essere visibile a tcpdump
+# sul lato ricevente, ICMP passa sempre, interfacce/cablaggio confermati
+# corretti) punta ora a un filtro applicato dal bridge Docker che
+# implementa il collision domain "l59", tipicamente nella catena
+# DOCKER-USER o FORWARD, o a bridge-nf-call-iptables che instrada il
+# traffico L2 del bridge attraverso iptables.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 1-ter] Dumping HOST-level iptables/Docker state (not inside containers)...${NC}"
+echo "  --- host: iptables -L FORWARD -n -v ---"
+sudo -n iptables -L FORWARD -n -v 2>&1 || echo "  (needs sudo password — run manually: sudo iptables -L FORWARD -n -v)"
+echo "  --- host: iptables -L DOCKER-USER -n -v ---"
+sudo -n iptables -L DOCKER-USER -n -v 2>&1 || echo "  (needs sudo password or chain doesn't exist — run manually: sudo iptables -L DOCKER-USER -n -v)"
+echo "  --- host: sysctl net.bridge.bridge-nf-call-iptables ---"
+sudo -n sysctl net.bridge.bridge-nf-call-iptables 2>&1 || cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>&1 || echo "  (br_netfilter module not loaded / not readable)"
+echo "  --- host: docker network ls (kathara collision domains) ---"
+sudo -n docker network ls 2>&1 || echo "  (needs sudo password — run manually: sudo docker network ls)"
+echo
+
+# ---------------------------------------------------------------------------
 # Step 2a — Link diretto darmstadt -> frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2a] Checking direct link darmstadt -> frankfurt (${FRANKFURT_DIRECT})...${NC}"
