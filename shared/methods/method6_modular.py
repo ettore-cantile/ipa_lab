@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Method 6 - Modular Neural Pipeline  (Pipeline 3)
 
@@ -21,9 +22,9 @@ Compatibility notes with the existing codebase:
   - All four programs (dispatcher + 3 layers) compiled from EBPF_MODULAR_FULL
     so BCC sees them as a single compilation unit — no separate .o files needed
 
-Files used:
-  /shared/weights.json       : int8 weights (319 values)
-  /shared/weights_float.json : float weights + scale_factor
+Files used (paths resolved relative to this file, not hardcoded /shared/):
+  ../weights.json       : int8 weights (319 values)
+  ../weights_float.json : float weights + scale_factor
 """
 import ctypes
 import socket
@@ -41,6 +42,11 @@ from common import (
     EGRESS_IFACE, INGRESS_IFACE, OFFSET,
     SRC_MAC, DST_MAC,
 )
+
+# Resolve the shared/ directory relative to this file regardless of cwd.
+# Inside Kathara: /shared/methods/method6_modular.py -> /shared/
+# Outside Kathara: resolved the same way via __file__.
+_SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _build_fwd_action_t3(b: BPF, egress_ifindex: int):
@@ -76,8 +82,8 @@ def _populate_fwd_t3(b: BPF, action, cp_weights: list, scale_factor: int):
 
 
 def run(model_id: int = 42):
-    weights_path = "/shared/weights.json"
-    float_path   = "/shared/weights_float.json"
+    weights_path = os.path.join(_SHARED_DIR, "weights.json")
+    float_path   = os.path.join(_SHARED_DIR, "weights_float.json")
     print(f"[Method 6 - Modular Pipeline] | model_id: {model_id}")
 
     if not os.path.exists(float_path):
@@ -125,7 +131,7 @@ def run(model_id: int = 42):
     print("[Method 6] Pipeline 3 (Modular) running. "
           "Stats: pkt_stats_t3 [HIT | FAKE | MISS]")
     print(f"  Tail call chain: modular_dispatcher "
-          f"-> layer_65_4 -> layer_4_4 -> layer_4_7_argmax")
+          f"-> layer_65_4 -> layer_4_4 -> layer_4_7_argmax  (4 tail calls total)")
 
     stats = b.get_table("pkt_stats_t3")
     print(f"\n{'TRUE HIT':<22} | {'FAKE HIT':<22} | {'MISS':<20}")

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# test_kathara.sh  —  Test IPA su Kathara: darmstadt → frankfurt
+# test_kathara.sh  -  Test IPA su Kathara: darmstadt -> frankfurt
 # =============================================================================
 # NOTA: kathara exec intercetta QUALSIASI argomento "-c" nella riga di comando,
 # inclusi quelli destinati a ping, python3, ecc.
@@ -50,26 +50,37 @@ echo
 
 # ---------------------------------------------------------------------------
 # STEP 2: Convergenza OSPF
-# Scriviamo lo script di ping nel container (evita -c intercettato da kathara)
+# Risolviamo l'IP di frankfurt dinamicamente (nessun IP hardcoded)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2] Waiting for OSPF convergence...${NC}"
 
-# Scrivi script di ping nel container darmstadt
-kscript darmstadt /tmp/ping_frankfurt.sh << 'PINGSCRIPT'
+# Resolve frankfurt IP dynamically inside the container
+# Kathara populates /etc/hosts with container names
+kscript darmstadt /tmp/resolve_frankfurt.sh << 'RESOLVESCRIPT'
 #!/bin/sh
-ping -c 1 -W 1 10.255.255.17 > /dev/null 2>&1 && echo "OK" || echo "FAIL"
-PINGSCRIPT
+FKT_IP=$(getent hosts frankfurt 2>/dev/null | awk '{print $1; exit}')
+if [ -z "$FKT_IP" ]; then
+    FKT_IP=$(grep frankfurt /etc/hosts 2>/dev/null | awk '{print $1; exit}')
+fi
+echo "${FKT_IP:-}"
+RESCOLVESCRIPT
+FRANKFURT_IP=$(kathara exec darmstadt bash /tmp/resolve_frankfurt.sh 2>/dev/null | tr -d '\r\n')
+if [ -z "$FRANKFURT_IP" ]; then
+    echo -e "${YELLOW}  [WARN] Could not resolve 'frankfurt' hostname; using fallback 10.255.255.17${NC}"
+    FRANKFURT_IP="10.255.255.17"
+fi
+echo "  Resolved frankfurt -> ${FRANKFURT_IP}"
 
-kscript darmstadt /tmp/ping_direct.sh << 'PINGSCRIPT'
+kscript darmstadt /tmp/ping_frankfurt.sh << PINGSCRIPT
 #!/bin/sh
-ping -c 1 -W 1 10.0.0.234 > /dev/null 2>&1 && echo "OK" || echo "FAIL"
+ping -c 1 -W 1 ${FRANKFURT_IP} > /dev/null 2>&1 && echo "OK" || echo "FAIL"
 PINGSCRIPT
 
 CONVERGED=0
 for i in $(seq 1 30); do
     RESULT=$(kathara exec darmstadt bash /tmp/ping_frankfurt.sh 2>/dev/null || echo "FAIL")
     if echo "$RESULT" | grep -q "OK"; then
-        echo "  frankfurt (10.255.255.17) reachable via OSPF"
+        echo "  frankfurt (${FRANKFURT_IP}) reachable via OSPF"
         CONVERGED=1
         break
     fi
@@ -79,14 +90,9 @@ done
 
 if [ $CONVERGED -eq 0 ]; then
     echo
-    echo -e "${YELLOW}  OSPF not converged, trying direct link 10.0.0.234...${NC}"
-    RESULT=$(kathara exec darmstadt bash /tmp/ping_direct.sh 2>/dev/null || echo "FAIL")
-    if echo "$RESULT" | grep -q "OK"; then
-        echo "  Direct link 10.0.0.234 reachable"
-    else
-        echo -e "${RED}  ERROR: 10.0.0.234 unreachable. Check lab.conf / kathara lstart.${NC}"
-        exit 1
-    fi
+    echo -e "${RED}  ERROR: frankfurt (${FRANKFURT_IP}) unreachable. Check lab.conf / kathara lstart.${NC}"
+    echo "TEST FAILED"
+    exit 1
 fi
 echo
 
@@ -106,15 +112,16 @@ echo
 
 # ---------------------------------------------------------------------------
 # STEP 4: Carica pipeline su darmstadt
+# NOTE: --iface eth1 matches common.py INGRESS_IFACE (not eth0 default)
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (eth0)...${NC}"
+echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (eth1)...${NC}"
 kscript darmstadt /tmp/run_pipeline.sh << PIPESCRIPT
 #!/bin/sh
-python3 /shared/execute_pipeline.py --method ${METHOD} --iface eth0 --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &
+python3 /shared/execute_pipeline.py --method ${METHOD} --iface eth1 --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &
 echo \$! > /tmp/pipeline.pid
 PIPESCRIPT
 kathara exec darmstadt bash /tmp/run_pipeline.sh
-echo "  Pipeline started — waiting 4s for XDP attach..."
+echo "  Pipeline started - waiting 4s for XDP attach..."
 sleep 4
 echo
 
@@ -156,7 +163,7 @@ kathara exec darmstadt cat /tmp/pipeline.log || echo "  (no log)"
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 9: BPF map stats
+# STEP 9: BPF map stats (informational, not a hard assertion)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 9] BPF map stats on darmstadt:${NC}"
 kscript darmstadt /tmp/bpf_stats.sh << 'STATSSCRIPT'
@@ -166,6 +173,38 @@ STATSSCRIPT
 kathara exec darmstadt bash /tmp/bpf_stats.sh
 echo
 
+# ---------------------------------------------------------------------------
+# STEP 10: Verifica conteggio pacchetti + emetti TEST PASSED / TEST FAILED
+# run_pipeline_test.sh cerca questa stringa esatta nell'output.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 10] Verifying packet counts...${NC}"
+kscript frankfurt /tmp/check_recv.sh << 'CHECKSCRIPT'
+#!/bin/sh
+LOG=/tmp/recv_ipa.log
+if [ ! -f "$LOG" ]; then
+    echo "RECV_COUNT=0"
+else
+    CNT=$(grep -c "Received IPA" "$LOG" 2>/dev/null || echo 0)
+    echo "RECV_COUNT=${CNT}"
+fi
+CHECKSCRIPT
+RECV_LINE=$(kathara exec frankfurt bash /tmp/check_recv.sh 2>/dev/null | tr -d '\r')
+RECV_COUNT=$(echo "$RECV_LINE" | grep -oP '(?<=RECV_COUNT=)\d+' || echo 0)
+echo "  Packets sent    : ${PACKET_COUNT}"
+echo "  Packets received: ${RECV_COUNT}"
+
+# Require >= 80% delivery (allows for a few OSPF/XDP warmup drops)
+THRESHOLD=$((PACKET_COUNT * 80 / 100))
+
+echo
 echo -e "${GREEN}============================================================${NC}"
 echo -e "${GREEN} Test complete! Method: ${METHOD}${NC}"
 echo -e "${GREEN}============================================================${NC}"
+if [ "${RECV_COUNT:-0}" -ge "${THRESHOLD}" ] 2>/dev/null; then
+    echo -e "${GREEN}TEST PASSED - received ${RECV_COUNT}/${PACKET_COUNT} packets (>= ${THRESHOLD} threshold)${NC}"
+    echo "TEST PASSED"
+else
+    echo -e "${RED}TEST FAILED - received ${RECV_COUNT}/${PACKET_COUNT} packets (< ${THRESHOLD} threshold)${NC}"
+    echo "TEST FAILED"
+    exit 1
+fi
