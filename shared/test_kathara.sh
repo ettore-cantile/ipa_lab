@@ -125,6 +125,40 @@ sudo -n docker network ls 2>&1 || echo "  (needs sudo password — run manually:
 echo
 
 # ---------------------------------------------------------------------------
+# Step 1-quater — FIX: disabilita GRO/offload sui veth peer LATO HOST + bridge
+#
+# Causa piu' probabile del "UDP burst sparisce, ICMP sparso passa":
+# interazione veth + XDP + GRO. Il burst UDP (stesso flusso, ~50 pps) viene
+# coalescato via Generic Receive Offload sul veth peer LATO HOST che
+# alimenta frankfurt/eth1; il super-frame GRO risultante arriva a
+# un'interfaccia con un programma XDP attaccato, non e' convertibile in
+# xdp_buff (single-buffer) e viene SCARTATO dal path veth-XDP PRIMA che il
+# nostro programma giri -- quindi niente incremento di debug_stats, niente
+# tcpdump lato ricevente. L'ICMP (1/s, sparso) non viene mai coalescato e
+# passa sempre. Disabilitare l'offload DENTRO i container (Step 2a-quater)
+# non basta: il coalescing avviene sui veth peer nel network namespace
+# dell'HOST, che solo `sudo` sull'host puo' toccare (kathara exec resta
+# confinato nel container). Qui disabilitiamo GRO/GSO/TSO/checksum su TUTTI
+# i veth e i bridge kt-* dell'host (sledgehammer, ma sicuro in un lab).
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 1-quater] FIX: disabling GRO/offload on HOST-side veths + kt-* bridges...${NC}"
+if sudo -n true 2>/dev/null; then
+    _n_veth=0
+    for _v in $(ip -o link show type veth 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'); do
+        sudo -n ethtool -K "${_v}" gro off gso off tso off tx off rx off 2>/dev/null && _n_veth=$((_n_veth+1))
+    done
+    _n_br=0
+    for _b in $(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | grep '^kt-'); do
+        sudo -n ethtool -K "${_b}" gro off gso off tso off tx off rx off 2>/dev/null && _n_br=$((_n_br+1))
+        sudo -n ip link set dev "${_b}" mtu 1500 2>/dev/null
+    done
+    echo "  Offload disabled on ${_n_veth} host-side veth(s) and ${_n_br} kt-* bridge(s)."
+else
+    echo "  (needs sudo — run the script with: sudo bash shared/test_kathara.sh ${METHOD})"
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # Step 2a — Link diretto darmstadt -> frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2a] Checking direct link darmstadt -> frankfurt (${FRANKFURT_DIRECT})...${NC}"
