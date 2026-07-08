@@ -16,6 +16,7 @@ import argparse
 import sys
 import os
 import numpy as np
+import torch
 
 # Riutilizza classi e helpers di test_local.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,7 +26,6 @@ from test_local import (
     N_INTERFACES, N_NODES, INPUT_SIZE, OUTPUT_SIZE,
     GREEN, YELLOW, RED, NC, ok, fail, info
 )
-import torch
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,6 @@ def run_tests(n_samples: int, seed: int):
 
     # --- Test F: update pesi e ricontrollo pkt_stats ---
     print(f"\n{YELLOW}[Test F] pkt_stats dopo update pesi (nuovo modello random){NC}")
-    import torch
     torch.manual_seed(seed + 1)
     new_model = FRRModel()
     m1.update_weights(new_model)
