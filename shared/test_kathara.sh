@@ -63,7 +63,7 @@ if [ -z "$FKT_IP" ]; then
     FKT_IP=$(grep frankfurt /etc/hosts 2>/dev/null | awk '{print $1; exit}')
 fi
 echo "${FKT_IP:-}"
-RESCOLVESCRIPT
+RESOLVESCRIPT
 FRANKFURT_IP=$(kathara exec darmstadt bash /tmp/resolve_frankfurt.sh 2>/dev/null | tr -d '\r\n')
 if [ -z "$FRANKFURT_IP" ]; then
     echo -e "${YELLOW}  [WARN] Could not resolve 'frankfurt' hostname; using fallback 10.255.255.17${NC}"
