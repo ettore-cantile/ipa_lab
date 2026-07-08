@@ -14,6 +14,11 @@ PACKET_COUNT=100
 INTERVAL=0.002
 WEIGHTS="/shared/weights.json"
 
+# IP di frankfurt ricavato da lab.conf: darmstadt[0]=l59, frankfurt[1]=l59
+# -> eth0 di darmstadt e' il link diretto a frankfurt
+# L'IP loopback di frankfurt usato da OSPF e' 10.255.255.17 (da /etc/hosts)
+FRANKFURT_IP="10.255.255.17"
+
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
@@ -25,14 +30,15 @@ echo -e "${GREEN}============================================================${N
 echo
 
 # ---------------------------------------------------------------------------
-# kscript <node> <remote_path> <<'EOF'  body  EOF
-# Scrive uno script nel container tramite tee (nessun -c a kathara)
+# kscript <node> <remote_path>
+# Legge il body da stdin e lo scrive nel container tramite tee.
+# NON usare per comandi con flag -c: kathara li intercetta.
 # ---------------------------------------------------------------------------
 kscript() {
     local node=$1
     local path=$2
     local body
-    body=$(cat)   # legge stdin (heredoc)
+    body=$(cat)
     printf '%s\n' "$body" | kathara exec "$node" tee "$path" > /dev/null
 }
 
@@ -50,37 +56,22 @@ echo
 
 # ---------------------------------------------------------------------------
 # STEP 2: Convergenza OSPF
-# Risolviamo l'IP di frankfurt dinamicamente (nessun IP hardcoded)
+# Scriviamo lo script di ping via kscript, poi lo eseguiamo con bash.
+# kscript usa tee (nessun flag -c a kathara).
+# Il ping usa l'IP loopback di frankfurt (10.255.255.17) noto da lab.conf.
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 2] Waiting for OSPF convergence...${NC}"
-
-# Resolve frankfurt IP dynamically inside the container
-# Kathara populates /etc/hosts with container names
-kscript darmstadt /tmp/resolve_frankfurt.sh << 'RESOLVESCRIPT'
-#!/bin/sh
-FKT_IP=$(getent hosts frankfurt 2>/dev/null | awk '{print $1; exit}')
-if [ -z "$FKT_IP" ]; then
-    FKT_IP=$(grep frankfurt /etc/hosts 2>/dev/null | awk '{print $1; exit}')
-fi
-echo "${FKT_IP:-}"
-RESOLVESCRIPT
-FRANKFURT_IP=$(kathara exec darmstadt bash /tmp/resolve_frankfurt.sh 2>/dev/null | tr -d '\r\n')
-if [ -z "$FRANKFURT_IP" ]; then
-    echo -e "${YELLOW}  [WARN] Could not resolve 'frankfurt' hostname; using fallback 10.255.255.17${NC}"
-    FRANKFURT_IP="10.255.255.17"
-fi
-echo "  Resolved frankfurt -> ${FRANKFURT_IP}"
+echo -e "${YELLOW}[Step 2] Waiting for OSPF convergence (frankfurt=${FRANKFURT_IP})...${NC}"
 
 kscript darmstadt /tmp/ping_frankfurt.sh << PINGSCRIPT
 #!/bin/sh
-ping -c 1 -W 1 ${FRANKFURT_IP} > /dev/null 2>&1 && echo "OK" || echo "FAIL"
+ping -c 1 -W 2 ${FRANKFURT_IP} > /dev/null 2>&1 && echo OK || echo FAIL
 PINGSCRIPT
 
 CONVERGED=0
 for i in $(seq 1 30); do
-    RESULT=$(kathara exec darmstadt bash /tmp/ping_frankfurt.sh 2>/dev/null || echo "FAIL")
+    RESULT=$(kathara exec darmstadt bash /tmp/ping_frankfurt.sh 2>/dev/null)
     if echo "$RESULT" | grep -q "OK"; then
-        echo "  frankfurt (${FRANKFURT_IP}) reachable via OSPF"
+        echo "  frankfurt (${FRANKFURT_IP}) reachable"
         CONVERGED=1
         break
     fi
@@ -90,7 +81,8 @@ done
 
 if [ $CONVERGED -eq 0 ]; then
     echo
-    echo -e "${RED}  ERROR: frankfurt (${FRANKFURT_IP}) unreachable. Check lab.conf / kathara lstart.${NC}"
+    echo -e "${RED}  ERROR: frankfurt (${FRANKFURT_IP}) unreachable after 30s.${NC}"
+    echo -e "${RED}  Verifica: kathara exec darmstadt -- ping frankfurt${NC}"
     echo "TEST FAILED"
     exit 1
 fi
@@ -112,12 +104,12 @@ echo
 
 # ---------------------------------------------------------------------------
 # STEP 4: Carica pipeline su darmstadt
-# NOTE: --iface eth1 matches common.py INGRESS_IFACE (not eth0 default)
+# NOTE: --iface eth0 e' il link diretto verso frankfurt (l59 in lab.conf)
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (eth1)...${NC}"
+echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (eth0)...${NC}"
 kscript darmstadt /tmp/run_pipeline.sh << PIPESCRIPT
 #!/bin/sh
-python3 /shared/execute_pipeline.py --method ${METHOD} --iface eth1 --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &
+python3 /shared/execute_pipeline.py --method ${METHOD} --iface eth0 --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &
 echo \$! > /tmp/pipeline.pid
 PIPESCRIPT
 kathara exec darmstadt bash /tmp/run_pipeline.sh
@@ -137,7 +129,7 @@ kathara exec darmstadt bash /tmp/setup_maps.sh
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 6: Invia pacchetti
+# STEP 6: Invia pacchetti IPA da darmstadt verso frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt -> frankfurt...${NC}"
 kscript darmstadt /tmp/send_ipa.sh << SENDSCRIPT
@@ -163,7 +155,7 @@ kathara exec darmstadt cat /tmp/pipeline.log || echo "  (no log)"
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 9: BPF map stats (informational, not a hard assertion)
+# STEP 9: BPF map stats (informational)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 9] BPF map stats on darmstadt:${NC}"
 kscript darmstadt /tmp/bpf_stats.sh << 'STATSSCRIPT'
@@ -174,7 +166,7 @@ kathara exec darmstadt bash /tmp/bpf_stats.sh
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 10: Verifica conteggio pacchetti + emetti TEST PASSED / TEST FAILED
+# STEP 10: Verifica conteggio pacchetti + TEST PASSED / TEST FAILED
 # run_pipeline_test.sh cerca questa stringa esatta nell'output.
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 10] Verifying packet counts...${NC}"
@@ -193,7 +185,6 @@ RECV_COUNT=$(echo "$RECV_LINE" | grep -oP '(?<=RECV_COUNT=)\d+' || echo 0)
 echo "  Packets sent    : ${PACKET_COUNT}"
 echo "  Packets received: ${RECV_COUNT}"
 
-# Require >= 80% delivery (allows for a few OSPF/XDP warmup drops)
 THRESHOLD=$((PACKET_COUNT * 80 / 100))
 
 echo
