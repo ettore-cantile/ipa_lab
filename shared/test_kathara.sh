@@ -96,16 +96,28 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
-# Step 2b — OSPF convergence (opzionale, 30s timeout)
+# Step 2b — OSPF convergence (opzionale, 30s timeout, SOLO informativo)
+#
+# Nota: questo check NON deve determinare l'IP usato per il test (Step 6).
+# germany50 e' una topologia a 50 nodi: il percorso che OSPF calcola verso
+# l'indirizzo di loopback ${FRANKFURT_OSPF} non e' garantito passare per il
+# link diretto darmstadt->frankfurt (${FRANKFURT_XDP_IFACE}) -- potrebbe
+# instradare altrove se esistono percorsi di costo pari/inferiore. Dato che
+# lo scopo del test e' verificare XDP specificamente su
+# ${FRANKFURT_XDP_IFACE}, i pacchetti IPA vanno SEMPRE spediti all'IP del
+# link diretto (FRANKFURT_IP resta ${FRANKFURT_DIRECT}); questo passo serve
+# solo a segnalare lo stato di convergenza OSPF, non a scegliere la
+# destinazione. (In precedenza sovrascriveva FRANKFURT_IP con l'indirizzo
+# OSPF quando convergeva, causando pacchetti instradati altrove e quindi
+# mai visti su eth1 -- TRUE HIT=0 senza alcun bug nella pipeline.)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2b] Checking optional OSPF convergence (${FRANKFURT_OSPF}, up to 30s)...${NC}"
 CONVERGED=0
 for i in $(seq 1 30); do
     RESULT=$(krun darmstadt "ping -c 1 -W 2 ${FRANKFURT_OSPF} > /dev/null 2>&1 && echo OK || echo FAIL" | tr -d '\r\n')
     if [ "${RESULT}" = "OK" ]; then
-        echo "  OSPF converged at ${i}s — ${FRANKFURT_OSPF} reachable"
+        echo "  OSPF converged at ${i}s — ${FRANKFURT_OSPF} reachable (informational only)"
         CONVERGED=1
-        FRANKFURT_IP="${FRANKFURT_OSPF}"
         break
     fi
     echo -n "."
@@ -113,8 +125,9 @@ for i in $(seq 1 30); do
 done
 if [ ${CONVERGED} -eq 0 ]; then
     echo
-    echo "  OSPF not ready — continuing with direct IP ${FRANKFURT_DIRECT}"
+    echo "  OSPF not ready (informational only, does not affect the test)"
 fi
+echo "  Using direct link IP ${FRANKFURT_IP} for the actual test (guarantees ingress via ${FRANKFURT_XDP_IFACE})"
 echo
 
 # ---------------------------------------------------------------------------
