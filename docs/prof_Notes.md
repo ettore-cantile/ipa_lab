@@ -245,6 +245,13 @@ L'implementazione hardcoded (Livello 1) e quella dove la tesi "massime prestazio
 
 Questo e un dato sperimentale interessante da riportare nel paper: il costo della specializzazione massima (Livello 1) non e solo prestazionale, ma anche *di ingegneria* — occorre una codifica del branching ad-hoc per non violare i limiti del verifier, mentre i Livelli 2 e 3 evitano il problema a monte delegando i pesi a `BPF_ARRAY` map.
 
+**Revisione dei Livelli 2 e 3 (verifica di conformita alla tassonomia):** un controllo su `ebpf_template_arch.py` e `ebpf_modular.py` ha trovato due bug, entrambi corretti:
+
+1. **Stack overflow nel Livello 2** — `arch_65_4_4_7` dichiarava `long long iv[65]` (520 B), gia da solo oltre il limite di 512 B, prima di contare `h1[4]`, `h2[4]` e i puntatori. Sarebbe fallito al load come il Livello 1. Fix: solo 3 posizioni su 65 sono mai diverse da zero, quindi il prodotto scalare per ogni neurone si calcola direttamente da 3 scalari via indici aritmetici nella `BPF_ARRAY` (a differenza degli array `static const` che hanno rotto il Livello 1, una lookup di map con indice calcolato a runtime e sicura per il verifier).
+2. **Disallineamento dell'encoding delle feature nei Livelli 2 e 3** — entrambi popolavano il vettore di input come `[0]=model_id, [1]=ttl, [2]=ingress_ifindex, [3]=input_size`, schema che NON corrisponde a come il modello e stato addestrato (`FRR_model.py`: 6 link_state (inutilizzati) + 6 ingress-iface one-hot [6..11] + 1 ttl [12] + 52 node one-hot [13..64], lo stesso schema del Livello 1). Pur rispettando fedelmente la tassonomia architetturale del professore (pesi da map, tail call, stato scratch), i due livelli non eseguivano lo stesso modello del Livello 1, rendendo invalido qualunque confronto di accuratezza tra le pipeline. Corretto per usare lo stesso encoding one-hot sparso del Livello 1.
+
+**Stato:** il Livello 1 e confermato funzionante end-to-end su Kathara. I Livelli 2 e 3 non sono ancora stati rilanciati su Kathara dopo questo fix (il fix dello stack per il Livello 2 e motivato per ragionamento ma non ancora verificato dal verifier reale). Inoltre `test_kathara.sh` legge solo le map `pkt_stats`/`cls_stats` del Livello 1: i Livelli 2/3 usano nomi diversi (`pkt_stats_t2`/`_t3`) e un modello hit/miss/fake-hit diverso (`fwd_table` + `valid_keys`), quindi gli Step 8/9/11 dello script non generalizzano ancora a `test_kathara.sh template` / `modular` — lavoro di follow-up non ancora fatto.
+
 ---
 
 *Ultimo aggiornamento: 2026-07-08*

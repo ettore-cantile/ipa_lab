@@ -182,30 +182,35 @@ echo
 
 # ---------------------------------------------------------------------------
 # Step 8 — Leggi pkt_stats da frankfurt via bpftool
+#
+# Nota: il payload Python viene scritto su file via heredoc (non passato
+# come stringa 'python3 -c "..."') perche' krun() gia' incapsula il comando
+# in un livello di quoting bash; una stringa -c "..." con doppi apici Python
+# annidati (liste, f-string) si scontra con quel livello e produce un file
+# .sh malformato ("syntax error near unexpected token '('"). Un heredoc con
+# delimitatore quotato ('PYEOF') e' scritto letteralmente, senza alcuna
+# espansione/escaping, quindi qualunque quoting Python e' al sicuro.
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 8] Reading BPF stats from frankfurt:${NC}"
-STATS_OUT=$(krun frankfurt 'python3 -c "
-import ctypes, sys
+cat > "${SCRIPT_DIR}/_stats_pkt.py" <<'PYEOF'
+import subprocess, re, sys
 try:
-    from bcc import BPF
-    import subprocess, re
-    # trova il map id di pkt_stats
-    out = subprocess.check_output(["bpftool","map","show"], text=True)
-    # legge le map via bpftool dump
-    lines = out.splitlines()
+    out = subprocess.check_output(["bpftool", "map", "show"], text=True)
     map_id = None
-    for line in lines:
+    for line in out.splitlines():
         if "pkt_stats" in line:
-            m = re.search(r"^(\\d+):", line)
-            if m: map_id = m.group(1)
+            m = re.search(r"^(\d+):", line)
+            if m:
+                map_id = m.group(1)
     if map_id is None:
         print("STATS_ERROR: pkt_stats map not found")
         sys.exit(0)
-    dump = subprocess.check_output(["bpftool","map","dump","id",map_id], text=True)
-    print("BPFTOOL_DUMP="+dump.replace("\n","|"))
+    dump = subprocess.check_output(["bpftool", "map", "dump", "id", map_id], text=True)
+    print("BPFTOOL_DUMP=" + dump.replace("\n", "|"))
 except Exception as e:
     print(f"STATS_ERROR: {e}")
-"')
+PYEOF
+STATS_OUT=$(krun frankfurt "python3 /shared/_stats_pkt.py")
 echo "  ${STATS_OUT}"
 echo
 
@@ -213,61 +218,66 @@ echo
 # Step 9 — Leggi cls_stats e stampa porta di uscita per classe
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 9] Per-class egress port distribution on frankfurt:${NC}"
-krun frankfurt 'python3 -c "
+cat > "${SCRIPT_DIR}/_stats_cls.py" <<'PYEOF'
 import subprocess, re, sys
 try:
-    out = subprocess.check_output(["bpftool","map","show"], text=True)
-    # pkt_stats
+    out = subprocess.check_output(["bpftool", "map", "show"], text=True)
     map_id_pkt = None
     map_id_cls = None
     for line in out.splitlines():
         if "pkt_stats" in line:
-            m = re.search(r"^(\\d+):", line)
-            if m: map_id_pkt = m.group(1)
+            m = re.search(r"^(\d+):", line)
+            if m:
+                map_id_pkt = m.group(1)
         if "cls_stats" in line:
-            m = re.search(r"^(\\d+):", line)
-            if m: map_id_cls = m.group(1)
+            m = re.search(r"^(\d+):", line)
+            if m:
+                map_id_cls = m.group(1)
 
     def read_array_map(mid):
-        if mid is None: return []
-        dump = subprocess.check_output(["bpftool","map","dump","id",mid], text=True)
+        if mid is None:
+            return []
+        dump = subprocess.check_output(["bpftool", "map", "dump", "id", mid], text=True)
         vals = []
         for entry in dump.split("key:"):
-            if not entry.strip(): continue
-            vm = re.search(r"value: ([\\da-f ]+)", entry)
+            if not entry.strip():
+                continue
+            vm = re.search(r"value: ([\da-f ]+)", entry)
             if vm:
                 hexbytes = vm.group(1).split()
                 if len(hexbytes) >= 8:
-                    val = int.from_bytes(bytes(int(h,16) for h in hexbytes[:8]), "little")
+                    val = int.from_bytes(bytes(int(h, 16) for h in hexbytes[:8]), "little")
                     vals.append(val)
         return vals
 
     pkt = read_array_map(map_id_pkt)
     cls = read_array_map(map_id_cls)
 
-    hit  = pkt[0] if len(pkt) > 0 else 0
+    hit = pkt[0] if len(pkt) > 0 else 0
     miss = pkt[1] if len(pkt) > 1 else 0
     drop = pkt[2] if len(pkt) > 2 else 0
     total = hit + miss + drop
 
-    print(f\"  TRUE HIT  (redirect) : {hit:>8}  ({100*hit/max(total,1):.1f}%)\")
-    print(f\"  MISS      (no cache) : {miss:>8}  ({100*miss/max(total,1):.1f}%)\")
-    print(f\"  DROP      (cls 6)    : {drop:>8}  ({100*drop/max(total,1):.1f}%)\")
-    print(f\"  TOTAL                : {total:>8}\")
+    print(f"  TRUE HIT  (redirect) : {hit:>8}  ({100*hit/max(total,1):.1f}%)")
+    print(f"  MISS      (no cache) : {miss:>8}  ({100*miss/max(total,1):.1f}%)")
+    print(f"  DROP      (cls 6)    : {drop:>8}  ({100*drop/max(total,1):.1f}%)")
+    print(f"  TOTAL                : {total:>8}")
     print()
-    print(\"  Egress port chosen per class (inference output)::\")
-    cls_labels = [\"eth0\",\"eth1\",\"eth2\",\"eth3\",\"eth4\",\"eth5\",\"DROP\"]
-    cls_total  = sum(cls) if cls else 1
+    print("  Egress port chosen per class (inference output)::")
+    cls_labels = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5", "DROP"]
+    cls_total = sum(cls) if cls else 1
     for i, cnt in enumerate(cls[:7]):
-        label = cls_labels[i] if i < len(cls_labels) else f\"cls{i}\"
-        bar   = \"#\" * int(30 * cnt / max(cls_total,1))
-        print(f\"    cls {i} -> {label:6s} : {cnt:>6}  {bar}\")
+        label = cls_labels[i] if i < len(cls_labels) else f"cls{i}"
+        bar = "#" * int(30 * cnt / max(cls_total, 1))
+        print(f"    cls {i} -> {label:6s} : {cnt:>6}  {bar}")
     print()
-    print(f\"CHOSEN_PORT={cls_labels[cls.index(max(cls))] if cls else \"NONE\"}\")
-    print(f\"HIT_COUNT={hit}\")
+    chosen = cls_labels[cls.index(max(cls))] if cls else "NONE"
+    print(f"CHOSEN_PORT={chosen}")
+    print(f"HIT_COUNT={hit}")
 except Exception as e:
-    print(f\"STATS_ERROR: {e}\")
-"'
+    print(f"STATS_ERROR: {e}")
+PYEOF
+krun frankfurt "python3 /shared/_stats_cls.py"
 echo
 
 # ---------------------------------------------------------------------------
@@ -281,31 +291,36 @@ echo
 # Step 11 — Verifica finale: TRUE HIT >= 80%
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 11] Final verdict:${NC}"
-HIT_LINE=$(krun frankfurt 'python3 -c "
+cat > "${SCRIPT_DIR}/_stats_hit.py" <<'PYEOF'
 import subprocess, re
 try:
-    out = subprocess.check_output([\"bpftool\",\"map\",\"show\"], text=True)
+    out = subprocess.check_output(["bpftool", "map", "show"], text=True)
     map_id = None
     for line in out.splitlines():
-        if \"pkt_stats\" in line:
-            m = re.search(r\"^(\\\\d+):\", line)
-            if m: map_id = m.group(1)
+        if "pkt_stats" in line:
+            m = re.search(r"^(\d+):", line)
+            if m:
+                map_id = m.group(1)
     if map_id is None:
-        print(\"HIT=0\"); exit()
-    dump = subprocess.check_output([\"bpftool\",\"map\",\"dump\",\"id\",map_id], text=True)
-    vals = []
-    for entry in dump.split(\"key:\"):
-        if not entry.strip(): continue
-        vm = re.search(r\"value: ([\\\\da-f ]+)\", entry)
-        if vm:
-            hexbytes = vm.group(1).split()
-            if len(hexbytes) >= 8:
-                val = int.from_bytes(bytes(int(h,16) for h in hexbytes[:8]), \"little\")
-                vals.append(val)
-    print(f\"HIT={vals[0] if vals else 0}\")
+        print("HIT=0")
+    else:
+        dump = subprocess.check_output(["bpftool", "map", "dump", "id", map_id], text=True)
+        vals = []
+        for entry in dump.split("key:"):
+            if not entry.strip():
+                continue
+            vm = re.search(r"value: ([\da-f ]+)", entry)
+            if vm:
+                hexbytes = vm.group(1).split()
+                if len(hexbytes) >= 8:
+                    val = int.from_bytes(bytes(int(h, 16) for h in hexbytes[:8]), "little")
+                    vals.append(val)
+        print(f"HIT={vals[0] if vals else 0}")
 except Exception as e:
-    print(f\"HIT=0\")
-"' | grep '^HIT=' | tr -d '\r')
+    print("HIT=0")
+PYEOF
+HIT_LINE=$(krun frankfurt "python3 /shared/_stats_hit.py" | grep '^HIT=' | tr -d '\r')
+rm -f "${SCRIPT_DIR}/_stats_pkt.py" "${SCRIPT_DIR}/_stats_cls.py" "${SCRIPT_DIR}/_stats_hit.py"
 
 HIT_COUNT=$(echo "${HIT_LINE}" | grep -oE '[0-9]+$' || echo 0)
 [ -z "${HIT_COUNT}" ] && HIT_COUNT=0

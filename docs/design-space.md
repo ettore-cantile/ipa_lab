@@ -213,6 +213,51 @@ rejected before landing on the current one:
    the fix is always "switch over the bounded index," not "shrink the
    array."
 
+### Pipeline 2 and 3: two further bugs found on review (not yet crashed, but would have)
+A pass over `ebpf_template_arch.py` and `ebpf_modular.py` — prompted by
+verifying the three pipelines against the professor's taxonomy — turned
+up two more issues, both fixed:
+
+1. **Stack overflow in Pipeline 2.** `arch_65_4_4_7` declared
+   `long long iv[65]` (520 B) to hold the input feature vector — on its
+   own already over the 512 B BPF stack limit, before `h1[4]`, `h2[4]`
+   and pointers. This would have failed exactly like Pipeline 1 did.
+   **Fix:** since only 3 of the 65 positions are ever non-zero (see
+   point 2), the `iv[]` array is unnecessary — each hidden neuron's dot
+   product is computed directly from 3 scalars via *arithmetic*
+   `BPF_ARRAY` indices (`woff + j*65 + {12, 5+iface, 13+node}`). Unlike
+   the `static const` globals that broke Pipeline 1, a `BPF_ARRAY`
+   lookup with a runtime-computed key is exactly what maps are for —
+   no verifier risk, and it cuts fc1 from 65×4 to 3×4 map lookups.
+2. **Feature-encoding mismatch in Pipeline 2 and 3.** Both populated
+   the input vector as `[0]=model_id, [1]=ttl, [2]=ingress_ifindex,
+   [3]=input_size, rest 0`, which does **not** match how the model was
+   actually trained (`FRR_model.py`: 6 link_state (unused) + 6
+   ingress-iface one-hot [6..11] + 1 ttl [12] + 52 node one-hot
+   [13..64] — the same encoding Pipeline 1 uses). Even though both
+   pipelines faithfully implemented the professor's *architectural*
+   taxonomy (map-backed weights, tail-call chaining, scratch state),
+   they were not running the *same model* as Pipeline 1, making any
+   cross-pipeline accuracy/classification comparison invalid.
+   **Fix:** both pipelines now write the identical sparse one-hot
+   encoding Pipeline 1 uses (Pipeline 2 via direct arithmetic map
+   indices as above; Pipeline 3's dispatcher now zeroes
+   `scratch_acts[0..64]` and sets only the 3 live slots before the
+   first tail call — `layer_65_4`'s dense dot-product loop needed no
+   change, since it already reads `scratch_acts[i]` one at a time).
+
+**Status:** Pipeline 1 is confirmed working end-to-end in Kathara.
+Pipelines 2 and 3 have not yet been run in Kathara after this fix —
+the stack-budget fix for Pipeline 2 is reasoned through but not yet
+verified against the real BPF verifier (unlike Pipeline 1, which had
+two iterations of real verifier feedback). `test_kathara.sh` also only
+reads back `pkt_stats`/`cls_stats` (Pipeline 1's map names); Pipelines
+2/3 use different map names (`pkt_stats_t2`/`_t3`) and a different
+hit/miss/fake-hit model (`fwd_table` + `valid_keys`), so the test
+script's Step 8/9/11 stats readout does not yet generalize to
+`test_kathara.sh template` / `test_kathara.sh modular` — extending it
+is follow-up work, not yet done.
+
 ### Quantization
 - All pipelines use int8 quantization (7-bit signed) as in the existing codebase
 - Scale factor stored in model_cache (Pipeline 1) or arch_registry (Pipelines 2 & 3)

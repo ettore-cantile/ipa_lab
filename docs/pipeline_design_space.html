@@ -683,8 +683,19 @@
       <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--text);margin-bottom:1rem;">
         <strong>Lezione generale:</strong> qualunque tabella <code style="font-family:var(--font-mono);">static const</code>/globale indicizzata da un valore runtime non e sicura sotto BCC per XDP, indipendentemente dalla dimensione; la soluzione e sempre "switch sull'indice limitato", mai "rimpicciolire l'array".
       </p>
-      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--muted);">
+      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--muted);margin-bottom:1.5rem;">
         Dato sperimentale interessante per il paper: il costo della specializzazione massima non e solo prestazionale, ma anche <em>di ingegneria</em> &mdash; richiede una codifica del branching ad-hoc per non violare i limiti del verifier, mentre i Livelli 2 e 3 evitano il problema a monte delegando i pesi a <code style="font-family:var(--font-mono);">BPF_ARRAY</code> map.
+      </p>
+      <div class="paper-label" style="color:var(--amber);">Revisione Livelli 2 e 3 &mdash; verifica di conformita</div>
+      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;margin-bottom:0.75rem;">
+        Un controllo su <code style="font-family:var(--font-mono);">ebpf_template_arch.py</code> e <code style="font-family:var(--font-mono);">ebpf_modular.py</code> ha trovato due bug, entrambi corretti:
+      </p>
+      <ol style="font-size:13px;color:var(--muted);line-height:1.9;margin:0 0 1rem 1.25rem;">
+        <li><strong style="color:var(--red);">Stack overflow nel Livello 2</strong> &mdash; <code style="font-family:var(--font-mono);">arch_65_4_4_7</code> dichiarava <code style="font-family:var(--font-mono);">long long iv[65]</code> (520&nbsp;B), gia da solo oltre il limite di 512&nbsp;B. Fix: prodotto scalare calcolato direttamente da 3 scalari via indici aritmetici nella <code style="font-family:var(--font-mono);">BPF_ARRAY</code> (sicuro per il verifier, a differenza degli array <code style="font-family:var(--font-mono);">static const</code>).</li>
+        <li><strong style="color:var(--red);">Disallineamento encoding feature (Livelli 2 e 3)</strong> &mdash; entrambi popolavano l'input come <code style="font-family:var(--font-mono);">[0]=model_id, [1]=ttl, [2]=ifindex, [3]=input_size</code>, schema diverso da come il modello e stato addestrato (<code style="font-family:var(--font-mono);">FRR_model.py</code>: 6 link_state + 6 iface one-hot [6..11] + ttl [12] + 52 node one-hot [13..64]). Rispettavano la tassonomia architetturale ma non eseguivano lo stesso modello del Livello 1. Corretto per usare lo stesso encoding one-hot.</li>
+      </ol>
+      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--muted);">
+        <strong style="color:var(--text);">Stato:</strong> Livello 1 confermato funzionante end-to-end su Kathara. Livelli 2 e 3 non ancora rilanciati su Kathara dopo il fix (ragionati ma non verificati dal verifier reale). <code style="font-family:var(--font-mono);">test_kathara.sh</code> legge solo le map del Livello 1 (<code style="font-family:var(--font-mono);">pkt_stats</code>/<code style="font-family:var(--font-mono);">cls_stats</code>); i Livelli 2/3 usano nomi e modello hit/miss diversi &mdash; estendere lo script e' lavoro di follow-up non ancora fatto.
       </p>
     </div>
   </div>

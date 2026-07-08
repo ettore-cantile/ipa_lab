@@ -32,6 +32,28 @@ Combined compilation note (pipeline_benchmark.py):
   EBPF_ARCH_65_4_4_7 wraps shared declarations in
   #ifndef IPA_ARCH_COMBINED / #endif.  pipeline_benchmark prepends
   '#define IPA_ARCH_COMBINED 1' before concatenating the two sources.
+
+Fixed bugs (2026-07-08):
+  1) Stack overflow: `long long iv[T2_N_IN]` (65 * 8B = 520B) alone
+     exceeded the 512B BPF stack limit, before even counting h1[4],
+     h2[4] and the various pointers -- this would have failed to load
+     with the same class of error fixed in Pipeline 1 (ebpf_program.py).
+  2) Feature-encoding mismatch: the input vector was populated as
+     iv[0]=model_id, iv[1]=ttl, iv[2]=ingress_ifindex, iv[3]=input_size,
+     which does NOT match how the model was actually trained (see
+     FRR_model.py: 6 link_state (unused, always 0) + 6 ingress-iface
+     one-hot [6..11] + 1 ttl [12] + 52 node one-hot [13..64], identical
+     to Pipeline 1's encoding). Inference run through the old encoding
+     was not comparable to Pipeline 1/3 on the same model.
+  Fix: drop the `iv[]` array entirely and compute each hidden neuron's
+  dot product directly from the 3 live scalars (_ttl, _iface, _node)
+  via arithmetic BPF_ARRAY indices (woff + j*T2_N_IN + {12, 5+iface,
+  13+node}). This is safe for arbitrary runtime indices -- unlike the
+  `static const` globals that broke Pipeline 1's verifier load, a
+  BPF_ARRAY lookup with a computed key is exactly what maps are for --
+  and is mathematically identical to summing over all 65 positions
+  (every other position is always 0), while removing the stack array
+  and cutting fc1 from 65*4 to 3*4 map lookups.
 """
 
 # Architecture constants (65-4-4-7 model)
@@ -216,12 +238,20 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
 
-    long long iv[T2_N_IN];
-    __builtin_memset(iv, 0, sizeof(iv));
-    iv[0] = ipa->model_id;
-    iv[1] = ip->ttl;
-    iv[2] = ctx->ingress_ifindex;
-    iv[3] = ipa->input_size;
+    /* Feature encoding (must match Pipeline 1 / the trained model exactly,
+     * see FRR_model.py: 6 link_state (always 0, unused) + 6 ingress-iface
+     * one-hot [6..11] + 1 ttl [12] + 52 node one-hot [13..64]).
+     * Only 3 features are ever non-zero per packet, so instead of
+     * materializing a `long long iv[65]` on the stack (520B -- already
+     * overflows the 512B BPF stack limit on its own) we compute each
+     * hidden neuron's dot product directly from the 3 live scalars via
+     * arithmetic BPF_ARRAY indices. This is safe (map lookups accept any
+     * computed index, unlike the `static const` globals fixed in Pipeline 1 --
+     * see ebpf_program.py's "Verifier history") and mathematically identical
+     * to summing over all 65 positions, since every other position is 0. */
+    __u32 _ttl   = ((__u32)ip->ttl) & 0xff;
+    __u32 _iface = ((__u32)ctx->ingress_ifindex) & 0x7;   /* valid 1..6 */
+    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;         /* valid 0..51 */
 
     /* fc1: T2_N_IN -> T2_N_H1
      * Note: arch_weights stores 'char' (signed) but lookup returns char*;
@@ -233,13 +263,26 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (bidx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
         char *bp = arch_weights.lookup(&bidx);
         long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
-        #pragma unroll
-        for (int i = 0; i < T2_N_IN; i++) {
-            int widx = woff + T2_FC1_W_OFF + j * T2_N_IN + i;
-            if (widx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-            char *wp = arch_weights.lookup(&widx);
-            if (wp) acc += iv[i] * (long long)(*(signed char *)wp);
+
+        int ttl_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + 12;
+        if (ttl_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+        char *ttl_wp = arch_weights.lookup(&ttl_idx);
+        if (ttl_wp) acc += (long long)_ttl * (long long)(*(signed char *)ttl_wp);
+
+        if (_iface >= 1 && _iface <= 6) {
+            int iface_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + 5 + _iface;
+            if (iface_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+            char *iface_wp = arch_weights.lookup(&iface_idx);
+            if (iface_wp) acc += (long long)(*(signed char *)iface_wp);
         }
+
+        if (_node <= 51) {
+            int node_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + 13 + _node;
+            if (node_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+            char *node_wp = arch_weights.lookup(&node_idx);
+            if (node_wp) acc += (long long)(*(signed char *)node_wp);
+        }
+
         h1[j] = RELU(acc);
     }
 

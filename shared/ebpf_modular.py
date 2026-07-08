@@ -29,6 +29,18 @@ eBPF verifier notes:
   - all layer dimensions are compile-time constants per program
   - tail call limit: 33 consecutive (Linux). For 3-layer net: 3 tail calls OK.
   - weight map key encodes (layer_id * MAX_NEURONS_SQ + flat_index)
+
+Fixed bug (2026-07-08): the dispatcher used to populate scratch_acts as
+  [0]=model_id, [1]=ttl, [2]=ingress_ifindex, [3]=input_size, rest 0 --
+  a feature encoding that does NOT match how the model was actually
+  trained (see FRR_model.py / ebpf_program.py: 6 link_state (unused) +
+  6 ingress-iface one-hot [6..11] + 1 ttl [12] + 52 node one-hot
+  [13..64]). Inference through the old encoding was not comparable to
+  Pipeline 1/2 on the same model. Fixed to write the same sparse
+  one-hot layout as Pipeline 1 into scratch_acts before the first tail
+  call; layer_65_4's dense dot-product loop is unchanged (it already
+  reads scratch_acts[i] one at a time, so it transparently picks up
+  the corrected activations).
 """
 
 # Scratch map layout constants
@@ -151,18 +163,36 @@ int modular_dispatcher(struct xdp_md *ctx) {
     idx = META_INGRESS_IF; { long long v = ctx->ingress_ifindex;   scratch_meta.update(&idx, &v); }
     idx = META_TTL;        { long long v = ip->ttl;                scratch_meta.update(&idx, &v); }
 
-    /* Feature extraction -> write to scratch_acts[0..N_IN-1]
-     * (4-feature stub matching Pipeline 1 for fair comparison) */
-    long long fv;
+    /* Feature extraction -> write to scratch_acts[0..64].
+     * Encoding MUST match Pipeline 1 / the trained model (FRR_model.py):
+     *   [0..5]   link_state, unused, always 0
+     *   [6..11]  ingress-iface one-hot (index = 5 + ifindex, ifindex 1..6)
+     *   [12]     ttl (raw scalar)
+     *   [13..64] node one-hot (index = 13 + model_id, model_id 0..51)
+     * Zero all 65 slots first (scratch_acts is PERCPU and may hold stale
+     * values from a previous packet on this CPU), then set only the live
+     * ones -- mirrors ebpf_program.py's sparse encoding exactly. */
+    long long zero = 0LL;
     int fi;
-    fi = 0; fv = ipa->model_id;           scratch_acts.update(&fi, &fv);
-    fi = 1; fv = ip->ttl;                  scratch_acts.update(&fi, &fv);
-    fi = 2; fv = ctx->ingress_ifindex;    scratch_acts.update(&fi, &fv);
-    fi = 3; fv = ipa->input_size;         scratch_acts.update(&fi, &fv);
-    /* Remaining 61 features set to 0 */
-    fv = 0;
     #pragma unroll
-    for (int i = 4; i < 65; i++) { int ki = i; scratch_acts.update(&ki, &fv); }
+    for (int i = 0; i < 65; i++) { fi = i; scratch_acts.update(&fi, &zero); }
+
+    __u32 _ttl   = ((__u32)ip->ttl) & 0xff;
+    __u32 _iface = ((__u32)ctx->ingress_ifindex) & 0x7;   /* valid 1..6 */
+    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;         /* valid 0..51 */
+
+    long long ttlv = _ttl;
+    fi = 12; scratch_acts.update(&fi, &ttlv);
+
+    long long one = 1LL;
+    if (_iface >= 1 && _iface <= 6) {
+        fi = 5 + _iface;
+        scratch_acts.update(&fi, &one);
+    }
+    if (_node <= 51) {
+        fi = 13 + _node;
+        scratch_acts.update(&fi, &one);
+    }
 
     /* Store weight offsets in meta slots 5,6,7 */
     idx = 5; { long long v = lentry->w_off_fc1; scratch_meta.update(&idx, &v); }
