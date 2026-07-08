@@ -129,8 +129,15 @@ BPF_ARRAY(debug_stats,      __u64, 8);
 #define DBG_WRONG_PORT  5   /* udp->dest != 9999 */
 #define DBG_IPA_FAIL    6   /* packet shorter than eth+ip+udp+ipa header */
 #define DBG_REACHED_MC  7   /* passed every header check, reached model_cache lookup */
-#define DBG_INC(i) do { int _di = (i); __u64 *_dp = debug_stats.lookup(&_di); \
-                        if (_dp) __sync_fetch_and_add(_dp, 1); } while (0)
+
+/* BCC refuses map method calls (.lookup/.update/...) textually nested
+ * inside a macro expansion ("cannot use map function inside a macro") --
+ * its source-to-source rewriter only recognizes them in plain function
+ * bodies. A real (non-macro) helper function works fine. */
+static inline void dbg_inc(int idx) {
+    __u64 *dp = debug_stats.lookup(&idx);
+    if (dp) __sync_fetch_and_add(dp, 1);
+}
 
 #define RELU_LL(x)    ((x) > 0LL ? (x) : 0LL)
 """
@@ -268,19 +275,19 @@ def generate_ebpf_hardcoded(
 int ipa_switch(struct xdp_md *ctx) {{
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    DBG_INC(DBG_SEEN);
+    dbg_inc(DBG_SEEN);
 
     struct ethhdr  *eth = data;
-    if ((void *)(eth + 1) > data_end) {{ DBG_INC(DBG_ETH_FAIL); return XDP_PASS; }}
+    if ((void *)(eth + 1) > data_end) {{ dbg_inc(DBG_ETH_FAIL); return XDP_PASS; }}
     struct iphdr   *ip  = (struct iphdr *)(eth + 1);
-    if ((void *)(ip  + 1) > data_end) {{ DBG_INC(DBG_IP_FAIL); return XDP_PASS; }}
-    if (ip->protocol != IPPROTO_UDP)  {{ DBG_INC(DBG_NOT_UDP); return XDP_PASS; }}
+    if ((void *)(ip  + 1) > data_end) {{ dbg_inc(DBG_IP_FAIL); return XDP_PASS; }}
+    if (ip->protocol != IPPROTO_UDP)  {{ dbg_inc(DBG_NOT_UDP); return XDP_PASS; }}
     struct udphdr  *udp = (struct udphdr *)(ip + 1);
-    if ((void *)(udp + 1) > data_end) {{ DBG_INC(DBG_UDP_FAIL); return XDP_PASS; }}
-    if (udp->dest != bpf_htons(9999)) {{ DBG_INC(DBG_WRONG_PORT); return XDP_PASS; }}
+    if ((void *)(udp + 1) > data_end) {{ dbg_inc(DBG_UDP_FAIL); return XDP_PASS; }}
+    if (udp->dest != bpf_htons(9999)) {{ dbg_inc(DBG_WRONG_PORT); return XDP_PASS; }}
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
-    if ((void *)(ipa + 1) > data_end) {{ DBG_INC(DBG_IPA_FAIL); return XDP_PASS; }}
-    DBG_INC(DBG_REACHED_MC);
+    if ((void *)(ipa + 1) > data_end) {{ dbg_inc(DBG_IPA_FAIL); return XDP_PASS; }}
+    dbg_inc(DBG_REACHED_MC);
 
     /* model_cache check: if model not loaded, count as miss and pass */
     struct model_data *m = model_cache.lookup(&ipa->model_id);
