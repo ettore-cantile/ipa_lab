@@ -96,6 +96,36 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
+# Step 2a-bis — Verifica che l'interfaccia XDP configurata sia quella VERA
+#
+# germany50 ha molti link per nodo: il ping riesce comunque (il kernel di
+# frankfurt instrada in base all'IP, non al nome interfaccia), ma XDP viene
+# agganciato al NOME hardcoded FRANKFURT_XDP_IFACE ("eth1"). Se quel nome
+# non corrisponde davvero all'interfaccia collegata a darmstadt, XDP vede
+# solo il traffico di un link completamente diverso (altro vicino OSPF) e
+# i pacchetti IPA -- pur arrivando fisicamente a frankfurt -- non passano
+# mai da li: TRUE HIT=0 senza alcun bug nella pipeline o nel routing.
+# Fix: risolvere dinamicamente l'interfaccia reale da ${FRANKFURT_DIRECT}
+# invece di fidarsi del nome hardcoded.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 2a-bis] Verifying which real interface on frankfurt carries ${FRANKFURT_DIRECT}...${NC}"
+ACTUAL_IFACE=$(krun frankfurt "ip -o -4 addr show | grep -F '${FRANKFURT_DIRECT}' | awk '{print \$2}'" | tr -d '\r\n')
+echo "  Configured FRANKFURT_XDP_IFACE = ${FRANKFURT_XDP_IFACE}"
+echo "  Actual interface holding ${FRANKFURT_DIRECT}  = ${ACTUAL_IFACE:-<not found>}"
+if [ -z "${ACTUAL_IFACE}" ]; then
+    echo -e "${RED}  ERROR: could not resolve which interface on frankfurt holds ${FRANKFURT_DIRECT}.${NC}"
+    echo "TEST FAILED"
+    exit 1
+fi
+if [ "${ACTUAL_IFACE}" != "${FRANKFURT_XDP_IFACE}" ]; then
+    echo -e "${YELLOW}  Mismatch detected — overriding FRANKFURT_XDP_IFACE: ${FRANKFURT_XDP_IFACE} -> ${ACTUAL_IFACE}${NC}"
+    FRANKFURT_XDP_IFACE="${ACTUAL_IFACE}"
+else
+    echo "  Match confirmed — XDP will attach to the correct interface."
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # Step 2b — OSPF convergence (opzionale, 30s timeout, SOLO informativo)
 #
 # Nota: questo check NON deve determinare l'IP usato per il test (Step 6).
