@@ -17,7 +17,7 @@ Compatibility notes with the existing codebase:
   - Uses common.py helpers: load_weights, attach_xdp, detach_xdp
   - Reads weights from weights.json (same file as Method 1/2/5)
   - Uses scale_factor from weights_float.json
-  - Attaches to INGRESS_IFACE (eth1), redirects to EGRESS_IFACE (eth2)
+  - Attaches to iface param (default: INGRESS_IFACE from common.py)
   - pkt_stats_t3, fwd_table_t3, valid_keys_t3 used as separate maps
   - All four programs (dispatcher + 3 layers) compiled from EBPF_MODULAR_FULL
     so BCC sees them as a single compilation unit — no separate .o files needed
@@ -59,14 +59,15 @@ def _build_fwd_action_t3(b: BPF, egress_ifindex: int):
     return action
 
 
-def _populate_fwd_t3(b: BPF, action, cp_weights: list, scale_factor: int):
+def _populate_fwd_t3(b: BPF, action, cp_weights: list, scale_factor: int,
+                     ingress_iface: str):
     """
     Pre-populate fwd_table_t3 and valid_keys_t3 for TTL 30-64.
     Key formula is identical to Pipeline 1/2 for fair comparison.
     """
     fwd    = b.get_table("fwd_table_t3")
     vk     = b.get_table("valid_keys_t3")
-    if_idx = socket.if_nametoindex(INGRESS_IFACE)
+    if_idx = socket.if_nametoindex(ingress_iface)
 
     for ttl in range(30, 65):
         iv = [42, ttl, if_idx, 65]
@@ -78,13 +79,21 @@ def _populate_fwd_t3(b: BPF, action, cp_weights: list, scale_factor: int):
         fwd[ctypes.c_ulonglong(key)] = action
         vk[ctypes.c_uint8(ttl)]      = ctypes.c_ulonglong(key)
 
-    print(f"[fwd_t3] fwd_table_t3 and valid_keys_t3 loaded for TTL 30-64 [integer/modular]")
+    print(f"[fwd_t3] fwd_table_t3 and valid_keys_t3 loaded for TTL 30-64 "
+          f"[integer/modular] iface={ingress_iface} ifindex={if_idx}")
 
 
-def run(model_id: int = 42):
+def run(model_id: int = 42, iface: str = None):
+    """
+    iface: network interface to attach XDP to.
+           Defaults to INGRESS_IFACE from common.py if not specified.
+           Pass the correct interface for the lab topology (e.g. 'eth0' for
+           darmstadt->frankfurt direct link l59 in lab.conf).
+    """
+    ingress_iface = iface if iface else INGRESS_IFACE
     weights_path = os.path.join(_SHARED_DIR, "weights.json")
     float_path   = os.path.join(_SHARED_DIR, "weights_float.json")
-    print(f"[Method 6 - Modular Pipeline] | model_id: {model_id}")
+    print(f"[Method 6 - Modular Pipeline] | model_id: {model_id} | iface: {ingress_iface}")
 
     if not os.path.exists(float_path):
         print(f"[ERROR] {float_path} not found. Run extract_weights.py first.")
@@ -99,6 +108,7 @@ def run(model_id: int = 42):
     integer_weights = load_weights(weights_path)
     print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
     print(f"  Total weights : {len(integer_weights)}")
+    print(f"  Ingress iface : {ingress_iface} (ifindex={socket.if_nametoindex(ingress_iface)})")
 
     # Compile all four eBPF functions from the combined source
     b = BPF(text=EBPF_MODULAR_FULL)
@@ -121,12 +131,12 @@ def run(model_id: int = 42):
     # Attach modular_dispatcher as the XDP entry point
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
 
-    # Populate forwarding tables
+    # Populate forwarding tables (use the actual ingress interface)
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     action = _build_fwd_action_t3(b, egress_ifindex)
-    _populate_fwd_t3(b, action, cp_weights, SCALE_FACTOR)
+    _populate_fwd_t3(b, action, cp_weights, SCALE_FACTOR, ingress_iface)
 
-    attach_xdp(b, fn_disp)
+    attach_xdp(b, fn_disp, iface=ingress_iface)
 
     print("[Method 6] Pipeline 3 (Modular) running. "
           "Stats: pkt_stats_t3 [HIT | FAKE | MISS]")
@@ -148,5 +158,5 @@ def run(model_id: int = 42):
             except Exception:
                 pass
     except KeyboardInterrupt:
-        detach_xdp(b)
+        detach_xdp(b, iface=ingress_iface)
         print("\n\nXDP removed. Exiting.")

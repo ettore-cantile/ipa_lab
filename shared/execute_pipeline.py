@@ -25,6 +25,7 @@ Note:
     - Richiede root (XDP attach)
     - Il modello .pt deve essere in shared/frr_germany50_5_model_4x2.pt
     - Methods 1-4 originali (PTQ, QAT, OpenFlow, IPA Demo) sono nel main branch
+    - extract_weights.py richiede torch; viene saltato se weights.json esiste gia'
 """
 
 import argparse
@@ -84,33 +85,48 @@ Per il benchmark comparativo completo:
     model_path = args.model or os.path.join(
         SHARED_DIR, "frr_germany50_5_model_4x2.pt"
     )
-    if not os.path.exists(model_path):
-        print(f"[ERROR] Model not found: {model_path}")
-        sys.exit(1)
 
     # ------------------------------------------------------------------
     # Step 1: extract weights (produces weights.json + weights_float.json)
+    # Skip if both files already exist — extract_weights.py requires torch
+    # which is NOT available inside Kathara containers.  The pre-built JSON
+    # files checked into the repo are sufficient for all three pipelines.
     # ------------------------------------------------------------------
+    weights_path = os.path.join(SHARED_DIR, "weights.json")
+    float_path   = os.path.join(SHARED_DIR, "weights_float.json")
+
     print("=" * 60)
     print(f"[pipeline] method={args.method}  iface={args.iface}  model_id={args.model_id}")
-    print(f"[pipeline] Step 1 — extracting weights from {model_path}")
     print("=" * 60)
-    runpy.run_path(
-        os.path.join(SHARED_DIR, "extract_weights.py"),
-        run_name="__main__"
-    )
-    weights_path = os.path.join(SHARED_DIR, "weights.json")
-    if not os.path.exists(weights_path):
-        print("[ERROR] weights.json not generated — exiting.")
-        sys.exit(1)
-    print(f"[pipeline] weights.json OK ({os.path.getsize(weights_path)} bytes)")
+
+    if os.path.exists(weights_path) and os.path.exists(float_path):
+        print(f"[pipeline] Step 1 — weights already present, skipping extract_weights.py")
+        print(f"[pipeline]   {weights_path} ({os.path.getsize(weights_path)} bytes)")
+        print(f"[pipeline]   {float_path} ({os.path.getsize(float_path)} bytes)")
+    else:
+        if not os.path.exists(model_path):
+            print(f"[ERROR] Model not found: {model_path}")
+            print(f"[ERROR] And weights.json / weights_float.json are also missing.")
+            print(f"[ERROR] Run extract_weights.py on a machine with torch, then commit the JSON files.")
+            sys.exit(1)
+        print(f"[pipeline] Step 1 — extracting weights from {model_path}")
+        runpy.run_path(
+            os.path.join(SHARED_DIR, "extract_weights.py"),
+            run_name="__main__"
+        )
+        if not os.path.exists(weights_path):
+            print("[ERROR] weights.json not generated — exiting.")
+            sys.exit(1)
+
+    print(f"[pipeline] weights.json OK")
 
     # ------------------------------------------------------------------
     # Step 2: launch the chosen pipeline
     # ------------------------------------------------------------------
     print()
     print("=" * 60)
-    print(f"[pipeline] Step 2 — launching Pipeline {'1' if args.method == 'hardcoded' else '2' if args.method == 'template' else '3'} ({args.method})")
+    pnum = {'hardcoded': '1', 'template': '2', 'modular': '3'}[args.method]
+    print(f"[pipeline] Step 2 — launching Pipeline {pnum} ({args.method})")
     print("=" * 60)
 
     if args.method == "hardcoded":
@@ -132,12 +148,12 @@ Per il benchmark comparativo completo:
     elif args.method == "template":
         # Pipeline 2 — architectural template, pesi in BPF_ARRAY
         from methods.method5_template import run
-        run(args.model_id)
+        run(model_id=args.model_id, iface=args.iface)
 
     else:
         # Pipeline 3 — modular layers, scratch map, N tail calls
         from methods.method6_modular import run
-        run(args.model_id)
+        run(model_id=args.model_id, iface=args.iface)
 
 
 if __name__ == "__main__":

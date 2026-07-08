@@ -5,7 +5,8 @@
 # NOTA: kathara exec intercetta QUALSIASI argomento "-c" nella riga di comando,
 # inclusi quelli destinati a ping, python3, ecc.
 # Tutti i comandi con "-c" o con ridirezioni vanno wrappati in uno script
-# scritto nel container via tee e poi eseguito con bash.
+# scritto nel container.  kscript() usa 'cat >' tramite sh -c passato come
+# file di input a bash, bypassando la trappola di kathara exec.
 # =============================================================================
 
 METHOD=${1:-hardcoded}
@@ -14,10 +15,11 @@ PACKET_COUNT=100
 INTERVAL=0.002
 WEIGHTS="/shared/weights.json"
 
-# IP di frankfurt ricavato da lab.conf: darmstadt[0]=l59, frankfurt[1]=l59
-# -> eth0 di darmstadt e' il link diretto a frankfurt
-# L'IP loopback di frankfurt usato da OSPF e' 10.255.255.17 (da /etc/hosts)
+# IP e interfaccia di darmstadt->frankfurt da lab.conf:
+#   darmstadt[0]="l59"  frankfurt[1]="l59"  => eth0 su darmstadt e' il link diretto
+#   10.255.255.17 e' il loopback OSPF di frankfurt (da /etc/hosts del container)
 FRANKFURT_IP="10.255.255.17"
+INGRESS_IFACE="eth0"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -30,16 +32,25 @@ echo -e "${GREEN}============================================================${N
 echo
 
 # ---------------------------------------------------------------------------
-# kscript <node> <remote_path>
-# Legge il body da stdin e lo scrive nel container tramite tee.
-# NON usare per comandi con flag -c: kathara li intercetta.
+# kscript <node> <remote_path> <content>
+# Scrive uno script nel container riga per riga via 'kathara exec <node> sh'
+# usando input redirect da process substitution — nessun flag -c a kathara.
+# Strategia: passiamo il contenuto come stdin a 'sh' con uno script wrapper
+# che usa 'cat >' per scrivere il file.  Funziona su qualsiasi immagine
+# Kathara perché usa solo sh/cat, non tee o altri strumenti opzionali.
 # ---------------------------------------------------------------------------
 kscript() {
-    local node=$1
-    local path=$2
-    local body
-    body=$(cat)
-    printf '%s\n' "$body" | kathara exec "$node" tee "$path" > /dev/null
+    local node="$1"
+    local path="$2"
+    local content="$3"
+    # Encode content to base64 to avoid any quoting/escaping issues
+    local b64
+    b64=$(printf '%s' "$content" | base64 -w0 2>/dev/null || printf '%s' "$content" | base64)
+    # Write via: echo <b64> | base64 -d > <path>  — all via stdin to sh
+    kathara exec "$node" sh << WRAPPER
+echo '${b64}' | base64 -d > ${path}
+chmod +x ${path}
+WRAPPER
 }
 
 # ---------------------------------------------------------------------------
@@ -55,23 +66,23 @@ echo "  frankfurt: UP"
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 2: Convergenza OSPF
-# Scriviamo lo script di ping via kscript, poi lo eseguiamo con bash.
-# kscript usa tee (nessun flag -c a kathara).
-# Il ping usa l'IP loopback di frankfurt (10.255.255.17) noto da lab.conf.
+# STEP 2: Convergenza OSPF — ping diretto via kathara exec
+# Nota: kathara exec intercetta solo flag che cominciano con '-'
+# passati DIRETTAMENTE a kathara. Il '--' separa gli argomenti di kathara
+# da quelli del comando remoto, ma ping con -c viene comunque intercettato.
+# Usiamo kscript per scrivere lo script e poi 'bash <path>' per eseguirlo.
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2] Waiting for OSPF convergence (frankfurt=${FRANKFURT_IP})...${NC}"
 
-kscript darmstadt /tmp/ping_frankfurt.sh << PINGSCRIPT
-#!/bin/sh
+kscript darmstadt /tmp/ping_fkt.sh "#!/bin/sh
 ping -c 1 -W 2 ${FRANKFURT_IP} > /dev/null 2>&1 && echo OK || echo FAIL
-PINGSCRIPT
+"
 
 CONVERGED=0
 for i in $(seq 1 30); do
-    RESULT=$(kathara exec darmstadt bash /tmp/ping_frankfurt.sh 2>/dev/null)
-    if echo "$RESULT" | grep -q "OK"; then
-        echo "  frankfurt (${FRANKFURT_IP}) reachable"
+    RESULT=$(kathara exec darmstadt bash /tmp/ping_fkt.sh 2>/dev/null | tr -d '\r\n')
+    if [ "$RESULT" = "OK" ]; then
+        echo "  frankfurt (${FRANKFURT_IP}) reachable — OSPF converged"
         CONVERGED=1
         break
     fi
@@ -81,8 +92,7 @@ done
 
 if [ $CONVERGED -eq 0 ]; then
     echo
-    echo -e "${RED}  ERROR: frankfurt (${FRANKFURT_IP}) unreachable after 30s.${NC}"
-    echo -e "${RED}  Verifica: kathara exec darmstadt -- ping frankfurt${NC}"
+    echo -e "${RED}  ERROR: frankfurt unreachable after 30s. Check OSPF / kathara lstart.${NC}"
     echo "TEST FAILED"
     exit 1
 fi
@@ -92,11 +102,11 @@ echo
 # STEP 3: Receiver su frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 3] Starting IPA receiver on frankfurt...${NC}"
-kscript frankfurt /tmp/run_recv.sh << RECVSCRIPT
-#!/bin/sh
+
+kscript frankfurt /tmp/run_recv.sh "#!/bin/sh
 python3 /shared/recv_ipa.py --timeout 60 --count ${PACKET_COUNT} > /tmp/recv_ipa.log 2>&1 &
 echo \$! > /tmp/recv_ipa.pid
-RECVSCRIPT
+"
 kathara exec frankfurt bash /tmp/run_recv.sh
 echo "  recv_ipa.py started (log: /tmp/recv_ipa.log)"
 sleep 2
@@ -104,27 +114,27 @@ echo
 
 # ---------------------------------------------------------------------------
 # STEP 4: Carica pipeline su darmstadt
-# NOTE: --iface eth0 e' il link diretto verso frankfurt (l59 in lab.conf)
+# --iface eth0: darmstadt[0]=l59 -> eth0 e' il link diretto verso frankfurt
 # ---------------------------------------------------------------------------
-echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (eth0)...${NC}"
-kscript darmstadt /tmp/run_pipeline.sh << PIPESCRIPT
-#!/bin/sh
-python3 /shared/execute_pipeline.py --method ${METHOD} --iface eth0 --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &
+echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (${INGRESS_IFACE})...${NC}"
+
+kscript darmstadt /tmp/run_pipeline.sh "#!/bin/sh
+python3 /shared/execute_pipeline.py --method ${METHOD} --iface ${INGRESS_IFACE} --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &
 echo \$! > /tmp/pipeline.pid
-PIPESCRIPT
+"
 kathara exec darmstadt bash /tmp/run_pipeline.sh
-echo "  Pipeline started - waiting 4s for XDP attach..."
-sleep 4
+echo "  Pipeline started — waiting 5s for XDP attach..."
+sleep 5
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 5: Popola BPF maps
+# STEP 5: Popola BPF maps (setup_fwd_table)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 5] Populating BPF maps on darmstadt...${NC}"
-kscript darmstadt /tmp/setup_maps.sh << MAPSCRIPT
-#!/bin/sh
-python3 /shared/setup_fwd_table.py --model-id ${MODEL_ID}
-MAPSCRIPT
+
+kscript darmstadt /tmp/setup_maps.sh "#!/bin/sh
+python3 /shared/setup_fwd_table.py --model-id ${MODEL_ID} 2>&1
+"
 kathara exec darmstadt bash /tmp/setup_maps.sh
 echo
 
@@ -132,36 +142,36 @@ echo
 # STEP 6: Invia pacchetti IPA da darmstadt verso frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt -> frankfurt...${NC}"
-kscript darmstadt /tmp/send_ipa.sh << SENDSCRIPT
-#!/bin/sh
-python3 /shared/send_ipa.py --dst frankfurt --count ${PACKET_COUNT} --model-id ${MODEL_ID} --weights ${WEIGHTS} --interval ${INTERVAL}
-SENDSCRIPT
+
+kscript darmstadt /tmp/send_ipa.sh "#!/bin/sh
+python3 /shared/send_ipa.py --dst ${FRANKFURT_IP} --count ${PACKET_COUNT} --model-id ${MODEL_ID} --weights ${WEIGHTS} --interval ${INTERVAL} 2>&1
+"
 kathara exec darmstadt bash /tmp/send_ipa.sh
 echo
 
 # ---------------------------------------------------------------------------
-# STEP 7: Log receiver su frankfurt
+# STEP 7: Risultati receiver su frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 7] Results on frankfurt:${NC}"
 sleep 2
-kathara exec frankfurt cat /tmp/recv_ipa.log || echo "  (log not available)"
+kathara exec frankfurt cat /tmp/recv_ipa.log 2>/dev/null || echo "  (log not available)"
 echo
 
 # ---------------------------------------------------------------------------
 # STEP 8: Log pipeline su darmstadt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 8] Pipeline log on darmstadt:${NC}"
-kathara exec darmstadt cat /tmp/pipeline.log || echo "  (no log)"
+kathara exec darmstadt cat /tmp/pipeline.log 2>/dev/null || echo "  (no log)"
 echo
 
 # ---------------------------------------------------------------------------
 # STEP 9: BPF map stats (informational)
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 9] BPF map stats on darmstadt:${NC}"
-kscript darmstadt /tmp/bpf_stats.sh << 'STATSSCRIPT'
-#!/bin/sh
+
+kscript darmstadt /tmp/bpf_stats.sh "#!/bin/sh
 bpftool map show 2>/dev/null | grep -E 'name|entries' || echo '  (no maps loaded)'
-STATSSCRIPT
+"
 kathara exec darmstadt bash /tmp/bpf_stats.sh
 echo
 
@@ -170,18 +180,20 @@ echo
 # run_pipeline_test.sh cerca questa stringa esatta nell'output.
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 10] Verifying packet counts...${NC}"
-kscript frankfurt /tmp/check_recv.sh << 'CHECKSCRIPT'
-#!/bin/sh
+
+kscript frankfurt /tmp/check_recv.sh "#!/bin/sh
 LOG=/tmp/recv_ipa.log
-if [ ! -f "$LOG" ]; then
-    echo "RECV_COUNT=0"
+if [ ! -f \"\$LOG\" ]; then
+    echo 'RECV_COUNT=0'
 else
-    CNT=$(grep -c "Received IPA" "$LOG" 2>/dev/null || echo 0)
-    echo "RECV_COUNT=${CNT}"
+    CNT=\$(grep -c 'recv_ipa' \"\$LOG\" 2>/dev/null || echo 0)
+    echo \"RECV_COUNT=\${CNT}\"
 fi
-CHECKSCRIPT
+"
 RECV_LINE=$(kathara exec frankfurt bash /tmp/check_recv.sh 2>/dev/null | tr -d '\r')
-RECV_COUNT=$(echo "$RECV_LINE" | grep -oP '(?<=RECV_COUNT=)\d+' || echo 0)
+RECV_COUNT=$(echo "$RECV_LINE" | grep -oP '(?<=RECV_COUNT=)\d+' 2>/dev/null || echo 0)
+[ -z "$RECV_COUNT" ] && RECV_COUNT=0
+
 echo "  Packets sent    : ${PACKET_COUNT}"
 echo "  Packets received: ${RECV_COUNT}"
 
@@ -191,7 +203,8 @@ echo
 echo -e "${GREEN}============================================================${NC}"
 echo -e "${GREEN} Test complete! Method: ${METHOD}${NC}"
 echo -e "${GREEN}============================================================${NC}"
-if [ "${RECV_COUNT:-0}" -ge "${THRESHOLD}" ] 2>/dev/null; then
+
+if [ "${RECV_COUNT}" -ge "${THRESHOLD}" ] 2>/dev/null; then
     echo -e "${GREEN}TEST PASSED - received ${RECV_COUNT}/${PACKET_COUNT} packets (>= ${THRESHOLD} threshold)${NC}"
     echo "TEST PASSED"
 else
