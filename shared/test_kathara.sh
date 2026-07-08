@@ -73,6 +73,31 @@ echo "  frankfurt:  UP"
 echo
 
 # ---------------------------------------------------------------------------
+# Step 1-bis — Dump iptables/nftables runtime su entrambi i nodi
+#
+# lab.conf conferma che darmstadt[0] e frankfurt[1] condividono lo stesso
+# collision domain "l59" (cablaggio corretto), e il fix del checksum
+# offload (ethtool) non ha risolto nulla. Il pattern osservato -- i
+# pacchetti UDP spariscono PRIMA di essere visibili a tcpdump sul lato
+# ricevente, mentre ICMP passa sempre -- e' la firma tipica di un filtro
+# netfilter (iptables/nftables) applicato al bridge del collision domain o
+# dentro il container stesso (magari gia' presente nell'immagine base
+# kathara/frr_ebpf, non aggiunto dagli startup script che ho gia'
+# controllato). Qui dumpiamo lo stato RUNTIME (non gli script di avvio)
+# per vedere se esiste una regola che droppa UDP specificamente.
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 1-bis] Dumping iptables/nftables runtime state on both nodes...${NC}"
+echo "  --- darmstadt: iptables -L -n -v ---"
+krun darmstadt "iptables -L -n -v 2>&1 || echo 'iptables not available'"
+echo "  --- darmstadt: nft list ruleset ---"
+krun darmstadt "nft list ruleset 2>&1 || echo 'nft not available'"
+echo "  --- frankfurt: iptables -L -n -v ---"
+krun frankfurt "iptables -L -n -v 2>&1 || echo 'iptables not available'"
+echo "  --- frankfurt: nft list ruleset ---"
+krun frankfurt "nft list ruleset 2>&1 || echo 'nft not available'"
+echo
+
+# ---------------------------------------------------------------------------
 # Step 2a — Link diretto darmstadt -> frankfurt
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2a] Checking direct link darmstadt -> frankfurt (${FRANKFURT_DIRECT})...${NC}"
