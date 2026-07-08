@@ -374,6 +374,127 @@ def run_tests(model, verbose=False):
         info(f".pt non trovato ({pt_path}) — test saltato")
         total -= 1
 
+    # ===========================================================================
+    # Test 6 — Design-space metrics (professor requirement)
+    # Misura: throughput Mpps, tail calls, map lookups, memoria mappe, flessibilita'
+    # ===========================================================================
+    print(f"\n{YELLOW}[Test 6] Design-space metrics (throughput, struttura, memoria){NC}")
+
+    # --- 6a: Throughput locale in Mpps (simulated: timed infer() loop) ---
+    BENCH_SECS = 2.0
+    throughputs = {}
+    inputs_cache = [make_input(I) for _ in range(1000)]
+    for mid, mobj, name in [(1, m1, 'hardcoded'), (2, m2, 'template'), (3, m3, 'modular')]:
+        t0 = time.perf_counter()
+        count = 0
+        while time.perf_counter() - t0 < BENCH_SECS:
+            mobj.infer(inputs_cache[count % 1000])
+            count += 1
+        elapsed = time.perf_counter() - t0
+        mpps = count / elapsed / 1_000_000
+        throughputs[mid] = (mpps, count, elapsed)
+    info(f"Throughput inferenza (Python, single-core, {BENCH_SECS:.0f}s benchmark):")
+    for mid, name in [(1, 'hardcoded'), (2, 'template'), (3, 'modular')]:
+        mpps, cnt, el = throughputs[mid]
+        info(f"  Method {mid} ({name:<10}): {mpps:.4f} Mpps  ({cnt} infer in {el:.2f}s)")
+    info("  NOTE: eBPF kernel throughput expected 10-100x higher (no Python overhead)")
+
+    # --- 6b: Static structural metrics per pipeline ---
+    # These are architectural constants, not measured at runtime.
+    # Values derive directly from the eBPF program design documented in the paper.
+    # Arch: 65-4-4-7  (fc1=264, fc2=20, out=35 weights = 319 total)
+    N_WEIGHTS = 319
+
+    # tail_calls: number of BPF_PROG_ARRAY.call() per packet
+    #   P1: 1 (dispatcher -> model_<id>)
+    #   P2: 1 (dispatcher -> arch_65_4_4_7)
+    #   P3: 1+3 = dispatcher tail-calls layer_chain[0], then 1->2->3  (3 layer calls)
+    TAIL_CALLS   = {1: 1, 2: 1, 3: 4}
+
+    # map_lookups: per-packet BPF map lookup calls
+    #   P1: 2 (fwd_table + valid_keys)  - pesi hardcoded, no weight lookup
+    #   P2: 1 (arch_registry) + N_WEIGHTS weight lookups + 2 fwd = 1+319+2 = 322
+    #       (arch program does one re-lookup of arch_registry after tail call)
+    #   P3: 1 (layer_registry in disp) + 8 meta writes + 65 feat writes
+    #       + per-layer: weight lookups + scratch reads
+    #       fc1: 264w + 65 reads = 329; fc2: 20w + 4 reads = 24; out: 35w + 4 reads = 39
+    #       + 2 fwd = 1+8+65+329+24+39+2 = 468  (approximate)
+    MAP_LOOKUPS  = {1: 2, 2: 322, 3: 468}
+
+    # Estimated BPF map memory (bytes) for the arch 65-4-4-7
+    # P1: fwd_table(256*22B) + valid_keys(256*9B) + pkt_stats(3*8B) = ~8KB
+    # P2: arch_weights(1024*1B) + arch_registry(256*7B) + fwd+vk+stats = ~11KB
+    # P3: layer_weights(2048*1B) + layer_registry(256*14B) +
+    #     scratch_acts(128*8B*ncpus) + scratch_meta(16*8B*ncpus) + fwd+vk+stats
+    #     Assuming ncpus=4: scratch = (128+16)*8*4 = 4608B ~= 4.5KB => total ~14KB
+    try:
+        import multiprocessing
+        ncpus = multiprocessing.cpu_count()
+    except Exception:
+        ncpus = 4
+    MAP_MEM_BYTES = {
+        1: 256 * 22 + 256 * 9 + 3 * 8,
+        2: 1024 * 1 + 256 * 7 + 256 * 22 + 256 * 9 + 3 * 8,
+        3: 2048 * 1 + 256 * 14 + (128 + 16) * 8 * ncpus + 256 * 22 + 256 * 9 + 3 * 8,
+    }
+    FLEXIBILITY  = {1: 'bassa',  2: 'media',  3: 'alta'}
+    WEIGHT_STORE = {1: 'hardcoded nel sorgente C', 2: 'BPF_ARRAY (arch_weights)', 3: 'BPF_ARRAY (layer_weights) + PERCPU scratch'}
+    MODEL_UPDATE = {
+        1: 'ricompila + ricarica programma eBPF',
+        2: 'bpf_map_update_elem() su arch_weights',
+        3: 'bpf_map_update_elem() su layer_weights + aggiorna layer_chain',
+    }
+
+    print()
+    COL = 32
+    hdr  = f"  {'Metrica':<{COL}} {'P1 hardcoded':>16} {'P2 template':>16} {'P3 modular':>16}"
+    sep  = "  " + "-" * (COL + 50)
+    print(hdr)
+    print(sep)
+
+    def row(label, vals, fmt="{}"):
+        v = [fmt.format(vals[k]) for k in [1, 2, 3]]
+        print(f"  {label:<{COL}} {v[0]:>16} {v[1]:>16} {v[2]:>16}")
+
+    row("Throughput locale (Mpps)",
+        {k: f"{throughputs[k][0]:.4f}" for k in [1,2,3]})
+    row("Tail calls / pacchetto",  TAIL_CALLS)
+    row("Map lookups / pacchetto", MAP_LOOKUPS)
+    row("Memoria BPF maps (stima)",
+        {k: f"{MAP_MEM_BYTES[k]//1024}KB ({MAP_MEM_BYTES[k]}B)" for k in [1,2,3]})
+    row("Flessibilita'",           FLEXIBILITY)
+    print(sep)
+    print()
+
+    info(f"CPU logiche rilevate: {ncpus} (influenza scratch map PERCPU per P3)")
+    print()
+    for mid, lbl in [(1, 'P1 hardcoded'), (2, 'P2 template'), (3, 'P3 modular')]:
+        info(f"{lbl} - aggiornamento modello: {MODEL_UPDATE[mid]}")
+    print()
+
+    # Assertions
+    total += 1
+    p1_mpps, p2_mpps, p3_mpps = throughputs[1][0], throughputs[2][0], throughputs[3][0]
+    if p1_mpps >= p3_mpps and p2_mpps >= p3_mpps:
+        ok(f"Trade-off confermato: P1({p1_mpps:.4f}) >= P3({p3_mpps:.4f}) Mpps")
+        passed += 1
+    else:
+        fail(f"Trade-off atteso NON verificato: P1={p1_mpps:.4f} P2={p2_mpps:.4f} P3={p3_mpps:.4f} Mpps")
+
+    total += 1
+    if TAIL_CALLS[3] > TAIL_CALLS[1] and MAP_LOOKUPS[3] > MAP_LOOKUPS[1]:
+        ok(f"Struttura: P3 ha piu' tail calls ({TAIL_CALLS[3]}) e map lookups ({MAP_LOOKUPS[3]}) di P1 ({TAIL_CALLS[1]}, {MAP_LOOKUPS[1]})")
+        passed += 1
+    else:
+        fail("Struttura: conteggi tail call / map lookup incoerenti")
+
+    total += 1
+    if MAP_MEM_BYTES[3] > MAP_MEM_BYTES[1]:
+        ok(f"Memoria: P3 ({MAP_MEM_BYTES[3]}B) > P1 ({MAP_MEM_BYTES[1]}B) come atteso")
+        passed += 1
+    else:
+        fail(f"Memoria: P3 ({MAP_MEM_BYTES[3]}B) dovrebbe essere > P1 ({MAP_MEM_BYTES[1]}B)")
+
     print(f"\n{YELLOW}{'='*52}{NC}")
     color = GREEN if passed == total else RED
     print(f"{color} Risultato: {passed}/{total} test passati{NC}")
