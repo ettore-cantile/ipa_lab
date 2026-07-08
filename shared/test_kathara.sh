@@ -1,6 +1,15 @@
 #!/bin/bash
 # =============================================================================
 # test_kathara.sh  —  Test IPA su Kathara: darmstadt -> frankfurt
+#
+# Usage: bash shared/test_kathara.sh [hardcoded|template|modular]
+#
+# Fix log:
+#   - INGRESS_IFACE aligned to eth1 (matches common.py / execute_pipeline.py)
+#   - kexec helper replaced with inline kathara exec -- sh -c "..."
+#     to avoid bash-not-found on Debian-slim containers and temp-file races
+#   - Direct link checked first (10.0.0.234); OSPF (10.255.255.17) optional
+#   - Step 10 emits TEST PASSED / TEST FAILED with exit code
 # =============================================================================
 
 METHOD=${1:-hardcoded}
@@ -12,7 +21,11 @@ WEIGHTS="/shared/weights.json"
 FRANKFURT_DIRECT="10.0.0.234"
 FRANKFURT_OSPF="10.255.255.17"
 FRANKFURT_IP="${FRANKFURT_DIRECT}"
-INGRESS_IFACE="eth0"
+
+# INGRESS_IFACE must match common.py (eth1 = ingress toward frankfurt on l58)
+# XDP is attached to eth1 by execute_pipeline.py.
+# eth0 is the management/loopback-facing interface on darmstadt.
+INGRESS_IFACE="eth1"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -24,23 +37,15 @@ echo -e "${GREEN} IPA Kathara Test: darmstadt -> frankfurt  [${METHOD}]${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo
 
-kscript() {
+# ---------------------------------------------------------------------------
+# krun NODE CMD  — run CMD inline inside NODE via kathara exec.
+# Uses 'sh -c' to avoid any dependency on bash inside the container and
+# eliminates the temp-file race that kscript + kexec had.
+# ---------------------------------------------------------------------------
+krun() {
     local node="$1"
-    local path="$2"
-    local content="$3"
-    local b64
-    b64=$(printf '%s' "${content}" | base64 -w0 2>/dev/null || printf '%s' "${content}" | base64)
-    local bootstrap
-    bootstrap="echo '${b64}' | base64 -d > '${path}'; chmod +x '${path}'"
-    kathara exec "${node}" -- sh < <(printf '%s\n' "${bootstrap}")
-}
-
-kexec() {
-    kathara exec "${1}" -- bash "${2}"
-}
-
-kcat() {
-    kathara exec "${1}" -- cat "${2}"
+    shift
+    kathara exec "${node}" -- sh -c "$*"
 }
 
 echo -e "${YELLOW}[Step 1] Checking Kathara containers...${NC}"
@@ -52,13 +57,13 @@ echo "  darmstadt: UP"
 echo "  frankfurt: UP"
 echo
 
+# ---------------------------------------------------------------------------
+# Step 2a — Direct link check (required)
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2a] Checking direct link darmstadt->frankfurt (${FRANKFURT_DIRECT})...${NC}"
-kscript darmstadt /tmp/ping_direct.sh "#!/bin/sh
-ping -c 1 -W 2 ${FRANKFURT_DIRECT} > /dev/null 2>&1 && echo OK || echo FAIL
-"
 DIRECT_OK=0
 for i in $(seq 1 15); do
-    RESULT=$(kexec darmstadt /tmp/ping_direct.sh 2>/dev/null | tr -d '\r\n')
+    RESULT=$(krun darmstadt "ping -c 1 -W 2 ${FRANKFURT_DIRECT} > /dev/null 2>&1 && echo OK || echo FAIL" 2>/dev/null | tr -d '\r\n')
     if [ "${RESULT}" = "OK" ]; then
         echo "  Direct link ${FRANKFURT_DIRECT} reachable — containers OK"
         DIRECT_OK=1
@@ -70,20 +75,27 @@ done
 if [ ${DIRECT_OK} -eq 0 ]; then
     echo
     echo -e "${RED}  ERROR: Direct link ${FRANKFURT_DIRECT} unreachable after 15s.${NC}"
-    echo -e "${RED}  Verify lab.conf: darmstadt[0]=l59, frankfurt[1]=l59${NC}"
-    echo -e "${RED}  Check IP: kathara exec darmstadt -- ip addr show eth0${NC}"
+    echo
+    echo "  Troubleshooting:"
+    echo "    1) Verify darmstadt eth0 has 10.0.0.233/30:"
+    echo "         kathara exec darmstadt -- ip addr show"
+    echo "    2) Verify frankfurt  eth1 has 10.0.0.234/30:"
+    echo "         kathara exec frankfurt  -- ip addr show"
+    echo "    3) Confirm lab.conf link: darmstadt[0]=A, frankfurt[1]=A"
+    echo "         (both on the same collision domain)"
+    echo
     echo "TEST FAILED"
     exit 1
 fi
 echo
 
+# ---------------------------------------------------------------------------
+# Step 2b — OSPF convergence (optional, 30 s timeout)
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 2b] Checking optional OSPF convergence (${FRANKFURT_OSPF}, up to 30s)...${NC}"
-kscript darmstadt /tmp/ping_ospf.sh "#!/bin/sh
-ping -c 1 -W 2 ${FRANKFURT_OSPF} > /dev/null 2>&1 && echo OK || echo FAIL
-"
 CONVERGED=0
 for i in $(seq 1 30); do
-    RESULT=$(kexec darmstadt /tmp/ping_ospf.sh 2>/dev/null | tr -d '\r\n')
+    RESULT=$(krun darmstadt "ping -c 1 -W 2 ${FRANKFURT_OSPF} > /dev/null 2>&1 && echo OK || echo FAIL" 2>/dev/null | tr -d '\r\n')
     if [ "${RESULT}" = "OK" ]; then
         echo "  OSPF converged at ${i}s — ${FRANKFURT_OSPF} reachable"
         CONVERGED=1
@@ -95,86 +107,91 @@ for i in $(seq 1 30); do
 done
 if [ ${CONVERGED} -eq 0 ]; then
     echo
-    echo "  OSPF not ready yet — continuing with direct link ${FRANKFURT_DIRECT}"
+    echo "  OSPF not ready — continuing with direct link ${FRANKFURT_DIRECT}"
 fi
 echo
 
+# ---------------------------------------------------------------------------
+# Step 3 — Start IPA receiver on frankfurt
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 3] Starting IPA receiver on frankfurt...${NC}"
-kscript frankfurt /tmp/run_recv.sh "#!/bin/sh
-python3 /shared/recv_ipa.py --timeout 60 --count ${PACKET_COUNT} > /tmp/recv_ipa.log 2>&1 &
-echo \$! > /tmp/recv_ipa.pid
-echo \"recv_ipa.py started (pid=\$!)\"
-"
-kexec frankfurt /tmp/run_recv.sh
+krun frankfurt "python3 /shared/recv_ipa.py --timeout 60 --count ${PACKET_COUNT} > /tmp/recv_ipa.log 2>&1 & echo \$! > /tmp/recv_ipa.pid && echo 'recv_ipa.py started'"
 sleep 2
 echo
 
+# ---------------------------------------------------------------------------
+# Step 4 — Load pipeline on darmstadt
+# execute_pipeline.py attaches XDP to INGRESS_IFACE (eth1).
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 4] Loading pipeline '${METHOD}' on darmstadt (iface=${INGRESS_IFACE})...${NC}"
-kscript darmstadt /tmp/run_pipeline.sh "#!/bin/sh
-python3 /shared/execute_pipeline.py --method ${METHOD} --iface ${INGRESS_IFACE} --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 &
-echo \$! > /tmp/pipeline.pid
-echo \"Pipeline started (pid=\$!)\"
-"
-kexec darmstadt /tmp/run_pipeline.sh
+krun darmstadt "python3 /shared/execute_pipeline.py --method ${METHOD} --iface ${INGRESS_IFACE} --model-id ${MODEL_ID} > /tmp/pipeline.log 2>&1 & echo \$! > /tmp/pipeline.pid && echo 'Pipeline started'"
 echo "  Waiting 6s for XDP attach..."
 sleep 6
 echo
 
+# ---------------------------------------------------------------------------
+# Step 5 — Pipeline startup check
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 5] Pipeline startup check:${NC}"
-kscript darmstadt /tmp/check_pipeline.sh "#!/bin/sh
-LOG=/tmp/pipeline.log
-if [ ! -f \"\$LOG\" ]; then
-    echo 'PIPELINE_STATUS=NOT_STARTED'
-elif grep -qi 'error\|traceback\|exception' \"\$LOG\"; then
-    echo 'PIPELINE_STATUS=ERROR'
+STATUS_LINE=$(krun darmstadt "
+if [ ! -f /tmp/pipeline.log ]; then
+    echo PIPELINE_STATUS=NOT_STARTED
+elif grep -qi 'error\\|traceback\\|exception' /tmp/pipeline.log; then
+    echo PIPELINE_STATUS=ERROR
 else
-    echo 'PIPELINE_STATUS=OK'
+    echo PIPELINE_STATUS=OK
 fi
-"
-STATUS_LINE=$(kexec darmstadt /tmp/check_pipeline.sh 2>/dev/null | tr -d '\r')
+" 2>/dev/null | tr -d '\r')
 echo "  ${STATUS_LINE}"
 if echo "${STATUS_LINE}" | grep -q 'ERROR\|NOT_STARTED'; then
     echo -e "${RED}  Pipeline failed. Full log:${NC}"
-    kcat darmstadt /tmp/pipeline.log
+    krun darmstadt "cat /tmp/pipeline.log"
     echo "TEST FAILED"
     exit 1
 fi
 echo
 
-echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt -> frankfurt (${FRANKFURT_IP})...${NC}"
-kscript darmstadt /tmp/send_ipa.sh "#!/bin/sh
-python3 /shared/send_ipa.py --dst ${FRANKFURT_IP} --count ${PACKET_COUNT} --model-id ${MODEL_ID} --weights ${WEIGHTS} --interval ${INTERVAL} 2>&1
-"
-kexec darmstadt /tmp/send_ipa.sh
+# ---------------------------------------------------------------------------
+# Step 6 — Send IPA packets
+# ---------------------------------------------------------------------------
+echo -e "${YELLOW}[Step 6] Sending ${PACKET_COUNT} IPA packets: darmstadt -> ${FRANKFURT_IP}...${NC}"
+krun darmstadt "python3 /shared/send_ipa.py --dst ${FRANKFURT_IP} --count ${PACKET_COUNT} --model-id ${MODEL_ID} --weights ${WEIGHTS} --interval ${INTERVAL} 2>&1"
 echo
 
+# ---------------------------------------------------------------------------
+# Step 7 — Receiver log
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 7] Receiver log on frankfurt:${NC}"
 sleep 2
-kcat frankfurt /tmp/recv_ipa.log 2>/dev/null || echo "  (log not available)"
+krun frankfurt "cat /tmp/recv_ipa.log 2>/dev/null || echo '(log not available)'"
 echo
 
+# ---------------------------------------------------------------------------
+# Step 8 — Pipeline log
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 8] Pipeline log on darmstadt:${NC}"
-kcat darmstadt /tmp/pipeline.log 2>/dev/null || echo "  (no log)"
+krun darmstadt "cat /tmp/pipeline.log 2>/dev/null || echo '(no log)'"
 echo
 
+# ---------------------------------------------------------------------------
+# Step 9 — BPF map stats
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 9] BPF map stats on darmstadt:${NC}"
-kscript darmstadt /tmp/bpf_stats.sh "#!/bin/sh
-bpftool map show 2>/dev/null | grep -E 'name|entries' || echo '  (no maps loaded)'
-"
-kexec darmstadt /tmp/bpf_stats.sh
+krun darmstadt "bpftool map show 2>/dev/null | grep -E 'name|entries' || echo '(no maps loaded)'"
 echo
 
+# ---------------------------------------------------------------------------
+# Step 10 — Verify packet counts (TEST PASSED / TEST FAILED)
+# ---------------------------------------------------------------------------
 echo -e "${YELLOW}[Step 10] Verifying packet counts...${NC}"
-kscript frankfurt /tmp/check_recv.sh "#!/bin/sh
-LOG=/tmp/recv_ipa.log
-if [ ! -f \"\$LOG\" ]; then
-    echo 'RECV_COUNT=0'
+RECV_LINE=$(krun frankfurt "
+if [ ! -f /tmp/recv_ipa.log ]; then
+    echo RECV_COUNT=0
 else
-    CNT=\$(grep -ci 'received\|recv\|packet' \"\$LOG\" 2>/dev/null || echo 0)
-    echo \"RECV_COUNT=\${CNT}\"
+    CNT=\$(grep -ci 'received\\|recv\\|packet' /tmp/recv_ipa.log 2>/dev/null || echo 0)
+    echo RECV_COUNT=\${CNT}
 fi
-"
-RECV_LINE=$(kexec frankfurt /tmp/check_recv.sh 2>/dev/null | grep RECV_COUNT | tr -d '\r')
+" 2>/dev/null | grep RECV_COUNT | tr -d '\r')
 RECV_COUNT=$(echo "${RECV_LINE}" | grep -oE '[0-9]+$' || echo 0)
 [ -z "${RECV_COUNT}" ] && RECV_COUNT=0
 THRESHOLD=$((PACKET_COUNT * 80 / 100))
