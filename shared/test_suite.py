@@ -17,13 +17,18 @@ Suite disponibili (--only):
   extract  : coerenza extract_weights.py / weights.json / dequant [ex test_extract_weights]
   quant    : accuracy argmax vs scale_factor (PTQ trade-off)   [ex test_quantization_accuracy]
   robust   : input edge-case, nessun crash, argmax valido       [ex test_robustness]
+  kernel   : metriche IN-KERNEL via BPF_PROG_TEST_RUN — #istruzioni eBPF,
+             latenza per-pacchetto, throughput Mpps, CPU%, + gate di dispatch
+             reale (ex verify_prog_run). Richiede Linux + BCC + root; altrove
+             viene saltata con grazia (non fa fallire la run).
   all      : tutte (default)
 
 Utilizzo:
-  python3 shared/test_suite.py                       # tutte le suite
+  python3 shared/test_suite.py                       # tutte le suite (kernel salta se no BCC)
   python3 shared/test_suite.py --only core --verbose
   python3 shared/test_suite.py --only quant --samples 200
-  python3 shared/test_suite.py --model shared/frr_germany50_5_model_4x2.pt
+  sudo python3 shared/test_suite.py --only kernel    # metriche kernel (root)
+  kathara exec frankfurt -- python3 /shared/test_suite.py --only kernel
 """
 
 import argparse
@@ -1058,6 +1063,138 @@ def suite_robust():
 # ===========================================================================
 # Driver
 # ===========================================================================
+# SUITE kernel — metriche in-kernel via BPF_PROG_TEST_RUN (richiede Linux+BCC+root)
+#   Copre le metriche del professore non ottenibili in userspace:
+#   #istruzioni eBPF, latenza per-pacchetto reale, throughput Mpps, CPU%.
+#   Include anche il gate di correttezza del dispatch (verify_prog_run.run).
+#   Degrada con grazia (return True = skip, non fail) dove BCC/root mancano.
+# ===========================================================================
+def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=True):
+    print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (istruzioni, latenza, throughput, CPU) ==={NC}\n")
+
+    if not sys.platform.startswith("linux"):
+        info(f"kernel suite saltata: piattaforma {sys.platform} (serve Linux).")
+        info("Esegui in Kathara / host Linux: sudo python3 shared/test_suite.py --only kernel")
+        return True
+
+    try:
+        import verify_prog_run as V
+    except Exception as e:
+        info(f"kernel suite saltata: BCC/verify_prog_run non importabile ({e}).")
+        info("Serve Linux + BCC + root. In Kathara: kathara exec frankfurt -- "
+             "python3 /shared/test_suite.py --only kernel")
+        return True
+
+    import resource
+    mp = model_path or V.MODEL_PT
+    methods = [("hardcoded", V.setup_hardcoded, 1),
+               ("template",  V.setup_template,  2),
+               ("modular",   V.setup_modular,   3)]
+
+    rows   = []
+    all_ok = True
+
+    for name, setup_fn, pl in methods:
+        try:
+            setup = setup_fn(0, mp)
+        except PermissionError:
+            info(f"{name}: permesso negato caricando XDP (serve root/CAP_BPF) — suite saltata.")
+            return True
+        except Exception as e:
+            # Il primo load fallito per mancanza di privilegi/kernel = skip, non fail.
+            msg = str(e).lower()
+            if "operation not permitted" in msg or "permission" in msg:
+                info(f"{name}: {e} — serve root. Suite saltata.")
+                return True
+            fail(f"{name}: setup fallito ({e})")
+            all_ok = False
+            continue
+
+        # --- #istruzioni eBPF (somma su tutti i programmi della pipeline) ---
+        per_prog   = []
+        insn_total = 0
+        jit_total  = 0
+        for pname, pfd in setup.get("progs", {}).items():
+            ic, jb = V.prog_insn_count(pfd)
+            if ic is not None:
+                insn_total += ic
+                jit_total  += (jb or 0)
+                per_prog.append((pname, ic))
+
+        # --- latenza / throughput: esegue il DISPATCHER (segue i tail call) ---
+        disp_fd = setup["disp"].fd
+        frame   = V.build_frame(0, ttl_max, setup["scale"])
+        # warm-up
+        try:
+            V.prog_test_run(disp_fd, frame, repeat=1000)
+        except OSError as e:
+            fail(f"{name}: BPF_PROG_TEST_RUN fallito ({e})")
+            all_ok = False
+            continue
+
+        ru0 = resource.getrusage(resource.RUSAGE_SELF)
+        w0  = time.perf_counter()
+        retval, dur_ns = V.prog_test_run(disp_fd, frame, repeat=repeat)
+        wall = time.perf_counter() - w0
+        ru1 = resource.getrusage(resource.RUSAGE_SELF)
+
+        cpu_s   = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
+        cpu_pct = 100.0 * cpu_s / wall if wall > 0 else 0.0
+        # dur_ns = durata media di UNA run riportata dal kernel
+        lat_ns  = float(dur_ns) if dur_ns else (wall * 1e9 / repeat)
+        mpps    = (1000.0 / lat_ns) if lat_ns > 0 else 0.0
+
+        rows.append({
+            "name": name, "pl": pl, "insn": insn_total, "jit": jit_total,
+            "per": per_prog, "lat": lat_ns, "mpps": mpps, "cpu": cpu_pct,
+            "retval": retval,
+        })
+        ok(f"{name:9s}: {insn_total:5d} istr eBPF | lat={lat_ns:8.1f} ns | "
+           f"{mpps:6.3f} Mpps | CPU={cpu_pct:4.0f}% | retval={retval}")
+
+    if not rows:
+        return all_ok
+
+    # --- tabella riepilogo metriche kernel ---
+    print()
+    print("  Metrica                         " + "".join(f"{r['name']:>16}" for r in rows))
+    print("  " + "-" * (32 + 16 * len(rows)))
+    def line(label, key, fmt):
+        print(f"  {label:<32}" + "".join(f"{fmt(r[key]):>16}" for r in rows))
+    line("Istruzioni eBPF (xlated)", "insn", lambda v: f"{v}")
+    line("Codice jited (byte)",      "jit",  lambda v: f"{v}")
+    line("Tail calls / pacchetto",   "pl",   lambda v: {1: "1", 2: "1", 3: "4"}[v])
+    line("Latenza (ns/pkt)",         "lat",  lambda v: f"{v:.1f}")
+    line("Throughput (Mpps)",        "mpps", lambda v: f"{v:.3f}")
+    line("CPU (%)",                  "cpu",  lambda v: f"{v:.0f}")
+    print("  " + "-" * (32 + 16 * len(rows)))
+    print()
+    for r in rows:
+        detail = "  ".join(f"{p}={c}" for p, c in r["per"])
+        info(f"{r['name']:9s} programmi: {detail}")
+
+    # --- gate di correttezza: dispatch reale via verify_prog_run.run ---
+    if verify:
+        print()
+        for name, _, _ in methods:
+            try:
+                failed = V.run(name, 0, mp, ttl_min, ttl_max, repeat=1000)
+                if failed == 0:
+                    ok(f"dispatch {name}: PASS (TTL {ttl_min}-{ttl_max})")
+                else:
+                    fail(f"dispatch {name}: {failed} TTL falliti")
+                    all_ok = False
+            except Exception as e:
+                fail(f"dispatch {name}: errore ({e})")
+                all_ok = False
+
+    print(f"\n{'='*52}")
+    print(f" kernel suite: {'PASS' if all_ok else 'FAIL'}")
+    print(f"{'='*52}\n")
+    return all_ok
+
+
+# ===========================================================================
 def _load_default_model(model_arg):
     """Carica il .pt (se compatibile con l'arch di default) o usa pesi casuali,
     replicando la logica del vecchio test_local.main."""
@@ -1087,16 +1224,21 @@ def main():
     parser = argparse.ArgumentParser(
         description="Suite di test locale IPA (3 metodi) — accorpa i vecchi test_*.py")
     parser.add_argument('--only', default='all',
-                        choices=['all', 'core', 'pktstats', 'extract', 'quant', 'robust'],
+                        choices=['all', 'core', 'pktstats', 'extract', 'quant', 'robust', 'kernel'],
                         help='Quale suite eseguire (default: all)')
     parser.add_argument('--model', type=str, default=None, help='Path al checkpoint .pt')
     parser.add_argument('--verbose', action='store_true', help='Dettagli extra (suite core)')
     parser.add_argument('--samples', type=int, default=200,
                         help='Campioni per pktstats/quant')
     parser.add_argument('--seed', type=int, default=42, help='Seed per pktstats')
+    parser.add_argument('--kernel-repeat', type=int, default=50000,
+                        help='Ripetizioni BPF_PROG_TEST_RUN per la suite kernel')
+    parser.add_argument('--no-verify', action='store_true',
+                        help='Suite kernel: salta il gate di dispatch (solo metriche)')
     args = parser.parse_args()
 
-    which = ['core', 'pktstats', 'extract', 'quant', 'robust'] if args.only == 'all' else [args.only]
+    all_suites = ['core', 'pktstats', 'extract', 'quant', 'robust', 'kernel']
+    which = all_suites if args.only == 'all' else [args.only]
 
     model, pt_path = _load_default_model(args.model)
 
@@ -1111,6 +1253,9 @@ def main():
         results['quant'] = suite_quant(args.samples, args.model)
     if 'robust' in which:
         results['robust'] = suite_robust()
+    if 'kernel' in which:
+        results['kernel'] = suite_kernel(args.model, repeat=args.kernel_repeat,
+                                         verify=not args.no_verify)
 
     print(f"{YELLOW}{'#'*52}{NC}")
     print(f"{YELLOW}#  RIEPILOGO SUITE{NC}")

@@ -118,6 +118,46 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
         raise OSError(e, os.strerror(e))
     return a.retval, a.duration
 
+
+# ---------------------------------------------------------------------------
+# BPF_OBJ_GET_INFO_BY_FD: numero di istruzioni eBPF (verified/xlated program)
+# ---------------------------------------------------------------------------
+
+_BPF_OBJ_GET_INFO_BY_FD = 15
+
+class _BpfProgInfo(ct.Structure):
+    # Prefisso di struct bpf_prog_info (linux/bpf.h), allineamento naturale.
+    # xlated_prog_len e' in byte; ogni istruzione eBPF = 8 byte.
+    _fields_ = [
+        ("type",            ct.c_uint32),
+        ("id",              ct.c_uint32),
+        ("tag",             ct.c_uint8 * 8),
+        ("jited_prog_len",  ct.c_uint32),
+        ("xlated_prog_len", ct.c_uint32),
+    ]
+
+class _BpfAttrObjInfo(ct.Structure):
+    _fields_ = [
+        ("bpf_fd",   ct.c_uint32),
+        ("info_len", ct.c_uint32),
+        ("info",     ct.c_uint64),
+    ]
+
+def prog_insn_count(prog_fd: int):
+    """(#istruzioni eBPF verificate, #byte jited) per un programma caricato.
+    Ritorna (None, None) se BPF_OBJ_GET_INFO_BY_FD fallisce."""
+    buf  = (ct.c_uint8 * 256)()          # buffer ampio, kernel riempie il prefisso
+    info = ct.cast(buf, ct.POINTER(_BpfProgInfo)).contents
+    attr = _BpfAttrObjInfo(
+        bpf_fd   = prog_fd,
+        info_len = ct.sizeof(buf),
+        info     = ct.cast(buf, ct.c_void_p).value,
+    )
+    r = _libc.syscall(321, _BPF_OBJ_GET_INFO_BY_FD, ct.byref(attr), ct.sizeof(attr))
+    if r != 0:
+        return None, None
+    return int(info.xlated_prog_len) // 8, int(info.jited_prog_len)
+
 # ---------------------------------------------------------------------------
 # ctypes mirror structs for perf event deserialization.
 # ---------------------------------------------------------------------------
@@ -384,6 +424,9 @@ def setup_hardcoded(model_id: int, model_path: str):
         entry.weights[i] = ct.c_uint8(int(v) & 0xFF).value
     b["model_cache"][ct.c_uint8(model_id)] = entry
 
+    progs = {"ipa_switch": fn.fd}
+    if disp is not fn:
+        progs["ipa_dispatcher"] = disp.fd
     return {
         "b":         b,
         "fn":        fn,
@@ -393,6 +436,7 @@ def setup_hardcoded(model_id: int, model_path: str):
         "cls_stats": b["cls_stats"],
         "pkt_stats": b["pkt_stats"],
         "pipeline":  1,
+        "progs":     progs,
     }
 
 # ---------------------------------------------------------------------------
@@ -427,6 +471,8 @@ def setup_template(model_id: int, model_path: str):
         "perf_cls":  MissEventT2,
         "fwd_table":  "fwd_table_t2",
         "valid_keys": "valid_keys_t2",
+        "progs": {"ipa_switch_template": disp_fn.fd,
+                  "arch_65_4_4_7":       leaf_fn.fd},
     }
 
 # ---------------------------------------------------------------------------
@@ -460,6 +506,10 @@ def setup_modular(model_id: int, model_path: str):
         "fwd_table":  "fwd_table_t3",
         "valid_keys": "valid_keys_t3",
         "w_off_out":  w_off_out,
+        "progs": {"modular_dispatcher": disp_fn.fd,
+                  "layer_65_4":         lf0.fd,
+                  "layer_4_4":          lf1.fd,
+                  "layer_4_7_argmax":   lf2.fd},
     }
 
 # ---------------------------------------------------------------------------
