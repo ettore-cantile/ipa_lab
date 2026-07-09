@@ -913,16 +913,6 @@
       asserendo che il redirect scatti (<span class="mono">retval ∈ {0,4}</span> e
       <span class="mono">pkt_stats[HIT] &gt; 0</span>). Questo separa PASS/FAIL dal richiedere che
       Python replichi bit-per-bit l'aritmetica intera del kernel.<br><br>
-      <strong>Copertura metriche del professore — un unico script.</strong>
-      Tutte le metriche sono raggiungibili da <span class="mono">test_suite.py</span>:
-      le suite userspace (<span class="mono">core/pktstats/extract/quant/robust</span>) danno tail call,
-      map lookup, memoria, tempo di update e accuratezza; la suite
-      <span class="mono">--only kernel</span> (Linux + BCC + root) esegue
-      <span class="mono">BPF_PROG_TEST_RUN</span> sui programmi XDP reali e misura
-      <strong>numero di istruzioni eBPF</strong> (xlated), <strong>latenza per-pacchetto</strong>,
-      <strong>throughput Mpps</strong> e <strong>CPU %</strong>, includendo il gate di dispatch two-pass.
-      Dove BCC/root mancano la suite kernel viene saltata senza far fallire la run.
-      <span class="mono">test_ipa.py</span> resta come sender live per throughput/latenza end-to-end sul fabric Kathara.
     </div>
   </section>
 
