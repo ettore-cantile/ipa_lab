@@ -40,6 +40,13 @@ Perche retval != 3 con BPF_PROG_TEST_RUN:
   ritorna XDP_ABORTED(0).  Criterio di PASS: retval in {0, 4} (redirect
   fire) E cls_stats/pkt_stats[HIT] incrementato (confirm correct path).
 
+Fixed bug (2026-07-09 v7): build_frame format string mismatch.
+  '!BBBHBBBBBBBBBBBBBBBb' had 20 format specs but pack() received 21
+  arguments -> struct.error: pack expected 20 items for packing (got 21).
+  The tail group (n_output_types=1, out0_code=0, out0_count=7, pad=0) is
+  4 values; the old format only had 'BBb' = 3 specs for that group.
+  Fix: use '!BBBHBBBBBBBBBBBBBBBBb' (21 specs matching 21 args exactly).
+
 Fixed bug (2026-07-09 v6): build_frame IPA header layout (param_size missing).
   struct ipa_hdr C layout:
     model_id(u8), model_type(u8), param_size(u8), scale_factor(be16), ...
@@ -55,8 +62,6 @@ Fixed bug (2026-07-09 v4): PERCPU write type must be ctypes Array.
     TypeError: byref() argument must be a ctypes instance, not 'list'
   Fix: _percpu_arr(val) now returns (ct.c_longlong * _NR_CPUS)(*([val]*_NR_CPUS))
   which is a properly-typed ctypes Array of nr_cpus elements.
-  The previous _percpu_val() returning a plain list was correct in intent
-  but incompatible with older BCC versions that do not unpack lists.
 
 Fixed bug (2026-07-09 v3): BPF_PERCPU_ARRAY write semantics.
   Writing a scalar only populates CPU-0 slot.  BPF_PROG_TEST_RUN runs on
@@ -171,12 +176,6 @@ _NR_CPUS = _nr_cpus()
 # PERCPU Array helper
 # ---------------------------------------------------------------------------
 
-# Leaf type for scratch_acts / scratch_meta is __s64 = ct.c_longlong.
-# BCC PerCpuArray.__setitem__ calls ct.byref(leaf), so leaf MUST be a
-# ctypes instance -- specifically a ctypes Array of nr_cpus elements.
-# A plain Python list or a single scalar both fail:
-#   list   -> TypeError: byref() argument must be a ctypes instance, not 'list'
-#   scalar -> only writes CPU-0 slot silently
 _PercpuLeaf = ct.c_longlong * _NR_CPUS
 
 def _percpu_arr(val: int) -> "_PercpuLeaf":
@@ -210,27 +209,51 @@ def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
                       ttl, 17, 0,
                       b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
-    # struct ipa_hdr C layout (packed):
-    #   model_id(u8), model_type(u8), param_size(u8), scale_factor(be16),
-    #   input_size(u8), output_size(u8), hidden_layers(u8),
-    #   neurons_per_layer(u8), n_feature_types(u8),
-    #   feat0_code(u8), feat0_count(u8),
-    #   feat1_code(u8), feat1_count(u8),
-    #   feat2_code(u8), feat2_count(u8),
-    #   feat3_code(u8), feat3_count(u8),
-    #   n_output_types(u8), out0_code(u8), out0_count(u8)
-    # NOTE: param_size MUST be included as an explicit byte before scale_factor.
-    # Previously '!BBH...' skipped param_size -> scale_factor read as 0 ->
-    # 'if (scale==0) return XDP_PASS' guard fired -> key never computed -> MISS.
-    ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBb',
-                      model_id,  # model_id
-                      0,         # model_type
-                      0,         # param_size  <-- was missing, caused scale=0 bug
-                      scale,     # scale_factor (be16)
-                      65, 7, 2, 4,
-                      3,
-                      0, 65, 0, 0, 0, 0, 0, 0,
-                      1, 0, 7, 0)
+    # struct ipa_hdr C layout (packed), 21 fields:
+    #  [0]  model_id         u8
+    #  [1]  model_type       u8
+    #  [2]  param_size       u8   <-- must be explicit before scale_factor
+    #  [3]  scale_factor     be16
+    #  [4]  input_size       u8
+    #  [5]  output_size      u8
+    #  [6]  hidden_layers    u8
+    #  [7]  neurons_per_layer u8
+    #  [8]  n_feature_types  u8
+    #  [9]  feat0_code       u8
+    # [10]  feat0_count      u8
+    # [11]  feat1_code       u8
+    # [12]  feat1_count      u8
+    # [13]  feat2_code       u8
+    # [14]  feat2_count      u8
+    # [15]  feat3_code       u8
+    # [16]  feat3_count      u8
+    # [17]  n_output_types   u8
+    # [18]  out0_code        u8
+    # [19]  out0_count       u8
+    # [20]  pad              s8
+    # Format '!BBBHBBBBBBBBBBBBBBBBb' = 3B + H + 16B + b = 21 specs / 21 args
+    ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBBb',
+                      model_id,   # [0]  model_id
+                      0,          # [1]  model_type
+                      0,          # [2]  param_size
+                      scale,      # [3]  scale_factor (be16)
+                      65,         # [4]  input_size
+                      7,          # [5]  output_size
+                      2,          # [6]  hidden_layers
+                      4,          # [7]  neurons_per_layer
+                      3,          # [8]  n_feature_types
+                      0,          # [9]  feat0_code
+                      65,         # [10] feat0_count
+                      0,          # [11] feat1_code
+                      0,          # [12] feat1_count
+                      0,          # [13] feat2_code
+                      0,          # [14] feat2_count
+                      0,          # [15] feat3_code
+                      0,          # [16] feat3_count
+                      1,          # [17] n_output_types
+                      0,          # [18] out0_code
+                      7,          # [19] out0_count
+                      0)          # [20] pad (signed)
     return eth + ip + udp + ipa
 
 # ---------------------------------------------------------------------------
@@ -319,25 +342,13 @@ def _remove_fwd_entry(b, fwd_table_name, valid_keys_name, ttl, key):
 
 def _prime_scratch_p3(b, h2: list, scale: int, model_id: int,
                       w_off_out: int, ingress_ifindex: int = 0, ttl: int = 0):
-    """
-    Populate scratch_acts[0..3] and scratch_meta[0,1,2,3,4,7] before
-    running TEST_RUN on layer_4_7_argmax (lf2).
-
-    Both maps are BPF_PERCPU_ARRAY whose leaf type is __s64.
-    BCC PerCpuArray.__setitem__ passes the value directly to ct.byref(),
-    which requires a ctypes instance.  We use _percpu_arr(val) which
-    returns (ct.c_longlong * _NR_CPUS)(*[val]*_NR_CPUS) -- a ctypes Array
-    of nr_cpus elements, broadcasting val to every CPU slot so that
-    BPF_PROG_TEST_RUN sees the correct value regardless of the CPU chosen
-    by the kernel for the test run.
-    """
     for i, v in enumerate(h2[:4]):
         b["scratch_acts"][ct.c_int(i)] = _percpu_arr(v)
 
     meta = {
         0: model_id,
         1: scale,
-        2: 2,            # META_LAYER_IDX: argmax is layer 2
+        2: 2,
         3: ingress_ifindex,
         4: ttl,
         7: w_off_out,
