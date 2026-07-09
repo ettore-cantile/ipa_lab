@@ -532,7 +532,10 @@ def suite_core(model, verbose=False):
                   + (H * H) + H
                   + (H * O) + H
                   + 2)
-    MAP_LOOKUPS = {1: 2, 2: N_WEIGHTS + 3, 3: p3_lookups}
+    # P1: 0 weight lookups (pesi = letterali C). Le uniche map lookup sono le
+    # 6 feature link_state + i contatori (pkt/cls/debug ~2). P2/P3 leggono i
+    # pesi da map, quindi molte piu' lookup.
+    MAP_LOOKUPS = {1: 6 + 2, 2: N_WEIGHTS + 3, 3: p3_lookups}
 
     try:
         import multiprocessing
@@ -540,8 +543,10 @@ def suite_core(model, verbose=False):
     except Exception:
         ncpus = 4
 
+    # P1 hardcoded puro: nessun model_cache. Solo link_state[6] + contatori.
+    #   link_state 6*(4+4) + pkt_stats 3*(4+8) + cls_stats 7*(4+8) + debug 8*(4+8) = 264
     MAP_MEM_BYTES = {
-        1: 256 * 22 + 256 * 9 + 3 * 8,
+        1: 6 * 8 + 3 * 12 + 7 * 12 + 8 * 12,
         2: N_WEIGHTS * 1 + 256 * 7 + 256 * 22 + 256 * 9 + 3 * 8,
         3: N_WEIGHTS * 2 + 256 * 14 + (H + 16) * 8 * ncpus + 256 * 22 + 256 * 9 + 3 * 8,
     }

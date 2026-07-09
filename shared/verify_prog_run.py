@@ -270,18 +270,13 @@ def setup_hardcoded(model_id: int, model_path: str):
     fn = b.load_func("ipa_switch", BPF.XDP)
     t_redirect_s = time.perf_counter() - t0
 
-    try:
-        disp = b.load_func("ipa_dispatcher", BPF.XDP)
-        b["model_progs"][ct.c_int(model_id)] = ct.c_int(fn.fd)
-    except Exception:
-        disp = fn
+    # Pure hardcoded: single leaf program, no dispatcher / model_progs tail-call map.
+    disp = fn
 
     # link_state[0..5] = 1 (all egress links up) -- input feature, not a weight.
     _seed_link_state(b, 1)
 
     progs = {"ipa_switch": fn.fd}
-    if disp is not fn:
-        progs["ipa_dispatcher"] = disp.fd
 
     return {
         "b": b, "fn": fn, "disp": disp,

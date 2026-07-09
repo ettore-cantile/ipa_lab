@@ -131,6 +131,7 @@ kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 1
 | Istruzioni eBPF (xlated)   |        1 095 |       2 897 |     13 645 |
 | Codice jited (byte)        |        5 132 |      12 575 |     58 146 |
 | Tail calls / pacchetto     |     0 (leaf) |           1 |          3 |
+| Map lookup / pacchetto (stima) | 8 (0 pesi) |         322 |        384 |
 | Memoria mappe (byte)       |          264 |      15 796 |     28 468 |
 | Latenza (ns/pacchetto)     |       1109.0 |       339.0 |     1291.0 |
 | Throughput (Mpps)          |        0.902 |       2.950 |      0.775 |
