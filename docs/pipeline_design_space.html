@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IPA/eBPF — Pipeline Design Space</title>
+<title>IPA/eBPF — Le Tre Pipeline</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -24,7 +24,7 @@
     --purple:    #bc8cff;
     --font-body: 'Inter', system-ui, sans-serif;
     --font-mono: 'JetBrains Mono', monospace;
-    --radius: 8px;
+    --radius:    8px;
     --radius-lg: 12px;
   }
 
@@ -39,718 +39,672 @@
     min-height: 100vh;
   }
 
-  /* NAV */
-  nav {
-    position: sticky; top: 0; z-index: 100;
-    background: rgba(13,17,23,0.92);
-    backdrop-filter: blur(12px);
+  /* ── HEADER ── */
+  header {
     border-bottom: 1px solid var(--border);
     padding: 0 2rem;
-    display: flex; align-items: center; gap: 2rem;
     height: 56px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,17,23,0.94);
+    backdrop-filter: blur(12px);
   }
-  .nav-logo {
-    display: flex; align-items: center; gap: 8px;
-    font-weight: 700; font-size: 14px; color: var(--text);
-    text-decoration: none;
-  }
-  .nav-logo svg { color: var(--teal); }
-  .nav-links { display: flex; gap: 1.5rem; margin-left: auto; }
-  .nav-links a {
-    color: var(--muted); text-decoration: none; font-size: 13px;
-    transition: color 180ms;
-  }
-  .nav-links a:hover { color: var(--text); }
+  .logo-icon { color: var(--teal); }
+  .logo-text { font-weight: 700; font-size: 14px; }
+  .logo-sep  { color: var(--faint); margin: 0 4px; }
+  .logo-sub  { color: var(--muted); font-size: 13px; }
 
-  /* LAYOUT */
-  .container { max-width: 1100px; margin: 0 auto; padding: 0 2rem; }
-  section { padding: 4rem 0; }
+  /* ── LAYOUT ── */
+  .container { max-width: 980px; margin: 0 auto; padding: 0 2rem; }
+  section { padding: 3.5rem 0; }
   section + section { border-top: 1px solid var(--border); }
 
-  /* HERO */
-  .hero { padding: 5rem 0 4rem; text-align: center; }
-  .hero-badge {
+  /* ── HERO ── */
+  .hero { padding: 4.5rem 0 3.5rem; }
+  .badge {
     display: inline-flex; align-items: center; gap: 6px;
     background: rgba(57,208,216,0.1); border: 1px solid rgba(57,208,216,0.25);
     color: var(--teal); border-radius: 100px; padding: 4px 14px;
-    font-size: 12px; font-weight: 600; letter-spacing: 0.05em;
-    text-transform: uppercase; margin-bottom: 1.5rem;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.07em;
+    text-transform: uppercase; margin-bottom: 1.25rem;
   }
   .hero h1 {
-    font-size: clamp(2rem, 4vw, 3rem); font-weight: 700;
-    line-height: 1.15; margin-bottom: 1rem;
-    background: linear-gradient(135deg, var(--text) 60%, var(--teal));
+    font-size: clamp(1.75rem, 3.5vw, 2.6rem);
+    font-weight: 700; line-height: 1.15; margin-bottom: 0.9rem;
+    background: linear-gradient(135deg, var(--text) 55%, var(--teal));
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
     background-clip: text;
   }
-  .hero p {
-    color: var(--muted); font-size: 1.1rem; max-width: 680px;
-    margin: 0 auto 2rem;
-  }
-
-  /* THESIS BOX */
-  .thesis-box {
-    background: rgba(57,208,216,0.06);
-    border: 1px solid rgba(57,208,216,0.2);
-    border-left: 3px solid var(--teal);
-    border-radius: var(--radius);
-    padding: 1.25rem 1.5rem;
-    margin: 0 auto 2rem;
-    max-width: 800px;
-    font-style: italic;
-    color: var(--text);
-    font-size: 0.95rem;
+  .hero-sub {
+    color: var(--muted); font-size: 1rem;
+    max-width: 640px; margin-bottom: 2rem;
     line-height: 1.7;
   }
-  .thesis-box strong { color: var(--teal); font-style: normal; }
+  .thesis-box {
+    background: rgba(57,208,216,0.05);
+    border: 1px solid rgba(57,208,216,0.18);
+    border-left: 3px solid var(--teal);
+    border-radius: var(--radius);
+    padding: 1.1rem 1.4rem;
+    max-width: 760px;
+    font-size: 0.88rem;
+    line-height: 1.75;
+    color: var(--muted);
+  }
+  .thesis-box strong { color: var(--teal); }
 
-  /* SECTION HEADERS */
-  .section-header { margin-bottom: 2.5rem; }
-  .section-header h2 {
-    font-size: 1.5rem; font-weight: 700; margin-bottom: 0.4rem;
+  /* ── SECTION LABEL ── */
+  .sec-label {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--teal); margin-bottom: 0.35rem;
   }
-  .section-header p { color: var(--muted); font-size: 0.9rem; }
-  .section-tag {
-    display: inline-block; font-size: 11px; font-weight: 700;
-    letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--teal); margin-bottom: 0.5rem;
-  }
+  .sec-title { font-size: 1.35rem; font-weight: 700; margin-bottom: 0.4rem; }
+  .sec-desc  { color: var(--muted); font-size: 0.875rem; margin-bottom: 2rem; }
 
-  /* PIPELINE CARDS */
-  .pipeline-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-    gap: 1.5rem;
-  }
-  .pipeline-card {
+  /* ── AXIS BAR ── */
+  .axis-wrap {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    padding: 1.75rem;
-    display: flex; flex-direction: column; gap: 1.25rem;
+    padding: 1.5rem 1.75rem;
+    margin-bottom: 2.5rem;
+  }
+  .axis-title { font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--muted); margin-bottom: 1.25rem; }
+  .axis-row   { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.75rem; }
+  .axis-label { font-size: 11px; font-weight: 600; color: var(--muted);
+    width: 110px; text-align: right; flex-shrink: 0; }
+  .bar-track  { flex: 1; }
+  .bar-segs   { display: flex; gap: 6px; margin-bottom: 5px; }
+  .bar-seg    { height: 7px; border-radius: 4px; flex: 1; }
+  .bar-labels { display: flex; justify-content: space-between; }
+  .bar-lbl    { font-size: 10px; font-weight: 600; }
+  .bar-lbl small { display: block; font-weight: 400; color: var(--muted); }
+  .axis-divider { height: 1px; background: var(--border); margin: 0.75rem 0; }
+
+  /* ── PIPELINE CARDS ── */
+  .pipeline-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+    gap: 1.25rem;
+  }
+  .p-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 1.5rem 1.6rem;
+    display: flex; flex-direction: column; gap: 1.1rem;
     transition: border-color 200ms, box-shadow 200ms;
   }
-  .pipeline-card:hover {
-    border-color: var(--teal);
-    box-shadow: 0 0 0 1px rgba(57,208,216,0.15), 0 8px 32px rgba(0,0,0,0.4);
+  .p-card:hover {
+    border-color: rgba(57,208,216,0.35);
+    box-shadow: 0 6px 28px rgba(0,0,0,0.35);
   }
-
-  .card-header { display: flex; align-items: flex-start; gap: 1rem; }
-  .card-number {
-    min-width: 36px; height: 36px;
-    border-radius: 50%;
+  .p-card-head   { display: flex; align-items: flex-start; gap: 0.85rem; }
+  .p-num {
+    min-width: 34px; height: 34px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 14px;
-    flex-shrink: 0;
+    font-weight: 700; font-size: 13px; flex-shrink: 0;
   }
-  .card-number.green  { background: rgba(63,185,80,0.15);  color: var(--green); }
-  .card-number.amber  { background: rgba(210,153,34,0.15); color: var(--amber); }
-  .card-number.red    { background: rgba(248,81,73,0.15);  color: var(--red); }
+  .p-num.g { background: rgba(63,185,80,0.14);  color: var(--green); }
+  .p-num.a { background: rgba(210,153,34,0.14); color: var(--amber); }
+  .p-num.r { background: rgba(248,81,73,0.14);  color: var(--red); }
+  .p-name   { font-size: 0.95rem; font-weight: 700; margin-bottom: 2px; }
+  .p-sub    { font-size: 0.78rem; color: var(--muted); }
 
-  .card-title h3 { font-size: 1rem; font-weight: 700; margin-bottom: 2px; }
-  .card-title .subtitle { color: var(--muted); font-size: 0.8rem; }
+  .chips    { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip     { font-size: 10px; font-weight: 700; padding: 2px 10px;
+    border-radius: 100px; letter-spacing: 0.04em; }
+  .chip-g   { background: rgba(63,185,80,0.12);  color: var(--green); border: 1px solid rgba(63,185,80,0.25); }
+  .chip-a   { background: rgba(210,153,34,0.12); color: var(--amber); border: 1px solid rgba(210,153,34,0.25); }
+  .chip-r   { background: rgba(248,81,73,0.12);  color: var(--red);   border: 1px solid rgba(248,81,73,0.25); }
 
-  .perf-badge {
-    display: inline-flex; align-items: center; gap: 5px;
-    font-size: 11px; font-weight: 600; padding: 2px 10px;
-    border-radius: 100px;
+  .p-desc   { font-size: 0.82rem; color: var(--muted); line-height: 1.65; }
+  .p-desc code {
+    font-family: var(--font-mono); font-size: 0.78rem;
+    background: var(--surface-2); border-radius: 4px; padding: 1px 6px;
   }
-  .perf-badge.max   { background: rgba(63,185,80,0.12);  color: var(--green);  border: 1px solid rgba(63,185,80,0.25); }
-  .perf-badge.mid   { background: rgba(210,153,34,0.12); color: var(--amber);  border: 1px solid rgba(210,153,34,0.25); }
-  .perf-badge.lower { background: rgba(248,81,73,0.12);  color: var(--red);    border: 1px solid rgba(248,81,73,0.25); }
 
-  /* PIPELINE FLOW */
-  .pipeline-flow {
+  /* ── FLOW DIAGRAM ── */
+  .flow {
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 1rem 1.25rem;
+    padding: 0.9rem 1.1rem;
     font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--muted);
+    font-size: 11.5px;
     line-height: 2;
+    color: var(--muted);
   }
-  .pipeline-flow .node   { color: var(--green); font-weight: 600; }
-  .pipeline-flow .arrow  { color: var(--faint); }
-  .pipeline-flow .note   { color: var(--blue); font-size: 10px; }
-  .pipeline-flow .scratch{ color: var(--amber); }
+  .flow .fn  { color: var(--green);  font-weight: 600; }
+  .flow .fn2 { color: var(--amber);  font-weight: 600; }
+  .flow .fn3 { color: var(--red);    font-weight: 600; }
+  .flow .ar  { color: var(--faint); }
+  .flow .nt  { color: var(--blue);   font-size: 10px; }
+  .flow .sc  { color: var(--amber);  font-size: 10px; }
 
-  /* PRO/CON */
-  .pro-con { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
-  .pro-list, .con-list {
-    background: var(--surface-2); border-radius: var(--radius); padding: 0.75rem 1rem;
+  /* ── PRO/CON ── */
+  .procon { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .pros, .cons {
+    background: var(--surface-2); border-radius: var(--radius);
+    padding: 0.65rem 0.85rem;
   }
-  .pro-list h4 { color: var(--green); font-size: 11px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.5rem; }
-  .con-list h4 { color: var(--red);   font-size: 11px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.5rem; }
-  .pro-list ul, .con-list ul { list-style: none; }
-  .pro-list li, .con-list li {
-    font-size: 12px; color: var(--muted); padding: 2px 0;
-    padding-left: 14px; position: relative;
+  .pros h4 { font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--green); margin-bottom: 0.4rem; }
+  .cons h4 { font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--red);   margin-bottom: 0.4rem; }
+  .pros ul, .cons ul { list-style: none; }
+  .pros li, .cons li {
+    font-size: 11px; color: var(--muted); padding: 1px 0;
+    padding-left: 13px; position: relative;
   }
-  .pro-list li::before { content: '+'; position: absolute; left: 0; color: var(--green); font-weight: 700; }
-  .con-list li::before { content: '-'; position: absolute; left: 0; color: var(--red); font-weight: 700; }
+  .pros li::before { content: '+'; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+  .cons li::before { content: '−'; position: absolute; left: 0; color: var(--red);   font-weight: 700; }
 
-  /* FILE LINK */
-  .file-link {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-family: var(--font-mono); font-size: 11px;
-    color: var(--blue); text-decoration: none;
-    background: rgba(88,166,255,0.08); border: 1px solid rgba(88,166,255,0.2);
-    border-radius: 6px; padding: 3px 10px;
-    transition: background 180ms, border-color 180ms;
-  }
-  .file-link:hover { background: rgba(88,166,255,0.14); border-color: rgba(88,166,255,0.4); }
-
-  /* TRADE-OFF TABLE */
-  .tradeoff-table-wrap { overflow-x: auto; }
+  /* ── TRADEOFF TABLE ── */
+  .tbl-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   thead th {
     background: var(--surface-2); color: var(--muted);
-    font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
-    padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border);
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.06em; padding: 9px 13px;
+    text-align: left; border-bottom: 1px solid var(--border);
   }
   tbody tr { border-bottom: 1px solid var(--border); }
   tbody tr:last-child { border-bottom: none; }
-  tbody td { padding: 12px 14px; vertical-align: middle; }
+  tbody td { padding: 11px 13px; vertical-align: middle; }
   tbody tr:hover td { background: rgba(255,255,255,0.02); }
-  .td-label { font-weight: 600; color: var(--text); }
-  .tag-ebpf  { display:inline-block; font-family:var(--font-mono); font-size:11px; border-radius:4px; padding:1px 7px; background:rgba(63,185,80,0.12); color:var(--green); }
-  .tag-bpf   { display:inline-block; font-family:var(--font-mono); font-size:11px; border-radius:4px; padding:1px 7px; background:rgba(210,153,34,0.12); color:var(--amber); }
-  .tag-percpu{ display:inline-block; font-family:var(--font-mono); font-size:11px; border-radius:4px; padding:1px 7px; background:rgba(248,81,73,0.12); color:var(--red); }
-  .flex-chip { display:inline-block; font-size:11px; font-weight:700; padding:2px 10px; border-radius:100px; letter-spacing:0.04em; }
-  .flex-low  { background:rgba(63,185,80,0.12); color:var(--green); border:1px solid rgba(63,185,80,0.25); }
-  .flex-mid  { background:rgba(210,153,34,0.12); color:var(--amber); border:1px solid rgba(210,153,34,0.25); }
-  .flex-high { background:rgba(248,81,73,0.12); color:var(--red); border:1px solid rgba(248,81,73,0.25); }
+  .mono { font-family: var(--font-mono); font-size: 11.5px; }
+  .tag {
+    display: inline-block; font-family: var(--font-mono); font-size: 11px;
+    border-radius: 4px; padding: 1px 7px; font-weight: 600;
+  }
+  .tag-g { background: rgba(63,185,80,0.12);  color: var(--green); }
+  .tag-a { background: rgba(210,153,34,0.12); color: var(--amber); }
+  .tag-r { background: rgba(248,81,73,0.12);  color: var(--red); }
+  .td-strong { font-weight: 600; color: var(--text); }
 
-  /* METRICS */
-  .metrics-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1rem;
+  /* ── INTERFACE STATE SECTION ── */
+  .iface-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
   }
-  .metric-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 1.25rem; display: flex; gap: 1rem; align-items: flex-start;
+  .iface-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 1.4rem 1.5rem;
   }
-  .metric-icon {
-    width: 36px; height: 36px; border-radius: 8px; background: rgba(57,208,216,0.1);
-    display: flex; align-items: center; justify-content: center;
-    color: var(--teal); flex-shrink: 0; font-size: 16px;
+  .iface-card h3 {
+    font-size: 0.88rem; font-weight: 700; margin-bottom: 0.3rem; color: var(--text);
   }
-  .metric-card h4 { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
-  .metric-card p  { font-size: 12px; color: var(--muted); }
+  .iface-card .iface-sub {
+    font-size: 0.78rem; color: var(--muted); margin-bottom: 0.85rem;
+  }
+  .iface-card p {
+    font-size: 0.82rem; color: var(--muted); line-height: 1.65; margin-bottom: 0.65rem;
+  }
+  .iface-card code {
+    font-family: var(--font-mono); font-size: 0.75rem;
+    background: var(--surface-2); border-radius: 4px; padding: 1px 6px;
+    color: var(--teal);
+  }
+  .codeblock {
+    font-family: var(--font-mono); font-size: 11px; line-height: 1.8;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 0.75rem 1rem;
+    color: var(--green); overflow-x: auto;
+    white-space: pre;
+  }
+  .iface-note {
+    background: rgba(57,208,216,0.05);
+    border: 1px solid rgba(57,208,216,0.18);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-top: 1.5rem;
+    font-size: 0.84rem;
+    color: var(--muted);
+    line-height: 1.7;
+  }
+  .iface-note strong { color: var(--teal); }
 
-  /* UPDATE COST */
-  .update-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem; }
-  .update-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 1.5rem;
+  /* ── FOOTER ── */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 1.75rem 0;
+    margin-top: 1rem;
   }
-  .update-card h3 { font-size: 13px; font-weight: 700; margin-bottom: 0.75rem; }
-  .update-card .cost-label {
-    font-size: 11px; color: var(--muted); margin-bottom: 0.4rem;
-    text-transform: uppercase; letter-spacing: 0.06em;
+  footer .inner {
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 0.75rem;
   }
-  .update-card code {
-    font-family: var(--font-mono); font-size: 11px;
-    background: var(--surface-2); color: var(--green);
-    border-radius: 4px; padding: 3px 7px;
-    display: block; margin-bottom: 4px;
+  footer span { color: var(--muted); font-size: 12px; }
+  footer a {
+    color: var(--blue); font-size: 12px; text-decoration: none;
   }
+  footer a:hover { text-decoration: underline; }
 
-  /* PAPER */
-  .paper-block {
-    background: var(--surface); border: 1px solid var(--border);
-    border-left: 3px solid var(--purple); border-radius: var(--radius-lg); padding: 1.75rem 2rem;
-  }
-  .paper-block .paper-label {
-    font-size: 11px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.08em; color: var(--purple); margin-bottom: 1rem;
-  }
-  .paper-block p {
-    font-family: var(--font-mono); font-size: 13px; line-height: 1.8; color: var(--text);
-  }
-  .paper-block em { color: var(--teal); font-style: normal; }
-
-  /* AXIS */
-  .tradeoff-axis {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius-lg); padding: 2rem; margin-bottom: 2rem;
-  }
-  .axis-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
-  .axis-label { font-size: 12px; font-weight: 600; color: var(--muted); width: 130px; text-align: right; flex-shrink: 0; }
-
-  @media (max-width: 700px) {
+  @media (max-width: 680px) {
     .pipeline-grid { grid-template-columns: 1fr; }
-    .pro-con { grid-template-columns: 1fr; }
-    .update-grid { grid-template-columns: 1fr; }
-    nav { padding: 0 1rem; }
-    .nav-links { display: none; }
-    .container { padding: 0 1rem; }
+    .iface-grid    { grid-template-columns: 1fr; }
+    .procon        { grid-template-columns: 1fr; }
+    header         { padding: 0 1rem; }
+    .container     { padding: 0 1rem; }
   }
 </style>
 </head>
 <body>
 
-<nav>
-  <a href="#" class="nav-logo">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-      <path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
-    </svg>
-    IPA/eBPF Design Space
-  </a>
-  <div class="nav-links">
-    <a href="#pipelines">Pipeline</a>
-    <a href="#tradeoff">Trade-off</a>
-    <a href="#metrics">Metriche</a>
-    <a href="#update-cost">Costo aggiornamento</a>
-    <a href="#formulation">Formulazione</a>
-    <a href="#verifier">Verifier</a>
-    <a href="#files">File</a>
-  </div>
-</nav>
+<header>
+  <svg class="logo-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+    <path d="M2 17l10 5 10-5"/>
+    <path d="M2 12l10 5 10-5"/>
+  </svg>
+  <span class="logo-text">IPA/eBPF</span>
+  <span class="logo-sep">/</span>
+  <span class="logo-sub">Design Space delle Pipeline</span>
+</header>
 
 <div class="container">
+
+  <!-- ── HERO ── -->
   <div class="hero">
-    <div class="hero-badge">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
-      Design Space Analysis
-    </div>
-    <h1>Performance vs. Flexibility<br>nel Datapath IPA/eBPF</h1>
-    <p>IPA/eBPF non ha una sola implementazione naturale. Esiste uno spazio di progetto in cui si puo scegliere quanto specializzare il modello nel datapath e quanto invece mantenere flessibilita runtime.</p>
+    <div class="badge">Design Space Analysis</div>
+    <h1>Performance vs. Flessibilità<br>nel Datapath IPA/eBPF</h1>
+    <p class="hero-sub">
+      IPA/eBPF non ha una sola implementazione naturale. Esiste uno spazio di progetto
+      in cui si può scegliere <em>quanto specializzare</em> il modello nel datapath e
+      quanto invece mantenere <em>flessibilità runtime</em>.
+    </p>
     <div class="thesis-box">
-      <strong>Domanda di ricerca:</strong> Quanto costa rendere IPA piu flessibile nel datapath?<br>
-      La valutazione misura sia la <strong>datapath performance</strong> che il <strong>control-plane flexibility</strong>.
+      <strong>Domanda di ricerca:</strong> quanto costa rendere IPA più flessibile nel datapath?<br>
+      La valutazione misura sia la <strong>datapath performance</strong> che il
+      <strong>control-plane flexibility</strong> — non solo throughput, ma anche il
+      costo di aggiornamento del modello e la gestione dello stato delle interfacce.
     </div>
   </div>
-</div>
 
-<div class="container" style="margin-bottom:0;">
-  <div class="tradeoff-axis">
-    <div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:1.25rem;">Spazio di trade-off</div>
-    <div class="axis-row">
-      <div class="axis-label">Prestazioni</div>
-      <div style="flex:1">
-        <div style="display:flex;gap:8px;align-items:center;">
-          <div style="width:33%;height:8px;border-radius:4px;background:var(--green);opacity:0.85;"></div>
-          <div style="width:33%;height:8px;border-radius:4px;background:var(--amber);opacity:0.75;"></div>
-          <div style="width:33%;height:8px;border-radius:4px;background:var(--red);opacity:0.6;"></div>
+  <!-- ── TRADE-OFF AXIS ── -->
+  <section id="axis" style="padding-top:0; border-top:none;">
+    <div class="axis-wrap">
+      <div class="axis-title">Spazio di trade-off — le due dimensioni</div>
+
+      <div class="axis-row">
+        <div class="axis-label">Prestazioni</div>
+        <div class="bar-track">
+          <div class="bar-segs">
+            <div class="bar-seg" style="background:var(--green);opacity:.85;"></div>
+            <div class="bar-seg" style="background:var(--amber);opacity:.75;"></div>
+            <div class="bar-seg" style="background:var(--red);opacity:.6;"></div>
+          </div>
+          <div class="bar-labels">
+            <span class="bar-lbl" style="color:var(--green);">Massime<small>Hardcoded</small></span>
+            <span class="bar-lbl" style="color:var(--amber);text-align:center;">Intermedie<small>Template</small></span>
+            <span class="bar-lbl" style="color:var(--red);text-align:right;">Inferiori<small>Modulare</small></span>
+          </div>
         </div>
-        <div style="display:flex;justify-content:space-between;margin-top:6px;">
-          <span style="font-size:11px;color:var(--green);font-weight:600;">Massime<br><span style="color:var(--muted);font-weight:400;">Hardcoded</span></span>
-          <span style="font-size:11px;color:var(--amber);font-weight:600;text-align:center;">Alte/Intermedie<br><span style="color:var(--muted);font-weight:400;">Template Arch</span></span>
-          <span style="font-size:11px;color:var(--red);font-weight:600;text-align:right;">Inferiori<br><span style="color:var(--muted);font-weight:400;">Modular</span></span>
+      </div>
+
+      <div class="axis-divider"></div>
+
+      <div class="axis-row">
+        <div class="axis-label">Flessibilità</div>
+        <div class="bar-track">
+          <div class="bar-segs">
+            <div class="bar-seg" style="background:var(--red);opacity:.6;"></div>
+            <div class="bar-seg" style="background:var(--amber);opacity:.75;"></div>
+            <div class="bar-seg" style="background:var(--green);opacity:.85;"></div>
+          </div>
+          <div class="bar-labels">
+            <span class="bar-lbl" style="color:var(--red);">Minima<small>Hardcoded</small></span>
+            <span class="bar-lbl" style="color:var(--amber);text-align:center;">Media<small>Template</small></span>
+            <span class="bar-lbl" style="color:var(--green);text-align:right;">Massima<small>Modulare</small></span>
+          </div>
         </div>
       </div>
     </div>
-    <div style="height:1px;background:var(--border);margin:1rem 0;"></div>
-    <div class="axis-row">
-      <div class="axis-label">Flessibilita</div>
-      <div style="flex:1">
-        <div style="display:flex;gap:8px;align-items:center;">
-          <div style="width:33%;height:8px;border-radius:4px;background:var(--red);opacity:0.6;"></div>
-          <div style="width:33%;height:8px;border-radius:4px;background:var(--amber);opacity:0.75;"></div>
-          <div style="width:33%;height:8px;border-radius:4px;background:var(--green);opacity:0.85;"></div>
-        </div>
-        <div style="display:flex;justify-content:space-between;margin-top:6px;">
-          <span style="font-size:11px;color:var(--red);font-weight:600;">Minima<br><span style="color:var(--muted);font-weight:400;">Hardcoded</span></span>
-          <span style="font-size:11px;color:var(--amber);font-weight:600;text-align:center;">Media<br><span style="color:var(--muted);font-weight:400;">Template Arch</span></span>
-          <span style="font-size:11px;color:var(--green);font-weight:600;text-align:right;">Massima<br><span style="color:var(--muted);font-weight:400;">Modular</span></span>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
 
-<section id="pipelines">
-  <div class="container">
-    <div class="section-header">
-      <div class="section-tag">Le tre pipeline</div>
-      <h2>Design Space IPA/eBPF</h2>
-      <p>Tre livelli principali di implementazione, ciascuno con caratteristiche distinte di performance e flessibilita.</p>
-    </div>
+    <!-- ── LE TRE PIPELINE ── -->
+    <div class="sec-label">Le tre pipeline</div>
+    <div class="sec-title">Design Space IPA/eBPF</div>
+    <p class="sec-desc">
+      Tre livelli principali di implementazione. Aumentando la flessibilità: diminuisce la
+      specializzazione del codice, aumentano map lookup, tail calls e passaggio di stato,
+      diminuiscono le prestazioni massime.
+    </p>
+
     <div class="pipeline-grid">
 
-      <!-- P1 -->
-      <div class="pipeline-card">
-        <div class="card-header">
-          <div class="card-number green">1</div>
-          <div class="card-title"><h3>Hardcoded Model</h3><div class="subtitle">Baseline best performance</div></div>
+      <!-- ══ PIPELINE 1 ══ -->
+      <div class="p-card">
+        <div class="p-card-head">
+          <div class="p-num g">1</div>
+          <div>
+            <div class="p-name">Hardcoded Model</div>
+            <div class="p-sub">Baseline — massime prestazioni</div>
+          </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <span class="perf-badge max">Massime prestazioni</span>
-          <span class="perf-badge lower">Minima flessibilita</span>
+        <div class="chips">
+          <span class="chip chip-g">Massime prestazioni</span>
+          <span class="chip chip-r">Minima flessibilità</span>
         </div>
-        <p style="font-size:13px;color:var(--muted);">
-          Ogni modello e trasformato in un programma eBPF dedicato
-          (<code style="font-family:var(--font-mono);font-size:11px;color:var(--green);">model_id -&gt; model_&lt;id&gt;.o</code>).
-          Feature extraction, pesi hardcoded, inferenza completa, argmax e azione sono
-          tutto unrolled in un unico programma.
+        <p class="p-desc">
+          Ogni modello è trasformato in un <strong style="color:var(--text);">programma eBPF dedicato</strong>
+          (<code>model_id → model_&lt;id&gt;.o</code>). Il programma contiene
+          feature extraction, pesi hardcoded, inferenza completa, argmax e azione —
+          tutto unrolled in un unico blocco compilato staticamente.
         </p>
-        <div class="pipeline-flow">
-          <span class="node">packet</span><br>
-          <span class="arrow">  |</span><br>
-          <span class="node">dispatcher</span><br>
-          <span class="arrow">  |</span> <span class="note">tail call (1x)</span><br>
-          <span class="node">model_&lt;id&gt;</span><br>
-          <span class="arrow">  |</span> <span class="note">pesi hardcoded, codice unrolled</span><br>
-          <span class="node">action</span>
+        <div class="flow">
+<span class="fn">packet</span>
+<span class="ar">  │</span>
+<span class="fn">dispatcher</span>
+<span class="ar">  │</span>  <span class="nt">tail call (1×)</span>
+<span class="fn">model_&lt;id&gt;</span>
+<span class="ar">  │</span>  <span class="nt">pesi hardcoded · codice unrolled</span>
+<span class="fn">action</span>
         </div>
-        <div class="pro-con">
-          <div class="pro-list"><h4>Vantaggi</h4><ul>
+        <div class="procon">
+          <div class="pros"><h4>Vantaggi</h4><ul>
             <li>Una sola tail call</li>
-            <li>Nessuna lookup pesi</li>
-            <li>Nessun stato intermedio</li>
+            <li>Nessuna lookup per i pesi</li>
+            <li>Nessun passaggio di stato</li>
             <li>Codice completamente unrolled</li>
-            <li>Massime prestazioni</li>
           </ul></div>
-          <div class="con-list"><h4>Svantaggi</h4><ul>
-            <li>Richiede ricompilazione per ogni nuovo modello</li>
-            <li>Bassa flessibilita runtime</li>
-            <li>Aggiornamento = reload programma</li>
+          <div class="cons"><h4>Svantaggi</h4><ul>
+            <li>Ricompilazione per ogni nuovo modello</li>
+            <li>Reload XDP necessario per aggiornare</li>
+            <li>Minima flessibilità runtime</li>
           </ul></div>
         </div>
-        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/ebpf_program.py" target="_blank" rel="noopener noreferrer">shared/ebpf_program.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/extract_weights.py" target="_blank" rel="noopener noreferrer">shared/extract_weights.py</a>
-        </div>
+        <p class="p-desc" style="margin-bottom:0;">
+          <strong style="color:var(--green);">Aggiornamento modello:</strong>
+          genera sorgente C → compila con LLVM → ricarica programma XDP.
+          Il datapath viene interrotto durante il reload.
+        </p>
       </div>
 
-      <!-- P2 -->
-      <div class="pipeline-card">
-        <div class="card-header">
-          <div class="card-number amber">2</div>
-          <div class="card-title"><h3>Pre-built Architecture Template</h3><div class="subtitle">Practical flexible design</div></div>
+      <!-- ══ PIPELINE 2 ══ -->
+      <div class="p-card">
+        <div class="p-card-head">
+          <div class="p-num a">2</div>
+          <div>
+            <div class="p-name">Pre-built Architecture Template</div>
+            <div class="p-sub">Practical flexible design</div>
+          </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <span class="perf-badge mid">Prestazioni intermedie</span>
-          <span class="perf-badge mid">Flessibilita media</span>
+        <div class="chips">
+          <span class="chip chip-a">Prestazioni intermedie</span>
+          <span class="chip chip-a">Flessibilità media</span>
         </div>
-        <p style="font-size:13px;color:var(--muted);">
-          Un programma per ogni architettura tipica (es. <code style="font-family:var(--font-mono);font-size:11px;color:var(--amber);">arch_65_4_4_7</code>).
-          Il dispatcher legge <code style="font-family:var(--font-mono);font-size:11px;color:var(--amber);">model_id -&gt; arch_id + weight_offset + scale</code>
-          da una BPF map e fa un tail call al template architetturale corretto.
+        <p class="p-desc">
+          Non un programma per ogni modello, ma
+          <strong style="color:var(--text);">un programma per ogni architettura tipica</strong>
+          (es. <code>arch_65_4_4_7</code>). Il dispatcher legge da una BPF map:
+          <code>model_id → arch_id + weight_offset + alpha</code>
+          e fa un tail call al template architetturale corretto, che recupera i pesi
+          dalla map e completa l'inferenza.
         </p>
-        <div class="pipeline-flow">
-          <span class="node">packet</span><br>
-          <span class="arrow">  |</span><br>
-          <span class="node">dispatcher</span><br>
-          <span class="arrow">  |</span> <span class="note">lookup model_registry[model_id]</span><br>
-          <span class="node">tail call arch_&lt;shape&gt;</span><br>
-          <span class="arrow">  |</span> <span class="note">legge pesi da BPF_ARRAY (arch_weights)</span><br>
-          <span class="node">inferenza completa</span><br>
-          <span class="arrow">  |</span><br>
-          <span class="node">action</span>
+        <div class="flow">
+<span class="fn2">packet</span>
+<span class="ar">  │</span>
+<span class="fn2">dispatcher</span>
+<span class="ar">  │</span>  <span class="nt">lookup model_registry[model_id]</span>
+<span class="fn2">tail call arch_&lt;shape&gt;</span>
+<span class="ar">  │</span>  <span class="nt">legge pesi da BPF_ARRAY</span>
+<span class="fn2">inferenza completa</span>
+<span class="ar">  │</span>
+<span class="fn2">action</span>
         </div>
-        <div class="pro-con">
-          <div class="pro-list"><h4>Vantaggi</h4><ul>
-            <li>Un programma supporta piu modelli (stessa arch)</li>
+        <div class="procon">
+          <div class="pros"><h4>Vantaggi</h4><ul>
+            <li>Un solo programma per N modelli (stessa arch)</li>
             <li>No ricompilazione per cambiare pesi</li>
-            <li>Architettura comunque statica/unrolled</li>
-            <li>Buon compromesso</li>
+            <li>Architettura ancora statica/unrolled</li>
           </ul></div>
-          <div class="con-list"><h4>Svantaggi</h4><ul>
+          <div class="cons"><h4>Svantaggi</h4><ul>
             <li>Lettura pesi da BPF map (overhead)</li>
-            <li>Piu overhead vs pesi hardcoded</li>
             <li>Solo architetture predefinite</li>
+            <li>1 map lookup aggiuntivo vs hardcoded</li>
           </ul></div>
         </div>
-        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/ebpf_template_arch.py" target="_blank" rel="noopener noreferrer">shared/ebpf_template_arch.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/weights_method2.json" target="_blank" rel="noopener noreferrer">shared/weights_method2.json</a>
-        </div>
+        <p class="p-desc" style="margin-bottom:0;">
+          <strong style="color:var(--amber);">Aggiornamento modello:</strong>
+          solo <code>bpf_map_update_elem</code> dal userspace. Nessuna interruzione del datapath —
+          aggiornamento atomico, trasparente ai pacchetti in volo.
+        </p>
       </div>
 
-      <!-- P3 -->
-      <div class="pipeline-card">
-        <div class="card-header">
-          <div class="card-number red">3</div>
-          <div class="card-title"><h3>Modular Neural Pipeline</h3><div class="subtitle">Maximum flexibility</div></div>
+      <!-- ══ PIPELINE 3 ══ -->
+      <div class="p-card">
+        <div class="p-card-head">
+          <div class="p-num r">3</div>
+          <div>
+            <div class="p-name">Modular Neural Pipeline</div>
+            <div class="p-sub">Maximum flexibility</div>
+          </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <span class="perf-badge lower">Prestazioni inferiori</span>
-          <span class="perf-badge max">Massima flessibilita</span>
+        <div class="chips">
+          <span class="chip chip-r">Prestazioni inferiori</span>
+          <span class="chip chip-g">Massima flessibilità</span>
         </div>
-        <p style="font-size:13px;color:var(--muted);">
-          Il modello e scomposto in blocchi/layer riusabili.
-          Le attivazioni intermedie passano via
-          <code style="font-family:var(--font-mono);font-size:11px;color:var(--amber);">BPF_PERCPU_ARRAY</code> scratch map
-          oppure tramite scratch area nell'header IPA.
+        <p class="p-desc">
+          Il modello è scomposto in
+          <strong style="color:var(--text);">blocchi/layer riusabili</strong>,
+          ciascuno implementato come programma eBPF separato.
+          Le attivazioni intermedie passano tramite una
+          <code>BPF_PERCPU_ARRAY</code> scratch map (o, meno pulito,
+          tramite scratch area nell'header IPA) tra un tail call e il successivo.
         </p>
-        <div class="pipeline-flow">
-          <span class="node">packet</span><br>
-          <span class="arrow">  |</span><br>
-          <span class="node">dispatcher</span><br>
-          <span class="arrow">  |</span><br>
-          <span class="node">layer block 1</span> <span class="note">(es. layer_8_to_6)</span><br>
-          <span class="arrow">  |</span> <span class="scratch">scratch map + tail call</span><br>
-          <span class="node">layer block 2</span> <span class="note">(es. layer_6_to_6)</span><br>
-          <span class="arrow">  |</span> <span class="scratch">scratch map + tail call</span><br>
-          <span class="node">layer block 3</span> <span class="note">(es. layer_6_to_4)</span><br>
-          <span class="arrow">  |</span><br>
-          <span class="node">argmax / action</span>
+        <div class="flow">
+<span class="fn3">packet</span>
+<span class="ar">  │</span>
+<span class="fn3">dispatcher</span>
+<span class="ar">  │</span>
+<span class="fn3">layer block 1</span>  <span class="nt">(es. layer_8_to_6)</span>
+<span class="ar">  │</span>  <span class="sc">scratch map + tail call</span>
+<span class="fn3">layer block 2</span>  <span class="nt">(es. layer_6_to_6)</span>
+<span class="ar">  │</span>  <span class="sc">scratch map + tail call</span>
+<span class="fn3">layer block 3</span>  <span class="nt">(es. layer_6_to_4)</span>
+<span class="ar">  │</span>
+<span class="fn3">argmax / action</span>
         </div>
-        <div class="pro-con">
-          <div class="pro-list"><h4>Vantaggi</h4><ul>
+        <div class="procon">
+          <div class="pros"><h4>Vantaggi</h4><ul>
             <li>Massimo riuso dei blocchi</li>
-            <li>Supporta piu architetture componendo moduli</li>
-            <li>Minore necessita di programmi completi</li>
-            <li>Piu flessibilita runtime</li>
+            <li>Supporta più architetture componendo moduli</li>
+            <li>Cambia architettura senza ricompilare</li>
           </ul></div>
-          <div class="con-list"><h4>Svantaggi</h4><ul>
-            <li>Piu tail calls (limite kernel: 33)</li>
+          <div class="cons"><h4>Svantaggi</h4><ul>
+            <li>Più tail calls (limite kernel: 33)</li>
             <li>Map lookup per stato intermedio</li>
             <li>Lettura pesi da map</li>
-            <li>Maggiore complessita e overhead</li>
+            <li>Complessità e overhead maggiori</li>
           </ul></div>
         </div>
-        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/ebpf_modular.py" target="_blank" rel="noopener noreferrer">shared/ebpf_modular.py</a>
-        </div>
+        <p class="p-desc" style="margin-bottom:0;">
+          <strong style="color:var(--red);">Aggiornamento modello/architettura:</strong>
+          <code>bpf_map_update_elem</code> su pesi + eventuale modifica della sequenza layer.
+          Si può cambiare anche l'architettura (non solo i pesi) senza alcun reload.
+        </p>
       </div>
 
-    </div>
-  </div>
-</section>
+    </div><!-- /pipeline-grid -->
+  </section>
 
-<section id="tradeoff">
-  <div class="container">
-    <div class="section-header">
-      <div class="section-tag">Confronto diretto</div>
-      <h2>Tabella Trade-off</h2>
-      <p>All'aumentare della flessibilita: diminuisce la specializzazione del codice, aumentano map lookup, tail calls e passaggio di stato, diminuiscono le prestazioni massime.</p>
-    </div>
-    <div class="tradeoff-table-wrap">
+  <!-- ── TRADE-OFF TABLE ── -->
+  <section id="tradeoff">
+    <div class="sec-label">Confronto diretto</div>
+    <div class="sec-title">Tabella Trade-off</div>
+    <p class="sec-desc">
+      Riepilogo delle caratteristiche strutturali di ciascuna pipeline.
+    </p>
+    <div class="tbl-wrap">
       <table>
         <thead>
           <tr>
-            <th>Soluzione</th><th>Codice eBPF</th><th>Pesi</th><th>Tail call</th><th>Stato intermedio</th><th>Flessibilita</th><th>Prestazioni attese</th>
+            <th>Soluzione</th>
+            <th>Codice eBPF</th>
+            <th>Pesi</th>
+            <th>Tail call</th>
+            <th>Stato intermedio</th>
+            <th>Flessibilità</th>
+            <th>Prestazioni</th>
           </tr>
         </thead>
         <tbody>
           <tr>
-            <td class="td-label">Hardcoded model</td>
-            <td><span class="tag-ebpf">1 per modello</span></td>
-            <td style="font-family:var(--font-mono);font-size:12px;color:var(--green);">hardcoded</td>
-            <td style="font-family:var(--font-mono);font-size:13px;color:var(--green);font-weight:700;">1</td>
+            <td class="td-strong">Hardcoded model</td>
+            <td><span class="tag tag-g">1 per modello</span></td>
+            <td class="mono" style="color:var(--green);">hardcoded</td>
+            <td class="mono" style="color:var(--green);font-weight:700;">1</td>
             <td style="color:var(--muted);font-size:12px;">nessuno</td>
-            <td><span class="flex-chip flex-low">bassa</span></td>
+            <td><span class="chip chip-r" style="display:inline-block;">bassa</span></td>
             <td style="color:var(--green);font-weight:600;">massime</td>
           </tr>
           <tr>
-            <td class="td-label">Template architetturale</td>
-            <td><span class="tag-bpf">1 per architettura</span></td>
-            <td style="font-family:var(--font-mono);font-size:12px;color:var(--amber);">BPF map</td>
-            <td style="font-family:var(--font-mono);font-size:13px;color:var(--amber);font-weight:700;">1</td>
+            <td class="td-strong">Template architetturale</td>
+            <td><span class="tag tag-a">1 per architettura</span></td>
+            <td class="mono" style="color:var(--amber);">BPF map</td>
+            <td class="mono" style="color:var(--amber);font-weight:700;">1</td>
             <td style="color:var(--muted);font-size:12px;">locale al programma</td>
-            <td><span class="flex-chip flex-mid">media</span></td>
-            <td style="color:var(--amber);font-weight:600;">alte / intermedie</td>
+            <td><span class="chip chip-a" style="display:inline-block;">media</span></td>
+            <td style="color:var(--amber);font-weight:600;">intermedie</td>
           </tr>
           <tr>
-            <td class="td-label">Moduli layer</td>
-            <td><span class="tag-percpu">1 per blocco</span></td>
-            <td style="font-family:var(--font-mono);font-size:12px;color:var(--red);">BPF map</td>
-            <td style="font-family:var(--font-mono);font-size:13px;color:var(--red);font-weight:700;">&gt;1</td>
+            <td class="td-strong">Moduli layer</td>
+            <td><span class="tag tag-r">1 per blocco</span></td>
+            <td class="mono" style="color:var(--red);">BPF map</td>
+            <td class="mono" style="color:var(--red);font-weight:700;">&gt;1</td>
             <td style="color:var(--amber);font-size:12px;">scratch map / header IPA</td>
-            <td><span class="flex-chip flex-high">alta</span></td>
+            <td><span class="chip chip-g" style="display:inline-block;">alta</span></td>
             <td style="color:var(--red);font-weight:600;">inferiori</td>
           </tr>
         </tbody>
       </table>
     </div>
-  </div>
-</section>
+  </section>
 
-<section id="metrics">
+  <!-- ── GESTIONE STATO INTERFACCE ── -->
+  <section id="iface">
+    <div class="sec-label">Gestione dello stato</div>
+    <div class="sec-title">Stato delle Interfacce nel Datapath</div>
+    <p class="sec-desc">
+      Ogni pipeline deve risolvere un problema comune: come propagare nel datapath eBPF
+      l'informazione sullo stato delle interfacce (link-state, mapping ifindex → classe,
+      one-hot encoding dei vicini) senza violare i vincoli del verifier.
+    </p>
+
+    <div class="iface-grid">
+
+      <div class="iface-card">
+        <h3>Stato letto dal control plane</h3>
+        <div class="iface-sub">Aggiornamento tramite BPF map</div>
+        <p>
+          Il control plane Python mantiene la tabella degli stati delle interfacce
+          (<code>link_state[ifindex] → {up, bw, neighbor_id}</code>) e la scrive
+          in una <code>BPF_HASH</code> map condivisa con tutti i programmi eBPF
+          delle tre pipeline.
+        </p>
+        <p>
+          Quando FRR notifica un cambio di stato (link up/down, cambio metrica),
+          il controller aggiorna la map lato userspace con <code>bpf_map_update_elem</code>.
+          I programmi eBPF leggono lo stato aggiornato al prossimo pacchetto processato,
+          senza necessità di reload.
+        </p>
+        <div class="codeblock">/* lato userspace (control plane) */
+iface_map[ifindex] = {
+    .state     = LINK_UP,
+    .neighbor  = node_id,   /* 0..51 */
+    .iface_idx = iface_cls  /* 1..6  */
+};</div>
+      </div>
+
+      <div class="iface-card">
+        <h3>One-hot encoding nel datapath</h3>
+        <div class="iface-sub">Come le feature vengono costruite in kernel space</div>
+        <p>
+          Il programma eBPF legge dalla map l'<code>iface_idx</code> e il
+          <code>neighbor</code> del pacchetto corrente e li converte in
+          <strong>one-hot encoding</strong> compatibile con il modello addestrato
+          (<code>FRR_model.py</code>):
+        </p>
+        <p>
+          6 link-state [0..5] + 6 iface one-hot [6..11] + TTL [12] + 52 node one-hot [13..64].
+          Questo vettore da 65 feature viene passato all'inferenza della pipeline attiva.
+        </p>
+        <div class="codeblock">/* feature vector layout (65 elementi) */
+fv[iface_idx + 6]  = 1;   /* iface one-hot */
+fv[neighbor + 13]  = 1;   /* node  one-hot */
+fv[12]             = ttl;
+/* link-state [0..5]: da iface_map */</div>
+      </div>
+
+      <div class="iface-card">
+        <h3>Pipeline 1 — switch sui valori runtime</h3>
+        <div class="iface-sub">Vincolo verifier: nessun array statico indicizzato</div>
+        <p>
+          Nel codice hardcoded i valori <code>iface_idx</code> e <code>neighbor</code>
+          sono variabili runtime. Il verifier eBPF non permette di indicizzare array
+          <code>static const</code> con variabili runtime (la relocation fallisce e
+          l'accesso collassa a indirizzo 0).
+        </p>
+        <p>
+          Soluzione adottata: un solo <code>switch(iface_idx)</code> e un solo
+          <code>switch(neighbor)</code> per l'intero programma, dove ogni
+          <code>case</code> assegna il contributo per <em>tutti</em> i neuroni
+          insieme. I branch restano O(6 + 52) indipendentemente dal numero di neuroni,
+          e i valori restano scalari su stack — nessuna global, nessuna map, zero lookup pesi.
+        </p>
+      </div>
+
+      <div class="iface-card">
+        <h3>Pipeline 2 e 3 — lookup da BPF_ARRAY</h3>
+        <div class="iface-sub">Flessibilità tramite map, senza vincoli sulle variabili</div>
+        <p>
+          Nelle pipeline 2 e 3 i pesi sono in <code>BPF_ARRAY</code>. L'accesso tramite
+          indice aritmetico (non tramite array <code>static const</code>) è sicuro per il
+          verifier: la map è un oggetto kernel registrato, non un puntatore non rilocato.
+        </p>
+        <p>
+          L'encoding one-hot viene costruito allo stesso modo (stessa <code>iface_map</code>
+          condivisa), ma il prodotto scalare con i pesi avviene tramite
+          <code>bpf_map_lookup_elem(&amp;weight_map, &amp;offset)</code>,
+          eliminando completamente il problema di relocation e permettendo di
+          cambiare i pesi a runtime senza toccare il codice eBPF.
+        </p>
+      </div>
+
+    </div>
+
+    <div class="iface-note">
+      <strong>Perché non serve una fwd_table dedicata nelle tre pipeline?</strong><br>
+      Le pipeline si occupano esclusivamente di <em>classificazione</em>: ricevono un pacchetto,
+      estraggono le feature, eseguono l'inferenza e producono un'<em>azione</em> (drop / pass /
+      redirect verso un ifindex). Il mapping <code>classe → ifindex di uscita</code> è
+      risolto inline nella pipeline stessa (switch su <code>best_cls</code> nella P1,
+      lookup su <code>action_map</code> nelle P2/P3) — non è necessaria una tabella di
+      forwarding separata. Una <code>fwd_table</code> diventerebbe rilevante solo se IPA
+      dovesse gestire routing IP generico, che non è nel perimetro di queste tre pipeline.
+    </div>
+  </section>
+
+</div><!-- /container -->
+
+<footer>
   <div class="container">
-    <div class="section-header">
-      <div class="section-tag">Valutazione sperimentale</div>
-      <h2>Metriche da Misurare</h2>
-      <p>Non basta misurare il throughput. Bisogna misurare anche il costo della flessibilita sia sul datapath che sul control plane.</p>
+    <div class="inner">
+      <span>IPA/eBPF Design Space &mdash; branch
+        <span style="font-family:var(--font-mono);color:var(--teal);">design-space-docs</span>
+      </span>
+      <a href="https://github.com/ettore-cantile/ipa_lab/tree/design-space-docs"
+         target="_blank" rel="noopener noreferrer">
+        Vai al branch su GitHub &rarr;
+      </a>
     </div>
-    <div class="metrics-grid">
-      <div class="metric-card"><div class="metric-icon">&#9889;</div><div><h4>Latenza per pacchetto</h4><p>Tempo di elaborazione end-to-end per singolo pacchetto IPA nel datapath eBPF.</p></div></div>
-      <div class="metric-card"><div class="metric-icon">&#128640;</div><div><h4>Throughput massimo (Mpps)</h4><p>Milioni di pacchetti al secondo processabili senza drop, misurati con pktgen/trex.</p></div></div>
-      <div class="metric-card"><div class="metric-icon">&#128187;</div><div><h4>CPU utilization</h4><p>Percentuale di CPU consumata durante il processing; rilevante per co-esistenza con FRR.</p></div></div>
-      <div class="metric-card"><div class="metric-icon">&#128203;</div><div><h4>Istruzioni eBPF</h4><p>Numero di istruzioni eBPF per pipeline. Proxy della complessita (<code style="font-family:var(--font-mono);font-size:11px;">bpftool prog show</code>).</p></div></div>
-      <div class="metric-card"><div class="metric-icon">&#128279;</div><div><h4>Numero tail calls</h4><p>Contatore di tail call chain per pacchetto. Limite kernel: 33 consecutive.</p></div></div>
-      <div class="metric-card"><div class="metric-icon">&#128506;</div><div><h4>Numero map lookup</h4><p>BPF map accesses per pacchetto: 0 per hardcoded, 1+ per template, N per modular.</p></div></div>
-      <div class="metric-card"><div class="metric-icon">&#128260;</div><div><h4>Tempo aggiornamento modello</h4><p>Quanto ci vuole per cambiare modello: reload vs map update vs layer swap.</p></div></div>
-      <div class="metric-card"><div class="metric-icon">&#128190;</div><div><h4>Memoria programmi/mappe</h4><p>Footprint in kernel memory: oggetti eBPF + BPF maps per ciascuna pipeline.</p></div></div>
-    </div>
-    <div style="margin-top:1.5rem;">
-      <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/pipeline_benchmark.py" target="_blank" rel="noopener noreferrer">shared/pipeline_benchmark.py &mdash; script di benchmark comparativo</a>
-    </div>
-  </div>
-</section>
-
-<section id="update-cost">
-  <div class="container">
-    <div class="section-header">
-      <div class="section-tag">Control-plane flexibility</div>
-      <h2>Costo di Aggiornamento Modello</h2>
-      <p>La dimensione sperimentale piu interessante: quanto costa cambiare modello a runtime per ciascuna pipeline?</p>
-    </div>
-    <div class="update-grid">
-      <div class="update-card" style="border-top:3px solid var(--green);">
-        <h3 style="color:var(--green);">1. Hardcoded</h3>
-        <div class="cost-label">Procedura di aggiornamento</div>
-        <code>clang -O2 -target bpf model_new.c -o model_new.o</code>
-        <code>ip link set dev eth0 xdp obj model_new.o sec xdp</code>
-        <p style="font-size:12px;color:var(--muted);margin-top:0.5rem;">Richiede: generazione sorgente C, compilazione LLVM, reload XDP. Il datapath e interrotto durante il reload.</p>
-      </div>
-      <div class="update-card" style="border-top:3px solid var(--amber);">
-        <h3 style="color:var(--amber);">2. Template architetturale</h3>
-        <div class="cost-label">Procedura di aggiornamento</div>
-        <code>bpf_map_update_elem(arch_weights, &amp;key, &amp;new_w, 0)</code>
-        <code>bpf_map_update_elem(model_registry, &amp;mid, &amp;info, 0)</code>
-        <p style="font-size:12px;color:var(--muted);margin-top:0.5rem;">Solo map update dal userspace. Nessuna interruzione del datapath. Aggiornamento atomico per pacchetti in volo.</p>
-      </div>
-      <div class="update-card" style="border-top:3px solid var(--red);">
-        <h3 style="color:var(--red);">3. Modular pipeline</h3>
-        <div class="cost-label">Procedura di aggiornamento</div>
-        <code>bpf_map_update_elem(layer_weights, &amp;key, &amp;w, 0)</code>
-        <code>bpf_map_update_elem(layer_chain, &amp;idx, &amp;fd, 0)</code>
-        <p style="font-size:12px;color:var(--muted);margin-top:0.5rem;">Aggiornamento pesi + eventuale modifica della sequenza layer. Permette di cambiare anche l'architettura (non solo i pesi).</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="formulation">
-  <div class="container">
-    <div class="section-header">
-      <div class="section-tag">Formulazione da paper</div>
-      <h2>Formulazione Accademica</h2>
-      <p>Testo pronto per la sezione "Design Space" del report/paper (dal professore).</p>
-    </div>
-    <div class="paper-block">
-      <div class="paper-label">Paper formulation</div>
-      <p>
-        We consider three implementation points in the IPA/eBPF design space.
-        The <em>first</em> one hardcodes each neural model into a dedicated eBPF program,
-        maximizing datapath performance at the cost of requiring code regeneration
-        and program reloading for each model update.
-        The <em>second</em> one relies on pre-built architectural templates, where each
-        eBPF program implements a common neural architecture and retrieves
-        model-specific quantized parameters from BPF maps.
-        This reduces recompilation needs while preserving a statically verifiable
-        inference structure.
-        The <em>third</em> one decomposes neural inference into reusable eBPF layer modules
-        connected through tail calls, using a per-CPU scratch map to exchange
-        intermediate activations. This maximizes architectural flexibility, but
-        introduces additional tail calls and map accesses, thus reducing the
-        maximum achievable packet processing rate.
-      </p>
-    </div>
-  </div>
-</section>
-
-<section id="verifier">
-  <div class="container">
-    <div class="section-header">
-      <div class="section-tag">Riscontro pratico</div>
-      <h2>Vincoli del Verifier eBPF</h2>
-      <p>Il Livello 1 (hardcoded) e quello dove "massime prestazioni, zero lookup" e piu difficile da ottenere in pratica: il verifier impone due vincoli che collidono con l'idea di codice completamente unrolled.</p>
-    </div>
-    <div class="metrics-grid" style="margin-bottom:1.5rem;">
-      <div class="metric-card">
-        <div class="metric-icon">&#9646;</div>
-        <div><h4>Stack limit: 512 B</h4><p>Feature vector o tabelle di pesi per-neurone troppo grandi eccedono il budget di stack di un programma eBPF.</p></div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-icon">&#8942;</div>
-        <div><h4>Esplosione del CFG</h4><p>Ramificare (switch/if) su un valore runtime dentro un ciclo per-neurone moltiplica (non somma) i path che il verifier deve esplorare.</p></div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-icon">&#8862;</div>
-        <div><h4>BCC e dati globali</h4><p>Senza CO-RE, BCC non rilocca correttamente array <code style="font-family:var(--font-mono);">static const</code> per XDP: l'indirizzo puo collassare a 0 al load.</p></div>
-      </div>
-    </div>
-    <div class="paper-block">
-      <div class="paper-label">Case study &mdash; Pipeline 1, fc1 (65-4-4-7)</div>
-      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;">
-        Solo 3 feature sono vive per pacchetto (ttl, iface one-hot, node one-hot):
-        il peso associato dipende quindi da un indice runtime limitato
-        (<em>_iface</em> &isin; 1..6, <em>_node</em> &isin; 0..51). Due tentativi sono stati scartati prima della soluzione attuale:
-      </p>
-      <ol style="font-size:13px;color:var(--muted);line-height:1.9;margin:1rem 0 1rem 1.25rem;">
-        <li><strong style="color:var(--red);">switch(_iface)+switch(_node) per neurone</strong> &mdash; con 4 neuroni i path esplorati crescono come (7&middot;52)<sup>4</sup> &asymp; 1.75&times;10<sup>10</sup>, ben oltre il budget di 1.000.000 istruzioni del verifier &rarr; <code style="font-family:var(--font-mono);font-size:11px;background:var(--surface-2);color:var(--red);padding:2px 6px;border-radius:4px;">Permission denied</code>.</li>
-        <li><strong style="color:var(--red);">Array <code style="font-family:var(--font-mono);">static const</code> per neurone</strong>, indicizzati con variabile mascherata &mdash; niente esplosione di path, ma BCC compila questi array come dati globali non rilocati per XDP: la load risultante legge dall'indirizzo 0 &rarr; <code style="font-family:var(--font-mono);font-size:11px;background:var(--surface-2);color:var(--red);padding:2px 6px;border-radius:4px;">R1 invalid mem access 'scalar'</code>.</li>
-        <li><strong style="color:var(--green);">Fix adottato:</strong> un solo <code style="font-family:var(--font-mono);">switch(_iface)</code> e un solo <code style="font-family:var(--font-mono);">switch(_node)</code> per l'intero programma, dove ogni case assegna il contributo per <em>tutti</em> i neuroni insieme. I branch restano O(7+52) indipendentemente dal numero di neuroni, e i valori restano scalari su stack (64&nbsp;B totali) &mdash; nessuna global, nessuna map, preservando la proprieta "zero lookup pesi" del Livello 1.</li>
-        <li><strong style="color:var(--amber);">Stesso bug, seconda occorrenza:</strong> il pattern si ripresentava dopo l'argmax in <code style="font-family:var(--font-mono);">static const __u32 IFINDEX_TABLE[6]</code>, indicizzato da <em>best_cls</em> (0..5) per scegliere l'ifindex di uscita &mdash; stesso sintomo (<code style="font-family:var(--font-mono);font-size:11px;background:var(--surface-2);color:var(--red);padding:2px 6px;border-radius:4px;">R7 invalid mem access 'scalar'</code>), stessa causa, stessa soluzione: <code style="font-family:var(--font-mono);">switch (best_cls) { case 0: egress_ifindex = ...; break; ... }</code>. Nessun rischio di esplosione qui (best_cls e un solo scalare per pacchetto, non ripetuto per neurone).</li>
-      </ol>
-      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--text);margin-bottom:1rem;">
-        <strong>Lezione generale:</strong> qualunque tabella <code style="font-family:var(--font-mono);">static const</code>/globale indicizzata da un valore runtime non e sicura sotto BCC per XDP, indipendentemente dalla dimensione; la soluzione e sempre "switch sull'indice limitato", mai "rimpicciolire l'array".
-      </p>
-      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--muted);margin-bottom:1.5rem;">
-        Dato sperimentale interessante per il paper: il costo della specializzazione massima non e solo prestazionale, ma anche <em>di ingegneria</em> &mdash; richiede una codifica del branching ad-hoc per non violare i limiti del verifier, mentre i Livelli 2 e 3 evitano il problema a monte delegando i pesi a <code style="font-family:var(--font-mono);">BPF_ARRAY</code> map.
-      </p>
-      <div class="paper-label" style="color:var(--amber);">Revisione Livelli 2 e 3 &mdash; verifica di conformita</div>
-      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;margin-bottom:0.75rem;">
-        Un controllo su <code style="font-family:var(--font-mono);">ebpf_template_arch.py</code> e <code style="font-family:var(--font-mono);">ebpf_modular.py</code> ha trovato due bug, entrambi corretti:
-      </p>
-      <ol style="font-size:13px;color:var(--muted);line-height:1.9;margin:0 0 1rem 1.25rem;">
-        <li><strong style="color:var(--red);">Stack overflow nel Livello 2</strong> &mdash; <code style="font-family:var(--font-mono);">arch_65_4_4_7</code> dichiarava <code style="font-family:var(--font-mono);">long long iv[65]</code> (520&nbsp;B), gia da solo oltre il limite di 512&nbsp;B. Fix: prodotto scalare calcolato direttamente da 3 scalari via indici aritmetici nella <code style="font-family:var(--font-mono);">BPF_ARRAY</code> (sicuro per il verifier, a differenza degli array <code style="font-family:var(--font-mono);">static const</code>).</li>
-        <li><strong style="color:var(--red);">Disallineamento encoding feature (Livelli 2 e 3)</strong> &mdash; entrambi popolavano l'input come <code style="font-family:var(--font-mono);">[0]=model_id, [1]=ttl, [2]=ifindex, [3]=input_size</code>, schema diverso da come il modello e stato addestrato (<code style="font-family:var(--font-mono);">FRR_model.py</code>: 6 link_state + 6 iface one-hot [6..11] + ttl [12] + 52 node one-hot [13..64]). Rispettavano la tassonomia architetturale ma non eseguivano lo stesso modello del Livello 1. Corretto per usare lo stesso encoding one-hot.</li>
-      </ol>
-      <p style="font-family:var(--font-body);font-size:13px;line-height:1.8;color:var(--muted);">
-        <strong style="color:var(--text);">Stato:</strong> Livello 1 confermato funzionante end-to-end su Kathara. Livelli 2 e 3 non ancora rilanciati su Kathara dopo il fix (ragionati ma non verificati dal verifier reale). <code style="font-family:var(--font-mono);">test_kathara.sh</code> legge solo le map del Livello 1 (<code style="font-family:var(--font-mono);">pkt_stats</code>/<code style="font-family:var(--font-mono);">cls_stats</code>); i Livelli 2/3 usano nomi e modello hit/miss diversi &mdash; estendere lo script e' lavoro di follow-up non ancora fatto.
-      </p>
-    </div>
-  </div>
-</section>
-
-<section id="files">
-  <div class="container">
-    <div class="section-header">
-      <div class="section-tag">Implementazione</div>
-      <h2>File nel Branch design-space-docs</h2>
-      <p>Tutti i file implementativi disponibili sul branch, organizzati per pipeline.</p>
-    </div>
-    <div style="display:grid;gap:1rem;">
-      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1.25rem;">
-        <div style="font-size:12px;font-weight:700;color:var(--green);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.75rem;">Pipeline 1 &mdash; Hardcoded</div>
-        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/ebpf_program.py" target="_blank" rel="noopener noreferrer">shared/ebpf_program.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/extract_weights.py" target="_blank" rel="noopener noreferrer">shared/extract_weights.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/weights.json" target="_blank" rel="noopener noreferrer">shared/weights.json</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/weights_float.json" target="_blank" rel="noopener noreferrer">shared/weights_float.json</a>
-        </div>
-      </div>
-      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1.25rem;">
-        <div style="font-size:12px;font-weight:700;color:var(--amber);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.75rem;">Pipeline 2 &mdash; Template Architetturale</div>
-        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/ebpf_template_arch.py" target="_blank" rel="noopener noreferrer">shared/ebpf_template_arch.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/weights_method2.json" target="_blank" rel="noopener noreferrer">shared/weights_method2.json</a>
-        </div>
-      </div>
-      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1.25rem;">
-        <div style="font-size:12px;font-weight:700;color:var(--red);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.75rem;">Pipeline 3 &mdash; Modular Neural Pipeline</div>
-        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/ebpf_modular.py" target="_blank" rel="noopener noreferrer">shared/ebpf_modular.py</a>
-        </div>
-      </div>
-      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1.25rem;">
-        <div style="font-size:12px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.75rem;">Benchmark &amp; Infrastruttura</div>
-        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;">
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/pipeline_benchmark.py" target="_blank" rel="noopener noreferrer">shared/pipeline_benchmark.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/execute_pipeline.py" target="_blank" rel="noopener noreferrer">shared/execute_pipeline.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/common.py" target="_blank" rel="noopener noreferrer">shared/common.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/send_ipa.py" target="_blank" rel="noopener noreferrer">shared/send_ipa.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/test_ipa.py" target="_blank" rel="noopener noreferrer">shared/test_ipa.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/FRR_model.py" target="_blank" rel="noopener noreferrer">shared/FRR_model.py</a>
-          <a class="file-link" href="https://github.com/ettore-cantile/ipa_lab/blob/design-space-docs/shared/frr_germany50_5_model_4x2.pt" target="_blank" rel="noopener noreferrer">shared/frr_germany50_5_model_4x2.pt</a>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<footer style="border-top:1px solid var(--border);padding:2rem 0;margin-top:2rem;">
-  <div class="container" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;">
-    <span style="color:var(--muted);font-size:12px;">IPA/eBPF Design Space &mdash; branch <code style="font-family:var(--font-mono);color:var(--teal);">design-space-docs</code></span>
-    <a href="https://github.com/ettore-cantile/ipa_lab/tree/design-space-docs" target="_blank" rel="noopener noreferrer" style="color:var(--blue);font-size:12px;text-decoration:none;">View on GitHub &rarr;</a>
   </div>
 </footer>
 
