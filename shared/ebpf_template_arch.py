@@ -6,7 +6,7 @@ Design space position:
   - Multiple models sharing the same shape reuse the same program
   - Weights are stored in BPF_ARRAY maps, loaded at runtime by the CP
   - No recompilation needed to change weights; only a BPF map update
-  - One tail call: dispatcher -> model_registry -> arch_<shape>
+  - One tail call: dispatcher -> arch_progs[arch_id] -> arch_65_4_4_7
 
 Architecture supported here: 65-4-4-7 (matching the existing model).
   fc1  : 65 inputs  -> 4 hidden   (260 weights + 4 bias = 264)
@@ -17,32 +17,14 @@ Architecture supported here: 65-4-4-7 (matching the existing model).
 Maps introduced:
   arch_registry   : model_id  -> {arch_id, weight_offset, scale_factor}
   arch_weights    : index     -> char  (signed, flat weight array)
+  arch_progs      : arch_id   -> fd of arch_65_4_4_7  <-- TAIL CALL ARRAY
   fwd_table_t2    : u64 key   -> fwd_action
   valid_keys_t2   : u8  ttl   -> u64 key
   pkt_stats_t2    : [0]=HIT [1]=MISS [2]=FAKE
   miss_events_t2  : perf buffer
 
-BCC leaf-type / BPF_ARRAY slot-size note:
-  BPF_ARRAY with 'char' leaf declared in BCC allocates value_size=8 bytes
-  per slot on x86_64 (kernel rounds up to nearest power-of-two >= 8).
-  The Python writer detects the real value_size via BPF_OBJ_GET_INFO_BY_FD
-  and allocates a properly-sized zeroed buffer for each write, placing
-  the int8 value at byte 0 (LSB on little-endian).  The eBPF program
-  reads *(signed char *)bp which is bp[0] -- correct on LE.
-
-Why NOT libbcc.so.0.bpf_update_elem:
-  bpf_update_elem is an internal libbcc symbol, not part of the public
-  ABI.  On Kathara/Debian containers it either does not resolve or
-  returns -1 silently, leaving arch_weights empty.  The raw bpf(2)
-  syscall is the correct stable mechanism.
-
-Combined compilation note (pipeline_benchmark.py):
-  EBPF_ARCH_65_4_4_7 wraps shared declarations in
-  #ifndef IPA_ARCH_COMBINED / #endif.  pipeline_benchmark prepends
-  '#define IPA_ARCH_COMBINED 1' before concatenating the two sources.
-
 Fixed bugs (2026-07-08):
-  1) Stack overflow: `long long iv[T2_N_IN]` (65 * 8B = 520B).
+  1) Stack overflow: `long long iv[T2_N_IN]` (65*8B = 520B).
   2) Feature-encoding mismatch (old iv[0]=model_id encoding).
   Fix: sparse dot-product via BPF_ARRAY index arithmetic.
 
@@ -54,15 +36,19 @@ Fixed bugs (2026-07-09 v8):
   5) libbcc bpf_update_elem not public ABI -> raw bpf(2) syscall.
 
 Fixed bugs (2026-07-09 v9):
-  6) value_size mismatch: BPF_ARRAY 'char' slot is 8 bytes on kernel;
-     passing c_int32 (4 bytes) caused EINVAL or partial writes.
-     Fix: detect real value_size via BPF_OBJ_GET_INFO_BY_FD, allocate
-     a zeroed buffer of that size, write int8 at byte 0.
+  6) value_size mismatch: detect real slot size via BPF_OBJ_GET_INFO_BY_FD.
+
+Fixed bugs (2026-07-09 v10):
+  7) ARCH_PROGS NOT POPULATED: load_arch_weights never set
+     arch_progs[arch_id] = arch_65_4_4_7.fd, so the tail call in the
+     dispatcher silently fell through (BPF_PROG_ARRAY slot empty =
+     XDP_PASS + no inference).  key in miss events was always 0 because
+     arch_65_4_4_7 was never reached.  Fix: wire the tail-call slot
+     after loading weights.
 """
 
 import ctypes as ct
 import os
-import struct
 
 # Architecture constants (65-4-4-7 model)
 N_IN   = 65
@@ -79,28 +65,19 @@ N_WEIGHTS_T2 = (N_IN * N_H1 + N_H1) + (N_H1 * N_H2 + N_H2) + (N_H2 * N_OUT + N_O
 _libc = ct.CDLL("libc.so.6", use_errno=True)
 _BPF_SYSCALL_NR          = 321   # x86_64
 _BPF_MAP_UPDATE_ELEM     = 2
+_BPF_MAP_LOOKUP_ELEM     = 1
 _BPF_OBJ_GET_INFO_BY_FD  = 15
 _BPF_ANY                 = 0
 
 
 class _BpfAttrMapElem(ct.Structure):
     """
-    Mirrors the kernel union bpf_attr for BPF_MAP_UPDATE/LOOKUP_ELEM.
-
-    Kernel layout (from include/uapi/linux/bpf.h):
-      struct {          /* used by BPF_MAP_*_ELEM commands */
-        __u32  map_fd;  /* offset  0, size 4 */
-        /* 4-byte implicit pad to align __aligned_u64 */
-        __aligned_u64  key;    /* offset  8, size 8 */
-        __aligned_u64  value;  /* offset 16, size 8 */
-        __u64          flags;  /* offset 24, size 8 */
-      };
-    Total: 32 bytes.  ctypes with natural alignment produces the same
-    layout (c_uint32 + 4-byte pad + c_uint64 + c_uint64 + c_uint64).
+    union bpf_attr for BPF_MAP_UPDATE/LOOKUP_ELEM.
+    Kernel layout: u32 map_fd + 4-byte pad + u64 key + u64 value + u64 flags.
     """
     _fields_ = [
         ("map_fd",  ct.c_uint32),
-        ("_pad",    ct.c_uint32),   # explicit pad to match __aligned_u64
+        ("_pad",    ct.c_uint32),
         ("key",     ct.c_uint64),
         ("value",   ct.c_uint64),
         ("flags",   ct.c_uint64),
@@ -108,26 +85,16 @@ class _BpfAttrMapElem(ct.Structure):
 
 
 class _BpfMapInfo(ct.Structure):
-    """
-    First fields of struct bpf_map_info (bpf.h).  We only need
-    value_size (offset 12) so we declare enough to reach it.
-    """
     _fields_ = [
-        ("map_type",    ct.c_uint32),   # offset  0
-        ("id",          ct.c_uint32),   # offset  4
-        ("key_size",    ct.c_uint32),   # offset  8
-        ("value_size",  ct.c_uint32),   # offset 12
-        ("max_entries", ct.c_uint32),   # offset 16
+        ("map_type",    ct.c_uint32),
+        ("id",          ct.c_uint32),
+        ("key_size",    ct.c_uint32),
+        ("value_size",  ct.c_uint32),
+        ("max_entries", ct.c_uint32),
     ]
 
 
 class _BpfAttrObjInfo(ct.Structure):
-    """
-    union bpf_attr for BPF_OBJ_GET_INFO_BY_FD:
-      __u32  bpf_fd
-      __u32  info_len
-      __aligned_u64 info  (pointer)
-    """
     _fields_ = [
         ("bpf_fd",   ct.c_uint32),
         ("info_len", ct.c_uint32),
@@ -136,10 +103,7 @@ class _BpfAttrObjInfo(ct.Structure):
 
 
 def _get_map_value_size(map_fd: int) -> int:
-    """
-    Return the kernel-reported value_size for a BPF map fd.
-    Falls back to 8 if the syscall is not available.
-    """
+    """Return kernel-reported value_size for a BPF map fd; fallback 8."""
     info = _BpfMapInfo()
     attr = _BpfAttrObjInfo(
         bpf_fd   = map_fd,
@@ -149,23 +113,19 @@ def _get_map_value_size(map_fd: int) -> int:
     ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_OBJ_GET_INFO_BY_FD,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
-        return 8   # safe fallback: BPF_ARRAY 'char' slot >= 8 bytes
+        print(f"[Pipeline2] BPF_OBJ_GET_INFO_BY_FD errno={ct.get_errno()}, using fallback value_size=8")
+        return 8
     return max(1, int(info.value_size))
 
 
 def _bpf_map_update_char(map_fd: int, value_size: int,
                          index: int, int8_val: int) -> None:
     """
-    Write int8_val into arch_weights[index] via BPF_MAP_UPDATE_ELEM.
-
-    Allocates a zeroed buffer of `value_size` bytes, places the int8
-    value at byte 0 (little-endian, matching *(signed char *)ptr in eBPF),
-    then calls the raw bpf(2) syscall.  Raises OSError on failure.
+    Write int8_val into a BPF_ARRAY[index] via raw BPF_MAP_UPDATE_ELEM.
+    Allocates a zeroed buffer of value_size bytes; places int8 at byte 0.
     """
     key_buf = ct.c_uint32(index)
-    # Zeroed value buffer sized to the map's actual slot size.
     val_buf = (ct.c_uint8 * value_size)()
-    # Write sign-preserved byte at position 0.
     val_buf[0] = ct.c_uint8(ct.c_int8(int8_val).value & 0xFF).value
 
     attr = _BpfAttrMapElem(
@@ -179,8 +139,26 @@ def _bpf_map_update_char(map_fd: int, value_size: int,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
         e = ct.get_errno()
-        raise OSError(e, f"BPF_MAP_UPDATE_ELEM arch_weights[{index}] "
-                         f"(value_size={value_size}): {os.strerror(e)}")
+        raise OSError(e, f"BPF_MAP_UPDATE_ELEM arch_weights[{index}]="
+                         f"{int8_val} (value_size={value_size}): {os.strerror(e)}")
+
+
+def _bpf_map_lookup_char(map_fd: int, value_size: int, index: int) -> int:
+    """Read arch_weights[index] and return value as signed int8 (for verification)."""
+    key_buf = ct.c_uint32(index)
+    val_buf = (ct.c_uint8 * value_size)()
+    attr = _BpfAttrMapElem(
+        map_fd = map_fd,
+        _pad   = 0,
+        key    = ct.cast(ct.byref(key_buf), ct.c_void_p).value,
+        value  = ct.cast(val_buf, ct.c_void_p).value,
+        flags  = 0,
+    )
+    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_LOOKUP_ELEM,
+                        ct.byref(attr), ct.sizeof(attr))
+    if ret != 0:
+        return None
+    return ct.c_int8(val_buf[0]).value
 
 
 EBPF_TEMPLATE_ARCH_DISPATCHER = r"""
@@ -227,11 +205,10 @@ struct miss_event_t2 {
     __u64 key;
 };
 
-/* 'char' leaf type: BCC str2ctype knows 'char'; '__s8'/'signed char'
- * are NOT in str2ctype -> KeyError.  char is signed on x86/x86_64.
- * Slot size in kernel BPF_ARRAY is roundup(sizeof(char), 8) = 8 bytes;
- * Python writer detects this via BPF_OBJ_GET_INFO_BY_FD and uses a
- * zeroed 8-byte buffer with the int8 value at byte 0. */
+/* 'char' leaf: BCC str2ctype maps 'char' correctly; '__s8'/'signed char'
+ * are not in the table -> KeyError.  char is signed on x86/x86_64.
+ * BPF_ARRAY slot size = max(sizeof(char), 8) = 8 on x86_64;
+ * Python writer detects this via BPF_OBJ_GET_INFO_BY_FD. */
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 
@@ -264,8 +241,11 @@ int ipa_switch_template(struct xdp_md *ctx) {
     struct arch_entry *entry = arch_registry.lookup(&model_id);
     if (!entry) return XDP_PASS;
 
+    /* Tail call into the architecture-specific inference program.
+     * If arch_progs[entry->arch_id] is empty (not populated by the
+     * control plane), this silently falls through to XDP_PASS. */
     arch_progs.call(ctx, entry->arch_id);
-    return XDP_PASS;
+    return XDP_PASS;  /* tail call failed or prog returned */
 }
 """
 
@@ -359,13 +339,17 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
 
-    /* Feature encoding: matches Pipeline 1 / FRR_model.py exactly.
-     * Sparse dot-product: only 3 positions are non-zero per packet.
-     * SANDBOX: ctx->ingress_ifindex=65536 -> clamp to 0. */
-    __u32 _ttl   = ((__u32)ip->ttl) & 0xff;
+    /* Sparse dot-product: only 3 of 65 input positions are non-zero.
+     * Feature layout (FRR_model.py):
+     *   [0..5]   link_state (always 0, unused)
+     *   [6..11]  ingress iface one-hot  (index = 5 + iface, iface in [1..6])
+     *   [12]     ttl
+     *   [13..64] node one-hot           (index = 13 + node, node in [0..51])
+     * SANDBOX: ingress_ifindex=65536 -> clamp to 0 (no iface contribution). */
+    __u32 _ttl       = ((__u32)ip->ttl) & 0xff;
     __u32 _raw_iface = ctx->ingress_ifindex;
-    __u32 _iface = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
-    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;
+    __u32 _iface     = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
+    __u32 _node      = ((__u32)ipa->model_id) & 0x3f;  /* 0..51 valid */
 
     long long h1[T2_N_H1];
     #pragma unroll
@@ -432,6 +416,8 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
+    /* KEY FORMULA: udiv (sdiv i64 not supported by BPF LLVM backend).
+     * Numerator is always positive: OUTPUT_OFFSET*scale >> |best_val|. */
     long long _num_signed = best_val + OUTPUT_OFFSET * (long long)scale;
     if (_num_signed < 0) return XDP_PASS;
     __u64 num = (__u64)_num_signed;
@@ -465,27 +451,36 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
 def load_arch_weights(bpf_obj, weights_int8: list,
                       model_id: int = 0, scale: int = 128) -> None:
     """
-    Populate arch_registry and arch_weights for Pipeline 2.
+    Populate arch_registry, arch_weights, AND arch_progs for Pipeline 2.
 
-    Detects the kernel BPF_ARRAY slot size via BPF_OBJ_GET_INFO_BY_FD
-    and writes each int8 weight into a properly-sized zeroed buffer at
-    byte 0, using the raw bpf(2) BPF_MAP_UPDATE_ELEM syscall.
+    arch_progs (BPF_PROG_ARRAY) MUST be populated so the tail call in
+    ipa_switch_template can reach arch_65_4_4_7.  An empty slot causes
+    the tail call to fall through silently (XDP_PASS, no inference,
+    key=0 in all miss events).
     """
-    from ctypes import c_uint8, c_uint32, c_uint16, Structure
+    from ctypes import c_uint8, c_uint32, c_uint16, c_int32, Structure
 
     weight_offset = 0
     arch_id       = 0
     map_fd        = bpf_obj["arch_weights"].map_fd
 
-    # Detect actual slot size (usually 8 for BPF_ARRAY 'char' on x86_64).
+    # Detect actual slot size.
     value_size = _get_map_value_size(map_fd)
-    print(f"[Pipeline2] arch_weights value_size={value_size} bytes/slot")
+    print(f"[Pipeline2] arch_weights fd={map_fd} value_size={value_size} bytes/slot")
 
+    # Write all 319 int8 weights.
     for idx, w in enumerate(weights_int8[:N_WEIGHTS_T2]):
         _bpf_map_update_char(map_fd, value_size,
                              index=weight_offset + idx,
                              int8_val=int(w))
 
+    # Verify first weight round-trips correctly.
+    v0 = _bpf_map_lookup_char(map_fd, value_size, 0)
+    expected0 = ct.c_int8(int(weights_int8[0])).value
+    status = "OK" if v0 == expected0 else f"MISMATCH (got {v0}, expected {expected0})"
+    print(f"[Pipeline2] arch_weights[0] verify: {status}")
+
+    # Register arch_entry in arch_registry.
     class ArchEntry(Structure):
         _pack_ = 1
         _fields_ = [("arch_id",       c_uint8),
@@ -495,7 +490,17 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     entry = ArchEntry(arch_id=arch_id, weight_offset=weight_offset,
                       scale_factor=scale)
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
+    print(f"[Pipeline2] arch_registry[{model_id}] = "
+          f"arch_id={arch_id} woff={weight_offset} scale={scale}")
 
-    print(f"[Pipeline2] model_id={model_id} registered: arch_id={arch_id}, "
-          f"w_off={weight_offset}, scale={scale}, "
-          f"weights={len(weights_int8[:N_WEIGHTS_T2])}")
+    # ---------------------------------------------------------------------------
+    # Wire the tail-call slot: arch_progs[arch_id] = arch_65_4_4_7.fd
+    #
+    # Without this step the dispatcher's arch_progs.call(ctx, arch_id)
+    # silently falls through (empty BPF_PROG_ARRAY slot = nop + XDP_PASS),
+    # and arch_65_4_4_7 is NEVER executed.  This was the root cause of
+    # key=0x0000000000000000 on all packets.
+    # ---------------------------------------------------------------------------
+    prog_fd = bpf_obj["arch_65_4_4_7"].fd
+    bpf_obj["arch_progs"][c_int32(arch_id)] = c_int32(prog_fd)
+    print(f"[Pipeline2] arch_progs[{arch_id}] = fd {prog_fd} (arch_65_4_4_7) -- tail call wired")
