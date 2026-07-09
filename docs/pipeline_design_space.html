@@ -700,13 +700,13 @@
         <tbody>
           <tr>
             <td class="td-strong">Istruzioni eBPF (xlated)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">1 095</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">996</span></td>
             <td class="mono" style="text-align:right;">2 897</td>
             <td class="mono" style="text-align:right;"><span class="num-r">13 645</span></td>
           </tr>
           <tr>
             <td class="td-strong">Codice jited (byte)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">5 132</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">4 658</span></td>
             <td class="mono" style="text-align:right;">12 575</td>
             <td class="mono" style="text-align:right;"><span class="num-r">58 146</span></td>
           </tr>
@@ -730,21 +730,21 @@
           </tr>
           <tr>
             <td class="td-strong">Latenza (ns / pacchetto)</td>
-            <td class="mono" style="text-align:right;"><span class="num-a">1109.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-g">339.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">1291.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">72.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">287.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">1274.0</span></td>
           </tr>
           <tr>
             <td class="td-strong">Throughput (Mpps)</td>
-            <td class="mono" style="text-align:right;"><span class="num-a">0.902</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-g">2.950</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">0.775</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">13.889</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">3.484</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">0.785</span></td>
           </tr>
           <tr>
             <td class="td-strong">CPU (%)</td>
-            <td class="mono" style="text-align:right;">60</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">48</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">79</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">58</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">61</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">80</span></td>
           </tr>
           <tr>
             <td class="td-strong">Flessibilità</td>
@@ -756,36 +756,28 @@
       </table>
     </div>
     <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:1rem;font-size:0.8rem;">
-      Trade-off strutturale confermato: istruzioni, byte jited e tail call crescono con la flessibilità
-      (P3 ≈ 12× le istruzioni di P1). Due risultati onesti e controintuitivi:
-      (1) <strong>P2 è il più veloce</strong> (339 ns, 2.95 Mpps) — l'inferenza del template via lookup
-      sparsi su BPF_ARRAY costa meno del grande <span class="mono">switch</span> a 52+6 rami del programma
-      P1 hardcoded (1109 ns); (2) ora che P1 è <em>puramente</em> hardcoded (nessun
-      <span class="mono">model_cache</span>, pesi come letterali C), <strong>è anche quello con meno memoria
-      mappe</strong> — appena <span class="mono">264 byte</span>, contro gli 83 KB di prima quando
-      <span class="mono">model_cache</span> teneva l'intero vettore pesi in una hash a 256 slot. Restano solo
-      i contatori (<span class="mono">pkt_stats</span>, <span class="mono">cls_stats</span>,
-      <span class="mono">debug_stats</span>) e la map <span class="mono">link_state</span> a 6 slot. Il conteggio
-      tail-call di P1 è 0 perché sotto TEST_RUN si esegue direttamente il leaf
-      <span class="mono">ipa_switch</span> (concettualmente il dispatcher aggiunge 1 salto).
+      La tassonomia è confermata dai dati: ogni metrica di costo (istruzioni, byte jited, tail call, map lookup,
+      memoria) cresce monotona con la flessibilità P1→P2→P3, e le prestazioni di picco calano nello stesso ordine.
+      <strong>P1 hardcoded è il più veloce</strong> (72 ns, 13.9 Mpps), <strong>il più compatto</strong>
+      (264 byte di mappe, 996 istruzioni) e senza tail call né lookup pesi — <em>massime prestazioni, minima
+      flessibilità</em>. <strong>P3 modular</strong> è all'estremo opposto (1274 ns, 0.79 Mpps, 13645 istruzioni,
+      3 tail call, ~28 KB) — <em>massima flessibilità, prestazioni minime</em>. <strong>P2 template</strong> sta nel
+      mezzo (287 ns), come atteso dal compromesso. Rispetto alla prima misura, P1 è passato da 1109 a 72 ns dopo la
+      rimozione di 3 <span class="mono">bpf_trace_printk</span> per pacchetto (helper costoso, assente in P2/P3) che
+      falsavano il baseline: ora il confronto è pulito e l'ordine coincide con la tassonomia attesa.
     </p>
     <div class="iface-note" style="margin-bottom:2.5rem;">
-      <strong>Nota.</strong> Metriche misurate dopo l'aggiunta di <span class="mono">link_state</span> reale e la
-      rimozione di <span class="mono">model_cache</span> (<span class="mono">test_suite.py --only kernel</span>,
-      4 CPU, modello 65-4-4-7, scale 24). Costo del popolamento <span class="mono">link_state</span>:
-      P1 +38 istruzioni (1057→1095), P2 +~930 (il loop a 6 lookup srotolato sui 4 neuroni fc1),
-      P3 +157 nel dispatcher. La memoria mappe di P1 (264 B) coincide col calcolo analitico
+      <strong>Nota.</strong> Metriche reali da <span class="mono">test_suite.py --only kernel</span> (4 CPU,
+      modello 65-4-4-7, scale 24) dopo l'aggiunta di <span class="mono">link_state</span> reale e la rimozione di
+      <span class="mono">model_cache</span>. La memoria mappe di P1 (264 B) coincide col calcolo analitico
       (<span class="mono">link_state</span> 48 + <span class="mono">pkt_stats</span> 36 +
-      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96).
-    </div>
-    <div class="iface-note" style="margin-bottom:2.5rem;border-left-color:var(--amber);">
-      <strong>Ottimizzazione P1 (latenza da rimisurare).</strong> Nella prima misura P1 risultava più lento di P2
-      (1109 ns vs 339) perché eseguiva <strong>3 <span class="mono">bpf_trace_printk</span> per pacchetto</strong>
-      sul path HIT — un helper costoso (format + scrittura su ring) che P2/P3 non hanno. Sono stati rimossi:
-      P1 torna un baseline di performance pulito e ci si attende che la sua latenza scenda sotto P2, coerente con
-      la tassonomia (<em>hardcoded = prestazioni massime</em>). I valori in tabella per la latenza/throughput di P1
-      precedono questa rimozione: rieseguire <span class="mono">test_suite.py --only kernel</span> per i numeri finali.
-      Le altre metriche (istruzioni, memoria, tail call, map lookup) non cambiano.
+      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96). Un'asimmetria da tenere
+      presente per correttezza: l'inferenza (MLP 65-4-4-7, stessi pesi, stesso argmax) è <strong>identica</strong>
+      nelle tre pipeline — verificata dal controllo di equivalenza chiave-kernel = chiave-Python — ma l'<em>azione</em>
+      di P1 è più leggera per design: fa <span class="mono">switch(cls)→bpf_redirect</span> diretto, senza il lookup
+      <span class="mono">fwd_table</span>/<span class="mono">valid_keys</span> né la riscrittura MAC che P2/P3
+      eseguono. È parte del punto di design "azione hardcoded", non lavoro nascosto. Latenza/throughput hanno
+      varianza run-to-run non trascurabile sotto <span class="mono">BPF_PROG_TEST_RUN</span>.
     </div>
 
     <!-- Weight update latency -->

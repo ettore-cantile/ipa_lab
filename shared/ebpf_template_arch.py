@@ -333,6 +333,16 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
     __u32 _iface     = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
     __u32 _node      = ((__u32)ipa->model_id) & 0x3f;
 
+    /* Read link_state[0..5] ONCE (feature [0..5]); reused across all neurons.
+     * (Previously read inside the neuron loop = 6*N_H1 redundant lookups.) */
+    long long ls[6];
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        int lsk = i;
+        __u32 *lsp = link_state.lookup(&lsk);
+        ls[i] = lsp ? (long long)(*lsp) : 0LL;
+    }
+
     long long h1[T2_N_H1];
     #pragma unroll
     for (int j = 0; j < T2_N_H1; j++) {
@@ -346,17 +356,14 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         char *ttl_wp = arch_weights.lookup(&ttl_idx);
         if (ttl_wp) acc += (long long)_ttl * (long long)(*(signed char *)ttl_wp);
 
-        /* link_state features [0..5]: acc += link_state[i] * w[j, i] */
+        /* link_state features [0..5]: acc += ls[i] * w[j, i] */
         #pragma unroll
         for (int i = 0; i < 6; i++) {
-            int lsk = i;
-            __u32 *lsp = link_state.lookup(&lsk);
-            long long lsv = lsp ? (long long)(*lsp) : 0LL;
-            if (lsv) {
+            if (ls[i]) {
                 int ls_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + i;
                 if (ls_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
                 char *ls_wp = arch_weights.lookup(&ls_idx);
-                if (ls_wp) acc += lsv * (long long)(*(signed char *)ls_wp);
+                if (ls_wp) acc += ls[i] * (long long)(*(signed char *)ls_wp);
             }
         }
 

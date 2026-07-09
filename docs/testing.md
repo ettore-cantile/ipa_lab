@@ -135,25 +135,25 @@ kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 1
 
 | Metrica                    | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated)   |        1 095 |       2 897 |     13 645 |
-| Codice jited (byte)        |        5 132 |      12 575 |     58 146 |
+| Istruzioni eBPF (xlated)   |          996 |       2 897 |     13 645 |
+| Codice jited (byte)        |        4 658 |      12 575 |     58 146 |
 | Tail calls / pacchetto     |     0 (leaf) |           1 |          3 |
 | Map lookup / pacchetto (stima) | 8 (0 pesi) |         322 |        384 |
 | Memoria mappe (byte)       |          264 |      15 796 |     28 468 |
-| Latenza (ns/pacchetto)     |       1109.0 |       339.0 |     1291.0 |
-| Throughput (Mpps)          |        0.902 |       2.950 |      0.775 |
-| CPU (%)                    |           60 |          48 |         79 |
+| Latenza (ns/pacchetto)     |         72.0 |       287.0 |     1274.0 |
+| Throughput (Mpps)          |       13.889 |       3.484 |      0.785 |
+| CPU (%)                    |           58 |          61 |         80 |
 | Dispatch (TTL 1–5)         |    5/5 PASS  |   5/5 PASS  |  5/5 PASS  |
+| link_state reroute         |         PASS (5/30 casi cambiano uscita) |||
 
 Misurate con `test_suite.py --only kernel` (4 CPU, scale 24) dopo l'aggiunta di `link_state` reale
 e la rimozione di `model_cache`.
 
 Note oneste:
-- **P2 è il più veloce** (339 ns): l'inferenza via lookup sparsi su `BPF_ARRAY` costa meno del grande `switch` a 52+6 rami del P1 hardcoded.
-- **P1 hardcoded puro = meno memoria mappe** (264 B): nessun `model_cache` (prima erano 83 KB, il 99% del totale), restano solo i contatori + la map `link_state` a 6 slot.
-- Costo del popolamento `link_state`: P1 +38 istruzioni, P2 +~930 (loop a 6 lookup srotolato sui 4 neuroni fc1), P3 +157.
-- Tail-call P1 = 0 perché sotto TEST_RUN si esegue direttamente il leaf `ipa_switch` (il dispatcher aggiungerebbe 1 salto).
-- Istruzioni, jited e tail-call crescono con la flessibilità: è il costo strutturale del design modulare (P3 ≈ 12× le istruzioni di P1).
-- `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa. Aggiornato dal monitor carrier userspace.
+- **P1 hardcoded è il più veloce** (72 ns, 13.9 Mpps), il più compatto (264 B, 996 istr) e senza tail call né lookup pesi: massime prestazioni, minima flessibilità. **P3 modular** all'opposto (1274 ns, 3 tail call, ~28 KB). **P2 template** nel mezzo (287 ns). Ordine coerente con la tassonomia.
+- Ogni metrica di costo (istruzioni, jited, tail call, map lookup, memoria) cresce monotona P1→P2→P3; le prestazioni di picco calano nello stesso ordine.
+- **P1 = meno memoria mappe** (264 B): nessun `model_cache` (prima 83 KB, il 99%), restano solo i contatori + `link_state` a 6 slot.
+- **Confronto pulito**: P1 è sceso da 1109 a 72 ns dopo aver rimosso 3 `bpf_trace_printk` per pacchetto dal path HIT (helper costoso, assente in P2/P3) che falsavano il baseline.
+- **Inferenza identica** nelle 3 pipeline (stesso MLP, stessi pesi, stesso argmax): verificata dal check di equivalenza chiave-kernel = chiave-Python. Asimmetria per design: l'azione di P1 è più leggera (`switch(cls)→bpf_redirect` diretto, senza lookup `fwd_table`/`valid_keys` né riscrittura MAC che P2/P3 fanno).
+- `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa; aggiornato dal monitor carrier. Il probe conferma che un link giù cambia l'uscita (5/30 casi).
 - Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`.
-- **Latenza P1 da rimisurare**: i valori in tabella precedono la rimozione dei 3 `bpf_trace_printk` per pacchetto dal path HIT di P1 (helper costoso, assente in P2/P3). Rimossi → P1 atteso più veloce di P2. Rieseguire la suite. Istruzioni/memoria/tail/lookup invariati.
