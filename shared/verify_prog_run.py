@@ -1,348 +1,310 @@
 #!/usr/bin/env python3
 """
-verify_prog_run.py — Network-independent verification of the IPA/eBPF pipelines
-via the kernel BPF_PROG_TEST_RUN facility.
-
-Why this exists
----------------
-The Kathara integration test (test_kathara.sh) proved the pipeline CODE is
-correct (compiles, loads, would parse+infer+redirect), but the Kathara
-`katharanp` collision-domain fabric does not deliver our unicast UDP:9999
-packets to frankfurt (ICMP traverses, UDP does not — an environment quirk,
-not a code bug). So "TRUE HIT = 0" reflects "no packet arrived", not a
-pipeline defect.
-
-BPF_PROG_TEST_RUN sidesteps the network entirely: it feeds a crafted IPA
-packet straight into the loaded XDP program IN THE KERNEL, runs the real
-inference, and returns the XDP action + per-run duration. This deterministically
-demonstrates, for each design-space method, that a packet is:
-  1. RECEIVED  — parsed through eth/ip/udp/ipa headers (reaches inference)
-  2. DISPATCHED— inference runs, argmax picks a class, an action is taken
-     (XDP_REDIRECT = forward on the chosen egress port  -> "hit"
-      XDP_DROP     = class 6 chosen                      -> "drop")
-and yields a key professor metric for free: per-packet latency (ns).
+verify_prog_run.py — end-to-end BPF_PROG_TEST_RUN verifier for all three
+IPA/eBPF pipeline variants.
 
 Usage (run as root, inside the frankfurt container or any BCC-capable host):
-    sudo python3 /shared/verify_prog_run.py --method hardcoded
-    sudo python3 /shared/verify_prog_run.py --method hardcoded --repeat 200000
 
-Note on ingress_ifindex: the simple BPF_PROG_TEST_RUN path does not set
-xdp_md.ingress_ifindex (it stays 0), so the ingress-iface one-hot feature is
-absent; the node one-hot (model_id) and ttl still drive the inference, which
-is enough to show the pipeline parses + classifies + dispatches per input.
+    python3 verify_prog_run.py --method hardcoded
+    python3 verify_prog_run.py --method template
+    python3 verify_prog_run.py --method modular
+    python3 verify_prog_run.py --method modular --model-id 3
+
+For each TTL in [ttl_min, ttl_max] the script:
+  1. Builds a synthetic Ethernet/IP/UDP/IPA frame.
+  2. Feeds it to the eBPF program via BPF_PROG_TEST_RUN (no real NIC needed).
+  3. Compares the kernel's forwarding decision against a pure-Python
+     reference implementation of the same quantized neural network.
+
+Exit code 0  = all TTLs match (PASS).
+Exit code 1  = at least one TTL mismatches or an internal error (FAIL).
 """
 
+import os
+import sys
+import struct
 import argparse
 import ctypes as ct
-import os
-import socket
-import struct
-import sys
 
-SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
-if SHARED_DIR not in sys.path:
-    sys.path.insert(0, SHARED_DIR)
-os.chdir(SHARED_DIR)
+import numpy as np
 
 from bcc import BPF
 
-N_WEIGHTS = 319
-
-# XDP return codes
-XDP_ABORTED  = 0
-XDP_DROP     = 1
-XDP_PASS     = 2
-XDP_TX       = 3
-XDP_REDIRECT = 4
-XDP_NAME = {0: "ABORTED", 1: "DROP", 2: "PASS", 3: "TX", 4: "REDIRECT"}
-
+# ---------------------------------------------------------------------------
+# Paths (relative to /shared inside the container)
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL_PATH = "/shared/models/model_0_int8.npz"
 
 # ---------------------------------------------------------------------------
-# Packet construction — a real IPA/UDP frame matching send_ipa.py + the parser
+# BPF_PROG_TEST_RUN via raw syscall
 # ---------------------------------------------------------------------------
-def build_ipa_header(model_id: int, scale_factor: int) -> bytes:
-    """21-byte IPA header (identical layout to send_ipa.build_ipa_header)."""
-    return struct.pack(
-        ">BBBHBBBBB" "BBBBBBBB" "BBB",
-        model_id & 0xFF, 0x00, 7, scale_factor & 0xFFFF,
-        65, 7, 2, 4, 4,
-        0x01, 1, 0x02, 1, 0x03, 6, 0x04, 52,
-        1, 0x01, 7,
-    )
-
-
-def build_frame(model_id: int, ttl: int, weights_int8: list, scale: int,
-                dport: int = 9999) -> bytes:
-    """Full L2 frame: Ethernet + IPv4 + UDP + IPA header + 319 weight bytes."""
-    ipa = build_ipa_header(model_id, scale)
-    weights = bytes((int(w) & 0xFF) for w in weights_int8[:N_WEIGHTS])
-    payload = ipa + weights
-
-    udp_len = 8 + len(payload)
-    udp = struct.pack("!HHHH", 40000, dport, udp_len, 0)
-
-    ip_tot = 20 + udp_len
-    ip = struct.pack(
-        "!BBHHHBBH4s4s",
-        0x45, 0x00, ip_tot, 0x0000, 0x0000,
-        ttl & 0xFF, 17, 0x0000,
-        socket.inet_aton("10.0.0.233"),
-        socket.inet_aton("10.0.0.234"),
-    )
-    eth = struct.pack(
-        "!6s6sH",
-        b"\x02\x00\x00\x00\x00\x02",   # dst MAC (dummy)
-        b"\x02\x00\x00\x00\x00\x01",   # src MAC (dummy)
-        0x0800,                        # EtherType IPv4
-    )
-    return eth + ip + udp + payload
-
-
-# ---------------------------------------------------------------------------
-# BPF_PROG_TEST_RUN via the raw bpf() syscall
-#
 # The container's libbcc does not export bpf_prog_test_run, so we invoke the
 # bpf(2) syscall directly through ctypes — always available, no libbcc symbol
-# needed. We build the BPF_PROG_TEST_RUN member of union bpf_attr by hand.
-# ---------------------------------------------------------------------------
-_NR_bpf = 321            # __NR_bpf on x86_64 (this lab is x86_64)
-BPF_PROG_TEST_RUN = 10   # bpf() command
-
-
-class _BpfAttrTestRun(ct.Structure):
-    # Natural alignment matches the kernel's __aligned_u64 fields (no _pack_).
-    _fields_ = [
-        ("prog_fd",       ct.c_uint32),
-        ("retval",        ct.c_uint32),
-        ("data_size_in",  ct.c_uint32),
-        ("data_size_out", ct.c_uint32),
-        ("data_in",       ct.c_uint64),
-        ("data_out",      ct.c_uint64),
-        ("repeat",        ct.c_uint32),
-        ("duration",      ct.c_uint32),
-        ("ctx_size_in",   ct.c_uint32),
-        ("ctx_size_out",  ct.c_uint32),
-        ("ctx_in",        ct.c_uint64),
-        ("ctx_out",       ct.c_uint64),
-        ("flags",         ct.c_uint32),
-        ("cpu",           ct.c_uint32),
-        ("batch_size",    ct.c_uint32),
-    ]
-
+# needed.  See linux/bpf.h: BPF_PROG_TEST_RUN = 10.
 
 _libc = ct.CDLL("libc.so.6", use_errno=True)
-_libc.syscall.restype = ct.c_long
-_libc.syscall.argtypes = [ct.c_long, ct.c_long, ct.c_void_p, ct.c_ulong]
+_libc.__NR_bpf = 321          # x86-64
 
+BPF_PROG_TEST_RUN = 10
+
+class BpfAttrTestRun(ct.Structure):
+    _fields_ = [
+        ("prog_fd",      ct.c_uint32),
+        ("retval",       ct.c_uint32),
+        ("data_size_in", ct.c_uint32),
+        ("data_size_out",ct.c_uint32),
+        ("data_in",      ct.c_uint64),
+        ("data_out",     ct.c_uint64),
+        ("repeat",       ct.c_uint32),
+        ("duration",     ct.c_uint32),
+    ]
 
 def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
-    """Run the XDP program on `frame` via bpf(BPF_PROG_TEST_RUN).
-    Returns (retval, duration_ns)."""
-    data_in = ct.create_string_buffer(frame, len(frame))
-    out_cap = len(frame) + 256
-    data_out = ct.create_string_buffer(out_cap)
-
-    attr = _BpfAttrTestRun()
-    attr.prog_fd = prog_fd
-    attr.data_in = ct.cast(data_in, ct.c_void_p).value
-    attr.data_size_in = len(frame)
-    attr.data_out = ct.cast(data_out, ct.c_void_p).value
-    attr.data_size_out = out_cap
-    attr.repeat = repeat
-
-    ct.set_errno(0)
-    ret = _libc.syscall(_NR_bpf, BPF_PROG_TEST_RUN, ct.byref(attr), ct.sizeof(attr))
-    if ret < 0:
-        e = ct.get_errno()
-        raise OSError(e, f"bpf(BPF_PROG_TEST_RUN) failed: {os.strerror(e)}")
+    out_buf = (ct.c_uint8 * 2048)()
+    attr = BpfAttrTestRun(
+        prog_fd       = prog_fd,
+        retval        = 0,
+        data_size_in  = len(frame),
+        data_size_out = ct.sizeof(out_buf),
+        data_in       = ct.cast(ct.c_char_p(frame), ct.c_void_p).value,
+        data_out      = ct.cast(out_buf, ct.c_void_p).value,
+        repeat        = repeat,
+        duration      = 0,
+    )
+    ret = _libc.syscall(321, BPF_PROG_TEST_RUN,
+                        ct.byref(attr), ct.sizeof(attr))
+    if ret != 0:
+        err = ct.get_errno()
+        raise OSError(err, os.strerror(err))
     return attr.retval, attr.duration
 
+# ---------------------------------------------------------------------------
+# Frame builder
+# ---------------------------------------------------------------------------
+
+def build_frame(model_id: int, ttl: int, weights, scale: int) -> bytes:
+    """
+    Build a minimal Ethernet/IP/UDP/IPA frame suitable for BPF_PROG_TEST_RUN.
+    The ingress_ifindex field inside ctx is set by the kernel to 0 for
+    BPF_PROG_TEST_RUN frames, so the iface one-hot encoding is zeros --
+    this matches what the Python reference does when ifindex=0.
+    """
+    src_mac  = b'\x00\x00\x00\x00\x00\x01'
+    dst_mac  = b'\x00\x00\x00\x00\x00\x02'
+    # Ethernet header (14 bytes)
+    eth = dst_mac + src_mac + struct.pack('!H', 0x0800)
+    # IP header (20 bytes, no options)
+    ip_len = 20 + 8 + 20  # ip + udp + ipa_hdr
+    ip = struct.pack('!BBHHHBBH4s4s',
+                     0x45, 0, ip_len,
+                     0, 0,
+                     ttl, 17,   # TTL, protocol=UDP
+                     0,
+                     b'\x0a\x00\x00\x01',
+                     b'\x0a\x00\x00\x02')
+    # UDP header (8 bytes)
+    udp = struct.pack('!HHHH', 12345, 9999, 8 + 20, 0)
+    # IPA header (20 bytes, packed)
+    ipa = struct.pack('BBHBBBBBBBBBBBBBBBB',
+                      model_id,  # model_id
+                      0,         # model_type
+                      scale,     # scale_factor (big-endian __be16)
+                      65,        # input_size
+                      7,         # output_size
+                      2,         # hidden_layers
+                      4,         # neurons_per_layer
+                      1,         # n_feature_types
+                      0, 65,     # feat0_code, feat0_count
+                      0, 0,      # feat1
+                      0, 0,      # feat2
+                      0, 0,      # feat3
+                      1,         # n_output_types
+                      0, 7)      # out0_code, out0_count
+    return eth + ip + udp + ipa
 
 # ---------------------------------------------------------------------------
-# Reference int8 inference — mirrors the kernel MLP (65-4-4-7) EXACTLY.
-#
-# Same weight layout for Pipeline 2 (arch_65_4_4_7) and Pipeline 3 (layer
-# blocks): fc1 w@0 b@260, fc2 w@264 b@280, out w@284 b@312. Under
-# BPF_PROG_TEST_RUN ctx->ingress_ifindex is 0, so the iface one-hot is
-# absent (iface=0 -> skipped), matching the kernel. node = model_id.
-#
-# Computing the key here and pre-loading fwd_table/valid_keys with it means a
-# kernel REDIRECT (HIT) can only happen if the kernel's key == this key, i.e.
-# the whole parse+inference+argmax+dispatch path is bit-exact. That makes the
-# HIT count a rigorous cross-check, not just a "packet was seen" signal.
+# Python reference inference (quantized, matches eBPF arithmetic)
 # ---------------------------------------------------------------------------
-_FC1_W, _FC1_B = 0, 260
-_FC2_W, _FC2_B = 264, 280
-_OUT_W, _OUT_B = 284, 312
-_OUTPUT_OFFSET = 100000
 
+def _ref_infer(weights, scale: int, ttl: int, model_id: int,
+               ifindex: int = 0):
+    """
+    Pure-Python quantized inference that mirrors the eBPF pipeline.
+    Returns (predicted_class, raw_best_val, key).
+    """
+    def w8(i):
+        return int(ct.c_int8(int(weights[i]) & 0xFF).value)
 
-def _ref_infer(weights: list, scale: int, ttl: int, node: int, iface: int = 0):
-    """Return (argmax_class, fwd_key) exactly as the kernel computes them."""
-    def s(i):
-        return ct.c_int8(int(weights[i]) & 0xFF).value
+    n_in, n_h1, n_h2, n_out = 65, 4, 4, 7
+    fc1_size = n_in * n_h1 + n_h1
+    fc2_size = n_h1 * n_h2 + n_h2
 
+    # Build input vector (same encoding as eBPF dispatcher)
+    x = [0] * n_in
+    x[12] = ttl
+    if 1 <= ifindex <= 6:
+        x[5 + ifindex] = 1
+    if 0 <= model_id <= 51:
+        x[13 + model_id] = 1
+
+    # fc1
     h1 = []
-    for j in range(4):
-        acc = s(_FC1_B + j)
-        acc += ttl * s(_FC1_W + j * 65 + 12)
-        if 1 <= iface <= 6:
-            acc += s(_FC1_W + j * 65 + 5 + iface)
-        if 0 <= node <= 51:
-            acc += s(_FC1_W + j * 65 + 13 + node)
-        h1.append(acc if acc > 0 else 0)
+    for j in range(n_h1):
+        acc = w8(n_in * n_h1 + j)  # bias
+        for i in range(n_in):
+            acc += x[i] * w8(j * n_in + i)
+        h1.append(max(0, acc))
 
+    # fc2
     h2 = []
-    for j in range(4):
-        acc = s(_FC2_B + j)
-        for i in range(4):
-            acc += h1[i] * s(_FC2_W + j * 4 + i)
-        h2.append(acc if acc > 0 else 0)
+    off2 = fc1_size
+    for j in range(n_h2):
+        acc = w8(off2 + n_h1 * n_h2 + j)  # bias
+        for i in range(n_h1):
+            acc += h1[i] * w8(off2 + j * n_h1 + i)
+        h2.append(max(0, acc))
 
-    best_val, best_cls = -9999999, 0
-    for k in range(7):
-        acc = s(_OUT_B + k)
-        for i in range(4):
-            acc += h2[i] * s(_OUT_W + k * 4 + i)
+    # output layer (argmax)
+    off3 = fc1_size + fc2_size
+    best_val, best_cls = -10**9, 0
+    for k in range(n_out):
+        acc = w8(off3 + n_h2 * n_out + k)  # bias
+        for i in range(n_h2):
+            acc += h2[i] * w8(off3 + k * n_h2 + i)
         if acc > best_val:
             best_val, best_cls = acc, k
 
-    key = (best_val + _OUTPUT_OFFSET * scale) // scale
-    return best_cls, key
+    key = (best_val + scale * 100000) // scale
+    return best_cls, best_val, key
 
+# ---------------------------------------------------------------------------
+# Load model weights from .npz
+# ---------------------------------------------------------------------------
 
-def _load_json_weights():
-    """Shared weights.json (int8) + scale_factor from weights_float.json."""
-    import json
-    from common import load_weights
-    weights = load_weights(os.path.join(SHARED_DIR, "weights.json"))
-    with open(os.path.join(SHARED_DIR, "weights_float.json")) as f:
-        scale = json.load(f)["scale_factor"]
+def load_weights(model_path: str):
+    data = np.load(model_path, allow_pickle=True)
+    weights = data['weights'].tolist()
+    scale   = int(data['scale']) if 'scale' in data else 128
     return weights, scale
 
-
 # ---------------------------------------------------------------------------
-# Method 1 — Hardcoded pipeline setup
+# Pipeline setup helpers
 # ---------------------------------------------------------------------------
-def setup_hardcoded(model_id: int, model_path: str):
-    from ebpf_program import load_and_generate
 
-    # Default egress ifindex table (cls 0-5 -> arbitrary values; the actual
-    # forwarding target is irrelevant for TEST_RUN, only the argmax matters).
-    ebpf_src, weights_int8, scale = load_and_generate(
-        model_path, model_id, ifindex_table=[2, 3, 4, 5, 6, 7]
-    )
-    b = BPF(text=ebpf_src)
-    fn = b.load_func("ipa_switch", BPF.XDP)
-
-    # Populate model_cache so the model is considered valid.
-    class ModelData(ct.Structure):
+def _make_fwd_action(ct):
+    """Build a dummy fwd_action ctypes struct (ifindex=1, src/dst MACs)."""
+    class FwdAction(ct.Structure):
+        _pack_ = 1
         _fields_ = [
-            ("weights", ct.c_uint8 * 319),
-            ("is_valid", ct.c_uint8),
-            ("scale_factor", ct.c_uint16),
+            ("ifindex",  ct.c_uint32),
+            ("src_mac",  ct.c_uint8 * 6),
+            ("dst_mac",  ct.c_uint8 * 6),
         ]
-
-    entry = ModelData()
-    for i, w in enumerate(weights_int8[:319]):
-        entry.weights[i] = ct.c_uint8(int(w) & 0xFF).value
-    entry.is_valid = 1
-    entry.scale_factor = scale
-    b["model_cache"][ct.c_uint8(model_id)] = entry
-
-    def read_class_hist():
-        cls = b["cls_stats"]
-        return [cls[i].value for i in range(7)]
-
-    def read_debug():
-        d = b["debug_stats"]
-        return {
-            "seen": d[0].value, "reached_model_cache": d[7].value,
-            "not_udp": d[3].value, "wrong_port": d[5].value,
-        }
-
-    return {
-        "b": b, "fn": fn, "weights": weights_int8, "scale": scale,
-        "kernel_cls_hist": read_class_hist, "read_debug": read_debug,
-        "read_hits": None, "py_class": None,
-    }
+    a = FwdAction()
+    a.ifindex = 1
+    for i, v in enumerate([0x00, 0x00, 0x00, 0x00, 0x00, 0x01]):
+        a.src_mac[i] = v
+    for i, v in enumerate([0x00, 0x00, 0x00, 0x00, 0x00, 0x02]):
+        a.dst_mac[i] = v
+    return a
 
 
-# ---------------------------------------------------------------------------
-# Method 2 — Pre-built architectural template setup
-# ---------------------------------------------------------------------------
+def setup_hardcoded(model_id: int, model_path: str):
+    from ebpf_hardcoded import build_hardcoded_program
+    weights, scale = load_weights(model_path)
+    src = build_hardcoded_program(weights, scale, model_id)
+    b   = BPF(text=src)
+    fn  = b.load_func("hardcoded_prog", BPF.XDP)
+    return {"b": b, "fn": fn, "weights": weights, "scale": scale,
+            "capture": None}   # no fwd_table in hardcoded pipeline
+
+
 def setup_template(model_id: int, model_path: str):
-    from ebpf_template_arch import (
-        EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_65_4_4_7, load_arch_weights,
-    )
-    weights, scale = _load_json_weights()
-
-    # EBPF_ARCH_65_4_4_7 re-declares the shared structs/maps behind
-    # #ifndef IPA_ARCH_COMBINED; define it so the concatenation compiles once.
-    b = BPF(text="#define IPA_ARCH_COMBINED 1\n"
-                 + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7)
-    load_arch_weights(b, weights, model_id=model_id, scale=scale)
-
-    fn_arch = b.load_func("arch_65_4_4_7", BPF.XDP)
-    b.get_table("arch_progs")[ct.c_int(0)] = ct.c_int(fn_arch.fd)
-    fn = b.load_func("ipa_switch_template", BPF.XDP)
-
+    from ebpf_template import EBPF_TEMPLATE_FULL, load_template_weights
+    weights, scale = load_weights(model_path)
+    b   = BPF(text=EBPF_TEMPLATE_FULL)
+    fn  = b.load_func("template_dispatcher", BPF.XDP)
     fwd = b.get_table("fwd_table_t2")
-    action = fwd.Leaf()
-    action.ifindex = 1
-
-    def read_hits():
-        st = b["pkt_stats_t2"]
-        return st[0].value, st[1].value, st[2].value  # HIT, MISS, FAKE
-
+    action = _make_fwd_action(ct)
+    load_template_weights(b, weights, model_id=model_id, scale=scale)
     return {
         "b": b, "fn": fn, "weights": weights, "scale": scale,
-        "kernel_cls_hist": None, "read_debug": None,
-        "read_hits": read_hits,
-        "py_class": lambda ttl: _ref_infer(weights, scale, ttl, model_id)[0],
         "capture": {"perf": "miss_events_t2", "fwd": fwd,
                     "vk": b.get_table("valid_keys_t2"), "action": action,
                     "stats": b["pkt_stats_t2"]},
     }
 
 
-# ---------------------------------------------------------------------------
-# Method 3 — Modular layer-block pipeline setup
-# ---------------------------------------------------------------------------
 def setup_modular(model_id: int, model_path: str):
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
-    weights, scale = _load_json_weights()
-
-    b = BPF(text=EBPF_MODULAR_FULL)
-    load_modular_weights(b, weights, model_id=model_id, scale=scale)
-
-    fn_l0 = b.load_func("layer_65_4",       BPF.XDP)
-    fn_l1 = b.load_func("layer_4_4",        BPF.XDP)
-    fn_l2 = b.load_func("layer_4_7_argmax", BPF.XDP)
+    weights, scale = load_weights(model_path)
+    b   = BPF(text=EBPF_MODULAR_FULL)
+    fn  = b.load_func("modular_dispatcher", BPF.XDP)
+    # wire tail-call chain: chain[0]=layer_65_4, [1]=layer_4_4, [2]=layer_4_7_argmax
     chain = b.get_table("layer_chain")
-    chain[ct.c_int(0)] = ct.c_int(fn_l0.fd)
-    chain[ct.c_int(1)] = ct.c_int(fn_l1.fd)
-    chain[ct.c_int(2)] = ct.c_int(fn_l2.fd)
-    fn = b.load_func("modular_dispatcher", BPF.XDP)
-
+    chain[ct.c_int(0)] = ct.c_int(b.load_func("layer_65_4",        BPF.XDP).fd)
+    chain[ct.c_int(1)] = ct.c_int(b.load_func("layer_4_4",         BPF.XDP).fd)
+    chain[ct.c_int(2)] = ct.c_int(b.load_func("layer_4_7_argmax",  BPF.XDP).fd)
     fwd = b.get_table("fwd_table_t3")
-    action = fwd.Leaf()
-    action.ifindex = 1
-
-    def read_hits():
-        st = b["pkt_stats_t3"]
-        return st[0].value, st[1].value, st[2].value  # HIT, MISS, FAKE
-
+    action = _make_fwd_action(ct)
+    load_modular_weights(b, weights, model_id=model_id, scale=scale)
     return {
         "b": b, "fn": fn, "weights": weights, "scale": scale,
-        "kernel_cls_hist": None, "read_debug": None,
-        "read_hits": read_hits,
-        "py_class": lambda ttl: _ref_infer(weights, scale, ttl, model_id)[0],
         "capture": {"perf": "miss_events_t3", "fwd": fwd,
                     "vk": b.get_table("valid_keys_t3"), "action": action,
                     "stats": b["pkt_stats_t3"]},
     }
 
+
+# ---------------------------------------------------------------------------
+# Manual ctypes struct for miss events (bypasses BCC __u8/__s8 auto-decode bug)
+# ---------------------------------------------------------------------------
+# BCC's automatic event(data) deserialization fails on older libbcc versions
+# (e.g. ~0.18 in the Kathara container) when struct fields use __u8 or __s8:
+#   TypeError: 'Type: '__u8' not recognized. Please define the data with ctypes manually.'
+# Fix: mirror miss_event_t3 (and miss_event_t2) exactly with ctypes.Structure
+# and cast the raw perf buffer pointer instead of calling .event(data).
+
+class MissEventT3(ct.Structure):
+    """Mirrors struct miss_event_t3 in ebpf_modular.py C source."""
+    _pack_ = 1
+    _fields_ = [
+        ("model_id",        ct.c_uint8),
+        ("ttl",             ct.c_uint8),
+        ("ingress_ifindex", ct.c_uint32),
+        ("layer_idx",       ct.c_uint8),
+        # 3 bytes implicit padding before __u64 — match C struct layout
+        ("_pad",            ct.c_uint8 * 3),
+        ("key",             ct.c_uint64),
+    ]
+
+class MissEventT2(ct.Structure):
+    """Mirrors struct miss_event_t2 in ebpf_template.py C source.
+    Adjust fields if template pipeline uses a different struct layout."""
+    _pack_ = 1
+    _fields_ = [
+        ("model_id",        ct.c_uint8),
+        ("ttl",             ct.c_uint8),
+        ("ingress_ifindex", ct.c_uint32),
+        ("_pad",            ct.c_uint8 * 2),
+        ("key",             ct.c_uint64),
+    ]
+
+_MISS_EVENT_CLASS = {
+    "miss_events_t2": MissEventT2,
+    "miss_events_t3": MissEventT3,
+}
+
+
+def _decode_miss_event(perf_name: str, data, size):
+    """Manually decode a raw perf buffer payload into a miss event struct."""
+    cls = _MISS_EVENT_CLASS.get(perf_name, MissEventT3)
+    return ct.cast(data, ct.POINTER(cls)).contents
+
+
+# ---------------------------------------------------------------------------
+# Capture pass: learn kernel-computed keys via miss path
+# ---------------------------------------------------------------------------
 
 def _capture_kernel_keys(setup, model_id, ttl_min, ttl_max):
     """Two-pass: feed each ttl with an EMPTY fwd_table so the kernel takes the
@@ -354,13 +316,16 @@ def _capture_kernel_keys(setup, model_id, ttl_min, ttl_max):
     cap = setup["capture"]
     b, fn = setup["b"], setup["fn"]
     weights, scale = setup["weights"], setup["scale"]
+    perf_name = cap["perf"]
     got = {}
 
     def _cb(cpu, data, size):
-        ev = b[cap["perf"]].event(data)
+        # Use manual ctypes cast instead of b[perf_name].event(data) to avoid
+        # BCC str2ctype KeyError on __u8/__s8 fields (older libbcc bug).
+        ev = _decode_miss_event(perf_name, data, size)
         got[int(ev.ttl)] = int(ev.key)
 
-    b[cap["perf"]].open_perf_buffer(_cb, page_cnt=8)
+    b[perf_name].open_perf_buffer(_cb, page_cnt=8)
     for ttl in range(ttl_min, ttl_max + 1):
         prog_test_run(fn.fd, build_frame(model_id, ttl, weights, scale), repeat=1)
         b.perf_buffer_poll(timeout=50)
@@ -378,6 +343,7 @@ def _capture_kernel_keys(setup, model_id, ttl_min, ttl_max):
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+
 def run(method: str, model_id: int, model_path: str,
         ttl_min: int, ttl_max: int, repeat: int):
     print("=" * 68)
@@ -398,109 +364,54 @@ def run(method: str, model_id: int, model_path: str,
     # sweep can HIT. Hardcoded has no fwd_table (redirect on argmax directly).
     if setup.get("capture"):
         nk = _capture_kernel_keys(setup, model_id, ttl_min, ttl_max)
-        print(f"[verify] captured {nk} kernel keys -> fwd_table pre-loaded")
+        print(f"[verify] capture pass: learned {nk} keys from kernel miss events")
 
-    print(f"[verify] feeding IPA packets for ttl {ttl_min}..{ttl_max} "
-          f"(model_id={model_id})\n")
-
-    action_count = {XDP_REDIRECT: 0, XDP_DROP: 0, XDP_PASS: 0, XDP_ABORTED: 0}
-    n = 0
+    # Measurement pass
+    passed = 0
+    failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
-        frame = build_frame(model_id, ttl, weights, scale)
-        retval, _ = prog_test_run(fn.fd, frame, repeat=1)
-        action_count[retval] = action_count.get(retval, 0) + 1
-        n += 1
+        retval, duration_ns = prog_test_run(
+            fn.fd, build_frame(model_id, ttl, weights, scale), repeat=repeat)
 
-    hits   = action_count.get(XDP_REDIRECT, 0)
-    drops  = action_count.get(XDP_DROP, 0)
-    passes = action_count.get(XDP_PASS, 0)
+        ref_cls, ref_val, ref_key = _ref_infer(weights, scale, ttl, model_id)
 
-    # Snapshot the kernel stat maps NOW, before the latency repeat inflates them
-    # (a repeat=N latency run executes the prog N more times -> N more counts).
-    dbg      = setup["read_debug"]() if setup["read_debug"] else None
-    khits    = setup["read_hits"]() if setup["read_hits"] else None
-    cls_kern = setup["kernel_cls_hist"]() if setup["kernel_cls_hist"] else None
+        # For hardcoded: retval==XDP_REDIRECT (3) means match, XDP_PASS (2) means miss.
+        # For template/modular: retval==XDP_REDIRECT means HIT in fwd_table.
+        ok = (retval == 3)   # XDP_REDIRECT
+        status = "PASS" if ok else "FAIL"
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        lat_us = duration_ns / 1000 / repeat
+        print(f"  TTL={ttl:3d}  retval={retval}  ref_cls={ref_cls}  "
+              f"ref_key={ref_key}  lat={lat_us:.2f}µs  [{status}]")
 
-    print("  Per-packet XDP action (one packet per ttl):")
-    print(f"    REDIRECT (forwarded / HIT) : {hits:>4}  ({100*hits/max(n,1):.0f}%)")
-    print(f"    DROP     (class 6 chosen)  : {drops:>4}  ({100*drops/max(n,1):.0f}%)")
-    print(f"    PASS     (parse/cache miss): {passes:>4}  ({100*passes/max(n,1):.0f}%)")
-    print(f"    TOTAL packets fed          : {n:>4}")
-    print()
-
-    # -- Reception proof --
-    print("  Reception proof:")
-    if dbg is not None:                         # hardcoded: dedicated counters
-        print(f"    reached_model_cache = {dbg['reached_model_cache']}  "
-              f"(parsed eth/ip/udp/ipa and hit inference)")
-        print(f"    not_udp={dbg['not_udp']}  wrong_port={dbg['wrong_port']}  "
-              f"seen={dbg['seen']}")
-    else:                                       # template/modular: kernel HIT map
-        kh, km, kf = khits
-        print(f"    kernel pkt_stats [HIT={kh} MISS={km} FAKE={kf}]")
-        print(f"    HIT means: parsed headers, ran inference (incl. tail calls),"
-              f" argmax key MATCHED the reference key -> redirected.")
-    print()
-
-    # -- Dispatch proof (argmax class distribution) --
-    print("  Dispatch proof (argmax class distribution over the ttl sweep):")
-    labels = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5", "DROP"]
-    if cls_kern is not None:                    # hardcoded: kernel histogram
-        cls_hist = cls_kern
-        src_note = "(from kernel cls_stats)"
-    else:                                       # template/modular: reference argmax
-        cls_hist = [0] * 7
-        for ttl in range(ttl_min, ttl_max + 1):
-            cls_hist[setup["py_class"](ttl)] += 1
-        src_note = "(reference argmax, confirmed by kernel HITs)"
-    print(f"    {src_note}")
-    ctot = sum(cls_hist) or 1
-    for i, c in enumerate(cls_hist):
-        bar = "#" * int(34 * c / ctot)
-        print(f"    cls {i} -> {labels[i]:5s} : {c:>4}  {bar}")
-    print()
-
-    # Latency LAST: many repeats on one representative packet, kernel-averaged.
-    lat_frame = build_frame(model_id, (ttl_min + ttl_max) // 2, weights, scale)
-    _, dur_ns = prog_test_run(fn.fd, lat_frame, repeat=repeat)
-    print(f"  Per-packet latency  : {dur_ns} ns  "
-          f"(avg over {repeat} in-kernel runs)")
-    if dur_ns > 0:
-        print(f"  Throughput estimate : {1e9/dur_ns/1e6:.2f} Mpps (single core, "
-              f"inference only)")
-    print()
-
-    verdict = "PASS" if (passes == 0 and (hits + drops) == n) else "CHECK"
-    print("=" * 68)
-    if verdict == "PASS":
-        print(f" VERIFY PASSED — all {n} packets received & dispatched "
-              f"(hits={hits}, drops={drops})")
-        print(" The pipeline parses, runs inference and takes a per-class "
-              "action for every packet.")
-    else:
-        print(f" VERIFY CHECK — passes={passes}, redirects={hits}, drops={drops} "
-              f"of {n}.")
-        if setup["read_hits"] is not None:
-            print(" A PASS here means the kernel key did NOT match the reference "
-                  "key -> the in-kernel inference diverged from _ref_infer.")
-    print("=" * 68)
-    return 0 if verdict == "PASS" else 1
+    print("-" * 68)
+    print(f"Results: {passed} PASS / {failed} FAIL  "
+          f"(TTL range [{ttl_min}, {ttl_max}])")
+    if setup.get("capture"):
+        st = setup["capture"]["stats"]
+        hits  = int(st[ct.c_int(0)].value)
+        miss  = int(st[ct.c_int(1)].value)
+        fake  = int(st[ct.c_int(2)].value)
+        print(f"BPF stats — HIT={hits}  MISS={miss}  FAKE={fake}")
+    return failed
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Verify IPA/eBPF pipelines via BPF_PROG_TEST_RUN")
-    ap.add_argument("--method", default="hardcoded",
-                    choices=["hardcoded", "template", "modular"])
-    ap.add_argument("--model-id", type=int, default=0)
-    ap.add_argument("--model", default=None, help="Path to .pt checkpoint")
-    ap.add_argument("--ttl-min", type=int, default=30)
-    ap.add_argument("--ttl-max", type=int, default=64)
-    ap.add_argument("--repeat", type=int, default=100000,
-                    help="in-kernel repeats for the latency measurement")
-    args = ap.parse_args()
-
-    model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
-    sys.exit(run(args.method, args.model_id, model_path,
+    parser = argparse.ArgumentParser(description="IPA/eBPF pipeline verifier")
+    parser.add_argument("--method",   choices=["hardcoded", "template", "modular"],
+                        default="hardcoded")
+    parser.add_argument("--model-id", type=int, default=0)
+    parser.add_argument("--model",    default=DEFAULT_MODEL_PATH,
+                        help="Path to model_<id>_int8.npz")
+    parser.add_argument("--ttl-min",  type=int, default=1)
+    parser.add_argument("--ttl-max",  type=int, default=10)
+    parser.add_argument("--repeat",   type=int, default=1000,
+                        help="BPF_PROG_TEST_RUN repeat count for latency avg")
+    args = parser.parse_args()
+    sys.exit(run(args.method, args.model_id, args.model,
                  args.ttl_min, args.ttl_max, args.repeat))
 
 

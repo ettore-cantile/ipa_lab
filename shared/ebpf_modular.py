@@ -16,7 +16,8 @@ Layer blocks implemented:
 Maps:
   scratch_acts     : BPF_PERCPU_ARRAY  index -> long long  (intermediate activations)
   scratch_meta     : BPF_PERCPU_ARRAY  0 -> {model_id, weight_offset, scale, layer_idx}
-  layer_weights    : BPF_HASH  (layer_id, neuron_idx) -> int8
+  layer_weights    : BPF_HASH  (layer_id, neuron_idx) -> __u8  (stored unsigned; signed
+                     reinterpretation is done in Python via c_int8 cast on read)
   layer_chain      : BPF_PROG_ARRAY  layer_idx -> BPF prog fd
   layer_registry   : model_id -> {n_layers, layer_ids[8], weight_offsets[8], scale}
   fwd_table_t3     : u64 -> fwd_action
@@ -41,6 +42,14 @@ Fixed bug (2026-07-08): the dispatcher used to populate scratch_acts as
   call; layer_65_4's dense dot-product loop is unchanged (it already
   reads scratch_acts[i] one at a time, so it transparently picks up
   the corrected activations).
+
+Fixed bug (2026-07-09): BPF_ARRAY(layer_weights, __s8, ...) caused a
+  KeyError: 'signed char' in BCC's str2ctype dict on the libbcc version
+  present in the Kathara container (~0.18).  Changed to __u8 (unsigned)
+  which BCC resolves correctly; Python-side load_modular_weights stores
+  values as c_uint8 (bit-identical to int8 in two's complement) and the
+  eBPF C code casts the retrieved byte to (__s8) before arithmetic, so
+  the sign semantics are preserved.
 """
 
 # Scratch map layout constants
@@ -98,9 +107,11 @@ struct miss_event_t3 {
 BPF_PERCPU_ARRAY(scratch_acts, long long, SCRATCH_ACT_SIZE);
 BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
 
-/* Weight map: flat int8, keyed by absolute index */
+/* Weight map: flat __u8 (unsigned byte storage; eBPF code casts to __s8 for arithmetic).
+ * Using __u8 instead of __s8 avoids KeyError: 'signed char' in BCC str2ctype
+ * on older libbcc versions (< 0.20) present in the Kathara container. */
 #define MAX_LAYER_WEIGHT_ENTRIES 2048
-BPF_ARRAY(layer_weights, __s8, MAX_LAYER_WEIGHT_ENTRIES);
+BPF_ARRAY(layer_weights, __u8, MAX_LAYER_WEIGHT_ENTRIES);
 
 /* Layer chain tail-call map: layer_idx -> BPF prog fd */
 BPF_PROG_ARRAY(layer_chain, 16);
@@ -112,6 +123,8 @@ BPF_ARRAY(pkt_stats_t3, __u64, 3);
 BPF_PERF_OUTPUT(miss_events_t3);
 
 #define OUTPUT_OFFSET 100000ULL
+/* Explicit signed cast so arithmetic is correct after __u8 storage */
+#define WEIGHT(p) ((__s8)(*p))
 #define RELU(x)  ((x) > 0 ? (x) : 0)
 
 /* Metadata slot indices */
@@ -230,8 +243,8 @@ int layer_65_4(struct xdp_md *ctx) {
     for (int j = 0; j < L0_N_OUT; j++) {
         int bidx = woff + L0_N_IN * L0_N_OUT + j;
         if (bidx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
-        __s8 *bp = layer_weights.lookup(&bidx);
-        long long acc = bp ? (long long)(*bp) : 0LL;
+        __u8 *bp = layer_weights.lookup(&bidx);
+        long long acc = bp ? (long long)((__s8)(*bp)) : 0LL;
         #pragma unroll
         for (int i = 0; i < L0_N_IN; i++) {
             int fi = i;
@@ -239,8 +252,8 @@ int layer_65_4(struct xdp_md *ctx) {
             long long x = xp ? *xp : 0LL;
             int widx = woff + j * L0_N_IN + i;
             if (widx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
-            __s8 *wp = layer_weights.lookup(&widx);
-            if (wp) acc += x * (long long)(*wp);
+            __u8 *wp = layer_weights.lookup(&widx);
+            if (wp) acc += x * (long long)((__s8)(*wp));
         }
         out[j] = RELU(acc);
     }
@@ -282,8 +295,8 @@ int layer_4_4(struct xdp_md *ctx) {
     for (int j = 0; j < L1_N_OUT; j++) {
         int bidx = woff + L1_N_IN * L1_N_OUT + j;
         if (bidx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
-        __s8 *bp = layer_weights.lookup(&bidx);
-        long long acc = bp ? (long long)(*bp) : 0LL;
+        __u8 *bp = layer_weights.lookup(&bidx);
+        long long acc = bp ? (long long)((__s8)(*bp)) : 0LL;
         #pragma unroll
         for (int i = 0; i < L1_N_IN; i++) {
             int fi = i;
@@ -291,8 +304,8 @@ int layer_4_4(struct xdp_md *ctx) {
             long long x = xp ? *xp : 0LL;
             int widx = woff + j * L1_N_IN + i;
             if (widx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
-            __s8 *wp = layer_weights.lookup(&widx);
-            if (wp) acc += x * (long long)(*wp);
+            __u8 *wp = layer_weights.lookup(&widx);
+            if (wp) acc += x * (long long)((__s8)(*wp));
         }
         out[j] = RELU(acc);
     }
@@ -361,8 +374,8 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
     for (int k = 0; k < L2_N_OUT; k++) {
         int bidx = woff + L2_N_IN * L2_N_OUT + k;
         if (bidx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
-        __s8 *bp = layer_weights.lookup(&bidx);
-        long long acc = bp ? (long long)(*bp) : 0LL;
+        __u8 *bp = layer_weights.lookup(&bidx);
+        long long acc = bp ? (long long)((__s8)(*bp)) : 0LL;
         #pragma unroll
         for (int i = 0; i < L2_N_IN; i++) {
             int fi = i;
@@ -370,8 +383,8 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
             long long x = xp ? *xp : 0LL;
             int widx = woff + k * L2_N_IN + i;
             if (widx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
-            __s8 *wp = layer_weights.lookup(&widx);
-            if (wp) acc += x * (long long)(*wp);
+            __u8 *wp = layer_weights.lookup(&widx);
+            if (wp) acc += x * (long long)((__s8)(*wp));
         }
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
@@ -433,8 +446,14 @@ def load_modular_weights(
       [.. .. +n_h2-1]                fc2 biases
       [.. .. +n_h2*n_out-1]          out weights
       [.. .. +n_out-1]               out biases
+
+    NOTE: layer_weights map uses __u8 in C (to avoid BCC str2ctype
+    KeyError: 'signed char' on older libbcc).  We store the int8 value
+    as its unsigned two's-complement bit pattern (c_uint8).  The eBPF C
+    code re-casts each byte to (__s8) before accumulation, so arithmetic
+    is correct.
     """
-    from ctypes import c_int8, c_uint32, c_uint16, c_uint8, Structure
+    from ctypes import c_uint8, c_uint32, c_uint16, Structure
 
     fc1_size = n_in * n_h1 + n_h1    # 264
     fc2_size = n_h1 * n_h2 + n_h2    # 20
@@ -446,7 +465,8 @@ def load_modular_weights(
 
     for idx, w in enumerate(weights_int8[:fc1_size + fc2_size + out_size]):
         key = c_uint32(idx)
-        val = c_int8(int(w))
+        # Store as unsigned bit pattern — C side casts back to __s8 for math
+        val = c_uint8(int(w) & 0xFF)
         bpf_obj["layer_weights"][key] = val
 
     class LayerModelEntry(Structure):
