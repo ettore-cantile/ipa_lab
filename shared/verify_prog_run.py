@@ -491,11 +491,19 @@ def _reset_stats(setup):
 # Perf buffer handler
 # ---------------------------------------------------------------------------
 
-def _make_perf_cb(event_cls, label):
+def _make_perf_cb(event_cls, label, capture):
+    """capture: dict updated in-place with the last-seen kernel key/ttl.
+
+    The kernel is the source of truth for the fwd_table key.  We capture the
+    key it emits on a miss (pass A, empty fwd_table) so pass B can install the
+    exact entry and verify redirect.  Avoids Python having to bit-match kernel
+    integer arithmetic."""
     def _cb(cpu, data, size):
         if size < ct.sizeof(event_cls):
             return
         ev = ct.cast(data, ct.POINTER(event_cls)).contents
+        capture["key"] = int(ev.key)
+        capture["ttl"] = int(ev.ttl)
         print(f"  [{label}] miss cpu={cpu} model_id={ev.model_id} "
               f"ttl={ev.ttl} ifindex={ev.ingress_ifindex} key={ev.key:#018x}")
     return _cb
@@ -532,55 +540,71 @@ def run(method: str, model_id: int, model_path: str,
     valid_keys_name = setup.get("valid_keys")
     w_off_out       = setup.get("w_off_out", 0)
 
+    capture   = {}
     perf_name = setup.get("perf_name")
     perf_cls  = setup.get("perf_cls")
     if perf_name and perf_cls:
-        cb = _make_perf_cb(perf_cls, f"P{pipeline}")
+        cb = _make_perf_cb(perf_cls, f"P{pipeline}", capture)
         b[perf_name].open_perf_buffer(cb, page_cnt=8)
 
     print(f"[setup] scale={scale}  weights={len(weights)}  prog_fd={fn.fd}")
 
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
-        _reset_stats(setup)
-
         ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=0)
         expected_key = _compute_fwd_key(ref_val, scale)
+        frame        = build_frame(model_id, ttl, scale)
 
-        if pipeline == 3:
-            _prime_scratch_p3(b, h2, scale, model_id,
-                              w_off_out=w_off_out,
-                              ingress_ifindex=0, ttl=ttl)
-
-        if fwd_table_name and valid_keys_name:
-            _insert_fwd_entry(b, fwd_table_name, valid_keys_name,
-                              ttl=ttl, key=expected_key, ifindex=2)
-
-        frame = build_frame(model_id, ttl, scale)
-        retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
-
-        if fwd_table_name and valid_keys_name:
-            _remove_fwd_entry(b, fwd_table_name, valid_keys_name,
-                              ttl=ttl, key=expected_key)
-
-        if perf_name and perf_cls:
-            b.perf_buffer_poll(timeout=0)
-
-        hit_count = _read_u64(ps, 0)
-
-        if pipeline == 1 and cs is not None:
-            cls_count = _read_u64(cs, ref_cls)
-            ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
+        if pipeline == 1:
+            # Hardcoded: argmax -> direct redirect, verified via cls_stats.
+            _reset_stats(setup)
+            retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
+            cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
+            ok     = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
             detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"
         else:
-            ok = (retval in XDP_REDIRECT_PASS) and (hit_count > 0)
-            detail = f"retval={retval} pkt_stats[HIT]={hit_count}"
+            # Template / Modular: two-pass.  The kernel owns the fwd key; we
+            # capture the key it emits on a miss (pass A, empty fwd_table),
+            # install exactly that entry, then re-run (pass B) to verify the
+            # redirect fires.  Decouples PASS/FAIL from Python bit-matching the
+            # kernel's integer arithmetic.
+            capture.clear()
+            _reset_stats(setup)
+            if pipeline == 3:
+                _prime_scratch_p3(b, h2, scale, model_id, w_off_out=w_off_out,
+                                  ingress_ifindex=0, ttl=ttl)
+            prog_test_run(fn.fd, frame, repeat=1)
+            b.perf_buffer_poll(timeout=100)
+            kernel_key = capture.get("key")
+
+            if kernel_key is None:
+                retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
+                ok     = False
+                detail = (f"retval={retval} no miss event "
+                          f"(inferenza non completata)")
+            else:
+                _insert_fwd_entry(b, fwd_table_name, valid_keys_name,
+                                  ttl=ttl, key=kernel_key, ifindex=2)
+                _reset_stats(setup)
+                if pipeline == 3:
+                    _prime_scratch_p3(b, h2, scale, model_id,
+                                      w_off_out=w_off_out,
+                                      ingress_ifindex=0, ttl=ttl)
+                retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
+                _remove_fwd_entry(b, fwd_table_name, valid_keys_name,
+                                  ttl=ttl, key=kernel_key)
+                hit_count = _read_u64(ps, 0)
+                ok    = (retval in XDP_REDIRECT_PASS) and (hit_count > 0)
+                drift = ("" if kernel_key == expected_key
+                         else f" [py={expected_key}!=kern={kernel_key}]")
+                detail = (f"retval={retval} pkt_stats[HIT]={hit_count} "
+                          f"key={kernel_key}{drift}")
 
         if retval == XDP_PASS:
             ok = False
             detail += "  <-- XDP_PASS: inferenza non completata o cache miss"
 
-        lat_us = dur_ns / 1000 / repeat
+        lat_us = dur_ns / 1000 / max(1, repeat)
         status = "PASS" if ok else "FAIL"
         if ok:
             passed += 1

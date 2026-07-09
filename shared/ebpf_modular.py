@@ -103,7 +103,7 @@ struct miss_event_t3 {
     __u32 ingress_ifindex;
     __u8  layer_idx;
     __u64 key;
-};
+} __attribute__((packed));
 
 /* Scratch maps: PERCPU to avoid contention */
 #define SCRATCH_ACT_SIZE   128

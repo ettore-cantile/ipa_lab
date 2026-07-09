@@ -205,7 +205,7 @@ struct miss_event_t2 {
     __u32 ingress_ifindex;
     __u8  arch_id;
     __u64 key;
-};
+} __attribute__((packed));
 
 /* 'char' leaf: BCC str2ctype knows 'char'; '__s8'/'signed char' are not. */
 #define MAX_WEIGHT_ENTRIES 1024
@@ -302,7 +302,7 @@ struct miss_event_t2 {
     __u32 ingress_ifindex;
     __u8  arch_id;
     __u64 key;
-};
+} __attribute__((packed));
 
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
