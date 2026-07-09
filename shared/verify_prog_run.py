@@ -13,7 +13,7 @@ Usage (run as root, inside the frankfurt container or any BCC-capable host):
 For each TTL in [ttl_min, ttl_max] the script:
   1. Builds a synthetic Ethernet/IP/UDP/IPA frame.
   2. Feeds it to the eBPF program via BPF_PROG_TEST_RUN (no real NIC needed).
-  3. Compares the kernel’s forwarding decision against a pure-Python
+  3. Compares the kernel's forwarding decision against a pure-Python
      reference implementation of the same quantized neural network.
 
 Exit code 0  = all TTLs match (PASS).
@@ -51,7 +51,7 @@ WEIGHTS_JSON = os.path.join(SHARED_DIR, "weights_float.json")
 # ---------------------------------------------------------------------------
 # BPF_PROG_TEST_RUN via raw syscall
 # ---------------------------------------------------------------------------
-# The container’s libbcc does not export bpf_prog_test_run, so we invoke the
+# The container's libbcc does not export bpf_prog_test_run, so we invoke the
 # bpf(2) syscall directly through ctypes — always available, no libbcc symbol
 # needed.  See linux/bpf.h: BPF_PROG_TEST_RUN = 10.
 
@@ -189,6 +189,9 @@ def _ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
         if acc > best_val:
             best_val, best_cls = acc, k
 
+    # Key formula: mirrors eBPF unsigned integer division.
+    # best_val + scale*100000 is always positive (scale*100000 >> |best_val|),
+    # so Python // and C unsigned / are identical here.
     key = (best_val + scale * 100000) // scale
     return best_cls, best_val, key
 
@@ -219,12 +222,34 @@ def setup_hardcoded(model_id: int, model_path: str):
     Pipeline 1: ebpf_program.generate_ebpf_hardcoded()
     Function name in BPF C: ipa_switch
     No fwd_table: redirect is hardcoded by class index.
+
+    FIX (Bug 3): model_cache must be populated with is_valid=1 before
+    BPF_PROG_TEST_RUN, otherwise the program takes the cache-miss branch
+    and returns XDP_PASS (retval=2) for every packet.
     """
     from ebpf_program import generate_ebpf_hardcoded, N_WEIGHTS
+
     weights, scale = load_weights(model_path)
     src = generate_ebpf_hardcoded(weights, scale, model_id)
     b   = BPF(text=src)
     fn  = b.load_func("ipa_switch", BPF.XDP)
+
+    # Populate model_cache so ipa_switch does not take the miss branch.
+    # struct model_data { __u8 weights[319]; __u8 is_valid; __u16 scale_factor; }
+    class ModelData(ct.Structure):
+        _pack_ = 1
+        _fields_ = [
+            ("weights",      ct.c_uint8 * N_WEIGHTS),
+            ("is_valid",     ct.c_uint8),
+            ("scale_factor", ct.c_uint16),
+        ]
+    entry = ModelData()
+    entry.is_valid     = 1
+    entry.scale_factor = scale
+    for i, w in enumerate(weights[:N_WEIGHTS]):
+        entry.weights[i] = ct.c_uint8(int(w) & 0xFF).value
+    b["model_cache"][ct.c_uint8(model_id)] = entry
+
     return {"b": b, "fn": fn, "weights": weights, "scale": scale,
             "capture": None}   # no fwd_table in Pipeline 1
 
@@ -234,6 +259,13 @@ def setup_template(model_id: int, model_path: str):
     Pipeline 2: ebpf_template_arch (DISPATCHER + ARCH_65_4_4_7 concatenated).
     BPF func names: ipa_switch_template (dispatcher), arch_65_4_4_7 (arch prog).
     fwd_table: fwd_table_t2 / valid_keys_t2.
+
+    FIX (Bug 2): BPF_PROG_TEST_RUN does not execute tail calls.
+    The dispatcher calls arch_progs.call(ctx, entry->arch_id) which is
+    silently skipped by the test runner — no inference, no perf event.
+    Solution: expose arch_65_4_4_7 as 'leaf_fn' so _capture_kernel_keys
+    can run TEST_RUN directly on the leaf (full inference path) during the
+    capture pass, then use the dispatcher fn for the measure pass.
     """
     from ebpf_template_arch import (
         EBPF_TEMPLATE_ARCH_DISPATCHER,
@@ -241,12 +273,11 @@ def setup_template(model_id: int, model_path: str):
         load_arch_weights,
     )
     weights, scale = load_weights(model_path)
-    # Combine dispatcher + arch in one BPF compilation unit
     combined_src = "#define IPA_ARCH_COMBINED 1\n" + \
                    EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + \
                    EBPF_ARCH_65_4_4_7
-    b   = BPF(text=combined_src)
-    fn  = b.load_func("ipa_switch_template", BPF.XDP)
+    b      = BPF(text=combined_src)
+    fn     = b.load_func("ipa_switch_template", BPF.XDP)
     # Wire arch tail-call: arch_progs[0] = arch_65_4_4_7
     arch_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
     b["arch_progs"][ct.c_int(0)] = ct.c_int(arch_fn.fd)
@@ -255,6 +286,9 @@ def setup_template(model_id: int, model_path: str):
     load_arch_weights(b, weights, model_id=model_id, scale=scale)
     return {
         "b": b, "fn": fn, "weights": weights, "scale": scale,
+        # leaf_fn: used by _capture_kernel_keys for BPF_PROG_TEST_RUN
+        # (bypasses the dispatcher tail-call limitation of the test runner)
+        "leaf_fn": arch_fn,
         "capture": {
             "perf":   "miss_events_t2",
             "fwd":    fwd,
@@ -269,20 +303,30 @@ def setup_modular(model_id: int, model_path: str):
     """
     Pipeline 3: ebpf_modular (EBPF_MODULAR_FULL + load_modular_weights).
     fwd_table: fwd_table_t3 / valid_keys_t3.
+
+    FIX (Bug 2): same tail-call issue as Pipeline 2.
+    Expose layer_4_7_argmax as 'leaf_fn' for the capture pass.
     """
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
     weights, scale = load_weights(model_path)
     b   = BPF(text=EBPF_MODULAR_FULL)
     fn  = b.load_func("modular_dispatcher", BPF.XDP)
     chain = b.get_table("layer_chain")
-    chain[ct.c_int(0)] = ct.c_int(b.load_func("layer_65_4",       BPF.XDP).fd)
-    chain[ct.c_int(1)] = ct.c_int(b.load_func("layer_4_4",        BPF.XDP).fd)
-    chain[ct.c_int(2)] = ct.c_int(b.load_func("layer_4_7_argmax", BPF.XDP).fd)
+    lf0 = b.load_func("layer_65_4",       BPF.XDP)
+    lf1 = b.load_func("layer_4_4",        BPF.XDP)
+    lf2 = b.load_func("layer_4_7_argmax", BPF.XDP)
+    chain[ct.c_int(0)] = ct.c_int(lf0.fd)
+    chain[ct.c_int(1)] = ct.c_int(lf1.fd)
+    chain[ct.c_int(2)] = ct.c_int(lf2.fd)
     fwd    = b.get_table("fwd_table_t3")
     action = _make_fwd_action()
     load_modular_weights(b, weights, model_id=model_id, scale=scale)
     return {
         "b": b, "fn": fn, "weights": weights, "scale": scale,
+        # leaf_fn: layer_4_7_argmax contains the full inference path
+        # (scratch_acts/scratch_meta are PERCPU; for TEST_RUN on this leaf
+        # the dispatcher pre-population is replaced by _prime_scratch below)
+        "leaf_fn": lf2,
         "capture": {
             "perf":   "miss_events_t3",
             "fwd":    fwd,
@@ -300,31 +344,45 @@ def setup_modular(model_id: int, model_path: str):
 # BCC .event(data) fails with:
 #   TypeError: 'Type: '__u8' not recognized. Please define data with ctypes manually.'
 # Fix: mirror the C structs exactly with ctypes.Structure and use cast().
+#
+# Padding note for MissEventT2:
+#   struct miss_event_t2 { u8 model_id; u8 ttl; u32 ingress_ifindex; u8 arch_id; u64 key; }
+#   Natural alignment: model_id@0, ttl@1, (pad 2B)@2, ingress_ifindex@4,
+#   arch_id@8, (pad 3B)@9, key@12  -- but GCC with no __attribute__((packed))
+#   aligns key (u64) to 8 bytes: arch_id@8, pad 3B @9-11, key@12.
+#   Wait -- without packed: model_id@0, ttl@1, pad@2-3, ingress_ifindex@4,
+#   arch_id@8, pad@9-11, key@12, total=20B.
+#   _pack_=1 in C struct (see ebpf_template_arch.py: no __attribute__((packed))
+#   on miss_event_t2, so the compiler inserts natural padding).
+#   MissEventT2 here uses _pack_=1 to mirror exactly what perf_submit sends
+#   (the kernel copies sizeof(struct miss_event_t2) raw bytes including padding).
 
 class MissEventT2(ct.Structure):
     """Mirrors struct miss_event_t2 in ebpf_template_arch.py.
-       Fields: model_id u8, ttl u8, ingress_ifindex u32, arch_id u8, key u64.
-       _pack_=1 so no implicit padding is inserted by ctypes."""
-    _pack_ = 1
+       C layout (no __packed__): model_id u8@0, ttl u8@1, pad 2B@2,
+       ingress_ifindex u32@4, arch_id u8@8, pad 3B@9, key u64@12. Total=20B.
+       We replicate padding explicitly so ctypes sizeof matches."""
     _fields_ = [
         ("model_id",        ct.c_uint8),
         ("ttl",             ct.c_uint8),
+        ("_pad0",           ct.c_uint8 * 2),   # natural align for u32
         ("ingress_ifindex", ct.c_uint32),
         ("arch_id",         ct.c_uint8),
-        ("_pad",            ct.c_uint8 * 1),   # align key to 2-byte boundary
+        ("_pad1",           ct.c_uint8 * 3),   # natural align for u64
         ("key",             ct.c_uint64),
     ]
 
 class MissEventT3(ct.Structure):
     """Mirrors struct miss_event_t3 in ebpf_modular.py.
-       Fields: model_id u8, ttl u8, ingress_ifindex u32, layer_idx u8, key u64."""
-    _pack_ = 1
+       C layout (no __packed__): model_id u8@0, ttl u8@1, pad 2B@2,
+       ingress_ifindex u32@4, layer_idx u8@8, pad 3B@9, key u64@12. Total=20B."""
     _fields_ = [
         ("model_id",        ct.c_uint8),
         ("ttl",             ct.c_uint8),
+        ("_pad0",           ct.c_uint8 * 2),
         ("ingress_ifindex", ct.c_uint32),
         ("layer_idx",       ct.c_uint8),
-        ("_pad",            ct.c_uint8 * 3),
+        ("_pad1",           ct.c_uint8 * 3),
         ("key",             ct.c_uint64),
     ]
 
@@ -351,21 +409,35 @@ def _capture_kernel_keys(setup, model_id, ttl_min, ttl_max):
     Then populate fwd_table/valid_keys with those exact kernel keys.
     Pass 2 (measure): re-feeding the same TTLs should yield XDP_REDIRECT (HIT),
     proving the full parse -> inference -> argmax -> key -> fwd_table path.
+
+    FIX (Bug 2): BPF_PROG_TEST_RUN does not execute tail calls.
+    The capture pass uses setup['leaf_fn'] (arch_65_4_4_7 for Pipeline 2,
+    layer_4_7_argmax for Pipeline 3) which contains the complete inference
+    and fwd_table lookup logic without requiring a tail call.
+    The measure pass uses setup['fn'] (the dispatcher) so the full XDP
+    attach path is exercised, but only after the fwd_table is populated.
+
+    FIX (Bug 1): _cb uses _decode_miss_event() (ctypes.cast) instead of
+    b[perf_name].event(data) which crashes with TypeError '__u8' not recognized
+    on libbcc ~0.18 (BCC str2ctype does not include __u8/__s8 entries).
     """
     cap       = setup["capture"]
     b, fn     = setup["b"], setup["fn"]
+    # FIX Bug 2: use the leaf program for capture (no tail call needed)
+    leaf_fn   = setup.get("leaf_fn", fn)
     weights   = setup["weights"]
     scale     = setup["scale"]
     perf_name = cap["perf"]
     got       = {}
 
+    # FIX Bug 1: use ctypes cast, not BCC .event() which fails on __u8 fields
     def _cb(cpu, data, size):
         ev = _decode_miss_event(perf_name, data, size)
         got[int(ev.ttl)] = int(ev.key)
 
     b[perf_name].open_perf_buffer(_cb, page_cnt=8)
     for ttl in range(ttl_min, ttl_max + 1):
-        prog_test_run(fn.fd, build_frame(model_id, ttl, weights, scale), repeat=1)
+        prog_test_run(leaf_fn.fd, build_frame(model_id, ttl, weights, scale), repeat=1)
         b.perf_buffer_poll(timeout=50)
 
     for ttl, key in got.items():
