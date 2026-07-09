@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import struct
+import time
 import argparse
 import ctypes as ct
 
@@ -232,28 +233,59 @@ def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, w_off_out: int, in
     for slot, val in meta.items():
         b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
 
+
 def setup_hardcoded(model_id: int, model_path: str):
+    """
+    Carica il programma eBPF hardcoded misurando separatamente:
+      - t_redirect_s : tempo di compilazione BPF + load_func nel kernel (il vero costo del "reload")
+      - t_insert_s   : tempo di inserimento dei pesi in model_cache (bpf_map_update_elem)
+    Entrambi vengono restituiti nel dict di setup per essere consumati dalla kernel suite.
+    """
     from ebpf_program import generate_ebpf_hardcoded, N_WEIGHTS
     weights, scale = load_weights(model_path)
     src = generate_ebpf_hardcoded(weights, scale, model_id)
-    b   = BPF(text=src)
-    fn  = b.load_func("ipa_switch", BPF.XDP)
+
+    # --- misura redirect/reload: compilazione eBPF + caricamento nel kernel ---
+    t0 = time.perf_counter()
+    b  = BPF(text=src)
+    fn = b.load_func("ipa_switch", BPF.XDP)
+    t_redirect_s = time.perf_counter() - t0
+
     try:
         disp = b.load_func("ipa_dispatcher", BPF.XDP)
         b["model_progs"][ct.c_int(model_id)] = ct.c_int(fn.fd)
     except Exception:
         disp = fn
+
     class ModelData(ct.Structure):
         _pack_ = 1
         _fields_ = [("weights", ct.c_uint8 * N_WEIGHTS), ("is_valid", ct.c_uint8), ("scale_factor", ct.c_uint16)]
+
     entry = ModelData(is_valid=1, scale_factor=scale)
     for i, v in enumerate(weights[:N_WEIGHTS]):
         entry.weights[i] = ct.c_uint8(int(v) & 0xFF).value
+
+    # --- misura weight insert: singola bpf_map_update_elem su model_cache ---
+    t1 = time.perf_counter()
     b["model_cache"][ct.c_uint8(model_id)] = entry
+    t_insert_s = time.perf_counter() - t1
+
     progs = {"ipa_switch": fn.fd}
     if disp is not fn:
         progs["ipa_dispatcher"] = disp.fd
-    return {"b": b, "fn": fn, "disp": disp, "weights": weights, "scale": scale, "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"], "pipeline": 1, "progs": progs}
+
+    return {
+        "b": b, "fn": fn, "disp": disp,
+        "weights": weights, "scale": scale,
+        "cls_stats": b["cls_stats"],
+        "pkt_stats": b["pkt_stats"],
+        "pipeline": 1,
+        "progs": progs,
+        # tempi reali di update del modello
+        "t_redirect_s": t_redirect_s,
+        "t_insert_s": t_insert_s,
+    }
+
 
 def setup_template(model_id: int, model_path: str):
     from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_65_4_4_7, load_arch_weights)
@@ -264,7 +296,19 @@ def setup_template(model_id: int, model_path: str):
     leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
     b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
     load_arch_weights(b, weights, model_id=model_id, scale=scale)
-    return {"b": b, "fn": leaf_fn, "disp": disp_fn, "weights": weights, "scale": scale, "cls_stats": None, "pkt_stats": b["pkt_stats_t2"], "pipeline": 2, "perf_name": "miss_events_t2", "perf_cls": MissEventT2, "fwd_table": "fwd_table_t2", "valid_keys": "valid_keys_t2", "progs": {"ipa_switch_template": disp_fn.fd, "arch_65_4_4_7": leaf_fn.fd}}
+    return {
+        "b": b, "fn": leaf_fn, "disp": disp_fn,
+        "weights": weights, "scale": scale,
+        "cls_stats": None,
+        "pkt_stats": b["pkt_stats_t2"],
+        "pipeline": 2,
+        "perf_name": "miss_events_t2",
+        "perf_cls": MissEventT2,
+        "fwd_table": "fwd_table_t2",
+        "valid_keys": "valid_keys_t2",
+        "progs": {"ipa_switch_template": disp_fn.fd, "arch_65_4_4_7": leaf_fn.fd},
+    }
+
 
 def setup_modular(model_id: int, model_path: str):
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
@@ -280,7 +324,24 @@ def setup_modular(model_id: int, model_path: str):
     load_modular_weights(b, weights, model_id=model_id, scale=scale)
     w_off_out = (65 * 4 + 4) + (4 * 4 + 4)
     print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
-    return {"b": b, "fn": lf2, "disp": disp_fn, "weights": weights, "scale": scale, "pkt_stats": b["pkt_stats_t3"], "pipeline": 3, "perf_name": "miss_events_t3", "perf_cls": MissEventT3, "fwd_table": "fwd_table_t3", "valid_keys": "valid_keys_t3", "w_off_out": w_off_out, "progs": {"modular_dispatcher": disp_fn.fd, "layer_65_4": lf0.fd, "layer_4_4": lf1.fd, "layer_4_7_argmax": lf2.fd}}
+    return {
+        "b": b, "fn": lf2, "disp": disp_fn,
+        "weights": weights, "scale": scale,
+        "pkt_stats": b["pkt_stats_t3"],
+        "pipeline": 3,
+        "perf_name": "miss_events_t3",
+        "perf_cls": MissEventT3,
+        "fwd_table": "fwd_table_t3",
+        "valid_keys": "valid_keys_t3",
+        "w_off_out": w_off_out,
+        "progs": {
+            "modular_dispatcher": disp_fn.fd,
+            "layer_65_4": lf0.fd,
+            "layer_4_4": lf1.fd,
+            "layer_4_7_argmax": lf2.fd,
+        },
+    }
+
 
 def _read_u64(table, key_val):
     try:
@@ -341,6 +402,16 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     if perf_name and perf_cls:
         cb = _make_perf_cb(perf_cls, f"P{pipeline}", capture)
         b[perf_name].open_perf_buffer(cb, page_cnt=8)
+
+    # Stampa i tempi reali di update del modello per il Method 1
+    if pipeline == 1:
+        t_redir = setup.get("t_redirect_s", 0.0)
+        t_ins   = setup.get("t_insert_s", 0.0)
+        print(f"[M1 update timing] redirect/reload (BPF compile+load): {t_redir*1000:.3f} ms")
+        print(f"[M1 update timing] weight insert   (model_cache map):  {t_ins*1000:.3f} ms")
+        print(f"[M1 update timing] total:                               {(t_redir+t_ins)*1000:.3f} ms")
+        print()
+
     print(f"[setup] scale={scale}  weights={len(weights)}  prog_fd={fn.fd}")
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
