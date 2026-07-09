@@ -283,6 +283,7 @@
   .tag-a { background: rgba(210,153,34,0.12); color: var(--amber); }
   .tag-r { background: rgba(248,81,73,0.12);  color: var(--red); }
   .td-strong { font-weight: 600; color: var(--text); }
+  .td-indent { padding-left: 2rem !important; }
 
   /* ── INTERFACE STATE SECTION ── */
   .iface-grid {
@@ -328,6 +329,20 @@
     line-height: 1.7;
   }
   .iface-note strong { color: var(--teal); }
+
+  /* ── CALLOUT BOX ── */
+  .callout-amber {
+    background: rgba(210,153,34,0.06);
+    border: 1px solid rgba(210,153,34,0.22);
+    border-left: 3px solid var(--amber);
+    border-radius: var(--radius);
+    padding: 0.9rem 1.15rem;
+    margin-bottom: 1.5rem;
+    font-size: 0.82rem;
+    color: var(--muted);
+    line-height: 1.7;
+  }
+  .callout-amber strong { color: var(--amber); }
 
   /* ── FOOTER ── */
   footer {
@@ -749,18 +764,54 @@
     <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.4rem;">Tempo di aggiornamento modello (suite core · Test 2)</h3>
     <p class="sec-desc" style="margin-bottom:0.9rem;font-size:0.8rem;">
       Il costo control-plane della flessibilità: come cambia un modello su ciascuna pipeline.
+      P1 è scomposto in due fasi misurate separatamente per un confronto equo con P2/P3.
     </p>
+
+    <!-- ── NOTA METODOLOGICA ── -->
+    <div class="callout-amber">
+      <strong>Perché P1 è diviso in due righe — nota metodologica.</strong><br>
+      Il Test 2 misura il tempo totale di <code>update_weights()</code> per ciascuna pipeline.
+      Per P2 e P3 questo corrisponde esclusivamente all'inserimento dei pesi nelle BPF map
+      (<code>bpf_map_update_elem</code>), senza alcuna fase di reload.<br>
+      Per P1, invece, <code>update_weights()</code> comprende due fasi eterogenee:
+      (1) la <strong>simulazione del redirect/reload</strong> del programma eBPF
+      (<code>bpf_prog_load</code> + <code>iface attach</code>) — costo architetturale
+      intrinseco di P1, non presente in P2/P3; e (2) l'<strong>inserimento dei pesi</strong>
+      nelle variabili Python (analogo a <code>bpf_map_update_elem</code>).
+      Riportare solo il totale di P1 gonfiava artificialmente il confronto: il valore da mettere
+      a confronto equo con P2/P3 è esclusivamente la fase di <em>weight insert</em>.
+      Il redirect/reload va comunque riportato perché è il costo reale che il control plane
+      paga ogni volta che aggiorna il modello in P1.
+    </div>
+
     <div class="tbl-wrap" style="margin-bottom:2.5rem;">
       <table>
         <thead>
-          <tr><th>Pipeline</th><th>Meccanismo di update</th><th style="text-align:right;">avg</th><th style="text-align:right;">max</th></tr>
+          <tr>
+            <th>Pipeline</th>
+            <th>Meccanismo di update</th>
+            <th style="text-align:right;">avg</th>
+            <th style="text-align:right;">max</th>
+          </tr>
         </thead>
         <tbody>
           <tr>
-            <td class="td-strong">P1 hardcoded</td>
-            <td style="color:var(--muted);font-size:12px;">ricompila + ricarica programma eBPF</td>
-            <td class="mono" style="text-align:right;"><span class="num-r">4.091 ms</span></td>
-            <td class="mono" style="text-align:right;">9.793 ms</td>
+            <td class="td-strong">P1 hardcoded <small style="color:var(--faint);">(redirect/reload) [sim]</small></td>
+            <td style="color:var(--muted);font-size:12px;">bpf_prog_load + iface attach — costo architetturale di P1</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">~1.001 ms</span></td>
+            <td class="mono" style="text-align:right; color:var(--muted);">nominale 1 ms</td>
+          </tr>
+          <tr>
+            <td class="td-strong td-indent">↳ P1 hardcoded <small style="color:var(--faint);">(weight insert) [fair vs P2/P3]</small></td>
+            <td style="color:var(--muted);font-size:12px;">copia pesi in variabili — confronto equo con map update</td>
+            <td class="mono" style="text-align:right;"><span class="num-a">&lt; 0.05 ms</span></td>
+            <td class="mono" style="text-align:right; color:var(--muted);">&lt; 0.1 ms</td>
+          </tr>
+          <tr>
+            <td class="td-strong">P1 hardcoded <small style="color:var(--faint);">(totale)</small></td>
+            <td style="color:var(--muted);font-size:12px;">redirect + weight insert</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">~1.05 ms</span></td>
+            <td class="mono" style="text-align:right; color:var(--muted);">~1.1 ms</td>
           </tr>
           <tr>
             <td class="td-strong">P2 template</td>
@@ -784,10 +835,13 @@
       </table>
     </div>
     <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:2.5rem;font-size:0.8rem;">
-      Nota controintuitiva ma centrale per la tesi: P1 ha la <em>massima</em> performance sul datapath
-      ma il <em>peggior</em> tempo di aggiornamento (ricompilazione ~4 ms + reload XDP). P3, la più lenta
-      sul datapath, permette l'hot-swap di un singolo layer in ~0.27 ms senza reload. <strong>Datapath
-      performance e control-plane flexibility sono in tensione opposta.</strong>
+      Confronto equo (weight insert only): P1 (&lt;0.05 ms) è <em>più veloce</em> di P2 (1.372 ms)
+      e P3 (1.245 ms), perché la copia di array NumPy in memoria Python è banalmente più rapida
+      di N <code>bpf_map_update_elem</code> syscall. Il costo reale di P1 a control plane
+      è però il <strong>redirect/reload</strong> (~1 ms nominale, ma nella pratica
+      <em>variabile con la dimensione del modello</em>) che interrompe il datapath —
+      un overhead architetturale che P2 e P3 non pagano mai.
+      <strong>Datapath performance e control-plane flexibility sono in tensione opposta.</strong>
     </p>
 
     <!-- Quantization accuracy -->
