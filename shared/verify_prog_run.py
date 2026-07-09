@@ -40,42 +40,24 @@ Perche retval != 3 con BPF_PROG_TEST_RUN:
   ritorna XDP_ABORTED(0).  Criterio di PASS: retval in {0, 4} (redirect
   fire) E cls_stats/pkt_stats[HIT] incrementato (confirm correct path).
 
+Fixed bug (2026-07-09 v4): PERCPU write type must be ctypes Array.
+  BCC ~0.18 PerCpuArray.__setitem__ calls ct.byref(leaf) internally.
+  ct.byref() requires a ctypes instance; a Python list raises:
+    TypeError: byref() argument must be a ctypes instance, not 'list'
+  Fix: _percpu_arr(val) now returns (ct.c_longlong * _NR_CPUS)(*([val]*_NR_CPUS))
+  which is a properly-typed ctypes Array of nr_cpus elements.
+  The previous _percpu_val() returning a plain list was correct in intent
+  but incompatible with older BCC versions that do not unpack lists.
+
 Fixed bug (2026-07-09 v3): BPF_PERCPU_ARRAY write semantics.
-  scratch_acts e scratch_meta sono BPF_PERCPU_ARRAY.  In BCC, scrivere
-  un singolo scalare su una mappa PERCPU popola solo lo slot di CPU-0.
-  BPF_PROG_TEST_RUN esegue su una CPU arbitraria (tipicamente != 0) e
-  legge il proprio slot -- che contiene zeri.  Risultato: layer_4_7_argmax
-  vede h2=[0,0,0,0] e scale=0 -> argmax errato -> key sbagliata ->
-  fwd_table_t3 miss -> XDP_PASS(2) -> tutti i TTL FAIL.
-  Fix: _prime_scratch_p3 ora rileva il numero di CPU online e scrive
-  ogni valore come lista [val]*nr_cpus, in modo che tutti gli slot
-  ricevano il valore corretto indipendentemente dalla CPU di esecuzione.
+  Writing a scalar only populates CPU-0 slot.  BPF_PROG_TEST_RUN runs on
+  an arbitrary CPU -> stale zeros -> argmax wrong -> all TTL FAIL.
 
-Fixed bug (2026-07-09 v2): Pipeline 1 restituiva retval=4 (XDP_REDIRECT)
-  su questo kernel, non 0 (XDP_ABORTED) come atteso -- il test falliva
-  su tutti i TTL.  Fix: accettare retval in {0, 4} per P1.
+Fixed bug (2026-07-09 v2): retval acceptance, fwd_table pre-population,
+  tail-call bypass (run TEST_RUN on lf2 directly).
 
-Fixed bug (2026-07-09 v2): Pipeline 2/3 non popolavano fwd_table_t2/t3
-  ne valid_keys_t2/t3 prima del TEST_RUN.  arch_65_4_4_7 e
-  layer_4_7_argmax finivano sempre nel ramo miss -> pkt_stats[MISS]++ e
-  XDP_PASS (retval=2, HIT=0).  Fix: calcolare la chiave attesa in Python
-  (stessa formula del C: key=(best_val+OUTPUT_OFFSET*scale)/scale),
-  inserire un entry in fwd_table+valid_keys prima del run, rimuoverla dopo.
-
-Fixed bug (2026-07-09 v2): Pipeline 3 eseguiva TEST_RUN su lf0
-  (layer_65_4) che termina con layer_chain.call(ctx,1).  Le tail call
-  NON vengono eseguite nel sandbox BPF_PROG_TEST_RUN: il programma
-  ritorna XDP_PASS(2) subito senza completare l'inferenza.
-  Fix: TEST_RUN sul leaf lf2 (layer_4_7_argmax) con scratch_acts e
-  scratch_meta pre-popolati dal runner Python prima di ogni syscall.
-
-Fixed bug (2026-07-09): _cb() used b[cap['perf']].event(data) which
-  calls BCC's automatic struct deserializer.  On libbcc ~0.18 (Kathara
-  container) _get_event_class() fails for any struct field typed __u8
-  with 'Type: __u8 not recognized. Please define the data with ctypes
-  manually.' then calls sys.exit(1) -> SystemExit per packet.
-  Fix: MissEventT2/T3 as explicit ctypes.Structure with _pack_=1;
-  replace .event(data) with ctypes.cast() in _cb().
+Fixed bug (2026-07-09): __u8 perf event crash via BCC auto-deserializer.
+  Fix: explicit ctypes.Structure + cast.
 """
 
 import os
@@ -124,15 +106,9 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
 
 # ---------------------------------------------------------------------------
 # ctypes mirror structs for perf event deserialization.
-# BCC ~0.18 cannot auto-decode __u8 / __u32 fields -> 'Type: __u8 not
-# recognized'.  We bypass .event() entirely and cast the raw data pointer.
-# Layout MUST match the C structs in ebpf_template_arch.py / ebpf_modular.py
-# exactly (same field order, same sizes, __attribute__((packed)) -> _pack_=1).
 # ---------------------------------------------------------------------------
 
 class MissEventT2(ct.Structure):
-    """Mirrors struct miss_event_t2 { __u8 model_id; __u8 ttl;
-       __u32 ingress_ifindex; __u8 arch_id; __u64 key; } __packed__"""
     _pack_ = 1
     _fields_ = [
         ("model_id",        ct.c_uint8),
@@ -143,8 +119,6 @@ class MissEventT2(ct.Structure):
     ]
 
 class MissEventT3(ct.Structure):
-    """Mirrors struct miss_event_t3 { __u8 model_id; __u8 ttl;
-       __u32 ingress_ifindex; __u8 layer_idx; __u64 key; } __packed__"""
     _pack_ = 1
     _fields_ = [
         ("model_id",        ct.c_uint8),
@@ -161,28 +135,16 @@ class MissEventT3(ct.Structure):
 SHARED_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODEL_PT     = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
 WEIGHTS_JSON = os.path.join(SHARED_DIR, "weights_float.json")
-
-# OUTPUT_OFFSET deve coincidere con quello usato nel C di P2/P3
 OUTPUT_OFFSET = 100000
 
 # ---------------------------------------------------------------------------
-# Numero di CPU online (per scritture PERCPU map)
+# Numero di CPU online
 # ---------------------------------------------------------------------------
 
 def _nr_cpus() -> int:
-    """
-    Restituisce il numero di CPU online letto da /sys.
-    Fallback a os.cpu_count() se il file non esiste (e.g. container
-    senza sysfs montato).  Fallback a 1 in caso di errore totale.
-
-    BCC BPF_PERCPU_ARRAY: il valore assegnato via b[map][key] deve
-    essere una lista di esattamente nr_cpus elementi.  Passare uno
-    scalare scrive solo lo slot CPU-0; BPF_PROG_TEST_RUN esegue su una
-    CPU arbitraria e leggerebbe zeri sugli altri slot.
-    """
     try:
         with open("/sys/devices/system/cpu/online") as f:
-            s = f.read().strip()   # e.g. "0-3" or "0,2-5"
+            s = f.read().strip()
         count = 0
         for part in s.split(","):
             if "-" in part:
@@ -194,7 +156,26 @@ def _nr_cpus() -> int:
     except Exception:
         return max(1, os.cpu_count() or 1)
 
-_NR_CPUS = _nr_cpus()   # computed once at import time
+_NR_CPUS = _nr_cpus()
+
+# ---------------------------------------------------------------------------
+# PERCPU Array helper
+# ---------------------------------------------------------------------------
+
+# Leaf type for scratch_acts / scratch_meta is __s64 = ct.c_longlong.
+# BCC PerCpuArray.__setitem__ calls ct.byref(leaf), so leaf MUST be a
+# ctypes instance -- specifically a ctypes Array of nr_cpus elements.
+# A plain Python list or a single scalar both fail:
+#   list   -> TypeError: byref() argument must be a ctypes instance, not 'list'
+#   scalar -> only writes CPU-0 slot silently
+_PercpuLeaf = ct.c_longlong * _NR_CPUS
+
+def _percpu_arr(val: int) -> "_PercpuLeaf":
+    """
+    Return a ctypes Array of _NR_CPUS c_longlong elements all set to val.
+    This is the correct leaf type expected by BCC PerCpuArray.__setitem__.
+    """
+    return _PercpuLeaf(*([int(val)] * _NR_CPUS))
 
 # ---------------------------------------------------------------------------
 # Weights loader
@@ -214,15 +195,11 @@ def load_weights(model_path=MODEL_PT):
 # ---------------------------------------------------------------------------
 
 def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
-    """
-    Ethernet / IP / UDP / IPA frame for BPF_PROG_TEST_RUN.
-    ingress_ifindex = 0 in the test sandbox (no real NIC).
-    """
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
-    ip = struct.pack('!BBHHHBBH4s4s',
-                     0x45, 0, 48, 0, 0,
-                     ttl, 17, 0,
-                     b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
+    ip  = struct.pack('!BBHHHBBH4s4s',
+                      0x45, 0, 48, 0, 0,
+                      ttl, 17, 0,
+                      b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
     ipa = struct.pack('!BBHBBBBBBBBBBBBBBBBb',
                       model_id, 0, scale,
@@ -233,18 +210,10 @@ def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
     return eth + ip + udp + ipa
 
 # ---------------------------------------------------------------------------
-# Python reference inference  (mirrors eBPF quantized arithmetic exactly)
+# Python reference inference
 # ---------------------------------------------------------------------------
 
 def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
-    """
-    Returns (best_cls, best_val, h1, h2).
-    Feature encoding (must match eBPF exactly):
-      x[12]         = ttl
-      x[5+ifindex]  = 1   (if 1 <= ifindex <= 6)
-      x[13+model_id]= 1   (if 0 <= model_id <= 51)
-    In TEST_RUN sandbox: ingress_ifindex=0, so iface contribution is zero.
-    """
     def s8(v):
         return ct.c_int8(int(v) & 0xFF).value
 
@@ -287,15 +256,13 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
     return best_cls, best_val, h1, h2
 
 def _compute_fwd_key(best_val: int, scale: int) -> int:
-    """Same formula as C: key = (best_val + OUTPUT_OFFSET*scale) / scale"""
     return (best_val + OUTPUT_OFFSET * scale) // scale
 
 # ---------------------------------------------------------------------------
-# fwd_table helpers for Pipeline 2 and Pipeline 3
+# fwd_table helpers
 # ---------------------------------------------------------------------------
 
 class _FwdAction(ct.Structure):
-    """Mirrors struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; }"""
     _pack_ = 1
     _fields_ = [
         ("ifindex",  ct.c_uint32),
@@ -303,25 +270,16 @@ class _FwdAction(ct.Structure):
         ("dst_mac",  ct.c_uint8 * 6),
     ]
 
-def _insert_fwd_entry(b, fwd_table_name: str, valid_keys_name: str,
-                      ttl: int, key: int, ifindex: int = 2):
-    """
-    Insert key -> fwd_action into fwd_table and ttl -> key into valid_keys.
-    ifindex=2 (eth1) is a safe default for the test (redirect target).
-    fwd_table_t2/t3 are BPF_HASH -> scalar assignment is correct.
-    valid_keys_t2/t3 are BPF_HASH -> scalar assignment is correct.
-    """
+def _insert_fwd_entry(b, fwd_table_name, valid_keys_name, ttl, key, ifindex=2):
     action = _FwdAction(
         ifindex = ifindex,
         src_mac = (ct.c_uint8 * 6)(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF),
         dst_mac = (ct.c_uint8 * 6)(0x11, 0x22, 0x33, 0x44, 0x55, 0x66),
     )
-    b[fwd_table_name][ct.c_uint64(key)]  = action
-    b[valid_keys_name][ct.c_uint8(ttl)]  = ct.c_uint64(key)
+    b[fwd_table_name][ct.c_uint64(key)] = action
+    b[valid_keys_name][ct.c_uint8(ttl)] = ct.c_uint64(key)
 
-def _remove_fwd_entry(b, fwd_table_name: str, valid_keys_name: str,
-                      ttl: int, key: int):
-    """Remove entries added by _insert_fwd_entry after the test run."""
+def _remove_fwd_entry(b, fwd_table_name, valid_keys_name, ttl, key):
     try:
         del b[fwd_table_name][ct.c_uint64(key)]
     except Exception:
@@ -332,61 +290,39 @@ def _remove_fwd_entry(b, fwd_table_name: str, valid_keys_name: str,
         pass
 
 # ---------------------------------------------------------------------------
-# Pipeline 3: pre-populate scratch PERCPU maps before TEST_RUN on lf2
+# Pipeline 3: pre-populate scratch PERCPU maps
 # ---------------------------------------------------------------------------
 
-def _percpu_val(val: int) -> list:
-    """
-    Wrap a scalar into a list of _NR_CPUS ct.c_longlong elements.
-
-    BCC BPF_PERCPU_ARRAY write semantics:
-      b[map][key] expects a list of exactly nr_cpus elements, one per CPU.
-      Assigning a scalar is silently accepted by Python but only writes
-      CPU-0's slot (index 0 of the per-cpu value array).  BPF_PROG_TEST_RUN
-      dispatches the program on an arbitrary CPU (often != 0), which reads
-      its own slot -- still containing the default value (0 for long long).
-      Broadcasting to all CPUs ensures the correct value is visible
-      regardless of which CPU the kernel selects for the test run.
-    """
-    return [ct.c_longlong(int(val))] * _NR_CPUS
-
 def _prime_scratch_p3(b, h2: list, scale: int, model_id: int,
-                      w_off_out: int, ingress_ifindex: int = 0,
-                      ttl: int = 0):
+                      w_off_out: int, ingress_ifindex: int = 0, ttl: int = 0):
     """
-    Write h2 activations and metadata into scratch_acts / scratch_meta
-    so that layer_4_7_argmax can run standalone in TEST_RUN.
+    Populate scratch_acts[0..3] and scratch_meta[0,1,2,3,4,7] before
+    running TEST_RUN on layer_4_7_argmax (lf2).
 
-    Both maps are BPF_PERCPU_ARRAY: each key must be assigned a list of
-    nr_cpus values (one per CPU) via _percpu_val(), NOT a bare scalar.
-    A bare scalar write only updates CPU-0's slot; BPF_PROG_TEST_RUN may
-    run on a different CPU and would read stale zeros.
-
-    scratch_acts[0..3] = h2[0..3]  (output of layer_4_4, input to argmax)
-    scratch_meta slots:
-      META_MODEL_ID  (0) = model_id
-      META_SCALE     (1) = scale
-      META_LAYER_IDX (2) = 2        (argmax is layer index 2)
-      META_INGRESS_IF(3) = ingress_ifindex
-      META_TTL       (4) = ttl
-      slot 7             = w_off_out (weight offset for output layer)
+    Both maps are BPF_PERCPU_ARRAY whose leaf type is __s64.
+    BCC PerCpuArray.__setitem__ passes the value directly to ct.byref(),
+    which requires a ctypes instance.  We use _percpu_arr(val) which
+    returns (ct.c_longlong * _NR_CPUS)(*[val]*_NR_CPUS) -- a ctypes Array
+    of nr_cpus elements, broadcasting val to every CPU slot so that
+    BPF_PROG_TEST_RUN sees the correct value regardless of the CPU chosen
+    by the kernel for the test run.
     """
     for i, v in enumerate(h2[:4]):
-        b["scratch_acts"][ct.c_int(i)] = _percpu_val(v)
+        b["scratch_acts"][ct.c_int(i)] = _percpu_arr(v)
 
     meta = {
         0: model_id,
         1: scale,
-        2: 2,
+        2: 2,            # META_LAYER_IDX: argmax is layer 2
         3: ingress_ifindex,
         4: ttl,
         7: w_off_out,
     }
     for slot, val in meta.items():
-        b["scratch_meta"][ct.c_int(slot)] = _percpu_val(val)
+        b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
 
 # ---------------------------------------------------------------------------
-# Pipeline 1: Hardcoded  (NO fwd_table, pesi hardcoded in C)
+# Pipeline 1: Hardcoded
 # ---------------------------------------------------------------------------
 
 def setup_hardcoded(model_id: int, model_path: str):
@@ -394,7 +330,7 @@ def setup_hardcoded(model_id: int, model_path: str):
     weights, scale = load_weights(model_path)
     src = generate_ebpf_hardcoded(weights, scale, model_id)
     b   = BPF(text=src)
-    fn      = b.load_func("ipa_switch",  BPF.XDP)
+    fn  = b.load_func("ipa_switch", BPF.XDP)
     try:
         disp = b.load_func("ipa_dispatcher", BPF.XDP)
         b["model_progs"][ct.c_int(model_id)] = ct.c_int(fn.fd)
@@ -454,8 +390,8 @@ def setup_template(model_id: int, model_path: str):
         "pipeline":  2,
         "perf_name": "miss_events_t2",
         "perf_cls":  MissEventT2,
-        "fwd_table":    "fwd_table_t2",
-        "valid_keys":   "valid_keys_t2",
+        "fwd_table":  "fwd_table_t2",
+        "valid_keys": "valid_keys_t2",
     }
 
 # ---------------------------------------------------------------------------
@@ -463,13 +399,6 @@ def setup_template(model_id: int, model_path: str):
 # ---------------------------------------------------------------------------
 
 def setup_modular(model_id: int, model_path: str):
-    """
-    TEST_RUN eseguito su lf2 (layer_4_7_argmax) direttamente.
-    Le tail call NON vengono eseguite nel sandbox BPF_PROG_TEST_RUN;
-    scratch_acts e scratch_meta vengono pre-popolati in Python prima
-    di ogni syscall con i valori corretti per quel TTL.
-    PERCPU write: ogni slot deve essere una lista di nr_cpus elementi.
-    """
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
     weights, scale = load_weights(model_path)
     b       = BPF(text=EBPF_MODULAR_FULL)
@@ -481,12 +410,8 @@ def setup_modular(model_id: int, model_path: str):
     b["layer_chain"][ct.c_int(1)] = ct.c_int(lf1.fd)
     b["layer_chain"][ct.c_int(2)] = ct.c_int(lf2.fd)
     load_modular_weights(b, weights, model_id=model_id, scale=scale)
-
-    # w_off_out: fc1_size=264, fc2_size=20 -> w_off_out=284
-    w_off_out = (65 * 4 + 4) + (4 * 4 + 4)   # 284
-
-    print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU broadcast enabled")
-
+    w_off_out = (65 * 4 + 4) + (4 * 4 + 4)  # 284
+    print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
     return {
         "b":         b,
         "fn":        lf2,
@@ -562,12 +487,12 @@ def run(method: str, model_id: int, model_path: str,
                 "modular":   setup_modular}[method]
     setup = setup_fn(model_id, model_path)
 
-    b, fn     = setup["b"], setup["fn"]
-    weights   = setup["weights"]
-    scale     = setup["scale"]
-    ps        = setup["pkt_stats"]
-    cs        = setup.get("cls_stats")
-    pipeline  = setup["pipeline"]
+    b, fn           = setup["b"], setup["fn"]
+    weights         = setup["weights"]
+    scale           = setup["scale"]
+    ps              = setup["pkt_stats"]
+    cs              = setup.get("cls_stats")
+    pipeline        = setup["pipeline"]
     fwd_table_name  = setup.get("fwd_table")
     valid_keys_name = setup.get("valid_keys")
     w_off_out       = setup.get("w_off_out", 0)
@@ -578,8 +503,7 @@ def run(method: str, model_id: int, model_path: str,
         cb = _make_perf_cb(perf_cls, f"P{pipeline}")
         b[perf_name].open_perf_buffer(cb, page_cnt=8)
 
-    print(f"[setup] scale={scale}  weights={len(weights)}  "
-          f"prog_fd={fn.fd}")
+    print(f"[setup] scale={scale}  weights={len(weights)}  prog_fd={fn.fd}")
 
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
@@ -631,8 +555,8 @@ def run(method: str, model_id: int, model_path: str,
         print(f"  TTL={ttl:3d}  ref_cls={ref_cls}  ref_val={ref_val:8d}  "
               f"{detail}  lat={lat_us:.2f}us  [{status}]")
 
-    miss  = _read_u64(ps, 1)
-    drop  = _read_u64(ps, 2)
+    miss = _read_u64(ps, 1)
+    drop = _read_u64(ps, 2)
     print("-" * 70)
     print(f"Risultati: {passed} PASS / {failed} FAIL  "
           f"(TTL range [{ttl_min},{ttl_max}])")
@@ -642,7 +566,7 @@ def run(method: str, model_id: int, model_path: str,
 
 def main():
     p = argparse.ArgumentParser(description="IPA/eBPF pipeline verifier")
-    p.add_argument("--method",   choices=["hardcoded","template","modular"],
+    p.add_argument("--method",   choices=["hardcoded", "template", "modular"],
                    default="hardcoded")
     p.add_argument("--model-id", type=int, default=0)
     p.add_argument("--model",    default=MODEL_PT)
