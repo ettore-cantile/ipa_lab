@@ -53,6 +53,12 @@ HIDDEN_DIM    = 32
 INPUT_SIZE    = N_INTERFACES + N_INTERFACES + 1 + N_NODES  # = 35
 OUTPUT_SIZE   = N_INTERFACES + 1                           # = 7
 
+# Nominal duration used in Method 1 to simulate the eBPF program
+# redirect/reload step (bpf_prog_load + iface redirect).
+# This constant is intentionally printed in Test 2 so it is always
+# visible in the output alongside the measured times.
+M1_REDIRECT_SIM_MS = 1.0   # milliseconds
+
 GREEN  = "\033[0;32m"
 YELLOW = "\033[1;33m"
 RED    = "\033[0;31m"
@@ -133,22 +139,26 @@ class Method1_Hardcoded:
         return self.W3 @ h2 + self.b3
 
     def measure_redirect_reload(self) -> float:
+        """Simulate eBPF program redirect/reload (bpf_prog_load + iface attach).
+        The nominal sleep duration is M1_REDIRECT_SIM_MS milliseconds."""
         t0 = time.perf_counter()
-        time.sleep(0.001)
+        time.sleep(M1_REDIRECT_SIM_MS / 1000.0)
         return time.perf_counter() - t0
 
     def measure_weight_insert(self, new_model) -> float:
+        """Measure only the weight copy step (analogous to bpf_map_update_elem
+        in Methods 2/3), so that it can be compared fairly against them."""
         t0 = time.perf_counter()
         self._copy_weights(new_model)
         return time.perf_counter() - t0
 
     def update_weights(self, new_model) -> dict:
         t_redirect = self.measure_redirect_reload()
-        t_insert = self.measure_weight_insert(new_model)
+        t_insert   = self.measure_weight_insert(new_model)
         return {
             'redirect_reload_s': t_redirect,
-            'weight_insert_s': t_insert,
-            'total_s': t_redirect + t_insert,
+            'weight_insert_s':   t_insert,
+            'total_s':           t_redirect + t_insert,
         }
 
 
@@ -391,14 +401,24 @@ def suite_core(model, verbose=False):
         else:
             fail(f"Method {mid} ({name}): quant error HIGH ({me[mid]:.4f} > {tol:.4f})")
 
-    print(f"\n{YELLOW}[Test 2] Weight update latency (10 update){NC}")
+    print(f"\n{YELLOW}[Test 2] Weight update latency (10 updates){NC}")
+    # M1_REDIRECT_SIM_MS is the *nominal* duration chosen to simulate the
+    # eBPF program redirect/reload step for Method 1 (bpf_prog_load + iface
+    # attach).  It is printed here so that it is always visible next to the
+    # measured times, making clear what portion of Method 1's total latency
+    # comes from the redirect and what comes from the actual weight copy.
+    info(f"Method 1 redirect/reload simulation: nominal={M1_REDIRECT_SIM_MS:.1f} ms "
+         f"(models the cost of bpf_prog_load + iface attach in the real eBPF case)")
+    info("Method 2/3 have no redirect step — their update = map insert only")
+    print()
+
     times = {
         '1_redirect': [],
-        '1_insert': [],
-        '1_total': [],
-        2: [],
-        3: [],
-        '3s': []
+        '1_insert':   [],
+        '1_total':    [],
+        2:            [],
+        3:            [],
+        '3s':         []
     }
     for _ in range(10):
         nm = FRRModel()
@@ -411,18 +431,24 @@ def suite_core(model, verbose=False):
         times['3s'].append(m3.update_weights(nm, layer_idx=2) * 1000)
 
     for key, lbl in [
-        ('1_redirect', 'Method 1 hardcoded (redirect/reload only)'),
-        ('1_insert', 'Method 1 hardcoded (weight insert only)'),
-        ('1_total', 'Method 1 hardcoded (redirect + weight insert)'),
-        (2, 'Method 2 template  (map update)'),
-        (3, 'Method 3 modular   (all layers)'),
-        ('3s', 'Method 3 modular   (single layer hot-swap)')
+        ('1_redirect', 'Method 1 hardcoded (redirect/reload only) [sim]'),
+        ('1_insert',   'Method 1 hardcoded (weight insert only)   [fair vs M2/M3]'),
+        ('1_total',    'Method 1 hardcoded (redirect + weight insert, total)'),
+        (2,            'Method 2 template  (map update)'),
+        (3,            'Method 3 modular   (all layers)'),
+        ('3s',         'Method 3 modular   (single layer hot-swap)')
     ]:
         avg = sum(times[key]) / 10
         info(f"{lbl}: avg={avg:.3f}ms  max={max(times[key]):.3f}ms")
+
+    print()
+    info("NOTE: to compare M1 fairly against M2/M3, use 'weight insert only'.")
+    info(f"      The redirect/reload overhead (~{M1_REDIRECT_SIM_MS:.1f} ms nominal) is an")
+    info("      architectural cost specific to M1 and must be reported separately.")
+
     total += 1
     passed += 1
-    ok("Update latency measured with Method 1 split into redirect and weight insert")
+    ok("Update latency measured — Method 1 split into redirect and weight insert")
 
     print(f"\n{YELLOW}[Test 3] Determinism (100 runs){NC}")
     xf = make_input(I)
