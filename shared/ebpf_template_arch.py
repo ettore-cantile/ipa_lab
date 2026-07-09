@@ -54,6 +54,23 @@ Fixed bugs (2026-07-08):
   and is mathematically identical to summing over all 65 positions
   (every other position is always 0), while removing the stack array
   and cutting fc1 from 65*4 to 3*4 map lookups.
+
+Fixed bugs (2026-07-09 v5):
+  3) KEY DIVISION OVERFLOW: the original formula
+       __u64 key = (__u64)((best_val + OUTPUT_OFFSET*scale) / (__u64)scale)
+     casts the numerator to __u64 before dividing when best_val is
+     negative, producing a wrap-around result completely different from
+     Python's integer floor division.  Fix: keep everything signed until
+     the final cast:
+       long long key_ll = (best_val + (long long)OUTPUT_OFFSET*(long long)scale)
+                          / (long long)scale;
+       __u64 key = (__u64)key_ll;
+     This matches Python: (ref_val + OUTPUT_OFFSET*scale) // scale exactly.
+  4) INGRESS_IFINDEX SANDBOX CLAMPING: ctx->ingress_ifindex == 65536 in
+     BPF_PROG_TEST_RUN (kernel assigns a junk ifindex not in [1..6]).
+     The old code `& 0x7` happened to give 0 for 65536 by coincidence;
+     replaced with an explicit clamp `(<= 6) ? x : 0` so behaviour is
+     documented and robust for any sandbox ifindex value.
 """
 
 # Architecture constants (65-4-4-7 model)
@@ -160,7 +177,7 @@ EBPF_ARCH_65_4_4_7 = r"""
 #define T2_OUT_W_OFF  284
 #define T2_OUT_B_OFF  312
 #define T2_N_WEIGHTS  319
-#define OUTPUT_OFFSET 100000ULL
+#define OUTPUT_OFFSET 100000LL
 #define RELU(x)  ((x) > 0 ? (x) : 0)
 
 #ifndef IPA_ARCH_COMBINED
@@ -248,9 +265,14 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
      * arithmetic BPF_ARRAY indices. This is safe (map lookups accept any
      * computed index, unlike the `static const` globals fixed in Pipeline 1 --
      * see ebpf_program.py's "Verifier history") and mathematically identical
-     * to summing over all 65 positions, since every other position is 0. */
+     * to summing over all 65 positions, since every other position is 0.
+     *
+     * SANDBOX NOTE: ctx->ingress_ifindex == 65536 in BPF_PROG_TEST_RUN.
+     * Clamp explicitly to [0,6]: any value > 6 means "no valid iface" (0),
+     * which is consistent with Python ref_infer(ifindex=0). */
     __u32 _ttl   = ((__u32)ip->ttl) & 0xff;
-    __u32 _iface = ((__u32)ctx->ingress_ifindex) & 0x7;   /* valid 1..6 */
+    __u32 _raw_iface = ctx->ingress_ifindex;
+    __u32 _iface = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
     __u32 _node  = ((__u32)ipa->model_id) & 0x3f;         /* valid 0..51 */
 
     /* fc1: T2_N_IN -> T2_N_H1
@@ -323,7 +345,14 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    __u64 key = (__u64)((best_val + (long long)(OUTPUT_OFFSET * scale)) / (__u64)scale);
+    /* KEY FORMULA: keep fully signed to match Python integer division.
+     * Old code: (__u64)((best_val + OUTPUT_OFFSET*scale) / (__u64)scale)
+     * This cast the numerator to __u64 before dividing when best_val < 0,
+     * producing wrap-around.  New code: divide as long long, cast result.
+     * Matches Python: (ref_val + OUTPUT_OFFSET * scale) // scale exactly. */
+    long long key_ll = (best_val + OUTPUT_OFFSET * (long long)scale)
+                       / (long long)scale;
+    __u64 key = (__u64)key_ll;
 
     struct fwd_action *action = fwd_table_t2.lookup(&key);
     __u64 *correct_key        = valid_keys_t2.lookup(&ip->ttl);
@@ -389,6 +418,6 @@ def load_arch_weights(bpf_obj, weights_int8: list, model_id: int = 0, scale: int
                       scale_factor=scale)
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
 
-    print(f"[Pipeline2] model_id={model_id} registered: arch={arch_id}, "
-          f"offset={weight_offset}, scale={scale}, "
+    print(f"[Pipeline2] model_id={model_id} registered: arch_id={arch_id}, "
+          f"w_off={weight_offset}, scale={scale}, "
           f"weights={len(weights_int8[:N_WEIGHTS_T2])}")
