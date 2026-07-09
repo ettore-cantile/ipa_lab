@@ -22,20 +22,19 @@ Maps introduced:
   pkt_stats_t2    : [0]=HIT [1]=MISS [2]=FAKE
   miss_events_t2  : perf buffer
 
-BCC leaf-type note:
-  BPF_ARRAY uses 'char' (not '__s8') as the leaf type.  BCC legacy
-  str2ctype maps 'char' -> c_char but the Python side writes via the
-  raw bpf(2) syscall (BPF_MAP_UPDATE_ELEM), bypassing BCC's type
-  decoder entirely.  The kernel BPF_ARRAY always stores 4-byte aligned
-  slots on x86_64, so the value is passed as c_int32 (sign-extended
-  from the int8 weight).  'char' is signed on x86/x86_64 so the
-  semantics in the eBPF program are identical to __s8.
+BCC leaf-type / BPF_ARRAY slot-size note:
+  BPF_ARRAY with 'char' leaf declared in BCC allocates value_size=8 bytes
+  per slot on x86_64 (kernel rounds up to nearest power-of-two >= 8).
+  The Python writer detects the real value_size via BPF_OBJ_GET_INFO_BY_FD
+  and allocates a properly-sized zeroed buffer for each write, placing
+  the int8 value at byte 0 (LSB on little-endian).  The eBPF program
+  reads *(signed char *)bp which is bp[0] -- correct on LE.
 
 Why NOT libbcc.so.0.bpf_update_elem:
   bpf_update_elem is an internal libbcc symbol, not part of the public
   ABI.  On Kathara/Debian containers it either does not resolve or
-  returns -1 silently, leaving arch_weights empty.  The raw syscall is
-  the correct, stable approach (same used by prog_test_run elsewhere).
+  returns -1 silently, leaving arch_weights empty.  The raw bpf(2)
+  syscall is the correct stable mechanism.
 
 Combined compilation note (pipeline_benchmark.py):
   EBPF_ARCH_65_4_4_7 wraps shared declarations in
@@ -43,66 +42,27 @@ Combined compilation note (pipeline_benchmark.py):
   '#define IPA_ARCH_COMBINED 1' before concatenating the two sources.
 
 Fixed bugs (2026-07-08):
-  1) Stack overflow: `long long iv[T2_N_IN]` (65 * 8B = 520B) alone
-     exceeded the 512B BPF stack limit, before even counting h1[4],
-     h2[4] and the various pointers -- this would have failed to load
-     with the same class of error fixed in Pipeline 1 (ebpf_program.py).
-  2) Feature-encoding mismatch: the input vector was populated as
-     iv[0]=model_id, iv[1]=ttl, iv[2]=ingress_ifindex, iv[3]=input_size,
-     which does NOT match how the model was actually trained (see
-     FRR_model.py: 6 link_state (unused, always 0) + 6 ingress-iface
-     one-hot [6..11] + 1 ttl [12] + 52 node one-hot [13..64], identical
-     to Pipeline 1's encoding). Inference run through the old encoding
-     was not comparable to Pipeline 1/3 on the same model.
-  Fix: drop the `iv[]` array entirely and compute each hidden neuron's
-  dot product directly from the 3 live scalars (_ttl, _iface, _node)
-  via arithmetic BPF_ARRAY indices (woff + j*T2_N_IN + {12, 5+iface,
-  13+node}). This is safe for arbitrary runtime indices -- unlike the
-  `static const` globals that broke Pipeline 1's verifier load, a
-  BPF_ARRAY lookup with a computed key is exactly what maps are for --
-  and is mathematically identical to summing over all 65 positions
-  (every other position is always 0), while removing the stack array
-  and cutting fc1 from 65*4 to 3*4 map lookups.
+  1) Stack overflow: `long long iv[T2_N_IN]` (65 * 8B = 520B).
+  2) Feature-encoding mismatch (old iv[0]=model_id encoding).
+  Fix: sparse dot-product via BPF_ARRAY index arithmetic.
 
-Fixed bugs (2026-07-09 v5):
-  3) KEY DIVISION OVERFLOW (reverted): the sdiv-based formula
-       long long key_ll = (best_val + OUTPUT_OFFSET*(long long)scale)
-                          / (long long)scale;
-     was correct mathematically but the BPF LLVM backend refuses to
-     compile `sdiv i64` -- it is not a native BPF instruction and LLVM
-     emits: "Unsupport signed division for DAG: i64 = sdiv".
-     Fix (v6): use unsigned division.  The numerator is ALWAYS >= 0
-     because OUTPUT_OFFSET*scale (>= 100000) >> |best_val| (< 5e6 only
-     for pathological int8 models, but for our 319-weight model the
-     empirical range is << 1e5 per unit scale).  So:
-       __u64 num = (__u64)(best_val + OUTPUT_OFFSET*(long long)scale);
-       __u64 key = num / (__u64)scale;
-     compiles to BPF udiv64 which is supported, and gives bit-identical
-     results to sdiv for all reachable values (positive numerator means
-     floor == truncation-toward-zero == Python // for positive args).
-  4) INGRESS_IFINDEX SANDBOX CLAMPING: ctx->ingress_ifindex == 65536 in
-     BPF_PROG_TEST_RUN (kernel assigns a junk ifindex not in [1..6]).
-     The old code `& 0x7` happened to give 0 for 65536 by coincidence;
-     replaced with an explicit clamp `(<= 6) ? x : 0` so behaviour is
-     documented and robust for any sandbox ifindex value.
+Fixed bugs (2026-07-09 v5-v6):
+  3) sdiv i64 not supported by BPF LLVM -> use udiv.
+  4) ingress_ifindex=65536 in sandbox -> explicit clamp to [0,6].
 
 Fixed bugs (2026-07-09 v8):
-  5) ARCH_WEIGHTS WRITE VIA libbcc.so.0 FAILS SILENTLY: bpf_update_elem
-     is not a public libbcc ABI symbol; on Kathara/Debian the CDLL lookup
-     resolves to NULL or returns -1 without raising an exception, so ALL
-     writes to arch_weights are no-ops and the map stays zeroed.
-     Consequence: every arch_weights.lookup() in the eBPF program returns
-     a pointer to a zero byte, so acc = 0 for all neurons, best_val = 0,
-     key = OUTPUT_OFFSET = 100000, never matching the correct key
-     -> pkt_stats[HIT]=0 always, all TTL FAIL.
-     Fix: use the raw bpf(2) syscall (NR=321, BPF_MAP_UPDATE_ELEM=2)
-     directly via libc.syscall(), same mechanism as prog_test_run().
-     The BPF_ARRAY slot is 4-byte aligned, so the value is c_int32
-     (sign-extended from int8) to match the kernel copy size exactly.
+  5) libbcc bpf_update_elem not public ABI -> raw bpf(2) syscall.
+
+Fixed bugs (2026-07-09 v9):
+  6) value_size mismatch: BPF_ARRAY 'char' slot is 8 bytes on kernel;
+     passing c_int32 (4 bytes) caused EINVAL or partial writes.
+     Fix: detect real value_size via BPF_OBJ_GET_INFO_BY_FD, allocate
+     a zeroed buffer of that size, write int8 at byte 0.
 """
 
 import ctypes as ct
 import os
+import struct
 
 # Architecture constants (65-4-4-7 model)
 N_IN   = 65
@@ -113,47 +73,114 @@ N_WEIGHTS_T2 = (N_IN * N_H1 + N_H1) + (N_H1 * N_H2 + N_H2) + (N_H2 * N_OUT + N_O
 # = 264 + 20 + 35 = 319
 
 # ---------------------------------------------------------------------------
-# Raw bpf(2) syscall helper for BPF_MAP_UPDATE_ELEM
+# Raw bpf(2) syscall helpers
 # ---------------------------------------------------------------------------
 
 _libc = ct.CDLL("libc.so.6", use_errno=True)
-_BPF_SYSCALL_NR      = 321   # x86_64
-_BPF_MAP_UPDATE_ELEM = 2
-_BPF_ANY             = 0
+_BPF_SYSCALL_NR          = 321   # x86_64
+_BPF_MAP_UPDATE_ELEM     = 2
+_BPF_OBJ_GET_INFO_BY_FD  = 15
+_BPF_ANY                 = 0
+
 
 class _BpfAttrMapElem(ct.Structure):
-    """union bpf_attr for BPF_MAP_UPDATE_ELEM / BPF_MAP_LOOKUP_ELEM."""
+    """
+    Mirrors the kernel union bpf_attr for BPF_MAP_UPDATE/LOOKUP_ELEM.
+
+    Kernel layout (from include/uapi/linux/bpf.h):
+      struct {          /* used by BPF_MAP_*_ELEM commands */
+        __u32  map_fd;  /* offset  0, size 4 */
+        /* 4-byte implicit pad to align __aligned_u64 */
+        __aligned_u64  key;    /* offset  8, size 8 */
+        __aligned_u64  value;  /* offset 16, size 8 */
+        __u64          flags;  /* offset 24, size 8 */
+      };
+    Total: 32 bytes.  ctypes with natural alignment produces the same
+    layout (c_uint32 + 4-byte pad + c_uint64 + c_uint64 + c_uint64).
+    """
     _fields_ = [
         ("map_fd",  ct.c_uint32),
+        ("_pad",    ct.c_uint32),   # explicit pad to match __aligned_u64
         ("key",     ct.c_uint64),
         ("value",   ct.c_uint64),
         ("flags",   ct.c_uint64),
     ]
 
-def _bpf_map_update(map_fd: int, key_obj, val_obj) -> None:
-    """
-    Write a single entry to a BPF map via the raw bpf(2) syscall.
 
-    key_obj and val_obj must be ctypes instances (their address is passed
-    to the kernel).  Raises OSError on failure.
-
-    Why not libbcc bpf_update_elem:
-      bpf_update_elem is an internal libbcc symbol not in its public ABI.
-      On Kathara/Debian containers it either does not resolve or returns
-      -1 silently, leaving the map empty.  The raw syscall is the correct
-      stable mechanism (same used by prog_test_run in verify_prog_run.py).
+class _BpfMapInfo(ct.Structure):
     """
+    First fields of struct bpf_map_info (bpf.h).  We only need
+    value_size (offset 12) so we declare enough to reach it.
+    """
+    _fields_ = [
+        ("map_type",    ct.c_uint32),   # offset  0
+        ("id",          ct.c_uint32),   # offset  4
+        ("key_size",    ct.c_uint32),   # offset  8
+        ("value_size",  ct.c_uint32),   # offset 12
+        ("max_entries", ct.c_uint32),   # offset 16
+    ]
+
+
+class _BpfAttrObjInfo(ct.Structure):
+    """
+    union bpf_attr for BPF_OBJ_GET_INFO_BY_FD:
+      __u32  bpf_fd
+      __u32  info_len
+      __aligned_u64 info  (pointer)
+    """
+    _fields_ = [
+        ("bpf_fd",   ct.c_uint32),
+        ("info_len", ct.c_uint32),
+        ("info",     ct.c_uint64),
+    ]
+
+
+def _get_map_value_size(map_fd: int) -> int:
+    """
+    Return the kernel-reported value_size for a BPF map fd.
+    Falls back to 8 if the syscall is not available.
+    """
+    info = _BpfMapInfo()
+    attr = _BpfAttrObjInfo(
+        bpf_fd   = map_fd,
+        info_len = ct.sizeof(info),
+        info     = ct.cast(ct.byref(info), ct.c_void_p).value,
+    )
+    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_OBJ_GET_INFO_BY_FD,
+                        ct.byref(attr), ct.sizeof(attr))
+    if ret != 0:
+        return 8   # safe fallback: BPF_ARRAY 'char' slot >= 8 bytes
+    return max(1, int(info.value_size))
+
+
+def _bpf_map_update_char(map_fd: int, value_size: int,
+                         index: int, int8_val: int) -> None:
+    """
+    Write int8_val into arch_weights[index] via BPF_MAP_UPDATE_ELEM.
+
+    Allocates a zeroed buffer of `value_size` bytes, places the int8
+    value at byte 0 (little-endian, matching *(signed char *)ptr in eBPF),
+    then calls the raw bpf(2) syscall.  Raises OSError on failure.
+    """
+    key_buf = ct.c_uint32(index)
+    # Zeroed value buffer sized to the map's actual slot size.
+    val_buf = (ct.c_uint8 * value_size)()
+    # Write sign-preserved byte at position 0.
+    val_buf[0] = ct.c_uint8(ct.c_int8(int8_val).value & 0xFF).value
+
     attr = _BpfAttrMapElem(
         map_fd = map_fd,
-        key    = ct.cast(ct.byref(key_obj), ct.c_void_p).value,
-        value  = ct.cast(ct.byref(val_obj), ct.c_void_p).value,
+        _pad   = 0,
+        key    = ct.cast(ct.byref(key_buf), ct.c_void_p).value,
+        value  = ct.cast(val_buf, ct.c_void_p).value,
         flags  = _BPF_ANY,
     )
     ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_UPDATE_ELEM,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
         e = ct.get_errno()
-        raise OSError(e, os.strerror(e))
+        raise OSError(e, f"BPF_MAP_UPDATE_ELEM arch_weights[{index}] "
+                         f"(value_size={value_size}): {os.strerror(e)}")
 
 
 EBPF_TEMPLATE_ARCH_DISPATCHER = r"""
@@ -200,11 +227,11 @@ struct miss_event_t2 {
     __u64 key;
 };
 
-/* 'char' leaf type: BCC legacy str2ctype knows 'char'; '__s8' expands to
- * 'signed char' which is NOT in str2ctype -> KeyError at map access.
- * char is signed on x86/x86_64 so semantics are identical to __s8.
- * NOTE: BPF_ARRAY aligns each slot to 4 bytes on x86_64; the Python
- * writer uses c_int32 (sign-extended from int8) to match the slot size. */
+/* 'char' leaf type: BCC str2ctype knows 'char'; '__s8'/'signed char'
+ * are NOT in str2ctype -> KeyError.  char is signed on x86/x86_64.
+ * Slot size in kernel BPF_ARRAY is roundup(sizeof(char), 8) = 8 bytes;
+ * Python writer detects this via BPF_OBJ_GET_INFO_BY_FD and uses a
+ * zeroed 8-byte buffer with the int8 value at byte 0. */
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 
@@ -332,29 +359,14 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
 
-    /* Feature encoding (must match Pipeline 1 / the trained model exactly,
-     * see FRR_model.py: 6 link_state (always 0, unused) + 6 ingress-iface
-     * one-hot [6..11] + 1 ttl [12] + 52 node one-hot [13..64]).
-     * Only 3 features are ever non-zero per packet, so instead of
-     * materializing a `long long iv[65]` on the stack (520B -- already
-     * overflows the 512B BPF stack limit on its own) we compute each
-     * hidden neuron's dot product directly from the 3 live scalars via
-     * arithmetic BPF_ARRAY indices. This is safe (map lookups accept any
-     * computed index, unlike the `static const` globals fixed in Pipeline 1 --
-     * see ebpf_program.py's "Verifier history") and mathematically identical
-     * to summing over all 65 positions, since every other position is 0.
-     *
-     * SANDBOX NOTE: ctx->ingress_ifindex == 65536 in BPF_PROG_TEST_RUN.
-     * Clamp explicitly to [0,6]: any value > 6 means "no valid iface" (0),
-     * which is consistent with Python ref_infer(ifindex=0). */
+    /* Feature encoding: matches Pipeline 1 / FRR_model.py exactly.
+     * Sparse dot-product: only 3 positions are non-zero per packet.
+     * SANDBOX: ctx->ingress_ifindex=65536 -> clamp to 0. */
     __u32 _ttl   = ((__u32)ip->ttl) & 0xff;
     __u32 _raw_iface = ctx->ingress_ifindex;
     __u32 _iface = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
-    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;         /* valid 0..51 */
+    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;
 
-    /* fc1: T2_N_IN -> T2_N_H1
-     * Note: arch_weights stores 'char' (signed) but lookup returns char*;
-     * cast to (signed char) to preserve sign for the multiply-accumulate. */
     long long h1[T2_N_H1];
     #pragma unroll
     for (int j = 0; j < T2_N_H1; j++) {
@@ -385,7 +397,6 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         h1[j] = RELU(acc);
     }
 
-    /* fc2: T2_N_H1 -> T2_N_H2 */
     long long h2[T2_N_H2];
     #pragma unroll
     for (int j = 0; j < T2_N_H2; j++) {
@@ -403,7 +414,6 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         h2[j] = RELU(acc);
     }
 
-    /* output: T2_N_H2 -> T2_N_OUT, argmax */
     long long best_val = -9999999LL;
     int best_cls = 0;
     #pragma unroll
@@ -422,22 +432,10 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    /* KEY FORMULA — unsigned division (BPF does not support sdiv i64).
-     *
-     * BPF LLVM backend error if using signed division (sdiv i64):
-     *   "Unsupport signed division for DAG" / "Please convert to unsigned"
-     *
-     * Safe to use udiv because the numerator is always positive:
-     *   OUTPUT_OFFSET * scale >= 100000 * 1 = 100000
-     *   |best_val| < OUTPUT_OFFSET * scale for all reachable int8 models
-     * so (best_val + OUTPUT_OFFSET*(long long)scale) > 0 always.
-     *
-     * For positive numerator: udiv == sdiv == Python // (all truncate to 0).
-     * Matches Python exactly: (ref_val + OUTPUT_OFFSET * scale) // scale */
     long long _num_signed = best_val + OUTPUT_OFFSET * (long long)scale;
-    if (_num_signed < 0) return XDP_PASS;  /* safety guard, should never fire */
+    if (_num_signed < 0) return XDP_PASS;
     __u64 num = (__u64)_num_signed;
-    __u64 key = num / (__u64)scale;        /* udiv i64: supported by BPF */
+    __u64 key = num / (__u64)scale;
 
     struct fwd_action *action = fwd_table_t2.lookup(&key);
     __u64 *correct_key        = valid_keys_t2.lookup(&ip->ttl);
@@ -464,34 +462,29 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
 """
 
 
-def load_arch_weights(bpf_obj, weights_int8: list, model_id: int = 0, scale: int = 128) -> None:
+def load_arch_weights(bpf_obj, weights_int8: list,
+                      model_id: int = 0, scale: int = 128) -> None:
     """
     Populate arch_registry and arch_weights for Pipeline 2.
 
-    Uses the raw bpf(2) syscall (BPF_MAP_UPDATE_ELEM) instead of
-    libbcc's bpf_update_elem, which is an internal symbol not in the
-    public libbcc ABI and silently fails on Kathara/Debian containers.
-
-    BPF_ARRAY slot alignment note:
-      On x86_64 the kernel aligns each BPF_ARRAY element to 8 bytes for
-      u64 maps, but for 'char' (1-byte declared type) BCC/kernel uses
-      max(sizeof(char), 8) = 8 bytes per slot in some versions, or
-      exactly sizeof(char)=1 with 4-byte alignment in others.  To be
-      safe we pass c_int32 (4 bytes, sign-extended from int8) which
-      covers the most common alignment without overwriting adjacent slots.
+    Detects the kernel BPF_ARRAY slot size via BPF_OBJ_GET_INFO_BY_FD
+    and writes each int8 weight into a properly-sized zeroed buffer at
+    byte 0, using the raw bpf(2) BPF_MAP_UPDATE_ELEM syscall.
     """
-    from ctypes import c_uint8, c_uint32, c_uint16, c_int32, Structure
+    from ctypes import c_uint8, c_uint32, c_uint16, Structure
 
     weight_offset = 0
     arch_id       = 0
     map_fd        = bpf_obj["arch_weights"].map_fd
 
+    # Detect actual slot size (usually 8 for BPF_ARRAY 'char' on x86_64).
+    value_size = _get_map_value_size(map_fd)
+    print(f"[Pipeline2] arch_weights value_size={value_size} bytes/slot")
+
     for idx, w in enumerate(weights_int8[:N_WEIGHTS_T2]):
-        k = c_uint32(weight_offset + idx)
-        # c_int32: sign-extend the int8 value into a 4-byte slot so the
-        # kernel copy covers the full BPF_ARRAY element width.
-        v = c_int32(ct.c_int8(int(w)).value)
-        _bpf_map_update(map_fd, k, v)
+        _bpf_map_update_char(map_fd, value_size,
+                             index=weight_offset + idx,
+                             int8_val=int(w))
 
     class ArchEntry(Structure):
         _pack_ = 1
