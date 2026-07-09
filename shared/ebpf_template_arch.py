@@ -56,16 +56,21 @@ Fixed bugs (2026-07-08):
   and cutting fc1 from 65*4 to 3*4 map lookups.
 
 Fixed bugs (2026-07-09 v5):
-  3) KEY DIVISION OVERFLOW: the original formula
-       __u64 key = (__u64)((best_val + OUTPUT_OFFSET*scale) / (__u64)scale)
-     casts the numerator to __u64 before dividing when best_val is
-     negative, producing a wrap-around result completely different from
-     Python's integer floor division.  Fix: keep everything signed until
-     the final cast:
-       long long key_ll = (best_val + (long long)OUTPUT_OFFSET*(long long)scale)
+  3) KEY DIVISION OVERFLOW (reverted): the sdiv-based formula
+       long long key_ll = (best_val + OUTPUT_OFFSET*(long long)scale)
                           / (long long)scale;
-       __u64 key = (__u64)key_ll;
-     This matches Python: (ref_val + OUTPUT_OFFSET*scale) // scale exactly.
+     was correct mathematically but the BPF LLVM backend refuses to
+     compile `sdiv i64` -- it is not a native BPF instruction and LLVM
+     emits: "Unsupport signed division for DAG: i64 = sdiv".
+     Fix (v6): use unsigned division.  The numerator is ALWAYS >= 0
+     because OUTPUT_OFFSET*scale (>= 100000) >> |best_val| (< 5e6 only
+     for pathological int8 models, but for our 319-weight model the
+     empirical range is << 1e5 per unit scale).  So:
+       __u64 num = (__u64)(best_val + OUTPUT_OFFSET*(long long)scale);
+       __u64 key = num / (__u64)scale;
+     compiles to BPF udiv64 which is supported, and gives bit-identical
+     results to sdiv for all reachable values (positive numerator means
+     floor == truncation-toward-zero == Python // for positive args).
   4) INGRESS_IFINDEX SANDBOX CLAMPING: ctx->ingress_ifindex == 65536 in
      BPF_PROG_TEST_RUN (kernel assigns a junk ifindex not in [1..6]).
      The old code `& 0x7` happened to give 0 for 65536 by coincidence;
@@ -345,14 +350,22 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    /* KEY FORMULA: keep fully signed to match Python integer division.
-     * Old code: (__u64)((best_val + OUTPUT_OFFSET*scale) / (__u64)scale)
-     * This cast the numerator to __u64 before dividing when best_val < 0,
-     * producing wrap-around.  New code: divide as long long, cast result.
-     * Matches Python: (ref_val + OUTPUT_OFFSET * scale) // scale exactly. */
-    long long key_ll = (best_val + OUTPUT_OFFSET * (long long)scale)
-                       / (long long)scale;
-    __u64 key = (__u64)key_ll;
+    /* KEY FORMULA — unsigned division (BPF does not support sdiv i64).
+     *
+     * BPF LLVM backend error if using signed division (sdiv i64):
+     *   "Unsupport signed division for DAG" / "Please convert to unsigned"
+     *
+     * Safe to use udiv because the numerator is always positive:
+     *   OUTPUT_OFFSET * scale >= 100000 * 1 = 100000
+     *   |best_val| < OUTPUT_OFFSET * scale for all reachable int8 models
+     * so (best_val + OUTPUT_OFFSET*(long long)scale) > 0 always.
+     *
+     * For positive numerator: udiv == sdiv == Python // (all truncate to 0).
+     * Matches Python exactly: (ref_val + OUTPUT_OFFSET * scale) // scale */
+    long long _num_signed = best_val + OUTPUT_OFFSET * (long long)scale;
+    if (_num_signed < 0) return XDP_PASS;  /* safety guard, should never fire */
+    __u64 num = (__u64)_num_signed;
+    __u64 key = num / (__u64)scale;        /* udiv i64: supported by BPF */
 
     struct fwd_action *action = fwd_table_t2.lookup(&key);
     __u64 *correct_key        = valid_keys_t2.lookup(&ip->ttl);
@@ -393,18 +406,14 @@ def load_arch_weights(bpf_obj, weights_int8: list, model_id: int = 0, scale: int
     weight_offset = 0
     arch_id       = 0
 
-    # Direct fd-level write: get the table object but use .items() iteration
-    # only for the key type; write the leaf as a raw c_int8 via the map fd.
     tbl = bpf_obj["arch_weights"]
     for idx, w in enumerate(weights_int8[:N_WEIGHTS_T2]):
         k = c_uint32(weight_offset + idx)
         v = c_int8(int(w))
-        # BCC Table.__setitem__ calls leaf_sprintf which also uses str2ctype.
-        # Use the underlying bpf_update_elem syscall directly via the fd.
         ret = ct.CDLL("libbcc.so.0", use_errno=True).bpf_update_elem(
             tbl.map_fd, ct.byref(k), ct.byref(v), 0)
         if ret != 0:
-            import errno, os
+            import errno
             raise OSError(errno.errorcode.get(ct.get_errno(), "?"),
                           f"bpf_update_elem arch_weights[{idx}] failed")
 
