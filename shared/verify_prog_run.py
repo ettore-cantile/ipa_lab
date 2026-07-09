@@ -40,6 +40,15 @@ Perche retval != 3 con BPF_PROG_TEST_RUN:
   ritorna XDP_ABORTED(0).  Criterio di PASS: retval in {0, 4} (redirect
   fire) E cls_stats/pkt_stats[HIT] incrementato (confirm correct path).
 
+Fixed bug (2026-07-09 v6): build_frame IPA header layout (param_size missing).
+  struct ipa_hdr C layout:
+    model_id(u8), model_type(u8), param_size(u8), scale_factor(be16), ...
+  build_frame was packing '!BBH...' -> param_size was absent, scale_factor
+  received the wrong bytes -> kernel read scale=0 -> guard 'if (scale==0)
+  return XDP_PASS' fired -> key was never computed -> all packets produced
+  key=0x0000000000000000 and MISS.
+  Fix: use '!BBBHBBBBBBBBBBBBBBBBb' with explicit param_size=0.
+
 Fixed bug (2026-07-09 v4): PERCPU write type must be ctypes Array.
   BCC ~0.18 PerCpuArray.__setitem__ calls ct.byref(leaf) internally.
   ct.byref() requires a ctypes instance; a Python list raises:
@@ -201,8 +210,23 @@ def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
                       ttl, 17, 0,
                       b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
-    ipa = struct.pack('!BBHBBBBBBBBBBBBBBBBb',
-                      model_id, 0, scale,
+    # struct ipa_hdr C layout (packed):
+    #   model_id(u8), model_type(u8), param_size(u8), scale_factor(be16),
+    #   input_size(u8), output_size(u8), hidden_layers(u8),
+    #   neurons_per_layer(u8), n_feature_types(u8),
+    #   feat0_code(u8), feat0_count(u8),
+    #   feat1_code(u8), feat1_count(u8),
+    #   feat2_code(u8), feat2_count(u8),
+    #   feat3_code(u8), feat3_count(u8),
+    #   n_output_types(u8), out0_code(u8), out0_count(u8)
+    # NOTE: param_size MUST be included as an explicit byte before scale_factor.
+    # Previously '!BBH...' skipped param_size -> scale_factor read as 0 ->
+    # 'if (scale==0) return XDP_PASS' guard fired -> key never computed -> MISS.
+    ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBb',
+                      model_id,  # model_id
+                      0,         # model_type
+                      0,         # param_size  <-- was missing, caused scale=0 bug
+                      scale,     # scale_factor (be16)
                       65, 7, 2, 4,
                       3,
                       0, 65, 0, 0, 0, 0, 0, 0,
