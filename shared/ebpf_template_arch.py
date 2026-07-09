@@ -24,9 +24,18 @@ Maps introduced:
 
 BCC leaf-type note:
   BPF_ARRAY uses 'char' (not '__s8') as the leaf type.  BCC legacy
-  str2ctype maps 'char' -> c_char but the Python side uses c_int8 via
-  direct fd-level ctypes write, bypassing BCC's leaf decoder entirely.
-  'char' is signed on x86/x86_64 so the semantics are identical to __s8.
+  str2ctype maps 'char' -> c_char but the Python side writes via the
+  raw bpf(2) syscall (BPF_MAP_UPDATE_ELEM), bypassing BCC's type
+  decoder entirely.  The kernel BPF_ARRAY always stores 4-byte aligned
+  slots on x86_64, so the value is passed as c_int32 (sign-extended
+  from the int8 weight).  'char' is signed on x86/x86_64 so the
+  semantics in the eBPF program are identical to __s8.
+
+Why NOT libbcc.so.0.bpf_update_elem:
+  bpf_update_elem is an internal libbcc symbol, not part of the public
+  ABI.  On Kathara/Debian containers it either does not resolve or
+  returns -1 silently, leaving arch_weights empty.  The raw syscall is
+  the correct, stable approach (same used by prog_test_run elsewhere).
 
 Combined compilation note (pipeline_benchmark.py):
   EBPF_ARCH_65_4_4_7 wraps shared declarations in
@@ -76,7 +85,24 @@ Fixed bugs (2026-07-09 v5):
      The old code `& 0x7` happened to give 0 for 65536 by coincidence;
      replaced with an explicit clamp `(<= 6) ? x : 0` so behaviour is
      documented and robust for any sandbox ifindex value.
+
+Fixed bugs (2026-07-09 v8):
+  5) ARCH_WEIGHTS WRITE VIA libbcc.so.0 FAILS SILENTLY: bpf_update_elem
+     is not a public libbcc ABI symbol; on Kathara/Debian the CDLL lookup
+     resolves to NULL or returns -1 without raising an exception, so ALL
+     writes to arch_weights are no-ops and the map stays zeroed.
+     Consequence: every arch_weights.lookup() in the eBPF program returns
+     a pointer to a zero byte, so acc = 0 for all neurons, best_val = 0,
+     key = OUTPUT_OFFSET = 100000, never matching the correct key
+     -> pkt_stats[HIT]=0 always, all TTL FAIL.
+     Fix: use the raw bpf(2) syscall (NR=321, BPF_MAP_UPDATE_ELEM=2)
+     directly via libc.syscall(), same mechanism as prog_test_run().
+     The BPF_ARRAY slot is 4-byte aligned, so the value is c_int32
+     (sign-extended from int8) to match the kernel copy size exactly.
 """
+
+import ctypes as ct
+import os
 
 # Architecture constants (65-4-4-7 model)
 N_IN   = 65
@@ -85,6 +111,50 @@ N_H2   = 4
 N_OUT  = 7
 N_WEIGHTS_T2 = (N_IN * N_H1 + N_H1) + (N_H1 * N_H2 + N_H2) + (N_H2 * N_OUT + N_OUT)
 # = 264 + 20 + 35 = 319
+
+# ---------------------------------------------------------------------------
+# Raw bpf(2) syscall helper for BPF_MAP_UPDATE_ELEM
+# ---------------------------------------------------------------------------
+
+_libc = ct.CDLL("libc.so.6", use_errno=True)
+_BPF_SYSCALL_NR      = 321   # x86_64
+_BPF_MAP_UPDATE_ELEM = 2
+_BPF_ANY             = 0
+
+class _BpfAttrMapElem(ct.Structure):
+    """union bpf_attr for BPF_MAP_UPDATE_ELEM / BPF_MAP_LOOKUP_ELEM."""
+    _fields_ = [
+        ("map_fd",  ct.c_uint32),
+        ("key",     ct.c_uint64),
+        ("value",   ct.c_uint64),
+        ("flags",   ct.c_uint64),
+    ]
+
+def _bpf_map_update(map_fd: int, key_obj, val_obj) -> None:
+    """
+    Write a single entry to a BPF map via the raw bpf(2) syscall.
+
+    key_obj and val_obj must be ctypes instances (their address is passed
+    to the kernel).  Raises OSError on failure.
+
+    Why not libbcc bpf_update_elem:
+      bpf_update_elem is an internal libbcc symbol not in its public ABI.
+      On Kathara/Debian containers it either does not resolve or returns
+      -1 silently, leaving the map empty.  The raw syscall is the correct
+      stable mechanism (same used by prog_test_run in verify_prog_run.py).
+    """
+    attr = _BpfAttrMapElem(
+        map_fd = map_fd,
+        key    = ct.cast(ct.byref(key_obj), ct.c_void_p).value,
+        value  = ct.cast(ct.byref(val_obj), ct.c_void_p).value,
+        flags  = _BPF_ANY,
+    )
+    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_UPDATE_ELEM,
+                        ct.byref(attr), ct.sizeof(attr))
+    if ret != 0:
+        e = ct.get_errno()
+        raise OSError(e, os.strerror(e))
+
 
 EBPF_TEMPLATE_ARCH_DISPATCHER = r"""
 #include <uapi/linux/if_ether.h>
@@ -132,7 +202,9 @@ struct miss_event_t2 {
 
 /* 'char' leaf type: BCC legacy str2ctype knows 'char'; '__s8' expands to
  * 'signed char' which is NOT in str2ctype -> KeyError at map access.
- * char is signed on x86/x86_64 so semantics are identical to __s8. */
+ * char is signed on x86/x86_64 so semantics are identical to __s8.
+ * NOTE: BPF_ARRAY aligns each slot to 4 bytes on x86_64; the Python
+ * writer uses c_int32 (sign-extended from int8) to match the slot size. */
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 
@@ -396,26 +468,30 @@ def load_arch_weights(bpf_obj, weights_int8: list, model_id: int = 0, scale: int
     """
     Populate arch_registry and arch_weights for Pipeline 2.
 
-    BCC leaf-type workaround: instead of bpf_obj["arch_weights"][key] = val
-    (which goes through str2ctype and fails for 'signed char'), we write
-    directly via the map's fd using ctypes, bypassing BCC's type decoder.
+    Uses the raw bpf(2) syscall (BPF_MAP_UPDATE_ELEM) instead of
+    libbcc's bpf_update_elem, which is an internal symbol not in the
+    public libbcc ABI and silently fails on Kathara/Debian containers.
+
+    BPF_ARRAY slot alignment note:
+      On x86_64 the kernel aligns each BPF_ARRAY element to 8 bytes for
+      u64 maps, but for 'char' (1-byte declared type) BCC/kernel uses
+      max(sizeof(char), 8) = 8 bytes per slot in some versions, or
+      exactly sizeof(char)=1 with 4-byte alignment in others.  To be
+      safe we pass c_int32 (4 bytes, sign-extended from int8) which
+      covers the most common alignment without overwriting adjacent slots.
     """
-    import ctypes as ct
-    from ctypes import c_int8, c_uint32, c_uint16, c_uint8, Structure
+    from ctypes import c_uint8, c_uint32, c_uint16, c_int32, Structure
 
     weight_offset = 0
     arch_id       = 0
+    map_fd        = bpf_obj["arch_weights"].map_fd
 
-    tbl = bpf_obj["arch_weights"]
     for idx, w in enumerate(weights_int8[:N_WEIGHTS_T2]):
         k = c_uint32(weight_offset + idx)
-        v = c_int8(int(w))
-        ret = ct.CDLL("libbcc.so.0", use_errno=True).bpf_update_elem(
-            tbl.map_fd, ct.byref(k), ct.byref(v), 0)
-        if ret != 0:
-            import errno
-            raise OSError(errno.errorcode.get(ct.get_errno(), "?"),
-                          f"bpf_update_elem arch_weights[{idx}] failed")
+        # c_int32: sign-extend the int8 value into a 4-byte slot so the
+        # kernel copy covers the full BPF_ARRAY element width.
+        v = c_int32(ct.c_int8(int(w)).value)
+        _bpf_map_update(map_fd, k, v)
 
     class ArchEntry(Structure):
         _pack_ = 1
