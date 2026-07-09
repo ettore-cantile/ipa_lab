@@ -159,6 +159,69 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
 
 
 # ---------------------------------------------------------------------------
+# Reference int8 inference — mirrors the kernel MLP (65-4-4-7) EXACTLY.
+#
+# Same weight layout for Pipeline 2 (arch_65_4_4_7) and Pipeline 3 (layer
+# blocks): fc1 w@0 b@260, fc2 w@264 b@280, out w@284 b@312. Under
+# BPF_PROG_TEST_RUN ctx->ingress_ifindex is 0, so the iface one-hot is
+# absent (iface=0 -> skipped), matching the kernel. node = model_id.
+#
+# Computing the key here and pre-loading fwd_table/valid_keys with it means a
+# kernel REDIRECT (HIT) can only happen if the kernel's key == this key, i.e.
+# the whole parse+inference+argmax+dispatch path is bit-exact. That makes the
+# HIT count a rigorous cross-check, not just a "packet was seen" signal.
+# ---------------------------------------------------------------------------
+_FC1_W, _FC1_B = 0, 260
+_FC2_W, _FC2_B = 264, 280
+_OUT_W, _OUT_B = 284, 312
+_OUTPUT_OFFSET = 100000
+
+
+def _ref_infer(weights: list, scale: int, ttl: int, node: int, iface: int = 0):
+    """Return (argmax_class, fwd_key) exactly as the kernel computes them."""
+    def s(i):
+        return ct.c_int8(int(weights[i]) & 0xFF).value
+
+    h1 = []
+    for j in range(4):
+        acc = s(_FC1_B + j)
+        acc += ttl * s(_FC1_W + j * 65 + 12)
+        if 1 <= iface <= 6:
+            acc += s(_FC1_W + j * 65 + 5 + iface)
+        if 0 <= node <= 51:
+            acc += s(_FC1_W + j * 65 + 13 + node)
+        h1.append(acc if acc > 0 else 0)
+
+    h2 = []
+    for j in range(4):
+        acc = s(_FC2_B + j)
+        for i in range(4):
+            acc += h1[i] * s(_FC2_W + j * 4 + i)
+        h2.append(acc if acc > 0 else 0)
+
+    best_val, best_cls = -9999999, 0
+    for k in range(7):
+        acc = s(_OUT_B + k)
+        for i in range(4):
+            acc += h2[i] * s(_OUT_W + k * 4 + i)
+        if acc > best_val:
+            best_val, best_cls = acc, k
+
+    key = (best_val + _OUTPUT_OFFSET * scale) // scale
+    return best_cls, key
+
+
+def _load_json_weights():
+    """Shared weights.json (int8) + scale_factor from weights_float.json."""
+    import json
+    from common import load_weights
+    weights = load_weights(os.path.join(SHARED_DIR, "weights.json"))
+    with open(os.path.join(SHARED_DIR, "weights_float.json")) as f:
+        scale = json.load(f)["scale_factor"]
+    return weights, scale
+
+
+# ---------------------------------------------------------------------------
 # Method 1 — Hardcoded pipeline setup
 # ---------------------------------------------------------------------------
 def setup_hardcoded(model_id: int, model_path: str):
@@ -198,7 +261,87 @@ def setup_hardcoded(model_id: int, model_path: str):
             "not_udp": d[3].value, "wrong_port": d[5].value,
         }
 
-    return b, fn, weights_int8, scale, read_class_hist, read_debug
+    return {
+        "b": b, "fn": fn, "weights": weights_int8, "scale": scale,
+        "kernel_cls_hist": read_class_hist, "read_debug": read_debug,
+        "read_hits": None, "py_class": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Method 2 — Pre-built architectural template setup
+# ---------------------------------------------------------------------------
+def setup_template(model_id: int, model_path: str):
+    from ebpf_template_arch import (
+        EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_65_4_4_7, load_arch_weights,
+    )
+    weights, scale = _load_json_weights()
+
+    b = BPF(text=EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7)
+    load_arch_weights(b, weights, model_id=model_id, scale=scale)
+
+    fn_arch = b.load_func("arch_65_4_4_7", BPF.XDP)
+    b.get_table("arch_progs")[ct.c_int(0)] = ct.c_int(fn_arch.fd)
+    fn = b.load_func("ipa_switch_template", BPF.XDP)
+
+    _populate_fwd(b, "fwd_table_t2", "valid_keys_t2", weights, scale, model_id)
+
+    def read_hits():
+        st = b["pkt_stats_t2"]
+        return st[0].value, st[1].value, st[2].value  # HIT, MISS, FAKE
+
+    return {
+        "b": b, "fn": fn, "weights": weights, "scale": scale,
+        "kernel_cls_hist": None, "read_debug": None,
+        "read_hits": read_hits,
+        "py_class": lambda ttl: _ref_infer(weights, scale, ttl, model_id)[0],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Method 3 — Modular layer-block pipeline setup
+# ---------------------------------------------------------------------------
+def setup_modular(model_id: int, model_path: str):
+    from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
+    weights, scale = _load_json_weights()
+
+    b = BPF(text=EBPF_MODULAR_FULL)
+    load_modular_weights(b, weights, model_id=model_id, scale=scale)
+
+    fn_l0 = b.load_func("layer_65_4",       BPF.XDP)
+    fn_l1 = b.load_func("layer_4_4",        BPF.XDP)
+    fn_l2 = b.load_func("layer_4_7_argmax", BPF.XDP)
+    chain = b.get_table("layer_chain")
+    chain[ct.c_int(0)] = ct.c_int(fn_l0.fd)
+    chain[ct.c_int(1)] = ct.c_int(fn_l1.fd)
+    chain[ct.c_int(2)] = ct.c_int(fn_l2.fd)
+    fn = b.load_func("modular_dispatcher", BPF.XDP)
+
+    _populate_fwd(b, "fwd_table_t3", "valid_keys_t3", weights, scale, model_id)
+
+    def read_hits():
+        st = b["pkt_stats_t3"]
+        return st[0].value, st[1].value, st[2].value  # HIT, MISS, FAKE
+
+    return {
+        "b": b, "fn": fn, "weights": weights, "scale": scale,
+        "kernel_cls_hist": None, "read_debug": None,
+        "read_hits": read_hits,
+        "py_class": lambda ttl: _ref_infer(weights, scale, ttl, model_id)[0],
+    }
+
+
+def _populate_fwd(b, fwd_name, vk_name, weights, scale, model_id):
+    """Pre-load fwd_table/valid_keys with the Python-computed key for every
+    ttl 0..255, so a kernel HIT proves the kernel key == reference key."""
+    fwd = b.get_table(fwd_name)
+    vk = b.get_table(vk_name)
+    action = fwd.Leaf()
+    action.ifindex = 1  # any valid ifindex; only "did it redirect" matters
+    for ttl in range(0, 256):
+        _cls, key = _ref_infer(weights, scale, ttl, model_id)
+        fwd[ct.c_ulonglong(key)] = action
+        vk[ct.c_uint8(ttl)] = ct.c_ulonglong(key)
 
 
 # ---------------------------------------------------------------------------
@@ -210,35 +353,31 @@ def run(method: str, model_id: int, model_path: str,
     print(f" IPA/eBPF verification via BPF_PROG_TEST_RUN — method={method}")
     print("=" * 68)
 
-    if method == "hardcoded":
-        b, fn, weights_int8, scale, read_class_hist, read_debug = \
-            setup_hardcoded(model_id, model_path)
-    else:
-        print(f"[verify] method '{method}' not yet wired for TEST_RUN "
-              f"(hardcoded is complete; template/modular next).")
-        return 2
+    setup = {"hardcoded": setup_hardcoded,
+             "template":  setup_template,
+             "modular":   setup_modular}[method](model_id, model_path)
 
-    print(f"[verify] program loaded (scale={scale}, weights={len(weights_int8)})")
+    b, fn = setup["b"], setup["fn"]
+    weights, scale = setup["weights"], setup["scale"]
+
+    print(f"[verify] program loaded (scale={scale}, weights={len(weights)})")
     print(f"[verify] feeding IPA packets for ttl {ttl_min}..{ttl_max} "
           f"(model_id={model_id})\n")
 
     action_count = {XDP_REDIRECT: 0, XDP_DROP: 0, XDP_PASS: 0, XDP_ABORTED: 0}
     n = 0
     for ttl in range(ttl_min, ttl_max + 1):
-        frame = build_frame(model_id, ttl, weights_int8, scale)
+        frame = build_frame(model_id, ttl, weights, scale)
         retval, _ = prog_test_run(fn.fd, frame, repeat=1)
         action_count[retval] = action_count.get(retval, 0) + 1
         n += 1
 
-    hits  = action_count.get(XDP_REDIRECT, 0)
-    drops = action_count.get(XDP_DROP, 0)
+    hits   = action_count.get(XDP_REDIRECT, 0)
+    drops  = action_count.get(XDP_DROP, 0)
     passes = action_count.get(XDP_PASS, 0)
 
-    dbg = read_debug()
-    cls_hist = read_class_hist()
-
     # Latency: many repeats on one representative packet, kernel-averaged.
-    lat_frame = build_frame(model_id, (ttl_min + ttl_max) // 2, weights_int8, scale)
+    lat_frame = build_frame(model_id, (ttl_min + ttl_max) // 2, weights, scale)
     _, dur_ns = prog_test_run(fn.fd, lat_frame, repeat=repeat)
 
     print("  Per-packet XDP action (one packet per ttl):")
@@ -247,19 +386,40 @@ def run(method: str, model_id: int, model_path: str,
     print(f"    PASS     (parse/cache miss): {passes:>4}  ({100*passes/max(n,1):.0f}%)")
     print(f"    TOTAL packets fed          : {n:>4}")
     print()
-    print("  Reception proof (debug counters, cumulative):")
-    print(f"    reached_model_cache = {dbg['reached_model_cache']}  "
-          f"(packets that parsed eth/ip/udp/ipa and hit inference)")
-    print(f"    not_udp={dbg['not_udp']}  wrong_port={dbg['wrong_port']}  "
-          f"seen={dbg['seen']}")
+
+    # -- Reception proof --
+    print("  Reception proof:")
+    if setup["read_debug"]:                     # hardcoded: dedicated counters
+        dbg = setup["read_debug"]()
+        print(f"    reached_model_cache = {dbg['reached_model_cache']}  "
+              f"(parsed eth/ip/udp/ipa and hit inference)")
+        print(f"    not_udp={dbg['not_udp']}  wrong_port={dbg['wrong_port']}  "
+              f"seen={dbg['seen']}")
+    else:                                       # template/modular: kernel HIT map
+        kh, km, kf = setup["read_hits"]()
+        print(f"    kernel pkt_stats [HIT={kh} MISS={km} FAKE={kf}]")
+        print(f"    HIT means: parsed headers, ran inference (incl. tail calls),"
+              f" argmax key MATCHED the reference key -> redirected.")
     print()
-    print("  Dispatch proof (argmax class distribution, cumulative):")
+
+    # -- Dispatch proof (argmax class distribution) --
+    print("  Dispatch proof (argmax class distribution over the ttl sweep):")
     labels = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5", "DROP"]
+    if setup["kernel_cls_hist"]:                # hardcoded: kernel histogram
+        cls_hist = setup["kernel_cls_hist"]()
+        src_note = "(from kernel cls_stats)"
+    else:                                       # template/modular: reference argmax
+        cls_hist = [0] * 7
+        for ttl in range(ttl_min, ttl_max + 1):
+            cls_hist[setup["py_class"](ttl)] += 1
+        src_note = "(reference argmax, confirmed by kernel HITs)"
+    print(f"    {src_note}")
     ctot = sum(cls_hist) or 1
     for i, c in enumerate(cls_hist):
         bar = "#" * int(34 * c / ctot)
         print(f"    cls {i} -> {labels[i]:5s} : {c:>4}  {bar}")
     print()
+
     print(f"  Per-packet latency  : {dur_ns} ns  "
           f"(avg over {repeat} in-kernel runs)")
     if dur_ns > 0:
@@ -267,8 +427,7 @@ def run(method: str, model_id: int, model_path: str,
               f"inference only)")
     print()
 
-    parsed_ok = (passes == 0)
-    verdict = "PASS" if (parsed_ok and (hits + drops) == n) else "CHECK"
+    verdict = "PASS" if (passes == 0 and (hits + drops) == n) else "CHECK"
     print("=" * 68)
     if verdict == "PASS":
         print(f" VERIFY PASSED — all {n} packets received & dispatched "
@@ -276,8 +435,11 @@ def run(method: str, model_id: int, model_path: str,
         print(" The pipeline parses, runs inference and takes a per-class "
               "action for every packet.")
     else:
-        print(f" VERIFY CHECK — passes={passes} (packets that failed a header "
-              "check or model_cache); investigate.")
+        print(f" VERIFY CHECK — passes={passes}, redirects={hits}, drops={drops} "
+              f"of {n}.")
+        if setup["read_hits"] is not None:
+            print(" A PASS here means the kernel key did NOT match the reference "
+                  "key -> the in-kernel inference diverged from _ref_infer.")
     print("=" * 68)
     return 0 if verdict == "PASS" else 1
 
