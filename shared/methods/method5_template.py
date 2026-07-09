@@ -118,7 +118,11 @@ def run(model_id: int = 42, iface: str = None):
 
     # Load the combined dispatcher + arch program
     # BCC compiles both functions from the concatenated source.
-    combined_src = EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7
+    # EBPF_ARCH_65_4_4_7 re-declares the shared structs/maps behind
+    # #ifndef IPA_ARCH_COMBINED; define it so the concatenation compiles once
+    # (without it BCC errors "redefinition of 'ipa_hdr'" etc.).
+    combined_src = ("#define IPA_ARCH_COMBINED 1\n"
+                    + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7)
     b = BPF(text=combined_src)
 
     # Populate arch_registry and arch_weights map

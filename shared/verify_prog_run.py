@@ -277,7 +277,10 @@ def setup_template(model_id: int, model_path: str):
     )
     weights, scale = _load_json_weights()
 
-    b = BPF(text=EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7)
+    # EBPF_ARCH_65_4_4_7 re-declares the shared structs/maps behind
+    # #ifndef IPA_ARCH_COMBINED; define it so the concatenation compiles once.
+    b = BPF(text="#define IPA_ARCH_COMBINED 1\n"
+                 + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7)
     load_arch_weights(b, weights, model_id=model_id, scale=scale)
 
     fn_arch = b.load_func("arch_65_4_4_7", BPF.XDP)
@@ -376,9 +379,11 @@ def run(method: str, model_id: int, model_path: str,
     drops  = action_count.get(XDP_DROP, 0)
     passes = action_count.get(XDP_PASS, 0)
 
-    # Latency: many repeats on one representative packet, kernel-averaged.
-    lat_frame = build_frame(model_id, (ttl_min + ttl_max) // 2, weights, scale)
-    _, dur_ns = prog_test_run(fn.fd, lat_frame, repeat=repeat)
+    # Snapshot the kernel stat maps NOW, before the latency repeat inflates them
+    # (a repeat=N latency run executes the prog N more times -> N more counts).
+    dbg      = setup["read_debug"]() if setup["read_debug"] else None
+    khits    = setup["read_hits"]() if setup["read_hits"] else None
+    cls_kern = setup["kernel_cls_hist"]() if setup["kernel_cls_hist"] else None
 
     print("  Per-packet XDP action (one packet per ttl):")
     print(f"    REDIRECT (forwarded / HIT) : {hits:>4}  ({100*hits/max(n,1):.0f}%)")
@@ -389,14 +394,13 @@ def run(method: str, model_id: int, model_path: str,
 
     # -- Reception proof --
     print("  Reception proof:")
-    if setup["read_debug"]:                     # hardcoded: dedicated counters
-        dbg = setup["read_debug"]()
+    if dbg is not None:                         # hardcoded: dedicated counters
         print(f"    reached_model_cache = {dbg['reached_model_cache']}  "
               f"(parsed eth/ip/udp/ipa and hit inference)")
         print(f"    not_udp={dbg['not_udp']}  wrong_port={dbg['wrong_port']}  "
               f"seen={dbg['seen']}")
     else:                                       # template/modular: kernel HIT map
-        kh, km, kf = setup["read_hits"]()
+        kh, km, kf = khits
         print(f"    kernel pkt_stats [HIT={kh} MISS={km} FAKE={kf}]")
         print(f"    HIT means: parsed headers, ran inference (incl. tail calls),"
               f" argmax key MATCHED the reference key -> redirected.")
@@ -405,8 +409,8 @@ def run(method: str, model_id: int, model_path: str,
     # -- Dispatch proof (argmax class distribution) --
     print("  Dispatch proof (argmax class distribution over the ttl sweep):")
     labels = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5", "DROP"]
-    if setup["kernel_cls_hist"]:                # hardcoded: kernel histogram
-        cls_hist = setup["kernel_cls_hist"]()
+    if cls_kern is not None:                    # hardcoded: kernel histogram
+        cls_hist = cls_kern
         src_note = "(from kernel cls_stats)"
     else:                                       # template/modular: reference argmax
         cls_hist = [0] * 7
@@ -420,6 +424,9 @@ def run(method: str, model_id: int, model_path: str,
         print(f"    cls {i} -> {labels[i]:5s} : {c:>4}  {bar}")
     print()
 
+    # Latency LAST: many repeats on one representative packet, kernel-averaged.
+    lat_frame = build_frame(model_id, (ttl_min + ttl_max) // 2, weights, scale)
+    _, dur_ns = prog_test_run(fn.fd, lat_frame, repeat=repeat)
     print(f"  Per-packet latency  : {dur_ns} ns  "
           f"(avg over {repeat} in-kernel runs)")
     if dur_ns > 0:

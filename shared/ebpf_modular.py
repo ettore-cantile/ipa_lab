@@ -319,6 +319,26 @@ EBPF_LAYER_4_7_ARGMAX = EBPF_MODULAR_COMMON_HEADER + r"""
 #define L2_N_OUT  7
 #define L2_W_BASE_META_SLOT  7
 
+/* Miss/fake-hit event emitter. Must be a real function, NOT a macro:
+ * BCC rejects map methods (scratch_meta.lookup / miss_events_t3.perf_submit)
+ * inside a #define -- "cannot use map function inside a macro". All the
+ * fields it needs (model_id, ttl, ingress_ifindex, layer_idx) were stored
+ * in scratch_meta by the dispatcher, so no ip/ctx fallback is required. */
+static __always_inline
+void emit_miss_t3(struct xdp_md *ctx, __u64 key) {
+    int mid_slot = META_MODEL_ID;   long long *mid_p = scratch_meta.lookup(&mid_slot);
+    int li_slot  = META_LAYER_IDX;  long long *lip   = scratch_meta.lookup(&li_slot);
+    int ttl_slot = META_TTL;        long long *ttlp  = scratch_meta.lookup(&ttl_slot);
+    int if_slot  = META_INGRESS_IF; long long *ifp   = scratch_meta.lookup(&if_slot);
+    struct miss_event_t3 ev = {};
+    ev.model_id        = mid_p ? (__u8)(*mid_p) : 0;
+    ev.ttl             = ttlp  ? (__u8)(*ttlp)  : 0;
+    ev.ingress_ifindex = ifp   ? (__u32)(*ifp)  : 0;
+    ev.layer_idx       = lip   ? (__u8)(*lip)   : 2;
+    ev.key             = key;
+    miss_events_t3.perf_submit(ctx, &ev, sizeof(ev));
+}
+
 int layer_4_7_argmax(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -366,25 +386,6 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
     struct fwd_action *action = fwd_table_t3.lookup(&key);
     __u64 *correct_key        = valid_keys_t3.lookup(&ip->ttl);
 
-    /* Helper macro to build and submit a miss event */
-    #define EMIT_EVENT() do { \
-        int mid_slot = META_MODEL_ID; \
-        long long *mid_p = scratch_meta.lookup(&mid_slot); \
-        int li_slot = META_LAYER_IDX; \
-        long long *lip = scratch_meta.lookup(&li_slot); \
-        int ttl_slot = META_TTL; \
-        long long *ttlp = scratch_meta.lookup(&ttl_slot); \
-        int if_slot = META_INGRESS_IF; \
-        long long *ifp = scratch_meta.lookup(&if_slot); \
-        struct miss_event_t3 ev = {}; \
-        ev.model_id        = mid_p ? (__u8)(*mid_p) : 0; \
-        ev.ttl             = ttlp  ? (__u8)(*ttlp)  : ip->ttl; \
-        ev.ingress_ifindex = ifp   ? (__u32)(*ifp)  : ctx->ingress_ifindex; \
-        ev.layer_idx       = lip   ? (__u8)(*lip)   : 2; \
-        ev.key             = key; \
-        miss_events_t3.perf_submit(ctx, &ev, sizeof(ev)); \
-    } while (0)
-
     if (action != NULL && correct_key && *correct_key == key) {
         int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
@@ -395,14 +396,13 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
         /* Fake hit: key found but TTL mismatch -> emit event for CP visibility */
         int si = 2; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
-        EMIT_EVENT();
+        emit_miss_t3(ctx, key);
     } else {
         /* Miss: key not in fwd_table */
         int si = 1; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
-        EMIT_EVENT();
+        emit_miss_t3(ctx, key);
     }
-    #undef EMIT_EVENT
     return XDP_PASS;
 }
 """
