@@ -135,7 +135,7 @@ kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 1
 
 | Metrica                    | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated)   |          996 |       2 897 |     13 645 |
+| Istruzioni eBPF (xlated)   |          996 |       2 668 |     13 645 |
 | Codice jited (byte)        |        4 658 |      12 575 |     58 146 |
 | Tail calls / pacchetto     |     0 (leaf) |           1 |          3 |
 | Map lookup / pacchetto (stima) | 8 (0 pesi) |         322 |        384 |
