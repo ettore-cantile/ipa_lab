@@ -287,7 +287,9 @@ def setup_template(model_id: int, model_path: str):
     b.get_table("arch_progs")[ct.c_int(0)] = ct.c_int(fn_arch.fd)
     fn = b.load_func("ipa_switch_template", BPF.XDP)
 
-    _populate_fwd(b, "fwd_table_t2", "valid_keys_t2", weights, scale, model_id)
+    fwd = b.get_table("fwd_table_t2")
+    action = fwd.Leaf()
+    action.ifindex = 1
 
     def read_hits():
         st = b["pkt_stats_t2"]
@@ -298,6 +300,9 @@ def setup_template(model_id: int, model_path: str):
         "kernel_cls_hist": None, "read_debug": None,
         "read_hits": read_hits,
         "py_class": lambda ttl: _ref_infer(weights, scale, ttl, model_id)[0],
+        "capture": {"perf": "miss_events_t2", "fwd": fwd,
+                    "vk": b.get_table("valid_keys_t2"), "action": action,
+                    "stats": b["pkt_stats_t2"]},
     }
 
 
@@ -320,7 +325,9 @@ def setup_modular(model_id: int, model_path: str):
     chain[ct.c_int(2)] = ct.c_int(fn_l2.fd)
     fn = b.load_func("modular_dispatcher", BPF.XDP)
 
-    _populate_fwd(b, "fwd_table_t3", "valid_keys_t3", weights, scale, model_id)
+    fwd = b.get_table("fwd_table_t3")
+    action = fwd.Leaf()
+    action.ifindex = 1
 
     def read_hits():
         st = b["pkt_stats_t3"]
@@ -331,20 +338,41 @@ def setup_modular(model_id: int, model_path: str):
         "kernel_cls_hist": None, "read_debug": None,
         "read_hits": read_hits,
         "py_class": lambda ttl: _ref_infer(weights, scale, ttl, model_id)[0],
+        "capture": {"perf": "miss_events_t3", "fwd": fwd,
+                    "vk": b.get_table("valid_keys_t3"), "action": action,
+                    "stats": b["pkt_stats_t3"]},
     }
 
 
-def _populate_fwd(b, fwd_name, vk_name, weights, scale, model_id):
-    """Pre-load fwd_table/valid_keys with the Python-computed key for every
-    ttl 0..255, so a kernel HIT proves the kernel key == reference key."""
-    fwd = b.get_table(fwd_name)
-    vk = b.get_table(vk_name)
-    action = fwd.Leaf()
-    action.ifindex = 1  # any valid ifindex; only "did it redirect" matters
-    for ttl in range(0, 256):
-        _cls, key = _ref_infer(weights, scale, ttl, model_id)
-        fwd[ct.c_ulonglong(key)] = action
-        vk[ct.c_uint8(ttl)] = ct.c_ulonglong(key)
+def _capture_kernel_keys(setup, model_id, ttl_min, ttl_max):
+    """Two-pass: feed each ttl with an EMPTY fwd_table so the kernel takes the
+    miss path and emits its own computed key via the perf buffer. Populate
+    fwd_table/valid_keys with those kernel keys, then reset pkt_stats. After
+    this, re-feeding the same ttls yields a REDIRECT (HIT), proving the whole
+    in-kernel parse -> inference -> argmax -> key -> forward path end to end,
+    with no dependency on replicating the arithmetic in Python."""
+    cap = setup["capture"]
+    b, fn = setup["b"], setup["fn"]
+    weights, scale = setup["weights"], setup["scale"]
+    got = {}
+
+    def _cb(cpu, data, size):
+        ev = b[cap["perf"]].event(data)
+        got[int(ev.ttl)] = int(ev.key)
+
+    b[cap["perf"]].open_perf_buffer(_cb, page_cnt=8)
+    for ttl in range(ttl_min, ttl_max + 1):
+        prog_test_run(fn.fd, build_frame(model_id, ttl, weights, scale), repeat=1)
+        b.perf_buffer_poll(timeout=50)
+
+    for ttl, key in got.items():
+        cap["fwd"][ct.c_ulonglong(key)] = cap["action"]
+        cap["vk"][ct.c_uint8(ttl)] = ct.c_ulonglong(key)
+
+    st = cap["stats"]                      # reset counts from the capture pass
+    for i in range(3):
+        st[ct.c_int(i)] = ct.c_ulonglong(0)
+    return len(got)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +392,14 @@ def run(method: str, model_id: int, model_path: str,
     weights, scale = setup["weights"], setup["scale"]
 
     print(f"[verify] program loaded (scale={scale}, weights={len(weights)})")
+
+    # Methods with a fwd_table (template/modular): learn the kernel's own keys
+    # from the miss-path perf events, then pre-load fwd_table so the measured
+    # sweep can HIT. Hardcoded has no fwd_table (redirect on argmax directly).
+    if setup.get("capture"):
+        nk = _capture_kernel_keys(setup, model_id, ttl_min, ttl_max)
+        print(f"[verify] captured {nk} kernel keys -> fwd_table pre-loaded")
+
     print(f"[verify] feeding IPA packets for ttl {ttl_min}..{ttl_max} "
           f"(model_id={model_id})\n")
 
