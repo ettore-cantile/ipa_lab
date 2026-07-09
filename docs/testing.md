@@ -53,7 +53,14 @@ sudo python3 shared/test_suite.py --only kernel --kernel-repeat 200000
 ```
 
 Output atteso: tabella metriche (istruzioni/jited/tail-call/memoria/latenza/throughput/CPU)
-+ `5 PASS / 0 FAIL` per ciascuna pipeline + `kernel suite: PASS`.
++ `5 PASS / 0 FAIL` per ciascuna pipeline + il probe `link_state reroute` (un link giù cambia
+l'uscita) + `kernel suite: PASS`.
+
+Cosa verifica in più oltre al dispatch:
+- **Equivalenza numerica**: per P2/P3 confronta la chiave del kernel con il riferimento Python
+  ricalcolato sull'`ingress_ifindex` realmente visto dal programma (risolve il vecchio "drift" P2).
+- **Reroute su guasto**: per ogni TTL e interfaccia `k`, esegue P1 con tutti i link up e poi con
+  `link_state[k]=0`, e conferma che l'argmax cambia uscita in almeno un caso.
 
 ### Verifier standalone (equivalente al gate di dispatch)
 
@@ -149,3 +156,4 @@ Note oneste:
 - Istruzioni, jited e tail-call crescono con la flessibilità: è il costo strutturale del design modulare (P3 ≈ 12× le istruzioni di P1).
 - `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa. Aggiornato dal monitor carrier userspace.
 - Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`.
+- **Latenza P1 da rimisurare**: i valori in tabella precedono la rimozione dei 3 `bpf_trace_printk` per pacchetto dal path HIT di P1 (helper costoso, assente in P2/P3). Rimossi → P1 atteso più veloce di P2. Rieseguire la suite. Istruzioni/memoria/tail/lookup invariati.

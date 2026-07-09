@@ -1122,6 +1122,23 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
             except Exception as e:
                 fail(f"dispatch {name}: error ({e})")
                 all_ok = False
+
+        # link_state is a live routing input: a link going down must be able to
+        # reroute the packet (change the argmax egress class). Probe Pipeline 1
+        # over all TTL x egress combinations.
+        print()
+        try:
+            changes, tested = V.probe_link_down(mp, 0, ttl_min, ttl_max)
+            if changes:
+                sample = ", ".join(f"TTL{t}:link{k} {u}->{d}" for t, k, u, d in changes[:6])
+                ok(f"link_state reroute: {len(changes)}/{tested} link-down cases change egress  [{sample}]")
+            else:
+                fail(f"link_state reroute: 0/{tested} link-down cases changed the egress class "
+                     f"(feature wired but the model never reroutes on failure for TTL {ttl_min}-{ttl_max})")
+                all_ok = False
+        except Exception as e:
+            fail(f"link_state reroute probe: error ({e})")
+            all_ok = False
     print(f"\n{'='*52}")
     print(f" kernel suite: {'PASS' if all_ok else 'FAIL'}")
     print(f"{'='*52}\n")

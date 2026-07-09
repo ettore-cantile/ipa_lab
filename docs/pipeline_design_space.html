@@ -776,8 +776,16 @@
       P1 +38 istruzioni (1057→1095), P2 +~930 (il loop a 6 lookup srotolato sui 4 neuroni fc1),
       P3 +157 nel dispatcher. La memoria mappe di P1 (264 B) coincide col calcolo analitico
       (<span class="mono">link_state</span> 48 + <span class="mono">pkt_stats</span> 36 +
-      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96). Latenza e throughput
-      hanno varianza run-to-run non trascurabile sotto <span class="mono">BPF_PROG_TEST_RUN</span>.
+      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96).
+    </div>
+    <div class="iface-note" style="margin-bottom:2.5rem;border-left-color:var(--amber);">
+      <strong>Ottimizzazione P1 (latenza da rimisurare).</strong> Nella prima misura P1 risultava più lento di P2
+      (1109 ns vs 339) perché eseguiva <strong>3 <span class="mono">bpf_trace_printk</span> per pacchetto</strong>
+      sul path HIT — un helper costoso (format + scrittura su ring) che P2/P3 non hanno. Sono stati rimossi:
+      P1 torna un baseline di performance pulito e ci si attende che la sua latenza scenda sotto P2, coerente con
+      la tassonomia (<em>hardcoded = prestazioni massime</em>). I valori in tabella per la latenza/throughput di P1
+      precedono questa rimozione: rieseguire <span class="mono">test_suite.py --only kernel</span> per i numeri finali.
+      Le altre metriche (istruzioni, memoria, tail call, map lookup) non cambiano.
     </div>
 
     <!-- Weight update latency -->
@@ -931,8 +939,18 @@
       e tre le pipeline. Per P2/P3 usa una verifica <strong>two-pass</strong>: cattura la chiave di
       forwarding emessa dal kernel, la installa nella <span class="mono">fwd_table</span> e ri-esegue,
       asserendo che il redirect scatti (<span class="mono">retval ∈ {0,4}</span> e
-      <span class="mono">pkt_stats[HIT] &gt; 0</span>). Questo separa PASS/FAIL dal richiedere che
-      Python replichi bit-per-bit l'aritmetica intera del kernel.<br><br>
+      <span class="mono">pkt_stats[HIT] &gt; 0</span>).<br><br>
+      <strong>Equivalenza numerica (drift P2 risolto).</strong> Sotto <span class="mono">BPF_PROG_TEST_RUN</span>
+      il leaf del template legge un <span class="mono">ctx-&gt;ingress_ifindex</span> di sandbox (≠0) e aggiunge
+      la one-hot iface, mentre il riferimento Python assumeva ifindex=0: da qui l'apparente "drift" tra le chiavi.
+      Ora il verifier ricalcola il riferimento con l'<span class="mono">ingress_ifindex</span> effettivamente
+      riportato nel miss-event, così il confronto diventa un <strong>controllo di equivalenza reale</strong>
+      (chiave kernel == chiave Python) e non solo "il redirect scatta".<br><br>
+      <strong>Reroute su guasto (link_state).</strong> La suite verifica anche che
+      <span class="mono">link_state</span> sia un input di routing vivo: per ogni TTL e ogni interfaccia
+      <em>k</em> esegue P1 con tutti i link up e poi con il link <em>k</em> giù
+      (<span class="mono">link_state[k]=0</span>), e conferma che in almeno un caso la classe di uscita
+      dell'argmax cambia — cioè un guasto reindirizza davvero il pacchetto.<br><br>
     </div>
   </section>
 

@@ -313,11 +313,9 @@ def generate_ebpf_hardcoded(
         argmax_lines.append(
             f"    if (out_{k} > best_val) {{ best_val = out_{k}; best_cls = {k}; }}"
         )
-    # Debug: log best_cls and best_val so we can verify without recompiling
-    argmax_lines.append(
-        '    bpf_trace_printk("IPA p1 argmax: cls=%d val=%lld iface=%d\\n",'
-        " best_cls, best_val, _iface);"
-    )
+    # NOTE: no bpf_trace_printk in the hot path -- it is an expensive helper
+    # (format + ring write) called per packet and would dominate the latency
+    # of this performance baseline. P2/P3 have no printk on the HIT path.
 
     fc1_src    = "\n".join(fc1_lines)
     fc2_src    = "\n".join(fc2_lines)
@@ -387,8 +385,6 @@ int ipa_switch(struct xdp_md *ctx) {{
         /* cls 6 = DROP */
         int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);
         if (_dv) __sync_fetch_and_add(_dv, 1);
-        bpf_trace_printk("IPA p1 DROP: model=%d ttl=%d\\n",
-                         ipa->model_id, ip->ttl);
         return XDP_DROP;
     }}
 
@@ -410,11 +406,6 @@ int ipa_switch(struct xdp_md *ctx) {{
     /* global hit counter */
     int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
     if (_hv) __sync_fetch_and_add(_hv, 1);
-
-    bpf_trace_printk("IPA p1: model=%d ttl=%d\\n",
-                     ipa->model_id, ip->ttl);
-    bpf_trace_printk("IPA p1: cls=%d ifindex=%d\\n",
-                     best_cls, egress_ifindex);
 
     return bpf_redirect(egress_ifindex, 0);
 }}

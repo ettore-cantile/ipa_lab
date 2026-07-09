@@ -377,11 +377,53 @@ def _make_perf_cb(event_cls, label, capture):
         ev = ct.cast(data, ct.POINTER(event_cls)).contents
         capture["key"] = int(ev.key)
         capture["ttl"] = int(ev.ttl)
+        capture["ingress"] = int(ev.ingress_ifindex)
         print(f"  [{label}] miss cpu={cpu} model_id={ev.model_id} ttl={ev.ttl} ifindex={ev.ingress_ifindex} key={ev.key:#018x}")
     return _cb
 
 XDP_PASS = 2
 XDP_REDIRECT_PASS = frozenset({0, 4})
+
+
+def _fired_cls_p1(setup) -> int:
+    """After a single-packet run of Pipeline 1, return the egress class that
+    fired: 0..5 = redirect on that class, 6 = DROP, -1 = nothing."""
+    cs = setup["cls_stats"]
+    for c in range(6):
+        if _read_u64(cs, c) > 0:
+            return c
+    if _read_u64(setup["pkt_stats"], 2) > 0:
+        return 6
+    return -1
+
+
+def probe_link_down(model_path, model_id: int = 0, ttl_min: int = 1, ttl_max: int = 5):
+    """Prove that link_state is a live routing input: for each TTL and each
+    egress k, run Pipeline 1 with all links up, then with link k down
+    (link_state[k]=0), and record the cases where the argmax egress class
+    changes. Returns (changes, tested) where changes is a list of
+    (ttl, k, cls_up, cls_down). A non-empty result means a link failure
+    actually reroutes the packet."""
+    setup = setup_hardcoded(model_id, model_path)
+    b, fn, scale = setup["b"], setup["fn"], setup["scale"]
+    changes, tested = [], 0
+    for ttl in range(ttl_min, ttl_max + 1):
+        frame = build_frame(model_id, ttl, scale)
+        _seed_link_state(b, 1)
+        _reset_stats(setup)
+        prog_test_run(fn.fd, frame, repeat=1)
+        cls_up = _fired_cls_p1(setup)
+        for k in range(6):
+            _seed_link_state(b, 1)
+            b["link_state"][ct.c_int(k)] = ct.c_uint32(0)
+            _reset_stats(setup)
+            prog_test_run(fn.fd, frame, repeat=1)
+            cls_down = _fired_cls_p1(setup)
+            tested += 1
+            if cls_down != cls_up:
+                changes.append((ttl, k, cls_up, cls_down))
+    _seed_link_state(b, 1)
+    return changes, tested
 
 def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int, repeat: int):
     print("=" * 70)
@@ -414,7 +456,7 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         t_redir = setup.get("t_redirect_s", 0.0)
         t_ins   = setup.get("t_insert_s", 0.0)
         print(f"[M1 update timing] redirect/reload (BPF compile+load): {t_redir*1000:.3f} ms")
-        print(f"[M1 update timing] weight insert   (model_cache map):  {t_ins*1000:.3f} ms")
+        print(f"[M1 update timing] weight insert   (n/a, pure hardcoded): {t_ins*1000:.3f} ms")
         print(f"[M1 update timing] total:                               {(t_redir+t_ins)*1000:.3f} ms")
         print()
 
@@ -451,7 +493,20 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
                 _remove_fwd_entry(b, fwd_table_name, valid_keys_name, ttl=ttl, key=kernel_key)
                 hit_count = _read_u64(ps, 0)
                 ok = (retval in XDP_REDIRECT_PASS) and (hit_count > 0)
-                drift = ("" if kernel_key == expected_key else f" [py={expected_key}!=kern={kernel_key}]")
+                # Under BPF_PROG_TEST_RUN the leaf sees a sandbox ctx->ingress_ifindex.
+                # P2 reads it directly (adds the iface one-hot), while ref_infer above
+                # assumed ifindex=0 -- that mismatch was the apparent "drift". Recompute
+                # the reference with the ingress the kernel actually reported (from the
+                # miss event), so the key comparison becomes a real numeric equivalence
+                # check between kernel inference and the Python reference.
+                kern_ingress = capture.get("ingress", 0)
+                _, ref_val_k, _, _ = ref_infer(weights, scale, ttl, model_id, ifindex=kern_ingress)
+                expected_key = _compute_fwd_key(ref_val_k, scale)
+                if kernel_key == expected_key:
+                    drift = f" [==ref(ifindex={kern_ingress})]"
+                else:
+                    drift = f" [MISMATCH py={expected_key}!=kern={kernel_key} ingress={kern_ingress}]"
+                    ok = False
                 detail = f"retval={retval} pkt_stats[HIT]={hit_count} key={kernel_key}{drift}"
         if retval == XDP_PASS:
             ok = False
