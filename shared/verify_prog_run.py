@@ -44,7 +44,7 @@ if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 os.chdir(SHARED_DIR)
 
-from bcc import BPF, lib
+from bcc import BPF
 
 N_WEIGHTS = 319
 
@@ -99,45 +99,63 @@ def build_frame(model_id: int, ttl: int, weights_int8: list, scale: int,
 
 
 # ---------------------------------------------------------------------------
-# BPF_PROG_TEST_RUN wrapper (libbcc bpf_prog_test_run, 8-arg classic form)
+# BPF_PROG_TEST_RUN via the raw bpf() syscall
+#
+# The container's libbcc does not export bpf_prog_test_run, so we invoke the
+# bpf(2) syscall directly through ctypes — always available, no libbcc symbol
+# needed. We build the BPF_PROG_TEST_RUN member of union bpf_attr by hand.
 # ---------------------------------------------------------------------------
-_test_run_ready = False
+_NR_bpf = 321            # __NR_bpf on x86_64 (this lab is x86_64)
+BPF_PROG_TEST_RUN = 10   # bpf() command
 
 
-def _init_test_run():
-    global _test_run_ready
-    if _test_run_ready:
-        return
-    if not hasattr(lib, "bpf_prog_test_run"):
-        raise RuntimeError(
-            "libbcc has no bpf_prog_test_run symbol — BCC too old for "
-            "BPF_PROG_TEST_RUN. Upgrade bpfcc, or use the Kathara path."
-        )
-    lib.bpf_prog_test_run.restype = ct.c_int
-    lib.bpf_prog_test_run.argtypes = [
-        ct.c_int, ct.c_int, ct.c_void_p, ct.c_uint32,
-        ct.c_void_p, ct.POINTER(ct.c_uint32),
-        ct.POINTER(ct.c_uint32), ct.POINTER(ct.c_uint32),
+class _BpfAttrTestRun(ct.Structure):
+    # Natural alignment matches the kernel's __aligned_u64 fields (no _pack_).
+    _fields_ = [
+        ("prog_fd",       ct.c_uint32),
+        ("retval",        ct.c_uint32),
+        ("data_size_in",  ct.c_uint32),
+        ("data_size_out", ct.c_uint32),
+        ("data_in",       ct.c_uint64),
+        ("data_out",      ct.c_uint64),
+        ("repeat",        ct.c_uint32),
+        ("duration",      ct.c_uint32),
+        ("ctx_size_in",   ct.c_uint32),
+        ("ctx_size_out",  ct.c_uint32),
+        ("ctx_in",        ct.c_uint64),
+        ("ctx_out",       ct.c_uint64),
+        ("flags",         ct.c_uint32),
+        ("cpu",           ct.c_uint32),
+        ("batch_size",    ct.c_uint32),
     ]
-    _test_run_ready = True
+
+
+_libc = ct.CDLL("libc.so.6", use_errno=True)
+_libc.syscall.restype = ct.c_long
+_libc.syscall.argtypes = [ct.c_long, ct.c_long, ct.c_void_p, ct.c_ulong]
 
 
 def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
-    """Run the XDP program on `frame`. Returns (retval, duration_ns)."""
-    _init_test_run()
+    """Run the XDP program on `frame` via bpf(BPF_PROG_TEST_RUN).
+    Returns (retval, duration_ns)."""
     data_in = ct.create_string_buffer(frame, len(frame))
     out_cap = len(frame) + 256
     data_out = ct.create_string_buffer(out_cap)
-    size_out = ct.c_uint32(out_cap)
-    retval = ct.c_uint32(0)
-    duration = ct.c_uint32(0)
-    rc = lib.bpf_prog_test_run(
-        prog_fd, repeat, data_in, len(frame),
-        data_out, ct.byref(size_out), ct.byref(retval), ct.byref(duration),
-    )
-    if rc != 0:
-        raise OSError(ct.get_errno(), f"bpf_prog_test_run failed rc={rc}")
-    return retval.value, duration.value
+
+    attr = _BpfAttrTestRun()
+    attr.prog_fd = prog_fd
+    attr.data_in = ct.cast(data_in, ct.c_void_p).value
+    attr.data_size_in = len(frame)
+    attr.data_out = ct.cast(data_out, ct.c_void_p).value
+    attr.data_size_out = out_cap
+    attr.repeat = repeat
+
+    ct.set_errno(0)
+    ret = _libc.syscall(_NR_bpf, BPF_PROG_TEST_RUN, ct.byref(attr), ct.sizeof(attr))
+    if ret < 0:
+        e = ct.get_errno()
+        raise OSError(e, f"bpf(BPF_PROG_TEST_RUN) failed: {os.strerror(e)}")
+    return attr.retval, attr.duration
 
 
 # ---------------------------------------------------------------------------
