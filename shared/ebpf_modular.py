@@ -16,8 +16,9 @@ Layer blocks implemented:
 Maps:
   scratch_acts     : BPF_PERCPU_ARRAY  index -> long long  (intermediate activations)
   scratch_meta     : BPF_PERCPU_ARRAY  0 -> {model_id, weight_offset, scale, layer_idx}
-  layer_weights    : BPF_HASH  (layer_id, neuron_idx) -> __u8  (stored unsigned; signed
-                     reinterpretation is done in Python via c_int8 cast on read)
+  layer_weights    : BPF_ARRAY  (flat index) -> __u8  (unsigned byte storage;
+                     eBPF C code casts to __s8 for signed arithmetic via WEIGHT() macro;
+                     Python side stores int8 as c_uint8(v & 0xFF) two's complement)
   layer_chain      : BPF_PROG_ARRAY  layer_idx -> BPF prog fd
   layer_registry   : model_id -> {n_layers, layer_ids[8], weight_offsets[8], scale}
   fwd_table_t3     : u64 -> fwd_action
@@ -45,11 +46,14 @@ Fixed bug (2026-07-08): the dispatcher used to populate scratch_acts as
 
 Fixed bug (2026-07-09): BPF_ARRAY(layer_weights, __s8, ...) caused a
   KeyError: 'signed char' in BCC's str2ctype dict on the libbcc version
-  present in the Kathara container (~0.18).  Changed to __u8 (unsigned)
-  which BCC resolves correctly; Python-side load_modular_weights stores
-  values as c_uint8 (bit-identical to int8 in two's complement) and the
-  eBPF C code casts the retrieved byte to (__s8) before arithmetic, so
-  the sign semantics are preserved.
+  present in the Kathara container (~0.18).  BCC resolves __s8 to the
+  C type string 'signed char', which is absent from str2ctype.  Changed
+  leaf type to __u8 (unsigned byte) which BCC resolves to 'unsigned char'
+  and handles correctly.  Sign semantics are fully preserved: the eBPF C
+  code casts each retrieved byte to (__s8) via the WEIGHT() macro before
+  any arithmetic; the Python load_modular_weights() stores each int8
+  value as c_uint8(int(v) & 0xFF) -- a bit-identical two's complement
+  representation -- bypassing BCC's leaf encoder for the map write.
 """
 
 # Scratch map layout constants
@@ -107,9 +111,13 @@ struct miss_event_t3 {
 BPF_PERCPU_ARRAY(scratch_acts, long long, SCRATCH_ACT_SIZE);
 BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
 
-/* Weight map: flat __u8 (unsigned byte storage; eBPF code casts to __s8 for arithmetic).
- * Using __u8 instead of __s8 avoids KeyError: 'signed char' in BCC str2ctype
- * on older libbcc versions (< 0.20) present in the Kathara container. */
+/* Weight map: __u8 leaf (unsigned byte storage).
+ * Using __u8 instead of __s8 avoids KeyError: 'signed char' in BCC
+ * str2ctype on older libbcc versions (< 0.20) present in the Kathara
+ * container.  __s8 expands to 'signed char' which is absent from
+ * str2ctype; __u8 expands to 'unsigned char' which IS present.
+ * Sign semantics are preserved: eBPF C code casts each retrieved byte
+ * to (__s8) via the WEIGHT() macro before any multiply-accumulate. */
 #define MAX_LAYER_WEIGHT_ENTRIES 2048
 BPF_ARRAY(layer_weights, __u8, MAX_LAYER_WEIGHT_ENTRIES);
 

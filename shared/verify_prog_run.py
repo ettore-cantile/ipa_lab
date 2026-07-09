@@ -39,6 +39,17 @@ Perche retval != 3 con BPF_PROG_TEST_RUN:
   logicamente ma restituisce XDP_ABORTED(0), mai XDP_REDIRECT(3).
   Criterio di PASS: retval == 0 (XDP_ABORTED = redirect fire) E
   cls_stats[ref_cls] incrementato (conferma che la classe inferita coincide).
+
+Fixed bug (2026-07-09): _cb() used b[cap['perf']].event(data) which calls
+  BCC's automatic struct deserializer.  On libbcc ~0.18 (Kathara container)
+  _get_event_class() fails for any struct field typed __u8 / __u32 with:
+    'Type: __u8 not recognized. Please define the data with ctypes manually.'
+  then calls sys.exit(1), which propagates as SystemExit inside the ctypes
+  callback and floods stderr once per packet.
+  Fix: define MissEventT2 and MissEventT3 as explicit ctypes.Structure classes
+  whose _fields_ match the C struct layout exactly (same field order, types,
+  pack=1).  Replace .event(data) with ctypes.cast(data, ctypes.POINTER(...))
+  in _cb(), bypassing BCC's type decoder entirely.
 """
 
 import os
@@ -84,6 +95,38 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
         e = ct.get_errno()
         raise OSError(e, os.strerror(e))
     return a.retval, a.duration
+
+# ---------------------------------------------------------------------------
+# ctypes mirror structs for perf event deserialization.
+# BCC ~0.18 cannot auto-decode __u8 / __u32 fields -> 'Type: __u8 not
+# recognized'.  We bypass .event() entirely and cast the raw data pointer.
+# Layout MUST match the C structs in ebpf_template_arch.py / ebpf_modular.py
+# exactly (same field order, same sizes, __attribute__((packed)) -> _pack_=1).
+# ---------------------------------------------------------------------------
+
+class MissEventT2(ct.Structure):
+    """Mirrors struct miss_event_t2 { __u8 model_id; __u8 ttl;
+       __u32 ingress_ifindex; __u8 arch_id; __u64 key; } __packed__"""
+    _pack_ = 1
+    _fields_ = [
+        ("model_id",        ct.c_uint8),
+        ("ttl",             ct.c_uint8),
+        ("ingress_ifindex", ct.c_uint32),
+        ("arch_id",         ct.c_uint8),
+        ("key",             ct.c_uint64),
+    ]
+
+class MissEventT3(ct.Structure):
+    """Mirrors struct miss_event_t3 { __u8 model_id; __u8 ttl;
+       __u32 ingress_ifindex; __u8 layer_idx; __u64 key; } __packed__"""
+    _pack_ = 1
+    _fields_ = [
+        ("model_id",        ct.c_uint8),
+        ("ttl",             ct.c_uint8),
+        ("ingress_ifindex", ct.c_uint32),
+        ("layer_idx",       ct.c_uint8),
+        ("key",             ct.c_uint64),
+    ]
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -276,6 +319,8 @@ def setup_template(model_id: int, model_path: str):
         "cls_stats": b["cls_stats_t2"] if "cls_stats_t2" in str(b.tables) else None,
         "pkt_stats": b["pkt_stats_t2"],
         "pipeline":  2,
+        "perf_name": "miss_events_t2",
+        "perf_cls":  MissEventT2,
     }
 
 # ---------------------------------------------------------------------------
@@ -311,6 +356,8 @@ def setup_modular(model_id: int, model_path: str):
         "scale":     scale,
         "pkt_stats": b["pkt_stats_t3"],
         "pipeline":  3,
+        "perf_name": "miss_events_t3",
+        "perf_cls":  MissEventT3,
     }
 
 # ---------------------------------------------------------------------------
@@ -337,6 +384,24 @@ def _reset_stats(setup):
                 cs[ct.c_uint32(i)] = ct.c_ulonglong(0)
             except Exception:
                 pass
+
+# ---------------------------------------------------------------------------
+# Perf buffer handler
+# ---------------------------------------------------------------------------
+
+def _make_perf_cb(event_cls, label):
+    """
+    Returns a perf callback that deserializes the event using the provided
+    ctypes Structure class instead of BCC's .event() -- which fails on
+    libbcc ~0.18 for structs containing __u8 fields.
+    """
+    def _cb(cpu, data, size):
+        if size < ct.sizeof(event_cls):
+            return
+        ev = ct.cast(data, ct.POINTER(event_cls)).contents
+        print(f"  [{label}] miss cpu={cpu} model_id={ev.model_id} "
+              f"ttl={ev.ttl} ifindex={ev.ingress_ifindex} key={ev.key:#018x}")
+    return _cb
 
 # ---------------------------------------------------------------------------
 # Driver
@@ -367,6 +432,13 @@ def run(method: str, model_id: int, model_path: str,
     cs        = setup.get("cls_stats")
     pipeline  = setup["pipeline"]
 
+    # Open perf buffer with manual ctypes deserializer (avoids BCC __u8 crash)
+    perf_name = setup.get("perf_name")
+    perf_cls  = setup.get("perf_cls")
+    if perf_name and perf_cls:
+        cb = _make_perf_cb(perf_cls, f"P{pipeline}")
+        b[perf_name].open_perf_buffer(cb, page_cnt=8)
+
     print(f"[setup] scale={scale}  weights={len(weights)}  "
           f"prog_fd={fn.fd}")
 
@@ -375,6 +447,10 @@ def run(method: str, model_id: int, model_path: str,
         _reset_stats(setup)
         frame = build_frame(model_id, ttl, scale)
         retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
+
+        # Drain perf buffer after each run (non-blocking)
+        if perf_name and perf_cls:
+            b.perf_buffer_poll(timeout=0)
 
         ref_cls, ref_val = ref_infer(weights, scale, ttl, model_id, ifindex=0)
 
