@@ -6,22 +6,29 @@ Design space position:
   - Each model -> a dedicated eBPF program
   - Weights hardcoded as literals in the C source
   - Inference: fc1 (65->4, ReLU) + fc2 (4->4, ReLU) + out (4->7, argmax)
-  - A single tail call, no map lookup for the weights
+  - A single tail call, NO map lookup for the weights (pure hardcoded).
+    The ONLY map read is link_state[0..5] (egress up/down), which is an
+    input feature, not a weight -- see below.
   - Per-class hardcoded action: best_cls -> ifindex[best_cls]
     (cls 0-5 = bpf_redirect on the corresponding iface, cls 6 = XDP_DROP)
   - No fwd_table, no valid_keys lookup: a TRUE HIT = the redirect fired
+  - No model_cache: the old is_valid gate + weight blob was a residue of an
+    earlier design; a pure hardcoded program already knows its weights, so it
+    always runs inference. Removed.
 
 Stack budget:
   iv[65] as int array  -> 260B (too much)
   iv0..iv64 long long  -> 520B (exceeds 512B alone)
 
-  Solution: the feature vector has only 3 non-zero entries at runtime:
-    iv[12]              = ip->ttl          (always set)
-    iv[5+ingress_iface] = 1                (one-hot, indices 6..11)
-    iv[13+model_id]     = 1                (one-hot, indices 13..64)
+  Solution: the feature vector has only a handful of live entries at runtime:
+    iv[0..5]            = link_state[0..5]  (egress up/down, from map)
+    iv[12]              = ip->ttl           (always set)
+    iv[5+ingress_iface] = 1                 (one-hot, indices 6..11)
+    iv[13+model_id]     = 1                 (one-hot, indices 13..64)
   All other indices are 0, so weight*0 terms vanish from fc1.
   We generate fc1 as:
-    h1_j = RELU( w[j,12]*ttl + w[j, 5+iface]*iface_weight
+    h1_j = RELU( sum_i(link_state[i]*w[j,i])           (i in 0..5)
+               + w[j,12]*ttl + w[j, 5+iface]*iface_weight
                + w[j, 13+node]*node_weight + bias_j )
 
 Verifier constraints (why the code is shaped this way):
@@ -115,37 +122,14 @@ struct ipa_hdr {
     __u8   out0_code;   __u8 out0_count;
 } __attribute__((packed));
 
-struct model_data {
-    __u8  weights[319];
-    __u8  is_valid;
-    __u16 scale_factor;
-};
-
-struct miss_event {
-    __u8  model_id;
-    __u8  ttl;
-    __u32 ingress_ifindex;
-    __u8  input_size;
-    __u8  chosen_cls;
-};
-
-struct model_miss_event {
-    __u8  model_id;
-    __u8  ttl;
-    __u32 ingress_ifindex;
-    __u8  input_size;
-    __u8  w0; __u8 w1; __u8 w2; __u8 w3;
-    __u8  n_weights;
-};
-
-BPF_HASH(model_cache,       __u8,  struct model_data, 256);
-BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss [2]=drop */
+/* link_state[i] = operational up/down of egress iface i (feature slots 0..5).
+ * Written by the userspace carrier monitor (link_state_monitor.py); read here
+ * into the first 6 feature-vector entries. 1 = link up, 0 = link down.
+ * This is the ONLY map read in the inference path -- it is an INPUT feature,
+ * not a weight. The weights remain C literals (pure hardcoded design). */
+BPF_ARRAY(link_state,       __u32, 6);
+BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(unused) [2]=drop */
 BPF_ARRAY(cls_stats,        __u64, 7);   /* per-class redirect counter */
-BPF_PERF_OUTPUT(miss_events);
-BPF_PERF_OUTPUT(model_miss_events);
-/* percpu scratch to keep event structs off the stack */
-BPF_PERCPU_ARRAY(ev_scratch,  struct miss_event,        1);
-BPF_PERCPU_ARRAY(mev_scratch, struct model_miss_event,  1);
 
 /* Diagnostic counters -- distinguishes "packet never reached the XDP
  * hook / never got this far" from "reached it but failed a specific
@@ -159,7 +143,7 @@ BPF_ARRAY(debug_stats,      __u64, 8);
 #define DBG_UDP_FAIL    4   /* packet shorter than eth+ip+udp header */
 #define DBG_WRONG_PORT  5   /* udp->dest != 9999 */
 #define DBG_IPA_FAIL    6   /* packet shorter than eth+ip+udp+ipa header */
-#define DBG_REACHED_MC  7   /* passed every header check, reached model_cache lookup */
+#define DBG_INFERRED    7   /* passed every header check, ran inference */
 
 /* BCC refuses map method calls (.lookup/.update/...) textually nested
  * inside a macro expansion ("cannot use map function inside a macro") --
@@ -187,7 +171,7 @@ def generate_ebpf_hardcoded(
       - resolves egress_ifindex via switch(best_cls) over hardcoded constants
       - cls 0-5: bpf_redirect(ifindex, 0)  -> pkt_stats[0]++, cls_stats[cls]++
       - cls  6:  XDP_DROP                  -> pkt_stats[2]++
-      - model_cache miss:                  -> pkt_stats[1]++
+      - inference always runs (pure hardcoded, no cache gate)
 
     ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex.
                    Defaults to [2,3,4,5,6,7] (eth1..eth6).
@@ -221,8 +205,8 @@ def generate_ebpf_hardcoded(
         return str(int(v))
 
     # ----------------------------------------------------------------
-    # Feature vector structure (65 dims, only 3 non-zero at runtime):
-    #   [0..5]   unused (always 0)
+    # Feature vector structure (65 dims, sparse at runtime):
+    #   [0..5]   egress link_state (up/down), read from the link_state map
     #   [6..11]  ingress_ifindex one-hot  (index = 5 + logical_iface, logical 1..6)
     #   [12]     ip->ttl
     #   [13..64] model_id / node_id one-hot (index = 13 + model_id, 0..51)
@@ -301,11 +285,16 @@ def generate_ebpf_hardcoded(
     for j in range(N_H1):
         w_ttl = int(fc1_w[j * N_IN + 12])
         b_j   = int(fc1_b[j])
+        # link_state feature terms: sum_i(ls{i} * w[j, i]) for i in 0..5
+        ls_terms = " + ".join(
+            f"ls{i} * {lit(int(fc1_w[j * N_IN + i]))}LL" for i in range(6)
+        )
         fc1_lines.append(
             f"    long long h1_{j} = RELU_LL("
             f"(__s64)_ttl * {lit(w_ttl)}LL"
             f" + w_iface_{j}"
             f" + w_node_{j}"
+            f" + {ls_terms}"
             f" + {lit(b_j)}LL);"
         )
 
@@ -367,31 +356,23 @@ int ipa_switch(struct xdp_md *ctx) {{
     if (udp->dest != bpf_htons(9999)) {{ dbg_inc(DBG_WRONG_PORT); return XDP_PASS; }}
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) {{ dbg_inc(DBG_IPA_FAIL); return XDP_PASS; }}
-    dbg_inc(DBG_REACHED_MC);
+    dbg_inc(DBG_INFERRED);
 
-    /* model_cache check: if model not loaded, count as miss and pass */
-    struct model_data *m = model_cache.lookup(&ipa->model_id);
-    if (!m || m->is_valid == 0) {{
-        __u8 *wp = (__u8 *)(ipa + 1);
-        if ((void *)(wp + 4) > data_end) return XDP_PASS;
-        __u32 _z = 0;
-        struct model_miss_event *mev = mev_scratch.lookup(&_z);
-        if (mev) {{
-            mev->model_id        = ipa->model_id;
-            mev->ttl             = ip->ttl;
-            mev->ingress_ifindex = ctx->ingress_ifindex;
-            mev->input_size      = ipa->input_size;
-            mev->w0=wp[0]; mev->w1=wp[1]; mev->w2=wp[2]; mev->w3=wp[3];
-            mev->n_weights       = 4;
-            model_miss_events.perf_submit(ctx, mev, sizeof(*mev));
-        }}
-        int _ms = 1; __u64 *_mv = pkt_stats.lookup(&_ms);
-        if (_mv) __sync_fetch_and_add(_mv, 1);
-        return XDP_PASS;
-    }}
-
+    /* Pure hardcoded: weights are C literals below, no weight map.
+     * Always run inference. */
     __u16 scale = {scale}U;
     if (scale == 0) return XDP_PASS;
+
+    /* link_state[0..5]: egress up/down read from map into feature slots 0..5.
+     * 1 = up, 0 = down; unpopulated slot defaults to 0. */
+    long long ls0=0LL, ls1=0LL, ls2=0LL, ls3=0LL, ls4=0LL, ls5=0LL;
+    {{ int _lk; __u32 *_lp;
+       _lk=0; _lp=link_state.lookup(&_lk); if (_lp) ls0=(long long)(*_lp);
+       _lk=1; _lp=link_state.lookup(&_lk); if (_lp) ls1=(long long)(*_lp);
+       _lk=2; _lp=link_state.lookup(&_lk); if (_lp) ls2=(long long)(*_lp);
+       _lk=3; _lp=link_state.lookup(&_lk); if (_lp) ls3=(long long)(*_lp);
+       _lk=4; _lp=link_state.lookup(&_lk); if (_lp) ls4=(long long)(*_lp);
+       _lk=5; _lp=link_state.lookup(&_lk); if (_lp) ls5=(long long)(*_lp); }}
 
 {fc1_src}
 

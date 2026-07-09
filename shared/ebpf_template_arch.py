@@ -199,6 +199,10 @@ struct miss_event_t2 {
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 
+/* link_state[i] = egress iface i up/down (feature [0..5]); written by the
+ * userspace carrier monitor, read by the leaf arch program. 1=up, 0=down. */
+BPF_ARRAY(link_state, __u32, 6);
+
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_PROG_ARRAY(arch_progs, 8);
 BPF_HASH(fwd_table_t2, __u64, struct fwd_action, 256);
@@ -294,6 +298,7 @@ struct miss_event_t2 {
 
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
+BPF_ARRAY(link_state, __u32, 6);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_HASH(fwd_table_t2, __u64, struct fwd_action, 256);
 BPF_HASH(valid_keys_t2, __u8, __u64, 256);
@@ -340,6 +345,20 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (ttl_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
         char *ttl_wp = arch_weights.lookup(&ttl_idx);
         if (ttl_wp) acc += (long long)_ttl * (long long)(*(signed char *)ttl_wp);
+
+        /* link_state features [0..5]: acc += link_state[i] * w[j, i] */
+        #pragma unroll
+        for (int i = 0; i < 6; i++) {
+            int lsk = i;
+            __u32 *lsp = link_state.lookup(&lsk);
+            long long lsv = lsp ? (long long)(*lsp) : 0LL;
+            if (lsv) {
+                int ls_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + i;
+                if (ls_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+                char *ls_wp = arch_weights.lookup(&ls_idx);
+                if (ls_wp) acc += lsv * (long long)(*(signed char *)ls_wp);
+            }
+        }
 
         if (_iface >= 1 && _iface <= 6) {
             int iface_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + 5 + _iface;

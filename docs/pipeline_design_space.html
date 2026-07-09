@@ -718,9 +718,9 @@
           </tr>
           <tr>
             <td class="td-strong">Memoria mappe (byte)</td>
-            <td class="mono" style="text-align:right;"><span class="num-r">83 036</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-g">15 748</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">28 420</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">~264</span><small style="color:var(--faint);"> †</small></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">15 748</span></td>
+            <td class="mono" style="text-align:right;">28 420</td>
           </tr>
           <tr>
             <td class="td-strong">Latenza (ns / pacchetto)</td>
@@ -749,16 +749,29 @@
         </tbody>
       </table>
     </div>
-    <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:2.5rem;font-size:0.8rem;">
+    <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:1rem;font-size:0.8rem;">
       Trade-off strutturale confermato: istruzioni, byte jited e tail call crescono con la flessibilità
-      (P3 ≈ 13× le istruzioni di P1). Due risultati onesti e controintuitivi: (1) <strong>P2 è il più veloce</strong>
+      (P3 ≈ 13× le istruzioni di P1). Risultato onesto e controintuitivo: <strong>P2 è il più veloce</strong>
       (131 ns, 7.6 Mpps) — l'inferenza del template via lookup sparsi su BPF_ARRAY costa meno del grande
-      <span class="mono">switch</span> a 52+6 rami del programma P1 hardcoded (1030 ns); (2) <strong>P1 usa più
-      memoria mappe</strong> (83 KB) perché <span class="mono">model_cache</span> conserva l'intero vettore pesi
-      per ogni modello in una hash a 256 slot, mentre P2/P3 tengono i pesi in un singolo BPF_ARRAY compatto.
-      Il conteggio tail-call di P1 è 0 perché sotto TEST_RUN si esegue direttamente il programma leaf
-      <span class="mono">ipa_switch</span> (concettualmente il dispatcher aggiunge 1 salto).
+      <span class="mono">switch</span> a 52+6 rami del programma P1 hardcoded (1030 ns). Ora che P1 è
+      <em>puramente</em> hardcoded (nessun <span class="mono">model_cache</span>, pesi come letterali C),
+      la sua memoria mappe crolla a poche centinaia di byte: restano solo i contatori
+      (<span class="mono">pkt_stats</span>, <span class="mono">cls_stats</span>, <span class="mono">debug_stats</span>)
+      e la map <span class="mono">link_state</span> a 6 slot. Il conteggio tail-call di P1 è 0 perché sotto
+      TEST_RUN si esegue direttamente il programma leaf <span class="mono">ipa_switch</span> (concettualmente
+      il dispatcher aggiunge 1 salto).
     </p>
+    <div class="iface-note" style="margin-bottom:2.5rem;">
+      <strong>† Nota di rimisurazione.</strong> Questa tabella è stata raccolta <em>prima</em> di due
+      modifiche recenti: (1) rimozione di <span class="mono">model_cache</span> da P1 (design hardcoded puro)
+      e (2) popolamento reale delle feature <span class="mono">link_state[0..5]</span> via map + monitor carrier.
+      Effetti attesi da rimisurare con <span class="mono">test_suite.py --only kernel</span>:
+      <em>memoria mappe P1</em> da 83 KB → ~264 B (<span class="mono">model_cache</span> era il 99% del totale);
+      <em>istruzioni eBPF</em> +~30–40 per i 6 lookup <span class="mono">link_state</span> in fc1 (P1/P2) o nel dispatcher (P3);
+      <em>latenza/throughput</em> sostanzialmente invariati. Il valore ~264 B è calcolato analiticamente
+      (<span class="mono">link_state</span> 48 + <span class="mono">pkt_stats</span> 36 +
+      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96).
+    </div>
 
     <!-- Weight update latency -->
     <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.4rem;">Tempo di aggiornamento modello (suite core · Test 2)</h3>
@@ -921,88 +934,85 @@
     <div class="sec-label">Gestione dello stato</div>
     <div class="sec-title">Stato delle Interfacce nel Datapath</div>
     <p class="sec-desc">
-      Ogni pipeline deve risolvere un problema comune: come propagare nel datapath eBPF
-      l'informazione sullo stato delle interfacce (link-state, mapping ifindex → classe,
-      one-hot encoding dei vicini) senza violare i vincoli del verifier.
+      Le prime 6 feature del modello (<code>FRR_model.py</code>) sono gli <strong>stati operativi
+      up/down delle 6 interfacce di uscita</strong> — il segnale centrale del fast-reroute: quale
+      next-hop è disponibile adesso. Sono lette da una map <code>link_state[6]</code> condivisa
+      dalle tre pipeline e tenuta aggiornata da un monitor userspace che osserva il carrier reale
+      delle interfacce. Le altre feature (one-hot iface, TTL, one-hot nodo) restano derivate dal
+      pacchetto in kernel space senza violare i vincoli del verifier.
     </p>
 
     <div class="iface-grid">
 
       <div class="iface-card">
-        <h3>Stato letto dal control plane</h3>
-        <div class="iface-sub">Aggiornamento tramite BPF map</div>
+        <h3>link_state reale dal carrier</h3>
+        <div class="iface-sub">Monitor userspace → BPF_ARRAY link_state[6]</div>
         <p>
-          Il control plane Python mantiene la tabella degli stati delle interfacce
-          (<code>link_state[ifindex] → {up, bw, neighbor_id}</code>) e la scrive
-          in una <code>BPF_HASH</code> map condivisa con tutti i programmi eBPF
-          delle tre pipeline.
+          <code>link_state_monitor.py</code> legge lo stato del carrier di ogni interfaccia egress
+          da <code>/sys/class/net/ethX/carrier</code> (fallback <code>operstate</code>) e scrive
+          <code>link_state[i] = 1</code> (up) / <code>0</code> (down) in una
+          <code>BPF_ARRAY</code> a 6 slot. Un thread di polling aggiorna la map a ogni cambiamento;
+          i programmi eBPF leggono il valore aggiornato al pacchetto successivo, senza reload.
         </p>
         <p>
-          Quando FRR notifica un cambio di stato (link up/down, cambio metrica),
-          il controller aggiorna la map lato userspace con <code>bpf_map_update_elem</code>.
-          I programmi eBPF leggono lo stato aggiornato al prossimo pacchetto processato,
-          senza necessità di reload.
+          È l'unico input <em>dinamico</em>: un link che cade porta la sua feature a 0, e l'inferenza
+          può scegliere un next-hop alternativo. All'avvio la map è seed a tutti-up.
         </p>
-        <div class="codeblock">/* lato userspace (control plane) */
-iface_map[ifindex] = {
-    .state     = LINK_UP,
-    .neighbor  = node_id,   /* 0..51 */
-    .iface_idx = iface_cls  /* 1..6  */
-};</div>
+        <div class="codeblock">/* userspace: link_state_monitor.py */
+st = carrier_state("eth1")      # /sys/class/net/eth1/carrier
+b["link_state"][c_int(i)] = c_uint32(st)   # 1=up, 0=down</div>
       </div>
 
       <div class="iface-card">
-        <h3>One-hot encoding nel datapath</h3>
-        <div class="iface-sub">Come le feature vengono costruite in kernel space</div>
+        <h3>Feature vector nel datapath</h3>
+        <div class="iface-sub">Come le 65 feature vengono costruite in kernel space</div>
         <p>
-          Il programma eBPF legge dalla map l'<code>iface_idx</code> e il
-          <code>neighbor</code> del pacchetto corrente e li converte in
-          <strong>one-hot encoding</strong> compatibile con il modello addestrato
-          (<code>FRR_model.py</code>):
+          Layout identico per le tre pipeline, coerente col modello addestrato:
+          <strong>6 link_state [0..5]</strong> + 6 iface one-hot [6..11] + TTL [12]
+          + 52 node one-hot [13..64].
         </p>
         <p>
-          6 link-state [0..5] + 6 iface one-hot [6..11] + TTL [12] + 52 node one-hot [13..64].
-          Questo vettore da 65 feature viene passato all'inferenza della pipeline attiva.
+          Le feature [0..5] provengono dalla map <code>link_state</code>; le one-hot e il TTL
+          sono derivate dal pacchetto. Il vettore risultante alimenta l'inferenza della pipeline attiva.
         </p>
         <div class="codeblock">/* feature vector layout (65 elementi) */
-fv[iface_idx + 6]  = 1;   /* iface one-hot */
-fv[neighbor + 13]  = 1;   /* node  one-hot */
+fv[i]              = link_state[i];  /* [0..5] up/down */
+fv[iface_idx + 5]  = 1;   /* iface one-hot [6..11] */
 fv[12]             = ttl;
-/* link-state [0..5]: da iface_map */</div>
+fv[node + 13]      = 1;   /* node one-hot [13..64] */</div>
       </div>
 
       <div class="iface-card">
-        <h3>Pipeline 1 — switch sui valori runtime</h3>
-        <div class="iface-sub">Vincolo verifier: nessun array statico indicizzato</div>
+        <h3>Pipeline 1 — hardcoded puro</h3>
+        <div class="iface-sub">Pesi come letterali C, un solo map read (input)</div>
         <p>
-          Nel codice hardcoded i valori <code>iface_idx</code> e <code>neighbor</code>
-          sono variabili runtime. Il verifier eBPF non permette di indicizzare array
-          <code>static const</code> con variabili runtime (la relocation fallisce e
-          l'accesso collassa a indirizzo 0).
+          I pesi restano letterali C: <code>h1_j</code> è generato srotolato, con un solo
+          <code>switch(iface)</code> e un solo <code>switch(node)</code> per l'intero programma
+          (evita la relocation di array <code>static const</code>, vietata dal verifier). I 6
+          contributi <code>link_state</code> si sommano come
+          <code>ls_i * w[j,i]</code>, dove <code>ls_i</code> è letto dalla map.
         </p>
         <p>
-          Soluzione adottata: un solo <code>switch(iface_idx)</code> e un solo
-          <code>switch(neighbor)</code> per l'intero programma, dove ogni
-          <code>case</code> assegna il contributo per <em>tutti</em> i neuroni
-          insieme. I branch restano O(6 + 52) indipendentemente dal numero di neuroni,
-          e i valori restano scalari su stack — nessuna global, nessuna map, zero lookup pesi.
+          <strong>Nessun <code>model_cache</code></strong>: era un residuo di un design precedente
+          (gate <code>is_valid</code> + blob pesi mai usato). Rimosso — un programma hardcoded conosce
+          già i suoi pesi. L'<em>unica</em> map letta nell'inferenza è <code>link_state</code>, che è
+          una feature di input, non un peso.
         </p>
       </div>
 
       <div class="iface-card">
         <h3>Pipeline 2 e 3 — lookup da BPF_ARRAY</h3>
-        <div class="iface-sub">Flessibilità tramite map, senza vincoli sulle variabili</div>
+        <div class="iface-sub">Flessibilità tramite map</div>
         <p>
-          Nelle pipeline 2 e 3 i pesi sono in <code>BPF_ARRAY</code>. L'accesso tramite
-          indice aritmetico (non tramite array <code>static const</code>) è sicuro per il
-          verifier: la map è un oggetto kernel registrato, non un puntatore non rilocato.
+          Nella P2 la stessa map <code>link_state</code> viene letta nel loop fc1: per ogni neurone
+          <code>acc += link_state[i] * arch_weights[woff + j*65 + i]</code>. Nella P3 il dispatcher
+          copia <code>link_state[0..5]</code> nei primi 6 slot di <code>scratch_acts</code> prima
+          della prima tail call, e i layer-block la trattano come qualunque altra attivazione.
         </p>
         <p>
-          L'encoding one-hot viene costruito allo stesso modo (stessa <code>iface_map</code>
-          condivisa), ma il prodotto scalare con i pesi avviene tramite
-          <code>bpf_map_lookup_elem(&amp;weight_map, &amp;offset)</code>,
-          eliminando completamente il problema di relocation e permettendo di
-          cambiare i pesi a runtime senza toccare il codice eBPF.
+          I pesi in <code>BPF_ARRAY</code> sono indicizzati aritmeticamente (map registrata, non
+          puntatore non-rilocato): il verifier li accetta e i pesi si cambiano a runtime senza
+          toccare il codice eBPF.
         </p>
       </div>
 

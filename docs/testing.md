@@ -97,6 +97,15 @@ Popolamento tabella di forwarding (se richiesto dalla pipeline):
 kathara exec frankfurt -- python3 /shared/setup_fwd_table.py --model-id 0 --method hardcoded
 ```
 
+Le pipeline avviano automaticamente il monitor `link_state` (thread di polling che tiene
+`link_state[0..5]` allineato al carrier reale delle interfacce egress). Per un dry-run dei
+carrier senza caricare eBPF:
+
+```bash
+# stampa lo stato up/down di eth0..eth5 che verrebbe scritto nella map
+kathara exec frankfurt -- python3 /shared/link_state_monitor.py --ifaces eth0 eth1 eth2 eth3 eth4 eth5
+```
+
 ---
 
 ## 5. Invio pacchetti IPA di prova
@@ -122,14 +131,20 @@ kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 1
 | Istruzioni eBPF (xlated)   |        1 057 |       1 968 |     13 488 |
 | Codice jited (byte)        |        5 081 |       8 766 |     57 523 |
 | Tail calls / pacchetto     |     0 (leaf) |           1 |          3 |
-| Memoria mappe (byte)       |       83 036 |      15 748 |     28 420 |
+| Memoria mappe (byte)       |       ~264 † |      15 748 |     28 420 |
 | Latenza (ns/pacchetto)     |       1030.0 |       131.0 |      562.0 |
 | Throughput (Mpps)          |        0.971 |       7.634 |      1.779 |
 | CPU (%)                    |           59 |          29 |         57 |
 | Dispatch (TTL 1–5)         |    5/5 PASS  |   5/5 PASS  |  5/5 PASS  |
 
+> **† Rimisurare.** La tabella è stata raccolta *prima* di due modifiche: rimozione di
+> `model_cache` da P1 (hardcoded puro) e popolamento reale di `link_state[0..5]` (map + monitor).
+> Rieseguire `test_suite.py --only kernel`. Effetti attesi: memoria mappe P1 da 83 KB → ~264 B
+> (`model_cache` era il 99%); +~30–40 istruzioni per i 6 lookup `link_state`; latenza ~invariata.
+
 Note oneste:
 - **P2 è il più veloce** (131 ns): l'inferenza via lookup sparsi su `BPF_ARRAY` costa meno del grande `switch` a 52+6 rami del P1 hardcoded.
-- **P1 usa più memoria mappe** (83 KB): `model_cache` conserva l'intero vettore pesi per ogni modello in una hash a 256 slot; P2/P3 tengono i pesi in un singolo `BPF_ARRAY` compatto.
+- **P1 hardcoded puro**: nessun `model_cache`, pesi come letterali C. Restano solo i contatori + la map `link_state` a 6 slot → memoria mappe minima (~264 B).
 - Tail-call P1 = 0 perché sotto TEST_RUN si esegue direttamente il leaf `ipa_switch` (il dispatcher aggiungerebbe 1 salto).
 - Istruzioni, jited e tail-call crescono con la flessibilità: è il costo strutturale del design modulare (P3 ≈ 13× le istruzioni di P1).
+- `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa. Aggiornato dal monitor carrier userspace.

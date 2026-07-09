@@ -1000,10 +1000,14 @@ def suite_robust():
 
 
 _PIPELINE_MAP_NAMES = [
-    "model_cache", "pkt_stats", "cls_stats", "model_progs",
-    "miss_events", "model_miss_events", "ev_scratch", "mev_scratch", "debug_stats",
+    # shared: link_state (egress up/down input feature, all 3 pipelines)
+    "link_state",
+    # P1 hardcoded (pure: no weight map -- only stats + debug)
+    "pkt_stats", "cls_stats", "debug_stats",
+    # P2 template
     "arch_weights", "arch_registry", "arch_progs",
     "fwd_table_t2", "valid_keys_t2", "pkt_stats_t2", "miss_events_t2",
+    # P3 modular
     "layer_weights", "layer_registry", "layer_chain", "scratch_acts", "scratch_meta",
     "fwd_table_t3", "valid_keys_t3", "pkt_stats_t3", "miss_events_t3",
 ]

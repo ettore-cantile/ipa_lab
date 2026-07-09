@@ -141,6 +141,12 @@ def run(model_id: int = 42, iface: str = None):
     action = _build_fwd_action_t2(b, egress_ifindex)
     _populate_fwd_t2(b, action, cp_weights, SCALE_FACTOR, ingress_iface)
 
+    # Seed link_state (egress up/down feature [0..5]) and start carrier monitor.
+    from link_state_monitor import init_link_state_up, start_monitor_thread
+    init_link_state_up(b)
+    stop_monitor = start_monitor_thread(b, interval=1.0)
+    print("[Method 5] link_state seeded (all up); carrier monitor running")
+
     attach_xdp(b, fn_dispatcher, iface=ingress_iface)
 
     print("[Method 5] Pipeline 2 (Arch Template) running. "
@@ -163,5 +169,6 @@ def run(model_id: int = 42, iface: str = None):
             except Exception:
                 pass
     except KeyboardInterrupt:
+        stop_monitor.set()
         detach_xdp(b, iface=ingress_iface)
         print("\n\nXDP removed. Exiting.")

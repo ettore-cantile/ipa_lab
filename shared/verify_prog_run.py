@@ -178,6 +178,10 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
     off_out_w = off_fc2_b + N_H2
     off_out_b = off_out_w + N_H2 * N_OUT
     x = [0] * N_IN
+    # link_state features [0..5] = 1 (all egress links up) -- matches the
+    # verify baseline where the link_state map is seeded to all-up.
+    for i in range(6):
+        x[i] = 1
     x[12] = ttl
     if 1 <= ifindex <= 6:
         x[5 + ifindex] = 1
@@ -234,18 +238,33 @@ def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, w_off_out: int, in
         b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
 
 
+def _seed_link_state(b, val: int = 1):
+    """Seed the link_state map [0..5] with `val` (1=up) if the program has it.
+    All three pipelines read these 6 slots as the model's first input features
+    (egress up/down). Verify runs the 'all links up' baseline, so it must match
+    ref_infer's x[0..5]=1."""
+    try:
+        for i in range(6):
+            b["link_state"][ct.c_int(i)] = ct.c_uint32(int(val))
+    except Exception:
+        pass
+
+
 def setup_hardcoded(model_id: int, model_path: str):
     """
-    Carica il programma eBPF hardcoded misurando separatamente:
-      - t_redirect_s : tempo di compilazione BPF + load_func nel kernel (il vero costo del "reload")
-      - t_insert_s   : tempo di inserimento dei pesi in model_cache (bpf_map_update_elem)
-    Entrambi vengono restituiti nel dict di setup per essere consumati dalla kernel suite.
+    Load the pure hardcoded eBPF program (Pipeline 1).
+
+    There is NO model_cache / weight map anymore: the weights are C literals
+    compiled into the program, so updating the model = recompiling+reloading the
+    whole program. We therefore measure only the redirect/reload cost:
+      - t_redirect_s : BPF compile + load_func into the kernel (the real update cost)
+      - t_insert_s   : 0 (no runtime weight insertion in the pure hardcoded design)
     """
-    from ebpf_program import generate_ebpf_hardcoded, N_WEIGHTS
+    from ebpf_program import generate_ebpf_hardcoded
     weights, scale = load_weights(model_path)
     src = generate_ebpf_hardcoded(weights, scale, model_id)
 
-    # --- misura redirect/reload: compilazione eBPF + caricamento nel kernel ---
+    # --- redirect/reload: eBPF compile + load into the kernel ---
     t0 = time.perf_counter()
     b  = BPF(text=src)
     fn = b.load_func("ipa_switch", BPF.XDP)
@@ -257,18 +276,8 @@ def setup_hardcoded(model_id: int, model_path: str):
     except Exception:
         disp = fn
 
-    class ModelData(ct.Structure):
-        _pack_ = 1
-        _fields_ = [("weights", ct.c_uint8 * N_WEIGHTS), ("is_valid", ct.c_uint8), ("scale_factor", ct.c_uint16)]
-
-    entry = ModelData(is_valid=1, scale_factor=scale)
-    for i, v in enumerate(weights[:N_WEIGHTS]):
-        entry.weights[i] = ct.c_uint8(int(v) & 0xFF).value
-
-    # --- misura weight insert: singola bpf_map_update_elem su model_cache ---
-    t1 = time.perf_counter()
-    b["model_cache"][ct.c_uint8(model_id)] = entry
-    t_insert_s = time.perf_counter() - t1
+    # link_state[0..5] = 1 (all egress links up) -- input feature, not a weight.
+    _seed_link_state(b, 1)
 
     progs = {"ipa_switch": fn.fd}
     if disp is not fn:
@@ -281,9 +290,9 @@ def setup_hardcoded(model_id: int, model_path: str):
         "pkt_stats": b["pkt_stats"],
         "pipeline": 1,
         "progs": progs,
-        # tempi reali di update del modello
+        # real model-update timing: pure hardcoded = full recompile, no weight insert
         "t_redirect_s": t_redirect_s,
-        "t_insert_s": t_insert_s,
+        "t_insert_s": 0.0,
     }
 
 
@@ -296,6 +305,7 @@ def setup_template(model_id: int, model_path: str):
     leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
     b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
     load_arch_weights(b, weights, model_id=model_id, scale=scale)
+    _seed_link_state(b, 1)
     return {
         "b": b, "fn": leaf_fn, "disp": disp_fn,
         "weights": weights, "scale": scale,
@@ -322,6 +332,7 @@ def setup_modular(model_id: int, model_path: str):
     b["layer_chain"][ct.c_int(1)] = ct.c_int(lf1.fd)
     b["layer_chain"][ct.c_int(2)] = ct.c_int(lf2.fd)
     load_modular_weights(b, weights, model_id=model_id, scale=scale)
+    _seed_link_state(b, 1)
     w_off_out = (65 * 4 + 4) + (4 * 4 + 4)
     print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
     return {

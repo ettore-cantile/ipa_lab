@@ -117,22 +117,18 @@ def run(
     print(f"[P1-hardcoded] Verifier: OK — program fd={fn.fd}")
 
     # ------------------------------------------------------------------
-    # Step 4: populate model_cache so model_miss_event is NOT triggered
+    # Step 4: seed link_state (egress up/down) and start the carrier monitor
+    #
+    # link_state[0..5] are the model's first 6 input features (output
+    # interface states). Pure hardcoded design has NO model_cache / weight
+    # map -- the only map read is this input feature. Seed all links "up",
+    # then a background thread keeps the map in sync with the real carrier
+    # state of the egress interfaces (link failure -> feature flips to 0).
     # ------------------------------------------------------------------
-    class ModelData(ctypes.Structure):
-        _fields_ = [
-            ("weights",      ctypes.c_uint8 * 319),
-            ("is_valid",     ctypes.c_uint8),
-            ("scale_factor", ctypes.c_uint16),
-        ]
-
-    entry = ModelData()
-    for i, w in enumerate(weights_int8[:319]):
-        entry.weights[i] = ctypes.c_uint8(w & 0xFF).value
-    entry.is_valid     = 1
-    entry.scale_factor = scale
-    b["model_cache"][ctypes.c_uint8(model_id)] = entry
-    print(f"[P1-hardcoded] model_cache[{model_id}] populated (is_valid=1, scale={scale})")
+    from link_state_monitor import init_link_state_up, start_monitor_thread
+    init_link_state_up(b, egress_ifaces)
+    stop_monitor = start_monitor_thread(b, egress_ifaces, interval=1.0)
+    print(f"[P1-hardcoded] link_state seeded (all up); carrier monitor running")
 
     # ------------------------------------------------------------------
     # Step 5: attach XDP on ingress iface
@@ -193,7 +189,7 @@ def run(
             print(
                 f"\n  DEBUG: seen={dbg[0]} eth_fail={dbg[1]} ip_fail={dbg[2]} "
                 f"not_udp={dbg[3]} udp_fail={dbg[4]} wrong_port={dbg[5]} "
-                f"ipa_fail={dbg[6]} reached_model_cache={dbg[7]}"
+                f"ipa_fail={dbg[6]} inferred={dbg[7]}"
             )
 
             prev_stats = cur_stats
@@ -201,6 +197,7 @@ def run(
     except KeyboardInterrupt:
         pass
     finally:
+        stop_monitor.set()
         b.remove_xdp(iface, flags=XDP_FLAGS_SKB_MODE)
         print(f"\n[P1-hardcoded] XDP removed from {iface}")
         _print_final_stats(b, egress_ifaces)
@@ -215,7 +212,7 @@ def _print_final_stats(b, egress_ifaces):
     print("=" * 56)
     print("Pipeline 1 — Hardcoded — final stats")
     print(f"  TRUE HIT  (redirect) : {hit:>10}  ({100*hit/max(total,1):.1f}%)")
-    print(f"  MISS      (no cache) : {miss:>10}  ({100*miss/max(total,1):.1f}%)")
+    print(f"  MISS      (unused)   : {miss:>10}  ({100*miss/max(total,1):.1f}%)")
     print(f"  DROP      (cls 6)    : {drop:>10}  ({100*drop/max(total,1):.1f}%)")
     print(f"  TOTAL                : {total:>10}")
     print()
@@ -234,7 +231,7 @@ def _print_final_stats(b, egress_ifaces):
     print("  Debug breakdown (why packets never reached pkt_stats, if 0):")
     print(f"    seen={dbg[0]} eth_fail={dbg[1]} ip_fail={dbg[2]} not_udp={dbg[3]} "
           f"udp_fail={dbg[4]} wrong_port={dbg[5]} ipa_fail={dbg[6]} "
-          f"reached_model_cache={dbg[7]}")
+          f"inferred={dbg[7]}")
     print("=" * 56)
 
 

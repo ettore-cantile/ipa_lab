@@ -113,6 +113,11 @@ BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
 #define MAX_LAYER_WEIGHT_ENTRIES 2048
 BPF_ARRAY(layer_weights, __u8, MAX_LAYER_WEIGHT_ENTRIES);
 
+/* link_state[i] = egress iface i up/down (feature [0..5]); written by the
+ * userspace carrier monitor, read by the dispatcher into scratch_acts[0..5].
+ * 1 = up, 0 = down. */
+BPF_ARRAY(link_state, __u32, 6);
+
 /* Layer chain tail-call map: layer_idx -> BPF prog fd */
 BPF_PROG_ARRAY(layer_chain, 16);
 
@@ -178,7 +183,7 @@ int modular_dispatcher(struct xdp_md *ctx) {
 
     /* Feature extraction -> write to scratch_acts[0..64].
      * Encoding MUST match Pipeline 1 / the trained model (FRR_model.py):
-     *   [0..5]   link_state, unused, always 0
+     *   [0..5]   egress link_state (up/down), read from the link_state map
      *   [6..11]  ingress-iface one-hot (index = 5 + ifindex, ifindex 1..6)
      *   [12]     ttl (raw scalar)
      *   [13..64] node one-hot (index = 13 + model_id, model_id 0..51)
@@ -189,6 +194,15 @@ int modular_dispatcher(struct xdp_md *ctx) {
     int fi;
     #pragma unroll
     for (int i = 0; i < 65; i++) { fi = i; scratch_acts.update(&fi, &zero); }
+
+    /* Feature [0..5] = egress link_state (up/down) from the link_state map. */
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        int lsk = i;
+        __u32 *lsp = link_state.lookup(&lsk);
+        long long lsv = lsp ? (long long)(*lsp) : 0LL;
+        fi = i; scratch_acts.update(&fi, &lsv);
+    }
 
     __u32 _ttl   = ((__u32)ip->ttl) & 0xff;
     __u32 _iface = ((__u32)ctx->ingress_ifindex) & 0x7;   /* valid 1..6 */
