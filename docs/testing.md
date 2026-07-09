@@ -128,23 +128,23 @@ kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 1
 
 | Metrica                    | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated)   |        1 057 |       1 968 |     13 488 |
-| Codice jited (byte)        |        5 081 |       8 766 |     57 523 |
+| Istruzioni eBPF (xlated)   |        1 095 |       2 897 |     13 645 |
+| Codice jited (byte)        |        5 132 |      12 575 |     58 146 |
 | Tail calls / pacchetto     |     0 (leaf) |           1 |          3 |
-| Memoria mappe (byte)       |       ~264 † |      15 748 |     28 420 |
-| Latenza (ns/pacchetto)     |       1030.0 |       131.0 |      562.0 |
-| Throughput (Mpps)          |        0.971 |       7.634 |      1.779 |
-| CPU (%)                    |           59 |          29 |         57 |
+| Memoria mappe (byte)       |          264 |      15 796 |     28 468 |
+| Latenza (ns/pacchetto)     |       1109.0 |       339.0 |     1291.0 |
+| Throughput (Mpps)          |        0.902 |       2.950 |      0.775 |
+| CPU (%)                    |           60 |          48 |         79 |
 | Dispatch (TTL 1–5)         |    5/5 PASS  |   5/5 PASS  |  5/5 PASS  |
 
-> **† Rimisurare.** La tabella è stata raccolta *prima* di due modifiche: rimozione di
-> `model_cache` da P1 (hardcoded puro) e popolamento reale di `link_state[0..5]` (map + monitor).
-> Rieseguire `test_suite.py --only kernel`. Effetti attesi: memoria mappe P1 da 83 KB → ~264 B
-> (`model_cache` era il 99%); +~30–40 istruzioni per i 6 lookup `link_state`; latenza ~invariata.
+Misurate con `test_suite.py --only kernel` (4 CPU, scale 24) dopo l'aggiunta di `link_state` reale
+e la rimozione di `model_cache`.
 
 Note oneste:
-- **P2 è il più veloce** (131 ns): l'inferenza via lookup sparsi su `BPF_ARRAY` costa meno del grande `switch` a 52+6 rami del P1 hardcoded.
-- **P1 hardcoded puro**: nessun `model_cache`, pesi come letterali C. Restano solo i contatori + la map `link_state` a 6 slot → memoria mappe minima (~264 B).
+- **P2 è il più veloce** (339 ns): l'inferenza via lookup sparsi su `BPF_ARRAY` costa meno del grande `switch` a 52+6 rami del P1 hardcoded.
+- **P1 hardcoded puro = meno memoria mappe** (264 B): nessun `model_cache` (prima erano 83 KB, il 99% del totale), restano solo i contatori + la map `link_state` a 6 slot.
+- Costo del popolamento `link_state`: P1 +38 istruzioni, P2 +~930 (loop a 6 lookup srotolato sui 4 neuroni fc1), P3 +157.
 - Tail-call P1 = 0 perché sotto TEST_RUN si esegue direttamente il leaf `ipa_switch` (il dispatcher aggiungerebbe 1 salto).
-- Istruzioni, jited e tail-call crescono con la flessibilità: è il costo strutturale del design modulare (P3 ≈ 13× le istruzioni di P1).
+- Istruzioni, jited e tail-call crescono con la flessibilità: è il costo strutturale del design modulare (P3 ≈ 12× le istruzioni di P1).
 - `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa. Aggiornato dal monitor carrier userspace.
+- Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`.
