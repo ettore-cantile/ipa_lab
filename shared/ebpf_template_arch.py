@@ -5,23 +5,25 @@ Design space position:
   - One eBPF program per architecture shape (e.g. arch_65_4_4_7)
   - Multiple models sharing the same shape reuse the same program
   - Weights are stored in BPF_ARRAY maps, loaded at runtime by the CP
-  - No recompilation needed to change weights; only a BPF map update
   - One tail call: dispatcher -> arch_progs[arch_id] -> arch_65_4_4_7
 
 Architecture supported here: 65-4-4-7 (matching the existing model).
   fc1  : 65 inputs  -> 4 hidden   (260 weights + 4 bias = 264)
   fc2  : 4  hidden  -> 4 hidden   (16  weights + 4 bias = 20)
   out  : 4  hidden  -> 7 outputs  (28  weights + 7 bias = 35)
-  Total: 319 int8 values  (same N_WEIGHTS as Pipeline 1)
+  Total: 319 int8 values
 
-Maps introduced:
-  arch_registry   : model_id  -> {arch_id, weight_offset, scale_factor}
-  arch_weights    : index     -> char  (signed, flat weight array)
-  arch_progs      : arch_id   -> fd of arch_65_4_4_7  <-- TAIL CALL ARRAY
-  fwd_table_t2    : u64 key   -> fwd_action
-  valid_keys_t2   : u8  ttl   -> u64 key
-  pkt_stats_t2    : [0]=HIT [1]=MISS [2]=FAKE
-  miss_events_t2  : perf buffer
+Control-plane split of responsibilities
+  load_arch_weights() populates:
+    - arch_weights    (319 int8 values via raw bpf(2) syscall)
+    - arch_registry   (arch_id, weight_offset, scale_factor)
+  The CALLER must separately wire the tail-call array BEFORE or AFTER:
+    leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
+    b["arch_progs"][ct.c_int(arch_id)] = ct.c_int(leaf_fn.fd)
+  This is done in verify_prog_run.py setup_template() already.
+  load_arch_weights does NOT touch arch_progs -- BCC does not expose
+  loaded XDP programs via bpf_obj[name] (only maps), so the fd must be
+  obtained from the .load_func() return value in the caller.
 
 Fixed bugs (2026-07-08):
   1) Stack overflow: `long long iv[T2_N_IN]` (65*8B = 520B).
@@ -39,12 +41,12 @@ Fixed bugs (2026-07-09 v9):
   6) value_size mismatch: detect real slot size via BPF_OBJ_GET_INFO_BY_FD.
 
 Fixed bugs (2026-07-09 v10):
-  7) ARCH_PROGS NOT POPULATED: load_arch_weights never set
-     arch_progs[arch_id] = arch_65_4_4_7.fd, so the tail call in the
-     dispatcher silently fell through (BPF_PROG_ARRAY slot empty =
-     XDP_PASS + no inference).  key in miss events was always 0 because
-     arch_65_4_4_7 was never reached.  Fix: wire the tail-call slot
-     after loading weights.
+  7) ARCH_PROGS NOT POPULATED (analysis was correct, fix location wrong):
+     arch_progs wiring belongs in the caller (setup_template), not here,
+     because bpf_obj["arch_65_4_4_7"] raises KeyError (programs are not
+     accessible via bpf_obj[name], only maps are).
+     verify_prog_run.py already does the wiring correctly before calling
+     load_arch_weights.  Removed the broken block from this file.
 """
 
 import ctypes as ct
@@ -113,7 +115,7 @@ def _get_map_value_size(map_fd: int) -> int:
     ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_OBJ_GET_INFO_BY_FD,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
-        print(f"[Pipeline2] BPF_OBJ_GET_INFO_BY_FD errno={ct.get_errno()}, using fallback value_size=8")
+        print(f"[Pipeline2] BPF_OBJ_GET_INFO_BY_FD errno={ct.get_errno()}, fallback value_size=8")
         return 8
     return max(1, int(info.value_size))
 
@@ -144,7 +146,7 @@ def _bpf_map_update_char(map_fd: int, value_size: int,
 
 
 def _bpf_map_lookup_char(map_fd: int, value_size: int, index: int) -> int:
-    """Read arch_weights[index] and return value as signed int8 (for verification)."""
+    """Read arch_weights[index]; return as signed int8 (for post-load verification)."""
     key_buf = ct.c_uint32(index)
     val_buf = (ct.c_uint8 * value_size)()
     attr = _BpfAttrMapElem(
@@ -205,10 +207,7 @@ struct miss_event_t2 {
     __u64 key;
 };
 
-/* 'char' leaf: BCC str2ctype maps 'char' correctly; '__s8'/'signed char'
- * are not in the table -> KeyError.  char is signed on x86/x86_64.
- * BPF_ARRAY slot size = max(sizeof(char), 8) = 8 on x86_64;
- * Python writer detects this via BPF_OBJ_GET_INFO_BY_FD. */
+/* 'char' leaf: BCC str2ctype knows 'char'; '__s8'/'signed char' are not. */
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 
@@ -241,11 +240,8 @@ int ipa_switch_template(struct xdp_md *ctx) {
     struct arch_entry *entry = arch_registry.lookup(&model_id);
     if (!entry) return XDP_PASS;
 
-    /* Tail call into the architecture-specific inference program.
-     * If arch_progs[entry->arch_id] is empty (not populated by the
-     * control plane), this silently falls through to XDP_PASS. */
     arch_progs.call(ctx, entry->arch_id);
-    return XDP_PASS;  /* tail call failed or prog returned */
+    return XDP_PASS;
 }
 """
 
@@ -339,17 +335,10 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
 
-    /* Sparse dot-product: only 3 of 65 input positions are non-zero.
-     * Feature layout (FRR_model.py):
-     *   [0..5]   link_state (always 0, unused)
-     *   [6..11]  ingress iface one-hot  (index = 5 + iface, iface in [1..6])
-     *   [12]     ttl
-     *   [13..64] node one-hot           (index = 13 + node, node in [0..51])
-     * SANDBOX: ingress_ifindex=65536 -> clamp to 0 (no iface contribution). */
     __u32 _ttl       = ((__u32)ip->ttl) & 0xff;
     __u32 _raw_iface = ctx->ingress_ifindex;
     __u32 _iface     = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
-    __u32 _node      = ((__u32)ipa->model_id) & 0x3f;  /* 0..51 valid */
+    __u32 _node      = ((__u32)ipa->model_id) & 0x3f;
 
     long long h1[T2_N_H1];
     #pragma unroll
@@ -416,8 +405,6 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    /* KEY FORMULA: udiv (sdiv i64 not supported by BPF LLVM backend).
-     * Numerator is always positive: OUTPUT_OFFSET*scale >> |best_val|. */
     long long _num_signed = best_val + OUTPUT_OFFSET * (long long)scale;
     if (_num_signed < 0) return XDP_PASS;
     __u64 num = (__u64)_num_signed;
@@ -451,36 +438,35 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
 def load_arch_weights(bpf_obj, weights_int8: list,
                       model_id: int = 0, scale: int = 128) -> None:
     """
-    Populate arch_registry, arch_weights, AND arch_progs for Pipeline 2.
+    Populate arch_weights and arch_registry for Pipeline 2.
 
-    arch_progs (BPF_PROG_ARRAY) MUST be populated so the tail call in
-    ipa_switch_template can reach arch_65_4_4_7.  An empty slot causes
-    the tail call to fall through silently (XDP_PASS, no inference,
-    key=0 in all miss events).
+    DOES NOT touch arch_progs.  The caller (setup_template in
+    verify_prog_run.py) is responsible for wiring the tail-call array:
+        leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
+        b["arch_progs"][ct.c_int(arch_id)] = ct.c_int(leaf_fn.fd)
+    BCC does not expose loaded programs via bpf_obj[name] -- only maps
+    are accessible that way -- so the fd must come from .load_func().
     """
-    from ctypes import c_uint8, c_uint32, c_uint16, c_int32, Structure
+    from ctypes import c_uint8, c_uint32, c_uint16, Structure
 
     weight_offset = 0
     arch_id       = 0
     map_fd        = bpf_obj["arch_weights"].map_fd
 
-    # Detect actual slot size.
     value_size = _get_map_value_size(map_fd)
     print(f"[Pipeline2] arch_weights fd={map_fd} value_size={value_size} bytes/slot")
 
-    # Write all 319 int8 weights.
     for idx, w in enumerate(weights_int8[:N_WEIGHTS_T2]):
         _bpf_map_update_char(map_fd, value_size,
                              index=weight_offset + idx,
                              int8_val=int(w))
 
-    # Verify first weight round-trips correctly.
-    v0 = _bpf_map_lookup_char(map_fd, value_size, 0)
-    expected0 = ct.c_int8(int(weights_int8[0])).value
-    status = "OK" if v0 == expected0 else f"MISMATCH (got {v0}, expected {expected0})"
-    print(f"[Pipeline2] arch_weights[0] verify: {status}")
+    # Post-load sanity check: read back weight[0].
+    v0       = _bpf_map_lookup_char(map_fd, value_size, 0)
+    expected = ct.c_int8(int(weights_int8[0])).value
+    ok       = "OK" if v0 == expected else f"MISMATCH got={v0} expected={expected}"
+    print(f"[Pipeline2] arch_weights[0] verify: {ok}")
 
-    # Register arch_entry in arch_registry.
     class ArchEntry(Structure):
         _pack_ = 1
         _fields_ = [("arch_id",       c_uint8),
@@ -491,16 +477,7 @@ def load_arch_weights(bpf_obj, weights_int8: list,
                       scale_factor=scale)
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
     print(f"[Pipeline2] arch_registry[{model_id}] = "
-          f"arch_id={arch_id} woff={weight_offset} scale={scale}")
-
-    # ---------------------------------------------------------------------------
-    # Wire the tail-call slot: arch_progs[arch_id] = arch_65_4_4_7.fd
-    #
-    # Without this step the dispatcher's arch_progs.call(ctx, arch_id)
-    # silently falls through (empty BPF_PROG_ARRAY slot = nop + XDP_PASS),
-    # and arch_65_4_4_7 is NEVER executed.  This was the root cause of
-    # key=0x0000000000000000 on all packets.
-    # ---------------------------------------------------------------------------
-    prog_fd = bpf_obj["arch_65_4_4_7"].fd
-    bpf_obj["arch_progs"][c_int32(arch_id)] = c_int32(prog_fd)
-    print(f"[Pipeline2] arch_progs[{arch_id}] = fd {prog_fd} (arch_65_4_4_7) -- tail call wired")
+          f"arch_id={arch_id} woff={weight_offset} scale={scale} "
+          f"weights={len(weights_int8[:N_WEIGHTS_T2])}")
+    print(f"[Pipeline2] NOTE: arch_progs wiring is caller's responsibility "
+          f"(setup_template already does: b['arch_progs'][0]=leaf_fn.fd)")
