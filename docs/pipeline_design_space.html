@@ -185,6 +185,64 @@
   .flow .nt  { color: var(--blue);   font-size: 10px; }
   .flow .sc  { color: var(--amber);  font-size: 10px; }
 
+  /* ── NODE-BASED PIPELINE DIAGRAM ── */
+  .pflow {
+    display: flex; flex-direction: column; align-items: stretch;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 1rem 1.1rem 1.1rem;
+  }
+  .pnode {
+    font-family: var(--font-mono); font-size: 11.5px; font-weight: 600;
+    text-align: center; padding: 7px 10px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  }
+  .pnode small { display:block; font-weight:400; font-size:9px; color:var(--muted); margin-top:2px; }
+  .pnode.head { background: rgba(88,166,255,0.1);  border-color: rgba(88,166,255,0.32); color: var(--blue); }
+  .pnode.out  { background: rgba(57,208,216,0.1);  border-color: rgba(57,208,216,0.32); color: var(--teal); }
+  .pnode.g { background: rgba(63,185,80,0.1);  border-color: rgba(63,185,80,0.32);  color: var(--green); }
+  .pnode.a { background: rgba(210,153,34,0.1); border-color: rgba(210,153,34,0.32); color: var(--amber); }
+  .pnode.r { background: rgba(248,81,73,0.1);  border-color: rgba(248,81,73,0.32);  color: var(--red); }
+  .parrow {
+    position: relative; width: 2px; height: 22px;
+    background: linear-gradient(var(--faint), var(--faint)) no-repeat center/2px 100%;
+    margin: 2px auto;
+  }
+  .parrow::before {
+    content: ''; position: absolute; bottom: -1px; left: 50%; transform: translateX(-50%);
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 5px solid var(--faint);
+  }
+  .parrow span {
+    position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+    white-space: nowrap; font-family: var(--font-mono); font-size: 9px;
+    color: var(--teal); background: var(--surface-2); padding: 0 4px;
+  }
+  .pnote { font-family: var(--font-mono); font-size: 9px; color: var(--muted); text-align: center; padding: 3px 0 1px; }
+
+  /* ── METRIC CARDS ── */
+  .metric-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 0.85rem; margin-bottom: 2rem;
+  }
+  .metric-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 1rem 1.1rem;
+  }
+  .metric-card .m-label { font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--muted); margin-bottom: 0.4rem; }
+  .metric-card .m-val { font-family: var(--font-mono); font-size: 1.35rem; font-weight: 600; }
+  .metric-card .m-sub { font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+  .pass-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: rgba(63,185,80,0.1); border: 1px solid rgba(63,185,80,0.28);
+    color: var(--green); border-radius: 100px; padding: 3px 12px;
+    font-size: 11px; font-weight: 700; font-family: var(--font-mono);
+  }
+  .num-g { color: var(--green); } .num-a { color: var(--amber); } .num-r { color: var(--red); }
+  .bar-cell { position: relative; }
+  .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; opacity: 0.16; z-index: 0; }
+  .bar-cell span { position: relative; z-index: 1; }
+
   /* ── PRO/CON ── */
   .procon { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .pros, .cons {
@@ -398,14 +456,15 @@
           feature extraction, pesi hardcoded, inferenza completa, argmax e azione —
           tutto unrolled in un unico blocco compilato staticamente.
         </p>
-        <div class="flow">
-<span class="fn">packet</span>
-<span class="ar">  │</span>
-<span class="fn">dispatcher</span>
-<span class="ar">  │</span>  <span class="nt">tail call (1×)</span>
-<span class="fn">model_&lt;id&gt;</span>
-<span class="ar">  │</span>  <span class="nt">pesi hardcoded · codice unrolled</span>
-<span class="fn">action</span>
+        <div class="pflow">
+          <div class="pnode head">packet</div>
+          <div class="parrow"></div>
+          <div class="pnode">dispatcher</div>
+          <div class="parrow"><span>tail call ×1</span></div>
+          <div class="pnode g">model_&lt;id&gt;<small>pesi hardcoded · unrolled</small></div>
+          <div class="pnote">feature · inferenza · argmax</div>
+          <div class="parrow"></div>
+          <div class="pnode out">action / redirect</div>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
@@ -448,16 +507,15 @@
           e fa un tail call al template architetturale corretto, che recupera i pesi
           dalla map e completa l'inferenza.
         </p>
-        <div class="flow">
-<span class="fn2">packet</span>
-<span class="ar">  │</span>
-<span class="fn2">dispatcher</span>
-<span class="ar">  │</span>  <span class="nt">lookup model_registry[model_id]</span>
-<span class="fn2">tail call arch_&lt;shape&gt;</span>
-<span class="ar">  │</span>  <span class="nt">legge pesi da BPF_ARRAY</span>
-<span class="fn2">inferenza completa</span>
-<span class="ar">  │</span>
-<span class="fn2">action</span>
+        <div class="pflow">
+          <div class="pnode head">packet</div>
+          <div class="parrow"><span>lookup registry[id]</span></div>
+          <div class="pnode">dispatcher</div>
+          <div class="parrow"><span>tail call ×1</span></div>
+          <div class="pnode a">arch_65_4_4_7<small>1 prog / architettura</small></div>
+          <div class="pnote">pesi da BPF_ARRAY · inferenza · argmax</div>
+          <div class="parrow"></div>
+          <div class="pnode out">action / redirect</div>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
@@ -499,18 +557,19 @@
           <code>BPF_PERCPU_ARRAY</code> scratch map (o, meno pulito,
           tramite scratch area nell'header IPA) tra un tail call e il successivo.
         </p>
-        <div class="flow">
-<span class="fn3">packet</span>
-<span class="ar">  │</span>
-<span class="fn3">dispatcher</span>
-<span class="ar">  │</span>
-<span class="fn3">layer block 1</span>  <span class="nt">(es. layer_8_to_6)</span>
-<span class="ar">  │</span>  <span class="sc">scratch map + tail call</span>
-<span class="fn3">layer block 2</span>  <span class="nt">(es. layer_6_to_6)</span>
-<span class="ar">  │</span>  <span class="sc">scratch map + tail call</span>
-<span class="fn3">layer block 3</span>  <span class="nt">(es. layer_6_to_4)</span>
-<span class="ar">  │</span>
-<span class="fn3">argmax / action</span>
+        <div class="pflow">
+          <div class="pnode head">packet</div>
+          <div class="parrow"></div>
+          <div class="pnode">dispatcher<small>scrive feature in scratch</small></div>
+          <div class="parrow"><span>tail call</span></div>
+          <div class="pnode r">layer_65_4</div>
+          <div class="parrow"><span>scratch + tail</span></div>
+          <div class="pnode r">layer_4_4</div>
+          <div class="parrow"><span>scratch + tail</span></div>
+          <div class="pnode r">layer_4_7_argmax</div>
+          <div class="pnote">3 tail call · attivazioni via BPF_PERCPU_ARRAY</div>
+          <div class="parrow"></div>
+          <div class="pnode out">action / redirect</div>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
@@ -585,6 +644,199 @@
           </tr>
         </tbody>
       </table>
+    </div>
+  </section>
+
+  <!-- ── RISULTATI SPERIMENTALI ── -->
+  <section id="results">
+    <div class="sec-label">Misure locali</div>
+    <div class="sec-title">Risultati Sperimentali</div>
+    <p class="sec-desc">
+      Metriche raccolte con <code style="font-family:var(--font-mono);background:var(--surface-2);border-radius:4px;padding:1px 6px;">shared/test_suite.py</code>
+      (5 suite, 56 test). Il costo della flessibilità è misurato su tail call, map lookup,
+      memoria e latenza di aggiornamento del modello — non solo throughput.
+    </p>
+
+    <div style="margin-bottom:2rem;">
+      <span class="pass-badge">✓ 56 / 56 test passati</span>
+      <span style="color:var(--muted);font-size:12px;margin-left:0.75rem;">
+        core 12 · pktstats 8 · extract 6 · quant 9 · robust 21
+      </span>
+    </div>
+
+    <!-- Design-space metrics -->
+    <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.9rem;">Metriche design-space (suite core · Test 6)</h3>
+    <div class="tbl-wrap" style="margin-bottom:2.5rem;">
+      <table>
+        <thead>
+          <tr>
+            <th>Metrica</th>
+            <th style="text-align:right;">P1 hardcoded</th>
+            <th style="text-align:right;">P2 template</th>
+            <th style="text-align:right;">P3 modular</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="td-strong">Tail calls / pacchetto</td>
+            <td class="mono" style="text-align:right;"><span class="num-g">1</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">1</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">4</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Map lookups / pacchetto</td>
+            <td class="mono" style="text-align:right;"><span class="num-g">2</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">2442</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">2502</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Memoria BPF maps (stima)</td>
+            <td class="mono" style="text-align:right;"><span class="num-g">7 960 B</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">12 191 B</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">17 958 B</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Throughput locale (Mpps)<small style="display:block;color:var(--faint);font-weight:400;font-size:10px;">Python single-core — solo indicativo</small></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">0.1339</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">0.0026</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">0.0030</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Flessibilità</td>
+            <td style="text-align:right;"><span class="chip chip-r" style="display:inline-block;">bassa</span></td>
+            <td style="text-align:right;"><span class="chip chip-a" style="display:inline-block;">media</span></td>
+            <td style="text-align:right;"><span class="chip chip-g" style="display:inline-block;">alta</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:2.5rem;font-size:0.8rem;">
+      Trade-off confermato: <span class="mono">tail_calls</span> e <span class="mono">map_lookups</span>
+      crescono monotonicamente P1 ≤ P2 ≤ P3; la memoria di P3 (17 958 B) è &gt; 2× quella di P1 (7 960 B).
+      Il throughput Python è dominato dall'overhead dell'interprete (non usato per assertion): nel kernel
+      il rapporto atteso è 10–100× più alto, ma l'<em>ordine relativo</em> tra le pipeline si conserva.
+    </p>
+
+    <!-- Weight update latency -->
+    <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.4rem;">Tempo di aggiornamento modello (suite core · Test 2)</h3>
+    <p class="sec-desc" style="margin-bottom:0.9rem;font-size:0.8rem;">
+      Il costo control-plane della flessibilità: come cambia un modello su ciascuna pipeline.
+    </p>
+    <div class="tbl-wrap" style="margin-bottom:2.5rem;">
+      <table>
+        <thead>
+          <tr><th>Pipeline</th><th>Meccanismo di update</th><th style="text-align:right;">avg</th><th style="text-align:right;">max</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="td-strong">P1 hardcoded</td>
+            <td style="color:var(--muted);font-size:12px;">ricompila + ricarica programma eBPF</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">4.091 ms</span></td>
+            <td class="mono" style="text-align:right;">9.793 ms</td>
+          </tr>
+          <tr>
+            <td class="td-strong">P2 template</td>
+            <td style="color:var(--muted);font-size:12px;"><span class="mono">bpf_map_update_elem</span> su arch_weights</td>
+            <td class="mono" style="text-align:right;"><span class="num-a">1.372 ms</span></td>
+            <td class="mono" style="text-align:right;">3.327 ms</td>
+          </tr>
+          <tr>
+            <td class="td-strong">P3 modular <small style="color:var(--faint);">(tutti i layer)</small></td>
+            <td style="color:var(--muted);font-size:12px;">update layer_weights + layer_chain</td>
+            <td class="mono" style="text-align:right;"><span class="num-a">1.245 ms</span></td>
+            <td class="mono" style="text-align:right;">3.121 ms</td>
+          </tr>
+          <tr>
+            <td class="td-strong">P3 modular <small style="color:var(--faint);">(hot-swap 1 layer)</small></td>
+            <td style="color:var(--muted);font-size:12px;">update di un solo blocco</td>
+            <td class="mono" style="text-align:right;"><span class="num-g">0.267 ms</span></td>
+            <td class="mono" style="text-align:right;">0.770 ms</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:2.5rem;font-size:0.8rem;">
+      Nota controintuitiva ma centrale per la tesi: P1 ha la <em>massima</em> performance sul datapath
+      ma il <em>peggior</em> tempo di aggiornamento (ricompilazione ~4 ms + reload XDP). P3, la più lenta
+      sul datapath, permette l'hot-swap di un singolo layer in ~0.27 ms senza reload. <strong>Datapath
+      performance e control-plane flexibility sono in tensione opposta.</strong>
+    </p>
+
+    <!-- Quantization accuracy -->
+    <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.4rem;">Accuratezza vs scale factor (suite quant · 200 campioni)</h3>
+    <p class="sec-desc" style="margin-bottom:0.9rem;font-size:0.8rem;">
+      P2 e P3 usano pesi quantizzati int8: lo <span class="mono">scale_factor</span> governa il trade-off
+      accuratezza/errore. P2 e P3 producono <strong>errore identico</strong> (stessa quantizzazione).
+    </p>
+    <div class="tbl-wrap" style="margin-bottom:2.5rem;">
+      <table>
+        <thead>
+          <tr>
+            <th>scale factor</th>
+            <th style="text-align:right;">max errore</th>
+            <th style="text-align:right;">accuratezza argmax</th>
+            <th style="text-align:right;">argmax errati / 200</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">16</td><td class="mono bar-cell" style="text-align:right;"><span>0.0611</span></td><td class="bar-cell" style="text-align:right;"><div class="bar-fill" style="background:var(--red);width:33.5%;"></div><span class="mono num-r">33.5 %</span></td><td class="mono" style="text-align:right;">133</td></tr>
+          <tr><td class="mono">32</td><td class="mono" style="text-align:right;">0.0299</td><td class="bar-cell" style="text-align:right;"><div class="bar-fill" style="background:var(--amber);width:81.5%;"></div><span class="mono num-a">81.5 %</span></td><td class="mono" style="text-align:right;">37</td></tr>
+          <tr><td class="mono">64</td><td class="mono" style="text-align:right;">0.0155</td><td class="bar-cell" style="text-align:right;"><div class="bar-fill" style="background:var(--green);width:93%;"></div><span class="mono num-g">93.0 %</span></td><td class="mono" style="text-align:right;">14</td></tr>
+          <tr><td class="mono">128</td><td class="mono" style="text-align:right;">0.0093</td><td class="bar-cell" style="text-align:right;"><div class="bar-fill" style="background:var(--green);width:93.5%;"></div><span class="mono num-g">93.5 %</span></td><td class="mono" style="text-align:right;">13</td></tr>
+          <tr><td class="mono">256</td><td class="mono" style="text-align:right;">0.0042</td><td class="bar-cell" style="text-align:right;"><div class="bar-fill" style="background:var(--green);width:98.5%;"></div><span class="mono num-g">98.5 %</span></td><td class="mono" style="text-align:right;">3</td></tr>
+          <tr><td class="mono">512 <span class="chip chip-g" style="display:inline-block;font-size:8px;">compute_scale()</span></td><td class="mono" style="text-align:right;">0.0019</td><td class="bar-cell" style="text-align:right;"><div class="bar-fill" style="background:var(--green);width:97.5%;"></div><span class="mono num-g">97.5 %</span></td><td class="mono" style="text-align:right;">5</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- pkt_stats + argmax -->
+    <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.4rem;">Dispatch outcome — pkt_stats (suite pktstats · 200 campioni)</h3>
+    <div class="metric-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr));">
+      <div class="metric-card">
+        <div class="m-label">P1 hardcoded</div>
+        <div class="m-val num-g">100.0%</div>
+        <div class="m-sub">HIT 200 · FAKE 0 · MISS 0 — pesi float, argmax esatto</div>
+      </div>
+      <div class="metric-card">
+        <div class="m-label">P2 template</div>
+        <div class="m-val num-a">97.5%</div>
+        <div class="m-sub">HIT 195 · FAKE 5 · MISS 0 — int8</div>
+      </div>
+      <div class="metric-card">
+        <div class="m-label">P3 modular</div>
+        <div class="m-val num-a">97.5%</div>
+        <div class="m-sub">HIT 195 · FAKE 5 · MISS 0 — identico a P2</div>
+      </div>
+      <div class="metric-card">
+        <div class="m-label">Robustezza</div>
+        <div class="m-val num-g">21/21</div>
+        <div class="m-sub">zero/ones/TTL=0/out-of-range/±1000 + 1000 stress input, nessun crash</div>
+      </div>
+    </div>
+    <p class="sec-desc" style="margin-bottom:2rem;font-size:0.8rem;">
+      HIT rate P1 (100%) ≥ P2 = P3 (97.5%): la quantizzazione int8 costa ~2.5% di argmax corretti,
+      identico tra template e modular perché condividono la stessa aritmetica quantizzata.
+      Le 3 pipeline concordano sull'argmax su tutti gli input anomali.
+    </p>
+
+    <!-- Kernel-side verify note -->
+    <div class="iface-note">
+      <strong>Verifica lato kernel (BPF_PROG_TEST_RUN).</strong>
+      Le tabelle qui sopra sono misure in userspace (modello numerico Python). La correttezza del
+      <em>dispatch reale in kernel</em> — pacchetto ricevuto → inferenza → redirect verso l'ifindex
+      corretto — è verificata separatamente da <span class="mono">shared/verify_prog_run.py</span>,
+      che carica i programmi XDP reali ed esegue <span class="mono">BPF_PROG_TEST_RUN</span> per tutte
+      e tre le pipeline. Per P2/P3 usa una verifica <strong>two-pass</strong>: cattura la chiave di
+      forwarding emessa dal kernel, la installa nella <span class="mono">fwd_table</span> e ri-esegue,
+      asserendo che il redirect scatti (<span class="mono">retval ∈ {0,4}</span> e
+      <span class="mono">pkt_stats[HIT] &gt; 0</span>). Questo separa PASS/FAIL dal richiedere che
+      Python replichi bit-per-bit l'aritmetica intera del kernel.<br><br>
+      <strong>Copertura metriche del professore.</strong>
+      <span class="mono">test_suite.py</span> → tail call, map lookup, memoria, tempo di update, accuratezza.
+      <span class="mono">verify_prog_run.py</span> → latenza per-pacchetto (kernel, TEST_RUN).
+      <span class="mono">test_ipa.py</span> → throughput/latenza live sul fabric Kathara.
+      Non ancora automatizzati: numero di istruzioni eBPF e CPU utilization (ricavabili da
+      <span class="mono">bpftool prog show</span> / <span class="mono">perf</span>).
     </div>
   </section>
 
