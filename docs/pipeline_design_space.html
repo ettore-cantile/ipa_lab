@@ -658,14 +658,20 @@
     </p>
 
     <div style="margin-bottom:2rem;">
-      <span class="pass-badge">✓ 56 / 56 test passati</span>
+      <span class="pass-badge">✓ 56 / 56 test userspace + kernel PASS</span>
       <span style="color:var(--muted);font-size:12px;margin-left:0.75rem;">
-        core 12 · pktstats 8 · extract 6 · quant 9 · robust 21
+        core 12 · pktstats 8 · extract 6 · quant 9 · robust 21 · kernel (3 pipeline, TTL 1–5)
       </span>
     </div>
 
     <!-- Design-space metrics -->
-    <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.9rem;">Metriche design-space (suite core · Test 6)</h3>
+    <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.35rem;">Metriche design-space misurate nel kernel</h3>
+    <p class="sec-desc" style="margin-bottom:0.9rem;font-size:0.8rem;">
+      Valori reali da <span class="mono">BPF_PROG_TEST_RUN</span> sui programmi XDP caricati
+      (<span class="mono">test_suite.py --only kernel</span>): istruzioni verificate, byte jited,
+      tail call, memoria mappe (via <span class="mono">BPF_OBJ_GET_INFO</span>), latenza e throughput
+      per-pacchetto, CPU. Non più stime analitiche.
+    </p>
     <div class="tbl-wrap" style="margin-bottom:2.5rem;">
       <table>
         <thead>
@@ -678,28 +684,46 @@
         </thead>
         <tbody>
           <tr>
+            <td class="td-strong">Istruzioni eBPF (xlated)</td>
+            <td class="mono" style="text-align:right;">1 057</td>
+            <td class="mono" style="text-align:right;">1 968</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">13 488</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Codice jited (byte)</td>
+            <td class="mono" style="text-align:right;">5 081</td>
+            <td class="mono" style="text-align:right;">8 766</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">57 523</span></td>
+          </tr>
+          <tr>
             <td class="td-strong">Tail calls / pacchetto</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">1</span></td>
+            <td class="mono" style="text-align:right;">0<small style="color:var(--faint);"> (leaf)</small></td>
             <td class="mono" style="text-align:right;"><span class="num-a">1</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">4</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">3</span></td>
           </tr>
           <tr>
-            <td class="td-strong">Map lookups / pacchetto</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">2</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">2442</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">2502</span></td>
+            <td class="td-strong">Memoria mappe (byte)</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">83 036</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">15 748</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">28 420</span></td>
           </tr>
           <tr>
-            <td class="td-strong">Memoria BPF maps (stima)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">7 960 B</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">12 191 B</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">17 958 B</span></td>
+            <td class="td-strong">Latenza (ns / pacchetto)</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">1030.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">131.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">562.0</span></td>
           </tr>
           <tr>
-            <td class="td-strong">Throughput locale (Mpps)<small style="display:block;color:var(--faint);font-weight:400;font-size:10px;">Python single-core — solo indicativo</small></td>
-            <td class="mono" style="text-align:right;"><span class="num-g">0.1339</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">0.0026</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">0.0030</span></td>
+            <td class="td-strong">Throughput (Mpps)</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">0.971</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">7.634</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">1.779</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">CPU (%)</td>
+            <td class="mono" style="text-align:right;">59</td>
+            <td class="mono" style="text-align:right;"><span class="num-g">29</span></td>
+            <td class="mono" style="text-align:right;">57</td>
           </tr>
           <tr>
             <td class="td-strong">Flessibilità</td>
@@ -711,10 +735,14 @@
       </table>
     </div>
     <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:2.5rem;font-size:0.8rem;">
-      Trade-off confermato: <span class="mono">tail_calls</span> e <span class="mono">map_lookups</span>
-      crescono monotonicamente P1 ≤ P2 ≤ P3; la memoria di P3 (17 958 B) è &gt; 2× quella di P1 (7 960 B).
-      Il throughput Python è dominato dall'overhead dell'interprete (non usato per assertion): nel kernel
-      il rapporto atteso è 10–100× più alto, ma l'<em>ordine relativo</em> tra le pipeline si conserva.
+      Trade-off strutturale confermato: istruzioni, byte jited e tail call crescono con la flessibilità
+      (P3 ≈ 13× le istruzioni di P1). Due risultati onesti e controintuitivi: (1) <strong>P2 è il più veloce</strong>
+      (131 ns, 7.6 Mpps) — l'inferenza del template via lookup sparsi su BPF_ARRAY costa meno del grande
+      <span class="mono">switch</span> a 52+6 rami del programma P1 hardcoded (1030 ns); (2) <strong>P1 usa più
+      memoria mappe</strong> (83 KB) perché <span class="mono">model_cache</span> conserva l'intero vettore pesi
+      per ogni modello in una hash a 256 slot, mentre P2/P3 tengono i pesi in un singolo BPF_ARRAY compatto.
+      Il conteggio tail-call di P1 è 0 perché sotto TEST_RUN si esegue direttamente il programma leaf
+      <span class="mono">ipa_switch</span> (concettualmente il dispatcher aggiunge 1 salto).
     </p>
 
     <!-- Weight update latency -->
