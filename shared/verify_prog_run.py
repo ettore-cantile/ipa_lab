@@ -11,67 +11,46 @@ Usage (root, inside Kathara frankfurt container or any BCC host):
 
 Exit 0 = all TTLs PASS.  Exit 1 = at least one mismatch.
 
---- Architecture per professor spec ---
+--- The three pipelines ---
 
-Pipeline 1 - Hardcoded Model (baseline assoluta)
-  Un programma eBPF per modello, pesi hardcoded come letterali C, inferenza
-  completamente unrolled.  Nessuna BPF map per i pesi, nessuna fwd_table.
-  Azione: switch(best_cls) { case 0: bpf_redirect(ifindex0); ... case 6: DROP }
-  dispatcher -> tail call -> ipa_switch (tutto in un blocco, max velocita)
+Pipeline 1 - Hardcoded Model (absolute baseline)
+  One eBPF program per model, weights as C literals, fully unrolled inference.
+  No BPF map for weights, no fwd_table.
+  Action: switch(best_cls) { case 0: bpf_redirect(ifindex0); ... case 6: DROP }
+  dispatcher -> tail call -> ipa_switch (single block, maximum speed).
 
-Pipeline 2 - Pre-built Architecture Template (compromesso pratico)
-  Un programma per forma architetturale (es. arch_65_4_4_7), pesi in
-  BPF_ARRAY.  Dispatcher consulta arch_registry[model_id] -> arch_id,
-  poi tail call -> arch_65_4_4_7 che legge i pesi da arch_weights[offset+i].
-  Azione: bpf_redirect(ifindex[best_cls]) diretto dopo argmax (no fwd_table).
-  Aggiornamento modello = sovrascrivere arch_weights, zero recompile.
+Pipeline 2 - Pre-built Architecture Template (practical trade-off)
+  One program per architecture shape (e.g. arch_65_4_4_7), weights in a
+  BPF_ARRAY. The dispatcher looks up arch_registry[model_id] -> arch_id, then
+  tail-calls arch_65_4_4_7, which reads weights from arch_weights[offset+i].
+  Action: bpf_redirect(ifindex[best_cls]) after argmax (no fwd_table).
+  Model update = overwrite arch_weights, no recompile.
 
-Pipeline 3 - Modular Neural Pipeline (massima flessibilita)
-  La rete e spezzata in layer indipendenti.  Ogni layer e un programma XDP:
+Pipeline 3 - Modular Neural Pipeline (maximum flexibility)
+  The network is split into independent layers, each an XDP program:
     layer_65_4  -> layer_4_4 -> layer_4_7_argmax
-  Le attivazioni intermedie sono salvate in BPF_PERCPU_ARRAY scratch.
-  Ogni layer fa una tail call al successivo.  Il costo misurato e quello
-  di multiple tail calls + letture/scritture scratch per lo stato intermedio.
-  Azione finale: bpf_redirect(ifindex[best_cls]) in layer_4_7_argmax.
+  Intermediate activations live in a BPF_PERCPU_ARRAY scratch map. Each layer
+  tail-calls the next. The measured cost is that of multiple tail calls plus
+  scratch reads/writes for the intermediate state.
+  Final action: bpf_redirect(ifindex[best_cls]) in layer_4_7_argmax.
 
-Perche retval != 3 con BPF_PROG_TEST_RUN:
-  bpf_redirect() in sandbox: su kernel recenti (>= 5.18) il redirect viene
-  eseguito davvero e restituisce XDP_REDIRECT(4); su kernel piu vecchi
-  ritorna XDP_ABORTED(0).  Criterio di PASS: retval in {0, 4} (redirect
-  fire) E cls_stats/pkt_stats[HIT] incrementato (confirm correct path).
+Why retval != 3 under BPF_PROG_TEST_RUN:
+  With bpf_redirect() in the sandbox, recent kernels (>= 5.18) actually run the
+  redirect and return XDP_REDIRECT(4); older kernels return XDP_ABORTED(0).
+  PASS criterion: retval in {0, 4} (redirect fires) AND cls_stats/pkt_stats[HIT]
+  incremented (confirms the correct path executed).
 
-Fixed bug (2026-07-09 v7): build_frame format string mismatch.
-  '!BBBHBBBBBBBBBBBBBBBb' had 20 format specs but pack() received 21
-  arguments -> struct.error: pack expected 20 items for packing (got 21).
-  The tail group (n_output_types=1, out0_code=0, out0_count=7, pad=0) is
-  4 values; the old format only had 'BBb' = 3 specs for that group.
-  Fix: use '!BBBHBBBBBBBBBBBBBBBBb' (21 specs matching 21 args exactly).
+Frame layout:
+  build_frame() emits eth + ip(proto=UDP) + udp(dport 9999) + ipa_hdr. The IPA
+  header is packed as '!BBBHBBBBBBBBBBBBBBBBb': model_id, model_type,
+  param_size, scale_factor(be16), then the feature/output descriptors. scale
+  must reach the kernel intact, otherwise the 'if (scale==0) return XDP_PASS'
+  guard fires and the key is never computed.
 
-Fixed bug (2026-07-09 v6): build_frame IPA header layout (param_size missing).
-  struct ipa_hdr C layout:
-    model_id(u8), model_type(u8), param_size(u8), scale_factor(be16), ...
-  build_frame was packing '!BBH...' -> param_size was absent, scale_factor
-  received the wrong bytes -> kernel read scale=0 -> guard 'if (scale==0)
-  return XDP_PASS' fired -> key was never computed -> all packets produced
-  key=0x0000000000000000 and MISS.
-  Fix: use '!BBBHBBBBBBBBBBBBBBBBb' with explicit param_size=0.
-
-Fixed bug (2026-07-09 v4): PERCPU write type must be ctypes Array.
-  BCC ~0.18 PerCpuArray.__setitem__ calls ct.byref(leaf) internally.
-  ct.byref() requires a ctypes instance; a Python list raises:
-    TypeError: byref() argument must be a ctypes instance, not 'list'
-  Fix: _percpu_arr(val) now returns (ct.c_longlong * _NR_CPUS)(*([val]*_NR_CPUS))
-  which is a properly-typed ctypes Array of nr_cpus elements.
-
-Fixed bug (2026-07-09 v3): BPF_PERCPU_ARRAY write semantics.
-  Writing a scalar only populates CPU-0 slot.  BPF_PROG_TEST_RUN runs on
-  an arbitrary CPU -> stale zeros -> argmax wrong -> all TTL FAIL.
-
-Fixed bug (2026-07-09 v2): retval acceptance, fwd_table pre-population,
-  tail-call bypass (run TEST_RUN on lf2 directly).
-
-Fixed bug (2026-07-09): __u8 perf event crash via BCC auto-deserializer.
-  Fix: explicit ctypes.Structure + cast.
+PERCPU scratch:
+  BPF_PROG_TEST_RUN runs on an arbitrary CPU, so per-CPU maps must be written
+  with a properly-typed ctypes Array covering nr_cpus slots; a scalar write
+  only populates CPU 0 and leaves stale zeros on the executing CPU.
 """
 
 import os
@@ -120,14 +99,14 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
 
 
 # ---------------------------------------------------------------------------
-# BPF_OBJ_GET_INFO_BY_FD: numero di istruzioni eBPF (verified/xlated program)
+# BPF_OBJ_GET_INFO_BY_FD: number of eBPF instructions (verified/xlated program)
 # ---------------------------------------------------------------------------
 
 _BPF_OBJ_GET_INFO_BY_FD = 15
 
 class _BpfProgInfo(ct.Structure):
-    # Prefisso di struct bpf_prog_info (linux/bpf.h), allineamento naturale.
-    # xlated_prog_len e' in byte; ogni istruzione eBPF = 8 byte.
+    # Prefix of struct bpf_prog_info (linux/bpf.h), natural alignment.
+    # xlated_prog_len is in bytes; each eBPF instruction is 8 bytes.
     _fields_ = [
         ("type",            ct.c_uint32),
         ("id",              ct.c_uint32),
@@ -144,9 +123,9 @@ class _BpfAttrObjInfo(ct.Structure):
     ]
 
 def prog_insn_count(prog_fd: int):
-    """(#istruzioni eBPF verificate, #byte jited) per un programma caricato.
-    Ritorna (None, None) se BPF_OBJ_GET_INFO_BY_FD fallisce."""
-    buf  = (ct.c_uint8 * 256)()          # buffer ampio, kernel riempie il prefisso
+    """(verified eBPF instruction count, jited byte count) for a loaded program.
+    Returns (None, None) if BPF_OBJ_GET_INFO_BY_FD fails."""
+    buf  = (ct.c_uint8 * 256)()          # oversized buffer; kernel fills the prefix
     info = ct.cast(buf, ct.POINTER(_BpfProgInfo)).contents
     attr = _BpfAttrObjInfo(
         bpf_fd   = prog_fd,
@@ -157,6 +136,43 @@ def prog_insn_count(prog_fd: int):
     if r != 0:
         return None, None
     return int(info.xlated_prog_len) // 8, int(info.jited_prog_len)
+
+
+class _BpfMapInfo(ct.Structure):
+    _fields_ = [
+        ("map_type",    ct.c_uint32),
+        ("id",          ct.c_uint32),
+        ("key_size",    ct.c_uint32),
+        ("value_size",  ct.c_uint32),
+        ("max_entries", ct.c_uint32),
+    ]
+
+# map_type ids that store one value slot per CPU
+_PERCPU_MAP_TYPES = frozenset({5, 6, 10, 21})
+
+def map_info(map_fd: int):
+    """(map_type, key_size, value_size, max_entries) for a loaded map, or None."""
+    info = _BpfMapInfo()
+    attr = _BpfAttrObjInfo(
+        bpf_fd   = map_fd,
+        info_len = ct.sizeof(info),
+        info     = ct.cast(ct.byref(info), ct.c_void_p).value,
+    )
+    r = _libc.syscall(321, _BPF_OBJ_GET_INFO_BY_FD, ct.byref(attr), ct.sizeof(attr))
+    if r != 0:
+        return None
+    return (int(info.map_type), int(info.key_size),
+            int(info.value_size), int(info.max_entries))
+
+def map_bytes(map_fd: int, nr_cpus: int = 1) -> int:
+    """Kernel-reported memory footprint of a map: (key + value) * max_entries,
+    with the value slot replicated per CPU for per-CPU map types."""
+    mi = map_info(map_fd)
+    if mi is None:
+        return 0
+    map_type, ksz, vsz, ment = mi
+    per_cpu = nr_cpus if map_type in _PERCPU_MAP_TYPES else 1
+    return (ksz + vsz * per_cpu) * ment
 
 # ---------------------------------------------------------------------------
 # ctypes mirror structs for perf event deserialization.
@@ -192,7 +208,7 @@ WEIGHTS_JSON = os.path.join(SHARED_DIR, "weights_float.json")
 OUTPUT_OFFSET = 100000
 
 # ---------------------------------------------------------------------------
-# Numero di CPU online
+# Number of online CPUs
 # ---------------------------------------------------------------------------
 
 def _nr_cpus() -> int:
@@ -427,6 +443,7 @@ def setup_hardcoded(model_id: int, model_path: str):
     progs = {"ipa_switch": fn.fd}
     if disp is not fn:
         progs["ipa_dispatcher"] = disp.fd
+    n_tail = 1 if disp is not fn else 0  # dispatcher -> model_<id>
     return {
         "b":         b,
         "fn":        fn,
@@ -437,6 +454,7 @@ def setup_hardcoded(model_id: int, model_path: str):
         "pkt_stats": b["pkt_stats"],
         "pipeline":  1,
         "progs":     progs,
+        "n_tail":    n_tail,
     }
 
 # ---------------------------------------------------------------------------
@@ -473,6 +491,7 @@ def setup_template(model_id: int, model_path: str):
         "valid_keys": "valid_keys_t2",
         "progs": {"ipa_switch_template": disp_fn.fd,
                   "arch_65_4_4_7":       leaf_fn.fd},
+        "n_tail": 1,   # dispatcher -> arch_<shape>
     }
 
 # ---------------------------------------------------------------------------
@@ -510,6 +529,8 @@ def setup_modular(model_id: int, model_path: str):
                   "layer_65_4":         lf0.fd,
                   "layer_4_4":          lf1.fd,
                   "layer_4_7_argmax":   lf2.fd},
+        # dispatcher -> layer_65_4 -> layer_4_4 -> layer_4_7_argmax
+        "n_tail": 3,
     }
 
 # ---------------------------------------------------------------------------
@@ -571,7 +592,7 @@ def run(method: str, model_id: int, model_path: str,
     print(f" IPA/eBPF BPF_PROG_TEST_RUN  --  method={method}  model_id={model_id}")
     print("=" * 70)
     print()
-    print("NOTA: bpf_redirect() in TEST_RUN sandbox.")
+    print("NOTE: bpf_redirect() runs in the TEST_RUN sandbox.")
     print("      PASS = retval in {0,4} (redirect fire) + cls_stats/pkt_stats hit.")
     print()
 
@@ -631,7 +652,7 @@ def run(method: str, model_id: int, model_path: str,
                 retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
                 ok     = False
                 detail = (f"retval={retval} no miss event "
-                          f"(inferenza non completata)")
+                          f"(inference did not complete)")
             else:
                 _insert_fwd_entry(b, fwd_table_name, valid_keys_name,
                                   ttl=ttl, key=kernel_key, ifindex=2)
@@ -652,7 +673,7 @@ def run(method: str, model_id: int, model_path: str,
 
         if retval == XDP_PASS:
             ok = False
-            detail += "  <-- XDP_PASS: inferenza non completata o cache miss"
+            detail += "  <-- XDP_PASS: inference did not complete or cache miss"
 
         lat_us = dur_ns / 1000 / max(1, repeat)
         status = "PASS" if ok else "FAIL"
@@ -667,7 +688,7 @@ def run(method: str, model_id: int, model_path: str,
     miss = _read_u64(ps, 1)
     drop = _read_u64(ps, 2)
     print("-" * 70)
-    print(f"Risultati: {passed} PASS / {failed} FAIL  "
+    print(f"Results: {passed} PASS / {failed} FAIL  "
           f"(TTL range [{ttl_min},{ttl_max}])")
     print(f"pkt_stats: HIT={_read_u64(ps,0)}  MISS={miss}  DROP={drop}")
     return failed
@@ -682,7 +703,7 @@ def main():
     p.add_argument("--ttl-min",  type=int, default=1)
     p.add_argument("--ttl-max",  type=int, default=10)
     p.add_argument("--repeat",   type=int, default=1000,
-                   help="BPF_PROG_TEST_RUN repeat per misura latenza")
+                   help="BPF_PROG_TEST_RUN repeat count for latency measurement")
     args = p.parse_args()
     sys.exit(run(args.method, args.model_id, args.model,
                  args.ttl_min, args.ttl_max, args.repeat))

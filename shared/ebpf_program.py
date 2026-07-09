@@ -2,16 +2,16 @@
 ebpf_program.py  —  Pipeline 1: Hardcoded Model (design-space baseline).
 
 Design space position:
-  - Massime prestazioni, minima flessibilita
-  - Ogni modello -> un programma eBPF dedicato
-  - Pesi hardcoded come letterali nel sorgente C
-  - Inferenza: fc1 (65->4, ReLU) + fc2 (4->4, ReLU) + out (4->7, argmax)
-  - Una sola tail call, nessuna map lookup per i pesi
-  - Azione hardcodata per classe: best_cls -> ifindex[best_cls]
-    (cls 0-5 = bpf_redirect su iface corrispondente, cls 6 = XDP_DROP)
-  - Nessuna fwd_table, nessuna valid_keys lookup: TRUE HIT = redirect riuscito
+  - Maximum performance, minimum flexibility
+  - Each model -> a dedicated eBPF program
+  - Weights hardcoded as literals in the C source
+  - Inference: fc1 (65->4, ReLU) + fc2 (4->4, ReLU) + out (4->7, argmax)
+  - A single tail call, no map lookup for the weights
+  - Per-class hardcoded action: best_cls -> ifindex[best_cls]
+    (cls 0-5 = bpf_redirect on the corresponding iface, cls 6 = XDP_DROP)
+  - No fwd_table, no valid_keys lookup: a TRUE HIT = the redirect fired
 
-Stack budget fix:
+Stack budget:
   iv[65] as int array  -> 260B (too much)
   iv0..iv64 long long  -> 520B (exceeds 512B alone)
 
@@ -24,7 +24,7 @@ Stack budget fix:
     h1_j = RELU( w[j,12]*ttl + w[j, 5+iface]*iface_weight
                + w[j, 13+node]*node_weight + bias_j )
 
-Verifier history (both fixed; see git log for the failed attempts):
+Verifier constraints (why the code is shaped this way):
   1) switch(_iface){...}; switch(_node){...} REPEATED per hidden neuron
      (once per j in 0..N_H1-1): each neuron's pair of switches multiplies
      the number of CFG paths the verifier must explore, so the total

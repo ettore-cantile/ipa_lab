@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-setup_fwd_table.py  —  Popola fwd_table e valid_keys nelle BPF maps
-====================================================================
-Legge le interfacce reali del nodo (via `ip addr`) e popola:
-  - fwd_table[model_id] = indice interfaccia next-hop verso frankfurt
-  - valid_keys[ttl]     = chiave attesa (model_id usato come chiave)
+setup_fwd_table.py  —  Populate fwd_table and valid_keys in the BPF maps
+========================================================================
+Reads the node's real interfaces (via `ip addr`) and populates:
+  - fwd_table[model_id] = next-hop interface index towards frankfurt
+  - valid_keys[ttl]     = expected key (model_id used as the key)
 
-Uso:
+Usage:
   sudo python3 /shared/setup_fwd_table.py [--model-id 0] [--method hardcoded|template|modular]
 
-Logica topologia darmstadt (node_id=10):
-  eth0 -> 10.0.0.233/30  (link verso frankfurt: 10.0.0.234 e' eth1 di frankfurt)
+darmstadt topology (node_id=10):
+  eth0 -> 10.0.0.233/30  (link to frankfurt: 10.0.0.234 is frankfurt's eth1)
   eth1 -> 10.0.0.246/30
   eth2 -> 10.0.0.250/30
 
-Il next-hop verso frankfurt (10.255.255.17) e' su eth0 (indice 0).
+The next-hop towards frankfurt (10.255.255.17) is on eth0 (index 0).
 """
 
 import argparse
@@ -27,12 +27,12 @@ if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 
 # --------------------------------------------------------------------------
-# Topologia nota: darmstadt eth0 -> subnet 10.0.0.232/30 -> frankfurt eth1
-# Next-hop verso frankfurt = indice 0 (eth0)
+# Known topology: darmstadt eth0 -> subnet 10.0.0.232/30 -> frankfurt eth1
+# Next-hop towards frankfurt = index 0 (eth0)
 # --------------------------------------------------------------------------
-NEXT_HOP_IFACE_IDX = 0   # eth0 di darmstadt punta a frankfurt
+NEXT_HOP_IFACE_IDX = 0   # darmstadt's eth0 points to frankfurt
 FRANKFURT_LOOPBACK = "10.255.255.17"
-FRANKFURT_ETH1     = "10.0.0.234"   # IP di frankfurt sull'eth1 (link diretto)
+FRANKFURT_ETH1     = "10.0.0.234"   # frankfurt's IP on eth1 (direct link)
 
 
 def get_iface_list():
@@ -93,9 +93,9 @@ def populate_maps_hardcoded(bpf, model_id):
 
 def populate_maps_via_bpftool(model_id):
     """
-    Fallback: usa bpftool map update per popolare fwd_table e valid_keys
-    senza riferimento all'oggetto BPF Python (utile se il programma e'
-    gia' stato caricato da un altro processo).
+    Fallback: use `bpftool map update` to populate fwd_table and valid_keys
+    without a reference to the Python BPF object (useful when the program was
+    already loaded by another process).
     """
     print("[setup_fwd_table] Using bpftool fallback to update maps...")
 

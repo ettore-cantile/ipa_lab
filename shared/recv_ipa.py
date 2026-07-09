@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-recv_ipa.py  —  Listener IPA su frankfurt per verificare arrivo pacchetti
+recv_ipa.py  —  IPA listener on frankfurt to verify packet arrival
 =========================================================================
-Da eseguire su frankfurt PRIMA di inviare da darmstadt.
-Ascolta UDP porta 9999, decodifica l'header IPA e stampa statistiche.
+Run on frankfurt BEFORE sending from darmstadt.
+Listens on UDP port 9999, decodes the IPA header and prints statistics.
 
 Usage:
   python3 /shared/recv_ipa.py [--timeout 30] [--port 9999]

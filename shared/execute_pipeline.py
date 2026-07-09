@@ -2,30 +2,29 @@
 """
 execute_pipeline.py  —  Design-space pipeline launcher
 =======================================================
-Entry point unificato per tutte e tre le pipeline del design space:
+Single entry point for all three design-space pipelines:
 
   --method hardcoded   Pipeline 1: Hardcoded model
-                       (pesi come letterali C, inferenza unrolled,
-                        1 tail call, 0 weight map lookup)
+                       (weights as C literals, unrolled inference,
+                        1 tail call, 0 weight map lookups)
 
   --method template    Pipeline 2: Pre-built architectural template
-                       (BPF_ARRAY per i pesi, 1 tail call,
-                        update modello = bpf_map_update_elem)
+                       (weights in BPF_ARRAY, 1 tail call,
+                        model update = bpf_map_update_elem)
 
   --method modular     Pipeline 3: Modular neural pipeline
                        (BPF_PERCPU_ARRAY scratch, N tail calls,
-                        massima flessibilità runtime)
+                        maximum runtime flexibility)
 
 Usage:
     sudo python3 shared/execute_pipeline.py --method hardcoded [--iface eth0] [--model-id 0]
     sudo python3 shared/execute_pipeline.py --method template  [--iface eth0] [--model-id 0]
     sudo python3 shared/execute_pipeline.py --method modular   [--iface eth0] [--model-id 0]
 
-Note:
-    - Richiede root (XDP attach)
-    - Il modello .pt deve essere in shared/frr_germany50_5_model_4x2.pt
-    - Methods 1-4 originali (PTQ, QAT, OpenFlow, IPA Demo) sono nel main branch
-    - extract_weights.py richiede torch; viene saltato se weights.json esiste gia'
+Notes:
+    - Requires root (XDP attach).
+    - The .pt model must be at shared/frr_germany50_5_model_4x2.pt
+    - extract_weights.py requires torch; it is skipped if weights.json exists.
 """
 
 import argparse
@@ -45,12 +44,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Pipeline trade-off summary:
-  hardcoded : massime prestazioni  | minima flessibilità   | 0 weight lookup
-  template  : prestazioni medie    | flessibilità media    | BPF_ARRAY lookup
-  modular   : prestazioni inferiori| massima flessibilità  | PERCPU_ARRAY + N tail calls
+  hardcoded : maximum performance | minimum flexibility | 0 weight lookups
+  template  : medium performance  | medium flexibility  | BPF_ARRAY lookup
+  modular   : lower performance   | maximum flexibility | PERCPU_ARRAY + N tail calls
 
-Per il benchmark comparativo completo:
-  sudo python3 shared/pipeline_benchmark.py --pipeline all --iface eth0
+For the full metric comparison across pipelines:
+  sudo python3 shared/test_suite.py --only kernel
         """
     )
     parser.add_argument(
@@ -130,7 +129,7 @@ Per il benchmark comparativo completo:
     print("=" * 60)
 
     if args.method == "hardcoded":
-        # Pipeline 1 — pesi hardcoded nel sorgente C, inferenza unrolled
+        # Pipeline 1 — weights hardcoded in the C source, unrolled inference
         from methods.method4_hardcoded import run
         if args.verify_only:
             sys.argv = ["method4_hardcoded.py", "--verify-only",
@@ -146,7 +145,7 @@ Per il benchmark comparativo completo:
             run(model_id=args.model_id, iface=args.iface, model_path=model_path)
 
     elif args.method == "template":
-        # Pipeline 2 — architectural template, pesi in BPF_ARRAY
+        # Pipeline 2 — architectural template, weights in BPF_ARRAY
         from methods.method5_template import run
         run(model_id=args.model_id, iface=args.iface)
 

@@ -3,20 +3,20 @@
 method4_hardcoded.py  —  Pipeline 1: Hardcoded Model
 
 Design space position:
-  Massime prestazioni, minima flessibilita'.
-  Ogni modello -> un programma eBPF dedicato con pesi hardcoded come
-  letterali signed char nel sorgente C. Inferenza completamente unrolled,
-  nessuna BPF map lookup per i pesi, una sola tail call.
+  Maximum performance, minimum flexibility.
+  Each model -> a dedicated eBPF program with weights hardcoded as signed-char
+  literals in the C source. Fully unrolled inference, no BPF map lookup for the
+  weights, a single tail call.
 
-  Azione: dopo argmax il programma esegue bpf_redirect verso l'ifindex
-  hardcodato per la classe scelta (nessuna fwd_table lookup).
-  cls 0-5 -> egress iface corrispondente, cls 6 -> XDP_DROP.
+  Action: after argmax the program issues bpf_redirect towards the ifindex
+  hardcoded for the chosen class (no fwd_table lookup).
+  cls 0-5 -> corresponding egress iface, cls 6 -> XDP_DROP.
 
-Topologia Kathara (XDP su frankfurt):
-  frankfurt eth1 = ingress da darmstadt (10.0.0.234/30, link l59)
-  frankfurt eth0 = altro link (fallback)
-  Le classi 0-5 mappano sugli ifindex delle interfacce di frankfurt
-  ricavati a runtime via socket.if_nametoindex.
+Kathara topology (XDP on frankfurt):
+  frankfurt eth1 = ingress from darmstadt (10.0.0.234/30, link l59)
+  frankfurt eth0 = other link (fallback)
+  Classes 0-5 map to the ifindex of frankfurt's interfaces, resolved at
+  runtime via socket.if_nametoindex.
 
 Usage (via execute_pipeline.py):
     python3 execute_pipeline.py --method hardcoded

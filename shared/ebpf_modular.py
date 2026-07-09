@@ -32,28 +32,20 @@ eBPF verifier notes:
   - tail call limit: 33 consecutive (Linux). For 3-layer net: 3 tail calls OK.
   - weight map key encodes (layer_id * MAX_NEURONS_SQ + flat_index)
 
-Fixed bug (2026-07-08): the dispatcher used to populate scratch_acts as
-  [0]=model_id, [1]=ttl, [2]=ingress_ifindex, [3]=input_size, rest 0 --
-  a feature encoding that does NOT match how the model was actually
-  trained (see FRR_model.py / ebpf_program.py: 6 link_state (unused) +
-  6 ingress-iface one-hot [6..11] + 1 ttl [12] + 52 node one-hot
-  [13..64]). Inference through the old encoding was not comparable to
-  Pipeline 1/2 on the same model. Fixed to write the same sparse
-  one-hot layout as Pipeline 1 into scratch_acts before the first tail
-  call; layer_65_4's dense dot-product loop is unchanged (it already
-  reads scratch_acts[i] one at a time, so it transparently picks up
-  the corrected activations).
+Feature encoding:
+  The dispatcher writes the same sparse one-hot layout used by Pipeline 1 into
+  scratch_acts before the first tail call: 6 link_state (unused) + 6 ingress
+  iface one-hot [6..11] + 1 ttl [12] + 52 node one-hot [13..64]. This keeps
+  inference comparable across the three pipelines on the same model. Each layer
+  block reads scratch_acts[i] one element at a time.
 
-Fixed bug (2026-07-09): BPF_ARRAY(layer_weights, __s8, ...) caused a
-  KeyError: 'signed char' in BCC's str2ctype dict on the libbcc version
-  present in the Kathara container (~0.18).  BCC resolves __s8 to the
-  C type string 'signed char', which is absent from str2ctype.  Changed
-  leaf type to __u8 (unsigned byte) which BCC resolves to 'unsigned char'
-  and handles correctly.  Sign semantics are fully preserved: the eBPF C
-  code casts each retrieved byte to (__s8) via the WEIGHT() macro before
-  any arithmetic; the Python load_modular_weights() stores each int8
-  value as c_uint8(int(v) & 0xFF) -- a bit-identical two's complement
-  representation -- bypassing BCC's leaf encoder for the map write.
+Weight storage:
+  layer_weights uses an unsigned-byte leaf (__u8). The libbcc build in the
+  Kathara container cannot resolve a signed-byte leaf type, so signedness is
+  handled explicitly: the eBPF C code casts each byte to __s8 via WEIGHT()
+  before arithmetic, and load_modular_weights() stores each int8 as
+  c_uint8(v & 0xFF) (identical two's-complement bits), bypassing the BCC leaf
+  encoder for the map write.
 """
 
 # Scratch map layout constants

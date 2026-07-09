@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
-test_suite.py — Suite di test LOCALE dei 3 metodi IPA (nessun eBPF/XDP richiesto)
+test_suite.py — LOCAL test suite for the 3 IPA methods (no eBPF/XDP required)
 ================================================================================
 
-Unico script che accorpa tutti i test locali (prima sparsi su test_local.py,
+Single script consolidating all local tests (previously split across test_local.py,
 test_ipa_methods.py, test_extract_weights.py, test_quantization_accuracy.py,
-test_robustness.py). Serve a misurare, in locale con PyTorch/NumPy, le
-proprieta' e le metriche del design-space richieste dal professore, senza
-bisogno di kernel/eBPF (per la verifica in-kernel usa verify_prog_run.py).
+test_robustness.py). Measures, locally with PyTorch/NumPy, the
+design-space properties and metrics, without
+needing kernel/eBPF (for the in-kernel check use verify_prog_run.py).
 
-Suite disponibili (--only):
-  core     : consistenza inferenza, update latency, determinismo, .pt load,
-             e la tabella design-space (throughput, tail calls, map lookups,
-             memoria mappe, flessibilita')                    [ex test_local]
-  pktstats : hit/fake/miss per i 3 metodi + coerenza counter   [ex test_ipa_methods]
-  extract  : coerenza extract_weights.py / weights.json / dequant [ex test_extract_weights]
+Available suites (--only):
+  core     : inference consistency, update latency, determinism, .pt load,
+             plus the design-space table (throughput, tail calls, map lookups,
+             map memory, flexibility)                    [ex test_local]
+  pktstats : hit/fake/miss for the 3 methods + counter consistency   [ex test_ipa_methods]
+  extract  : extract_weights.py / weights.json / dequant consistency [ex test_extract_weights]
   quant    : accuracy argmax vs scale_factor (PTQ trade-off)   [ex test_quantization_accuracy]
-  robust   : input edge-case, nessun crash, argmax valido       [ex test_robustness]
-  kernel   : metriche IN-KERNEL via BPF_PROG_TEST_RUN — #istruzioni eBPF,
-             latenza per-pacchetto, throughput Mpps, CPU%, + gate di dispatch
-             reale (ex verify_prog_run). Richiede Linux + BCC + root; altrove
-             viene saltata con grazia (non fa fallire la run).
-  all      : tutte (default)
+  robust   : edge-case inputs, no crash, valid argmax       [ex test_robustness]
+  kernel   : IN-KERNEL metrics via BPF_PROG_TEST_RUN — #istruzioni eBPF,
+             per-packet latency, throughput Mpps, CPU%, + real dispatch
+             gate (ex verify_prog_run). Requires Linux + BCC + root; elsewhere
+             it is skipped gracefully (does not fail the run).
+  all      : every suite (default)
 
-Utilizzo:
-  python3 shared/test_suite.py                       # tutte le suite (kernel salta se no BCC)
+Usage:
+  python3 shared/test_suite.py                       # every suite (kernel skipped without BCC)
   python3 shared/test_suite.py --only core --verbose
   python3 shared/test_suite.py --only quant --samples 200
-  sudo python3 shared/test_suite.py --only kernel    # metriche kernel (root)
+  sudo python3 shared/test_suite.py --only kernel    # kernel metrics (root)
   kathara exec frankfurt -- python3 /shared/test_suite.py --only kernel
 """
 
@@ -41,12 +41,12 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
 except ImportError:
-    print("[ERROR] PyTorch non trovato. Installa con: pip install torch")
+    print("[ERROR] PyTorch not found. Install with: pip install torch")
     sys.exit(1)
 
 import numpy as np
 
-# Architettura reale da FRR_model.py (usata per i test 1-4)
+# Real architecture from FRR_model.py (used by tests 1-4)
 N_INTERFACES  = 6
 N_NODES       = 22
 HIDDEN_DIM    = 32
@@ -65,12 +65,12 @@ def info(msg): print(f"  {YELLOW}[INFO]{NC} {msg}")
 
 def decode_nexthop(argmax_idx: int, n_interfaces: int = N_INTERFACES) -> str:
     """
-    Converte l'indice argmax dell'output della rete nella stringa
-    leggibile del next-hop.
+    Convert the network output argmax index into the human-readable
+    next-hop string.
 
-    Convenzione label encoding (da FRR_model.py / dataset):
-      0           -> DROP (nessuna rotta disponibile)
-      1 .. N_INT  -> eth{idx-1}  (interfaccia fisica 0-indexed)
+    Label encoding convention (from FRR_model.py / dataset):
+      0           -> DROP (no route available)
+      1 .. N_INT  -> eth{idx-1}  (physical interface, 0-indexed)
     """
     if argmax_idx == 0:
         return "DROP"
@@ -81,7 +81,7 @@ def decode_nexthop(argmax_idx: int, n_interfaces: int = N_INTERFACES) -> str:
 
 
 # ===========================================================================
-# Modello con architettura fissa
+# Fixed-architecture model
 # ===========================================================================
 class FRRModel(nn.Module):
     def __init__(self, input_size=INPUT_SIZE, hidden_dim=HIDDEN_DIM, output_size=OUTPUT_SIZE):
@@ -98,9 +98,9 @@ class FRRModel(nn.Module):
 
 def load_pt_dynamic(path: str) -> tuple:
     """
-    Carica un checkpoint .pt inferendo automaticamente le dimensioni
-    dell'architettura dai tensori salvati.
-    Ritorna (model, input_size, hidden_dim, output_size).
+    Load a .pt checkpoint, inferring the architecture sizes automatically
+    from the saved tensors.
+    Returns (model, input_size, hidden_dim, output_size).
     """
     state = torch.load(path, map_location='cpu', weights_only=True)
 
@@ -121,7 +121,7 @@ def load_pt_dynamic(path: str) -> tuple:
 
 
 def compute_scale(model: nn.Module) -> int:
-    """Scale factor come potenza di 2 che evita overflow int8."""
+    """Scale factor as a power of 2 that avoids int8 overflow."""
     max_abs = 0.0
     for p in model.parameters():
         max_abs = max(max_abs, float(p.detach().abs().max()))
@@ -269,7 +269,7 @@ class Method3_Modular:
         return time.perf_counter() - t0
 
 
-# Varianti a scale fisso (usate dalla suite quant)
+# Fixed-scale variants (used by the quant suite)
 class Method2_FixedScale(Method2_Template):
     """Variante di Method2 con scale_factor fisso (non auto-calcolato)."""
     def __init__(self, model, scale: int):
@@ -342,7 +342,7 @@ def pytorch_ref(model, x_np):
 def _banner(passed, total):
     print(f"\n{YELLOW}{'='*52}{NC}")
     color = GREEN if passed == total else RED
-    print(f"{color} Risultato: {passed}/{total} test passati{NC}")
+    print(f"{color} Result: {passed}/{total} tests passed{NC}")
     if passed < total:
         print(f"{RED} Controlla i messaggi [FAIL] sopra{NC}")
     print(f"{YELLOW}{'='*52}{NC}\n")
@@ -352,11 +352,11 @@ def _banner(passed, total):
 # SUITE: core  (ex test_local.py)
 # ===========================================================================
 def suite_core(model, verbose=False):
-    print(f"\n{YELLOW}=== SUITE core — IPA Pipeline (3 metodi) ==={NC}\n")
+    print(f"\n{YELLOW}=== SUITE core — IPA Pipeline (3 methods) ==={NC}\n")
     H = model.fc1.out_features
     I = model.fc1.in_features
     O = model.out.out_features
-    print(f"  Architettura: {I} -> {H} -> {H} -> {O}")
+    print(f"  Architecture: {I} -> {H} -> {H} -> {O}")
     print()
 
     m1 = Method1_Hardcoded(model)
@@ -370,7 +370,7 @@ def suite_core(model, verbose=False):
     N = 50
     passed = total = 0
 
-    print(f"{YELLOW}[Test 1] Output consistency & argmax ({N} campioni){NC}")
+    print(f"{YELLOW}[Test 1] Output consistency & argmax ({N} samples){NC}")
     mm = {2: 0, 3: 0}
     me = {1: 0.0, 2: 0.0, 3: 0.0}
     for i in range(N):
@@ -396,13 +396,13 @@ def suite_core(model, verbose=False):
 
     total += 1
     passed += 1
-    ok(f"Method 1 (hardcoded): argmax 100% corretto | max_err={me[1]:.6f}")
+    ok(f"Method 1 (hardcoded): argmax 100% correct | max_err={me[1]:.6f}")
 
     for mid, name in [(2, 'template'), (3, 'modular')]:
         total += 1
         pct = mm[mid] / N * 100
         if pct <= 10:
-            ok(f"Method {mid} ({name}): argmax {100-pct:.0f}% corretto ({mm[mid]}/{N}) | max_err={me[mid]:.4f}")
+            ok(f"Method {mid} ({name}): argmax {100-pct:.0f}% correct ({mm[mid]}/{N}) | max_err={me[mid]:.4f}")
             passed += 1
         else:
             fail(f"Method {mid} ({name}): {mm[mid]}/{N} argmax errati | max_err={me[mid]:.4f} | scale={m2.scale}")
@@ -411,10 +411,10 @@ def suite_core(model, verbose=False):
         total += 1
         tol = H / sc
         if me[mid] <= tol:
-            ok(f"Method {mid} ({name}): errore quant. ok ({me[mid]:.4f} <= {tol:.4f})")
+            ok(f"Method {mid} ({name}): quant error ok ({me[mid]:.4f} <= {tol:.4f})")
             passed += 1
         else:
-            fail(f"Method {mid} ({name}): errore quant. ALTO ({me[mid]:.4f} > {tol:.4f})")
+            fail(f"Method {mid} ({name}): quant error HIGH ({me[mid]:.4f} > {tol:.4f})")
 
     print(f"\n{YELLOW}[Test 2] Weight update latency (10 update){NC}")
     times = {1: [], 2: [], 3: [], '3s': []}
@@ -428,27 +428,27 @@ def suite_core(model, verbose=False):
     for key, lbl in [
         (1, 'Method 1 hardcoded (ricompilazione simulata)'),
         (2, 'Method 2 template  (map update)'),
-        (3, 'Method 3 modular   (tutti i layer)'),
-        ('3s', 'Method 3 modular   (singolo layer hot-swap)')
+        (3, 'Method 3 modular   (all layers)'),
+        ('3s', 'Method 3 modular   (single layer hot-swap)')
     ]:
         avg = sum(times[key]) / 10
         info(f"{lbl}: avg={avg:.3f}ms  max={max(times[key]):.3f}ms")
     total += 1
     passed += 1
-    ok("Update latency misurata")
+    ok("Update latency measured")
 
-    print(f"\n{YELLOW}[Test 3] Determinismo (100 run){NC}")
+    print(f"\n{YELLOW}[Test 3] Determinism (100 runs){NC}")
     xf = make_input(I)
     rs = {int(np.argmax(m2.infer(xf))) for _ in range(100)}
     total += 1
     if len(rs) == 1:
         nh_str = decode_nexthop(list(rs)[0])
-        ok(f"Method 2: deterministico ({list(rs)[0]} -> {nh_str}) su 100 run")
+        ok(f"Method 2: deterministic ({list(rs)[0]} -> {nh_str}) over 100 runs")
         passed += 1
     else:
-        fail(f"Method 2: NON deterministico: {rs}")
+        fail(f"Method 2: NOT deterministic: {rs}")
 
-    print(f"\n{YELLOW}[Test 4] Consistenza post-update{NC}")
+    print(f"\n{YELLOW}[Test 4] Post-update consistency{NC}")
     nm = FRRModel()
     m2.update_weights(nm)
     m3.update_weights(nm)
@@ -459,12 +459,12 @@ def suite_core(model, verbose=False):
             mp += 1
     total += 1
     if mp == 0:
-        ok(f"Method 2 e 3 concordano su {N} campioni dopo update")
+        ok(f"Method 2 and 3 agree on {N} samples after update")
         passed += 1
     else:
-        fail(f"Method 2 e 3 discordano su {mp}/{N} campioni")
+        fail(f"Method 2 and 3 disagree on {mp}/{N} samples")
 
-    print(f"\n{YELLOW}[Test 5] Caricamento modello .pt (dimensioni auto-inferite){NC}")
+    print(f"\n{YELLOW}[Test 5] Load .pt model (auto-inferred sizes){NC}")
     total += 1
     pt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'frr_germany50_5_model_4x2.pt')
     if os.path.exists(pt_path):
@@ -481,19 +481,19 @@ def suite_core(model, verbose=False):
                 info(f"  Decode: 0=DROP, 1=eth0 .. {lo-1}=eth{lo-2}")
             passed += 1
         except Exception as e:
-            fail(f"Errore caricamento .pt: {e}")
+            fail(f"Error loading .pt: {e}")
     else:
-        info(f".pt non trovato ({pt_path}) — test saltato")
+        info(f".pt not found ({pt_path}) — test skipped")
         total -= 1
 
     # -----------------------------------------------------------------------
     # Test 6 — Design-space metrics (professor requirement)
-    # NOTA: il throughput Python NON e' la metrica di confronto corretta
-    # (M1 usa NumPy matmul, M2/M3 dict lookup per simulare BPF map). Il
-    # trade-off reale e' sulle metriche STRUTTURALI eBPF: tail calls, map
-    # lookups, memoria mappe -- costanti architetturali indipendenti dall'emulatore.
+    # NOTA: the Python throughput is NOT the correct comparison metric
+    # (M1 uses NumPy matmul, M2/M3 dict lookup to emulate the BPF map). The
+    # real trade-off is on the STRUCTURAL eBPF metrics: tail calls, map
+    # lookups, map memory -- architectural constants independent of the emulator.
     # -----------------------------------------------------------------------
-    print(f"\n{YELLOW}[Test 6] Design-space metrics (throughput, struttura, memoria){NC}")
+    print(f"\n{YELLOW}[Test 6] Design-space metrics (throughput, structure, memory){NC}")
 
     BENCH_SECS = 2.0
     throughputs = {}
@@ -507,22 +507,22 @@ def suite_core(model, verbose=False):
         elapsed = time.perf_counter() - t0
         mpps = count / elapsed / 1_000_000
         throughputs[mid] = (mpps, count, elapsed)
-    info(f"Throughput inferenza (Python, single-core, {BENCH_SECS:.0f}s benchmark):")
+    info(f"Inference throughput (Python, single-core, {BENCH_SECS:.0f}s benchmark):")
     for mid, name in [(1, 'hardcoded'), (2, 'template'), (3, 'modular')]:
         mpps, cnt, el = throughputs[mid]
         info(f"  Method {mid} ({name:<10}): {mpps:.4f} Mpps  ({cnt} infer in {el:.2f}s)")
     info("  NOTE: eBPF kernel throughput expected 10-100x higher (no Python overhead)")
-    info("  NOTE: throughput Python non usato per l'assertion (vedi commento Test 6)")
+    info("  NOTE: Python throughput not used for the assertion (see Test 6 comment)")
 
     n_fc1 = I * H + H
     n_fc2 = H * H + H
     n_out = H * O + O
     N_WEIGHTS = n_fc1 + n_fc2 + n_out
 
-    # tail_calls: P1 1, P2 1, P3 4 (dispatcher + 3 layer tail calls)
+    # tail_calls (analytical estimate; real values via --only kernel)
     TAIL_CALLS = {1: 1, 2: 1, 3: 4}
 
-    # map_lookups per packet
+    # map_lookups per packet (analytical estimate; real via --only kernel)
     p3_lookups = (1 + I
                   + (I * H) + H
                   + (H * H) + H
@@ -541,16 +541,16 @@ def suite_core(model, verbose=False):
         2: N_WEIGHTS * 1 + 256 * 7 + 256 * 22 + 256 * 9 + 3 * 8,
         3: N_WEIGHTS * 2 + 256 * 14 + (H + 16) * 8 * ncpus + 256 * 22 + 256 * 9 + 3 * 8,
     }
-    FLEXIBILITY = {1: 'bassa',  2: 'media',  3: 'alta'}
+    FLEXIBILITY = {1: 'low',  2: 'medium',  3: 'high'}
     MODEL_UPDATE = {
-        1: 'ricompila + ricarica programma eBPF',
-        2: 'bpf_map_update_elem() su arch_weights',
-        3: 'bpf_map_update_elem() su layer_weights + aggiorna layer_chain',
+        1: 'recompile + reload eBPF program',
+        2: 'bpf_map_update_elem() on arch_weights',
+        3: 'bpf_map_update_elem() on layer_weights + update layer_chain',
     }
 
     print()
     COL = 32
-    hdr = f"  {'Metrica':<{COL}} {'P1 hardcoded':>16} {'P2 template':>16} {'P3 modular':>16}"
+    hdr = f"  {'Metric':<{COL}} {'P1 hardcoded':>16} {'P2 template':>16} {'P3 modular':>16}"
     sep = "  " + "-" * (COL + 50)
     print(hdr)
     print(sep)
@@ -559,47 +559,47 @@ def suite_core(model, verbose=False):
         v = [str(vals[k]) for k in [1, 2, 3]]
         print(f"  {label:<{COL}} {v[0]:>16} {v[1]:>16} {v[2]:>16}")
 
-    row("Throughput locale (Mpps)",
+    row("Local throughput (Mpps)",
         {k: f"{throughputs[k][0]:.4f}" for k in [1, 2, 3]})
-    row("Tail calls / pacchetto",  TAIL_CALLS)
-    row("Map lookups / pacchetto", MAP_LOOKUPS)
-    row("Memoria BPF maps (stima)",
+    row("Tail calls / packet (est.)",  TAIL_CALLS)
+    row("Map lookups / packet (est.)", MAP_LOOKUPS)
+    row("BPF map memory (est.)",
         {k: f"{MAP_MEM_BYTES[k]//1024}KB ({MAP_MEM_BYTES[k]}B)" for k in [1, 2, 3]})
-    row("Flessibilita'",           FLEXIBILITY)
+    row("Flexibility",             FLEXIBILITY)
     print(sep)
     print()
 
-    info(f"CPU logiche rilevate: {ncpus} (influenza scratch map PERCPU per P3)")
+    info(f"Logical CPUs detected: {ncpus} (affects the PERCPU scratch map for P3)")
     print()
     for mid, lbl in [(1, 'P1 hardcoded'), (2, 'P2 template'), (3, 'P3 modular')]:
-        info(f"{lbl} - aggiornamento modello: {MODEL_UPDATE[mid]}")
+        info(f"{lbl} - model update: {MODEL_UPDATE[mid]}")
     print()
 
     total += 1
     tc_ok = TAIL_CALLS[1] <= TAIL_CALLS[2] <= TAIL_CALLS[3]
     ml_ok = MAP_LOOKUPS[1] <= MAP_LOOKUPS[2] <= MAP_LOOKUPS[3]
     if tc_ok and ml_ok:
-        ok(f"Trade-off eBPF confermato: "
+        ok(f"eBPF trade-off confirmed: "
            f"tail_calls P1({TAIL_CALLS[1]}) <= P2({TAIL_CALLS[2]}) <= P3({TAIL_CALLS[3]}) | "
            f"map_lookups P1({MAP_LOOKUPS[1]}) <= P2({MAP_LOOKUPS[2]}) <= P3({MAP_LOOKUPS[3]})")
         passed += 1
     else:
-        fail(f"Trade-off strutturale incoerente: "
+        fail(f"structural trade-off inconsistent: "
              f"tail_calls={list(TAIL_CALLS.values())} map_lookups={list(MAP_LOOKUPS.values())}")
 
     total += 1
     if TAIL_CALLS[3] > TAIL_CALLS[1] and MAP_LOOKUPS[3] > MAP_LOOKUPS[1]:
-        ok(f"Struttura: P3 ha piu' tail calls ({TAIL_CALLS[3]}) e map lookups ({MAP_LOOKUPS[3]}) di P1 ({TAIL_CALLS[1]}, {MAP_LOOKUPS[1]})")
+        ok(f"Structure: P3 has more tail calls ({TAIL_CALLS[3]}) and map lookups ({MAP_LOOKUPS[3]}) vs P1 ({TAIL_CALLS[1]}, {MAP_LOOKUPS[1]})")
         passed += 1
     else:
-        fail("Struttura: conteggi tail call / map lookup incoerenti")
+        fail("Structure: inconsistent tail-call / map-lookup counts")
 
     total += 1
     if MAP_MEM_BYTES[3] > MAP_MEM_BYTES[1]:
-        ok(f"Memoria: P3 ({MAP_MEM_BYTES[3]}B) > P1 ({MAP_MEM_BYTES[1]}B) come atteso")
+        ok(f"Memory: P3 ({MAP_MEM_BYTES[3]}B) > P1 ({MAP_MEM_BYTES[1]}B) as expected")
         passed += 1
     else:
-        fail(f"Memoria: P3 ({MAP_MEM_BYTES[3]}B) dovrebbe essere > P1 ({MAP_MEM_BYTES[1]}B)")
+        fail(f"Memory: P3 ({MAP_MEM_BYTES[3]}B) should be > P1 ({MAP_MEM_BYTES[1]}B)")
 
     _banner(passed, total)
     return passed == total
@@ -609,8 +609,8 @@ def suite_core(model, verbose=False):
 # SUITE: pktstats  (ex test_ipa_methods.py)
 # ===========================================================================
 def _classify_packet(output_vec, ref_vec, valid_outputs):
-    """HIT: argmax corretto e in valid_outputs; FAKE: in valid_outputs ma
-    argmax errato; MISS: action non in valid_outputs (DROP/unknown)."""
+    """HIT: argmax correct and in valid_outputs; FAKE: in valid_outputs but
+    argmax wrong; MISS: action not in valid_outputs (DROP/unknown)."""
     pred   = int(np.argmax(output_vec))
     target = int(np.argmax(ref_vec))
     if pred in valid_outputs:
@@ -631,12 +631,12 @@ def suite_pktstats(n_samples=200, seed=42):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    print(f"\n{YELLOW}=== SUITE pktstats — pkt_stats (3 pipeline) ==={NC}\n")
+    print(f"\n{YELLOW}=== SUITE pktstats — pkt_stats (3 pipelines) ==={NC}\n")
     model = FRRModel()
     H = model.fc1.out_features
     I = model.fc1.in_features
     O = model.out.out_features
-    print(f"  Architettura: {I} -> {H} -> {H} -> {O} | samples={n_samples} | seed={seed}")
+    print(f"  Architecture: {I} -> {H} -> {H} -> {O} | samples={n_samples} | seed={seed}")
     print()
 
     m1 = Method1_Hardcoded(model)
@@ -650,7 +650,7 @@ def suite_pktstats(n_samples=200, seed=42):
     inputs = [make_input(I) for _ in range(n_samples)]
     passed = total = 0
 
-    print(f"{YELLOW}[Test A] pkt_stats per metodo ({n_samples} campioni){NC}")
+    print(f"{YELLOW}[Test A] pkt_stats per method ({n_samples} samples){NC}")
     stats = {}
     for mid, mobj, name in [(1, m1, 'hardcoded'), (2, m2, 'template'), (3, m3, 'modular')]:
         s = _run_pkt_stats(mobj, inputs, model, valid_outputs)
@@ -660,7 +660,7 @@ def suite_pktstats(n_samples=200, seed=42):
         info(f"  P{mid} {name:<10}: HIT={s['HIT']:4d} ({hit_rate:.1f}%)  "
              f"FAKE={s['FAKE']:4d}  MISS={s['MISS']:4d}  total={total_pkts}")
 
-    print(f"\n{YELLOW}[Test B] Totale counter == n_samples per ogni metodo{NC}")
+    print(f"\n{YELLOW}[Test B] Total counter == n_samples for each method{NC}")
     for mid in [1, 2, 3]:
         total += 1
         s = stats[mid]
@@ -671,15 +671,15 @@ def suite_pktstats(n_samples=200, seed=42):
         else:
             fail(f"P{mid}: HIT+FAKE+MISS = {tot} != {n_samples}")
 
-    print(f"\n{YELLOW}[Test C] P1 hardcoded deve avere FAKE=0 (pesi float){NC}")
+    print(f"\n{YELLOW}[Test C] P1 hardcoded must have FAKE=0 (float weights){NC}")
     total += 1
     if stats[1]['FAKE'] == 0:
         ok("P1 FAKE=0 confermato (hardcoded float)")
         passed += 1
     else:
-        fail(f"P1 FAKE={stats[1]['FAKE']} (atteso 0 con pesi float)")
+        fail(f"P1 FAKE={stats[1]['FAKE']} (expected 0 with float weights)")
 
-    print(f"\n{YELLOW}[Test D] P2 e P3 stesso HIT/FAKE/MISS (stessa quantizzazione){NC}")
+    print(f"\n{YELLOW}[Test D] P2 and P3 same HIT/FAKE/MISS (same quantization){NC}")
     total += 1
     if stats[2] == stats[3]:
         ok(f"P2 e P3 concordano: HIT={stats[2]['HIT']} FAKE={stats[2]['FAKE']} MISS={stats[2]['MISS']}")
@@ -687,7 +687,7 @@ def suite_pktstats(n_samples=200, seed=42):
     else:
         fail(f"P2={stats[2]} != P3={stats[3]}")
 
-    print(f"\n{YELLOW}[Test E] HIT rate P1 >= P2 e P3 (float piu' preciso){NC}")
+    print(f"\n{YELLOW}[Test E] HIT rate P1 >= P2 and P3 (float more precise){NC}")
     total += 1
     hr1 = stats[1]['HIT'] / n_samples
     hr2 = stats[2]['HIT'] / n_samples
@@ -696,9 +696,9 @@ def suite_pktstats(n_samples=200, seed=42):
         ok(f"HIT rate: P1={hr1:.3f} >= P2={hr2:.3f} >= P3={hr3:.3f}")
         passed += 1
     else:
-        fail(f"HIT rate: P1={hr1:.3f} P2={hr2:.3f} P3={hr3:.3f} — atteso P1 massimo")
+        fail(f"HIT rate: P1={hr1:.3f} P2={hr2:.3f} P3={hr3:.3f} — expected P1 maximum")
 
-    print(f"\n{YELLOW}[Test F] pkt_stats dopo update pesi (nuovo modello random){NC}")
+    print(f"\n{YELLOW}[Test F] pkt_stats after weight update (new random model){NC}")
     torch.manual_seed(seed + 1)
     new_model = FRRModel()
     m1.update_weights(new_model)
@@ -711,17 +711,17 @@ def suite_pktstats(n_samples=200, seed=42):
     tot2 = sum(stats_new[2].values())
     tot3 = sum(stats_new[3].values())
     if tot2 == n_samples and tot3 == n_samples:
-        ok(f"Counter post-update coerenti: P2={tot2} P3={tot3} == {n_samples}")
+        ok(f"Post-update counters consistent: P2={tot2} P3={tot3} == {n_samples}")
         passed += 1
     else:
-        fail(f"Counter post-update: P2={tot2} P3={tot3} (atteso {n_samples})")
+        fail(f"Post-update counter: P2={tot2} P3={tot3} (expected {n_samples})")
 
     total += 1
     if stats_new[2] == stats_new[3]:
-        ok(f"P2 e P3 concordano post-update: HIT={stats_new[2]['HIT']}")
+        ok(f"P2 and P3 agree post-update: HIT={stats_new[2]['HIT']}")
         passed += 1
     else:
-        fail(f"P2/P3 discordano post-update: P2={stats_new[2]} P3={stats_new[3]}")
+        fail(f"P2/P3 disagree post-update: P2={stats_new[2]} P3={stats_new[3]}")
 
     _banner(passed, total)
     return passed == total
@@ -732,34 +732,34 @@ def suite_pktstats(n_samples=200, seed=42):
 # ===========================================================================
 def suite_extract(model_path):
     import json
-    print(f"\n{YELLOW}=== SUITE extract — coerenza pesi/quantizzazione ==={NC}\n")
+    print(f"\n{YELLOW}=== SUITE extract — weight/quantization consistency ==={NC}\n")
     print(f"  model: {model_path}")
     print()
 
     if not os.path.exists(model_path):
-        fail(f"Modello non trovato: {model_path}")
+        fail(f"Model not found: {model_path}")
         return False
 
     passed = total = 0
     shared_dir = os.path.dirname(os.path.abspath(model_path))
 
-    print(f"{YELLOW}[Test 1] extract_weights_int8() — range e lunghezza{NC}")
+    print(f"{YELLOW}[Test 1] extract_weights_int8() — range and length{NC}")
     total += 1
     try:
         model, I, H, O = load_pt_dynamic(model_path)
         floats = [w for p in model.parameters() for w in p.data.view(-1).tolist()]
         max_abs = max(abs(w) for w in floats)
-        scale_ew = int(127 / max_abs)  # formula di extract_weights.py
+        scale_ew = int(127 / max_abs)  # extract_weights.py formula
         n_weights_expected = I * H + H + H * H + H + H * O + O
         int8_weights = [max(-128, min(127, int(round(wf * scale_ew)))) for wf in floats]
 
         if len(int8_weights) == n_weights_expected:
-            ok(f"N_WEIGHTS = {len(int8_weights)} (atteso {n_weights_expected})")
+            ok(f"N_WEIGHTS = {len(int8_weights)} (expected {n_weights_expected})")
             passed += 1
         else:
-            fail(f"N_WEIGHTS = {len(int8_weights)} != atteso {n_weights_expected}")
+            fail(f"N_WEIGHTS = {len(int8_weights)} != expected {n_weights_expected}")
     except Exception as e:
-        fail(f"Eccezione durante estrazione: {e}")
+        fail(f"Exception during extraction: {e}")
         _banner(passed, total)
         return False
 
@@ -768,35 +768,35 @@ def suite_extract(model_path):
     scale_cs = compute_scale(model)
     both_valid = (scale_cs * max_abs <= 127.0 + 1e-6) and (scale_ew * max_abs <= 127.0 + 1e-6)
     if both_valid:
-        ok(f"Entrambi i scale validi: compute_scale={scale_cs} extract_weights={scale_ew} | max|w|={max_abs:.6f}")
+        ok(f"Both scales valid: compute_scale={scale_cs} extract_weights={scale_ew} | max|w|={max_abs:.6f}")
         passed += 1
     else:
-        fail(f"Scale non valido: compute_scale={scale_cs} extract_weights={scale_ew} max|w|={max_abs:.6f}")
+        fail(f"Invalid scale: compute_scale={scale_cs} extract_weights={scale_ew} max|w|={max_abs:.6f}")
 
-    print(f"\n{YELLOW}[Test 3] weights.json coerenza con estrazione live dal .pt{NC}")
+    print(f"\n{YELLOW}[Test 3] weights.json consistency with live extraction from .pt{NC}")
     total += 1
     wj_path = os.path.join(shared_dir, 'weights.json')
     if not os.path.exists(wj_path):
-        info(f"weights.json non trovato in {shared_dir} — test saltato")
+        info(f"weights.json not found in {shared_dir} — test skipped")
         total -= 1
     else:
         with open(wj_path) as f:
             saved_weights = json.load(f)
         if len(saved_weights) != len(int8_weights):
-            fail(f"Lunghezza diversa: weights.json={len(saved_weights)} vs live={len(int8_weights)}")
+            fail(f"Different length: weights.json={len(saved_weights)} vs live={len(int8_weights)}")
         else:
             mismatches = sum(1 for a, b in zip(saved_weights, int8_weights) if a != b)
             if mismatches == 0:
-                ok(f"weights.json identico all'estrazione live ({len(saved_weights)} pesi)")
+                ok(f"weights.json identical to live extraction ({len(saved_weights)} weights)")
                 passed += 1
             else:
-                fail(f"weights.json ha {mismatches}/{len(int8_weights)} pesi diversi dall'estrazione live")
-                info("  Rigenera con: python3 shared/extract_weights.py")
+                fail(f"weights.json has {mismatches}/{len(int8_weights)} weights differing from the live extraction")
+                info("  Regenerate with: python3 shared/extract_weights.py")
 
-    print(f"\n{YELLOW}[Test 4] weights_float.json — scale_factor e valori float{NC}")
+    print(f"\n{YELLOW}[Test 4] weights_float.json — scale_factor and float values{NC}")
     wf_path = os.path.join(shared_dir, 'weights_float.json')
     if not os.path.exists(wf_path):
-        info("weights_float.json non trovato — test saltato")
+        info("weights_float.json not found — test skipped")
     else:
         with open(wf_path) as f:
             wf_data = json.load(f)
@@ -805,7 +805,7 @@ def suite_extract(model_path):
 
         total += 1
         if saved_scale == scale_ew:
-            ok(f"scale_factor in weights_float.json = {saved_scale} == estratto = {scale_ew}")
+            ok(f"scale_factor in weights_float.json = {saved_scale} == extracted = {scale_ew}")
             passed += 1
         else:
             fail(f"scale_factor mismatch: file={saved_scale} vs live={scale_ew}")
@@ -814,12 +814,12 @@ def suite_extract(model_path):
         if len(saved_floats) == len(floats):
             max_diff = max(abs(a - b) for a, b in zip(saved_floats, floats))
             if max_diff < 1e-5:
-                ok(f"Float weights identici (max_diff={max_diff:.2e})")
+                ok(f"Float weights identical (max_diff={max_diff:.2e})")
                 passed += 1
             else:
-                fail(f"Float weights divergono (max_diff={max_diff:.2e})")
+                fail(f"Float weights diverge (max_diff={max_diff:.2e})")
         else:
-            fail(f"Lunghezza float diversa: file={len(saved_floats)} vs live={len(floats)}")
+            fail(f"Different float length: file={len(saved_floats)} vs live={len(floats)}")
 
     print(f"\n{YELLOW}[Test 5] Dequant: max|w_float - w_int8/scale| <= 1/scale{NC}")
     total += 1
@@ -828,12 +828,12 @@ def suite_extract(model_path):
     max_dequant_err = max(abs(a - b) for a, b in zip(floats, dequant))
     clamped_count   = sum(1 for w in int8_weights if w == 127 or w == -128)
     if max_dequant_err <= tol + 1e-9:
-        ok(f"max errore dequant = {max_dequant_err:.6f} <= {tol:.6f} (1/scale)")
+        ok(f"max dequant error = {max_dequant_err:.6f} <= {tol:.6f} (1/scale)")
         passed += 1
     else:
-        fail(f"max errore dequant = {max_dequant_err:.6f} > {tol:.6f} (1/scale)")
+        fail(f"max dequant error = {max_dequant_err:.6f} > {tol:.6f} (1/scale)")
     if clamped_count > 0:
-        info(f"  {clamped_count}/{len(int8_weights)} pesi clamped a +-127/128 (overflow int8)")
+        info(f"  {clamped_count}/{len(int8_weights)} weights clamped to +-127/128 (int8 overflow)")
 
     _banner(passed, total)
     return passed == total
@@ -866,20 +866,20 @@ def _evaluate_scale(model, scale, inputs, n_samples):
 
 
 def suite_quant(n_samples=200, model_path=None):
-    print(f"\n{YELLOW}=== SUITE quant — accuracy argmax vs scale_factor ==={NC}\n")
+    print(f"\n{YELLOW}=== SUITE quant — argmax accuracy vs scale_factor ==={NC}\n")
     torch.manual_seed(42)
     np.random.seed(42)
 
     if model_path and os.path.exists(model_path):
         model, I, H, O = load_pt_dynamic(model_path)
-        print(f"  Modello: {model_path} | arch={I}->{H}->{H}->{O}")
+        print(f"  Model: {model_path} | arch={I}->{H}->{H}->{O}")
     else:
         model = FRRModel()
         I = model.fc1.in_features
         H = model.fc1.out_features
         O = model.out.out_features
-        print(f"  Modello: pesi casuali (seed=42) | arch={I}->{H}->{H}->{O}")
-    print(f"  Campioni: {n_samples} | scale_factors: {SCALE_FACTORS}")
+        print(f"  Model: random weights (seed=42) | arch={I}->{H}->{H}->{O}")
+    print(f"  Samples: {n_samples} | scale_factors: {SCALE_FACTORS}")
     print()
 
     inputs = [make_input(I) for _ in range(n_samples)]
@@ -899,42 +899,42 @@ def suite_quant(n_samples=200, model_path=None):
 
     passed = total = 0
 
-    print(f"{YELLOW}[Test A] max_err M2 decresce (o stabile) al crescere dello scale{NC}")
+    print(f"{YELLOW}[Test A] max_err M2 decreases (or stable) as scale increases{NC}")
     total += 1
     errs2 = [results[sf][0] for sf in SCALE_FACTORS]
     first_half_avg = sum(errs2[:3]) / 3
     second_half_avg = sum(errs2[3:]) / 3
     if first_half_avg >= second_half_avg - 1e-4:
-        ok(f"Tendenza corretta: scale basso -> err alto ({first_half_avg:.4f}) scale alto -> err basso ({second_half_avg:.4f})")
+        ok(f"Correct trend: low scale -> high err ({first_half_avg:.4f}) high scale -> low err ({second_half_avg:.4f})")
         passed += 1
     else:
-        fail(f"Tendenza inattesa: scale basso avg_err={first_half_avg:.4f} < scale alto avg_err={second_half_avg:.4f}")
+        fail(f"Unexpected trend: low scale avg_err={first_half_avg:.4f} < high scale avg_err={second_half_avg:.4f}")
 
-    print(f"\n{YELLOW}[Test B] M2 e M3 hanno max_err identico per ogni scale{NC}")
+    print(f"\n{YELLOW}[Test B] M2 and M3 have identical max_err for each scale{NC}")
     total += 1
     all_equal = all(abs(results[sf][0] - results[sf][3]) < 1e-9 for sf in SCALE_FACTORS)
     if all_equal:
-        ok("M2 e M3 producono identico max_err per tutti gli scale")
+        ok("M2 and M3 produce identical max_err for all scales")
         passed += 1
     else:
         diffs = [sf for sf in SCALE_FACTORS if abs(results[sf][0] - results[sf][3]) >= 1e-9]
-        fail(f"M2 e M3 divergono per scale={diffs}")
+        fail(f"M2 and M3 diverge for scale={diffs}")
 
-    print(f"\n{YELLOW}[Test C] compute_scale() accuracy >= media degli altri scale{NC}")
+    print(f"\n{YELLOW}[Test C] compute_scale() accuracy >= average of other scales{NC}")
     total += 1
     optimal_scale = compute_scale(model)
     if optimal_scale not in results:
         results[optimal_scale] = _evaluate_scale(model, optimal_scale, inputs, n_samples)
     avg_acc2 = sum(results[sf][1] for sf in SCALE_FACTORS) / len(SCALE_FACTORS)
     opt_acc2 = results[optimal_scale][1]
-    info(f"  compute_scale()={optimal_scale} -> acc={opt_acc2:.1f}% | media={avg_acc2:.1f}%")
+    info(f"  compute_scale()={optimal_scale} -> acc={opt_acc2:.1f}% | avg={avg_acc2:.1f}%")
     if opt_acc2 >= avg_acc2 - 1.0:
-        ok(f"compute_scale accuracy ({opt_acc2:.1f}%) >= media ({avg_acc2:.1f}%) - 1%")
+        ok(f"compute_scale accuracy ({opt_acc2:.1f}%) >= avg ({avg_acc2:.1f}%) - 1%")
         passed += 1
     else:
-        fail(f"compute_scale accuracy ({opt_acc2:.1f}%) < media ({avg_acc2:.1f}%)")
+        fail(f"compute_scale accuracy ({opt_acc2:.1f}%) < avg ({avg_acc2:.1f}%)")
 
-    print(f"\n{YELLOW}[Test D] max_err <= H/scale per ogni scale (bound teorico){NC}")
+    print(f"\n{YELLOW}[Test D] max_err <= H/scale for each scale (theoretical bound){NC}")
     for sf in SCALE_FACTORS:
         total += 1
         err2 = results[sf][0]
@@ -984,7 +984,7 @@ _EDGE_CASES = [
 
 
 def suite_robust():
-    print(f"\n{YELLOW}=== SUITE robust — input anomali ==={NC}\n")
+    print(f"\n{YELLOW}=== SUITE robust — anomalous inputs ==={NC}\n")
     torch.manual_seed(42)
     np.random.seed(42)
 
@@ -992,7 +992,7 @@ def suite_robust():
     I = model.fc1.in_features
     O = model.out.out_features
     H = model.fc1.out_features
-    print(f"  Architettura: {I} -> {H} -> {H} -> {O}")
+    print(f"  Architecture: {I} -> {H} -> {H} -> {O}")
     print()
 
     m1 = Method1_Hardcoded(model)
@@ -1022,22 +1022,22 @@ def suite_robust():
                     if not finite: reasons.append(f"output non finito: {out}")
                     fail(f"P{mid} {mname:<10}: {' | '.join(reasons)}")
             except Exception as e:
-                fail(f"P{mid} {mname:<10}: eccezione — {e}")
+                fail(f"P{mid} {mname:<10}: exception — {e}")
 
         total += 1
         try:
             a2 = int(np.argmax(m2.infer(x)))
             a3 = int(np.argmax(m3.infer(x)))
             if a2 == a3:
-                ok(f"  P2 e P3 concordano su input anomalo: argmax={a2}")
+                ok(f"  P2 and P3 agree on anomalous input: argmax={a2}")
                 passed += 1
             else:
-                fail(f"  P2={a2} e P3={a3} discordano su input anomalo '{case_name}'")
+                fail(f"  P2={a2} and P3={a3} disagree on anomalous input '{case_name}'")
         except Exception as e:
-            fail(f"  Eccezione nella verifica consistenza: {e}")
+            fail(f"  Exception in the consistency check: {e}")
         print()
 
-    print(f"{YELLOW}[Stress] 1000 input out-of-range [-10, 10] senza crash{NC}")
+    print(f"{YELLOW}[Stress] 1000 out-of-range inputs [-10, 10] without crashes{NC}")
     total += 1
     n_crash = 0
     for _ in range(1000):
@@ -1051,10 +1051,10 @@ def suite_robust():
         except Exception:
             n_crash += 1
     if n_crash == 0:
-        ok("Nessun crash su 1000 input stress (range [-10,10])")
+        ok("No crash over 1000 stress inputs (range [-10,10])")
         passed += 1
     else:
-        fail(f"{n_crash}/1000 input stress hanno causato argmax invalido o eccezione")
+        fail(f"{n_crash}/1000 stress inputs caused invalid argmax or exception")
 
     _banner(passed, total)
     return passed == total
@@ -1063,25 +1063,41 @@ def suite_robust():
 # ===========================================================================
 # Driver
 # ===========================================================================
-# SUITE kernel — metriche in-kernel via BPF_PROG_TEST_RUN (richiede Linux+BCC+root)
-#   Copre le metriche del professore non ottenibili in userspace:
-#   #istruzioni eBPF, latenza per-pacchetto reale, throughput Mpps, CPU%.
-#   Include anche il gate di correttezza del dispatch (verify_prog_run.run).
-#   Degrada con grazia (return True = skip, non fail) dove BCC/root mancano.
+# SUITE kernel — in-kernel metrics via BPF_PROG_TEST_RUN (requires Linux+BCC+root)
+#   Covers the metrics not obtainable in userspace:
+#   #eBPF instructions, real per-packet latency, throughput Mpps, CPU%.
+#   Also includes the dispatch correctness gate (verify_prog_run.run).
+#   Degrades gracefully (return True = skip, not fail) where BCC/root are missing.
 # ===========================================================================
+# Union of BPF map names across the three pipelines; suite_kernel probes each
+# and skips the ones absent from a given loaded object (memory is read from the
+# kernel per map, so only the names are structural — the byte counts are real).
+_PIPELINE_MAP_NAMES = [
+    # Pipeline 1 (hardcoded)
+    "model_cache", "pkt_stats", "cls_stats", "model_progs",
+    "miss_events", "model_miss_events", "ev_scratch", "mev_scratch", "debug_stats",
+    # Pipeline 2 (template)
+    "arch_weights", "arch_registry", "arch_progs",
+    "fwd_table_t2", "valid_keys_t2", "pkt_stats_t2", "miss_events_t2",
+    # Pipeline 3 (modular)
+    "layer_weights", "layer_registry", "layer_chain", "scratch_acts", "scratch_meta",
+    "fwd_table_t3", "valid_keys_t3", "pkt_stats_t3", "miss_events_t3",
+]
+
+
 def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=True):
-    print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (istruzioni, latenza, throughput, CPU) ==={NC}\n")
+    print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
 
     if not sys.platform.startswith("linux"):
-        info(f"kernel suite saltata: piattaforma {sys.platform} (serve Linux).")
-        info("Esegui in Kathara / host Linux: sudo python3 shared/test_suite.py --only kernel")
+        info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
+        info("Run in Kathara / a Linux host: sudo python3 shared/test_suite.py --only kernel")
         return True
 
     try:
         import verify_prog_run as V
     except Exception as e:
-        info(f"kernel suite saltata: BCC/verify_prog_run non importabile ({e}).")
-        info("Serve Linux + BCC + root. In Kathara: kathara exec frankfurt -- "
+        info(f"kernel suite skipped: BCC/verify_prog_run not importable ({e}).")
+        info("Needs Linux + BCC + root. In Kathara: kathara exec frankfurt -- "
              "python3 /shared/test_suite.py --only kernel")
         return True
 
@@ -1098,19 +1114,19 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         try:
             setup = setup_fn(0, mp)
         except PermissionError:
-            info(f"{name}: permesso negato caricando XDP (serve root/CAP_BPF) — suite saltata.")
+            info(f"{name}: permission denied loading XDP (needs root/CAP_BPF) — suite skipped.")
             return True
         except Exception as e:
-            # Il primo load fallito per mancanza di privilegi/kernel = skip, non fail.
+            # First load failing for missing privileges/kernel = skip, not fail.
             msg = str(e).lower()
             if "operation not permitted" in msg or "permission" in msg:
-                info(f"{name}: {e} — serve root. Suite saltata.")
+                info(f"{name}: {e} — needs root. Suite skipped.")
                 return True
-            fail(f"{name}: setup fallito ({e})")
+            fail(f"{name}: setup failed ({e})")
             all_ok = False
             continue
 
-        # --- #istruzioni eBPF (somma su tutti i programmi della pipeline) ---
+        # --- #eBPF instructions (summed over all pipeline programs) ---
         per_prog   = []
         insn_total = 0
         jit_total  = 0
@@ -1121,14 +1137,14 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
                 jit_total  += (jb or 0)
                 per_prog.append((pname, ic))
 
-        # --- latenza / throughput: esegue il DISPATCHER (segue i tail call) ---
+        # --- latency / throughput: run the DISPATCHER (follows tail calls) ---
         disp_fd = setup["disp"].fd
         frame   = V.build_frame(0, ttl_max, setup["scale"])
         # warm-up
         try:
             V.prog_test_run(disp_fd, frame, repeat=1000)
         except OSError as e:
-            fail(f"{name}: BPF_PROG_TEST_RUN fallito ({e})")
+            fail(f"{name}: BPF_PROG_TEST_RUN failed ({e})")
             all_ok = False
             continue
 
@@ -1140,40 +1156,49 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
 
         cpu_s   = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
         cpu_pct = 100.0 * cpu_s / wall if wall > 0 else 0.0
-        # dur_ns = durata media di UNA run riportata dal kernel
+        # dur_ns = average duration of ONE run reported by the kernel
         lat_ns  = float(dur_ns) if dur_ns else (wall * 1e9 / repeat)
         mpps    = (1000.0 / lat_ns) if lat_ns > 0 else 0.0
+
+        # --- map memory: measured from the kernel (BPF_OBJ_GET_INFO per map) ---
+        mem = 0
+        for mname in _PIPELINE_MAP_NAMES:
+            try:
+                mem += V.map_bytes(setup["b"][mname].map_fd, V._NR_CPUS)
+            except Exception:
+                pass  # map not present in this pipeline
 
         rows.append({
             "name": name, "pl": pl, "insn": insn_total, "jit": jit_total,
             "per": per_prog, "lat": lat_ns, "mpps": mpps, "cpu": cpu_pct,
-            "retval": retval,
+            "retval": retval, "mem": mem, "n_tail": setup.get("n_tail", 0),
         })
-        ok(f"{name:9s}: {insn_total:5d} istr eBPF | lat={lat_ns:8.1f} ns | "
+        ok(f"{name:9s}: {insn_total:5d} eBPF instr | lat={lat_ns:8.1f} ns | "
            f"{mpps:6.3f} Mpps | CPU={cpu_pct:4.0f}% | retval={retval}")
 
     if not rows:
         return all_ok
 
-    # --- tabella riepilogo metriche kernel ---
+    # --- kernel metrics summary table ---
     print()
-    print("  Metrica                         " + "".join(f"{r['name']:>16}" for r in rows))
+    print("  Metric                          " + "".join(f"{r['name']:>16}" for r in rows))
     print("  " + "-" * (32 + 16 * len(rows)))
     def line(label, key, fmt):
         print(f"  {label:<32}" + "".join(f"{fmt(r[key]):>16}" for r in rows))
-    line("Istruzioni eBPF (xlated)", "insn", lambda v: f"{v}")
-    line("Codice jited (byte)",      "jit",  lambda v: f"{v}")
-    line("Tail calls / pacchetto",   "pl",   lambda v: {1: "1", 2: "1", 3: "4"}[v])
-    line("Latenza (ns/pkt)",         "lat",  lambda v: f"{v:.1f}")
-    line("Throughput (Mpps)",        "mpps", lambda v: f"{v:.3f}")
-    line("CPU (%)",                  "cpu",  lambda v: f"{v:.0f}")
+    line("eBPF instructions (xlated)", "insn",   lambda v: f"{v}")
+    line("Jited code (bytes)",      "jit",    lambda v: f"{v}")
+    line("Tail calls / packet",   "n_tail", lambda v: f"{v}")
+    line("Map memory (bytes)",     "mem",    lambda v: f"{v}")
+    line("Latency (ns/pkt)",         "lat",    lambda v: f"{v:.1f}")
+    line("Throughput (Mpps)",        "mpps",   lambda v: f"{v:.3f}")
+    line("CPU (%)",                  "cpu",    lambda v: f"{v:.0f}")
     print("  " + "-" * (32 + 16 * len(rows)))
     print()
     for r in rows:
         detail = "  ".join(f"{p}={c}" for p, c in r["per"])
-        info(f"{r['name']:9s} programmi: {detail}")
+        info(f"{r['name']:9s} programs: {detail}")
 
-    # --- gate di correttezza: dispatch reale via verify_prog_run.run ---
+    # --- correctness gate: real dispatch via verify_prog_run.run ---
     if verify:
         print()
         for name, _, _ in methods:
@@ -1182,10 +1207,10 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
                 if failed == 0:
                     ok(f"dispatch {name}: PASS (TTL {ttl_min}-{ttl_max})")
                 else:
-                    fail(f"dispatch {name}: {failed} TTL falliti")
+                    fail(f"dispatch {name}: {failed} TTL failed")
                     all_ok = False
             except Exception as e:
-                fail(f"dispatch {name}: errore ({e})")
+                fail(f"dispatch {name}: error ({e})")
                 all_ok = False
 
     print(f"\n{'='*52}")
@@ -1196,8 +1221,8 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
 
 # ===========================================================================
 def _load_default_model(model_arg):
-    """Carica il .pt (se compatibile con l'arch di default) o usa pesi casuali,
-    replicando la logica del vecchio test_local.main."""
+    """Load the .pt (if compatible with the default arch) or use random weights,
+    replicating the old test_local.main logic."""
     torch.manual_seed(42)
     np.random.seed(42)
     model = FRRModel()
@@ -1208,33 +1233,33 @@ def _load_default_model(model_arg):
             loaded, li, lh, lo = load_pt_dynamic(pt_path)
             if li == INPUT_SIZE and lh == HIDDEN_DIM:
                 model = loaded
-                print(f"{GREEN}[OK]{NC} Modello caricato da {pt_path} (arch {li}->{lh}->{lo})")
+                print(f"{GREEN}[OK]{NC} Model loaded from {pt_path} (arch {li}->{lh}->{lo})")
             else:
-                print(f"{YELLOW}[INFO]{NC} .pt ha arch {li}->{lh}->{lo} (diversa da default "
+                print(f"{YELLOW}[INFO]{NC} .pt has arch {li}->{lh}->{lo} (differs from default "
                       f"{INPUT_SIZE}->{HIDDEN_DIM}->{OUTPUT_SIZE})")
-                print(f"{YELLOW}[INFO]{NC} core Test 1-4 usano pesi casuali (seed=42), Test 5 usa il .pt")
+                print(f"{YELLOW}[INFO]{NC} core Test 1-4 use random weights (seed=42), Test 5 uses the .pt")
         except Exception as e:
-            print(f"{YELLOW}[WARN]{NC} {e} — uso pesi casuali")
+            print(f"{YELLOW}[WARN]{NC} {e} — using random weights")
     else:
-        print(f"{YELLOW}[INFO]{NC} Nessun .pt trovato — pesi casuali (seed=42)")
+        print(f"{YELLOW}[INFO]{NC} No .pt found — random weights (seed=42)")
     return model, pt_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Suite di test locale IPA (3 metodi) — accorpa i vecchi test_*.py")
+        description="Local IPA test suite (3 methods) — consolidates the old test_*.py")
     parser.add_argument('--only', default='all',
                         choices=['all', 'core', 'pktstats', 'extract', 'quant', 'robust', 'kernel'],
-                        help='Quale suite eseguire (default: all)')
-    parser.add_argument('--model', type=str, default=None, help='Path al checkpoint .pt')
-    parser.add_argument('--verbose', action='store_true', help='Dettagli extra (suite core)')
+                        help='Which suite to run (default: all)')
+    parser.add_argument('--model', type=str, default=None, help='Path to the .pt checkpoint')
+    parser.add_argument('--verbose', action='store_true', help='Extra detail (core suite)')
     parser.add_argument('--samples', type=int, default=200,
-                        help='Campioni per pktstats/quant')
-    parser.add_argument('--seed', type=int, default=42, help='Seed per pktstats')
+                        help='Samples for pktstats/quant')
+    parser.add_argument('--seed', type=int, default=42, help='Seed for pktstats')
     parser.add_argument('--kernel-repeat', type=int, default=50000,
-                        help='Ripetizioni BPF_PROG_TEST_RUN per la suite kernel')
+                        help='BPF_PROG_TEST_RUN repeats for the kernel suite')
     parser.add_argument('--no-verify', action='store_true',
-                        help='Suite kernel: salta il gate di dispatch (solo metriche)')
+                        help='Kernel suite: skip the dispatch gate (metrics only)')
     args = parser.parse_args()
 
     all_suites = ['core', 'pktstats', 'extract', 'quant', 'robust', 'kernel']
@@ -1258,7 +1283,7 @@ def main():
                                          verify=not args.no_verify)
 
     print(f"{YELLOW}{'#'*52}{NC}")
-    print(f"{YELLOW}#  RIEPILOGO SUITE{NC}")
+    print(f"{YELLOW}#  SUITE SUMMARY{NC}")
     for name, res in results.items():
         tag = f"{GREEN}PASS{NC}" if res else f"{RED}FAIL{NC}"
         print(f"   {name:<10} : {tag}")

@@ -25,28 +25,16 @@ Control-plane split of responsibilities
   loaded XDP programs via bpf_obj[name] (only maps), so the fd must be
   obtained from the .load_func() return value in the caller.
 
-Fixed bugs (2026-07-08):
-  1) Stack overflow: `long long iv[T2_N_IN]` (65*8B = 520B).
-  2) Feature-encoding mismatch (old iv[0]=model_id encoding).
-  Fix: sparse dot-product via BPF_ARRAY index arithmetic.
-
-Fixed bugs (2026-07-09 v5-v6):
-  3) sdiv i64 not supported by BPF LLVM -> use udiv.
-  4) ingress_ifindex=65536 in sandbox -> explicit clamp to [0,6].
-
-Fixed bugs (2026-07-09 v8):
-  5) libbcc bpf_update_elem not public ABI -> raw bpf(2) syscall.
-
-Fixed bugs (2026-07-09 v9):
-  6) value_size mismatch: detect real slot size via BPF_OBJ_GET_INFO_BY_FD.
-
-Fixed bugs (2026-07-09 v10):
-  7) ARCH_PROGS NOT POPULATED (analysis was correct, fix location wrong):
-     arch_progs wiring belongs in the caller (setup_template), not here,
-     because bpf_obj["arch_65_4_4_7"] raises KeyError (programs are not
-     accessible via bpf_obj[name], only maps are).
-     verify_prog_run.py already does the wiring correctly before calling
-     load_arch_weights.  Removed the broken block from this file.
+Implementation notes:
+  - Inference uses a sparse dot-product over the one-hot feature vector via
+    BPF_ARRAY index arithmetic, avoiding a large on-stack activation array.
+  - The output key division uses unsigned division (BPF LLVM has no signed
+    64-bit divide), with an OUTPUT_OFFSET bias to keep the numerator positive.
+  - ingress_ifindex is clamped to [0,6]; under BPF_PROG_TEST_RUN it is a
+    sandbox value outside that range and is treated as "no ingress iface".
+  - Weights are written through the raw bpf(2) syscall (libbcc does not export
+    a stable bpf_update_elem); the real map slot size is detected via
+    BPF_OBJ_GET_INFO_BY_FD before writing.
 """
 
 import ctypes as ct
