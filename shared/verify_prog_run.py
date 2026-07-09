@@ -25,8 +25,8 @@ import sys
 import struct
 import argparse
 import ctypes as ct
-
-import numpy as np
+import zipfile
+import io
 
 from bcc import BPF
 
@@ -77,6 +77,86 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
         err = ct.get_errno()
         raise OSError(err, os.strerror(err))
     return attr.retval, attr.duration
+
+# ---------------------------------------------------------------------------
+# Pure-stdlib .npz loader (no numpy required)
+# ---------------------------------------------------------------------------
+# A .npz file is a ZIP archive where each array is stored as a .npy entry.
+# The .npy format (v1.0) is:
+#   magic: \x93NUMPY  (6 bytes)
+#   version: major(1) minor(0)  (2 bytes)
+#   header_len: uint16 LE  (2 bytes)
+#   header: ASCII Python dict literal  (header_len bytes)
+#   data: raw array bytes (C-order)
+#
+# We only need to read 1-D int8/int32/int64 arrays and scalar integers,
+# which covers the 'weights' and 'scale' keys used by load_weights().
+
+_NPY_DTYPE_SIZES = {
+    '|i1': 1, '<i1': 1,  # int8
+    '|u1': 1, '<u1': 1,  # uint8
+    '<i2': 2,            # int16
+    '<i4': 4,            # int32
+    '<i8': 8,            # int64
+    '<f4': 4,            # float32
+    '<f8': 8,            # float64
+}
+
+_NPY_STRUCT_FMT = {
+    '|i1': 'b', '<i1': 'b',
+    '|u1': 'B', '<u1': 'B',
+    '<i2': 'h',
+    '<i4': 'i',
+    '<i8': 'q',
+    '<f4': 'f',
+    '<f8': 'd',
+}
+
+def _parse_npy(data: bytes):
+    """Parse a .npy byte string; return a flat Python list of numbers."""
+    magic = b'\x93NUMPY'
+    if data[:6] != magic:
+        raise ValueError('Not a valid .npy file')
+    # version bytes at [6],[7] — we support v1.0 and v2.0
+    major = data[6]
+    if major == 1:
+        header_len = struct.unpack_from('<H', data, 8)[0]
+        header_start = 10
+    elif major == 2:
+        header_len = struct.unpack_from('<I', data, 8)[0]
+        header_start = 12
+    else:
+        raise ValueError(f'Unsupported .npy version {major}')
+    header = data[header_start:header_start + header_len].decode('latin1').strip()
+    # Parse dtype and shape from the header dict literal
+    # e.g. {'descr': '<i1', 'fortran_order': False, 'shape': (319,), }
+    import ast
+    hdict = ast.literal_eval(header)
+    dtype = hdict['descr']
+    shape = hdict['shape']   # tuple
+    data_start = header_start + header_len
+    raw = data[data_start:]
+    elem_size = _NPY_DTYPE_SIZES.get(dtype)
+    fmt_char  = _NPY_STRUCT_FMT.get(dtype)
+    if elem_size is None or fmt_char is None:
+        raise ValueError(f'Unsupported dtype {dtype} in .npy')
+    n_elems = 1
+    for s in shape:
+        n_elems *= s
+    values = list(struct.unpack_from(f'<{n_elems}{fmt_char}', raw, 0))
+    return values
+
+
+def _load_npz(path: str) -> dict:
+    """Load a .npz file without numpy; returns dict of key -> flat Python list."""
+    result = {}
+    with zipfile.ZipFile(path, 'r') as zf:
+        for name in zf.namelist():
+            key = name[:-4] if name.endswith('.npy') else name
+            raw = zf.read(name)
+            result[key] = _parse_npy(raw)
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Frame builder
@@ -178,13 +258,23 @@ def _ref_infer(weights, scale: int, ttl: int, model_id: int,
     return best_cls, best_val, key
 
 # ---------------------------------------------------------------------------
-# Load model weights from .npz
+# Load model weights from .npz  (stdlib only — no numpy)
 # ---------------------------------------------------------------------------
 
 def load_weights(model_path: str):
-    data = np.load(model_path, allow_pickle=True)
-    weights = data['weights'].tolist()
-    scale   = int(data['scale']) if 'scale' in data else 128
+    """
+    Load weights and scale from a .npz file without numpy.
+    The .npz must contain:
+      'weights' : 1-D int8 array
+      'scale'   : scalar int (stored as 0-D or 1-D int array)
+    """
+    npz = _load_npz(model_path)
+    weights = [int(v) for v in npz['weights']]
+    if 'scale' in npz:
+        scale_raw = npz['scale']
+        scale = int(scale_raw[0]) if isinstance(scale_raw, list) else int(scale_raw)
+    else:
+        scale = 128
     return weights, scale
 
 # ---------------------------------------------------------------------------
@@ -385,7 +475,7 @@ def run(method: str, model_id: int, model_path: str,
             failed += 1
         lat_us = duration_ns / 1000 / repeat
         print(f"  TTL={ttl:3d}  retval={retval}  ref_cls={ref_cls}  "
-              f"ref_key={ref_key}  lat={lat_us:.2f}µs  [{status}]")
+              f"ref_key={ref_key}  lat={lat_us:.2f}\u00b5s  [{status}]")
 
     print("-" * 68)
     print(f"Results: {passed} PASS / {failed} FAIL  "
