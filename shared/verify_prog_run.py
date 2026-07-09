@@ -446,10 +446,17 @@ def setup_modular(model_id: int, model_path: str):
     b["layer_chain"][ct.c_int(2)] = ct.c_int(lf2.fd)
     load_modular_weights(b, weights, model_id=model_id, scale=scale)
     w_off_out = (65 * 4 + 4) + (4 * 4 + 4)  # 284
-    print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
+    # Run the FULL chain: TEST_RUN on modular_dispatcher, which writes
+    # scratch_meta + scratch_acts itself (on the executing CPU) and tail-calls
+    # layer_65_4 -> layer_4_4 -> layer_4_7_argmax. This exercises the real
+    # pipeline (the point of Pipeline 3: multiple tail calls + scratch state)
+    # and avoids fragile userspace PERCPU priming (BCC sizes PERCPU maps by
+    # POSSIBLE cpus, so hand-priming the wrong CPU slot left the argmax input
+    # stale -> key mismatch/MISS).
+    print(f"[P3 setup] running full dispatcher chain (3 tail calls)")
     return {
         "b":         b,
-        "fn":        lf2,
+        "fn":        disp_fn,
         "disp":      disp_fn,
         "weights":   weights,
         "scale":     scale,
@@ -460,6 +467,7 @@ def setup_modular(model_id: int, model_path: str):
         "fwd_table":  "fwd_table_t3",
         "valid_keys": "valid_keys_t3",
         "w_off_out":  w_off_out,
+        "prime_scratch": False,
     }
 
 # ---------------------------------------------------------------------------
@@ -547,7 +555,7 @@ def run(method: str, model_id: int, model_path: str,
         ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=0)
         expected_key = _compute_fwd_key(ref_val, scale)
 
-        if pipeline == 3:
+        if pipeline == 3 and setup.get("prime_scratch"):
             _prime_scratch_p3(b, h2, scale, model_id,
                               w_off_out=w_off_out,
                               ingress_ifindex=0, ttl=ttl)
