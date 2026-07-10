@@ -439,9 +439,17 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
 
 
 def load_arch_weights(bpf_obj, weights_int8: list,
-                      model_id: int = 0, scale: int = 128) -> None:
+                      model_id: int = 0, scale: int = 128,
+                      weight_offset: int = 0) -> None:
     """
     Populate arch_weights and arch_registry for Pipeline 2.
+
+    weight_offset lets the caller register several model_id entries in the
+    same arch_weights array without overlapping their weight blocks: call
+    this once per model_id with a distinct, non-overlapping weight_offset
+    (e.g. i * N_WEIGHTS_T2). All entries share the same arch_id (arch_65_4_4_7
+    is the only compiled shape), so the dispatcher resolves model_id ->
+    weight_offset via arch_registry and tail-calls the same leaf program.
 
     DOES NOT touch arch_progs.  The caller (setup_template in
     verify_prog_run.py) is responsible for wiring the tail-call array:
@@ -452,9 +460,13 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     """
     from ctypes import c_uint8, c_uint32, c_uint16, Structure
 
-    weight_offset = 0
     arch_id       = 0
     map_fd        = bpf_obj["arch_weights"].map_fd
+
+    if weight_offset + N_WEIGHTS_T2 > 1024:  # MAX_WEIGHT_ENTRIES in the eBPF source
+        raise ValueError(
+            f"weight_offset={weight_offset} + N_WEIGHTS_T2={N_WEIGHTS_T2} "
+            f"exceeds MAX_WEIGHT_ENTRIES=1024 -- too many concurrent model_id's")
 
     value_size = _get_map_value_size(map_fd)
     print(f"[Pipeline2] arch_weights fd={map_fd} value_size={value_size} bytes/slot")
@@ -464,11 +476,11 @@ def load_arch_weights(bpf_obj, weights_int8: list,
                              index=weight_offset + idx,
                              int8_val=int(w))
 
-    # Post-load sanity check: read back weight[0].
-    v0       = _bpf_map_lookup_char(map_fd, value_size, 0)
+    # Post-load sanity check: read back weight[0] of this model's block.
+    v0       = _bpf_map_lookup_char(map_fd, value_size, weight_offset)
     expected = ct.c_int8(int(weights_int8[0])).value
     ok       = "OK" if v0 == expected else f"MISMATCH got={v0} expected={expected}"
-    print(f"[Pipeline2] arch_weights[0] verify: {ok}")
+    print(f"[Pipeline2] arch_weights[{weight_offset}] verify: {ok}")
 
     class ArchEntry(Structure):
         _pack_ = 1

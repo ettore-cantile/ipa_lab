@@ -70,17 +70,27 @@ def _populate_mac_t2(b: BPF, egress_iface: str, egress_ifindex: int):
           f"src={':'.join(f'{b:02x}' for b in src_mac)} dst={':'.join(f'{b:02x}' for b in dst_mac)}")
 
 
-def run(model_id: int = 42, iface: str = None):
+def run(model_id: int = 42, iface: str = None, model_ids: list = None):
     """
     iface: network interface to attach XDP to.
            Defaults to INGRESS_IFACE from common.py if not specified.
            Pass the correct interface for the lab topology (e.g. 'eth0' for
            darmstadt->frankfurt direct link l59 in lab.conf).
+    model_ids: optional list of model_id's to register concurrently, all
+           sharing the arch_65_4_4_7 shape. Each gets its own, non-overlapping
+           slice of the arch_weights map (weight_offset = i * N_WEIGHTS_T2), so
+           the dispatcher can serve several models in the same run without a
+           reload -- the flexibility hardcoded Pipeline 1 cannot offer.
+           Defaults to [model_id] (single-model, backward compatible).
+           All registered models currently reuse the same trained weights
+           (only one .pt is checked into the repo); this exercises the
+           multi-model registry/dispatch mechanism, not distinct models.
     """
     ingress_iface = iface if iface else INGRESS_IFACE
+    ids = list(model_ids) if model_ids else [model_id]
     weights_path = os.path.join(_SHARED_DIR, "weights.json")
     float_path   = os.path.join(_SHARED_DIR, "weights_float.json")
-    print(f"[Method 5 - Arch Template] | model_id: {model_id} | iface: {ingress_iface}")
+    print(f"[Method 5 - Arch Template] | model_ids: {ids} | iface: {ingress_iface}")
 
     if not os.path.exists(float_path):
         print(f"[ERROR] {float_path} not found. Run extract_weights.py first.")
@@ -107,8 +117,11 @@ def run(model_id: int = 42, iface: str = None):
                     + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7)
     b = BPF(text=combined_src)
 
-    # Populate arch_registry and arch_weights map
-    load_arch_weights(b, integer_weights, model_id=model_id, scale=SCALE_FACTOR)
+    # Populate arch_registry and arch_weights map: one non-overlapping
+    # weight block per model_id, all pointing at the same arch program.
+    for i, mid in enumerate(ids):
+        load_arch_weights(b, integer_weights, model_id=mid, scale=SCALE_FACTOR,
+                          weight_offset=i * N_WEIGHTS_T2)
 
     # Register arch_65_4_4_7 function in the arch_progs tail-call map
     fn_arch = b.load_func("arch_65_4_4_7", BPF.XDP)

@@ -425,12 +425,21 @@ def load_modular_weights(
     weights_int8: list,
     model_id: int = 0,
     scale: int = 128,
-    n_in: int = 65, n_h1: int = 4, n_h2: int = 4, n_out: int = 7
+    n_in: int = 65, n_h1: int = 4, n_h2: int = 4, n_out: int = 7,
+    base_offset: int = 0
 ) -> None:
     """
     Populate layer_registry and layer_weights for Pipeline 3.
 
-    Weight layout in flat array:
+    base_offset lets the caller register several model_id entries in the
+    same layer_weights array without overlapping their weight blocks: call
+    this once per model_id with a distinct, non-overlapping base_offset
+    (e.g. i * (fc1_size + fc2_size + out_size)). All entries reuse the same
+    compiled layer chain (layer_65_4 -> layer_4_4 -> layer_4_7_argmax); the
+    dispatcher resolves model_id -> per-model weight offsets via
+    layer_registry before the first tail call.
+
+    Weight layout in flat array (relative to base_offset):
       [0 .. n_in*n_h1-1]            fc1 weights
       [n_in*n_h1 .. +n_h1-1]        fc1 biases
       [.. .. +n_h1*n_h2-1]           fc2 weights
@@ -449,13 +458,19 @@ def load_modular_weights(
     fc1_size = n_in * n_h1 + n_h1    # 264
     fc2_size = n_h1 * n_h2 + n_h2    # 20
     out_size = n_h2 * n_out + n_out   # 35
+    model_size = fc1_size + fc2_size + out_size
 
-    w_off_fc1 = 0
-    w_off_fc2 = fc1_size
-    w_off_out = fc1_size + fc2_size
+    if base_offset + model_size > 2048:  # MAX_LAYER_WEIGHT_ENTRIES in the eBPF source
+        raise ValueError(
+            f"base_offset={base_offset} + model_size={model_size} "
+            f"exceeds MAX_LAYER_WEIGHT_ENTRIES=2048 -- too many concurrent model_id's")
 
-    for idx, w in enumerate(weights_int8[:fc1_size + fc2_size + out_size]):
-        key = c_uint32(idx)
+    w_off_fc1 = base_offset
+    w_off_fc2 = base_offset + fc1_size
+    w_off_out = base_offset + fc1_size + fc2_size
+
+    for idx, w in enumerate(weights_int8[:model_size]):
+        key = c_uint32(base_offset + idx)
         val = c_uint8(int(w) & 0xFF)
         bpf_obj["layer_weights"][key] = val
 

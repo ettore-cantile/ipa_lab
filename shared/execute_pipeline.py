@@ -70,6 +70,15 @@ For the full metric comparison across pipelines:
         help="Model ID to register (default: 0)"
     )
     parser.add_argument(
+        "--model-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Register several model_id's concurrently (template/modular only; "
+             "ignored by hardcoded, which is single-model by design). "
+             "Overrides --model-id when given."
+    )
+    parser.add_argument(
         "--model",
         default=None,
         help="Path to .pt checkpoint (default: shared/frr_germany50_5_model_4x2.pt)"
@@ -95,7 +104,8 @@ For the full metric comparison across pipelines:
     float_path   = os.path.join(SHARED_DIR, "weights_float.json")
 
     print("=" * 60)
-    print(f"[pipeline] method={args.method}  iface={args.iface}  model_id={args.model_id}")
+    ids_desc = args.model_ids if args.model_ids else args.model_id
+    print(f"[pipeline] method={args.method}  iface={args.iface}  model_id(s)={ids_desc}")
     print("=" * 60)
 
     if os.path.exists(weights_path) and os.path.exists(float_path):
@@ -147,12 +157,12 @@ For the full metric comparison across pipelines:
     elif args.method == "template":
         # Pipeline 2 — architectural template, weights in BPF_ARRAY
         from methods.method5_template import run
-        run(model_id=args.model_id, iface=args.iface)
+        run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids)
 
     else:
         # Pipeline 3 — modular layers, scratch map, N tail calls
         from methods.method6_modular import run
-        run(model_id=args.model_id, iface=args.iface)
+        run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,10 @@ parser.add_argument("--dest",         type=str,   default="frankfurt")
 parser.add_argument("--count",        type=int,   default=10)
 parser.add_argument("--delay",        type=float, default=0.0)
 parser.add_argument("--model-id",     type=int,   default=42)
+parser.add_argument("--model-ids",    type=int,   nargs="+", default=None,
+                    help="Cycle packets across several model_id's (round-robin) "
+                         "to exercise a multi-model template/modular registry. "
+                         "Overrides --model-id when given.")
 parser.add_argument("--scale-factor", type=int,   default=128,
                     help="scale_factor in the IPA header (default 128). "
                          "It does not affect kernel inference (which uses the cache), "
@@ -79,7 +83,7 @@ args = parser.parse_args()
 N            = args.count
 DELAY        = args.delay
 DEST         = args.dest
-MODEL_ID     = args.model_id
+MODEL_IDS    = args.model_ids if args.model_ids else [args.model_id]
 SCALE_FACTOR = args.scale_factor
 
 weights_payload = b""
@@ -93,22 +97,23 @@ if args.weights_file:
         print(f"[test_ipa] Warning: {e}")
 
 print(f"\n[test_ipa] Sending {N} packets to '{DEST}'")
-print(f"  model_id={MODEL_ID} | scale_factor={SCALE_FACTOR} | "
+print(f"  model_ids={MODEL_IDS} (round-robin) | scale_factor={SCALE_FACTOR} | "
       f"header=21 byte | weights={'1st pkt only' if weights_payload else 'none'}")
 print()
 
 t_start = time.perf_counter()
 for i in range(N):
     ttl = random.randint(30, 64)
-    ipa_hdr = IPA_HDR(model_id=MODEL_ID, scale_factor=SCALE_FACTOR)
+    mid = MODEL_IDS[i % len(MODEL_IDS)]
+    ipa_hdr = IPA_HDR(model_id=mid, scale_factor=SCALE_FACTOR)
     packet  = IP(dst=DEST, ttl=ttl) / UDP(dport=9999) / ipa_hdr
 
     if i == 0 and weights_payload:
         packet = packet / Raw(load=weights_payload)
-        print(f"  pkt #{i+1:>4} | TTL={ttl} | +weights ({len(weights_payload)} byte)")
+        print(f"  pkt #{i+1:>4} | TTL={ttl} | model_id={mid} | +weights ({len(weights_payload)} byte)")
     else:
         if i < 3 or i == N - 1:
-            print(f"  pkt #{i+1:>4} | TTL={ttl}")
+            print(f"  pkt #{i+1:>4} | TTL={ttl} | model_id={mid}")
         elif i == 3:
             print(f"  ... ({N - 4} more)")
 

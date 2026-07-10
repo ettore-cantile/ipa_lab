@@ -61,15 +61,25 @@ def _populate_mac_t3(b: BPF, egress_iface: str, egress_ifindex: int):
           f"src={':'.join(f'{b:02x}' for b in src_mac)} dst={':'.join(f'{b:02x}' for b in dst_mac)}")
 
 
-def run(model_id: int = 42, iface: str = None):
+def run(model_id: int = 42, iface: str = None, model_ids: list = None):
     """
     iface: network interface to attach XDP to.
            Defaults to INGRESS_IFACE from common.py if not specified.
+    model_ids: optional list of model_id's to register concurrently, all
+           sharing the same layer_65_4 -> layer_4_4 -> layer_4_7_argmax chain.
+           Each gets its own, non-overlapping slice of layer_weights
+           (base_offset = i * model_size), so the dispatcher can serve
+           several models in the same run without a reload.
+           Defaults to [model_id] (single-model, backward compatible).
+           All registered models currently reuse the same trained weights
+           (only one .pt is checked into the repo); this exercises the
+           multi-model registry/dispatch mechanism, not distinct models.
     """
     ingress_iface = iface if iface else INGRESS_IFACE
+    ids = list(model_ids) if model_ids else [model_id]
     weights_path = os.path.join(_SHARED_DIR, "weights.json")
     float_path   = os.path.join(_SHARED_DIR, "weights_float.json")
-    print(f"[Method 6 - Modular Pipeline] | model_id: {model_id} | iface: {ingress_iface}")
+    print(f"[Method 6 - Modular Pipeline] | model_ids: {ids} | iface: {ingress_iface}")
 
     if not os.path.exists(float_path):
         print(f"[ERROR] {float_path} not found. Run extract_weights.py first.")
@@ -89,8 +99,12 @@ def run(model_id: int = 42, iface: str = None):
     # Compile all four eBPF functions from the combined source
     b = BPF(text=EBPF_MODULAR_FULL)
 
-    # Populate layer_registry and layer_weights
-    load_modular_weights(b, integer_weights, model_id=model_id, scale=SCALE_FACTOR)
+    # Populate layer_registry and layer_weights: one non-overlapping weight
+    # block per model_id, all reusing the same compiled layer chain.
+    model_size = len(integer_weights)
+    for i, mid in enumerate(ids):
+        load_modular_weights(b, integer_weights, model_id=mid, scale=SCALE_FACTOR,
+                             base_offset=i * model_size)
 
     # Wire up the tail-call chain
     fn_l0 = b.load_func("layer_65_4",      BPF.XDP)
