@@ -136,27 +136,27 @@ kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 1
 
 | Metrica                    | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated)   |          996 |       2 668 |     13 645 |
-| Codice jited (byte)        |        4 658 |      12 575 |     58 146 |
+| Istruzioni eBPF (xlated)   |          996 |       2 618 |     13 441 |
+| Codice jited (byte)        |        4 658 |      11 464 |     57 224 |
 | Tail calls / pacchetto     |     0 (leaf) |           1 |          3 |
 | Map lookup / pacchetto (stima) | 8 (0 pesi) |         322 |        384 |
-| Memoria mappe (byte)       |          264 |      15 796 |     28 468 |
-| Latenza (ns/pacchetto)     |         72.0 |       287.0 |     1274.0 |
-| Throughput (Mpps)          |       13.889 |       3.484 |      0.785 |
-| CPU (%)                    |           58 |          61 |         80 |
+| Memoria mappe (byte)       |          264 |       7 560 |     20 232 |
+| Latenza (ns/pacchetto)     |         32.0 |       125.0 |      590.0 |
+| Throughput (Mpps)          |       31.250 |       8.000 |      1.695 |
+| CPU (%)                    |           38 |          53 |         60 |
 | Dispatch (TTL 1–5)         |    5/5 PASS  |   5/5 PASS  |  5/5 PASS  |
 | link_state reroute         |         PASS (5/30 casi cambiano uscita) |||
 
-Misurate con `test_suite.py --only kernel` (4 CPU, scale 24) dopo l'aggiunta di `link_state` reale
-e la rimozione di `model_cache`.
+Misurate con `test_suite.py --only kernel` (4 CPU, scale 24) dopo il refactor `mac_table`
+(sostituisce `fwd_table`/`valid_keys`) e la correzione del match di `ingress_ifindex` in
+`BPF_PROG_TEST_RUN` (nessun `ctx_in` custom, vedi sotto).
 
 Note oneste:
-- **P1 hardcoded è il più veloce** (72 ns, 13.9 Mpps), il più compatto (264 B, 996 istr) e senza tail call né lookup pesi: massime prestazioni, minima flessibilità. **P3 modular** all'opposto (1274 ns, 3 tail call, ~28 KB). **P2 template** nel mezzo (287 ns). Ordine coerente con la tassonomia.
+- **P1 hardcoded è il più veloce** (32 ns, 31.2 Mpps), il più compatto (264 B, 996 istr) e senza tail call né lookup pesi: massime prestazioni, minima flessibilità. **P3 modular** all'opposto (590 ns, 3 tail call, ~20 KB). **P2 template** nel mezzo (125 ns). Ordine coerente con la tassonomia.
 - Ogni metrica di costo (istruzioni, jited, tail call, map lookup, memoria) cresce monotona P1→P2→P3; le prestazioni di picco calano nello stesso ordine.
 - **P1 = meno memoria mappe** (264 B): nessun `model_cache` (prima 83 KB, il 99%), restano solo i contatori + `link_state` a 6 slot.
-- **Confronto pulito**: P1 è sceso da 1109 a 72 ns dopo aver rimosso 3 `bpf_trace_printk` per pacchetto dal path HIT (helper costoso, assente in P2/P3) che falsavano il baseline.
 - **Inferenza identica** nelle 3 pipeline (stesso MLP, stessi pesi, stesso argmax): verificata dal check di corrispondenza di classe (classe kernel = classe riferimento Python). Differiscono solo per *come* calcolano l'inferenza.
-- **Azione uniforme (mac_table)**: tutte fanno `argmax → mac_table[classe] → bpf_redirect`. La NN decide la porta; `mac_table` è un dizionario `classe → {ifindex, MAC}` (in P1 hardcoded in uno `switch`, 0 lookup). Rimossa la vecchia `fwd_table` indicizzata dal valore + validazione per-TTL (`valid_keys`).
-- **P2/P3 da rimisurare**: istruzioni e soprattutto memoria mappe calano (hash 256 slot → 8 slot). Rieseguire `--only kernel`.
+- **Azione uniforme (mac_table)**: tutte fanno `argmax → mac_table[classe] → bpf_redirect`. La NN decide la porta; `mac_table` è un dizionario `classe → {ifindex, MAC}` (in P1 hardcoded in uno `switch`, 0 lookup). Rimossa la vecchia `fwd_table` indicizzata dal valore + validazione per-TTL (`valid_keys`): memoria mappe P2/P3 scesa rispettivamente da 15 796→7 560 B e 28 468→20 232 B (hash 256 slot → 8 slot).
 - `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa; aggiornato dal monitor carrier. Il probe conferma che un link giù cambia l'uscita (5/30 casi).
+- **Nessun `ctx_in` custom nel verifier**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox cade fuori sia dalla `ifindex_table` di P1 sia dal clamp `[1,6]` di P2/P3, quindi tutte e tre risolvono a "nessuna iface di ingresso" (`_iface=0`) nello stesso modo — il riferimento Python usa `ifindex=0` senza bisogno di forzare il contesto.
 - Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`.

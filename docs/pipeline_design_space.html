@@ -503,7 +503,7 @@
           <span class="c g"><b>0</b> tail call</span>
           <span class="c g"><b>0</b> lookup pesi</span>
           <span class="c g"><b>264 B</b> mappe</span>
-          <span class="c g"><b>72 ns</b> · 13.9 Mpps</span>
+          <span class="c g"><b>32 ns</b> · 31.3 Mpps</span>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
@@ -559,7 +559,7 @@
           <span class="c a"><b>1</b> tail call</span>
           <span class="c"><b>~322</b> lookup / pkt</span>
           <span class="c"><b>15.8 KB</b> mappe</span>
-          <span class="c a"><b>287 ns</b> · 3.5 Mpps</span>
+          <span class="c a"><b>125 ns</b> · 8.0 Mpps</span>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
@@ -617,8 +617,8 @@
         <div class="pcost">
           <span class="c r"><b>3</b> tail call</span>
           <span class="c r"><b>~384</b> lookup / pkt</span>
-          <span class="c"><b>28.5 KB</b> mappe</span>
-          <span class="c r"><b>1274 ns</b> · 0.79 Mpps</span>
+          <span class="c"><b>19.8 KB</b> mappe</span>
+          <span class="c r"><b>590 ns</b> · 1.70 Mpps</span>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
@@ -735,14 +735,14 @@
           <tr>
             <td class="td-strong">Istruzioni eBPF (xlated)</td>
             <td class="mono" style="text-align:right;"><span class="num-g">996</span></td>
-            <td class="mono" style="text-align:right;">2 668</td>
-            <td class="mono" style="text-align:right;"><span class="num-r">13 645</span></td>
+            <td class="mono" style="text-align:right;">2 618</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">13 441</span></td>
           </tr>
           <tr>
             <td class="td-strong">Codice jited (byte)</td>
             <td class="mono" style="text-align:right;"><span class="num-g">4 658</span></td>
-            <td class="mono" style="text-align:right;">12 575</td>
-            <td class="mono" style="text-align:right;"><span class="num-r">58 146</span></td>
+            <td class="mono" style="text-align:right;">11 464</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">57 224</span></td>
           </tr>
           <tr>
             <td class="td-strong">Tail calls / pacchetto</td>
@@ -759,26 +759,26 @@
           <tr>
             <td class="td-strong">Memoria mappe (byte)</td>
             <td class="mono" style="text-align:right;"><span class="num-g">264</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">15 796</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">28 468</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">7 560</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">20 232</span></td>
           </tr>
           <tr>
             <td class="td-strong">Latenza (ns / pacchetto)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">72.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">287.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">1274.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">32.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">125.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">590.0</span></td>
           </tr>
           <tr>
             <td class="td-strong">Throughput (Mpps)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">13.889</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">3.484</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">0.785</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">31.250</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">8.000</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">1.695</span></td>
           </tr>
           <tr>
             <td class="td-strong">CPU (%)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">58</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">61</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">80</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">38</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">53</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">60</span></td>
           </tr>
           <tr>
             <td class="td-strong">Flessibilità</td>
@@ -792,13 +792,11 @@
     <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:1rem;font-size:0.8rem;">
       La tassonomia è confermata dai dati: ogni metrica di costo (istruzioni, byte jited, tail call, map lookup,
       memoria) cresce monotona con la flessibilità P1→P2→P3, e le prestazioni di picco calano nello stesso ordine.
-      <strong>P1 hardcoded è il più veloce</strong> (72 ns, 13.9 Mpps), <strong>il più compatto</strong>
+      <strong>P1 hardcoded è il più veloce</strong> (32 ns, 31.3 Mpps), <strong>il più compatto</strong>
       (264 byte di mappe, 996 istruzioni) e senza tail call né lookup pesi — <em>massime prestazioni, minima
-      flessibilità</em>. <strong>P3 modular</strong> è all'estremo opposto (1274 ns, 0.79 Mpps, 13645 istruzioni,
-      3 tail call, ~28 KB) — <em>massima flessibilità, prestazioni minime</em>. <strong>P2 template</strong> sta nel
-      mezzo (287 ns), come atteso dal compromesso. Rispetto alla prima misura, P1 è passato da 1109 a 72 ns dopo la
-      rimozione di 3 <span class="mono">bpf_trace_printk</span> per pacchetto (helper costoso, assente in P2/P3) che
-      falsavano il baseline: ora il confronto è pulito e l'ordine coincide con la tassonomia attesa.
+      flessibilità</em>. <strong>P3 modular</strong> è all'estremo opposto (590 ns, 1.70 Mpps, 13 441 istruzioni,
+      3 tail call, ~19.8 KB) — <em>massima flessibilità, prestazioni minime</em>. <strong>P2 template</strong> sta nel
+      mezzo (125 ns), come atteso dal compromesso.
     </p>
     <div class="iface-note" style="margin-bottom:2.5rem;">
       <strong>Nota.</strong> Metriche reali da <span class="mono">test_suite.py --only kernel</span> (4 CPU,
@@ -815,14 +813,13 @@
       non trascurabile sotto <span class="mono">BPF_PROG_TEST_RUN</span>.
     </div>
     <div class="iface-note" style="margin-bottom:2.5rem;border-left-color:var(--amber);">
-      <strong>mac_table — da rimisurare.</strong> P2/P3 non usano più una <span class="mono">fwd_table</span>
+      <strong>mac_table.</strong> P2/P3 non usano più una <span class="mono">fwd_table</span>
       indicizzata dal valore dell'inferenza + validazione per-TTL (<span class="mono">valid_keys</span>). Ora la
       NN decide la classe (argmax) e una singola lookup <span class="mono">mac_table[classe] → {ifindex, MAC}</span>
       risolve il next-hop L2 e fa <span class="mono">bpf_redirect</span> — un "dizionario delle porte", nessuna
       decisione di routing nella tabella. Rimossi la divisione unsigned della chiave, la seconda lookup e la logica
-      HIT/FAKE/MISS. I valori di P2/P3 in tabella (istruzioni e soprattutto <em>memoria mappe</em>) precedono questa
-      modifica: attesa una riduzione (la grande hash a 256 slot sostituita da 8 slot). Rieseguire
-      <span class="mono">test_suite.py --only kernel</span>.
+      HIT/FAKE/MISS. Effetto misurato: memoria mappe P2 15 796→7 560 B, P3 28 468→20 232 B (la hash a 256 slot
+      sostituita da 8 slot); istruzioni P2 2 668→2 618, P3 13 645→13 441.
     </div>
 
     <!-- Weight update latency -->
