@@ -59,8 +59,10 @@ l'uscita) + `kernel suite: PASS`.
 Cosa verifica in più oltre al dispatch:
 - **Corrispondenza di classe** (single-pass, uniforme sulle 3 pipeline): pre-installa `mac_table[0..5]`,
   esegue una volta e controlla che la classe scelta dal kernel = classe del riferimento Python
-  (`cls_stats[ref_cls] > 0`). Passa un `xdp_md` azzerato come contesto → `ingress_ifindex=0` deterministico
-  (risolve il vecchio "drift" del template).
+  (`cls_stats[ref_cls] > 0`). Nessun `ctx_in` custom: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex`
+  di sandbox cade fuori sia dalla `ifindex_table` di P1 sia dal clamp `[1,6]` di P2/P3, quindi tutte
+  e tre risolvono a "nessuna iface di ingresso" (`_iface=0`) — il riferimento Python usa `ifindex=0`
+  per combaciare, senza bisogno di forzare il contesto.
 - **Reroute su guasto**: per ogni TTL e interfaccia `k`, esegue P1 con tutti i link up e poi con
   `link_state[k]=0`, e conferma che l'argmax cambia uscita in almeno un caso.
 

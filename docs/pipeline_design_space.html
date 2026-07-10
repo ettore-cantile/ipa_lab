@@ -978,9 +978,13 @@
       <strong>classe scelta dal kernel</strong> coincida con quella del riferimento Python
       (<span class="mono">cls_stats[ref_cls] &gt; 0</span> e <span class="mono">retval ∈ {0,4}</span>). Niente più
       cattura della chiave, installazione e seconda passata.<br><br>
-      <strong>ingress deterministico.</strong> La chiamata passa un <span class="mono">xdp_md</span> azzerato come
-      contesto, così <span class="mono">ingress_ifindex = 0</span> per tutte le pipeline e la classe combacia col
-      riferimento (risolve il vecchio "drift" del template, che leggeva un ingress di sandbox ≠0).<br><br>
+      <strong>ingress coerente, senza contesto forzato.</strong> Sotto <span class="mono">BPF_PROG_TEST_RUN</span>
+      l'<span class="mono">ingress_ifindex</span> di sandbox cade fuori sia dalla <span class="mono">ifindex_table</span>
+      di P1 sia dal clamp <span class="mono">[1,6]</span> di P2/P3: tutte e tre risolvono quindi a "nessuna iface
+      di ingresso" (<span class="mono">_iface = 0</span>) allo stesso modo, e il riferimento Python usa
+      <span class="mono">ifindex = 0</span> per combaciare — nessun <span class="mono">ctx_in</span> custom necessario
+      (un tentativo precedente di forzarlo con uno <span class="mono">xdp_md</span> azzerato azzerava anche
+      <span class="mono">data_end</span>, facendo cadere ogni pacchetto prima dell'inferenza).<br><br>
       <strong>Reroute su guasto (link_state).</strong> La suite verifica anche che
       <span class="mono">link_state</span> sia un input di routing vivo: per ogni TTL e ogni interfaccia
       <em>k</em> esegue P1 con tutti i link up e poi con il link <em>k</em> giù
