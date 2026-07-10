@@ -358,12 +358,10 @@ int layer_first(struct xdp_md *ctx) {
         if (j >= n_out) { out[j] = 0LL; continue; }
 
         int bidx = woff + bias_off + j;
-        if (bidx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
         __u8 *bp = layer_weights.lookup(&bidx);
         long long acc = bp ? (long long)WEIGHT(bp) : 0LL;
 
         int ttl_idx = woff + j * PROTO_N_IN + 12;
-        if (ttl_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
         __u8 *ttl_wp = layer_weights.lookup(&ttl_idx);
         if (ttl_wp) acc += (long long)_ttl * (long long)WEIGHT(ttl_wp);
 
@@ -371,7 +369,6 @@ int layer_first(struct xdp_md *ctx) {
         for (int i = 0; i < 6; i++) {
             if (ls[i]) {
                 int ls_idx = woff + j * PROTO_N_IN + i;
-                if (ls_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
                 __u8 *ls_wp = layer_weights.lookup(&ls_idx);
                 if (ls_wp) acc += ls[i] * (long long)WEIGHT(ls_wp);
             }
@@ -379,14 +376,12 @@ int layer_first(struct xdp_md *ctx) {
 
         if (_iface >= 1 && _iface <= 6) {
             int iface_idx = woff + j * PROTO_N_IN + 5 + _iface;
-            if (iface_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
             __u8 *iface_wp = layer_weights.lookup(&iface_idx);
             if (iface_wp) acc += (long long)WEIGHT(iface_wp);
         }
 
         if (_node <= 51) {
             int node_idx = woff + j * PROTO_N_IN + 13 + _node;
-            if (node_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
             __u8 *node_wp = layer_weights.lookup(&node_idx);
             if (node_wp) acc += (long long)WEIGHT(node_wp);
         }
@@ -462,7 +457,6 @@ int layer_hidden(struct xdp_md *ctx) {
     for (int j = 0; j < MLH_MAX_H; j++) {
         if (j >= n_out) { out[j] = 0LL; continue; }
         int bidx = woff + bias_off + j;
-        if (bidx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
         __u8 *bp = layer_weights.lookup(&bidx);
         long long acc = bp ? (long long)WEIGHT(bp) : 0LL;
         #pragma unroll
@@ -472,7 +466,6 @@ int layer_hidden(struct xdp_md *ctx) {
             long long *xp = scratch_acts.lookup(&fi);
             long long x = xp ? *xp : 0LL;
             int widx = woff + j * n_in + i;
-            if (widx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
             __u8 *wp = layer_weights.lookup(&widx);
             if (wp) acc += x * (long long)WEIGHT(wp);
         }
