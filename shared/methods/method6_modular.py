@@ -5,16 +5,18 @@ Method 6 - Modular Neural Pipeline  (Pipeline 3)
 Design space position: maximum flexibility, lower performance.
 
 This method demonstrates the third point in the IPA/eBPF design space:
-  - Neural inference decomposed into a chain of tail calls, ALL of them the
-    SAME generic layer program (layer_generic): one linear transformation
-    n_in -> n_out + ReLU, or argmax + forward if it's the model's last layer
+  - Neural inference decomposed into a chain of tail calls across TWO
+    generic layer programs: layer_first (always hop 0, sparse read of the
+    protocol-fixed 65-feature IPA vector) and layer_hidden (hop 1..N-1,
+    dense n_in -> n_out). Either one argmaxes + forwards instead of
+    continuing the chain if it's the model's last layer.
   - Intermediate activations transit via BPF_PERCPU_ARRAY scratch map
-  - Layer chain: dispatcher -> layer_generic -> layer_generic -> ... (as
-    many hops as the model has layers, read from a per-model registry)
+  - Layer chain: dispatcher -> layer_first -> layer_hidden -> ... (as
+    many layer_hidden hops as the model needs, read from a per-model registry)
   - Maximum flexibility: change architecture (depth AND width) = change the
     registered (n_in, n_out) list + weights for that model_id; no eBPF
-    recompilation, same compiled program for any shape within the compiled
-    ceilings (ML_MAX_IN/ML_MAX_OUT in ebpf_modular.py)
+    recompilation, same 2 compiled programs for any shape within the
+    compiled ceilings (ML1_MAX_H1/MLH_MAX_H in ebpf_modular.py)
   - Model update cost: bpf_map_update_elem() for layer_weights + layer_shapes
 
 Compatibility notes with the existing codebase:
@@ -23,8 +25,9 @@ Compatibility notes with the existing codebase:
   - Uses scale_factor from weights_float.json
   - Attaches to iface param (default: INGRESS_IFACE from common.py)
   - pkt_stats_t3 + mac_table_t3 (class -> ifindex + MACs) used as separate maps
-  - All four programs (dispatcher + 3 layers) compiled from EBPF_MODULAR_FULL
-    so BCC sees them as a single compilation unit — no separate .o files needed
+  - All three programs (dispatcher + layer_first + layer_hidden) compiled
+    from EBPF_MODULAR_FULL so BCC sees them as a single compilation unit —
+    no separate .o files needed
 
 Files used (paths resolved relative to this file, not hardcoded /shared/):
   ../weights.json       : int8 weights (319 values)
@@ -71,10 +74,11 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     iface: network interface to attach XDP to.
            Defaults to INGRESS_IFACE from common.py if not specified.
     model_ids: optional list of model_id's to register concurrently, all
-           sharing the same compiled layer_generic program -- depth and
-           width may differ per model (see layer_dims_by_model), since the
-           "is this the last layer" decision is made at runtime from data,
-           not from which program is wired at a given tail-call slot.
+           sharing the same compiled layer_first/layer_hidden programs --
+           depth and width may differ per model (see layer_dims_by_model),
+           since the "is this the last layer" decision is made at runtime
+           from data, not from which program is wired at a given tail-call
+           slot.
            Each gets its own, non-overlapping slice of layer_weights, so the
            dispatcher can serve several models in the same run without a
            reload. Defaults to [model_id] (single-model, backward compatible).
@@ -114,8 +118,8 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     print(f"  Total weights : {len(integer_weights)}")
     print(f"  Ingress iface : {ingress_iface} (ifindex={socket.if_nametoindex(ingress_iface)})")
 
-    # Compile both eBPF functions (dispatcher + the one generic layer
-    # program) from the combined source
+    # Compile all three eBPF functions (dispatcher + layer_first + layer_hidden)
+    # from the combined source
     b = BPF(text=EBPF_MODULAR_FULL)
 
     # Populate layer_registry/layer_shapes/layer_weights: one non-overlapping
@@ -126,15 +130,18 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
                                         layer_dims=layer_dims, base_offset=base_offset)
         base_offset += consumed
 
-    # Wire the tail-call chain: every slot points at the SAME generic
-    # program. Which hop is "the last layer" is decided at runtime per
-    # model (layer_idx+1 == n_layers), not by which program sits at a given
-    # slot -- so this wiring never needs to change when a model's depth
-    # differs from another concurrently-registered model's depth.
-    fn_generic = b.load_func("layer_generic", BPF.XDP)
+    # Wire the tail-call chain: slot 0 = layer_first (always the first hop
+    # for any model), slots 1..15 = layer_hidden (always a later hop for
+    # any model). Which hop is ALSO "the last layer" is decided at runtime
+    # per model (layer_idx+1 == n_layers), not by which program sits at a
+    # given slot -- so this wiring never needs to change when a model's
+    # depth differs from another concurrently-registered model's depth.
+    fn_first  = b.load_func("layer_first",  BPF.XDP)
+    fn_hidden = b.load_func("layer_hidden", BPF.XDP)
     chain = b.get_table("layer_chain")
-    for i in range(16):  # LAYER_CHAIN_SIZE in ebpf_modular.py
-        chain[ctypes.c_int(i)] = ctypes.c_int(fn_generic.fd)
+    chain[ctypes.c_int(0)] = ctypes.c_int(fn_first.fd)
+    for i in range(1, 16):  # LAYER_CHAIN_SIZE in ebpf_modular.py
+        chain[ctypes.c_int(i)] = ctypes.c_int(fn_hidden.fd)
 
     # Attach modular_dispatcher as the XDP entry point
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
@@ -153,8 +160,8 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
 
     print("[Method 6] Pipeline 3 (Modular) running. "
           "Stats: pkt_stats_t3 [HIT | MISS | DROP]")
-    print(f"  Tail call chain: modular_dispatcher -> layer_generic (x n_layers per model, "
-          f"per-model depth read from layer_registry)")
+    print(f"  Tail call chain: modular_dispatcher -> layer_first -> layer_hidden (x n_layers-1 "
+          f"per model, per-model depth read from layer_registry)")
 
     stats = b.get_table("pkt_stats_t3")
     print(f"\n{'TRUE HIT':>12} {'MISS':>10} {'DROP':>10}")

@@ -2,62 +2,91 @@
 ebpf_modular.py  —  Pipeline 3: Modular Neural Pipeline.
 
 Design space position:
-  - Neural inference is decomposed into reusable eBPF layer-block programs
-  - ONE generic layer block (layer_generic) implements any linear
-    transformation n_in -> n_out (+ ReLU unless it's the model's last layer)
-  - Intermediate activations transit via BPF_PERCPU_ARRAY scratch map
-  - Layer chain: dispatcher -> layer_generic -> layer_generic -> ... (as
-    many hops as the model has layers) -> argmax + forward on the last hop
+  - Neural inference is decomposed into a tail-call chain of TWO generic
+    layer programs (not one per layer, not one per model):
+      layer_first  : always hop 0. Input is the protocol-fixed 65-feature
+                      IPA vector, read SPARSELY straight from scratch_meta +
+                      link_state (same trick as Pipeline 2's arch_generic_2layer
+                      -- only ~9 of 65 inputs are ever non-zero per packet).
+                      Output width n_out is dynamic, up to ML1_MAX_H1.
+      layer_hidden  : hop 1..n_layers-1. Dense n_in -> n_out (both dynamic,
+                      up to MLH_MAX_H), reading/writing scratch_acts.
+  - Whichever hop is the model's LAST layer (decided at runtime, not by
+    which program is wired at that slot -- see below) argmaxes and forwards
+    instead of chaining further
   - Maximum flexibility: changing model architecture (depth AND width) =
-    change the (n_in, n_out) list registered for that model_id + weights;
-    no recompilation, same compiled program for every architecture that
-    fits the ceilings below
+    change the registered (n_in, n_out) list + weights for that model_id;
+    no eBPF recompilation, for any depth/width combination within the
+    compiled ceilings below
+
+Why two programs, not one "fully generic" block:
+  An earlier version of this file used ONE block generic over n_in up to 80
+  (to also cover the 65-wide first layer) with a DENSE map-lookup loop over
+  every input position. That blew the kernel's BPF_COMPLEXITY_LIMIT_INSNS
+  (4096 instructions on this lab's kernel -- the historic pre-5.2 hard cap,
+  not the newer 1M-instruction limit): looping densely over 65 mostly-zero
+  inputs for every hidden neuron is enormously wasteful, since real IPA
+  packets only ever have ~9 non-zero features (link_state bits, one ingress-
+  iface bit, ttl, one node bit). Splitting the first hop into its own
+  program that reads those ~9 positions directly (mirroring Pipeline 2's
+  sparse fc1) cuts its cost by roughly 7x and keeps hidden-to-hidden hops
+  small (dense, but bounded to a small MLH_MAX_H, not the 65-wide input).
+  Two small compiled programs fit the 4096-instruction cap; one large one
+  did not.
 
 Compile-time ceilings (verifier needs a compile-time trip count; wider/
-deeper models need these raised and the program reloaded once):
-  ML_MAX_IN   = 80   (covers the protocol-fixed 65-feature input vector
-                       plus headroom for hidden widths feeding forward)
-  ML_MAX_OUT  = 16   (covers hidden widths and the protocol-fixed 7-class
-                       output layer)
+deeper models need these raised and the program reloaded once -- raising
+them grows layer_first/layer_hidden's own instruction count, watch the
+4096-instruction cap on kernels that still enforce it):
+  PROTO_N_IN   = 65  (fixed: the IPA feature vector is always this wide;
+                       not a ceiling, the exact, protocol-mandated width)
+  ML1_MAX_H1   = 8   (first layer's output width ceiling)
+  MLH_MAX_H    = 8   (every later layer's input AND output width ceiling,
+                       including the model's last layer, e.g. the
+                       protocol-fixed 7-class output)
   layer_chain size = 16 (max depth; Linux tail-call limit is ~33 anyway)
 A layer whose shape exceeds these is rejected at load time by
 load_modular_weights() with a clear error, not silently corrupted.
 
-Why one generic block instead of one program per layer:
-  Whether a given hop is "the last layer" (ReLU vs argmax+redirect) is
-  decided INSIDE the program from data (layer_idx+1 == n_layers, both read
-  from per-model registries), not by which program is wired at that
-  layer_chain slot. This means layer_chain[i] = the SAME layer_generic.fd
-  for every i, for every model, regardless of how deep any individual
-  model is -- so several models with DIFFERENT depths can be registered
-  concurrently without their layer_chain slots conflicting (a model-per-
-  slot design would break the moment two concurrent models disagreed on
-  which slot is "last").
+Why the two programs never conflict across concurrently-registered models
+of different depths:
+  layer_chain[0] is ALWAYS layer_first.fd and layer_chain[i>=1] is ALWAYS
+  layer_hidden.fd, for every model, regardless of that model's own depth --
+  because layer 0 is always "the first layer" and layer i>=1 is always "a
+  later layer", true for any model. Whether a given hop is ALSO "the last
+  layer" (argmax+redirect instead of ReLU+continue) is decided INSIDE the
+  program from data (layer_idx+1 == n_layers, both read from per-model
+  registries), never by which program sits at that tail-call slot. So
+  model A (3 layers) and model B (2 layers) can share layer_chain[1]
+  perfectly fine: for A it continues to layer_chain[2], for B it argmaxes,
+  and both facts are resolved from A/B's own registry entry, not from the
+  slot itself.
 
 Maps:
-  scratch_acts    : BPF_PERCPU_ARRAY  index -> long long  (intermediate activations)
-  scratch_meta     : BPF_PERCPU_ARRAY  0 -> {model_id, scale, layer_idx, ingress_if, ttl}
-  layer_weights    : BPF_ARRAY  (flat index) -> __u8  (unsigned byte storage;
-                     eBPF C code casts to __s8 for signed arithmetic via WEIGHT() macro;
-                     Python side stores int8 as c_uint8(v & 0xFF) two's complement)
-  layer_chain      : BPF_PROG_ARRAY  layer_idx -> layer_generic's own fd (every slot)
-  layer_registry   : model_id -> {scale_factor, n_layers}
-  layer_shapes     : {model_id, layer_idx} -> {n_in, n_out, weight_offset}
-  mac_table_t3     : u32 class (argmax output) -> fwd_action {ifindex, src/dst MAC}
-  cls_stats_t3     : per-class redirect counter
-  pkt_stats_t3     : [0]=HIT [1]=MISS [2]=DROP
+  scratch_acts     : BPF_PERCPU_ARRAY  index -> long long  (hidden activations,
+                      NOT used for the first layer -- that reads scratch_meta
+                      + link_state directly, see layer_first)
+  scratch_meta      : BPF_PERCPU_ARRAY  0 -> {model_id, scale, layer_idx, ingress_if, ttl}
+  layer_weights     : BPF_ARRAY  (flat index) -> __u8  (unsigned byte storage;
+                      eBPF C code casts to __s8 for signed arithmetic via WEIGHT() macro;
+                      Python side stores int8 as c_uint8(v & 0xFF) two's complement)
+  layer_chain       : BPF_PROG_ARRAY  0 -> layer_first.fd, 1..15 -> layer_hidden.fd
+  layer_registry    : model_id -> {scale_factor, n_layers}
+  layer_shapes      : {model_id, layer_idx} -> {n_in, n_out, weight_offset}
+  mac_table_t3      : u32 class (argmax output) -> fwd_action {ifindex, src/dst MAC}
+  cls_stats_t3      : per-class redirect counter
+  pkt_stats_t3      : [0]=HIT [1]=MISS [2]=DROP
 
 Action: the last layer runs argmax -> class, then a single mac_table_t3[class]
 lookup resolves the L2 next-hop and bpf_redirect()s (cls 6 = DROP). No output
 key, no per-TTL validation -- the NN decides, the table only maps class->port.
 
 Feature encoding (protocol-fixed, independent of hidden depth/width):
-  The dispatcher writes the same sparse one-hot layout used by Pipeline 1/2
-  into scratch_acts before the first tail call: 6 link_state + 6 ingress
-  iface one-hot [6..11] + 1 ttl [12] + 52 node one-hot [13..64]. This keeps
-  inference comparable across the three pipelines on the same model. It is
-  always the first layer's n_in=65 input; the last layer's n_out is always
-  7 (6 egress classes + drop), matching the mac_table/argmax action below.
+  link_state[0..5] + ingress-iface one-hot [6..11] + ttl [12] + node one-hot
+  [13..64] -- always the first layer's n_in=65 input; the last layer's
+  n_out is always 7 (6 egress classes + drop), matching the mac_table/argmax
+  action above. layer_first reads these straight from scratch_meta/link_state
+  (no dense 65-slot scratch_acts array is ever built for it).
 
 Weight storage:
   layer_weights uses an unsigned-byte leaf (__u8). The libbcc build in the
@@ -80,8 +109,9 @@ META_INGRESS_IF   = 3
 META_TTL          = 4
 
 # Compile-time layer-shape ceilings (see module docstring)
-ML_MAX_IN  = 80
-ML_MAX_OUT = 16
+PROTO_N_IN   = 65   # protocol-fixed IPA feature vector width, not a ceiling
+ML1_MAX_H1   = 8    # first layer's output width ceiling
+MLH_MAX_H    = 8    # later layers' input/output width ceiling
 LAYER_CHAIN_SIZE = 16
 
 EBPF_MODULAR_COMMON_HEADER = r"""
@@ -131,12 +161,12 @@ BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
 BPF_ARRAY(layer_weights, __u8, MAX_LAYER_WEIGHT_ENTRIES);
 
 /* link_state[i] = egress iface i up/down (feature [0..5]); written by the
- * userspace carrier monitor, read by the dispatcher into scratch_acts[0..5].
- * 1 = up, 0 = down. */
+ * userspace carrier monitor, read directly by layer_first. 1=up, 0=down. */
 BPF_ARRAY(link_state, __u32, 6);
 
-/* Layer chain tail-call map: every slot holds layer_generic's own fd --
- * see module docstring for why one program serves every hop/every model. */
+/* Layer chain tail-call map: slot 0 = layer_first.fd, slots 1..15 =
+ * layer_hidden.fd -- see module docstring for why this never conflicts
+ * across concurrently-registered models of different depths. */
 BPF_PROG_ARRAY(layer_chain, 16);
 
 /* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
@@ -157,7 +187,7 @@ BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
 #define META_TTL         4
 
 /* Per-model metadata: model_id -> {scale_factor, n_layers}. n_layers tells
- * layer_generic when it has reached the last hop (layer_idx+1==n_layers). */
+ * each hop when it has reached the last layer (layer_idx+1==n_layers). */
 struct layer_model_entry {
     __u16 scale_factor;
     __u8  n_layers;
@@ -166,8 +196,10 @@ BPF_HASH(layer_registry, __u8, struct layer_model_entry, 256);
 
 /* Per-(model_id, layer_idx) shape: which n_in/n_out this hop computes and
  * where its weights start in the flat layer_weights array. This is what
- * makes layer_generic architecture-agnostic -- it never assumes a fixed
- * width or depth, it just looks up what THIS model's THIS layer needs. */
+ * makes the layer chain architecture-agnostic -- it never assumes a fixed
+ * width or depth, it just looks up what THIS model's THIS layer needs.
+ * (layer 0's n_in is always PROTO_N_IN=65 by protocol, so only its n_out
+ * is actually consulted -- see layer_first.) */
 struct layer_shape_key {
     __u8 model_id;
     __u8 layer_idx;
@@ -178,10 +210,45 @@ struct layer_shape_entry {
     __u32 weight_offset;
 } __attribute__((packed));
 BPF_HASH(layer_shapes, struct layer_shape_key, struct layer_shape_entry, 512);
+
+/* Shared argmax + mac_table + redirect epilogue, used by both layer_first
+ * (1-layer models) and layer_hidden whenever they are the model's last
+ * layer. A plain C helper, not a macro, so both callers get one copy of
+ * the logic without the macro-argument foot-guns of the previous 3-block
+ * design (see git history: struct padding bugs from more implicit magic). */
+static inline __attribute__((always_inline))
+int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end, int best_cls) {
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+
+    if (best_cls >= 6) {
+        int di = 2; __u64 *dv = pkt_stats_t3.lookup(&di);
+        if (dv) __sync_fetch_and_add(dv, 1);
+        return XDP_DROP;
+    }
+
+    __u32 cls = (__u32)best_cls;
+    struct fwd_action *action = mac_table_t3.lookup(&cls);
+    if (action != NULL) {
+        int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
+        if (v) __sync_fetch_and_add(v, 1);
+        __u64 *cv = cls_stats_t3.lookup(&cls);
+        if (cv) __sync_fetch_and_add(cv, 1);
+        __builtin_memcpy(eth->h_source, action->src_mac, 6);
+        __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
+        return bpf_redirect(action->ifindex, 0);
+    }
+    /* no mac_table entry for that class (e.g. link down / not provisioned) */
+    int si = 1; __u64 *v = pkt_stats_t3.lookup(&si);
+    if (v) __sync_fetch_and_add(v, 1);
+    return XDP_PASS;
+}
 """
 
 # -----------------------------------------------------------------
-# Dispatcher: feature extraction + write to scratch + tail call layer_chain[0]
+# Dispatcher: parse packet, stash metadata, tail call layer_chain[0].
+# No scratch_acts writes here -- layer_first reads scratch_meta/link_state
+# directly (sparse), it never needs a dense 65-slot feature array.
 # -----------------------------------------------------------------
 EBPF_MODULAR_DISPATCHER = EBPF_MODULAR_COMMON_HEADER + r"""
 
@@ -207,7 +274,6 @@ int modular_dispatcher(struct xdp_md *ctx) {
     struct layer_model_entry *lentry = layer_registry.lookup(&model_id);
     if (!lentry) return XDP_PASS;
 
-    /* Write metadata to scratch_meta */
     int idx;
     idx = META_MODEL_ID;   { long long v = model_id;               scratch_meta.update(&idx, &v); }
     idx = META_SCALE;      { long long v = lentry->scale_factor;   scratch_meta.update(&idx, &v); }
@@ -215,64 +281,25 @@ int modular_dispatcher(struct xdp_md *ctx) {
     idx = META_INGRESS_IF; { long long v = ctx->ingress_ifindex;   scratch_meta.update(&idx, &v); }
     idx = META_TTL;        { long long v = ip->ttl;                scratch_meta.update(&idx, &v); }
 
-    /* Feature extraction -> write to scratch_acts[0..64].
-     * Encoding MUST match Pipeline 1/2 / the trained model (FRR_model.py):
-     *   [0..5]   egress link_state (up/down), read from the link_state map
-     *   [6..11]  ingress-iface one-hot (index = 5 + ifindex, ifindex 1..6)
-     *   [12]     ttl (raw scalar)
-     *   [13..64] node one-hot (index = 13 + model_id, model_id 0..51)
-     * This is the model's first layer's input (n_in=65), fixed by the IPA
-     * packet format regardless of the model's hidden depth/width.
-     * Zero all 65 slots first (scratch_acts is PERCPU and may hold stale
-     * values from a previous packet on this CPU), then set only the live
-     * ones -- mirrors ebpf_program.py's sparse encoding exactly. */
-    long long zero = 0LL;
-    int fi;
-    #pragma unroll
-    for (int i = 0; i < 65; i++) { fi = i; scratch_acts.update(&fi, &zero); }
-
-    /* Feature [0..5] = egress link_state (up/down) from the link_state map. */
-    #pragma unroll
-    for (int i = 0; i < 6; i++) {
-        int lsk = i;
-        __u32 *lsp = link_state.lookup(&lsk);
-        long long lsv = lsp ? (long long)(*lsp) : 0LL;
-        fi = i; scratch_acts.update(&fi, &lsv);
-    }
-
-    __u32 _ttl   = ((__u32)ip->ttl) & 0xff;
-    __u32 _iface = ((__u32)ctx->ingress_ifindex) & 0x7;   /* valid 1..6 */
-    __u32 _node  = ((__u32)ipa->model_id) & 0x3f;         /* valid 0..51 */
-
-    long long ttlv = _ttl;
-    fi = 12; scratch_acts.update(&fi, &ttlv);
-
-    long long one = 1LL;
-    if (_iface >= 1 && _iface <= 6) {
-        fi = 5 + _iface;
-        scratch_acts.update(&fi, &one);
-    }
-    if (_node <= 51) {
-        fi = 13 + _node;
-        scratch_acts.update(&fi, &one);
-    }
-
-    /* Tail call to layer_chain[0] -- layer_generic looks up model_id/layer_idx
-     * itself from scratch_meta, no per-model wiring needed here. */
+    /* Tail call to layer_chain[0] = layer_first. It reads model_id/scale/
+     * ttl/ingress_if straight back out of scratch_meta and link_state --
+     * the protocol-fixed 65-feature vector is never materialized densely. */
     layer_chain.call(ctx, 0);
     return XDP_PASS;
 }
 """
 
 # -----------------------------------------------------------------
-# Generic layer block: n_in -> n_out (+ ReLU, unless it's the model's last
-# layer, in which case it argmaxes and forwards instead of chaining further)
+# layer_first: always hop 0. Sparse read of the protocol-fixed 65-feature
+# IPA vector (mirrors Pipeline 2's arch_generic_2layer fc1 loop) -> n_out
+# up to ML1_MAX_H1. Argmax+forward directly if this is also the last layer
+# (a 1-layer model), otherwise ReLU + write scratch_acts + chain to hop 1.
 # -----------------------------------------------------------------
-EBPF_LAYER_GENERIC = EBPF_MODULAR_COMMON_HEADER + r"""
-#define ML_MAX_IN   80
-#define ML_MAX_OUT  16
+EBPF_LAYER_FIRST = EBPF_MODULAR_COMMON_HEADER + r"""
+#define PROTO_N_IN  65
+#define ML1_MAX_H1   8
 
-int layer_generic(struct xdp_md *ctx) {
+int layer_first(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
@@ -284,6 +311,125 @@ int layer_generic(struct xdp_md *ctx) {
     int ms = META_SCALE;
     long long *sp = scratch_meta.lookup(&ms);
     if (!sp || *sp == 0) return XDP_PASS;
+
+    struct layer_model_entry *lentry = layer_registry.lookup(&model_id);
+    if (!lentry) return XDP_PASS;
+    __u8 n_layers = lentry->n_layers;
+    if (n_layers == 0) return XDP_PASS;
+    __u8 is_last = (n_layers == 1) ? 1 : 0;
+
+    struct layer_shape_key key = {};
+    key.model_id  = model_id;
+    key.layer_idx = 0;
+    struct layer_shape_entry *shape = layer_shapes.lookup(&key);
+    if (!shape) return XDP_PASS;
+
+    __u32 n_out = shape->n_out;   /* n_in is always PROTO_N_IN by protocol */
+    __u32 woff  = shape->weight_offset;
+    if (n_out == 0 || n_out > ML1_MAX_H1) return XDP_PASS;
+    __u32 bias_off = PROTO_N_IN * n_out;
+
+    int mtl = META_TTL;
+    long long *ttlp = scratch_meta.lookup(&mtl);
+    __u32 _ttl = ttlp ? (__u32)(*ttlp) & 0xff : 0;
+
+    int mif = META_INGRESS_IF;
+    long long *ifp = scratch_meta.lookup(&mif);
+    __u32 _raw_iface = ifp ? (__u32)(*ifp) : 0;
+    __u32 _iface = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
+
+    __u32 _node = ((__u32)model_id) & 0x3f;
+
+    /* Read link_state[0..5] ONCE; reused across all neurons. */
+    long long ls[6];
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        int lsk = i;
+        __u32 *lsp = link_state.lookup(&lsk);
+        ls[i] = lsp ? (long long)(*lsp) : 0LL;
+    }
+
+    long long out[ML1_MAX_H1];
+    long long best_val = -9999999LL;
+    int best_cls = 0;
+
+    #pragma unroll
+    for (int j = 0; j < ML1_MAX_H1; j++) {
+        if (j >= n_out) { out[j] = 0LL; continue; }
+
+        int bidx = woff + bias_off + j;
+        if (bidx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
+        __u8 *bp = layer_weights.lookup(&bidx);
+        long long acc = bp ? (long long)WEIGHT(bp) : 0LL;
+
+        int ttl_idx = woff + j * PROTO_N_IN + 12;
+        if (ttl_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
+        __u8 *ttl_wp = layer_weights.lookup(&ttl_idx);
+        if (ttl_wp) acc += (long long)_ttl * (long long)WEIGHT(ttl_wp);
+
+        #pragma unroll
+        for (int i = 0; i < 6; i++) {
+            if (ls[i]) {
+                int ls_idx = woff + j * PROTO_N_IN + i;
+                if (ls_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
+                __u8 *ls_wp = layer_weights.lookup(&ls_idx);
+                if (ls_wp) acc += ls[i] * (long long)WEIGHT(ls_wp);
+            }
+        }
+
+        if (_iface >= 1 && _iface <= 6) {
+            int iface_idx = woff + j * PROTO_N_IN + 5 + _iface;
+            if (iface_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
+            __u8 *iface_wp = layer_weights.lookup(&iface_idx);
+            if (iface_wp) acc += (long long)WEIGHT(iface_wp);
+        }
+
+        if (_node <= 51) {
+            int node_idx = woff + j * PROTO_N_IN + 13 + _node;
+            if (node_idx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
+            __u8 *node_wp = layer_weights.lookup(&node_idx);
+            if (node_wp) acc += (long long)WEIGHT(node_wp);
+        }
+
+        if (is_last) {
+            if (acc > best_val) { best_val = acc; best_cls = j; }
+        } else {
+            out[j] = RELU(acc);
+        }
+    }
+
+    if (!is_last) {
+        #pragma unroll
+        for (int j = 0; j < ML1_MAX_H1; j++) {
+            int ki = j;
+            scratch_acts.update(&ki, &out[j]);
+        }
+        int li = META_LAYER_IDX;
+        long long nv = 1LL;
+        scratch_meta.update(&li, &nv);
+        layer_chain.call(ctx, 1);
+        return XDP_PASS;
+    }
+
+    return ml_argmax_forward(ctx, data, data_end, best_cls);
+}
+"""
+
+# -----------------------------------------------------------------
+# layer_hidden: hop 1..n_layers-1. Dense n_in -> n_out (+ ReLU, unless this
+# is the model's last layer, in which case argmax+forward instead).
+# -----------------------------------------------------------------
+EBPF_LAYER_HIDDEN = EBPF_MODULAR_COMMON_HEADER + r"""
+#define MLH_MAX_H  8
+
+int layer_hidden(struct xdp_md *ctx) {
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    int mi_model = META_MODEL_ID;
+    long long *mp = scratch_meta.lookup(&mi_model);
+    if (!mp) return XDP_PASS;
+    __u8 model_id = (__u8)(*mp);
 
     int mi_layer = META_LAYER_IDX;
     long long *lp = scratch_meta.lookup(&mi_layer);
@@ -305,27 +451,22 @@ int layer_generic(struct xdp_md *ctx) {
     __u32 n_in  = shape->n_in;
     __u32 n_out = shape->n_out;
     __u32 woff  = shape->weight_offset;
-    if (n_in == 0 || n_in > ML_MAX_IN || n_out == 0 || n_out > ML_MAX_OUT) return XDP_PASS;
-
-    /* Flat per-layer weight layout: [n_in*n_out weights][n_out bias],
-     * relative to woff -- identical to the single-layer case in Pipeline 2. */
+    if (n_in == 0 || n_in > MLH_MAX_H || n_out == 0 || n_out > MLH_MAX_H) return XDP_PASS;
     __u32 bias_off = n_in * n_out;
 
-    long long out[ML_MAX_OUT];
+    long long out[MLH_MAX_H];
     long long best_val = -9999999LL;
     int best_cls = 0;
 
     #pragma unroll
-    for (int j = 0; j < ML_MAX_OUT; j++) {
+    for (int j = 0; j < MLH_MAX_H; j++) {
         if (j >= n_out) { out[j] = 0LL; continue; }
-
         int bidx = woff + bias_off + j;
         if (bidx >= MAX_LAYER_WEIGHT_ENTRIES) return XDP_PASS;
         __u8 *bp = layer_weights.lookup(&bidx);
         long long acc = bp ? (long long)WEIGHT(bp) : 0LL;
-
         #pragma unroll
-        for (int i = 0; i < ML_MAX_IN; i++) {
+        for (int i = 0; i < MLH_MAX_H; i++) {
             if (i >= n_in) continue;
             int fi = i;
             long long *xp = scratch_acts.lookup(&fi);
@@ -335,7 +476,6 @@ int layer_generic(struct xdp_md *ctx) {
             __u8 *wp = layer_weights.lookup(&widx);
             if (wp) acc += x * (long long)WEIGHT(wp);
         }
-
         if (is_last) {
             if (acc > best_val) { best_val = acc; best_cls = j; }
         } else {
@@ -344,55 +484,27 @@ int layer_generic(struct xdp_md *ctx) {
     }
 
     if (!is_last) {
-        /* Not the last layer: publish activations for the next hop, advance
-         * layer_idx, keep chaining -- layer_chain[layer_idx+1] is this same
-         * program, it will look up the next layer's own shape itself. */
         #pragma unroll
-        for (int j = 0; j < ML_MAX_OUT; j++) {
+        for (int j = 0; j < MLH_MAX_H; j++) {
             int ki = j;
             scratch_acts.update(&ki, &out[j]);
         }
         int li = META_LAYER_IDX;
         long long nv = (long long)(layer_idx + 1);
         scratch_meta.update(&li, &nv);
-
         layer_chain.call(ctx, layer_idx + 1);
         return XDP_PASS;
     }
 
-    /* Last layer: best_cls is the argmax decided above -- act on it. */
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) return XDP_PASS;
-
-    /* The NN decided the egress class (argmax). cls 6 = DROP. */
-    if (best_cls >= 6) {
-        int di = 2; __u64 *dv = pkt_stats_t3.lookup(&di);
-        if (dv) __sync_fetch_and_add(dv, 1);
-        return XDP_DROP;
-    }
-
-    __u32 cls = (__u32)best_cls;
-    struct fwd_action *action = mac_table_t3.lookup(&cls);
-    if (action != NULL) {
-        int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
-        __u64 *cv = cls_stats_t3.lookup(&cls);
-        if (cv) __sync_fetch_and_add(cv, 1);
-        __builtin_memcpy(eth->h_source, action->src_mac, 6);
-        __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
-        return bpf_redirect(action->ifindex, 0);
-    }
-    /* no mac_table entry for that class (e.g. link down / not provisioned) */
-    int si = 1; __u64 *v = pkt_stats_t3.lookup(&si);
-    if (v) __sync_fetch_and_add(v, 1);
-    return XDP_PASS;
+    return ml_argmax_forward(ctx, data, data_end, best_cls);
 }
 """
 
 # Full combined source for single-program compilation
 EBPF_MODULAR_FULL = (
     EBPF_MODULAR_DISPATCHER
-    + "\n" + EBPF_LAYER_GENERIC.replace(EBPF_MODULAR_COMMON_HEADER, "")
+    + "\n" + EBPF_LAYER_FIRST.replace(EBPF_MODULAR_COMMON_HEADER, "")
+    + "\n" + EBPF_LAYER_HIDDEN.replace(EBPF_MODULAR_COMMON_HEADER, "")
 )
 
 
@@ -411,14 +523,17 @@ def load_modular_weights(
       [(65, 4), (4, 4), (4, 7)] for today's 65-4-4-7 model (the default,
       used when layer_dims is None -- backward compatible with the one
       trained model checked into the repo). Any depth/width combination
-      works as long as each (n_in, n_out) fits under ML_MAX_IN=80/
-      ML_MAX_OUT=16 -- this is what makes Pipeline 3 genuinely
-      architecture-agnostic: no eBPF recompilation for a different depth
-      or different hidden widths, just a different layer_dims + weights.
-      By protocol, the first layer's n_in should be 65 (IPA feature vector)
-      and the last layer's n_out should be 7 (6 egress classes + drop) --
-      not enforced here, but a mismatch will desync the dispatcher's
-      feature vector / mac_table class range from what the network expects.
+      works as long as:
+        - the first layer's n_in is exactly PROTO_N_IN=65 (protocol
+          feature vector -- layer_first reads it sparsely, not generically)
+          and its n_out is <= ML1_MAX_H1
+        - every later layer's n_in and n_out are both <= MLH_MAX_H
+      This is what makes Pipeline 3 genuinely architecture-agnostic: no
+      eBPF recompilation for a different depth or different hidden widths,
+      just a different layer_dims + weights. By protocol, the last layer's
+      n_out should be 7 (6 egress classes + drop) -- not enforced here, but
+      a mismatch will desync the mac_table class range from what the
+      network expects.
 
     base_offset: lets the caller stack several models' weights in the same
       layer_weights array without overlap (like Pipeline 2's weight_offset).
@@ -444,15 +559,24 @@ def load_modular_weights(
         layer_dims = [(65, 4), (4, 4), (4, 7)]
 
     n_layers = len(layer_dims)
-    if n_layers == 0 or n_layers > 16:  # layer_chain BPF_PROG_ARRAY size
-        raise ValueError(f"n_layers={n_layers} must be in [1, 16] (layer_chain size)")
-    for shape in layer_dims:
-        n_in, n_out = shape
-        if n_in <= 0 or n_in > 80 or n_out <= 0 or n_out > 16:  # ML_MAX_IN/ML_MAX_OUT
-            raise ValueError(
-                f"layer shape {shape} outside the compiled ceiling "
-                f"ML_MAX_IN=80/ML_MAX_OUT=16 -- raise the ceiling in "
-                f"ebpf_modular.py and reload to support it")
+    if n_layers == 0 or n_layers > LAYER_CHAIN_SIZE:
+        raise ValueError(f"n_layers={n_layers} must be in [1, {LAYER_CHAIN_SIZE}] (layer_chain size)")
+
+    for i, (n_in, n_out) in enumerate(layer_dims):
+        if i == 0:
+            if n_in != PROTO_N_IN:
+                raise ValueError(
+                    f"first layer n_in must be PROTO_N_IN={PROTO_N_IN} "
+                    f"(protocol feature vector), got {n_in}")
+            if n_out <= 0 or n_out > ML1_MAX_H1:
+                raise ValueError(
+                    f"first layer n_out={n_out} exceeds the compiled ceiling "
+                    f"ML1_MAX_H1={ML1_MAX_H1} -- raise it in ebpf_modular.py and reload")
+        else:
+            if n_in <= 0 or n_in > MLH_MAX_H or n_out <= 0 or n_out > MLH_MAX_H:
+                raise ValueError(
+                    f"layer {i} shape ({n_in},{n_out}) exceeds the compiled ceiling "
+                    f"MLH_MAX_H={MLH_MAX_H} -- raise it in ebpf_modular.py and reload")
 
     total_weights = sum(n_in * n_out + n_out for (n_in, n_out) in layer_dims)
     if base_offset + total_weights > 2048:  # MAX_LAYER_WEIGHT_ENTRIES in the eBPF source

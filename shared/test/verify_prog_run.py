@@ -245,9 +245,9 @@ def _install_mac_table(b, name, ifindex=2):
         b[name][ct.c_uint32(cls)] = action
 
 def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, layer_idx: int, ingress_ifindex: int = 0, ttl: int = 0):
-    """Seed scratch_acts/scratch_meta so that calling layer_generic directly
+    """Seed scratch_acts/scratch_meta so that calling layer_hidden directly
     (bypassing dispatcher + earlier hops) exercises just the model's LAST
-    layer: layer_idx must be n_layers-1 so layer_generic's own
+    layer: layer_idx must be n_layers-1 so layer_hidden's own
     (layer_idx+1==n_layers) check resolves to argmax+forward. The weight
     offset for that layer comes from layer_shapes[{model_id, layer_idx}]
     (already populated by load_modular_weights), not from scratch_meta --
@@ -337,12 +337,14 @@ def setup_modular(model_id: int, model_path: str):
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
     weights, scale = load_weights(model_path)
     b = BPF(text=EBPF_MODULAR_FULL)
-    disp_fn = b.load_func("modular_dispatcher", BPF.XDP)
-    fn_generic = b.load_func("layer_generic", BPF.XDP)
-    # Every layer_chain slot points at the same generic program -- see
-    # ebpf_modular.py module docstring for why.
-    for i in range(16):  # LAYER_CHAIN_SIZE
-        b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_generic.fd)
+    disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)
+    fn_first  = b.load_func("layer_first",  BPF.XDP)
+    fn_hidden = b.load_func("layer_hidden", BPF.XDP)
+    # slot 0 = layer_first (always hop 0), slots 1..15 = layer_hidden
+    # (always a later hop) -- see ebpf_modular.py module docstring for why.
+    b["layer_chain"][ct.c_int(0)] = ct.c_int(fn_first.fd)
+    for i in range(1, 16):  # LAYER_CHAIN_SIZE
+        b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_hidden.fd)
     layer_dims = [(65, 4), (4, 4), (4, 7)]
     n_layers = len(layer_dims)
     load_modular_weights(b, weights, model_id=model_id, scale=scale, layer_dims=layer_dims)
@@ -350,20 +352,23 @@ def setup_modular(model_id: int, model_path: str):
     _install_mac_table(b, "mac_table_t3")
     print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
     return {
-        "b": b, "fn": fn_generic, "disp": disp_fn,
+        # "fn" is the direct BPF_PROG_TEST_RUN target used by run() below to
+        # exercise the model's LAST layer in isolation (see _prime_scratch_p3):
+        # for a 3-layer model that's always layer_hidden (layer_idx>=1).
+        "b": b, "fn": fn_hidden, "disp": disp_fn,
         "weights": weights, "scale": scale,
         "cls_stats": b["cls_stats_t3"],
         "pkt_stats": b["pkt_stats_t3"],
         "pipeline": 3,
         "last_layer_idx": n_layers - 1,
         # n_tail = actual runtime tail-call hops for this model (dispatcher ->
-        # layer_generic, called once per layer): NOT len(progs)-1 anymore --
-        # there are only 2 distinct loaded programs regardless of depth,
-        # since every hop reuses the same layer_generic.
+        # layer_first -> layer_hidden x (n_layers-1)): NOT len(progs)-1 --
+        # there are only 2 distinct layer programs regardless of depth.
         "n_tail": n_layers,
         "progs": {
             "modular_dispatcher": disp_fn.fd,
-            "layer_generic": fn_generic.fd,
+            "layer_first": fn_first.fd,
+            "layer_hidden": fn_hidden.fd,
         },
     }
 

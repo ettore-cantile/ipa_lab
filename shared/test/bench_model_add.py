@@ -112,11 +112,13 @@ def bench_modular(weights, scale, n_models):
 
     t0 = time.perf_counter()
     b = BPF(text=EBPF_MODULAR_FULL)
-    disp_fn = b.load_func("modular_dispatcher", BPF.XDP)
-    fn_generic = b.load_func("layer_generic", BPF.XDP)
-    # Every layer_chain slot points at the same generic program.
-    for i in range(16):  # LAYER_CHAIN_SIZE
-        b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_generic.fd)
+    disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)
+    fn_first  = b.load_func("layer_first",  BPF.XDP)
+    fn_hidden = b.load_func("layer_hidden", BPF.XDP)
+    # slot 0 = layer_first, slots 1..15 = layer_hidden.
+    b["layer_chain"][ct.c_int(0)] = ct.c_int(fn_first.fd)
+    for i in range(1, 16):  # LAYER_CHAIN_SIZE
+        b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_hidden.fd)
     setup_s = time.perf_counter() - t0
 
     times = []
