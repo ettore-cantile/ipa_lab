@@ -57,8 +57,10 @@ Output atteso: tabella metriche (istruzioni/jited/tail-call/memoria/latenza/thro
 l'uscita) + `kernel suite: PASS`.
 
 Cosa verifica in più oltre al dispatch:
-- **Equivalenza numerica**: per P2/P3 confronta la chiave del kernel con il riferimento Python
-  ricalcolato sull'`ingress_ifindex` realmente visto dal programma (risolve il vecchio "drift" P2).
+- **Corrispondenza di classe** (single-pass, uniforme sulle 3 pipeline): pre-installa `mac_table[0..5]`,
+  esegue una volta e controlla che la classe scelta dal kernel = classe del riferimento Python
+  (`cls_stats[ref_cls] > 0`). Passa un `xdp_md` azzerato come contesto → `ingress_ifindex=0` deterministico
+  (risolve il vecchio "drift" del template).
 - **Reroute su guasto**: per ogni TTL e interfaccia `k`, esegue P1 con tutti i link up e poi con
   `link_state[k]=0`, e conferma che l'argmax cambia uscita in almeno un caso.
 
@@ -98,11 +100,8 @@ kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method modular  
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --verify-only
 ```
 
-Popolamento tabella di forwarding (se richiesto dalla pipeline):
-
-```bash
-kathara exec frankfurt -- python3 /shared/setup_fwd_table.py --model-id 0 --method hardcoded
-```
+Le pipeline popolano `mac_table` (class → ifindex + MAC) da sole all'avvio; non serve uno
+step separato di setup della tabella di forwarding.
 
 Le pipeline avviano automaticamente il monitor `link_state` (thread di polling che tiene
 `link_state[0..5]` allineato al carrier reale delle interfacce egress). Per un dry-run dei
@@ -154,6 +153,8 @@ Note oneste:
 - Ogni metrica di costo (istruzioni, jited, tail call, map lookup, memoria) cresce monotona P1→P2→P3; le prestazioni di picco calano nello stesso ordine.
 - **P1 = meno memoria mappe** (264 B): nessun `model_cache` (prima 83 KB, il 99%), restano solo i contatori + `link_state` a 6 slot.
 - **Confronto pulito**: P1 è sceso da 1109 a 72 ns dopo aver rimosso 3 `bpf_trace_printk` per pacchetto dal path HIT (helper costoso, assente in P2/P3) che falsavano il baseline.
-- **Inferenza identica** nelle 3 pipeline (stesso MLP, stessi pesi, stesso argmax): verificata dal check di equivalenza chiave-kernel = chiave-Python. Asimmetria per design: l'azione di P1 è più leggera (`switch(cls)→bpf_redirect` diretto, senza lookup `fwd_table`/`valid_keys` né riscrittura MAC che P2/P3 fanno).
+- **Inferenza identica** nelle 3 pipeline (stesso MLP, stessi pesi, stesso argmax): verificata dal check di corrispondenza di classe (classe kernel = classe riferimento Python). Differiscono solo per *come* calcolano l'inferenza.
+- **Azione uniforme (mac_table)**: tutte fanno `argmax → mac_table[classe] → bpf_redirect`. La NN decide la porta; `mac_table` è un dizionario `classe → {ifindex, MAC}` (in P1 hardcoded in uno `switch`, 0 lookup). Rimossa la vecchia `fwd_table` indicizzata dal valore + validazione per-TTL (`valid_keys`).
+- **P2/P3 da rimisurare**: istruzioni e soprattutto memoria mappe calano (hash 256 slot → 8 slot). Rieseguire `--only kernel`.
 - `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa; aggiornato dal monitor carrier. Il probe conferma che un link giù cambia l'uscita (5/30 casi).
 - Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`.

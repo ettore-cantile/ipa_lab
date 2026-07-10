@@ -545,10 +545,12 @@ def suite_core(model, verbose=False):
 
     # P1 hardcoded puro: nessun model_cache. Solo link_state[6] + contatori.
     #   link_state 6*(4+4) + pkt_stats 3*(4+8) + cls_stats 7*(4+8) + debug 8*(4+8) = 264
+    # mac_table replaced the old fwd_table(256)+valid_keys(256): now class->action
+    # over 8 slots + a small cls_stats(7). Much smaller footprint on P2/P3.
     MAP_MEM_BYTES = {
         1: 6 * 8 + 3 * 12 + 7 * 12 + 8 * 12,
-        2: N_WEIGHTS * 1 + 256 * 7 + 256 * 22 + 256 * 9 + 3 * 8,
-        3: N_WEIGHTS * 2 + 256 * 14 + (H + 16) * 8 * ncpus + 256 * 22 + 256 * 9 + 3 * 8,
+        2: N_WEIGHTS * 1 + 256 * 7 + 8 * 20 + 3 * 8 + 7 * 8,
+        3: N_WEIGHTS * 2 + 256 * 14 + (H + 16) * 8 * ncpus + 8 * 20 + 3 * 8 + 7 * 8,
     }
     FLEXIBILITY = {1: 'low',  2: 'medium',  3: 'high'}
     MODEL_UPDATE = {
@@ -1011,10 +1013,10 @@ _PIPELINE_MAP_NAMES = [
     "pkt_stats", "cls_stats", "debug_stats",
     # P2 template
     "arch_weights", "arch_registry", "arch_progs",
-    "fwd_table_t2", "valid_keys_t2", "pkt_stats_t2", "miss_events_t2",
+    "mac_table_t2", "pkt_stats_t2", "cls_stats_t2",
     # P3 modular
     "layer_weights", "layer_registry", "layer_chain", "scratch_acts", "scratch_meta",
-    "fwd_table_t3", "valid_keys_t3", "pkt_stats_t3", "miss_events_t3",
+    "mac_table_t3", "pkt_stats_t3", "cls_stats_t3",
 ]
 
 

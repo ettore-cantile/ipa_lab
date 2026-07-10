@@ -21,10 +21,13 @@ Maps:
                      Python side stores int8 as c_uint8(v & 0xFF) two's complement)
   layer_chain      : BPF_PROG_ARRAY  layer_idx -> BPF prog fd
   layer_registry   : model_id -> {n_layers, layer_ids[8], weight_offsets[8], scale}
-  fwd_table_t3     : u64 -> fwd_action
-  valid_keys_t3    : u8  -> u64
-  pkt_stats_t3     : [0]=HIT [1]=MISS [2]=FAKE
-  miss_events_t3   : perf buffer
+  mac_table_t3     : u32 class (argmax output) -> fwd_action {ifindex, src/dst MAC}
+  cls_stats_t3     : per-class redirect counter
+  pkt_stats_t3     : [0]=HIT [1]=MISS [2]=DROP
+
+Action: the last layer runs argmax -> class, then a single mac_table_t3[class]
+lookup resolves the L2 next-hop and bpf_redirect()s (cls 6 = DROP). No output
+key, no per-TTL validation -- the NN decides, the table only maps class->port.
 
 eBPF verifier notes:
   - scratch_acts is PERCPU -> no spinlock needed
@@ -89,14 +92,6 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-struct miss_event_t3 {
-    __u8  model_id;
-    __u8  ttl;
-    __u32 ingress_ifindex;
-    __u8  layer_idx;
-    __u64 key;
-} __attribute__((packed));
-
 /* Scratch maps: PERCPU to avoid contention */
 #define SCRATCH_ACT_SIZE   128
 #define SCRATCH_META_SLOTS  16
@@ -121,13 +116,12 @@ BPF_ARRAY(link_state, __u32, 6);
 /* Layer chain tail-call map: layer_idx -> BPF prog fd */
 BPF_PROG_ARRAY(layer_chain, 16);
 
-/* Forwarding maps */
-BPF_HASH(fwd_table_t3, __u64, struct fwd_action, 256);
-BPF_HASH(valid_keys_t3, __u8, __u64, 256);
-BPF_ARRAY(pkt_stats_t3, __u64, 3);
-BPF_PERF_OUTPUT(miss_events_t3);
+/* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
+ * The NN decides the port; this only resolves the L2 next-hop. */
+BPF_HASH(mac_table_t3, __u32, struct fwd_action, 8);
+BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
+BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
 
-#define OUTPUT_OFFSET 100000ULL
 /* Explicit signed cast so arithmetic is correct after __u8 storage */
 #define WEIGHT(p) ((__s8)(*p))
 #define RELU(x)  ((x) > 0 ? (x) : 0)
@@ -346,26 +340,6 @@ EBPF_LAYER_4_7_ARGMAX = EBPF_MODULAR_COMMON_HEADER + r"""
 #define L2_N_OUT  7
 #define L2_W_BASE_META_SLOT  7
 
-/* Miss/fake-hit event emitter. Must be a real function, NOT a macro:
- * BCC rejects map methods (scratch_meta.lookup / miss_events_t3.perf_submit)
- * inside a #define -- "cannot use map function inside a macro". All the
- * fields it needs (model_id, ttl, ingress_ifindex, layer_idx) were stored
- * in scratch_meta by the dispatcher, so no ip/ctx fallback is required. */
-static __always_inline
-void emit_miss_t3(struct xdp_md *ctx, __u64 key) {
-    int mid_slot = META_MODEL_ID;   long long *mid_p = scratch_meta.lookup(&mid_slot);
-    int li_slot  = META_LAYER_IDX;  long long *lip   = scratch_meta.lookup(&li_slot);
-    int ttl_slot = META_TTL;        long long *ttlp  = scratch_meta.lookup(&ttl_slot);
-    int if_slot  = META_INGRESS_IF; long long *ifp   = scratch_meta.lookup(&if_slot);
-    struct miss_event_t3 ev = {};
-    ev.model_id        = mid_p ? (__u8)(*mid_p) : 0;
-    ev.ttl             = ttlp  ? (__u8)(*ttlp)  : 0;
-    ev.ingress_ifindex = ifp   ? (__u32)(*ifp)  : 0;
-    ev.layer_idx       = lip   ? (__u8)(*lip)   : 2;
-    ev.key             = key;
-    miss_events_t3.perf_submit(ctx, &ev, sizeof(ev));
-}
-
 int layer_4_7_argmax(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -374,7 +348,6 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
     int ms = META_SCALE;
     long long *sp = scratch_meta.lookup(&ms);
     if (!sp || *sp == 0) return XDP_PASS;
-    __u16 scale = (__u16)(*sp);
 
     int mi = L2_W_BASE_META_SLOT;
     long long *woff_p = scratch_meta.lookup(&mi);
@@ -403,33 +376,32 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    __u64 key = (__u64)((best_val + (long long)(OUTPUT_OFFSET * scale)) / (__u64)scale);
-
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
-    struct iphdr *ip = (struct iphdr *)(eth + 1);
-    if ((void *)(ip + 1) > data_end)  return XDP_PASS;
 
-    struct fwd_action *action = fwd_table_t3.lookup(&key);
-    __u64 *correct_key        = valid_keys_t3.lookup(&ip->ttl);
+    /* The NN decided the egress class (argmax). cls 6 = DROP. */
+    if (best_cls >= 6) {
+        int di = 2; __u64 *dv = pkt_stats_t3.lookup(&di);
+        if (dv) __sync_fetch_and_add(dv, 1);
+        return XDP_DROP;
+    }
 
-    if (action != NULL && correct_key && *correct_key == key) {
+    /* mac_table: class -> {ifindex, src/dst MAC}. Single lookup, no key math,
+     * no output validation -- resolve the L2 next-hop and redirect. */
+    __u32 cls = (__u32)best_cls;
+    struct fwd_action *action = mac_table_t3.lookup(&cls);
+    if (action != NULL) {
         int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
+        __u64 *cv = cls_stats_t3.lookup(&cls);
+        if (cv) __sync_fetch_and_add(cv, 1);
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
-    } else if (action != NULL) {
-        /* Fake hit: key found but TTL mismatch -> emit event for CP visibility */
-        int si = 2; __u64 *v = pkt_stats_t3.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
-        emit_miss_t3(ctx, key);
-    } else {
-        /* Miss: key not in fwd_table */
-        int si = 1; __u64 *v = pkt_stats_t3.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
-        emit_miss_t3(ctx, key);
     }
+    /* no mac_table entry for that class (e.g. link down / not provisioned) */
+    int si = 1; __u64 *v = pkt_stats_t3.lookup(&si);
+    if (v) __sync_fetch_and_add(v, 1);
     return XDP_PASS;
 }
 """

@@ -25,11 +25,18 @@ Control-plane split of responsibilities
   loaded XDP programs via bpf_obj[name] (only maps), so the fd must be
   obtained from the .load_func() return value in the caller.
 
+Action (mac_table):
+  The NN decides the egress class (argmax). The program then does a single
+  lookup mac_table_t2[class] -> {ifindex, src_mac, dst_mac}, rewrites the L2
+  header and bpf_redirect()s. mac_table is just the physical next-hop
+  dictionary -- no routing decision, no output validation. cls 6 = DROP.
+  (Earlier design keyed a fwd_table by the raw argmax value and validated it
+  per-TTL via valid_keys; that was over-engineered for a routing action and
+  has been removed.)
+
 Implementation notes:
   - Inference uses a sparse dot-product over the one-hot feature vector via
     BPF_ARRAY index arithmetic, avoiding a large on-stack activation array.
-  - The output key division uses unsigned division (BPF LLVM has no signed
-    64-bit divide), with an OUTPUT_OFFSET bias to keep the numerator positive.
   - ingress_ifindex is clamped to [0,6]; under BPF_PROG_TEST_RUN it is a
     sandbox value outside that range and is treated as "no ingress iface".
   - Weights are written through the raw bpf(2) syscall (libbcc does not export
@@ -187,14 +194,6 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-struct miss_event_t2 {
-    __u8  model_id;
-    __u8  ttl;
-    __u32 ingress_ifindex;
-    __u8  arch_id;
-    __u64 key;
-} __attribute__((packed));
-
 /* 'char' leaf: BCC str2ctype knows 'char'; '__s8'/'signed char' are not. */
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
@@ -205,10 +204,12 @@ BPF_ARRAY(link_state, __u32, 6);
 
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_PROG_ARRAY(arch_progs, 8);
-BPF_HASH(fwd_table_t2, __u64, struct fwd_action, 256);
-BPF_HASH(valid_keys_t2, __u8, __u64, 256);
-BPF_ARRAY(pkt_stats_t2, __u64, 3);
-BPF_PERF_OUTPUT(miss_events_t2);
+/* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
+ * The NN decides the port; this is only the L2 next-hop dictionary. No routing
+ * decision here, no output validation -- just resolve the physical action. */
+BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
+BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
+BPF_ARRAY(cls_stats_t2, __u64, 7);   /* per-class redirect counter */
 
 int ipa_switch_template(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -249,7 +250,6 @@ EBPF_ARCH_65_4_4_7 = r"""
 #define T2_OUT_W_OFF  284
 #define T2_OUT_B_OFF  312
 #define T2_N_WEIGHTS  319
-#define OUTPUT_OFFSET 100000LL
 #define RELU(x)  ((x) > 0 ? (x) : 0)
 
 #ifndef IPA_ARCH_COMBINED
@@ -288,22 +288,13 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-struct miss_event_t2 {
-    __u8  model_id;
-    __u8  ttl;
-    __u32 ingress_ifindex;
-    __u8  arch_id;
-    __u64 key;
-} __attribute__((packed));
-
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 BPF_ARRAY(link_state, __u32, 6);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
-BPF_HASH(fwd_table_t2, __u64, struct fwd_action, 256);
-BPF_HASH(valid_keys_t2, __u8, __u64, 256);
+BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
-BPF_PERF_OUTPUT(miss_events_t2);
+BPF_ARRAY(cls_stats_t2, __u64, 7);
 #endif /* IPA_ARCH_COMBINED */
 
 int arch_65_4_4_7(struct xdp_md *ctx) {
@@ -419,31 +410,29 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    long long _num_signed = best_val + OUTPUT_OFFSET * (long long)scale;
-    if (_num_signed < 0) return XDP_PASS;
-    __u64 num = (__u64)_num_signed;
-    __u64 key = num / (__u64)scale;
+    /* The NN decided the egress class (argmax). cls 6 = DROP. */
+    if (best_cls >= 6) {
+        int di = 2; __u64 *dv = pkt_stats_t2.lookup(&di);
+        if (dv) __sync_fetch_and_add(dv, 1);
+        return XDP_DROP;
+    }
 
-    struct fwd_action *action = fwd_table_t2.lookup(&key);
-    __u64 *correct_key        = valid_keys_t2.lookup(&ip->ttl);
-
-    if (action != NULL && correct_key && *correct_key == key) {
+    /* mac_table: class -> {ifindex, src/dst MAC}. Single lookup, no key math,
+     * no output validation -- resolve the L2 next-hop and redirect. */
+    __u32 cls = (__u32)best_cls;
+    struct fwd_action *action = mac_table_t2.lookup(&cls);
+    if (action != NULL) {
         int si = 0; __u64 *v = pkt_stats_t2.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
+        __u64 *cv = cls_stats_t2.lookup(&cls);
+        if (cv) __sync_fetch_and_add(cv, 1);
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
-    } else {
-        int fake = (action != NULL) ? 1 : 0;
-        int si   = fake ? 2 : 1;
-        __u64 *v = pkt_stats_t2.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
-        struct miss_event_t2 ev = {};
-        ev.model_id = model_id; ev.ttl = ip->ttl;
-        ev.ingress_ifindex = ctx->ingress_ifindex;
-        ev.arch_id = entry->arch_id; ev.key = key;
-        miss_events_t2.perf_submit(ctx, &ev, sizeof(ev));
     }
+    /* no mac_table entry for that class (e.g. link down / not provisioned) */
+    int si = 1; __u64 *v = pkt_stats_t2.lookup(&si);
+    if (v) __sync_fetch_and_add(v, 1);
     return XDP_PASS;
 }
 """

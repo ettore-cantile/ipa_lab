@@ -552,7 +552,7 @@
           <div class="pnode">dispatcher<small>arch_id</small></div>
           <div class="pchev"><span>tail call ×1</span><b>›</b></div>
           <div class="pnode a">arch_65_4_4_7<small>pesi da BPF_ARRAY<br>inferenza + argmax</small></div>
-          <div class="pchev"><span>fwd_table</span><b>›</b></div>
+          <div class="pchev"><span>mac_table[cls]</span><b>›</b></div>
           <div class="pnode out">bpf_redirect<small>azione</small></div>
         </div>
         <div class="pcost">
@@ -805,13 +805,24 @@
       modello 65-4-4-7, scale 24) dopo l'aggiunta di <span class="mono">link_state</span> reale e la rimozione di
       <span class="mono">model_cache</span>. La memoria mappe di P1 (264 B) coincide col calcolo analitico
       (<span class="mono">link_state</span> 48 + <span class="mono">pkt_stats</span> 36 +
-      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96). Un'asimmetria da tenere
-      presente per correttezza: l'inferenza (MLP 65-4-4-7, stessi pesi, stesso argmax) è <strong>identica</strong>
-      nelle tre pipeline — verificata dal controllo di equivalenza chiave-kernel = chiave-Python — ma l'<em>azione</em>
-      di P1 è più leggera per design: fa <span class="mono">switch(cls)→bpf_redirect</span> diretto, senza il lookup
-      <span class="mono">fwd_table</span>/<span class="mono">valid_keys</span> né la riscrittura MAC che P2/P3
-      eseguono. È parte del punto di design "azione hardcoded", non lavoro nascosto. Latenza/throughput hanno
-      varianza run-to-run non trascurabile sotto <span class="mono">BPF_PROG_TEST_RUN</span>.
+      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96). L'inferenza
+      (MLP 65-4-4-7, stessi pesi, stesso argmax) è <strong>identica</strong> nelle tre pipeline — verificata dal
+      test di corrispondenza di classe (classe scelta dal kernel = classe del riferimento Python). L'unica
+      differenza è <em>come</em> si calcola l'inferenza (il costo della flessibilità). L'azione è ora
+      <strong>uniforme</strong>: tutte fanno <span class="mono">argmax → mac_table[classe] → bpf_redirect</span>;
+      P1 tiene la mappatura classe→porta hardcoded in uno <span class="mono">switch</span> (0 lookup),
+      P2/P3 la risolvono da <span class="mono">mac_table</span>. Latenza/throughput hanno varianza run-to-run
+      non trascurabile sotto <span class="mono">BPF_PROG_TEST_RUN</span>.
+    </div>
+    <div class="iface-note" style="margin-bottom:2.5rem;border-left-color:var(--amber);">
+      <strong>mac_table — da rimisurare.</strong> P2/P3 non usano più una <span class="mono">fwd_table</span>
+      indicizzata dal valore dell'inferenza + validazione per-TTL (<span class="mono">valid_keys</span>). Ora la
+      NN decide la classe (argmax) e una singola lookup <span class="mono">mac_table[classe] → {ifindex, MAC}</span>
+      risolve il next-hop L2 e fa <span class="mono">bpf_redirect</span> — un "dizionario delle porte", nessuna
+      decisione di routing nella tabella. Rimossi la divisione unsigned della chiave, la seconda lookup e la logica
+      HIT/FAKE/MISS. I valori di P2/P3 in tabella (istruzioni e soprattutto <em>memoria mappe</em>) precedono questa
+      modifica: attesa una riduzione (la grande hash a 256 slot sostituita da 8 slot). Rieseguire
+      <span class="mono">test_suite.py --only kernel</span>.
     </div>
 
     <!-- Weight update latency -->
@@ -962,16 +973,14 @@
       <em>dispatch reale in kernel</em> — pacchetto ricevuto → inferenza → redirect verso l'ifindex
       corretto — è verificata separatamente da <span class="mono">shared/verify_prog_run.py</span>,
       che carica i programmi XDP reali ed esegue <span class="mono">BPF_PROG_TEST_RUN</span> per tutte
-      e tre le pipeline. Per P2/P3 usa una verifica <strong>two-pass</strong>: cattura la chiave di
-      forwarding emessa dal kernel, la installa nella <span class="mono">fwd_table</span> e ri-esegue,
-      asserendo che il redirect scatti (<span class="mono">retval ∈ {0,4}</span> e
-      <span class="mono">pkt_stats[HIT] &gt; 0</span>).<br><br>
-      <strong>Equivalenza numerica (drift P2 risolto).</strong> Sotto <span class="mono">BPF_PROG_TEST_RUN</span>
-      il leaf del template legge un <span class="mono">ctx-&gt;ingress_ifindex</span> di sandbox (≠0) e aggiunge
-      la one-hot iface, mentre il riferimento Python assumeva ifindex=0: da qui l'apparente "drift" tra le chiavi.
-      Ora il verifier ricalcola il riferimento con l'<span class="mono">ingress_ifindex</span> effettivamente
-      riportato nel miss-event, così il confronto diventa un <strong>controllo di equivalenza reale</strong>
-      (chiave kernel == chiave Python) e non solo "il redirect scatta".<br><br>
+      e tre le pipeline. Con <span class="mono">mac_table</span> la verifica è <strong>single-pass e uniforme</strong>:
+      si pre-installa <span class="mono">mac_table[0..5]</span>, si esegue una volta e si controlla che la
+      <strong>classe scelta dal kernel</strong> coincida con quella del riferimento Python
+      (<span class="mono">cls_stats[ref_cls] &gt; 0</span> e <span class="mono">retval ∈ {0,4}</span>). Niente più
+      cattura della chiave, installazione e seconda passata.<br><br>
+      <strong>ingress deterministico.</strong> La chiamata passa un <span class="mono">xdp_md</span> azzerato come
+      contesto, così <span class="mono">ingress_ifindex = 0</span> per tutte le pipeline e la classe combacia col
+      riferimento (risolve il vecchio "drift" del template, che leggeva un ingress di sandbox ≠0).<br><br>
       <strong>Reroute su guasto (link_state).</strong> La suite verifica anche che
       <span class="mono">link_state</span> sia un input di routing vivo: per ogni TTL e ogni interfaccia
       <em>k</em> esegue P1 con tutti i link up e poi con il link <em>k</em> giù
@@ -1070,14 +1079,16 @@ fv[node + 13]      = 1;   /* node one-hot [13..64] */</div>
     </div>
 
     <div class="iface-note">
-      <strong>Perché non serve una fwd_table dedicata nelle tre pipeline?</strong><br>
-      Le pipeline si occupano esclusivamente di <em>classificazione</em>: ricevono un pacchetto,
-      estraggono le feature, eseguono l'inferenza e producono un'<em>azione</em> (drop / pass /
-      redirect verso un ifindex). Il mapping <code>classe → ifindex di uscita</code> è
-      risolto inline nella pipeline stessa (switch su <code>best_cls</code> nella P1,
-      lookup su <code>action_map</code> nelle P2/P3) — non è necessaria una tabella di
-      forwarding separata. Una <code>fwd_table</code> diventerebbe rilevante solo se IPA
-      dovesse gestire routing IP generico, che non è nel perimetro di queste tre pipeline.
+      <strong>La tabella non decide il routing: lo fa l'IA.</strong><br>
+      Le pipeline si occupano di <em>classificazione</em>: ricevono un pacchetto, estraggono le feature,
+      eseguono l'inferenza e producono un'<em>azione</em> (redirect verso una porta, o DROP). La rete
+      neurale decide la porta (argmax); la <code>mac_table</code> è solo un <strong>dizionario delle
+      porte</strong> — <code>classe → {ifindex, src_mac, dst_mac}</code> — che risolve il next-hop L2 e
+      riscrive gli header Ethernet. In P1 questo dizionario è hardcoded in uno <code>switch(best_cls)</code>
+      (zero lookup); in P2/P3 è la mappa <code>mac_table</code>. Nessuna decisione di routing nella tabella,
+      nessuna validazione dell'output: ci si fida della classe scelta dal modello. Una vera tabella di
+      forwarding (per prefissi IP) servirebbe solo se IPA gestisse routing IP generico, fuori dal perimetro
+      di queste tre pipeline.
     </div>
   </section>
 

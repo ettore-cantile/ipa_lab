@@ -26,10 +26,35 @@ class _BpfAttrTest(ct.Structure):
         ("data_out",      ct.c_uint64),
         ("repeat",        ct.c_uint32),
         ("duration",      ct.c_uint32),
+        ("ctx_size_in",   ct.c_uint32),
+        ("ctx_size_out",  ct.c_uint32),
+        ("ctx_in",        ct.c_uint64),
+        ("ctx_out",       ct.c_uint64),
+        ("flags",         ct.c_uint32),
+        ("cpu",           ct.c_uint32),
+        ("batch_size",    ct.c_uint32),
     ]
 
-def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
+class _XdpMd(ct.Structure):
+    """struct xdp_md — passed as ctx so ingress_ifindex is deterministic.
+    Under BPF_PROG_TEST_RUN the data* fields must be 0 (the kernel fills them
+    from data_in); we only care about pinning ingress_ifindex."""
+    _fields_ = [
+        ("data",            ct.c_uint32),
+        ("data_end",        ct.c_uint32),
+        ("data_meta",       ct.c_uint32),
+        ("ingress_ifindex", ct.c_uint32),
+        ("rx_queue_index",  ct.c_uint32),
+        ("egress_ifindex",  ct.c_uint32),
+    ]
+
+def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1, ingress_ifindex: int = 0):
+    """Run an XDP program on `frame`. A zeroed xdp_md ctx pins ingress_ifindex
+    (default 0) so every pipeline sees the same value and matches the Python
+    reference. Falls back to a no-ctx call on kernels without XDP ctx support."""
     out = (ct.c_uint8 * 2048)()
+    ctx_in  = _XdpMd(ingress_ifindex=ingress_ifindex)
+    ctx_out = _XdpMd()
     a = _BpfAttrTest(
         prog_fd       = prog_fd,
         data_size_in  = len(frame),
@@ -37,11 +62,19 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1):
         data_in       = ct.cast(ct.c_char_p(frame), ct.c_void_p).value,
         data_out      = ct.cast(out, ct.c_void_p).value,
         repeat        = repeat,
+        ctx_size_in   = ct.sizeof(ctx_in),
+        ctx_size_out  = ct.sizeof(ctx_out),
+        ctx_in        = ct.cast(ct.byref(ctx_in), ct.c_void_p).value,
+        ctx_out       = ct.cast(ct.byref(ctx_out), ct.c_void_p).value,
     )
     r = _libc.syscall(321, BPF_PROG_TEST_RUN, ct.byref(a), ct.sizeof(a))
     if r != 0:
-        e = ct.get_errno()
-        raise OSError(e, os.strerror(e))
+        # retry without ctx (older kernels reject xdp_md ctx)
+        a.ctx_size_in = 0; a.ctx_size_out = 0; a.ctx_in = 0; a.ctx_out = 0
+        r = _libc.syscall(321, BPF_PROG_TEST_RUN, ct.byref(a), ct.sizeof(a))
+        if r != 0:
+            e = ct.get_errno()
+            raise OSError(e, os.strerror(e))
     return a.retval, a.duration
 
 _BPF_OBJ_GET_INFO_BY_FD = 15
@@ -106,30 +139,9 @@ def map_bytes(map_fd: int, nr_cpus: int = 1) -> int:
     per_cpu = nr_cpus if map_type in _PERCPU_MAP_TYPES else 1
     return (ksz + vsz * per_cpu) * ment
 
-class MissEventT2(ct.Structure):
-    _pack_ = 1
-    _fields_ = [
-        ("model_id",        ct.c_uint8),
-        ("ttl",             ct.c_uint8),
-        ("ingress_ifindex", ct.c_uint32),
-        ("arch_id",         ct.c_uint8),
-        ("key",             ct.c_uint64),
-    ]
-
-class MissEventT3(ct.Structure):
-    _pack_ = 1
-    _fields_ = [
-        ("model_id",        ct.c_uint8),
-        ("ttl",             ct.c_uint8),
-        ("ingress_ifindex", ct.c_uint32),
-        ("layer_idx",       ct.c_uint8),
-        ("key",             ct.c_uint64),
-    ]
-
 SHARED_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODEL_PT     = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
 WEIGHTS_JSON = os.path.join(SHARED_DIR, "weights_float.json")
-OUTPUT_OFFSET = 100000
 
 def _nr_cpus() -> int:
     try:
@@ -208,27 +220,20 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
             best_val, best_cls = acc, k
     return best_cls, best_val, h1, h2
 
-def _compute_fwd_key(best_val: int, scale: int) -> int:
-    return (best_val + OUTPUT_OFFSET * scale) // scale
-
 class _FwdAction(ct.Structure):
     _pack_ = 1
     _fields_ = [("ifindex",  ct.c_uint32), ("src_mac",  ct.c_uint8 * 6), ("dst_mac",  ct.c_uint8 * 6)]
 
-def _insert_fwd_entry(b, fwd_table_name, valid_keys_name, ttl, key, ifindex=2):
-    action = _FwdAction(ifindex=ifindex, src_mac=(ct.c_uint8 * 6)(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF), dst_mac=(ct.c_uint8 * 6)(0x11, 0x22, 0x33, 0x44, 0x55, 0x66))
-    b[fwd_table_name][ct.c_uint64(key)] = action
-    b[valid_keys_name][ct.c_uint8(ttl)] = ct.c_uint64(key)
-
-def _remove_fwd_entry(b, fwd_table_name, valid_keys_name, ttl, key):
-    try:
-        del b[fwd_table_name][ct.c_uint64(key)]
-    except Exception:
-        pass
-    try:
-        del b[valid_keys_name][ct.c_uint8(ttl)]
-    except Exception:
-        pass
+def _install_mac_table(b, name, ifindex=2):
+    """Pre-install the class->action map for classes 0..5 (the argmax output).
+    The NN picks the class; this dictionary resolves it to {ifindex, MACs}."""
+    action = _FwdAction(
+        ifindex=ifindex,
+        src_mac=(ct.c_uint8 * 6)(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF),
+        dst_mac=(ct.c_uint8 * 6)(0x11, 0x22, 0x33, 0x44, 0x55, 0x66),
+    )
+    for cls in range(6):
+        b[name][ct.c_uint32(cls)] = action
 
 def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, w_off_out: int, ingress_ifindex: int = 0, ttl: int = 0):
     for i, v in enumerate(h2[:4]):
@@ -301,16 +306,13 @@ def setup_template(model_id: int, model_path: str):
     b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
     load_arch_weights(b, weights, model_id=model_id, scale=scale)
     _seed_link_state(b, 1)
+    _install_mac_table(b, "mac_table_t2")
     return {
         "b": b, "fn": leaf_fn, "disp": disp_fn,
         "weights": weights, "scale": scale,
-        "cls_stats": None,
+        "cls_stats": b["cls_stats_t2"],
         "pkt_stats": b["pkt_stats_t2"],
         "pipeline": 2,
-        "perf_name": "miss_events_t2",
-        "perf_cls": MissEventT2,
-        "fwd_table": "fwd_table_t2",
-        "valid_keys": "valid_keys_t2",
         "progs": {"ipa_switch_template": disp_fn.fd, "arch_65_4_4_7": leaf_fn.fd},
     }
 
@@ -328,17 +330,15 @@ def setup_modular(model_id: int, model_path: str):
     b["layer_chain"][ct.c_int(2)] = ct.c_int(lf2.fd)
     load_modular_weights(b, weights, model_id=model_id, scale=scale)
     _seed_link_state(b, 1)
+    _install_mac_table(b, "mac_table_t3")
     w_off_out = (65 * 4 + 4) + (4 * 4 + 4)
     print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
     return {
         "b": b, "fn": lf2, "disp": disp_fn,
         "weights": weights, "scale": scale,
+        "cls_stats": b["cls_stats_t3"],
         "pkt_stats": b["pkt_stats_t3"],
         "pipeline": 3,
-        "perf_name": "miss_events_t3",
-        "perf_cls": MissEventT3,
-        "fwd_table": "fwd_table_t3",
-        "valid_keys": "valid_keys_t3",
         "w_off_out": w_off_out,
         "progs": {
             "modular_dispatcher": disp_fn.fd,
@@ -369,17 +369,6 @@ def _reset_stats(setup):
                 cs[ct.c_uint32(i)] = ct.c_ulonglong(0)
             except Exception:
                 pass
-
-def _make_perf_cb(event_cls, label, capture):
-    def _cb(cpu, data, size):
-        if size < ct.sizeof(event_cls):
-            return
-        ev = ct.cast(data, ct.POINTER(event_cls)).contents
-        capture["key"] = int(ev.key)
-        capture["ttl"] = int(ev.ttl)
-        capture["ingress"] = int(ev.ingress_ifindex)
-        print(f"  [{label}] miss cpu={cpu} model_id={ev.model_id} ttl={ev.ttl} ifindex={ev.ingress_ifindex} key={ev.key:#018x}")
-    return _cb
 
 XDP_PASS = 2
 XDP_REDIRECT_PASS = frozenset({0, 4})
@@ -441,17 +430,9 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     ps = setup["pkt_stats"]
     cs = setup.get("cls_stats")
     pipeline = setup["pipeline"]
-    fwd_table_name = setup.get("fwd_table")
-    valid_keys_name = setup.get("valid_keys")
     w_off_out = setup.get("w_off_out", 0)
-    capture = {}
-    perf_name = setup.get("perf_name")
-    perf_cls = setup.get("perf_cls")
-    if perf_name and perf_cls:
-        cb = _make_perf_cb(perf_cls, f"P{pipeline}", capture)
-        b[perf_name].open_perf_buffer(cb, page_cnt=8)
 
-    # Stampa i tempi reali di update del modello per il Method 1
+    # Model-update timing for Method 1
     if pipeline == 1:
         t_redir = setup.get("t_redirect_s", 0.0)
         t_ins   = setup.get("t_insert_s", 0.0)
@@ -461,56 +442,24 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         print()
 
     print(f"[setup] scale={scale}  weights={len(weights)}  prog_fd={fn.fd}")
+    print("      All pipelines: argmax -> mac_table[class] -> bpf_redirect.")
+    print("      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.")
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
+        # Reference (ingress=0, matched by the zeroed xdp_md ctx we pass below).
         ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=0)
-        expected_key = _compute_fwd_key(ref_val, scale)
         frame = build_frame(model_id, ttl, scale)
-        if pipeline == 1:
-            _reset_stats(setup)
-            retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
-            cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
-            ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
-            detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"
-        else:
-            capture.clear()
-            _reset_stats(setup)
-            if pipeline == 3:
-                _prime_scratch_p3(b, h2, scale, model_id, w_off_out=w_off_out, ingress_ifindex=0, ttl=ttl)
-            prog_test_run(fn.fd, frame, repeat=1)
-            b.perf_buffer_poll(timeout=100)
-            kernel_key = capture.get("key")
-            if kernel_key is None:
-                retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
-                ok = False
-                detail = f"retval={retval} no miss event (inference did not complete)"
-            else:
-                _insert_fwd_entry(b, fwd_table_name, valid_keys_name, ttl=ttl, key=kernel_key, ifindex=2)
-                _reset_stats(setup)
-                if pipeline == 3:
-                    _prime_scratch_p3(b, h2, scale, model_id, w_off_out=w_off_out, ingress_ifindex=0, ttl=ttl)
-                retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat)
-                _remove_fwd_entry(b, fwd_table_name, valid_keys_name, ttl=ttl, key=kernel_key)
-                hit_count = _read_u64(ps, 0)
-                ok = (retval in XDP_REDIRECT_PASS) and (hit_count > 0)
-                # Under BPF_PROG_TEST_RUN the leaf sees a sandbox ctx->ingress_ifindex.
-                # P2 reads it directly (adds the iface one-hot), while ref_infer above
-                # assumed ifindex=0 -- that mismatch was the apparent "drift". Recompute
-                # the reference with the ingress the kernel actually reported (from the
-                # miss event), so the key comparison becomes a real numeric equivalence
-                # check between kernel inference and the Python reference.
-                kern_ingress = capture.get("ingress", 0)
-                _, ref_val_k, _, _ = ref_infer(weights, scale, ttl, model_id, ifindex=kern_ingress)
-                expected_key = _compute_fwd_key(ref_val_k, scale)
-                if kernel_key == expected_key:
-                    drift = f" [==ref(ifindex={kern_ingress})]"
-                else:
-                    drift = f" [MISMATCH py={expected_key}!=kern={kernel_key} ingress={kern_ingress}]"
-                    ok = False
-                detail = f"retval={retval} pkt_stats[HIT]={hit_count} key={kernel_key}{drift}"
+        _reset_stats(setup)
+        # P3 runs the leaf directly, so prime the intermediate activations it reads.
+        if pipeline == 3:
+            _prime_scratch_p3(b, h2, scale, model_id, w_off_out=w_off_out, ingress_ifindex=0, ttl=ttl)
+        retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat, ingress_ifindex=0)
+        cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
+        ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
+        detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"
         if retval == XDP_PASS:
             ok = False
-            detail += "  <-- XDP_PASS: inference did not complete or cache miss"
+            detail += "  <-- XDP_PASS: inference did not complete / no mac_table entry"
         lat_us = dur_ns / 1000 / max(1, repeat)
         status = "PASS" if ok else "FAIL"
         if ok:
@@ -518,11 +467,9 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         else:
             failed += 1
         print(f"  TTL={ttl:3d}  ref_cls={ref_cls}  ref_val={ref_val:8d}  {detail}  lat={lat_us:.2f}us  [{status}]")
-    miss = _read_u64(ps, 1)
-    drop = _read_u64(ps, 2)
     print("-" * 70)
     print(f"Results: {passed} PASS / {failed} FAIL  (TTL range [{ttl_min},{ttl_max}])")
-    print(f"pkt_stats: HIT={_read_u64(ps,0)}  MISS={miss}  DROP={drop}")
+    print(f"pkt_stats: HIT={_read_u64(ps,0)}  MISS={_read_u64(ps,1)}  DROP={_read_u64(ps,2)}")
     return failed
 
 def main():

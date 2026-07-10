@@ -18,7 +18,7 @@ Compatibility notes with the existing codebase:
   - Reads weights from weights.json (same file as Method 1/2/5)
   - Uses scale_factor from weights_float.json
   - Attaches to iface param (default: INGRESS_IFACE from common.py)
-  - pkt_stats_t3, fwd_table_t3, valid_keys_t3 used as separate maps
+  - pkt_stats_t3 + mac_table_t3 (class -> ifindex + MACs) used as separate maps
   - All four programs (dispatcher + 3 layers) compiled from EBPF_MODULAR_FULL
     so BCC sees them as a single compilation unit — no separate .o files needed
 
@@ -39,7 +39,7 @@ from ebpf_modular import (
 )
 from common import (
     load_weights, attach_xdp, detach_xdp,
-    EGRESS_IFACE, INGRESS_IFACE, OFFSET,
+    EGRESS_IFACE, INGRESS_IFACE,
     SRC_MAC, DST_MAC,
 )
 
@@ -49,38 +49,20 @@ from common import (
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _build_fwd_action_t3(b: BPF, egress_ifindex: int):
-    fwd    = b.get_table("fwd_table_t3")
-    action = fwd.Leaf()
+def _populate_mac_t3(b: BPF, egress_ifindex: int):
+    """Install mac_table_t3: egress class (0..5, the argmax output) ->
+    {ifindex, src_mac, dst_mac}. The NN decides the port; this map only
+    resolves the L2 next-hop. All classes point to the same egress iface in
+    this lab; a real deployment maps each class to its own neighbour + MACs."""
+    mac    = b.get_table("mac_table_t3")
+    action = mac.Leaf()
     action.ifindex = egress_ifindex
     for i in range(6):
         action.src_mac[i] = SRC_MAC[i]
         action.dst_mac[i] = DST_MAC[i]
-    return action
-
-
-def _populate_fwd_t3(b: BPF, action, cp_weights: list, scale_factor: int,
-                     ingress_iface: str):
-    """
-    Pre-populate fwd_table_t3 and valid_keys_t3 for TTL 30-64.
-    Key formula is identical to Pipeline 1/2 for fair comparison.
-    """
-    fwd    = b.get_table("fwd_table_t3")
-    vk     = b.get_table("valid_keys_t3")
-    if_idx = socket.if_nametoindex(ingress_iface)
-
-    for ttl in range(30, 65):
-        iv = [42, ttl, if_idx, 65]
-        output_raw = sum(
-            v * ctypes.c_int8(int(w)).value
-            for v, w in zip(iv, cp_weights)
-        )
-        key = (output_raw + OFFSET * scale_factor) // scale_factor
-        fwd[ctypes.c_ulonglong(key)] = action
-        vk[ctypes.c_uint8(ttl)]      = ctypes.c_ulonglong(key)
-
-    print(f"[fwd_t3] fwd_table_t3 and valid_keys_t3 loaded for TTL 30-64 "
-          f"[integer/modular] iface={ingress_iface} ifindex={if_idx}")
+    for cls in range(6):
+        mac[ctypes.c_uint32(cls)] = action
+    print(f"[mac_t3] mac_table_t3 loaded: class 0..5 -> ifindex={egress_ifindex}")
 
 
 def run(model_id: int = 42, iface: str = None):
@@ -131,10 +113,9 @@ def run(model_id: int = 42, iface: str = None):
     # Attach modular_dispatcher as the XDP entry point
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
 
-    # Populate forwarding tables (use the actual ingress interface)
+    # Populate the L2 next-hop dictionary (class -> ifindex + MACs)
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
-    action = _build_fwd_action_t3(b, egress_ifindex)
-    _populate_fwd_t3(b, action, cp_weights, SCALE_FACTOR, ingress_iface)
+    _populate_mac_t3(b, egress_ifindex)
 
     # Seed link_state (egress up/down feature [0..5]) and start carrier monitor.
     from link_state_monitor import init_link_state_up, start_monitor_thread
@@ -145,21 +126,21 @@ def run(model_id: int = 42, iface: str = None):
     attach_xdp(b, fn_disp, iface=ingress_iface)
 
     print("[Method 6] Pipeline 3 (Modular) running. "
-          "Stats: pkt_stats_t3 [HIT | FAKE | MISS]")
+          "Stats: pkt_stats_t3 [HIT | MISS | DROP]")
     print(f"  Tail call chain: modular_dispatcher "
           f"-> layer_65_4 -> layer_4_4 -> layer_4_7_argmax  (4 tail calls total)")
 
     stats = b.get_table("pkt_stats_t3")
-    print(f"\n{'TRUE HIT':<22} | {'FAKE HIT':<22} | {'MISS':<20}")
+    print(f"\n{'TRUE HIT':<22} | {'MISS':<22} | {'DROP':<20}")
     print("-" * 70)
     try:
         while True:
             time.sleep(1)
             try:
-                true_hits = stats[stats.Key(0)].value
-                misses    = stats[stats.Key(1)].value
-                fake_hits = stats[stats.Key(2)].value
-                print(f"\r{true_hits:<22} | {fake_hits:<22} | {misses:<20}",
+                hits   = stats[stats.Key(0)].value
+                misses = stats[stats.Key(1)].value
+                drops  = stats[stats.Key(2)].value
+                print(f"\r{hits:<22} | {misses:<22} | {drops:<20}",
                       end="", flush=True)
             except Exception:
                 pass
