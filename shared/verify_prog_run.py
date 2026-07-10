@@ -160,6 +160,10 @@ def _nr_cpus() -> int:
         return max(1, os.cpu_count() or 1)
 
 _NR_CPUS = _nr_cpus()
+_PercpuLeaf = ct.c_longlong * _NR_CPUS
+
+def _percpu_arr(val: int) -> "_PercpuLeaf":
+    return _PercpuLeaf(*([int(val)] * _NR_CPUS))
 
 def load_weights(model_path=MODEL_PT):
     from extract_weights import extract_weights_int8
@@ -231,6 +235,14 @@ def _install_mac_table(b, name, ifindex=2):
     )
     for cls in range(6):
         b[name][ct.c_uint32(cls)] = action
+
+def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, w_off_out: int, ingress_ifindex: int = 0, ttl: int = 0):
+    for i, v in enumerate(h2[:4]):
+        b["scratch_acts"][ct.c_int(i)] = _percpu_arr(v)
+    meta = {0: model_id, 1: scale, 2: 2, 3: ingress_ifindex, 4: ttl, 7: w_off_out}
+    for slot, val in meta.items():
+        b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
+
 
 def _seed_link_state(b, val: int = 1):
     """Seed the link_state map [0..5] with `val` (1=up) if the program has it.
@@ -413,21 +425,13 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print()
     setup_fn = {"hardcoded": setup_hardcoded, "template": setup_template, "modular": setup_modular}[method]
     setup = setup_fn(model_id, model_path)
-    # Always drive BPF_PROG_TEST_RUN through the real dispatch entry point
-    # (disp), not the isolated leaf program. For P1 disp==fn (single leaf,
-    # no dispatcher). For P2 the leaf self-parses the packet so testing it
-    # directly happens to match production. For P3 the leaf programs do NOT
-    # parse the packet -- they only read scratch_acts/scratch_meta written
-    # by modular_dispatcher -- so testing the leaf alone with Python-primed
-    # scratch (the old approach) never exercised the real tail-call chain
-    # (dispatcher -> layer_65_4 -> layer_4_4 -> layer_4_7_argmax). Using
-    # disp here closes that gap and matches what execute_pipeline.py runs.
-    disp = setup["disp"]
+    b, fn = setup["b"], setup["fn"]
     weights = setup["weights"]
     scale = setup["scale"]
     ps = setup["pkt_stats"]
     cs = setup.get("cls_stats")
     pipeline = setup["pipeline"]
+    w_off_out = setup.get("w_off_out", 0)
 
     # Model-update timing for Method 1
     if pipeline == 1:
@@ -438,7 +442,7 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         print(f"[M1 update timing] total:                               {(t_redir+t_ins)*1000:.3f} ms")
         print()
 
-    print(f"[setup] scale={scale}  weights={len(weights)}  disp_fd={disp.fd}")
+    print(f"[setup] scale={scale}  weights={len(weights)}  prog_fd={fn.fd}")
     print("      All pipelines: argmax -> mac_table[class] -> bpf_redirect.")
     print("      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.")
     passed = failed = 0
@@ -447,10 +451,13 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         # ingress_ifindex falls outside both P1's ifindex_table and P2/P3's
         # [1,6] clamp, so all 3 pipelines resolve it to "no ingress iface"
         # (_iface=0) -- ifindex=0 here matches that without needing a ctx_in.
-        ref_cls, ref_val, _h1, _h2 = ref_infer(weights, scale, ttl, model_id, ifindex=0)
+        ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=0)
         frame = build_frame(model_id, ttl, scale)
         _reset_stats(setup)
-        retval, dur_ns = prog_test_run(disp.fd, frame, repeat=repeat, ingress_ifindex=0)
+        # P3 runs the leaf directly, so prime the intermediate activations it reads.
+        if pipeline == 3:
+            _prime_scratch_p3(b, h2, scale, model_id, w_off_out=w_off_out, ingress_ifindex=0, ttl=ttl)
+        retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat, ingress_ifindex=0)
         cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
         ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
         detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"

@@ -131,7 +131,6 @@ def run(model_id: int = 42, iface: str = None):
           f"-> layer_65_4 -> layer_4_4 -> layer_4_7_argmax  (4 tail calls total)")
 
     stats = b.get_table("pkt_stats_t3")
-    dbg   = b.get_table("debug_stats_t3")
     print(f"\n{'TRUE HIT':<22} | {'MISS':<22} | {'DROP':<20}")
     print("-" * 70)
     try:
@@ -143,13 +142,6 @@ def run(model_id: int = 42, iface: str = None):
                 drops  = stats[stats.Key(2)].value
                 print(f"\r{hits:<22} | {misses:<22} | {drops:<20}",
                       end="", flush=True)
-                d = [dbg[dbg.Key(i)].value for i in range(12)]
-                print(
-                    f"\n  DEBUG: disp_seen={d[0]} eth_fail={d[1]} ip_fail={d[2]} "
-                    f"not_udp={d[3]} udp_fail={d[4]} wrong_port={d[5]} "
-                    f"ipa_fail={d[6]} no_registry={d[7]} disp_tailed={d[8]} "
-                    f"L0_enter={d[9]} L1_enter={d[10]} L2_enter={d[11]}"
-                )
             except Exception:
                 pass
     except KeyboardInterrupt:
