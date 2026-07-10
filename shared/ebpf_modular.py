@@ -156,7 +156,10 @@ int modular_dispatcher(struct xdp_md *ctx) {
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end)  return XDP_PASS;
-    if (ip->protocol != IPPROTO_UDP)   return XDP_PASS;
+    /* Read protocol via absolute RFC 791 byte offset (byte 9), not ip->protocol,
+     * to avoid bitfield packing ambiguity -- see ebpf_program.py FIX(#4). */
+    __u8 ip_proto = *((__u8 *)ip + 9);
+    if (ip_proto != IPPROTO_UDP)   return XDP_PASS;
     struct udphdr *udp = (struct udphdr *)(ip + 1);
     if ((void *)(udp + 1) > data_end)  return XDP_PASS;
     if (udp->dest != bpf_htons(9999))  return XDP_PASS;
