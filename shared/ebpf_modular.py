@@ -336,9 +336,11 @@ int layer_first(struct xdp_md *ctx) {
     int mif = META_INGRESS_IF;
     long long *ifp = scratch_meta.lookup(&mif);
     __u32 _raw_iface = ifp ? (__u32)(*ifp) : 0;
-    __u32 _iface = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
+    __u32 _iface_active = (_raw_iface >= 1 && _raw_iface <= 6) ? 1 : 0;
+    __u32 _iface = _iface_active ? _raw_iface : 0;
 
     __u32 _node = ((__u32)model_id) & 0x3f;
+    __u32 _node_active = (_node <= 51) ? 1 : 0;
 
     /* Read link_state[0..5] ONCE; reused across all neurons. */
     long long ls[6];
@@ -367,23 +369,21 @@ int layer_first(struct xdp_md *ctx) {
 
         #pragma unroll
         for (int i = 0; i < 6; i++) {
-            if (ls[i]) {
-                int ls_idx = woff + j * PROTO_N_IN + i;
-                __u8 *ls_wp = layer_weights.lookup(&ls_idx);
-                if (ls_wp) acc += ls[i] * (long long)WEIGHT(ls_wp);
-            }
+            int ls_idx = woff + j * PROTO_N_IN + i;
+            __u8 *ls_wp = layer_weights.lookup(&ls_idx);
+            if (ls_wp) acc += ls[i] * (long long)WEIGHT(ls_wp);
         }
 
-        if (_iface >= 1 && _iface <= 6) {
+        {
             int iface_idx = woff + j * PROTO_N_IN + 5 + _iface;
             __u8 *iface_wp = layer_weights.lookup(&iface_idx);
-            if (iface_wp) acc += (long long)WEIGHT(iface_wp);
+            if (iface_wp) acc += (long long)_iface_active * (long long)WEIGHT(iface_wp);
         }
 
-        if (_node <= 51) {
+        {
             int node_idx = woff + j * PROTO_N_IN + 13 + _node;
             __u8 *node_wp = layer_weights.lookup(&node_idx);
-            if (node_wp) acc += (long long)WEIGHT(node_wp);
+            if (node_wp) acc += (long long)_node_active * (long long)WEIGHT(node_wp);
         }
 
         if (is_last) {
