@@ -5,7 +5,8 @@ Tre pipeline (P1 hardcoded, P2 template, P3 modular) verificate su due piani:
 - **userspace** (numerico, PyTorch/NumPy) — accuratezza, quantizzazione, robustezza, struttura;
 - **kernel** (`BPF_PROG_TEST_RUN` sui programmi XDP reali) — istruzioni eBPF, latenza, throughput, CPU, memoria mappe + dispatch reale.
 
-Tutto è raccolto in un unico script: `shared/test_suite.py`.
+Tutto è raccolto in un unico script: `shared/test/test_suite.py`. Tutti gli script di test
+(compreso `bench_model_add.py`, vedi §6) vivono ora sotto `shared/test/`.
 
 ---
 
@@ -14,21 +15,19 @@ Tutto è raccolto in un unico script: `shared/test_suite.py`.
 Richiede solo `torch` + `numpy`. Girano ovunque (anche fuori da Kathara).
 
 ```bash
-cd shared
-
 # Tutte le suite (la suite kernel viene saltata se non c'è BCC/root)
-python3 test_suite.py
+python3 shared/test/test_suite.py
 
 # Una singola suite
-python3 test_suite.py --only core       # struttura design-space + update latency
-python3 test_suite.py --only quant       # accuratezza argmax vs scale_factor
-python3 test_suite.py --only pktstats    # HIT/FAKE/MISS per pipeline
-python3 test_suite.py --only extract     # coerenza pesi / weights.json / dequant
-python3 test_suite.py --only robust      # input anomali, nessun crash
+python3 shared/test/test_suite.py --only core       # struttura design-space + update latency
+python3 shared/test/test_suite.py --only quant       # accuratezza argmax vs scale_factor
+python3 shared/test/test_suite.py --only pktstats    # HIT/FAKE/MISS per pipeline
+python3 shared/test/test_suite.py --only extract     # coerenza pesi / weights.json / dequant
+python3 shared/test/test_suite.py --only robust      # input anomali, nessun crash
 
 # Opzioni
-python3 test_suite.py --only quant --samples 500
-python3 test_suite.py --model shared/frr_germany50_5_model_4x2.pt --verbose
+python3 shared/test/test_suite.py --only quant --samples 500
+python3 shared/test/test_suite.py --model shared/frr_germany50_5_model_4x2.pt --verbose
 ```
 
 ---
@@ -40,16 +39,16 @@ del design space direttamente dal kernel e verifica il dispatch (redirect) per o
 
 ```bash
 # Su host Linux con BCC installato
-sudo python3 shared/test_suite.py --only kernel
+sudo python3 shared/test/test_suite.py --only kernel
 
 # Dentro Kathara (nodo frankfurt)
-kathara exec frankfurt -- python3 /shared/test_suite.py --only kernel
+kathara exec frankfurt -- python3 /shared/test/test_suite.py --only kernel
 
 # Solo metriche, senza il gate di dispatch
-sudo python3 shared/test_suite.py --only kernel --no-verify
+sudo python3 shared/test/test_suite.py --only kernel --no-verify
 
 # Più ripetizioni per una latenza più stabile
-sudo python3 shared/test_suite.py --only kernel --kernel-repeat 200000
+sudo python3 shared/test/test_suite.py --only kernel --kernel-repeat 200000
 ```
 
 Output atteso: tabella metriche (istruzioni/jited/tail-call/memoria/latenza/throughput/CPU)
@@ -69,10 +68,10 @@ Cosa verifica in più oltre al dispatch:
 ### Verifier standalone (equivalente al gate di dispatch)
 
 ```bash
-kathara exec frankfurt -- python3 /shared/verify_prog_run.py --method hardcoded
-kathara exec frankfurt -- python3 /shared/verify_prog_run.py --method template
-kathara exec frankfurt -- python3 /shared/verify_prog_run.py --method modular
-kathara exec frankfurt -- python3 /shared/verify_prog_run.py --method modular --model-id 3
+kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method hardcoded
+kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method template
+kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method modular
+kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method modular --model-id 3
 ```
 
 ---
@@ -127,8 +126,28 @@ kathara exec frankfurt -- python3 /shared/recv_ipa.py --timeout 30 --port 9999
 
 # sender da darmstadt
 kathara exec darmstadt -- python3 /shared/send_ipa.py
-kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 100 --model-id 0
+kathara exec darmstadt -- python3 /shared/test/test_ipa.py --dest frankfurt --count 100 --model-id 0
+
+# traffico multi-modello (round-robin), per esercitare il dispatch multi-model_id di P2/P3
+kathara exec darmstadt -- python3 /shared/test/test_ipa.py --dest frankfurt --count 90 --model-ids 42 43 44
 ```
+
+---
+
+## 6. Costo reale di aggiunta modello (`bench_model_add.py`)
+
+Misura, con `BPF(text=…)` + `load_func()` reali (non stimati), quanto costa registrare un
+nuovo `model_id` a runtime in ciascuna pipeline — sfrutta il multi-model concorrente di P2/P3
+(più `model_id` nella stessa run, blocchi di pesi non sovrapposti in `arch_weights`/`layer_weights`).
+
+```bash
+sudo python3 shared/test/bench_model_add.py --n-models 3
+kathara exec frankfurt -- python3 /shared/test/bench_model_add.py --n-models 3
+```
+
+Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (max 3 modelli con questa architettura),
+`MAX_LAYER_WEIGHT_ENTRIES=2048` in P3 (max 6). Risultati e lettura nel dettaglio
+in `docs/pipeline_design_space.html` (sezione Risultati Sperimentali).
 
 ---
 

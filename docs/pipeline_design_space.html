@@ -701,7 +701,7 @@
     <div class="sec-label">Misure locali</div>
     <div class="sec-title">Risultati Sperimentali</div>
     <p class="sec-desc">
-      Metriche raccolte con <code style="font-family:var(--font-mono);background:var(--surface-2);border-radius:4px;padding:1px 6px;">shared/test_suite.py</code>
+      Metriche raccolte con <code style="font-family:var(--font-mono);background:var(--surface-2);border-radius:4px;padding:1px 6px;">shared/test/test_suite.py</code>
       (5 suite, 56 test). Il costo della flessibilità è misurato su tail call, map lookup,
       memoria e latenza di aggiornamento del modello — non solo throughput.
     </p>
@@ -906,6 +906,80 @@
       <strong>Datapath performance e control-plane flexibility sono in tensione opposta.</strong>
     </p>
 
+    <!-- Real model-add benchmark (bench_model_add.py) -->
+    <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.4rem;">Costo reale di aggiunta modello (<span class="mono">shared/test/bench_model_add.py</span>)</h3>
+    <p class="sec-desc" style="margin-bottom:0.9rem;font-size:0.8rem;">
+      Il test sopra (Test 2 della suite core) è una <strong>simulazione</strong> in userspace: per P1
+      stima il redirect/reload con un valore nominale (~1 ms), non lo misura davvero. Per avere un
+      numero reale abbiamo aggiunto il multi-model concorrente a P2/P3 — più <span class="mono">model_id</span>
+      registrati nella stessa run, ciascuno con un blocco di pesi non sovrapposto
+      (<span class="mono">weight_offset</span>/<span class="mono">base_offset</span> in
+      <span class="mono">arch_weights</span>/<span class="mono">layer_weights</span>) — e uno script dedicato,
+      <span class="mono">bench_model_add.py</span>, che misura il costo <em>vero</em> di "aggiungere un
+      modello" con <span class="mono">BPF(text=…)</span> + <span class="mono">load_func()</span> reali
+      (non stimati), eseguito in Kathara con root + BCC. Per P2/P3 il programma XDP è caricato
+      <strong>una sola volta</strong> (setup one-time); ogni aggiunta successiva è solo scrittura mappa.
+      Per P1 non esiste percorso incrementale: ogni "add" è una rigenerazione completa del sorgente C
+      + compilazione + <span class="mono">load_func()</span>.
+    </p>
+    <div class="tbl-wrap" style="margin-bottom:1rem;">
+      <table>
+        <thead>
+          <tr>
+            <th>Metrica</th>
+            <th style="text-align:right;">P1 hardcoded</th>
+            <th style="text-align:right;">P2 template</th>
+            <th style="text-align:right;">P3 modular</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="td-strong">Setup one-time (ms)</td>
+            <td class="mono" style="text-align:right;color:var(--muted);">n/d (nel costo add)</td>
+            <td class="mono" style="text-align:right;">2 137.812</td>
+            <td class="mono" style="text-align:right;">2 425.498</td>
+          </tr>
+          <tr>
+            <td class="td-strong">Mean add (ms)</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">1 893.448</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">2.143</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">2.801</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Min / Max add (ms)</td>
+            <td class="mono" style="text-align:right;">1 420.993 / 2 829.601</td>
+            <td class="mono" style="text-align:right;">1.395 / 2.656</td>
+            <td class="mono" style="text-align:right;">1.802 / 4.454</td>
+          </tr>
+          <tr>
+            <td class="td-strong">Stdev add (ms)</td>
+            <td class="mono" style="text-align:right;">661.970</td>
+            <td class="mono" style="text-align:right;">0.540</td>
+            <td class="mono" style="text-align:right;">1.177</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:1rem;font-size:0.8rem;">
+      3 <span class="mono">model_id</span> registrati per pipeline (modello 65-4-4-7, scale=24).
+      <strong>Aggiungere un modello in P1 costa in media ~700–900× più di P2/P3</strong>
+      (1 893 ms vs 2.1–2.8 ms): il costo è dominato dalla compilazione LLVM/clang dentro BCC
+      (varianza alta, stdev 662 ms), non presente in P2/P3 dove l'update è solo
+      <span class="mono">bpf_map_update_elem</span> a programma già caricato. Il setup one-time
+      di P2/P3 (~2.1–2.4 s) va pagato una volta sola all'avvio, non ad ogni modello — a differenza
+      di P1, che lo paga <em>ogni volta</em>. Numero reale misurato, non stimato: conferma e quantifica
+      la tesi del trade-off control-plane flexibility con dati di compilazione/caricamento kernel reali.
+    </p>
+    <div class="iface-note" style="margin-bottom:2.5rem;">
+      <strong>Come riprodurlo.</strong> <span class="mono">sudo python3 shared/test/bench_model_add.py --n-models 3</span>
+      (o via <span class="mono">kathara exec frankfurt -- python3 /shared/test/bench_model_add.py</span>).
+      I limiti sono i bound reali delle mappe eBPF: <span class="mono">MAX_WEIGHT_ENTRIES=1024</span>
+      per P2 (max 3 modelli con questa architettura) e <span class="mono">MAX_LAYER_WEIGHT_ENTRIES=2048</span>
+      per P3 (max 6). Il traffico multi-modello si esercita con
+      <span class="mono">shared/test/test_ipa.py --model-ids 42 43 44</span> (round-robin) verso una pipeline
+      lanciata con <span class="mono">execute_pipeline.py --method template --model-ids 42 43 44</span>.
+    </div>
+
     <!-- Quantization accuracy -->
     <h3 style="font-size:0.95rem;font-weight:700;margin:0 0 0.4rem;">Accuratezza vs scale factor (suite quant · 200 campioni)</h3>
     <p class="sec-desc" style="margin-bottom:0.9rem;font-size:0.8rem;">
@@ -968,7 +1042,7 @@
       <strong>Verifica lato kernel (BPF_PROG_TEST_RUN).</strong>
       Le tabelle qui sopra sono misure in userspace (modello numerico Python). La correttezza del
       <em>dispatch reale in kernel</em> — pacchetto ricevuto → inferenza → redirect verso l'ifindex
-      corretto — è verificata separatamente da <span class="mono">shared/verify_prog_run.py</span>,
+      corretto — è verificata separatamente da <span class="mono">shared/test/verify_prog_run.py</span>,
       che carica i programmi XDP reali ed esegue <span class="mono">BPF_PROG_TEST_RUN</span> per tutte
       e tre le pipeline. Con <span class="mono">mac_table</span> la verifica è <strong>single-pass e uniforme</strong>:
       si pre-installa <span class="mono">mac_table[0..5]</span>, si esegue una volta e si controlla che la

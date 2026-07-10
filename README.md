@@ -45,7 +45,7 @@ ipa_lab/
 │   ├── ebpf_program.py         # eBPF/XDP C code shared by all methods
 │   ├── common.py               # Shared helpers (load_bpf, populate tables, stats_loop…)
 │   ├── send_ipa.py             # Scapy sender: builds and sends a single IPA packet
-│   ├── test_ipa.py             # Scapy sender: performance tester (N packets)
+│   ├── test/test_ipa.py        # Scapy sender: performance tester (N packets)
 │   ├── weights.json            # Int8 weights — PTQ (Method 1)
 │   ├── weights_float.json      # Float weights + scale_factor — PTQ reference
 │   ├── weights_method2.json    # Int8 weights — QAT (Method 2, 3, 4)
@@ -97,7 +97,7 @@ Replace node names and `--model-id` as needed for your topology.
 python3 /shared/switch_core.py ptq
 
 # Sender (darmstadt) — no weight payload needed
-python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
 ```
 
 **Expected:** high FAKE HIT (PTQ quantization error), few or no TRUE HIT, some MISS.
@@ -111,7 +111,7 @@ python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 python3 /shared/switch_core.py qat
 
 # Sender (darmstadt)
-python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
 ```
 
 **Expected:** TRUE HIT ~100%, FAKE HIT = 0, MISS = 0.
@@ -125,10 +125,10 @@ python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 python3 /shared/switch_core.py openflow
 
 # Sender (darmstadt) — first round: all MISS while fwd_table is being populated
-python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
 
 # Sender (darmstadt) — second round: TRUE HIT for TTLs already seen
-python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
+python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
 ```
 
 **Expected first round:** all MISS + router logs `[CP] FWD MISS | TTL=X -> INSTALLED` for each new TTL.
@@ -144,7 +144,7 @@ python3 /shared/test_ipa.py --dest frankfurt --count 30 --model-id 42
 python3 /shared/switch_core.py ipa_demo
 
 # Sender (darmstadt) — first packet carries the model weights in the payload
-python3 /shared/test_ipa.py --dest frankfurt --count 30 \
+python3 /shared/test/test_ipa.py --dest frankfurt --count 30 \
         --model-id 42 --weights-file /shared/weights_method2.json
 ```
 

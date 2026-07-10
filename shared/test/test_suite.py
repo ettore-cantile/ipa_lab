@@ -17,24 +17,31 @@ Available suites (--only):
   extract  : extract_weights.py / weights.json / dequant consistency [ex test_extract_weights]
   quant    : accuracy argmax vs scale_factor (PTQ trade-off)   [ex test_quantization_accuracy]
   robust   : edge-case inputs, no crash, valid argmax       [ex test_robustness]
-  kernel   : IN-KERNEL metrics via BPF_PROG_TEST_RUN — #istruzioni eBPF,
+  kernel   : IN-KERNEL metrics via BPF_PROG_TEST_RUN — eBPF instruction count,
              per-packet latency, throughput Mpps, CPU%, + real dispatch
              gate (ex verify_prog_run). Requires Linux + BCC + root; elsewhere
              it is skipped gracefully (does not fail the run).
   all      : every suite (default)
 
 Usage:
-  python3 shared/test_suite.py                       # every suite (kernel skipped without BCC)
-  python3 shared/test_suite.py --only core --verbose
-  python3 shared/test_suite.py --only quant --samples 200
-  sudo python3 shared/test_suite.py --only kernel    # kernel metrics (root)
-  kathara exec frankfurt -- python3 /shared/test_suite.py --only kernel
+  python3 shared/test/test_suite.py                       # every suite (kernel skipped without BCC)
+  python3 shared/test/test_suite.py --only core --verbose
+  python3 shared/test/test_suite.py --only quant --samples 200
+  sudo python3 shared/test/test_suite.py --only kernel    # kernel metrics (root)
+  kathara exec frankfurt -- python3 /shared/test/test_suite.py --only kernel
 """
 
 import argparse
 import time
 import sys
 import os
+
+# Lives in shared/test/; pipeline modules (ebpf_program, extract_weights, ...)
+# and the .pt/.json data files live one level up in shared/.
+_TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR = os.path.dirname(_TEST_DIR)
+if SHARED_DIR not in sys.path:
+    sys.path.insert(0, SHARED_DIR)
 
 try:
     import torch
@@ -479,7 +486,7 @@ def suite_core(model, verbose=False):
 
     print(f"\n{YELLOW}[Test 5] Load .pt model (auto-inferred sizes){NC}")
     total += 1
-    pt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'frr_germany50_5_model_4x2.pt')
+    pt_path = os.path.join(SHARED_DIR, 'frr_germany50_5_model_4x2.pt')
     if os.path.exists(pt_path):
         try:
             loaded, li, lh, lo = load_pt_dynamic(pt_path)
@@ -543,7 +550,7 @@ def suite_core(model, verbose=False):
     except Exception:
         ncpus = 4
 
-    # P1 hardcoded puro: nessun model_cache. Solo link_state[6] + contatori.
+    # Pure P1 hardcoded: no model_cache. Only link_state[6] + counters.
     #   link_state 6*(4+4) + pkt_stats 3*(4+8) + cls_stats 7*(4+8) + debug 8*(4+8) = 264
     # mac_table replaced the old fwd_table(256)+valid_keys(256): now class->action
     # over 8 slots + a small cls_stats(7). Much smaller footprint on P2/P3.
@@ -1151,7 +1158,7 @@ def _load_default_model(model_arg):
     torch.manual_seed(42)
     np.random.seed(42)
     model = FRRModel()
-    pt_path = model_arg or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'frr_germany50_5_model_4x2.pt')
+    pt_path = model_arg or os.path.join(SHARED_DIR, 'frr_germany50_5_model_4x2.pt')
     if os.path.exists(pt_path):
         try:
             loaded, li, lh, lo = load_pt_dynamic(pt_path)

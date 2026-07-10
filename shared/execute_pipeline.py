@@ -49,7 +49,7 @@ Pipeline trade-off summary:
   modular   : lower performance   | maximum flexibility | PERCPU_ARRAY + N tail calls
 
 For the full metric comparison across pipelines:
-  sudo python3 shared/test_suite.py --only kernel
+  sudo python3 shared/test/test_suite.py --only kernel
         """
     )
     parser.add_argument(

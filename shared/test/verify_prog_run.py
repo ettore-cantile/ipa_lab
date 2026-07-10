@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 verify_prog_run.py  --  BPF_PROG_TEST_RUN verifier for the 3 IPA pipelines.
+
+Lives in shared/test/; the pipeline modules it imports (ebpf_program,
+ebpf_template_arch, ebpf_modular, extract_weights) live one level up in
+shared/, so SHARED_DIR is added to sys.path below.
 """
 
 import os
@@ -10,6 +14,11 @@ import struct
 import time
 import argparse
 import ctypes as ct
+
+_TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR = os.path.dirname(_TEST_DIR)
+if SHARED_DIR not in sys.path:
+    sys.path.insert(0, SHARED_DIR)
 
 from bcc import BPF
 
@@ -140,7 +149,6 @@ def map_bytes(map_fd: int, nr_cpus: int = 1) -> int:
     per_cpu = nr_cpus if map_type in _PERCPU_MAP_TYPES else 1
     return (ksz + vsz * per_cpu) * ment
 
-SHARED_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODEL_PT     = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
 WEIGHTS_JSON = os.path.join(SHARED_DIR, "weights_float.json")
 

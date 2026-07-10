@@ -15,13 +15,14 @@ For Method 4, use --weights-file: the FIRST packet embeds the weights,
 and the following packets are sent without payload (model already in cache).
 
 Usage:
-  python3 test_ipa.py [--dest HOST] [--count N] [--delay SEC]
-                      [--model-id ID] [--weights-file PATH]
+  python3 shared/test/test_ipa.py [--dest HOST] [--count N] [--delay SEC]
+                      [--model-id ID] [--model-ids ID1 ID2 ...] [--weights-file PATH]
                       [--scale-factor N]
 Examples:
-  python3 test_ipa.py --dest frankfurt --count 100
-  python3 test_ipa.py --dest frankfurt --count 50 --model-id 42
-  python3 test_ipa.py --dest frankfurt --count 50 --model-id 42 \
+  python3 shared/test/test_ipa.py --dest frankfurt --count 100
+  python3 shared/test/test_ipa.py --dest frankfurt --count 50 --model-id 42
+  python3 shared/test/test_ipa.py --dest frankfurt --count 50 --model-ids 42 43 44
+  python3 shared/test/test_ipa.py --dest frankfurt --count 50 --model-id 42 \
                       --weights-file /shared/weights_method2.json
 """
 import argparse
