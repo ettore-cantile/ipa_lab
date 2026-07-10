@@ -13,8 +13,7 @@ This method demonstrates the second point in the IPA/eBPF design space:
   - Model update cost: only bpf_map_update_elem() calls
 
 Compatibility notes with the existing codebase:
-  - Uses common.py helpers: load_bpf, build_fwd_action,
-    populate_fwd_and_valid_keys, attach_xdp, stats_loop
+  - Uses common.py helpers: load_weights, resolve_egress_mac, attach_xdp, detach_xdp
   - Reads weights from weights.json (same file as Method 1/2)
   - Uses scale_factor from weights_float.json (same as Method 1)
   - Attaches to iface param (default: INGRESS_IFACE from common.py)

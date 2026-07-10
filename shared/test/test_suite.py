@@ -43,13 +43,17 @@ SHARED_DIR = os.path.dirname(_TEST_DIR)
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 
+# torch is optional at import time: `--only kernel` never touches a torch
+# model (it drives verify_prog_run.py / BCC directly), so it must keep working
+# inside Kathara containers that don't have torch installed. main() hard-fails
+# with a clear error only if a suite that actually needs torch is requested.
 try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    TORCH_AVAILABLE = True
 except ImportError:
-    print("[ERROR] PyTorch not found. Install with: pip install torch")
-    sys.exit(1)
+    TORCH_AVAILABLE = False
 
 import numpy as np
 
@@ -85,50 +89,51 @@ def decode_nexthop(argmax_idx: int, n_interfaces: int = N_INTERFACES) -> str:
     return f"UNKNOWN(idx={argmax_idx})"
 
 
-class FRRModel(nn.Module):
-    def __init__(self, input_size=INPUT_SIZE, hidden_dim=HIDDEN_DIM, output_size=OUTPUT_SIZE):
-        super().__init__()
-        self.fc1 = nn.Linear(input_size, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.out = nn.Linear(hidden_dim, output_size)
+if TORCH_AVAILABLE:
+    class FRRModel(nn.Module):
+        def __init__(self, input_size=INPUT_SIZE, hidden_dim=HIDDEN_DIM, output_size=OUTPUT_SIZE):
+            super().__init__()
+            self.fc1 = nn.Linear(input_size, hidden_dim)
+            self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+            self.out = nn.Linear(hidden_dim, output_size)
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.out(x)
-
-
-def load_pt_dynamic(path: str) -> tuple:
-    state = torch.load(path, map_location='cpu', weights_only=True)
-    w1_shape  = state['fc1.weight'].shape
-    out_shape = state['out.weight'].shape
-    inferred_input  = w1_shape[1]
-    inferred_hidden = w1_shape[0]
-    inferred_output = out_shape[0]
-    model = FRRModel(
-        input_size=inferred_input,
-        hidden_dim=inferred_hidden,
-        output_size=inferred_output
-    )
-    model.load_state_dict(state)
-    return model, inferred_input, inferred_hidden, inferred_output
+        def forward(self, x):
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
+            return self.out(x)
 
 
-def compute_scale(model: nn.Module) -> int:
-    max_abs = 0.0
-    for p in model.parameters():
-        max_abs = max(max_abs, float(p.detach().abs().max()))
-    if max_abs == 0:
-        return 128
-    raw = 127.0 / max_abs
-    power = 1
-    while power * 2 <= raw:
-        power *= 2
-    return power
+    def load_pt_dynamic(path: str) -> tuple:
+        state = torch.load(path, map_location='cpu', weights_only=True)
+        w1_shape  = state['fc1.weight'].shape
+        out_shape = state['out.weight'].shape
+        inferred_input  = w1_shape[1]
+        inferred_hidden = w1_shape[0]
+        inferred_output = out_shape[0]
+        model = FRRModel(
+            input_size=inferred_input,
+            hidden_dim=inferred_hidden,
+            output_size=inferred_output
+        )
+        model.load_state_dict(state)
+        return model, inferred_input, inferred_hidden, inferred_output
+
+
+    def compute_scale(model: "nn.Module") -> int:
+        max_abs = 0.0
+        for p in model.parameters():
+            max_abs = max(max_abs, float(p.detach().abs().max()))
+        if max_abs == 0:
+            return 128
+        raw = 127.0 / max_abs
+        power = 1
+        while power * 2 <= raw:
+            power *= 2
+        return power
 
 
 class Method1_Hardcoded:
-    def __init__(self, model: FRRModel):
+    def __init__(self, model: "FRRModel"):
         self._copy_weights(model)
 
     def _copy_weights(self, model):
@@ -170,7 +175,7 @@ class Method1_Hardcoded:
 
 
 class Method2_Template:
-    def __init__(self, model: FRRModel):
+    def __init__(self, model: "FRRModel"):
         self.hidden = model.fc1.out_features
         self.input = model.fc1.in_features
         self.output = model.out.out_features
@@ -219,7 +224,7 @@ class Method2_Template:
 
 
 class Method3_Modular:
-    def __init__(self, model: FRRModel):
+    def __init__(self, model: "FRRModel"):
         self.hidden = model.fc1.out_features
         self.input = model.fc1.in_features
         self.output = model.out.out_features
@@ -1187,7 +1192,12 @@ def main():
     args = parser.parse_args()
     all_suites = ['core', 'pktstats', 'extract', 'quant', 'robust', 'kernel']
     which = all_suites if args.only == 'all' else [args.only]
-    model, pt_path = _load_default_model(args.model)
+    needs_torch = any(s != 'kernel' for s in which)
+    if needs_torch and not TORCH_AVAILABLE:
+        print("[ERROR] PyTorch not found. Install with: pip install torch")
+        print("        (--only kernel does not need torch and works without it)")
+        sys.exit(1)
+    model, pt_path = _load_default_model(args.model) if needs_torch else (None, args.model)
     results = {}
     if 'core' in which:
         results['core'] = suite_core(model, args.verbose)
