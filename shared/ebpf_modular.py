@@ -125,7 +125,7 @@ BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
 /* Diagnostic counters -- pinpoints where a live packet stops progressing
  * through the tail-call chain (dispatcher -> layer_65_4 -> layer_4_4 ->
  * layer_4_7_argmax), since pkt_stats_t3 only increments at the very end. */
-BPF_ARRAY(debug_stats_t3, __u64, 14);
+BPF_ARRAY(debug_stats_t3, __u64, 16);
 #define DBG3_DISP_SEEN     0   /* modular_dispatcher invoked at all */
 #define DBG3_ETH_FAIL      1
 #define DBG3_IP_FAIL       2
@@ -140,6 +140,8 @@ BPF_ARRAY(debug_stats_t3, __u64, 14);
 #define DBG3_L2_ENTER     11   /* layer_4_7_argmax entered (tail call from layer_4_4 landed) */
 #define DBG3_L0_TAILED    12   /* layer_65_4 reached its own tail call to layer_4_4 */
 #define DBG3_L1_TAILED    13   /* layer_4_4 reached its own tail call to layer_4_7_argmax */
+#define DBG3_L0_WOFF_OK   14   /* layer_65_4: scratch_meta[5] (weight offset) lookup succeeded */
+#define DBG3_L0_LOOP_DONE 15   /* layer_65_4: fc1 compute loop finished without an early return */
 
 static inline void dbg3_inc(int idx) {
     __u64 *dp = debug_stats_t3.lookup(&idx);
@@ -273,6 +275,7 @@ int layer_65_4(struct xdp_md *ctx) {
     int mi = 5;
     long long *woff_p = scratch_meta.lookup(&mi);
     if (!woff_p) return XDP_PASS;
+    dbg3_inc(DBG3_L0_WOFF_OK);
     __u32 woff = (__u32)(*woff_p);
 
     /* Compute fc1 */
@@ -295,6 +298,7 @@ int layer_65_4(struct xdp_md *ctx) {
         }
         out[j] = RELU(acc);
     }
+    dbg3_inc(DBG3_L0_LOOP_DONE);
 
     /* Write output activations to scratch_acts[0..L0_N_OUT-1] */
     #pragma unroll

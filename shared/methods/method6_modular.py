@@ -147,12 +147,13 @@ def run(model_id: int = 42, iface: str = None):
                 drops  = stats[stats.Key(2)].value
                 print(f"\r{hits:<22} | {misses:<22} | {drops:<20}",
                       end="", flush=True)
-                d = [dbg[dbg.Key(i)].value for i in range(14)]
+                d = [dbg[dbg.Key(i)].value for i in range(16)]
                 print(
                     f"\n  DEBUG: disp_seen={d[0]} eth_fail={d[1]} ip_fail={d[2]} "
                     f"not_udp={d[3]} udp_fail={d[4]} wrong_port={d[5]} "
                     f"ipa_fail={d[6]} no_registry={d[7]} disp_tailed={d[8]} "
-                    f"L0_enter={d[9]} L0_tailed={d[12]} L1_enter={d[10]} "
+                    f"L0_enter={d[9]} L0_woff_ok={d[14]} L0_loop_done={d[15]} "
+                    f"L0_tailed={d[12]} L1_enter={d[10]} "
                     f"L1_tailed={d[13]} L2_enter={d[11]}"
                 )
             except Exception:
