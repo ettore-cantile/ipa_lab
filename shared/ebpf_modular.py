@@ -126,7 +126,7 @@ BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
  * through the tail-call chain (dispatcher -> layer_65_4 -> layer_4_4 ->
  * layer_4_7_argmax), since pkt_stats_t3 only increments at the very end.
  * Mirrors ebpf_program.py's debug_stats for Pipeline 1. */
-BPF_ARRAY(debug_stats_t3, __u64, 14);
+BPF_ARRAY(debug_stats_t3, __u64, 12);
 #define DBG3_DISP_SEEN     0   /* modular_dispatcher invoked at all */
 #define DBG3_ETH_FAIL      1
 #define DBG3_IP_FAIL       2
@@ -139,8 +139,6 @@ BPF_ARRAY(debug_stats_t3, __u64, 14);
 #define DBG3_L0_ENTER      9   /* layer_65_4 entered (tail call from dispatcher landed) */
 #define DBG3_L1_ENTER     10   /* layer_4_4 entered (tail call from layer_65_4 landed) */
 #define DBG3_L2_ENTER     11   /* layer_4_7_argmax entered (tail call from layer_4_4 landed) */
-#define DBG3_L0_TAILED    12   /* layer_65_4 reached its own tail call to layer_4_4 */
-#define DBG3_L1_TAILED    13   /* layer_4_4 reached its own tail call to layer_4_7_argmax */
 
 static inline void dbg3_inc(int idx) {
     __u64 *dp = debug_stats_t3.lookup(&idx);
@@ -310,7 +308,6 @@ int layer_65_4(struct xdp_md *ctx) {
     if (lp) { long long nv = *lp + 1; scratch_meta.update(&li, &nv); }
 
     /* Tail call to layer_chain[1] = layer_4_4 */
-    dbg3_inc(DBG3_L0_TAILED);
     layer_chain.call(ctx, 1);
     return XDP_PASS;
 }
@@ -360,7 +357,6 @@ int layer_4_4(struct xdp_md *ctx) {
     long long *lp = scratch_meta.lookup(&li);
     if (lp) { long long nv = *lp + 1; scratch_meta.update(&li, &nv); }
 
-    dbg3_inc(DBG3_L1_TAILED);
     layer_chain.call(ctx, 2);
     return XDP_PASS;
 }
