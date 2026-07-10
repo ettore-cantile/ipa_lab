@@ -540,36 +540,37 @@
         </div>
         <p class="p-desc">
           Non un programma per ogni modello, ma
-          <strong style="color:var(--text);">un programma per ogni architettura tipica</strong>
-          (es. <code>arch_65_4_4_7</code>). Il dispatcher legge da una BPF map:
-          <code>model_id → arch_id + weight_offset + alpha</code>
-          e fa un tail call al template architetturale corretto, che recupera i pesi
-          dalla map e completa l'inferenza.
+          <strong style="color:var(--text);">un programma per l'intera famiglia di architetture</strong>
+          "2 hidden layer" (<code>arch_generic_2layer</code>). Input/output sono fissi dal protocollo
+          (65/7), ma le <strong style="color:var(--text);">larghezze <code>n_h1</code>/<code>n_h2</code>
+          sono lette a runtime</strong> da <code>arch_registry</code> (fino al tetto compilato
+          <code>T2_MAX_H1</code>/<code>T2_MAX_H2</code>) — nessuna ricompilazione per un modello
+          più largo o più stretto, solo <code>load_arch_weights()</code>.
         </p>
         <div class="pflow">
           <div class="pnode head">packet<small>IPA / UDP</small></div>
           <div class="pchev"><span>registry[id]</span><b>›</b></div>
           <div class="pnode">dispatcher<small>arch_id</small></div>
           <div class="pchev"><span>tail call ×1</span><b>›</b></div>
-          <div class="pnode a">arch_65_4_4_7<small>pesi da BPF_ARRAY<br>inferenza + argmax</small></div>
+          <div class="pnode a">arch_generic_2layer<small>n_h1/n_h2 runtime<br>inferenza + argmax</small></div>
           <div class="pchev"><span>mac_table[cls]</span><b>›</b></div>
           <div class="pnode out">bpf_redirect<small>azione</small></div>
         </div>
         <div class="pcost">
           <span class="c a"><b>1</b> tail call</span>
-          <span class="c"><b>~322</b> lookup / pkt</span>
-          <span class="c"><b>15.8 KB</b> mappe</span>
-          <span class="c a"><b>125 ns</b> · 8.0 Mpps</span>
+          <span class="c"><b>5 951</b> istruzioni</span>
+          <span class="c"><b>8.1 KB</b> mappe</span>
+          <span class="c a"><b>411 ns</b> · 2.43 Mpps</span>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
-            <li>Un solo programma per N modelli (stessa arch)</li>
-            <li>No ricompilazione per cambiare pesi</li>
-            <li>Architettura ancora statica/unrolled</li>
+            <li>Un solo programma per N modelli, larghezze diverse</li>
+            <li>No ricompilazione per cambiare pesi o larghezza hidden</li>
+            <li>Profondità ancora fissa a 2 hidden layer</li>
           </ul></div>
           <div class="cons"><h4>Svantaggi</h4><ul>
             <li>Lettura pesi da BPF map (overhead)</li>
-            <li>Solo architetture predefinite</li>
+            <li>Solo topologia "2 hidden layer" (input/output protocol-fissi)</li>
             <li>1 map lookup aggiuntivo vs hardcoded</li>
           </ul></div>
         </div>
@@ -595,48 +596,52 @@
         </div>
         <p class="p-desc">
           Il modello è scomposto in
-          <strong style="color:var(--text);">blocchi/layer riusabili</strong>,
-          ciascuno implementato come programma eBPF separato.
-          Le attivazioni intermedie passano tramite una
-          <code>BPF_PERCPU_ARRAY</code> scratch map (o, meno pulito,
-          tramite scratch area nell'header IPA) tra un tail call e il successivo.
+          <strong style="color:var(--text);">due programmi generici riusabili</strong> —
+          <code>layer_first</code> (sempre hop 0, lettura sparsa del vettore 65-feature
+          protocol-fisso) e <code>layer_hidden</code> (hop 1..N-1, denso <code>n_in→n_out</code>) —
+          non uno per layer fisso. <strong style="color:var(--text);">Profondità e larghezza sono
+          entrambe dinamiche</strong>: <code>layer_registry</code>/<code>layer_shapes</code>
+          dicono a runtime quanti layer ha il modello e la forma di ciascuno; chi è "l'ultimo
+          layer" è deciso dai dati, non da quale programma occupa quello slot di tail-call —
+          per cui modelli con profondità diverse condividono lo stesso chain senza conflitti.
         </p>
         <div class="pflow">
           <div class="pnode head">packet<small>IPA / UDP</small></div>
           <div class="pchev"><b>›</b></div>
           <div class="pnode">dispatcher<small>feature → scratch</small></div>
           <div class="pchev"><span>tail</span><b>›</b></div>
-          <div class="pnode r">layer_65_4<small>fc1 + ReLU</small></div>
+          <div class="pnode r">layer_first<small>sparso, n_out runtime</small></div>
           <div class="pchev"><span>scratch</span><b>›</b></div>
-          <div class="pnode r">layer_4_4<small>fc2 + ReLU</small></div>
-          <div class="pchev"><span>scratch</span><b>›</b></div>
-          <div class="pnode r">layer_4_7<small>out + argmax</small></div>
+          <div class="pnode r">layer_hidden<small>denso, n_in/n_out runtime</small></div>
+          <div class="pchev"><span>scratch × N-2</span><b>›</b></div>
+          <div class="pnode r">layer_hidden<small>ultimo layer → argmax</small></div>
           <div class="pchev"><b>›</b></div>
           <div class="pnode out">bpf_redirect<small>azione</small></div>
         </div>
         <div class="pcost">
           <span class="c r"><b>3</b> tail call</span>
-          <span class="c r"><b>~384</b> lookup / pkt</span>
-          <span class="c"><b>19.8 KB</b> mappe</span>
-          <span class="c r"><b>590 ns</b> · 1.70 Mpps</span>
+          <span class="c r"><b>5 931</b> istruzioni</span>
+          <span class="c"><b>16.5 KB</b> mappe</span>
+          <span class="c r"><b>738 ns</b> · 1.36 Mpps</span>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
-            <li>Massimo riuso dei blocchi</li>
-            <li>Supporta più architetture componendo moduli</li>
+            <li>2 soli programmi compilati per qualsiasi profondità/larghezza</li>
+            <li>Profondità E larghezza dinamiche (non solo la larghezza)</li>
             <li>Cambia architettura senza ricompilare</li>
           </ul></div>
           <div class="cons"><h4>Svantaggi</h4><ul>
             <li>Più tail calls (limite kernel: 33)</li>
-            <li>Map lookup per stato intermedio</li>
+            <li>Map lookup per stato intermedio + shape per hop</li>
             <li>Lettura pesi da map</li>
-            <li>Complessità e overhead maggiori</li>
+            <li>Latenza cresce con la profondità (più hop)</li>
           </ul></div>
         </div>
         <p class="p-desc" style="margin-bottom:0;">
           <strong style="color:var(--red);">Aggiornamento modello/architettura:</strong>
-          <code>bpf_map_update_elem</code> su pesi + eventuale modifica della sequenza layer.
-          Si può cambiare anche l'architettura (non solo i pesi) senza alcun reload.
+          <code>load_modular_weights()</code> scrive pesi + <code>layer_shapes</code> +
+          <code>layer_registry</code> (nuova lista di layer). Si può cambiare profondità E
+          larghezza (non solo i pesi) senza alcun reload dei 2 programmi eBPF.
         </p>
       </div>
 
@@ -734,15 +739,15 @@
         <tbody>
           <tr>
             <td class="td-strong">Istruzioni eBPF (xlated)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">996</span></td>
-            <td class="mono" style="text-align:right;">2 618</td>
-            <td class="mono" style="text-align:right;"><span class="num-r">13 441</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">883</span></td>
+            <td class="mono" style="text-align:right;">5 951</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">5 931</span></td>
           </tr>
           <tr>
             <td class="td-strong">Codice jited (byte)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">4 658</span></td>
-            <td class="mono" style="text-align:right;">11 464</td>
-            <td class="mono" style="text-align:right;"><span class="num-r">57 224</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">4 215</span></td>
+            <td class="mono" style="text-align:right;">27 097</td>
+            <td class="mono" style="text-align:right;"><span class="num-r">26 823</span></td>
           </tr>
           <tr>
             <td class="td-strong">Tail calls / pacchetto</td>
@@ -751,34 +756,28 @@
             <td class="mono" style="text-align:right;"><span class="num-r">3</span></td>
           </tr>
           <tr>
-            <td class="td-strong">Map lookup / pacchetto<small style="color:var(--faint);"> (stima)</small></td>
-            <td class="mono" style="text-align:right;"><span class="num-g">8</span><small style="color:var(--faint);"> · 0 pesi</small></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">322</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">384</span></td>
-          </tr>
-          <tr>
             <td class="td-strong">Memoria mappe (byte)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">264</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">7 560</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">20 232</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">168</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">8 072</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">16 904</span></td>
           </tr>
           <tr>
             <td class="td-strong">Latenza (ns / pacchetto)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">32.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">125.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">590.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">50.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">411.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">738.0</span></td>
           </tr>
           <tr>
             <td class="td-strong">Throughput (Mpps)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">31.250</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">8.000</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">1.695</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">20.000</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">2.433</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">1.355</span></td>
           </tr>
           <tr>
             <td class="td-strong">CPU (%)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">38</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">53</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">60</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">36</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">67</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">75</span></td>
           </tr>
           <tr>
             <td class="td-strong">Flessibilità</td>
@@ -790,13 +789,18 @@
       </table>
     </div>
     <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:1rem;font-size:0.8rem;">
-      La tassonomia è confermata dai dati: ogni metrica di costo (istruzioni, byte jited, tail call, map lookup,
-      memoria) cresce monotona con la flessibilità P1→P2→P3, e le prestazioni di picco calano nello stesso ordine.
-      <strong>P1 hardcoded è il più veloce</strong> (32 ns, 31.3 Mpps), <strong>il più compatto</strong>
-      (264 byte di mappe, 996 istruzioni) e senza tail call né lookup pesi — <em>massime prestazioni, minima
-      flessibilità</em>. <strong>P3 modular</strong> è all'estremo opposto (590 ns, 1.70 Mpps, 13 441 istruzioni,
-      3 tail call, ~19.8 KB) — <em>massima flessibilità, prestazioni minime</em>. <strong>P2 template</strong> sta nel
-      mezzo (125 ns), come atteso dal compromesso.
+      La tassonomia è confermata dai dati: tail call, memoria mappe e latenza crescono monotoni con la
+      flessibilità P1→P2→P3, e le prestazioni di picco calano nello stesso ordine. Le istruzioni statiche
+      di P2/P3 sono invece quasi identiche (5 951 vs 5 931) — stessa aritmetica (fc1 sparso + 2 layer densi),
+      solo distribuita su 1 programma grande (template) o 2 piccoli incatenati (modular): il costo reale
+      della profondità dinamica di P3 non è nel codice statico ma nei <strong>tail call extra a runtime</strong>
+      (3 vs 1), che è ciò che spiega la latenza maggiore.
+      <strong>P1 hardcoded è il più veloce</strong> (50 ns, 20.0 Mpps), <strong>il più compatto</strong>
+      (168 byte di mappe, 883 istruzioni) e senza tail call né lookup pesi — <em>massime prestazioni, minima
+      flessibilità</em>. <strong>P3 modular</strong> è all'estremo opposto (738 ns, 1.36 Mpps, 3 tail call,
+      ~16.5 KB) — <em>massima flessibilità (profondità E larghezza dinamiche), prestazioni minime</em>.
+      <strong>P2 template</strong> sta nel mezzo (411 ns, larghezza dinamica ma profondità fissa a 2 hidden
+      layer), come atteso dal compromesso.
     </p>
     <div class="iface-note" style="margin-bottom:2.5rem;">
       <strong>Nota.</strong> Metriche reali da <span class="mono">test_suite.py --only kernel</span> (4 CPU,
