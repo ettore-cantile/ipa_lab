@@ -40,7 +40,7 @@ from ebpf_modular import (
 from common import (
     load_weights, attach_xdp, detach_xdp,
     EGRESS_IFACE, INGRESS_IFACE,
-    SRC_MAC, DST_MAC,
+    resolve_egress_mac,
 )
 
 # Resolve the shared/ directory relative to this file regardless of cwd.
@@ -49,20 +49,24 @@ from common import (
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _populate_mac_t3(b: BPF, egress_ifindex: int):
+def _populate_mac_t3(b: BPF, egress_iface: str, egress_ifindex: int):
     """Install mac_table_t3: egress class (0..5, the argmax output) ->
     {ifindex, src_mac, dst_mac}. The NN decides the port; this map only
-    resolves the L2 next-hop. All classes point to the same egress iface in
-    this lab; a real deployment maps each class to its own neighbour + MACs."""
+    resolves the L2 next-hop. src_mac/dst_mac are resolved from the kernel
+    (own iface MAC + ARP table for the neighbor), not hardcoded constants.
+    All classes point to the same egress iface in this lab; a real
+    deployment maps each class to its own neighbour + MACs."""
+    src_mac, dst_mac = resolve_egress_mac(egress_iface)
     mac    = b.get_table("mac_table_t3")
     action = mac.Leaf()
     action.ifindex = egress_ifindex
     for i in range(6):
-        action.src_mac[i] = SRC_MAC[i]
-        action.dst_mac[i] = DST_MAC[i]
+        action.src_mac[i] = src_mac[i]
+        action.dst_mac[i] = dst_mac[i]
     for cls in range(6):
         mac[ctypes.c_uint32(cls)] = action
-    print(f"[mac_t3] mac_table_t3 loaded: class 0..5 -> ifindex={egress_ifindex}")
+    print(f"[mac_t3] mac_table_t3 loaded: class 0..5 -> ifindex={egress_ifindex} "
+          f"src={':'.join(f'{b:02x}' for b in src_mac)} dst={':'.join(f'{b:02x}' for b in dst_mac)}")
 
 
 def run(model_id: int = 42, iface: str = None):
@@ -115,7 +119,7 @@ def run(model_id: int = 42, iface: str = None):
 
     # Populate the L2 next-hop dictionary (class -> ifindex + MACs)
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
-    _populate_mac_t3(b, egress_ifindex)
+    _populate_mac_t3(b, EGRESS_IFACE, egress_ifindex)
 
     # Seed link_state (egress up/down feature [0..5]) and start carrier monitor.
     from link_state_monitor import init_link_state_up, start_monitor_thread

@@ -37,6 +37,52 @@ def load_weights(path: str) -> list:
         return json.load(f)
 
 
+def local_mac(iface: str) -> list:
+    """Real MAC address of `iface`, read from the kernel (/sys/class/net) --
+    always available, unlike the neighbor's MAC which requires a resolved
+    ARP/neighbor entry."""
+    with open(f"/sys/class/net/{iface}/address") as f:
+        hexstr = f.read().strip()
+    return [int(b, 16) for b in hexstr.split(":")]
+
+
+def neighbor_mac(iface: str):
+    """Next-hop neighbor MAC on `iface`, resolved from the kernel's ARP
+    table (/proc/net/arp). Returns None if the link hasn't seen any
+    traffic yet (no ARP exchange -> no entry) -- callers should fall back
+    to a default and warn rather than install an unresolved/zero MAC."""
+    try:
+        with open("/proc/net/arp") as f:
+            lines = f.readlines()[1:]
+    except OSError:
+        return None
+    for line in lines:
+        cols = line.split()
+        if len(cols) < 6:
+            continue
+        hw_addr, dev = cols[3], cols[5]
+        if dev != iface or hw_addr in ("00:00:00:00:00:00", "<incomplete>"):
+            continue
+        return [int(b, 16) for b in hw_addr.split(":")]
+    return None
+
+
+def resolve_egress_mac(iface: str, fallback_dst: list = None):
+    """Real per-interface L2 addressing for a mac_table action:
+      src_mac = this host's own MAC on `iface` (always resolvable)
+      dst_mac = the next-hop neighbor's MAC, from the kernel ARP table
+    Falls back to `fallback_dst` (or the module DST_MAC constant) with a
+    warning if the neighbor hasn't been ARP-resolved yet (idle link --
+    e.g. before any OSPF/IP traffic has crossed it)."""
+    src = local_mac(iface)
+    dst = neighbor_mac(iface)
+    if dst is None:
+        dst = fallback_dst or DST_MAC
+        dst_str = ":".join(f"{b:02x}" for b in dst)
+        print(f"[mac] WARNING: no ARP entry for {iface} yet -- using fallback dst_mac {dst_str}")
+    return src, dst
+
+
 def build_fwd_action(b: BPF, egress_ifindex: int,
                      src_mac=None, dst_mac=None):
     src_mac = src_mac or SRC_MAC
