@@ -244,10 +244,17 @@ def _install_mac_table(b, name, ifindex=2):
     for cls in range(6):
         b[name][ct.c_uint32(cls)] = action
 
-def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, w_off_out: int, ingress_ifindex: int = 0, ttl: int = 0):
+def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, layer_idx: int, ingress_ifindex: int = 0, ttl: int = 0):
+    """Seed scratch_acts/scratch_meta so that calling layer_generic directly
+    (bypassing dispatcher + earlier hops) exercises just the model's LAST
+    layer: layer_idx must be n_layers-1 so layer_generic's own
+    (layer_idx+1==n_layers) check resolves to argmax+forward. The weight
+    offset for that layer comes from layer_shapes[{model_id, layer_idx}]
+    (already populated by load_modular_weights), not from scratch_meta --
+    unlike the old fixed 3-block design there is no w_off_out slot anymore."""
     for i, v in enumerate(h2[:4]):
         b["scratch_acts"][ct.c_int(i)] = _percpu_arr(v)
-    meta = {0: model_id, 1: scale, 2: 2, 3: ingress_ifindex, 4: ttl, 7: w_off_out}
+    meta = {0: model_id, 1: scale, 2: layer_idx, 3: ingress_ifindex, 4: ttl}
     for slot, val in meta.items():
         b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
 
@@ -306,14 +313,14 @@ def setup_hardcoded(model_id: int, model_path: str):
 
 
 def setup_template(model_id: int, model_path: str):
-    from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_65_4_4_7, load_arch_weights)
+    from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER, load_arch_weights)
     weights, scale = load_weights(model_path)
-    src = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7
+    src = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER
     b = BPF(text=src)
     disp_fn = b.load_func("ipa_switch_template", BPF.XDP)
-    leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
+    leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
     b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
-    load_arch_weights(b, weights, model_id=model_id, scale=scale)
+    load_arch_weights(b, weights, model_id=model_id, scale=scale)  # default n_h1=n_h2=4 matches weights.json
     _seed_link_state(b, 1)
     _install_mac_table(b, "mac_table_t2")
     return {
@@ -322,7 +329,7 @@ def setup_template(model_id: int, model_path: str):
         "cls_stats": b["cls_stats_t2"],
         "pkt_stats": b["pkt_stats_t2"],
         "pipeline": 2,
-        "progs": {"ipa_switch_template": disp_fn.fd, "arch_65_4_4_7": leaf_fn.fd},
+        "progs": {"ipa_switch_template": disp_fn.fd, "arch_generic_2layer": leaf_fn.fd},
     }
 
 
@@ -331,29 +338,32 @@ def setup_modular(model_id: int, model_path: str):
     weights, scale = load_weights(model_path)
     b = BPF(text=EBPF_MODULAR_FULL)
     disp_fn = b.load_func("modular_dispatcher", BPF.XDP)
-    lf0 = b.load_func("layer_65_4", BPF.XDP)
-    lf1 = b.load_func("layer_4_4", BPF.XDP)
-    lf2 = b.load_func("layer_4_7_argmax", BPF.XDP)
-    b["layer_chain"][ct.c_int(0)] = ct.c_int(lf0.fd)
-    b["layer_chain"][ct.c_int(1)] = ct.c_int(lf1.fd)
-    b["layer_chain"][ct.c_int(2)] = ct.c_int(lf2.fd)
-    load_modular_weights(b, weights, model_id=model_id, scale=scale)
+    fn_generic = b.load_func("layer_generic", BPF.XDP)
+    # Every layer_chain slot points at the same generic program -- see
+    # ebpf_modular.py module docstring for why.
+    for i in range(16):  # LAYER_CHAIN_SIZE
+        b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_generic.fd)
+    layer_dims = [(65, 4), (4, 4), (4, 7)]
+    n_layers = len(layer_dims)
+    load_modular_weights(b, weights, model_id=model_id, scale=scale, layer_dims=layer_dims)
     _seed_link_state(b, 1)
     _install_mac_table(b, "mac_table_t3")
-    w_off_out = (65 * 4 + 4) + (4 * 4 + 4)
     print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
     return {
-        "b": b, "fn": lf2, "disp": disp_fn,
+        "b": b, "fn": fn_generic, "disp": disp_fn,
         "weights": weights, "scale": scale,
         "cls_stats": b["cls_stats_t3"],
         "pkt_stats": b["pkt_stats_t3"],
         "pipeline": 3,
-        "w_off_out": w_off_out,
+        "last_layer_idx": n_layers - 1,
+        # n_tail = actual runtime tail-call hops for this model (dispatcher ->
+        # layer_generic, called once per layer): NOT len(progs)-1 anymore --
+        # there are only 2 distinct loaded programs regardless of depth,
+        # since every hop reuses the same layer_generic.
+        "n_tail": n_layers,
         "progs": {
             "modular_dispatcher": disp_fn.fd,
-            "layer_65_4": lf0.fd,
-            "layer_4_4": lf1.fd,
-            "layer_4_7_argmax": lf2.fd,
+            "layer_generic": fn_generic.fd,
         },
     }
 
@@ -439,7 +449,7 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     ps = setup["pkt_stats"]
     cs = setup.get("cls_stats")
     pipeline = setup["pipeline"]
-    w_off_out = setup.get("w_off_out", 0)
+    last_layer_idx = setup.get("last_layer_idx", 2)
 
     # Model-update timing for Method 1
     if pipeline == 1:
@@ -464,7 +474,7 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         _reset_stats(setup)
         # P3 runs the leaf directly, so prime the intermediate activations it reads.
         if pipeline == 3:
-            _prime_scratch_p3(b, h2, scale, model_id, w_off_out=w_off_out, ingress_ifindex=0, ttl=ttl)
+            _prime_scratch_p3(b, h2, scale, model_id, layer_idx=last_layer_idx, ingress_ifindex=0, ttl=ttl)
         retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat, ingress_ifindex=0)
         cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
         ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)

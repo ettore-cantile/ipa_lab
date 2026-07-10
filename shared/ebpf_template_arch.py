@@ -2,23 +2,32 @@
 ebpf_template_arch.py  —  Pipeline 2: Pre-built Architectural Template.
 
 Design space position:
-  - One eBPF program per architecture shape (e.g. arch_65_4_4_7)
-  - Multiple models sharing the same shape reuse the same program
+  - One eBPF program for the whole "2 hidden-layer MLP" architecture family
+  - Any model with that topology (any hidden widths up to the compiled
+    ceiling) reuses the same program -- no recompilation per model
   - Weights are stored in BPF_ARRAY maps, loaded at runtime by the CP
-  - One tail call: dispatcher -> arch_progs[arch_id] -> arch_65_4_4_7
+  - One tail call: dispatcher -> arch_progs[arch_id] -> arch_generic_2layer
 
-Architecture supported here: 65-4-4-7 (matching the existing model).
-  fc1  : 65 inputs  -> 4 hidden   (260 weights + 4 bias = 264)
-  fc2  : 4  hidden  -> 4 hidden   (16  weights + 4 bias = 20)
-  out  : 4  hidden  -> 7 outputs  (28  weights + 7 bias = 35)
-  Total: 319 int8 values
+Architecture family supported here: fc1 -> ReLU -> fc2 -> ReLU -> out,
+input/output sizes fixed by the IPA packet format, hidden widths dynamic:
+  fc1  : T2_N_IN=65 inputs -> n_h1 hidden   (n_h1 <= T2_MAX_H1)
+  fc2  : n_h1 hidden       -> n_h2 hidden   (n_h2 <= T2_MAX_H2)
+  out  : n_h2 hidden       -> T2_N_OUT=7 outputs
+T2_N_IN=65 and T2_N_OUT=7 are fixed by the IPA header/feature encoding
+(6 link_state + 6 iface one-hot + 1 ttl + 52 node one-hot = 65 in;
+6 egress classes + drop = 7 out) -- they are protocol constants, not model
+hyperparameters, so they stay compile-time. n_h1/n_h2 are read at runtime
+from arch_registry, up to the compiled ceilings T2_MAX_H1/T2_MAX_H2 (see
+arch_weight_count() below for how the flat weight layout depends on them).
+A model whose hidden widths exceed the ceiling is rejected at load time by
+load_arch_weights() with a clear error, not silently truncated.
 
 Control-plane split of responsibilities
   load_arch_weights() populates:
-    - arch_weights    (319 int8 values via raw bpf(2) syscall)
-    - arch_registry   (arch_id, weight_offset, scale_factor)
+    - arch_weights    (int8 values via raw bpf(2) syscall)
+    - arch_registry   (arch_id, weight_offset, scale_factor, n_h1, n_h2)
   The CALLER must separately wire the tail-call array BEFORE or AFTER:
-    leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
+    leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
     b["arch_progs"][ct.c_int(arch_id)] = ct.c_int(leaf_fn.fd)
   This is done in verify_prog_run.py setup_template() already.
   load_arch_weights does NOT touch arch_progs -- BCC does not expose
@@ -47,13 +56,30 @@ Implementation notes:
 import ctypes as ct
 import os
 
-# Architecture constants (65-4-4-7 model)
-N_IN   = 65
-N_H1   = 4
-N_H2   = 4
-N_OUT  = 7
-N_WEIGHTS_T2 = (N_IN * N_H1 + N_H1) + (N_H1 * N_H2 + N_H2) + (N_H2 * N_OUT + N_OUT)
-# = 264 + 20 + 35 = 319
+# Protocol-fixed constants: input/output size are dictated by the IPA
+# feature encoding (65 in) and the number of egress classes + drop (7 out),
+# not by the model. Hidden widths are the actual per-model hyperparameters.
+T2_N_IN   = 65
+T2_N_OUT  = 7
+# Compile-time ceilings for the hidden widths: the eBPF program unrolls its
+# neuron loops up to these bounds (verifier requires a compile-time trip
+# count) and skips the unused tail at runtime via `if (j >= n_h1)` guards.
+# Any model with n_h1 <= T2_MAX_H1 and n_h2 <= T2_MAX_H2 runs on this same
+# compiled program -- raise these and reload once if a wider model shows up.
+T2_MAX_H1 = 8
+T2_MAX_H2 = 8
+
+
+def arch_weight_count(n_h1: int, n_h2: int) -> int:
+    """Flat int8 weight count for a T2_N_IN -> n_h1 -> n_h2 -> T2_N_OUT MLP
+    (fc1 weights+bias, fc2 weights+bias, out weights+bias), matching the
+    flat layout load_arch_weights() writes and the eBPF program reads."""
+    return (T2_N_IN * n_h1 + n_h1) + (n_h1 * n_h2 + n_h2) + (n_h2 * T2_N_OUT + T2_N_OUT)
+
+
+# Weight count for the one model currently in the repo (65-4-4-7 = 319),
+# kept for callers/tests that assumed the old fixed shape.
+N_WEIGHTS_T2 = arch_weight_count(4, 4)
 
 # ---------------------------------------------------------------------------
 # Raw bpf(2) syscall helpers
@@ -186,6 +212,8 @@ struct arch_entry {
     __u8  arch_id;
     __u32 weight_offset;
     __u16 scale_factor;
+    __u8  n_h1;   /* fc1 output width  (<= T2_MAX_H1), read at runtime */
+    __u8  n_h2;   /* fc2 output width  (<= T2_MAX_H2), read at runtime */
 } __attribute__((packed));
 
 struct fwd_action {
@@ -238,18 +266,11 @@ int ipa_switch_template(struct xdp_md *ctx) {
 }
 """
 
-EBPF_ARCH_65_4_4_7 = r"""
-#define T2_N_IN    65
-#define T2_N_H1     4
-#define T2_N_H2     4
-#define T2_N_OUT    7
-#define T2_FC1_W_OFF  0
-#define T2_FC1_B_OFF  260
-#define T2_FC2_W_OFF  264
-#define T2_FC2_B_OFF  280
-#define T2_OUT_W_OFF  284
-#define T2_OUT_B_OFF  312
-#define T2_N_WEIGHTS  319
+EBPF_ARCH_GENERIC_2LAYER = r"""
+#define T2_N_IN     65
+#define T2_N_OUT     7
+#define T2_MAX_H1    8
+#define T2_MAX_H2    8
 #define RELU(x)  ((x) > 0 ? (x) : 0)
 
 #ifndef IPA_ARCH_COMBINED
@@ -280,6 +301,8 @@ struct arch_entry {
     __u8  arch_id;
     __u32 weight_offset;
     __u16 scale_factor;
+    __u8  n_h1;
+    __u8  n_h2;
 } __attribute__((packed));
 
 struct fwd_action {
@@ -297,7 +320,7 @@ BPF_ARRAY(pkt_stats_t2, __u64, 3);
 BPF_ARRAY(cls_stats_t2, __u64, 7);
 #endif /* IPA_ARCH_COMBINED */
 
-int arch_65_4_4_7(struct xdp_md *ctx) {
+int arch_generic_2layer(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
@@ -319,6 +342,24 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
 
+    /* Hidden widths for THIS model, read at runtime. The neuron loops below
+     * are unrolled to the compiled ceilings T2_MAX_H1/T2_MAX_H2 (verifier
+     * needs a compile-time trip count) but skip/zero any neuron past the
+     * model's actual width -- same program serves any n_h1<=T2_MAX_H1,
+     * n_h2<=T2_MAX_H2 without recompiling. */
+    __u32 n_h1 = entry->n_h1;
+    __u32 n_h2 = entry->n_h2;
+    if (n_h1 == 0 || n_h1 > T2_MAX_H1 || n_h2 == 0 || n_h2 > T2_MAX_H2) return XDP_PASS;
+
+    /* Flat weight layout offsets (relative to woff), sized for THIS model's
+     * hidden widths -- mirrors arch_weight_count() on the Python side. */
+    __u32 fc1_w_off = 0;
+    __u32 fc1_b_off = T2_N_IN * n_h1;
+    __u32 fc2_w_off = fc1_b_off + n_h1;
+    __u32 fc2_b_off = fc2_w_off + n_h1 * n_h2;
+    __u32 out_w_off = fc2_b_off + n_h2;
+    __u32 out_b_off = out_w_off + n_h2 * T2_N_OUT;
+
     __u32 _ttl       = ((__u32)ip->ttl) & 0xff;
     __u32 _raw_iface = ctx->ingress_ifindex;
     __u32 _iface     = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
@@ -334,15 +375,17 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         ls[i] = lsp ? (long long)(*lsp) : 0LL;
     }
 
-    long long h1[T2_N_H1];
+    long long h1[T2_MAX_H1];
     #pragma unroll
-    for (int j = 0; j < T2_N_H1; j++) {
-        int bidx = woff + T2_FC1_B_OFF + j;
+    for (int j = 0; j < T2_MAX_H1; j++) {
+        if (j >= n_h1) { h1[j] = 0LL; continue; }
+
+        int bidx = woff + fc1_b_off + j;
         if (bidx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
         char *bp = arch_weights.lookup(&bidx);
         long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
 
-        int ttl_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + 12;
+        int ttl_idx = woff + fc1_w_off + j * T2_N_IN + 12;
         if (ttl_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
         char *ttl_wp = arch_weights.lookup(&ttl_idx);
         if (ttl_wp) acc += (long long)_ttl * (long long)(*(signed char *)ttl_wp);
@@ -351,7 +394,7 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         #pragma unroll
         for (int i = 0; i < 6; i++) {
             if (ls[i]) {
-                int ls_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + i;
+                int ls_idx = woff + fc1_w_off + j * T2_N_IN + i;
                 if (ls_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
                 char *ls_wp = arch_weights.lookup(&ls_idx);
                 if (ls_wp) acc += ls[i] * (long long)(*(signed char *)ls_wp);
@@ -359,14 +402,14 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         }
 
         if (_iface >= 1 && _iface <= 6) {
-            int iface_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + 5 + _iface;
+            int iface_idx = woff + fc1_w_off + j * T2_N_IN + 5 + _iface;
             if (iface_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
             char *iface_wp = arch_weights.lookup(&iface_idx);
             if (iface_wp) acc += (long long)(*(signed char *)iface_wp);
         }
 
         if (_node <= 51) {
-            int node_idx = woff + T2_FC1_W_OFF + j * T2_N_IN + 13 + _node;
+            int node_idx = woff + fc1_w_off + j * T2_N_IN + 13 + _node;
             if (node_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
             char *node_wp = arch_weights.lookup(&node_idx);
             if (node_wp) acc += (long long)(*(signed char *)node_wp);
@@ -375,16 +418,20 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         h1[j] = RELU(acc);
     }
 
-    long long h2[T2_N_H2];
+    /* h1[i]==0 for i>=n_h1 (set above), so the inner loop can always unroll
+     * to T2_MAX_H1: out-of-range weight reads still get multiplied by 0. */
+    long long h2[T2_MAX_H2];
     #pragma unroll
-    for (int j = 0; j < T2_N_H2; j++) {
-        int bidx = woff + T2_FC2_B_OFF + j;
+    for (int j = 0; j < T2_MAX_H2; j++) {
+        if (j >= n_h2) { h2[j] = 0LL; continue; }
+
+        int bidx = woff + fc2_b_off + j;
         if (bidx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
         char *bp = arch_weights.lookup(&bidx);
         long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
         #pragma unroll
-        for (int i = 0; i < T2_N_H1; i++) {
-            int widx = woff + T2_FC2_W_OFF + j * T2_N_H1 + i;
+        for (int i = 0; i < T2_MAX_H1; i++) {
+            int widx = woff + fc2_w_off + j * n_h1 + i;
             if (widx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
             char *wp = arch_weights.lookup(&widx);
             if (wp) acc += h1[i] * (long long)(*(signed char *)wp);
@@ -392,17 +439,19 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
         h2[j] = RELU(acc);
     }
 
+    /* Same trick: h2[i]==0 for i>=n_h2, so the output loop is always
+     * unrolled to T2_MAX_H2 regardless of this model's actual n_h2. */
     long long best_val = -9999999LL;
     int best_cls = 0;
     #pragma unroll
     for (int k = 0; k < T2_N_OUT; k++) {
-        int bidx = woff + T2_OUT_B_OFF + k;
+        int bidx = woff + out_b_off + k;
         if (bidx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
         char *bp = arch_weights.lookup(&bidx);
         long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
         #pragma unroll
-        for (int i = 0; i < T2_N_H2; i++) {
-            int widx = woff + T2_OUT_W_OFF + k * T2_N_H2 + i;
+        for (int i = 0; i < T2_MAX_H2; i++) {
+            int widx = woff + out_w_off + k * n_h2 + i;
             if (widx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
             char *wp = arch_weights.lookup(&widx);
             if (wp) acc += h2[i] * (long long)(*(signed char *)wp);
@@ -440,38 +489,60 @@ int arch_65_4_4_7(struct xdp_md *ctx) {
 
 def load_arch_weights(bpf_obj, weights_int8: list,
                       model_id: int = 0, scale: int = 128,
-                      weight_offset: int = 0) -> None:
+                      weight_offset: int = 0,
+                      n_h1: int = 4, n_h2: int = 4) -> None:
     """
     Populate arch_weights and arch_registry for Pipeline 2.
+
+    n_h1/n_h2 are THIS model's hidden widths (input=T2_N_IN=65 and
+    output=T2_N_OUT=7 are protocol-fixed, see module docstring). They must
+    fit under the compiled ceilings T2_MAX_H1/T2_MAX_H2 -- raises ValueError
+    otherwise rather than silently truncating. Any model with hidden widths
+    within the ceiling runs on the same compiled arch_generic_2layer program;
+    no recompilation needed to change n_h1/n_h2 between models.
 
     weight_offset lets the caller register several model_id entries in the
     same arch_weights array without overlapping their weight blocks: call
     this once per model_id with a distinct, non-overlapping weight_offset
-    (e.g. i * N_WEIGHTS_T2). All entries share the same arch_id (arch_65_4_4_7
-    is the only compiled shape), so the dispatcher resolves model_id ->
-    weight_offset via arch_registry and tail-calls the same leaf program.
+    (e.g. the running sum of arch_weight_count(n_h1, n_h2) for models already
+    registered -- their sizes may differ). All entries share the same arch_id
+    (arch_generic_2layer is the only compiled shape), so the dispatcher
+    resolves model_id -> (weight_offset, n_h1, n_h2) via arch_registry and
+    tail-calls the same leaf program.
 
     DOES NOT touch arch_progs.  The caller (setup_template in
     verify_prog_run.py) is responsible for wiring the tail-call array:
-        leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
+        leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
         b["arch_progs"][ct.c_int(arch_id)] = ct.c_int(leaf_fn.fd)
     BCC does not expose loaded programs via bpf_obj[name] -- only maps
     are accessible that way -- so the fd must come from .load_func().
     """
     from ctypes import c_uint8, c_uint32, c_uint16, Structure
 
-    arch_id       = 0
-    map_fd        = bpf_obj["arch_weights"].map_fd
-
-    if weight_offset + N_WEIGHTS_T2 > 1024:  # MAX_WEIGHT_ENTRIES in the eBPF source
+    if n_h1 <= 0 or n_h1 > T2_MAX_H1 or n_h2 <= 0 or n_h2 > T2_MAX_H2:
         raise ValueError(
-            f"weight_offset={weight_offset} + N_WEIGHTS_T2={N_WEIGHTS_T2} "
+            f"n_h1={n_h1}/n_h2={n_h2} outside the compiled ceiling "
+            f"T2_MAX_H1={T2_MAX_H1}/T2_MAX_H2={T2_MAX_H2} -- raise the "
+            f"ceiling in ebpf_template_arch.py and reload to support it")
+
+    n_weights = arch_weight_count(n_h1, n_h2)
+    arch_id   = 0
+    map_fd    = bpf_obj["arch_weights"].map_fd
+
+    if weight_offset + n_weights > 1024:  # MAX_WEIGHT_ENTRIES in the eBPF source
+        raise ValueError(
+            f"weight_offset={weight_offset} + n_weights={n_weights} "
             f"exceeds MAX_WEIGHT_ENTRIES=1024 -- too many concurrent model_id's")
+
+    if len(weights_int8) < n_weights:
+        raise ValueError(
+            f"n_h1={n_h1}/n_h2={n_h2} needs {n_weights} weights, "
+            f"got only {len(weights_int8)}")
 
     value_size = _get_map_value_size(map_fd)
     print(f"[Pipeline2] arch_weights fd={map_fd} value_size={value_size} bytes/slot")
 
-    for idx, w in enumerate(weights_int8[:N_WEIGHTS_T2]):
+    for idx, w in enumerate(weights_int8[:n_weights]):
         _bpf_map_update_char(map_fd, value_size,
                              index=weight_offset + idx,
                              int8_val=int(w))
@@ -486,13 +557,15 @@ def load_arch_weights(bpf_obj, weights_int8: list,
         _pack_ = 1
         _fields_ = [("arch_id",       c_uint8),
                     ("weight_offset",  c_uint32),
-                    ("scale_factor",   c_uint16)]
+                    ("scale_factor",   c_uint16),
+                    ("n_h1",           c_uint8),
+                    ("n_h2",           c_uint8)]
 
     entry = ArchEntry(arch_id=arch_id, weight_offset=weight_offset,
-                      scale_factor=scale)
+                      scale_factor=scale, n_h1=n_h1, n_h2=n_h2)
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
     print(f"[Pipeline2] arch_registry[{model_id}] = "
           f"arch_id={arch_id} woff={weight_offset} scale={scale} "
-          f"weights={len(weights_int8[:N_WEIGHTS_T2])}")
+          f"shape=65-{n_h1}-{n_h2}-7 weights={n_weights}")
     print(f"[Pipeline2] NOTE: arch_progs wiring is caller's responsibility "
           f"(setup_template already does: b['arch_progs'][0]=leaf_fn.fd)")

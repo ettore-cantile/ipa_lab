@@ -71,7 +71,7 @@ def bench_template(weights, scale, n_models):
     """One-time compile+load, then N incremental load_arch_weights() calls."""
     from bcc import BPF
     from ebpf_template_arch import (
-        EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_65_4_4_7,
+        EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER,
         load_arch_weights, N_WEIGHTS_T2,
     )
 
@@ -81,11 +81,11 @@ def bench_template(weights, scale, n_models):
               f"(MAX_WEIGHT_ENTRIES=1024 / N_WEIGHTS_T2={N_WEIGHTS_T2})")
         n_models = max_models
 
-    src = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_65_4_4_7
+    src = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER
     t0 = time.perf_counter()
     b = BPF(text=src)
     b.load_func("ipa_switch_template", BPF.XDP)
-    leaf_fn = b.load_func("arch_65_4_4_7", BPF.XDP)
+    leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
     b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
     setup_s = time.perf_counter() - t0
 
@@ -93,7 +93,7 @@ def bench_template(weights, scale, n_models):
     for i in range(n_models):
         t0 = time.perf_counter()
         load_arch_weights(b, weights, model_id=i, scale=scale,
-                          weight_offset=i * N_WEIGHTS_T2)
+                          weight_offset=i * N_WEIGHTS_T2)  # default n_h1=n_h2=4 matches weights.json
         times.append(time.perf_counter() - t0)
     return setup_s, times
 
@@ -113,12 +113,10 @@ def bench_modular(weights, scale, n_models):
     t0 = time.perf_counter()
     b = BPF(text=EBPF_MODULAR_FULL)
     disp_fn = b.load_func("modular_dispatcher", BPF.XDP)
-    lf0 = b.load_func("layer_65_4", BPF.XDP)
-    lf1 = b.load_func("layer_4_4", BPF.XDP)
-    lf2 = b.load_func("layer_4_7_argmax", BPF.XDP)
-    b["layer_chain"][ct.c_int(0)] = ct.c_int(lf0.fd)
-    b["layer_chain"][ct.c_int(1)] = ct.c_int(lf1.fd)
-    b["layer_chain"][ct.c_int(2)] = ct.c_int(lf2.fd)
+    fn_generic = b.load_func("layer_generic", BPF.XDP)
+    # Every layer_chain slot points at the same generic program.
+    for i in range(16):  # LAYER_CHAIN_SIZE
+        b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_generic.fd)
     setup_s = time.perf_counter() - t0
 
     times = []
