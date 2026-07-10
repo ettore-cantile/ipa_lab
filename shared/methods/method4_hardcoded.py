@@ -117,13 +117,7 @@ def run(
     print(f"[P1-hardcoded] Verifier: OK — program fd={fn.fd}")
 
     # ------------------------------------------------------------------
-    # Step 4: seed link_state (egress up/down) and start the carrier monitor
-    #
-    # link_state[0..5] are the model's first 6 input features (output
-    # interface states). Pure hardcoded design has NO model_cache / weight
-    # map -- the only map read is this input feature. Seed all links "up",
-    # then a background thread keeps the map in sync with the real carrier
-    # state of the egress interfaces (link failure -> feature flips to 0).
+    # Step 4: seed link_state and start the carrier monitor
     # ------------------------------------------------------------------
     from link_state_monitor import init_link_state_up, start_monitor_thread
     init_link_state_up(b, egress_ifaces)
@@ -131,18 +125,7 @@ def run(
     print(f"[P1-hardcoded] link_state seeded (all up); carrier monitor running")
 
     # ------------------------------------------------------------------
-    # Step 5: attach XDP on ingress iface
-    #
-    # FIX: attach in SKB/generic mode (XDP_FLAGS_SKB_MODE = 2), NOT native.
-    # The ingress iface here is a veth (Kathara collision domain). A NATIVE
-    # XDP program on one end of a veth pair breaks UNICAST reception from
-    # the peer/bridge: unless XDP is attached to BOTH veth ends, unicast
-    # frames forwarded to the XDP-enabled end are dropped by the veth path
-    # BEFORE the program runs (multicast/broadcast — OSPF/ARP — still flood
-    # through, which is exactly what tcpdump showed: OSPF/ARP arrive, the
-    # unicast UDP:9999 IPA packets do not). Generic/SKB-mode XDP runs after
-    # the normal veth delivery (in netif_receive_skb), so unicast packets
-    # reach the program; bpf_redirect() is supported in generic mode too.
+    # Step 5: attach XDP on ingress iface (SKB/generic mode)
     # ------------------------------------------------------------------
     XDP_FLAGS_SKB_MODE = 2
     b.attach_xdp(iface, fn, flags=XDP_FLAGS_SKB_MODE)
@@ -150,50 +133,22 @@ def run(
     print(f"[P1-hardcoded] Design: 0 weight-map lookups, 0 fwd_table lookups, ~780 insns")
     print(f"[P1-hardcoded] Egress port chosen dynamically by inference (best_cls -> switch(cls))")
     print()
-    print(f"  {'TRUE HIT':>12} {'MISS':>10} {'DROP':>10}  {'cls0':>6} {'cls1':>6} {'cls2':>6} {'cls3':>6} {'cls4':>6} {'cls5':>6} {'cls6':>6}")
-    print("  " + "-" * 88)
+    print(f"  {'TRUE HIT':>12} {'MISS':>10} {'DROP':>10}")
+    print("  " + "-" * 34)
 
     # ------------------------------------------------------------------
-    # Step 6: stats loop — show hit/miss/drop + per-class distribution
+    # Step 6: stats loop
     # ------------------------------------------------------------------
-    prev_stats = [0, 0, 0]
-    prev_cls   = [0] * 7
     try:
         while True:
             time.sleep(1)
             pkt_stats = b["pkt_stats"]
-            cls_stats = b["cls_stats"]
-            cur_stats = [pkt_stats[i].value for i in range(3)]
-            cur_cls   = [cls_stats[i].value  for i in range(7)]
-
-            # chosen port = cls with highest delta in last second
-            delta_cls   = [cur_cls[i]   - prev_cls[i]   for i in range(7)]
-            chosen_cls  = delta_cls.index(max(delta_cls)) if any(delta_cls) else -1
-            chosen_iface = egress_ifaces[chosen_cls] if 0 <= chosen_cls <= 5 else "DROP"
-
+            cur = [pkt_stats[i].value for i in range(3)]
             print(
-                f"  {cur_stats[0]:>12} {cur_stats[1]:>10} {cur_stats[2]:>10}  "
-                + "".join(f"{cur_cls[i]:>6}" for i in range(7))
-                + f"   chosen_port={chosen_iface}",
-                end="\r",
+                f"\r  {cur[0]:>12} {cur[1]:>10} {cur[2]:>10}",
+                end="", flush=True,
             )
-
-            # Diagnostic breakdown of WHY packets never reach pkt_stats
-            # (e.g. all zeros -- wrong protocol/port, or never reaching
-            # eth1 at all). Printed on its own real newline (leading \n
-            # forces a clean line break even after the \r above) so it
-            # survives a plain `tail`/log read, unlike the \r-refreshed
-            # line above.
-            debug_stats = b["debug_stats"]
-            dbg = [debug_stats[i].value for i in range(8)]
-            print(
-                f"\n  DEBUG: seen={dbg[0]} eth_fail={dbg[1]} ip_fail={dbg[2]} "
-                f"not_udp={dbg[3]} udp_fail={dbg[4]} wrong_port={dbg[5]} "
-                f"ipa_fail={dbg[6]} inferred={dbg[7]}"
-            )
-
-            prev_stats = cur_stats
-            prev_cls   = cur_cls
+            print()
     except KeyboardInterrupt:
         pass
     finally:
@@ -225,13 +180,6 @@ def _print_final_stats(b, egress_ifaces):
         print(f"    cls {i} -> {name:6s} : {cnt:>8}  {bar}")
     drop_cnt = cls_stats[6].value if 6 < len(cls_stats) else drop
     print(f"    cls 6 -> DROP   : {drop_cnt:>8}")
-    print()
-    debug_stats = b["debug_stats"]
-    dbg = [debug_stats[i].value for i in range(8)]
-    print("  Debug breakdown (why packets never reached pkt_stats, if 0):")
-    print(f"    seen={dbg[0]} eth_fail={dbg[1]} ip_fail={dbg[2]} not_udp={dbg[3]} "
-          f"udp_fail={dbg[4]} wrong_port={dbg[5]} ipa_fail={dbg[6]} "
-          f"inferred={dbg[7]}")
     print("=" * 56)
 
 

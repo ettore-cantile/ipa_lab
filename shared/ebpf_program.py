@@ -131,29 +131,6 @@ BPF_ARRAY(link_state,       __u32, 6);
 BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(unused) [2]=drop */
 BPF_ARRAY(cls_stats,        __u64, 7);   /* per-class redirect counter */
 
-/* Diagnostic counters -- distinguishes "packet never reached the XDP
- * hook / never got this far" from "reached it but failed a specific
- * header check", since pkt_stats only increments AFTER all header
- * checks pass. See DEBUG_* indices below. */
-BPF_ARRAY(debug_stats,      __u64, 8);
-#define DBG_SEEN        0   /* ipa_switch invoked at all (very first line) */
-#define DBG_ETH_FAIL    1   /* packet shorter than eth header */
-#define DBG_IP_FAIL     2   /* packet shorter than eth+ip header */
-#define DBG_NOT_UDP     3   /* ip_proto != 17 (IPPROTO_UDP) */
-#define DBG_UDP_FAIL    4   /* packet shorter than eth+ip+udp header */
-#define DBG_WRONG_PORT  5   /* udp->dest != 9999 */
-#define DBG_IPA_FAIL    6   /* packet shorter than eth+ip+udp+ipa header */
-#define DBG_INFERRED    7   /* passed every header check, ran inference */
-
-/* BCC refuses map method calls (.lookup/.update/...) textually nested
- * inside a macro expansion ("cannot use map function inside a macro") --
- * its source-to-source rewriter only recognizes them in plain function
- * bodies. A real (non-macro) helper function works fine. */
-static inline void dbg_inc(int idx) {
-    __u64 *dp = debug_stats.lookup(&idx);
-    if (dp) __sync_fetch_and_add(dp, 1);
-}
-
 #define RELU_LL(x)    ((x) > 0LL ? (x) : 0LL)
 """
 
@@ -204,49 +181,14 @@ def generate_ebpf_hardcoded(
     def lit(v):
         return str(int(v))
 
-    # ----------------------------------------------------------------
-    # Feature vector structure (65 dims, sparse at runtime):
-    #   [0..5]   egress link_state (up/down), read from the link_state map
-    #   [6..11]  ingress_ifindex one-hot  (index = 5 + logical_iface, logical 1..6)
-    #   [12]     ip->ttl
-    #   [13..64] model_id / node_id one-hot (index = 13 + model_id, 0..51)
-    #
-    # FIX(#5): ctx->ingress_ifindex is the kernel ifindex (e.g. 655 for eth1),
-    # NOT the logical index 1..6 used by the training feature encoding.
-    # We emit a preliminary switch(ctx->ingress_ifindex) that maps each
-    # hardcoded kernel ifindex (from ifindex_table) to its logical index
-    # 1..6, storing the result in _iface.  The existing switch(_iface)
-    # below that picks w_iface_j then works correctly.
-    #
-    # Verifier-friendly encoding: ONE switch(_iface) and ONE switch(_node)
-    # for the WHOLE program (not one pair per neuron). Each case assigns
-    # the per-neuron contribution for all N_H1 neurons simultaneously, so
-    # the CFG only ever has ~7 + ~52 branches total, independent of N_H1 —
-    # no combinatorial explosion, no globals, just plain stack scalars.
-    # ----------------------------------------------------------------
-
     fc1_lines = []
     fc1_lines.append("    /* fc1: only 3 live features -- ttl, iface one-hot, node one-hot */")
     fc1_lines.append("    __u32 _ttl  = ((__u32)ip->ttl) & 0xff;")
     fc1_lines.append("    __u32 _node = ((__u32)ipa->model_id) & 0x3f;  /* 0..51 */")
 
-    # FIX(#5): map kernel ifindex -> logical iface index 1..6
-    # Each entry in ifindex_table[cls] is the kernel ifindex for egress cls;
-    # we need the INGRESS mapping.  The ingress iface for this XDP hook is
-    # whichever interface in ifindex_table the packet actually arrives on.
-    # We emit all 6 possible kernel ifindices as cases; unknown -> _iface=0
-    # (no one-hot contribution, which is equivalent to "iface not in training").
     fc1_lines.append("    /* FIX(#5): map raw kernel ifindex -> logical 1..6 for one-hot */")
     fc1_lines.append("    __u32 _iface = 0U;")
     fc1_lines.append("    switch (ctx->ingress_ifindex) {")
-    # FIX(#6): dedupe by kernel ifindex. On a node where some egress ifaces
-    # don't exist (e.g. frankfurt has no eth4/eth5), _build_ifindex_table
-    # falls those back to eth0's ifindex, producing repeated values in
-    # ifindex_table. Emitting one `case` per entry then yields duplicate
-    # `case <N>:` labels -> "duplicate case value" compile error. Keep only
-    # the FIRST logical index for each distinct kernel ifindex: that first
-    # occurrence is the real interface (e.g. 207 -> eth0 -> logical 1); the
-    # later fallback duplicates are non-existent ifaces no packet arrives on.
     _seen_ifindex = set()
     for logical_idx, kern_ifindex in enumerate(ifindex_table[:6], start=1):
         ki = int(kern_ifindex)
@@ -260,7 +202,6 @@ def generate_ebpf_hardcoded(
     for j in range(N_H1):
         fc1_lines.append(f"    long long w_iface_{j} = 0LL, w_node_{j} = 0LL;")
 
-    # Single switch over _iface (logical 1..6): sets w_iface_0..w_iface_{N_H1-1}.
     fc1_lines.append("    switch (_iface) {")
     for iface in range(1, 7):
         assigns = " ".join(
@@ -271,7 +212,6 @@ def generate_ebpf_hardcoded(
     fc1_lines.append("        default: break;")
     fc1_lines.append("    }")
 
-    # Single switch over _node: sets w_node_0..w_node_{N_H1-1} together.
     fc1_lines.append("    switch (_node) {")
     for node in range(52):
         assigns = " ".join(
@@ -285,7 +225,6 @@ def generate_ebpf_hardcoded(
     for j in range(N_H1):
         w_ttl = int(fc1_w[j * N_IN + 12])
         b_j   = int(fc1_b[j])
-        # link_state feature terms: sum_i(ls{i} * w[j, i]) for i in 0..5
         ls_terms = " + ".join(
             f"ls{i} * {lit(int(fc1_w[j * N_IN + i]))}LL" for i in range(6)
         )
@@ -313,9 +252,6 @@ def generate_ebpf_hardcoded(
         argmax_lines.append(
             f"    if (out_{k} > best_val) {{ best_val = out_{k}; best_cls = {k}; }}"
         )
-    # NOTE: no bpf_trace_printk in the hot path -- it is an expensive helper
-    # (format + ring write) called per packet and would dominate the latency
-    # of this performance baseline. P2/P3 have no printk on the HIT path.
 
     fc1_src    = "\n".join(fc1_lines)
     fc2_src    = "\n".join(fc2_lines)
@@ -331,38 +267,31 @@ def generate_ebpf_hardcoded(
 int ipa_switch(struct xdp_md *ctx) {{
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    dbg_inc(DBG_SEEN);
 
     struct ethhdr  *eth = data;
-    if ((void *)(eth + 1) > data_end) {{ dbg_inc(DBG_ETH_FAIL); return XDP_PASS; }}
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
     struct iphdr   *ip  = (struct iphdr *)(eth + 1);
-    if ((void *)(ip  + 1) > data_end) {{ dbg_inc(DBG_IP_FAIL); return XDP_PASS; }}
+    if ((void *)(ip  + 1) > data_end) return XDP_PASS;
 
-    /* FIX(#4): read protocol via absolute RFC 791 byte offset (byte 9),
-     * not ip->protocol, to avoid bitfield packing ambiguity in struct iphdr
-     * (ihl:4,version:4 at byte 0) on BCC with minimal Kathara kernel headers.
-     * This is the root cause of DBG_NOT_UDP firing for all UDP packets. */
+    /* FIX(#4): read protocol via absolute RFC 791 byte offset (byte 9) */
     __u8 ip_proto = *((__u8 *)ip + 9);
-    if (ip_proto != 17U) {{ dbg_inc(DBG_NOT_UDP); return XDP_PASS; }}
+    if (ip_proto != 17U) return XDP_PASS;
 
-    /* FIX(#4): compute UDP header pointer from actual ihl*4 (handles IP
-     * Options where ihl > 5), not the fixed sizeof(struct iphdr) = 20. */
+    /* FIX(#4): compute UDP header pointer from actual ihl*4 */
     __u32 _ip_hlen = (((__u8 *)ip)[0] & 0x0fU) << 2U;
-    if (_ip_hlen < 20U) {{ dbg_inc(DBG_IP_FAIL); return XDP_PASS; }}
+    if (_ip_hlen < 20U) return XDP_PASS;
     struct udphdr  *udp = (struct udphdr *)((void *)ip + _ip_hlen);
-    if ((void *)(udp + 1) > data_end) {{ dbg_inc(DBG_UDP_FAIL); return XDP_PASS; }}
-    if (udp->dest != bpf_htons(9999)) {{ dbg_inc(DBG_WRONG_PORT); return XDP_PASS; }}
+    if ((void *)(udp + 1) > data_end) return XDP_PASS;
+    if (udp->dest != bpf_htons(9999)) return XDP_PASS;
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
-    if ((void *)(ipa + 1) > data_end) {{ dbg_inc(DBG_IPA_FAIL); return XDP_PASS; }}
-    dbg_inc(DBG_INFERRED);
+    if ((void *)(ipa + 1) > data_end) return XDP_PASS;
 
     /* Pure hardcoded: weights are C literals below, no weight map.
      * Always run inference. */
     __u16 scale = {scale}U;
     if (scale == 0) return XDP_PASS;
 
-    /* link_state[0..5]: egress up/down read from map into feature slots 0..5.
-     * 1 = up, 0 = down; unpopulated slot defaults to 0. */
+    /* link_state[0..5]: egress up/down read from map into feature slots 0..5. */
     long long ls0=0LL, ls1=0LL, ls2=0LL, ls3=0LL, ls4=0LL, ls5=0LL;
     {{ int _lk; __u32 *_lp;
        _lk=0; _lp=link_state.lookup(&_lk); if (_lp) ls0=(long long)(*_lp);
@@ -388,10 +317,6 @@ int ipa_switch(struct xdp_md *ctx) {{
         return XDP_DROP;
     }}
 
-    /* egress_ifindex: hardcoded per-class constant (switch, not a global
-     * array -- BCC does not relocate static/global data for XDP programs,
-     * see module docstring "Verifier history"). best_cls is 0..5 here
-     * (>=6 already handled above), so this is a single bounded switch. */
     __u32 egress_ifindex = 0;
     switch (best_cls) {{
 {ifindex_cases}

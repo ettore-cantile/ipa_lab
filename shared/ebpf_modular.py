@@ -122,32 +122,6 @@ BPF_HASH(mac_table_t3, __u32, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
 
-/* Diagnostic counters -- pinpoints where a live packet stops progressing
- * through the tail-call chain (dispatcher -> layer_65_4 -> layer_4_4 ->
- * layer_4_7_argmax), since pkt_stats_t3 only increments at the very end. */
-BPF_ARRAY(debug_stats_t3, __u64, 16);
-#define DBG3_DISP_SEEN     0   /* modular_dispatcher invoked at all */
-#define DBG3_ETH_FAIL      1
-#define DBG3_IP_FAIL       2
-#define DBG3_NOT_UDP       3
-#define DBG3_UDP_FAIL      4
-#define DBG3_WRONG_PORT    5
-#define DBG3_IPA_FAIL      6
-#define DBG3_NO_REGISTRY   7   /* model_id not in layer_registry */
-#define DBG3_DISP_TAILED   8   /* dispatcher finished feature extraction, tail-calling layer_65_4 */
-#define DBG3_L0_ENTER      9   /* layer_65_4 entered (tail call from dispatcher landed) */
-#define DBG3_L1_ENTER     10   /* layer_4_4 entered (tail call from layer_65_4 landed) */
-#define DBG3_L2_ENTER     11   /* layer_4_7_argmax entered (tail call from layer_4_4 landed) */
-#define DBG3_L0_TAILED    12   /* layer_65_4 reached its own tail call to layer_4_4 */
-#define DBG3_L1_TAILED    13   /* layer_4_4 reached its own tail call to layer_4_7_argmax */
-#define DBG3_L0_WOFF_OK   14   /* layer_65_4: scratch_meta[5] (weight offset) lookup succeeded */
-#define DBG3_L0_LOOP_DONE 15   /* layer_65_4: fc1 compute loop finished without an early return */
-
-static inline void dbg3_inc(int idx) {
-    __u64 *dp = debug_stats_t3.lookup(&idx);
-    if (dp) __sync_fetch_and_add(dp, 1);
-}
-
 /* Explicit signed cast so arithmetic is correct after __u8 storage */
 #define WEIGHT(p) ((__s8)(*p))
 #define RELU(x)  ((x) > 0 ? (x) : 0)
@@ -184,25 +158,24 @@ BPF_HASH(layer_registry, __u8, struct layer_model_entry, 256);
 int modular_dispatcher(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    dbg3_inc(DBG3_DISP_SEEN);
 
     struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) { dbg3_inc(DBG3_ETH_FAIL); return XDP_PASS; }
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
     struct iphdr *ip = (struct iphdr *)(eth + 1);
-    if ((void *)(ip + 1) > data_end)  { dbg3_inc(DBG3_IP_FAIL); return XDP_PASS; }
+    if ((void *)(ip + 1) > data_end)  return XDP_PASS;
     /* Read protocol via absolute RFC 791 byte offset (byte 9), not ip->protocol,
      * to avoid bitfield packing ambiguity -- see ebpf_program.py FIX(#4). */
     __u8 ip_proto = *((__u8 *)ip + 9);
-    if (ip_proto != IPPROTO_UDP)   { dbg3_inc(DBG3_NOT_UDP); return XDP_PASS; }
+    if (ip_proto != IPPROTO_UDP)   return XDP_PASS;
     struct udphdr *udp = (struct udphdr *)(ip + 1);
-    if ((void *)(udp + 1) > data_end)  { dbg3_inc(DBG3_UDP_FAIL); return XDP_PASS; }
-    if (udp->dest != bpf_htons(9999))  { dbg3_inc(DBG3_WRONG_PORT); return XDP_PASS; }
+    if ((void *)(udp + 1) > data_end)  return XDP_PASS;
+    if (udp->dest != bpf_htons(9999))  return XDP_PASS;
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
-    if ((void *)(ipa + 1) > data_end)  { dbg3_inc(DBG3_IPA_FAIL); return XDP_PASS; }
+    if ((void *)(ipa + 1) > data_end)  return XDP_PASS;
 
     __u8 model_id = ipa->model_id;
     struct layer_model_entry *lentry = layer_registry.lookup(&model_id);
-    if (!lentry) { dbg3_inc(DBG3_NO_REGISTRY); return XDP_PASS; }
+    if (!lentry) return XDP_PASS;
 
     /* Write metadata to scratch_meta */
     int idx;
@@ -258,7 +231,6 @@ int modular_dispatcher(struct xdp_md *ctx) {
     idx = 7; { long long v = lentry->w_off_out; scratch_meta.update(&idx, &v); }
 
     /* Tail call to layer_chain[0] = layer_65_4 */
-    dbg3_inc(DBG3_DISP_TAILED);
     layer_chain.call(ctx, 0);
     return XDP_PASS;
 }
@@ -266,9 +238,6 @@ int modular_dispatcher(struct xdp_md *ctx) {
 
 # -----------------------------------------------------------------
 # Layer block 0: fc1  65 -> 4  (ReLU)
-# Reads input from scratch_acts[0..64]
-# Writes output to scratch_acts[0..3]
-# Tail-calls layer_chain[1]
 # -----------------------------------------------------------------
 EBPF_LAYER_65_4 = EBPF_MODULAR_COMMON_HEADER + r"""
 #define L0_N_IN   65
@@ -277,12 +246,10 @@ EBPF_LAYER_65_4 = EBPF_MODULAR_COMMON_HEADER + r"""
 #define L0_W_SIZE  (L0_N_IN * L0_N_OUT + L0_N_OUT)  /* 260 + 4 = 264 */
 
 int layer_65_4(struct xdp_md *ctx) {
-    dbg3_inc(DBG3_L0_ENTER);
     /* Read weight offset from meta slot 5 */
     int mi = 5;
     long long *woff_p = scratch_meta.lookup(&mi);
     if (!woff_p) return XDP_PASS;
-    dbg3_inc(DBG3_L0_WOFF_OK);
     __u32 woff = (__u32)(*woff_p);
 
     /* Compute fc1 */
@@ -305,7 +272,6 @@ int layer_65_4(struct xdp_md *ctx) {
         }
         out[j] = RELU(acc);
     }
-    dbg3_inc(DBG3_L0_LOOP_DONE);
 
     /* Write output activations to scratch_acts[0..L0_N_OUT-1] */
     #pragma unroll
@@ -320,7 +286,6 @@ int layer_65_4(struct xdp_md *ctx) {
     if (lp) { long long nv = *lp + 1; scratch_meta.update(&li, &nv); }
 
     /* Tail call to layer_chain[1] = layer_4_4 */
-    dbg3_inc(DBG3_L0_TAILED);
     layer_chain.call(ctx, 1);
     return XDP_PASS;
 }
@@ -335,7 +300,6 @@ EBPF_LAYER_4_4 = EBPF_MODULAR_COMMON_HEADER + r"""
 #define L1_W_BASE_META_SLOT  6
 
 int layer_4_4(struct xdp_md *ctx) {
-    dbg3_inc(DBG3_L1_ENTER);
     int mi = L1_W_BASE_META_SLOT;
     long long *woff_p = scratch_meta.lookup(&mi);
     if (!woff_p) return XDP_PASS;
@@ -370,7 +334,6 @@ int layer_4_4(struct xdp_md *ctx) {
     long long *lp = scratch_meta.lookup(&li);
     if (lp) { long long nv = *lp + 1; scratch_meta.update(&li, &nv); }
 
-    dbg3_inc(DBG3_L1_TAILED);
     layer_chain.call(ctx, 2);
     return XDP_PASS;
 }
@@ -385,7 +348,6 @@ EBPF_LAYER_4_7_ARGMAX = EBPF_MODULAR_COMMON_HEADER + r"""
 #define L2_W_BASE_META_SLOT  7
 
 int layer_4_7_argmax(struct xdp_md *ctx) {
-    dbg3_inc(DBG3_L2_ENTER);
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
@@ -431,8 +393,6 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    /* mac_table: class -> {ifindex, src/dst MAC}. Single lookup, no key math,
-     * no output validation -- resolve the L2 next-hop and redirect. */
     __u32 cls = (__u32)best_cls;
     struct fwd_action *action = mac_table_t3.lookup(&cls);
     if (action != NULL) {
@@ -451,7 +411,7 @@ int layer_4_7_argmax(struct xdp_md *ctx) {
 }
 """
 
-# Full combined source for single-program compilation (BCC can load all functions)
+# Full combined source for single-program compilation
 EBPF_MODULAR_FULL = (
     EBPF_MODULAR_DISPATCHER
     + "\n" + EBPF_LAYER_65_4.replace(EBPF_MODULAR_COMMON_HEADER, "")
@@ -496,7 +456,6 @@ def load_modular_weights(
 
     for idx, w in enumerate(weights_int8[:fc1_size + fc2_size + out_size]):
         key = c_uint32(idx)
-        # Store as unsigned bit pattern — C side casts back to __s8 for math
         val = c_uint8(int(w) & 0xFF)
         bpf_obj["layer_weights"][key] = val
 

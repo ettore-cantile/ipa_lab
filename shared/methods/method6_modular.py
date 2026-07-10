@@ -43,19 +43,11 @@ from common import (
     resolve_egress_mac,
 )
 
-# Resolve the shared/ directory relative to this file regardless of cwd.
-# Inside Kathara: /shared/methods/method6_modular.py -> /shared/
-# Outside Kathara: resolved the same way via __file__.
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _populate_mac_t3(b: BPF, egress_iface: str, egress_ifindex: int):
-    """Install mac_table_t3: egress class (0..5, the argmax output) ->
-    {ifindex, src_mac, dst_mac}. The NN decides the port; this map only
-    resolves the L2 next-hop. src_mac/dst_mac are resolved from the kernel
-    (own iface MAC + ARP table for the neighbor), not hardcoded constants.
-    All classes point to the same egress iface in this lab; a real
-    deployment maps each class to its own neighbour + MACs."""
+    """Install mac_table_t3: egress class (0..5) -> {ifindex, src_mac, dst_mac}."""
     src_mac, dst_mac = resolve_egress_mac(egress_iface)
     mac    = b.get_table("mac_table_t3")
     action = mac.Leaf()
@@ -73,8 +65,6 @@ def run(model_id: int = 42, iface: str = None):
     """
     iface: network interface to attach XDP to.
            Defaults to INGRESS_IFACE from common.py if not specified.
-           Pass the correct interface for the lab topology (e.g. 'eth0' for
-           darmstadt->frankfurt direct link l59 in lab.conf).
     """
     ingress_iface = iface if iface else INGRESS_IFACE
     weights_path = os.path.join(_SHARED_DIR, "weights.json")
@@ -102,10 +92,7 @@ def run(model_id: int = 42, iface: str = None):
     # Populate layer_registry and layer_weights
     load_modular_weights(b, integer_weights, model_id=model_id, scale=SCALE_FACTOR)
 
-    # Wire up the tail-call chain:
-    #   layer_chain[0] = layer_65_4
-    #   layer_chain[1] = layer_4_4
-    #   layer_chain[2] = layer_4_7_argmax
+    # Wire up the tail-call chain
     fn_l0 = b.load_func("layer_65_4",      BPF.XDP)
     fn_l1 = b.load_func("layer_4_4",       BPF.XDP)
     fn_l2 = b.load_func("layer_4_7_argmax",BPF.XDP)
@@ -117,11 +104,11 @@ def run(model_id: int = 42, iface: str = None):
     # Attach modular_dispatcher as the XDP entry point
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
 
-    # Populate the L2 next-hop dictionary (class -> ifindex + MACs)
+    # Populate the L2 next-hop dictionary
     egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
     _populate_mac_t3(b, EGRESS_IFACE, egress_ifindex)
 
-    # Seed link_state (egress up/down feature [0..5]) and start carrier monitor.
+    # Seed link_state and start carrier monitor
     from link_state_monitor import init_link_state_up, start_monitor_thread
     init_link_state_up(b)
     stop_monitor = start_monitor_thread(b, interval=1.0)
@@ -135,9 +122,8 @@ def run(model_id: int = 42, iface: str = None):
           f"-> layer_65_4 -> layer_4_4 -> layer_4_7_argmax  (4 tail calls total)")
 
     stats = b.get_table("pkt_stats_t3")
-    dbg   = b.get_table("debug_stats_t3")
-    print(f"\n{'TRUE HIT':<22} | {'MISS':<22} | {'DROP':<20}")
-    print("-" * 70)
+    print(f"\n{'TRUE HIT':>12} {'MISS':>10} {'DROP':>10}")
+    print("-" * 34)
     try:
         while True:
             time.sleep(1)
@@ -145,17 +131,9 @@ def run(model_id: int = 42, iface: str = None):
                 hits   = stats[stats.Key(0)].value
                 misses = stats[stats.Key(1)].value
                 drops  = stats[stats.Key(2)].value
-                print(f"\r{hits:<22} | {misses:<22} | {drops:<20}",
+                print(f"\r{hits:>12} {misses:>10} {drops:>10}",
                       end="", flush=True)
-                d = [dbg[dbg.Key(i)].value for i in range(16)]
-                print(
-                    f"\n  DEBUG: disp_seen={d[0]} eth_fail={d[1]} ip_fail={d[2]} "
-                    f"not_udp={d[3]} udp_fail={d[4]} wrong_port={d[5]} "
-                    f"ipa_fail={d[6]} no_registry={d[7]} disp_tailed={d[8]} "
-                    f"L0_enter={d[9]} L0_woff_ok={d[14]} L0_loop_done={d[15]} "
-                    f"L0_tailed={d[12]} L1_enter={d[10]} "
-                    f"L1_tailed={d[13]} L2_enter={d[11]}"
-                )
+                print()
             except Exception:
                 pass
     except KeyboardInterrupt:
