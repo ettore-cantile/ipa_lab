@@ -165,13 +165,20 @@ static inline void dbg3_inc(int idx) {
 # -----------------------------------------------------------------
 EBPF_MODULAR_DISPATCHER = EBPF_MODULAR_COMMON_HEADER + r"""
 
-/* Layer registry: model_id -> {scale_factor, w_off_fc1, w_off_fc2, w_off_out} */
+/* Layer registry: model_id -> {scale_factor, w_off_fc1, w_off_fc2, w_off_out}
+ * MUST be packed: load_modular_weights() writes a ctypes Structure with
+ * _pack_=1 (no padding). Without __attribute__((packed)) here, Clang
+ * aligns w_off_fc1 to a 4-byte boundary (offset 4, not 2), so every field
+ * read back on the eBPF side is shifted -- w_off_fc1 comes out as garbage
+ * (tail of the real w_off_fc1 + head of w_off_fc2), which blows past
+ * MAX_LAYER_WEIGHT_ENTRIES in layer_65_4's bound check and returns early,
+ * before ever reaching its own tail call. */
 struct layer_model_entry {
     __u16 scale_factor;
     __u32 w_off_fc1;   /* weight offset for layer fc1 (65->4) */
     __u32 w_off_fc2;   /* weight offset for layer fc2 (4->4)  */
     __u32 w_off_out;   /* weight offset for output layer (4->7) */
-};
+} __attribute__((packed));
 BPF_HASH(layer_registry, __u8, struct layer_model_entry, 256);
 
 int modular_dispatcher(struct xdp_md *ctx) {
