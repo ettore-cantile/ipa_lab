@@ -63,10 +63,15 @@ def ref_h1(weights, ttl, model_id, ifindex=0):
 
 
 MODEL_ID = 1   # must match the real 4-layer model's id (node feature depends on it)
-h1_ref = ref_h1(LAYER0_WEIGHTS, TTL, MODEL_ID)
+print("[ref] sweeping assumed ctx->ingress_ifindex (0 = no iface contribution, 1..6 = one-hot):")
+for cand_ifindex in range(0, 7):
+    h1_c = ref_h1(LAYER0_WEIGHTS, TTL, MODEL_ID, ifindex=cand_ifindex)
+    best_c = max(range(5), key=lambda j: h1_c[j])
+    print(f"  ifindex={cand_ifindex}: h1={h1_c}  argmax=class {best_c}")
+h1_ref = ref_h1(LAYER0_WEIGHTS, TTL, MODEL_ID, ifindex=0)
 ref_best = max(range(5), key=lambda j: h1_ref[j])
-print(f"[ref] h1 (pre-ReLU, argmax target) = {h1_ref}")
-print(f"[ref] argmax(h1) = class {ref_best}\n")
+print(f"\n[ref] h1 (ifindex=0 baseline) = {h1_ref}")
+print(f"[ref] argmax(h1, ifindex=0) = class {ref_best}\n")
 
 b = BPF(text=EBPF_MODULAR_FULL)
 disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)
