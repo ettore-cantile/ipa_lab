@@ -127,8 +127,14 @@ def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3):
     frame = build_frame(model_id, ttl, 24)
     _reset(ps, cs)
     retval, _ = prog_test_run(disp_fd, frame, repeat=1)
-    got = _read_u64(cs, ref_cls) if ref_cls < 6 else _read_u64(ps, 2)
-    ok = (retval in PASS_RETVALS) and got > 0
+    if ref_cls < 6:
+        got = _read_u64(cs, ref_cls)
+        ok = (retval in PASS_RETVALS) and got > 0
+    else:
+        # ref picked the DROP class (6): the correct kernel behavior is
+        # XDP_DROP (retval=1), not a redirect.
+        got = _read_u64(ps, 2)
+        ok = (retval == 1) and got > 0
     tag = "PASS" if ok else "FAIL"
     shape = "-".join(str(d[0]) for d in ref_layer_dims) + f"-{ref_layer_dims[-1][1]}"
     print(f"  [{tag}] {name:10s} model_id={model_id} shape={shape:14s} "
