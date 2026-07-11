@@ -244,7 +244,15 @@ BPF_ARRAY(cls_stats_t2, __u64, 7);   /* per-class redirect counter */
  * see common.py instrument_map_lookups()). No-op otherwise. */
 #ifdef IPA_COUNT_LOOKUPS
 BPF_ARRAY(lookup_ctr, __u64, 1);
-#define CTR_INC() do { int _lci = 0; __u64 *_lcv = lookup_ctr.lookup(&_lci); if (_lcv) __sync_fetch_and_add(_lcv, 1); } while (0)
+/* BCC's rewriter refuses table.lookup() calls that appear textually inside
+ * a macro expansion -- must be a real function (static inline), not a
+ * #define body. */
+static inline __attribute__((always_inline)) void ctr_inc(void) {
+    int _lci = 0;
+    __u64 *_lcv = lookup_ctr.lookup(&_lci);
+    if (_lcv) __sync_fetch_and_add(_lcv, 1);
+}
+#define CTR_INC() ctr_inc()
 #else
 #define CTR_INC() do {} while (0)
 #endif
@@ -330,7 +338,12 @@ BPF_ARRAY(pkt_stats_t2, __u64, 3);
 BPF_ARRAY(cls_stats_t2, __u64, 7);
 #ifdef IPA_COUNT_LOOKUPS
 BPF_ARRAY(lookup_ctr, __u64, 1);
-#define CTR_INC() do { int _lci = 0; __u64 *_lcv = lookup_ctr.lookup(&_lci); if (_lcv) __sync_fetch_and_add(_lcv, 1); } while (0)
+static inline __attribute__((always_inline)) void ctr_inc(void) {
+    int _lci = 0;
+    __u64 *_lcv = lookup_ctr.lookup(&_lci);
+    if (_lcv) __sync_fetch_and_add(_lcv, 1);
+}
+#define CTR_INC() ctr_inc()
 #else
 #define CTR_INC() do {} while (0)
 #endif
