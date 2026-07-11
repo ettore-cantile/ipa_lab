@@ -486,36 +486,39 @@
         </div>
         <p class="p-desc">
           Ogni modello è trasformato in un <strong style="color:var(--text);">programma eBPF dedicato</strong>
-          (<code>model_id → model_&lt;id&gt;.o</code>). Il programma contiene
+          (<code>model_id → model_&lt;id&gt;</code>). Un dispatcher leggero estrae <code>model_id</code>
+          dal pacchetto e fa un'unica tail call a <code>model_&lt;id&gt;</code>, che contiene
           feature extraction, pesi hardcoded, inferenza completa, argmax e azione —
-          tutto unrolled in un unico blocco compilato staticamente.
+          tutto unrolled, nessuna lookup sui pesi.
         </p>
         <div class="pflow">
           <div class="pnode head">packet<small>IPA / UDP</small></div>
-          <div class="pchev"><b>›</b></div>
-          <div class="pnode g">ipa_switch<small>pesi = letterali C<br>inferenza unrolled</small></div>
+          <div class="pchev"><span>model_id</span><b>›</b></div>
+          <div class="pnode">dispatcher<small>ipa_switch_hardcoded</small></div>
+          <div class="pchev"><span>tail call ×1</span><b>›</b></div>
+          <div class="pnode g">model_&lt;id&gt;<small>pesi = letterali C<br>inferenza unrolled</small></div>
           <div class="pchev"><span>argmax</span><b>›</b></div>
           <div class="pnode g">switch(cls)<small>ifindex hardcoded</small></div>
           <div class="pchev"><b>›</b></div>
           <div class="pnode out">bpf_redirect<small>azione</small></div>
         </div>
         <div class="pcost">
-          <span class="c g"><b>0</b> tail call</span>
+          <span class="c g"><b>1</b> tail call</span>
           <span class="c g"><b>0</b> lookup pesi</span>
-          <span class="c g"><b>264 B</b> mappe</span>
-          <span class="c g"><b>32 ns</b> · 31.3 Mpps</span>
+          <span class="c g"><b>168 B</b> mappe</span>
+          <span class="c g"><b>45 ns</b> · 22.2 Mpps</span>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
-            <li>Una sola tail call</li>
+            <li>Una sola tail call (dispatcher → model_&lt;id&gt;)</li>
             <li>Nessuna lookup per i pesi</li>
-            <li>Nessun passaggio di stato</li>
+            <li>Nessun passaggio di stato tra hop</li>
             <li>Codice completamente unrolled</li>
           </ul></div>
           <div class="cons"><h4>Svantaggi</h4><ul>
             <li>Ricompilazione per ogni nuovo modello</li>
             <li>Reload XDP necessario per aggiornare</li>
-            <li>Minima flessibilità runtime</li>
+            <li>Minima flessibilità runtime (architettura sempre 65-4-4-7)</li>
           </ul></div>
         </div>
         <p class="p-desc" style="margin-bottom:0;">
@@ -739,21 +742,27 @@
         <tbody>
           <tr>
             <td class="td-strong">Istruzioni eBPF (xlated)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">883</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">912</span></td>
             <td class="mono" style="text-align:right;">5 951</td>
             <td class="mono" style="text-align:right;"><span class="num-r">5 931</span></td>
           </tr>
           <tr>
             <td class="td-strong">Codice jited (byte)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">4 215</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">4 436</span></td>
             <td class="mono" style="text-align:right;">27 097</td>
             <td class="mono" style="text-align:right;"><span class="num-r">26 823</span></td>
           </tr>
           <tr>
             <td class="td-strong">Tail calls / pacchetto</td>
-            <td class="mono" style="text-align:right;">0<small style="color:var(--faint);"> (leaf)</small></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">1</span></td>
             <td class="mono" style="text-align:right;"><span class="num-a">1</span></td>
             <td class="mono" style="text-align:right;"><span class="num-r">3</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Map lookup / pacchetto<small style="color:var(--faint);"> (reale, contatore a runtime)</small></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">8.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">150.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">163.0</span></td>
           </tr>
           <tr>
             <td class="td-strong">Memoria mappe (byte)</td>
@@ -763,21 +772,21 @@
           </tr>
           <tr>
             <td class="td-strong">Latenza (ns / pacchetto)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">50.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">411.0</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">738.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">45.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">476.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">772.0</span></td>
           </tr>
           <tr>
             <td class="td-strong">Throughput (Mpps)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">20.000</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">2.433</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">1.355</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">22.222</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">2.101</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">1.295</span></td>
           </tr>
           <tr>
             <td class="td-strong">CPU (%)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">36</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-a">67</span></td>
-            <td class="mono" style="text-align:right;"><span class="num-r">75</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">42</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-a">81</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-r">69</span></td>
           </tr>
           <tr>
             <td class="td-strong">Flessibilità</td>
@@ -789,18 +798,34 @@
       </table>
     </div>
     <p class="sec-desc" style="margin-top:-1.75rem;margin-bottom:1rem;font-size:0.8rem;">
-      La tassonomia è confermata dai dati: tail call, memoria mappe e latenza crescono monotoni con la
-      flessibilità P1→P2→P3, e le prestazioni di picco calano nello stesso ordine. Le istruzioni statiche
-      di P2/P3 sono invece quasi identiche (5 951 vs 5 931) — stessa aritmetica (fc1 sparso + 2 layer densi),
-      solo distribuita su 1 programma grande (template) o 2 piccoli incatenati (modular): il costo reale
-      della profondità dinamica di P3 non è nel codice statico ma nei <strong>tail call extra a runtime</strong>
-      (3 vs 1), che è ciò che spiega la latenza maggiore.
-      <strong>P1 hardcoded è il più veloce</strong> (50 ns, 20.0 Mpps), <strong>il più compatto</strong>
-      (168 byte di mappe, 883 istruzioni) e senza tail call né lookup pesi — <em>massime prestazioni, minima
-      flessibilità</em>. <strong>P3 modular</strong> è all'estremo opposto (738 ns, 1.36 Mpps, 3 tail call,
-      ~16.5 KB) — <em>massima flessibilità (profondità E larghezza dinamiche), prestazioni minime</em>.
-      <strong>P2 template</strong> sta nel mezzo (411 ns, larghezza dinamica ma profondità fissa a 2 hidden
-      layer), come atteso dal compromesso.
+      La tassonomia è confermata dai dati: tail call, map lookup reali, memoria mappe e latenza crescono
+      monotoni con la flessibilità P1→P2→P3, e le prestazioni di picco calano nello stesso ordine
+      (map lookup misurati da un contatore <span class="mono">BPF_ARRAY</span> incrementato ad ogni
+      <span class="mono">.lookup()</span>, attivo solo in una build di misura dedicata — zero overhead
+      sui programmi di produzione). Le istruzioni statiche di P2/P3 sono invece quasi identiche
+      (5 951 vs 5 931) — stessa aritmetica (fc1 sparso + 2 layer densi), solo distribuita su 1 programma
+      grande (template) o 2 piccoli incatenati (modular): il costo reale della profondità dinamica di P3
+      non è nel codice statico ma nei <strong>tail call extra a runtime</strong> (3 vs 1) e nei map lookup
+      extra (163 vs 150), che è ciò che spiega la latenza maggiore.
+      <strong>P1 hardcoded è il più veloce</strong> (45 ns, 22.2 Mpps), <strong>il più compatto</strong>
+      (168 byte di mappe, 912 istruzioni) e con un solo tail call verso <span class="mono">model_&lt;id&gt;</span>
+      e zero lookup sui pesi — <em>massime prestazioni, minima flessibilità</em>. <strong>P3 modular</strong>
+      è all'estremo opposto (772 ns, 1.30 Mpps, 3 tail call, ~16.5 KB) — <em>massima flessibilità
+      (profondità E larghezza dinamiche), prestazioni minime</em>. <strong>P2 template</strong> sta nel
+      mezzo (476 ns, larghezza dinamica ma profondità fissa a 2 hidden layer), come atteso dal compromesso.
+    </p>
+    <p class="sec-desc" style="margin-bottom:1rem;font-size:0.8rem;">
+      <strong>Multi-modello verificato realmente, non solo dichiarato</strong>
+      (<span class="mono">shared/test/verify_multi_model.py</span>): le 3 pipeline sono state testate con
+      2 <span class="mono">model_id</span> registrati <em>concorrentemente nello stesso oggetto BPF
+      compilato</em>, esercitando il dispatcher reale (path completo con tail-call). P2 ha gestito
+      correttamente un secondo modello con larghezza diversa (65-6-5-7 sintetico, vs 65-4-4-7 reale);
+      P3 un secondo modello con <strong>profondità E larghezza diverse</strong> (65-5-6-4-7, 4 layer,
+      sintetico, vs 65-4-4-7 reale a 3 layer) — la stessa coppia di programmi compilati
+      (<span class="mono">layer_first</span>/<span class="mono">layer_hidden</span>) ha servito entrambe
+      le profondità senza ricompilare. P1 ha verificato il routing <span class="mono">dispatcher →
+      model_progs[model_id]</span> con 2 id sulla stessa architettura (l'unica che il generatore C
+      supporta oggi). 6/6 PASS.
     </p>
     <div class="iface-note" style="margin-bottom:2.5rem;">
       <strong>Nota.</strong> Metriche reali da <span class="mono">test_suite.py --only kernel</span> (4 CPU,
