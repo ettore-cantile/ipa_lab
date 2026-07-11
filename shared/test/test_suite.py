@@ -1098,10 +1098,15 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         n_tail = setup.get("n_tail")
         if n_tail is None:
             n_tail = max(0, len(setup.get("progs", {})) - 1)
+        try:
+            lookups = V.count_lookups(name, 0, mp)
+        except Exception as e:
+            info(f"{name}: map-lookup count skipped ({e})")
+            lookups = None
         rows.append({
             "name": name, "pl": pl, "insn": insn_total, "jit": jit_total,
             "per": per_prog, "lat": lat_ns, "mpps": mpps, "cpu": cpu_pct,
-            "retval": retval, "mem": mem, "n_tail": n_tail,
+            "retval": retval, "mem": mem, "n_tail": n_tail, "lookups": lookups,
         })
         ok(f"{name:9s}: {insn_total:5d} eBPF instr | lat={lat_ns:8.1f} ns | {mpps:6.3f} Mpps | CPU={cpu_pct:4.0f}% | retval={retval} | tail={n_tail}")
     if not rows:
@@ -1114,6 +1119,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
     line("eBPF instructions (xlated)", "insn",   lambda v: f"{v}")
     line("Jited code (bytes)",      "jit",    lambda v: f"{v}")
     line("Tail calls / packet",   "n_tail", lambda v: f"{v}")
+    line("Map lookups / packet (real)", "lookups", lambda v: "n/a" if v is None else f"{v:.1f}")
     line("Map memory (bytes)",     "mem",    lambda v: f"{v}")
     line("Latency (ns/pkt)",         "lat",    lambda v: f"{v:.1f}")
     line("Throughput (Mpps)",        "mpps",   lambda v: f"{v:.3f}")

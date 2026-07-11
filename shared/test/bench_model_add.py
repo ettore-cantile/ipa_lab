@@ -53,16 +53,21 @@ def _stats(times):
 
 def bench_hardcoded(weights, scale, n_models):
     """Every model add = full C source regen + BPF compile + load_func.
-    Pipeline 1 has no cheaper path by design (weights are literals)."""
+    Pipeline 1 has no cheaper path by design (weights are literals) --
+    each add is a standalone dispatcher+model_<id> compile, matching the
+    real datapath structure (1 tail call), not a bare monolithic program."""
     from bcc import BPF
-    from ebpf_program import generate_ebpf_hardcoded
+    import ctypes as ct
+    from ebpf_program import build_combined_hardcoded_source
 
     times = []
     for i in range(n_models):
         t0 = time.perf_counter()
-        src = generate_ebpf_hardcoded(weights, scale, model_id=i)
+        src = build_combined_hardcoded_source([(i, weights, scale, None)])
         b = BPF(text=src)
-        b.load_func("ipa_switch", BPF.XDP)
+        model_fn = b.load_func(f"model_{i}", BPF.XDP)
+        b.load_func("ipa_switch_hardcoded", BPF.XDP)
+        b["model_progs"][ct.c_int(i)] = ct.c_int(model_fn.fd)
         times.append(time.perf_counter() - t0)
     return None, times  # no separable one-time setup
 

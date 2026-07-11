@@ -113,8 +113,10 @@ def run(
     # ------------------------------------------------------------------
     print(f"[P1-hardcoded] Loading eBPF program (verifier check) ...")
     b = BPF(text=ebpf_src)
-    fn = b.load_func("ipa_switch", BPF.XDP)
-    print(f"[P1-hardcoded] Verifier: OK — program fd={fn.fd}")
+    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
+    fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    b["model_progs"][ctypes.c_int(model_id)] = ctypes.c_int(model_fn.fd)
+    print(f"[P1-hardcoded] Verifier: OK — dispatcher fd={fn.fd}, model_{model_id} fd={model_fn.fd}")
 
     # ------------------------------------------------------------------
     # Step 4: seed link_state and start the carrier monitor
@@ -130,7 +132,8 @@ def run(
     XDP_FLAGS_SKB_MODE = 2
     b.attach_xdp(iface, fn, flags=XDP_FLAGS_SKB_MODE)
     print(f"\n[P1-hardcoded] XDP attached to {iface} (SKB/generic mode) — running (Ctrl-C to stop)")
-    print(f"[P1-hardcoded] Design: 0 weight-map lookups, 0 fwd_table lookups, ~780 insns")
+    print(f"[P1-hardcoded] Design: dispatcher -> 1 tail call -> model_{model_id} "
+          f"(0 weight-map lookups, fully unrolled)")
     print(f"[P1-hardcoded] Egress port chosen dynamically by inference (best_cls -> switch(cls))")
     print()
     print(f"  {'TRUE HIT':>12} {'MISS':>10} {'DROP':>10}")
@@ -205,8 +208,9 @@ if __name__ == "__main__":
         src, w, s = load_and_generate(model_path, args.model_id, ifindex_table=ifindex_table)
         print(f"[verify-only] scale={s}, weights={len(w)}, source_chars={len(src)}")
         b = BPF(text=src)
-        fn = b.load_func("ipa_switch", BPF.XDP)
-        print(f"[verify-only] Verifier PASSED — fd={fn.fd}")
+        model_fn = b.load_func(f"model_{args.model_id}", BPF.XDP)
+        fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+        print(f"[verify-only] Verifier PASSED — dispatcher fd={fn.fd}, model_{args.model_id} fd={model_fn.fd}")
         sys.exit(0)
 
     run(

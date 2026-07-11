@@ -281,26 +281,30 @@ def setup_hardcoded(model_id: int, model_path: str):
       - t_redirect_s : BPF compile + load_func into the kernel (the real update cost)
       - t_insert_s   : 0 (no runtime weight insertion in the pure hardcoded design)
     """
-    from ebpf_program import generate_ebpf_hardcoded
+    from ebpf_program import build_combined_hardcoded_source
     weights, scale = load_weights(model_path)
-    src = generate_ebpf_hardcoded(weights, scale, model_id)
+    src = build_combined_hardcoded_source([(model_id, weights, scale, None)])
 
     # --- redirect/reload: eBPF compile + load into the kernel ---
     t0 = time.perf_counter()
     b  = BPF(text=src)
-    fn = b.load_func("ipa_switch", BPF.XDP)
+    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
+    fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
     t_redirect_s = time.perf_counter() - t0
 
-    # Pure hardcoded: single leaf program, no dispatcher / model_progs tail-call map.
+    # Dispatcher tail-calls model_progs[model_id] -- 1 tail call, matching
+    # the design-space spec's hardcoded pipeline (packet -> dispatcher ->
+    # tail call -> model_<id> -> action). Still zero weight-map lookups.
     disp = fn
 
     # link_state[0..5] = 1 (all egress links up) -- input feature, not a weight.
     _seed_link_state(b, 1)
 
-    progs = {"ipa_switch": fn.fd}
+    progs = {"ipa_switch_hardcoded": fn.fd, f"model_{model_id}": model_fn.fd}
 
     return {
-        "b": b, "fn": fn, "disp": disp,
+        "b": b, "fn": model_fn, "disp": disp,
         "weights": weights, "scale": scale,
         "cls_stats": b["cls_stats"],
         "pkt_stats": b["pkt_stats"],
@@ -371,6 +375,63 @@ def setup_modular(model_id: int, model_path: str):
             "layer_hidden": fn_hidden.fd,
         },
     }
+
+
+def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, repeat: int = 2000) -> float:
+    """
+    Real per-packet map-lookup count for `method`, measured via a dedicated
+    instrumented build (every `.lookup()` call wrapped with CTR_INC(), see
+    common.py instrument_map_lookups()). This compiles a SEPARATE BPF object
+    from the one used for latency/instruction measurement -- the counting
+    overhead never contaminates the hardware-measured performance numbers,
+    only this metric. Runs `repeat` packets through the dispatcher (the real
+    per-packet path, tail calls included) and returns lookup_ctr[0]/repeat.
+    """
+    from common import instrument_map_lookups
+    weights, scale = load_weights(model_path)
+
+    if method == "hardcoded":
+        from ebpf_program import build_combined_hardcoded_source
+        raw = build_combined_hardcoded_source([(model_id, weights, scale, None)])
+        src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
+        b = BPF(text=src)
+        model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
+        disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+        b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
+        _seed_link_state(b, 1)
+    elif method == "template":
+        from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER, load_arch_weights)
+        raw = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER
+        src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
+        b = BPF(text=src)
+        disp_fn = b.load_func("ipa_switch_template", BPF.XDP)
+        leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
+        b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
+        load_arch_weights(b, weights, model_id=model_id, scale=scale)
+        _seed_link_state(b, 1)
+        _install_mac_table(b, "mac_table_t2")
+    elif method == "modular":
+        from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
+        src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(EBPF_MODULAR_FULL)
+        b = BPF(text=src)
+        disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)
+        fn_first  = b.load_func("layer_first",  BPF.XDP)
+        fn_hidden = b.load_func("layer_hidden", BPF.XDP)
+        b["layer_chain"][ct.c_int(0)] = ct.c_int(fn_first.fd)
+        for i in range(1, 16):
+            b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_hidden.fd)
+        load_modular_weights(b, weights, model_id=model_id, scale=scale,
+                             layer_dims=[(65, 4), (4, 4), (4, 7)])
+        _seed_link_state(b, 1)
+        _install_mac_table(b, "mac_table_t3")
+    else:
+        raise ValueError(f"count_lookups: unknown method {method!r}")
+
+    frame = build_frame(model_id, ttl, scale)
+    b["lookup_ctr"][ct.c_int(0)] = ct.c_ulonglong(0)
+    prog_test_run(disp_fn.fd, frame, repeat=repeat)
+    total = int(b["lookup_ctr"][ct.c_int(0)].value)
+    return total / float(repeat)
 
 
 def _read_u64(table, key_val):

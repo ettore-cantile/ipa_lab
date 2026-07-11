@@ -131,7 +131,54 @@ BPF_ARRAY(link_state,       __u32, 6);
 BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(unused) [2]=drop */
 BPF_ARRAY(cls_stats,        __u64, 7);   /* per-class redirect counter */
 
+/* CTR_INC(): real per-packet map-lookup counter, active only when
+ * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
+ * see common.py instrument_map_lookups() / verify_prog_run.count_lookups()).
+ * A no-op otherwise, so production/performance builds are unaffected. */
+#ifdef IPA_COUNT_LOOKUPS
+BPF_ARRAY(lookup_ctr, __u64, 1);
+#define CTR_INC() do { int _lci = 0; __u64 *_lcv = lookup_ctr.lookup(&_lci); if (_lcv) __sync_fetch_and_add(_lcv, 1); } while (0)
+#else
+#define CTR_INC() do {} while (0)
+#endif
+
+/* model_progs: dispatcher -> model_<id>, indexed directly by ipa->model_id.
+ * A single tail call, matching the design-space spec's hardcoded pipeline
+ * ("packet -> dispatcher -> tail call -> model_<id> -> action") -- lets
+ * several fully-hardcoded models be registered concurrently, each still
+ * with zero weight-map lookups and fully unrolled inference. */
+BPF_PROG_ARRAY(model_progs, 256);
+
 #define RELU_LL(x)    ((x) > 0LL ? (x) : 0LL)
+"""
+
+EBPF_HARDCODED_DISPATCHER = r"""
+int ipa_switch_hardcoded(struct xdp_md *ctx) {
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr  *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    struct iphdr   *ip  = (struct iphdr *)(eth + 1);
+    if ((void *)(ip  + 1) > data_end) return XDP_PASS;
+
+    __u8 ip_proto = *((__u8 *)ip + 9);
+    if (ip_proto != IPPROTO_UDP) return XDP_PASS;
+
+    __u32 _ip_hlen = (((__u8 *)ip)[0] & 0x0fU) << 2U;
+    if (_ip_hlen < 20U) return XDP_PASS;
+    struct udphdr  *udp = (struct udphdr *)((void *)ip + _ip_hlen);
+    if ((void *)(udp + 1) > data_end) return XDP_PASS;
+    if (udp->dest != bpf_htons(9999)) return XDP_PASS;
+    struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
+    if ((void *)(ipa + 1) > data_end) return XDP_PASS;
+
+    /* Single tail call, no map lookup for weights, no intermediate state --
+     * model_progs is indexed directly by the protocol's model_id byte. */
+    __u32 mid = (__u32)ipa->model_id;
+    model_progs.call(ctx, mid);
+    return XDP_PASS;   /* reached only if model_id has no registered program */
+}
 """
 
 
@@ -140,9 +187,14 @@ def generate_ebpf_hardcoded(
     scale: int,
     model_id: int = 0,
     ifindex_table: list = None,
+    include_header: bool = True,
 ) -> str:
     """
-    Generate a self-contained eBPF XDP program for model `model_id`.
+    Generate an eBPF XDP program, function name `model_<model_id>`, for
+    model `model_id`. Reachable only via a tail call from
+    EBPF_HARDCODED_DISPATCHER's `model_progs[model_id]` -- it re-derives
+    data/data_end from ctx itself (pointers don't carry across tail calls)
+    but otherwise still does zero weight-map lookups, fully unrolled.
 
     After argmax the program:
       - resolves egress_ifindex via switch(best_cls) over hardcoded constants
@@ -152,6 +204,11 @@ def generate_ebpf_hardcoded(
 
     ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex.
                    Defaults to [2,3,4,5,6,7] (eth1..eth6).
+
+    include_header: True returns header+body (a standalone compilable
+      source, for single-model callers). False returns only the function
+      body, for concatenating several models + EBPF_HARDCODED_DISPATCHER
+      into one combined compilation unit (see build_combined_hardcoded_source).
 
     Verifier fix: see the module docstring "Verifier history" section.
     A single switch(_iface) and a single switch(_node) (not one per
@@ -263,8 +320,9 @@ def generate_ebpf_hardcoded(
         for cls in range(6)
     )
 
+    fn_name = f"model_{model_id}"
     body = f"""
-int ipa_switch(struct xdp_md *ctx) {{
+int {fn_name}(struct xdp_md *ctx) {{
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
@@ -335,7 +393,25 @@ int ipa_switch(struct xdp_md *ctx) {{
     return bpf_redirect(egress_ifindex, 0);
 }}
 """
-    return _EBPF_STATIC_HEADER + f"\n/* Pipeline 1 — model_id={model_id}, scale={scale} */\n" + body
+    src = body if not include_header else (
+        _EBPF_STATIC_HEADER + f"\n/* Pipeline 1 — model_id={model_id}, scale={scale} */\n" + body
+    )
+    return src
+
+
+def build_combined_hardcoded_source(models: list) -> str:
+    """
+    models: list of (model_id, weights_int8, scale, ifindex_table) tuples.
+    Returns one compilation unit: header (incl. model_progs) + dispatcher +
+    one model_<id> function per entry in `models`. Caller loads
+    "ipa_switch_hardcoded" as the XDP entry point, loads each "model_<id>",
+    and wires model_progs[model_id] = model_<id>.fd -- see method4_hardcoded.py.
+    """
+    src = _EBPF_STATIC_HEADER + "\n" + EBPF_HARDCODED_DISPATCHER
+    for model_id, weights_int8, scale, ifindex_table in models:
+        src += "\n" + generate_ebpf_hardcoded(
+            weights_int8, scale, model_id, ifindex_table, include_header=False)
+    return src
 
 
 def load_and_generate(
@@ -344,8 +420,10 @@ def load_and_generate(
     ifindex_table: list = None,
 ) -> tuple:
     """
-    Returns (ebpf_src, weights_int8, scale).
-    ifindex_table is forwarded to generate_ebpf_hardcoded.
+    Returns (ebpf_src, weights_int8, scale) -- a standalone combined source
+    (header + dispatcher + one model_<model_id> function) ready to compile
+    and attach EBPF_HARDCODED_DISPATCHER's "ipa_switch_hardcoded" as the XDP
+    entry point. ifindex_table is forwarded to generate_ebpf_hardcoded.
     """
     from extract_weights import extract_weights_int8
     import json, os
@@ -363,11 +441,11 @@ def load_and_generate(
         max_abs = max(abs(w) for w in floats)
         scale   = int(127 / max_abs)
     weights_int8 = extract_weights_int8(model_path)
-    ebpf_src     = generate_ebpf_hardcoded(weights_int8, scale, model_id, ifindex_table)
+    ebpf_src     = build_combined_hardcoded_source([(model_id, weights_int8, scale, ifindex_table)])
     return ebpf_src, weights_int8, scale
 
 
-EBPF_PROGRAM = generate_ebpf_hardcoded(weights_int8=[0]*N_WEIGHTS, scale=128, model_id=0)
+EBPF_PROGRAM = build_combined_hardcoded_source([(0, [0]*N_WEIGHTS, 128, None)])
 
 if __name__ == "__main__":
     import sys

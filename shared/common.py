@@ -9,6 +9,7 @@ Interface mapping (from lab.conf + darmstadt.startup):
 
 """
 import json
+import re
 from bcc import BPF
 
 INGRESS_IFACE = "eth0"   # darmstadt[0]=l59, link to frankfurt (10.0.0.233/30)
@@ -22,6 +23,30 @@ N_WEIGHTS = 319
 def load_weights(path: str) -> list:
     with open(path, "r") as f:
         return json.load(f)
+
+
+_LOOKUP_CALL_RE = re.compile(r'(\b\w+)\.lookup\(([^()]*)\)')
+
+
+def instrument_map_lookups(src: str) -> str:
+    """
+    Wrap every `<map>.lookup(<key>)` call in `src` with a CTR_INC() counter
+    increment, turning `table.lookup(&key)` into
+    `({ CTR_INC(); table.lookup(&key); })` (a GNU C statement expression --
+    valid wherever the original call was, since its last statement's value
+    becomes the expression's value).
+
+    CTR_INC() is a no-op unless IPA_COUNT_LOOKUPS is #defined before the
+    source is compiled (see the CTR_INC macro in each pipeline's eBPF
+    header) -- so this instrumentation only affects a dedicated measurement
+    build, never the production/performance-measured programs whose
+    instruction counts and latency are already hardware-verified.
+
+    Used by verify_prog_run.count_lookups() to get a REAL per-packet
+    map-lookup count for the design-space metrics table, replacing a
+    stale hand estimate.
+    """
+    return _LOOKUP_CALL_RE.sub(r'({ CTR_INC(); \1.lookup(\2); })', src)
 
 
 def local_mac(iface: str) -> list:

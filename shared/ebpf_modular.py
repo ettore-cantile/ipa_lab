@@ -175,6 +175,16 @@ BPF_HASH(mac_table_t3, __u32, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
 
+/* CTR_INC(): real per-packet map-lookup counter, active only when
+ * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
+ * see common.py instrument_map_lookups()). No-op otherwise. */
+#ifdef IPA_COUNT_LOOKUPS
+BPF_ARRAY(lookup_ctr, __u64, 1);
+#define CTR_INC() do { int _lci = 0; __u64 *_lcv = lookup_ctr.lookup(&_lci); if (_lcv) __sync_fetch_and_add(_lcv, 1); } while (0)
+#else
+#define CTR_INC() do {} while (0)
+#endif
+
 /* Explicit signed cast so arithmetic is correct after __u8 storage */
 #define WEIGHT(p) ((__s8)(*p))
 #define RELU(x)  ((x) > 0 ? (x) : 0)

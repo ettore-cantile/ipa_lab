@@ -239,6 +239,16 @@ BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t2, __u64, 7);   /* per-class redirect counter */
 
+/* CTR_INC(): real per-packet map-lookup counter, active only when
+ * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
+ * see common.py instrument_map_lookups()). No-op otherwise. */
+#ifdef IPA_COUNT_LOOKUPS
+BPF_ARRAY(lookup_ctr, __u64, 1);
+#define CTR_INC() do { int _lci = 0; __u64 *_lcv = lookup_ctr.lookup(&_lci); if (_lcv) __sync_fetch_and_add(_lcv, 1); } while (0)
+#else
+#define CTR_INC() do {} while (0)
+#endif
+
 int ipa_switch_template(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -318,6 +328,12 @@ BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
 BPF_ARRAY(cls_stats_t2, __u64, 7);
+#ifdef IPA_COUNT_LOOKUPS
+BPF_ARRAY(lookup_ctr, __u64, 1);
+#define CTR_INC() do { int _lci = 0; __u64 *_lcv = lookup_ctr.lookup(&_lci); if (_lcv) __sync_fetch_and_add(_lcv, 1); } while (0)
+#else
+#define CTR_INC() do {} while (0)
+#endif
 #endif /* IPA_ARCH_COMBINED */
 
 int arch_generic_2layer(struct xdp_md *ctx) {
