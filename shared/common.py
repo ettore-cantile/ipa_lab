@@ -45,8 +45,18 @@ def instrument_map_lookups(src: str) -> str:
     Used by verify_prog_run.count_lookups() to get a REAL per-packet
     map-lookup count for the design-space metrics table, replacing a
     stale hand estimate.
+
+    Skips `lookup_ctr.lookup(...)` itself -- that call lives inside the
+    CTR_INC() macro definition; wrapping it would make CTR_INC call
+    itself recursively, which cpp does not expand (leaves a literal
+    "undeclared function CTR_INC" call in the compiled output).
     """
-    return _LOOKUP_CALL_RE.sub(r'({ CTR_INC(); \1.lookup(\2); })', src)
+    def _wrap(m):
+        table = m.group(1)
+        if table == "lookup_ctr":
+            return m.group(0)
+        return "({ CTR_INC(); %s.lookup(%s); })" % (table, m.group(2))
+    return _LOOKUP_CALL_RE.sub(_wrap, src)
 
 
 def local_mac(iface: str) -> list:
