@@ -122,8 +122,20 @@ def _reset(ps, cs, n_cls=7):
             pass
 
 
-def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3):
-    ref_cls, ref_val = ref_infer_shape(weights, ref_layer_dims, ttl, model_id)
+def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3, ifindex=0):
+    """
+    ifindex: the reference's assumed ctx->ingress_ifindex under
+    BPF_PROG_TEST_RUN. P1 (hardcoded) translates the kernel's default value
+    through its OWN ifindex_table (which doesn't map it to anything, so it
+    resolves to "no iface feature" == ifindex=0 for the reference too). P2
+    (template) and P3 (modular) clamp the RAW ctx->ingress_ifindex directly
+    (1 <= x <= 6), and the empirically observed default under TEST_RUN is 1
+    -- so their reference must assume ifindex=1, not 0, or a close/tied
+    class can flip (this was silently masked by verify_prog_run.py's real
+    trained-model weights never being sensitive to it -- see the multi-model
+    test's synthetic-weight diagnostics for the discrepancy this exposed).
+    """
+    ref_cls, ref_val = ref_infer_shape(weights, ref_layer_dims, ttl, model_id, ifindex=ifindex)
     frame = build_frame(model_id, ttl, 24)
     _reset(ps, cs)
     retval, _ = prog_test_run(disp_fd, frame, repeat=1)
@@ -159,8 +171,10 @@ def test_hardcoded():
 
     ps, cs = b["pkt_stats"], b["cls_stats"]
     ok = True
-    ok &= _check("hardcoded", 0, disp_fn.fd, ps, cs, dims, weights0)
-    ok &= _check("hardcoded", 1, disp_fn.fd, ps, cs, dims, weights0)
+    # ifindex=0: P1's ifindex_table (default [2..7]) never maps the kernel's
+    # TEST_RUN ingress_ifindex to a logical port, so _iface stays 0.
+    ok &= _check("hardcoded", 0, disp_fn.fd, ps, cs, dims, weights0, ifindex=0)
+    ok &= _check("hardcoded", 1, disp_fn.fd, ps, cs, dims, weights0, ifindex=0)
     return ok
 
 
@@ -190,8 +204,11 @@ def test_template():
 
     ps, cs = b["pkt_stats_t2"], b["cls_stats_t2"]
     ok = True
-    ok &= _check("template", 0, disp_fn.fd, ps, cs, dims0, weights0)
-    ok &= _check("template", 1, disp_fn.fd, ps, cs, dims1, weights1)
+    # ifindex=1: P2 clamps the RAW ctx->ingress_ifindex (1<=x<=6) directly,
+    # no translation table -- the empirically observed TEST_RUN default (1)
+    # falls inside that range and DOES contribute a feature.
+    ok &= _check("template", 0, disp_fn.fd, ps, cs, dims0, weights0, ifindex=1)
+    ok &= _check("template", 1, disp_fn.fd, ps, cs, dims1, weights1, ifindex=1)
     return ok
 
 
@@ -219,8 +236,10 @@ def test_modular():
 
     ps, cs = b["pkt_stats_t3"], b["cls_stats_t3"]
     ok = True
-    ok &= _check("modular", 0, disp_fn.fd, ps, cs, dims0, weights0)
-    ok &= _check("modular", 1, disp_fn.fd, ps, cs, dims1, weights1)
+    # ifindex=1: layer_first also clamps the RAW ctx->ingress_ifindex
+    # directly, same reasoning as P2 above.
+    ok &= _check("modular", 0, disp_fn.fd, ps, cs, dims0, weights0, ifindex=1)
+    ok &= _check("modular", 1, disp_fn.fd, ps, cs, dims1, weights1, ifindex=1)
     return ok
 
 
