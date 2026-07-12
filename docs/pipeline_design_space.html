@@ -498,15 +498,15 @@
           <div class="pchev"><span>tail call ×1</span><b>›</b></div>
           <div class="pnode g">model_&lt;id&gt;<small>pesi = letterali C<br>inferenza unrolled</small></div>
           <div class="pchev"><span>argmax</span><b>›</b></div>
-          <div class="pnode g">switch(cls)<small>ifindex hardcoded</small></div>
+          <div class="pnode g">mac_table[cls]<small>ifindex + MAC rewrite</small></div>
           <div class="pchev"><b>›</b></div>
           <div class="pnode out">bpf_redirect<small>azione</small></div>
         </div>
         <div class="pcost">
           <span class="c g"><b>1</b> tail call</span>
           <span class="c g"><b>0</b> lookup pesi</span>
-          <span class="c g"><b>168 B</b> mappe</span>
-          <span class="c g"><b>45 ns</b> · 22.2 Mpps</span>
+          <span class="c g"><b>328 B</b> mappe</span>
+          <span class="c g"><b>85 ns</b> · 11.8 Mpps</span>
         </div>
         <div class="procon">
           <div class="pros"><h4>Vantaggi</h4><ul>
@@ -524,7 +524,9 @@
         <p class="p-desc" style="margin-bottom:0;">
           <strong style="color:var(--green);">Aggiornamento modello:</strong>
           genera sorgente C → compila con LLVM → ricarica programma XDP.
-          Il datapath viene interrotto durante il reload.
+          Il datapath viene interrotto durante il reload. Azione risolta via
+          <code>mac_table[cls]</code> (stesso pattern di P2/P3): riscrive i MAC
+          src/dst reali prima del redirect, non solo l'iface di uscita.
         </p>
       </div>
 
@@ -742,13 +744,13 @@
         <tbody>
           <tr>
             <td class="td-strong">Istruzioni eBPF (xlated)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">912</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">963</span></td>
             <td class="mono" style="text-align:right;">5 951</td>
             <td class="mono" style="text-align:right;"><span class="num-r">5 931</span></td>
           </tr>
           <tr>
             <td class="td-strong">Codice jited (byte)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">4 436</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">4 591</span></td>
             <td class="mono" style="text-align:right;">27 097</td>
             <td class="mono" style="text-align:right;"><span class="num-r">26 823</span></td>
           </tr>
@@ -760,31 +762,31 @@
           </tr>
           <tr>
             <td class="td-strong">Map lookup / pacchetto<small style="color:var(--faint);"> (reale, contatore a runtime)</small></td>
-            <td class="mono" style="text-align:right;"><span class="num-g">8.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">9.0</span></td>
             <td class="mono" style="text-align:right;"><span class="num-a">150.0</span></td>
             <td class="mono" style="text-align:right;"><span class="num-r">163.0</span></td>
           </tr>
           <tr>
             <td class="td-strong">Memoria mappe (byte)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">168</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">328</span></td>
             <td class="mono" style="text-align:right;"><span class="num-a">8 072</span></td>
             <td class="mono" style="text-align:right;"><span class="num-r">16 904</span></td>
           </tr>
           <tr>
             <td class="td-strong">Latenza (ns / pacchetto)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">45.0</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">85.0</span></td>
             <td class="mono" style="text-align:right;"><span class="num-a">476.0</span></td>
             <td class="mono" style="text-align:right;"><span class="num-r">772.0</span></td>
           </tr>
           <tr>
             <td class="td-strong">Throughput (Mpps)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">22.222</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">11.765</span></td>
             <td class="mono" style="text-align:right;"><span class="num-a">2.101</span></td>
             <td class="mono" style="text-align:right;"><span class="num-r">1.295</span></td>
           </tr>
           <tr>
             <td class="td-strong">CPU (%)</td>
-            <td class="mono" style="text-align:right;"><span class="num-g">42</span></td>
+            <td class="mono" style="text-align:right;"><span class="num-g">57</span></td>
             <td class="mono" style="text-align:right;"><span class="num-a">81</span></td>
             <td class="mono" style="text-align:right;"><span class="num-r">69</span></td>
           </tr>
@@ -807,9 +809,10 @@
       grande (template) o 2 piccoli incatenati (modular): il costo reale della profondità dinamica di P3
       non è nel codice statico ma nei <strong>tail call extra a runtime</strong> (3 vs 1) e nei map lookup
       extra (163 vs 150), che è ciò che spiega la latenza maggiore.
-      <strong>P1 hardcoded è il più veloce</strong> (45 ns, 22.2 Mpps), <strong>il più compatto</strong>
-      (168 byte di mappe, 912 istruzioni) e con un solo tail call verso <span class="mono">model_&lt;id&gt;</span>
-      e zero lookup sui pesi — <em>massime prestazioni, minima flessibilità</em>. <strong>P3 modular</strong>
+      <strong>P1 hardcoded è il più veloce</strong> (85 ns, 11.8 Mpps), <strong>il più compatto</strong>
+      (328 byte di mappe, 963 istruzioni) e con un solo tail call verso <span class="mono">model_&lt;id&gt;</span>
+      e zero lookup sui pesi (la 9ª lookup è <span class="mono">mac_table</span> per l'azione, non un peso)
+      — <em>massime prestazioni, minima flessibilità</em>. <strong>P3 modular</strong>
       è all'estremo opposto (772 ns, 1.30 Mpps, 3 tail call, ~16.5 KB) — <em>massima flessibilità
       (profondità E larghezza dinamiche), prestazioni minime</em>. <strong>P2 template</strong> sta nel
       mezzo (476 ns, larghezza dinamica ma profondità fissa a 2 hidden layer), come atteso dal compromesso.
