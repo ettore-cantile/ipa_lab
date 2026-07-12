@@ -39,7 +39,7 @@ os.chdir(SHARED_DIR)
 
 from bcc import BPF
 import verify_prog_run as V
-from verify_multi_model import ref_infer_shape
+from verify_multi_model import ref_infer_shape, synth_weights
 
 _libc = ct.CDLL("libc.so.6", use_errno=True)
 _SYS_bpf = 321
@@ -85,8 +85,15 @@ def main():
         sys.exit(1)
 
     from ebpf_template_arch import EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER, load_arch_weights
-    weights, scale = V.load_weights(V.MODEL_PT)
-    dims = [(65, 4), (4, 4), (4, 7)]
+    # The real trained 65-4-4-7 model is NOT sensitive to the iface feature
+    # (class 0 dominates regardless -- confirmed: ref_val shifts per ifindex
+    # but never flips the winner). Use the SAME synthetic weights that
+    # already proved sensitive to this exact feature earlier in the session
+    # (verify_multi_model.py's P2 model_id=1, seed=1234) so a real signal
+    # is actually observable.
+    dims = [(65, 6), (6, 5), (5, 7)]
+    weights = synth_weights(dims, seed=1234)
+    scale = 30
     model_id = 0
     ttl = 3
 
@@ -95,14 +102,15 @@ def main():
     disp_fn = b.load_func("ipa_switch_template", BPF.XDP)
     leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
     b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
-    load_arch_weights(b, weights, model_id=model_id, scale=scale)
+    load_arch_weights(b, weights, model_id=model_id, scale=scale, n_h1=6, n_h2=5)
     V._seed_link_state(b, 1)
     V._install_mac_table(b, "mac_table_t2")
 
     frame = V.build_frame(model_id, ttl, scale)
     cs = b["cls_stats_t2"]
+    ps = b["pkt_stats_t2"]
 
-    print("[diag] Pipeline 2 (raw ctx->ingress_ifindex clamp), ttl=3, model_id=0")
+    print("[diag] Pipeline 2 (raw ctx->ingress_ifindex clamp), synthetic 65-6-5-7 (iface-sensitive), ttl=3, model_id=0")
     print("[diag] For each candidate ifindex: kernel result (via ctx_in) vs reference (that exact ifindex)\n")
 
     any_varies = False
@@ -112,6 +120,8 @@ def main():
 
         for i in range(7):
             cs[ct.c_int(i)] = ct.c_ulonglong(0)
+        for i in range(3):
+            ps[ct.c_int(i)] = ct.c_ulonglong(0)
         retval, err = prog_test_run_with_ctx(disp_fn.fd, frame, ingress_ifindex=cand, repeat=1)
 
         if err is not None:
@@ -123,6 +133,8 @@ def main():
             if cs[ct.c_int(i)].value > 0:
                 kernel_cls = i
                 break
+        if kernel_cls is None and ps[ct.c_int(2)].value > 0:
+            kernel_cls = 6  # DROP
         match = "MATCH" if kernel_cls == ref_cls else "MISMATCH"
         print(f"  ifindex={cand}: retval={retval}  kernel_cls={kernel_cls}  ref_cls={ref_cls}  ref_val={ref_val:>8}  [{match}]")
         if prev_kernel_cls is not None and kernel_cls != prev_kernel_cls:
