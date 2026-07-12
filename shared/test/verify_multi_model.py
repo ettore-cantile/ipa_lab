@@ -168,6 +168,7 @@ def test_hardcoded():
     b["model_progs"][ct.c_int(0)] = ct.c_int(model0_fn.fd)
     b["model_progs"][ct.c_int(1)] = ct.c_int(model1_fn.fd)
     _seed_link_state(b, 1)
+    _install_mac_table(b, "mac_table")
 
     ps, cs = b["pkt_stats"], b["cls_stats"]
     ok = True

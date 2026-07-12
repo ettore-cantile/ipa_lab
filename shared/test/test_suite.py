@@ -1021,8 +1021,8 @@ def suite_robust():
 _PIPELINE_MAP_NAMES = [
     # shared: link_state (egress up/down input feature, all 3 pipelines)
     "link_state",
-    # P1 hardcoded (pure: no weight map -- only stats + debug)
-    "pkt_stats", "cls_stats", "debug_stats",
+    # P1 hardcoded (pure: no weight map -- only stats + mac_table)
+    "pkt_stats", "cls_stats", "mac_table",
     # P2 template
     "arch_weights", "arch_registry", "arch_progs",
     "mac_table_t2", "pkt_stats_t2", "cls_stats_t2",

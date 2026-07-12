@@ -9,8 +9,11 @@ Design space position:
   - A single tail call, NO map lookup for the weights (pure hardcoded).
     The ONLY map read is link_state[0..5] (egress up/down), which is an
     input feature, not a weight -- see below.
-  - Per-class hardcoded action: best_cls -> ifindex[best_cls]
-    (cls 0-5 = bpf_redirect on the corresponding iface, cls 6 = XDP_DROP)
+  - Action: best_cls -> mac_table[best_cls] -> MAC rewrite -> bpf_redirect
+    (cls 0-5 = redirect on the resolved iface with real src/dst MAC,
+    cls 6 = XDP_DROP). Same mac_table pattern as P2/P3 -- the NN decides
+    the port, mac_table only resolves the L2 next-hop -- so the packet's
+    Ethernet header is rewritten before leaving, not just its egress iface.
   - No fwd_table, no valid_keys lookup: a TRUE HIT = the redirect fired
   - No model_cache: the old is_valid gate + weight blob was a residue of an
     earlier design; a pure hardcoded program already knows its weights, so it
@@ -56,9 +59,15 @@ Verifier constraints (why the code is shaped this way):
   3) The SAME broken-global-array pattern (root cause #2 above) also
      existed in the post-argmax action code as `static const __u32
      IFINDEX_TABLE[6]` indexed by `best_cls`. Same symptom ("R7 invalid
-     mem access 'scalar'"), same fix: a `switch (best_cls) { case 0:
-     egress_ifindex = ...; break; ... }` (6 cases, single decision
-     point, no loop -> no explosion risk) replaces the array lookup.
+     mem access 'scalar'"), same fix at the time: a `switch (best_cls) {
+     case 0: egress_ifindex = ...; break; ... }` (6 cases, single decision
+     point, no loop -> no explosion risk) replaced the array lookup.
+     That switch has since been replaced again, this time by a real
+     mac_table BPF_HASH lookup (matching P2/P3's action pattern) so P1
+     also rewrites the Ethernet src/dst MAC before redirecting -- a plain
+     BPF_HASH lookup is verifier-safe here (unlike the broken static
+     const array) because it goes through the normal map helper, not a
+     relocated global symbol.
 
   4) ip->protocol bitfield ambiguity on BCC/Kathara (DBG_NOT_UDP=100%):
      struct iphdr declares ihl:4,version:4 as a bitfield at byte 0.
@@ -128,8 +137,20 @@ struct ipa_hdr {
  * This is the ONLY map read in the inference path -- it is an INPUT feature,
  * not a weight. The weights remain C literals (pure hardcoded design). */
 BPF_ARRAY(link_state,       __u32, 6);
-BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(unused) [2]=drop */
+BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(no mac_table entry) [2]=drop */
 BPF_ARRAY(cls_stats,        __u64, 7);   /* per-class redirect counter */
+
+/* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
+ * Same struct/role as P2/P3's mac_table_t2/t3 -- the NN decides the port,
+ * this only resolves the L2 next-hop and rewrites the Ethernet header
+ * before bpf_redirect(). Populated per-class (P1 supports a distinct
+ * egress iface per class, unlike P2/P3's single shared egress). */
+struct fwd_action {
+    __u32 ifindex;
+    __u8  src_mac[6];
+    __u8  dst_mac[6];
+} __attribute__((packed));
+BPF_HASH(mac_table, __u32, struct fwd_action, 8);
 
 /* CTR_INC(): real per-packet map-lookup counter, active only when
  * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
@@ -205,13 +226,21 @@ def generate_ebpf_hardcoded(
     but otherwise still does zero weight-map lookups, fully unrolled.
 
     After argmax the program:
-      - resolves egress_ifindex via switch(best_cls) over hardcoded constants
-      - cls 0-5: bpf_redirect(ifindex, 0)  -> pkt_stats[0]++, cls_stats[cls]++
+      - resolves the action via mac_table[best_cls] -> {ifindex, src_mac, dst_mac}
+      - cls 0-5: rewrites eth->h_source/h_dest, bpf_redirect(ifindex, 0)
+                 -> pkt_stats[0]++, cls_stats[cls]++
+      - cls 0-5 but mac_table has no entry (not provisioned): pkt_stats[1]++, XDP_PASS
       - cls  6:  XDP_DROP                  -> pkt_stats[2]++
       - inference always runs (pure hardcoded, no cache gate)
+      - mac_table itself is populated by the CALLER (method4_hardcoded.py),
+        not by this function -- same split of responsibility as P2/P3's
+        arch_progs/layer_chain wiring.
 
-    ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex.
-                   Defaults to [2,3,4,5,6,7] (eth1..eth6).
+    ifindex_table: list of 6 integers mapping cls 0-5 to kernel ifindex,
+                   used for the INPUT ingress-iface one-hot feature (see
+                   FIX(#5) below). Defaults to [2,3,4,5,6,7] (eth1..eth6).
+                   The OUTPUT egress iface comes from mac_table instead,
+                   populated separately (may differ from this table).
 
     include_header: True returns header+body (a standalone compilable
       source, for single-model callers). False returns only the function
@@ -323,11 +352,6 @@ def generate_ebpf_hardcoded(
     out_src    = "\n".join(out_lines)
     argmax_src = "\n".join(argmax_lines)
 
-    ifindex_cases = "\n".join(
-        f"        case {cls}: egress_ifindex = {int(ifindex_table[cls])}U; break;"
-        for cls in range(6)
-    )
-
     fn_name = f"model_{model_id}"
     body = f"""
 int {fn_name}(struct xdp_md *ctx) {{
@@ -375,7 +399,7 @@ int {fn_name}(struct xdp_md *ctx) {{
 
 {argmax_src}
 
-    /* --- Hardcoded action: class -> egress port (no map lookup) --- */
+    /* --- Action: class -> mac_table[class] -> MAC rewrite -> bpf_redirect --- */
     if (best_cls >= 6) {{
         /* cls 6 = DROP */
         int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);
@@ -383,22 +407,21 @@ int {fn_name}(struct xdp_md *ctx) {{
         return XDP_DROP;
     }}
 
-    __u32 egress_ifindex = 0;
-    switch (best_cls) {{
-{ifindex_cases}
-        default: break;
-    }}
-
-    /* per-class counter */
     __u32 _cls = (__u32)best_cls;
-    __u64 *_cv = cls_stats.lookup(&_cls);
-    if (_cv) __sync_fetch_and_add(_cv, 1);
-
-    /* global hit counter */
-    int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
-    if (_hv) __sync_fetch_and_add(_hv, 1);
-
-    return bpf_redirect(egress_ifindex, 0);
+    struct fwd_action *_action = mac_table.lookup(&_cls);
+    if (_action != NULL) {{
+        int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
+        if (_hv) __sync_fetch_and_add(_hv, 1);
+        __u64 *_cv = cls_stats.lookup(&_cls);
+        if (_cv) __sync_fetch_and_add(_cv, 1);
+        __builtin_memcpy(eth->h_source, _action->src_mac, 6);
+        __builtin_memcpy(eth->h_dest,   _action->dst_mac, 6);
+        return bpf_redirect(_action->ifindex, 0);
+    }}
+    /* no mac_table entry for that class (not provisioned) */
+    int _mi = 1; __u64 *_mv = pkt_stats.lookup(&_mi);
+    if (_mv) __sync_fetch_and_add(_mv, 1);
+    return XDP_PASS;
 }}
 """
     src = body if not include_header else (

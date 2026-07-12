@@ -300,6 +300,7 @@ def setup_hardcoded(model_id: int, model_path: str):
 
     # link_state[0..5] = 1 (all egress links up) -- input feature, not a weight.
     _seed_link_state(b, 1)
+    _install_mac_table(b, "mac_table")
 
     progs = {"ipa_switch_hardcoded": fn.fd, f"model_{model_id}": model_fn.fd}
 
@@ -399,6 +400,7 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
         disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
         b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
         _seed_link_state(b, 1)
+        _install_mac_table(b, "mac_table")
     elif method == "template":
         from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER, load_arch_weights)
         raw = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER
