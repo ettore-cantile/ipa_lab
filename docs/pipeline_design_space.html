@@ -832,17 +832,21 @@
     </p>
     <div class="iface-note" style="margin-bottom:2.5rem;">
       <strong>Nota.</strong> Metriche reali da <span class="mono">test_suite.py --only kernel</span> (4 CPU,
-      modello 65-4-4-7, scale 24) dopo l'aggiunta di <span class="mono">link_state</span> reale e la rimozione di
-      <span class="mono">model_cache</span>. La memoria mappe di P1 (264 B) coincide col calcolo analitico
-      (<span class="mono">link_state</span> 48 + <span class="mono">pkt_stats</span> 36 +
-      <span class="mono">cls_stats</span> 84 + <span class="mono">debug_stats</span> 96). L'inferenza
-      (MLP 65-4-4-7, stessi pesi, stesso argmax) è <strong>identica</strong> nelle tre pipeline — verificata dal
-      test di corrispondenza di classe (classe scelta dal kernel = classe del riferimento Python). L'unica
-      differenza è <em>come</em> si calcola l'inferenza (il costo della flessibilità). L'azione è ora
-      <strong>uniforme</strong>: tutte fanno <span class="mono">argmax → mac_table[classe] → bpf_redirect</span>;
-      P1 tiene la mappatura classe→porta hardcoded in uno <span class="mono">switch</span> (0 lookup),
-      P2/P3 la risolvono da <span class="mono">mac_table</span>. Latenza/throughput hanno varianza run-to-run
-      non trascurabile sotto <span class="mono">BPF_PROG_TEST_RUN</span>.
+      modello 65-4-4-7, scale 24) dopo l'aggiunta di <span class="mono">link_state</span> reale, la rimozione di
+      <span class="mono">model_cache</span> e l'aggiunta di <span class="mono">mac_table</span> a P1 (328 B di
+      mappe: <span class="mono">link_state</span> + <span class="mono">pkt_stats</span> +
+      <span class="mono">cls_stats</span> + <span class="mono">mac_table</span>, nessuna
+      <span class="mono">debug_stats</span> — mai esistita nel codice, era un riferimento morto in un
+      elenco di test). L'inferenza (MLP 65-4-4-7, stessi pesi, stesso argmax) è <strong>identica</strong>
+      nelle tre pipeline — verificata dal test di corrispondenza di classe (classe scelta dal kernel =
+      classe del riferimento Python). L'unica differenza è <em>come</em> si calcola l'inferenza (il costo
+      della flessibilità). L'azione è ora <strong>uniforme su tutte e tre</strong>:
+      <span class="mono">argmax → mac_table[classe] → MAC rewrite → bpf_redirect</span> — anche P1, che
+      prima riscriveva solo l'ifindex via <span class="mono">switch(cls)</span> senza toccare i MAC
+      src/dst del pacchetto (bug corretto: il pacchetto usciva con i MAC del mittente originale, non
+      quelli del vero next-hop). Latenza/throughput hanno varianza run-to-run non trascurabile sotto
+      <span class="mono">BPF_PROG_TEST_RUN</span> (misurazioni ottimistiche, vedi nota sopra) — usare i
+      valori come confronto relativo tra pipeline, non come numeri di produzione assoluti.
     </div>
     <div class="iface-note" style="margin-bottom:2.5rem;border-left-color:var(--amber);">
       <strong>mac_table.</strong> P2/P3 non usano più una <span class="mono">fwd_table</span>
@@ -1076,18 +1080,32 @@
       <em>dispatch reale in kernel</em> — pacchetto ricevuto → inferenza → redirect verso l'ifindex
       corretto — è verificata separatamente da <span class="mono">shared/test/verify_prog_run.py</span>,
       che carica i programmi XDP reali ed esegue <span class="mono">BPF_PROG_TEST_RUN</span> per tutte
-      e tre le pipeline. Con <span class="mono">mac_table</span> la verifica è <strong>single-pass e uniforme</strong>:
+      e tre le pipeline, <strong>sempre attraverso il dispatcher reale</strong> (catena di tail-call
+      completa: dispatcher → ... → azione, mai un leaf testato in isolamento con stato pre-innescato —
+      confermato affidabile anche su catene P3 a 4 hop, vedi <span class="mono">verify_multi_model.py</span>).
+      Con <span class="mono">mac_table</span> la verifica è <strong>single-pass e uniforme</strong>:
       si pre-installa <span class="mono">mac_table[0..5]</span>, si esegue una volta e si controlla che la
       <strong>classe scelta dal kernel</strong> coincida con quella del riferimento Python
       (<span class="mono">cls_stats[ref_cls] &gt; 0</span> e <span class="mono">retval ∈ {0,4}</span>). Niente più
       cattura della chiave, installazione e seconda passata.<br><br>
-      <strong>ingress coerente, senza contesto forzato.</strong> Sotto <span class="mono">BPF_PROG_TEST_RUN</span>
-      l'<span class="mono">ingress_ifindex</span> di sandbox cade fuori sia dalla <span class="mono">ifindex_table</span>
-      di P1 sia dal clamp <span class="mono">[1,6]</span> di P2/P3: tutte e tre risolvono quindi a "nessuna iface
-      di ingresso" (<span class="mono">_iface = 0</span>) allo stesso modo, e il riferimento Python usa
-      <span class="mono">ifindex = 0</span> per combaciare — nessun <span class="mono">ctx_in</span> custom necessario
-      (un tentativo precedente di forzarlo con uno <span class="mono">xdp_md</span> azzerato azzerava anche
-      <span class="mono">data_end</span>, facendo cadere ogni pacchetto prima dell'inferenza).<br><br>
+      <strong>ingress, senza contesto forzato.</strong> Sotto <span class="mono">BPF_PROG_TEST_RUN</span>
+      il valore reale di <span class="mono">ctx-&gt;ingress_ifindex</span> della sandbox è <strong>1</strong>
+      (osservato empiricamente, non zero). P1 lo traduce tramite la propria <span class="mono">ifindex_table</span>
+      (default <span class="mono">[2..7]</span>), che non mappa il valore 1 → <span class="mono">_iface</span>
+      resta 0 lì. P2/P3 clampano invece il valore grezzo (<span class="mono">1&lt;=x&lt;=6</span>), quindi il
+      valore 1 <strong>contribuisce davvero</strong> una feature di ingresso — il riferimento Python usa
+      <span class="mono">ifindex=0</span> per P1 e <span class="mono">ifindex=1</span> per P2/P3 per
+      combaciare esattamente. Nessun <span class="mono">ctx_in</span> custom necessario (un tentativo
+      precedente di forzarlo con uno <span class="mono">xdp_md</span> azzerato azzerava anche
+      <span class="mono">data_end</span>, facendo cadere ogni pacchetto prima dell'inferenza — per questo
+      si accetta il default della sandbox invece di sovrascriverlo).<br><br>
+      <strong>Limite noto: numeri assoluti ottimistici.</strong> <span class="mono">BPF_PROG_TEST_RUN</span>
+      esegue il programma in un tight-loop dentro il kernel, senza NIC/DMA/IRQ reali né contesa con altri
+      processi — latenza e throughput misurati sono quindi un limite superiore ottimistico rispetto a un
+      deployment con traffico reale eterogeneo, non un numero di produzione. Il confronto <strong>relativo</strong>
+      tra P1/P2/P3 (stessa metodologia, stesse condizioni per tutti e tre) resta valido ed è ciò che la
+      tesi effettivamente sostiene: il trade-off prestazioni/flessibilità, non un throughput assoluto
+      di produzione.<br><br>
       <strong>Reroute su guasto (link_state).</strong> La suite verifica anche che
       <span class="mono">link_state</span> sia un input di routing vivo: per ogni TTL e ogni interfaccia
       <em>k</em> esegue P1 con tutti i link up e poi con il link <em>k</em> giù

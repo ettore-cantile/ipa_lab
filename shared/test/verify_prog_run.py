@@ -511,13 +511,12 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print()
     setup_fn = {"hardcoded": setup_hardcoded, "template": setup_template, "modular": setup_modular}[method]
     setup = setup_fn(model_id, model_path)
-    b, fn = setup["b"], setup["fn"]
+    b, fn, disp = setup["b"], setup["fn"], setup["disp"]
     weights = setup["weights"]
     scale = setup["scale"]
     ps = setup["pkt_stats"]
     cs = setup.get("cls_stats")
     pipeline = setup["pipeline"]
-    last_layer_idx = setup.get("last_layer_idx", 2)
 
     # Model-update timing for Method 1
     if pipeline == 1:
@@ -528,22 +527,27 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         print(f"[M1 update timing] total:                               {(t_redir+t_ins)*1000:.3f} ms")
         print()
 
-    print(f"[setup] scale={scale}  weights={len(weights)}  prog_fd={fn.fd}")
-    print("      All pipelines: argmax -> mac_table[class] -> bpf_redirect.")
+    print(f"[setup] scale={scale}  weights={len(weights)}  disp_fd={disp.fd}")
+    print("      All pipelines tested via the REAL dispatcher (full tail-call chain,")
+    print("      dispatcher -> ... -> action) -- no leaf-priming shortcut.")
+    print("      argmax -> mac_table[class] -> bpf_redirect.")
     print("      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.")
+    # Reference ingress_ifindex: under BPF_PROG_TEST_RUN, the sandbox's real
+    # default ctx->ingress_ifindex is 1 (empirically confirmed -- see
+    # TEST_RUN_DEFAULT_INGRESS_IFINDEX above and the multi-model diagnostics
+    # in verify_multi_model.py). P1 translates it through its OWN
+    # ifindex_table (default [2..7]), which does NOT map 1 -> _iface stays 0.
+    # P2/P3 clamp the raw value directly (1<=x<=6), so 1 DOES contribute an
+    # iface feature there. This only ever flips a close/tied argmax; the
+    # real trained 65-4-4-7 model isn't sensitive to it (class 0 dominates),
+    # which is why ifindex=0 "worked" here for years without anyone noticing.
+    ref_ifindex = 0 if pipeline == 1 else 1
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
-        # Reference (ingress=0): under BPF_PROG_TEST_RUN the sandbox
-        # ingress_ifindex falls outside both P1's ifindex_table and P2/P3's
-        # [1,6] clamp, so all 3 pipelines resolve it to "no ingress iface"
-        # (_iface=0) -- ifindex=0 here matches that without needing a ctx_in.
-        ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=0)
+        ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=ref_ifindex)
         frame = build_frame(model_id, ttl, scale)
         _reset_stats(setup)
-        # P3 runs the leaf directly, so prime the intermediate activations it reads.
-        if pipeline == 3:
-            _prime_scratch_p3(b, h2, scale, model_id, layer_idx=last_layer_idx, ingress_ifindex=0, ttl=ttl)
-        retval, dur_ns = prog_test_run(fn.fd, frame, repeat=repeat, ingress_ifindex=0)
+        retval, dur_ns = prog_test_run(disp.fd, frame, repeat=repeat, ingress_ifindex=0)
         cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
         ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
         detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"
