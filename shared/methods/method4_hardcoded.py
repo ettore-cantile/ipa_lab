@@ -192,11 +192,18 @@ def run(
 
     # ------------------------------------------------------------------
     # Step 4: seed link_state and start the carrier monitor
+    # (dense route has no link_state map -- see _build_header(need_link_state=
+    # False) in ebpf_program.py -- features come from the payload, not from
+    # network state, so there's nothing to seed/monitor.)
     # ------------------------------------------------------------------
-    from link_state_monitor import init_link_state_up, start_monitor_thread
-    init_link_state_up(b, egress_ifaces)
-    stop_monitor = start_monitor_thread(b, egress_ifaces, interval=1.0)
-    print(f"[P1-hardcoded] link_state seeded (all up); carrier monitor running")
+    if is_dense:
+        stop_monitor = None
+        print(f"[P1-hardcoded] dense scenario: no link_state map (features read from payload)")
+    else:
+        from link_state_monitor import init_link_state_up, start_monitor_thread
+        init_link_state_up(b, egress_ifaces)
+        stop_monitor = start_monitor_thread(b, egress_ifaces, interval=1.0)
+        print(f"[P1-hardcoded] link_state seeded (all up); carrier monitor running")
 
     # ------------------------------------------------------------------
     # Step 5: attach XDP on ingress iface (SKB/generic mode)
@@ -227,7 +234,8 @@ def run(
     except KeyboardInterrupt:
         pass
     finally:
-        stop_monitor.set()
+        if stop_monitor is not None:
+            stop_monitor.set()
         b.remove_xdp(iface, flags=XDP_FLAGS_SKB_MODE)
         print(f"\n[P1-hardcoded] XDP removed from {iface}")
         _print_final_stats(b, egress_ifaces, n_egress)
