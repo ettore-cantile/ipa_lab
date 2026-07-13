@@ -37,7 +37,21 @@ import argparse
 SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
+# Remember the caller's cwd BEFORE chdir -- a relative --model/--egress-ifaces
+# path typed at the repo root (the natural place to run this from) would
+# otherwise silently resolve against SHARED_DIR instead (e.g. "shared/x.pt"
+# becoming "<SHARED_DIR>/shared/x.pt", which doesn't exist). See __main__.
+_ORIGINAL_CWD = os.getcwd()
 os.chdir(SHARED_DIR)
+
+
+def _resolve_cli_path(path):
+    """Resolve a CLI-provided path against the ORIGINAL cwd (pre-chdir),
+    not the post-chdir SHARED_DIR -- so `--model shared/foo.pt` typed at
+    the repo root works the same whether or not this module has chdir'd."""
+    if path is None or os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(_ORIGINAL_CWD, path))
 
 from bcc import BPF
 from ebpf_program import load_and_generate
@@ -264,6 +278,7 @@ if __name__ == "__main__":
     parser.add_argument("--verify-only", action="store_true",
                         help="Load+verify eBPF program but do NOT attach XDP")
     args = parser.parse_args()
+    args.model = _resolve_cli_path(args.model)
 
     if args.verify_only:
         model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")

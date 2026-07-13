@@ -439,7 +439,7 @@ def generate_ebpf_hardcoded(
     fc1_lines.append("    switch (_node) {")
     for node in range(n_nodes):
         assigns = " ".join(
-            f"w_node_{j} = {_lit(fc1_w[j * n_in + 2*n_interfaces + 1 + node])}LL"
+            f"w_node_{j} = {_lit(fc1_w[j * n_in + 2*n_interfaces + 1 + node])}LL;"
             for j in range(n_h1)
         )
         fc1_lines.append(f"        case {node}: {assigns} break;")
