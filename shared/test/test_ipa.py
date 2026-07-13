@@ -26,11 +26,18 @@ Examples:
                       --weights-file /shared/weights_method2.json
 """
 import argparse
+import os
+import sys
 import time
 import random
 import json
 from scapy.all import send, IP, UDP, Packet, Raw
 from scapy.fields import ByteField, ShortField
+
+_TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR = os.path.dirname(_TEST_DIR)
+if SHARED_DIR not in sys.path:
+    sys.path.insert(0, SHARED_DIR)
 
 FEAT_LINK_STATE = 0x01
 FEAT_INGRESS_IF = 0x02
@@ -79,6 +86,17 @@ parser.add_argument("--scale-factor", type=int,   default=128,
                          "but it must match the one used by the CP in Method 4.")
 parser.add_argument("--weights-file", type=str,   default=None,
                     help="If provided, the 1st packet embeds the weights (Method 4)")
+parser.add_argument("--scenario", choices=["sparse", "dense"], default="sparse",
+                    help="'sparse' (default): today's behavior (header only, optional "
+                         "1st-packet weight blob). 'dense': every packet carries a real "
+                         "quantized feature vector, read directly by the dense eBPF "
+                         "route (generate_ebpf_hardcoded_dense) -- see --model-meta.")
+parser.add_argument("--model-meta", type=str, default=None,
+                    help="dense only: path to model_meta.json declaring n_in/n_out "
+                         "(default: shared/test/fixtures/dense_10_4_4_4/model_meta.json)")
+parser.add_argument("--features", type=str, default=None,
+                    help="dense only: comma-separated int8 feature values, reused for "
+                         "every packet (default: one random vector, reused for all packets)")
 args = parser.parse_args()
 
 N            = args.count
@@ -97,19 +115,49 @@ if args.weights_file:
     except Exception as e:
         print(f"[test_ipa] Warning: {e}")
 
+dense_payload = b""
+dense_n_in = dense_n_out = None
+if args.scenario == "dense":
+    import model_meta as _mm
+    meta_path = args.model_meta or os.path.join(
+        SHARED_DIR, "test", "fixtures", "dense_10_4_4_4", "model_meta.json")
+    with open(meta_path) as f:
+        _meta = json.load(f)
+    dense_n_in, dense_n_out = _meta["n_in"], _meta["n_out"]
+    if args.features:
+        features = [int(x) for x in args.features.split(",")]
+        if len(features) != dense_n_in:
+            raise SystemExit(f"--features has {len(features)} values, expected {dense_n_in}")
+    else:
+        features = [random.randint(-30, 30) for _ in range(dense_n_in)]
+    dense_payload = bytes(f & 0xFF for f in features)
+    print(f"[test_ipa] dense scenario: n_in={dense_n_in} n_out={dense_n_out} "
+          f"features={features}")
+
 print(f"\n[test_ipa] Sending {N} packets to '{DEST}'")
 print(f"  model_ids={MODEL_IDS} (round-robin) | scale_factor={SCALE_FACTOR} | "
-      f"header=21 byte | weights={'1st pkt only' if weights_payload else 'none'}")
+      f"header=21 byte | scenario={args.scenario} | "
+      f"weights={'1st pkt only' if weights_payload else 'none'}")
 print()
 
 t_start = time.perf_counter()
 for i in range(N):
     ttl = random.randint(30, 64)
     mid = MODEL_IDS[i % len(MODEL_IDS)]
-    ipa_hdr = IPA_HDR(model_id=mid, scale_factor=SCALE_FACTOR)
+    if args.scenario == "dense":
+        ipa_hdr = IPA_HDR(model_id=mid, scale_factor=SCALE_FACTOR,
+                          input_size=dense_n_in, output_size=dense_n_out)
+    else:
+        ipa_hdr = IPA_HDR(model_id=mid, scale_factor=SCALE_FACTOR)
     packet  = IP(dst=DEST, ttl=ttl) / UDP(dport=9999) / ipa_hdr
 
-    if i == 0 and weights_payload:
+    if args.scenario == "dense":
+        packet = packet / Raw(load=dense_payload)
+        if i < 3 or i == N - 1:
+            print(f"  pkt #{i+1:>4} | TTL={ttl} | model_id={mid} | features ({len(dense_payload)} byte)")
+        elif i == 3:
+            print(f"  ... ({N - 4} more)")
+    elif i == 0 and weights_payload:
         packet = packet / Raw(load=weights_payload)
         print(f"  pkt #{i+1:>4} | TTL={ttl} | model_id={mid} | +weights ({len(weights_payload)} byte)")
     else:
