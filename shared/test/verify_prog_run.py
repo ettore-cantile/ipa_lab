@@ -187,7 +187,14 @@ def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
     ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, ttl, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
-    ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBBb', model_id, 0, 0, scale, 65, 7, 2, 4, 3, 0, 65, 0, 0, 0, 0, 0, 0, 1, 0, 7, 0)
+    # NOTE: exactly 20 format letters (3 B + 1 H + 16 B) = 21 bytes, matching
+    # sizeof(struct ipa_hdr) in the eBPF C source. An earlier version of this
+    # format string carried a spurious 21st field (an extra trailing 'b'),
+    # producing a 22-byte header -- harmless for the sparse/template/modular
+    # routes (which never read past the header), but it silently shifted
+    # every payload byte by one position for the dense route, corrupting
+    # the feature vector it reads at ipa_hdr+1 (see build_frame_dense()).
+    ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBB', model_id, 0, 0, scale, 65, 7, 2, 4, 3, 0, 65, 0, 0, 0, 0, 0, 0, 1, 0, 7)
     return eth + ip + udp + ipa
 
 def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
@@ -241,8 +248,13 @@ def build_frame_dense(model_id: int, features: list, scale: int, n_in: int, n_ou
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
     ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, 64, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
-    ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBBb', model_id, 0, 0, scale, n_in, n_out, 2, 4,
-                      0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, n_out, 0)
+    # Exactly 20 format letters (3 B + 1 H + 16 B) = 21 bytes == sizeof(struct
+    # ipa_hdr) -- must match precisely here (unlike build_frame()'s sparse
+    # frame, which never reads past the header): the dense datapath computes
+    # _feat = (__u8*)(ipa+1), so any extra/missing byte in this header
+    # shifts every feature read by one position.
+    ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBB', model_id, 0, 0, scale, n_in, n_out, 2, 4,
+                      0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, n_out)
     payload = bytes(int(f) & 0xFF for f in features)
     return eth + ip + udp + ipa + payload
 
