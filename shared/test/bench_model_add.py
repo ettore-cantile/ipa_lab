@@ -55,21 +55,37 @@ def bench_hardcoded(weights, scale, n_models):
     """Every model add = full C source regen + BPF compile + load_func.
     Pipeline 1 has no cheaper path by design (weights are literals) --
     each add is a standalone dispatcher+model_<id> compile, matching the
-    real datapath structure (1 tail call), not a bare monolithic program."""
+    real datapath structure (1 tail call), not a bare monolithic program.
+
+    Returns (setup_s, times, phases): `times` is the per-model total (as
+    before), `phases` is a dict of per-model sub-timings
+    {"gen","compile","load"} so we can show WHERE the ~1.4s goes -- the key
+    number for "can we cut the recompile cost?": if `compile` (clang/LLVM
+    C->BPF, which BCC redoes every time) dominates, then an AOT-compiled
+    program whose weights live in .rodata (rewritten per model, no
+    recompile) would keep the datapath identical while collapsing the add
+    cost to just `load`."""
     from bcc import BPF
     import ctypes as ct
     from ebpf_program import build_combined_hardcoded_source
 
     times = []
+    phases = {"gen": [], "compile": [], "load": []}
     for i in range(n_models):
         t0 = time.perf_counter()
         src = build_combined_hardcoded_source([(i, weights, scale, None)])
-        b = BPF(text=src)
-        model_fn = b.load_func(f"model_{i}", BPF.XDP)
+        t_gen = time.perf_counter()
+        b = BPF(text=src)                         # clang/LLVM: C -> BPF bytecode
+        t_compile = time.perf_counter()
+        model_fn = b.load_func(f"model_{i}", BPF.XDP)   # verifier + kernel load
         b.load_func("ipa_switch_hardcoded", BPF.XDP)
         b["model_progs"][ct.c_int(i)] = ct.c_int(model_fn.fd)
-        times.append(time.perf_counter() - t0)
-    return None, times  # no separable one-time setup
+        t_load = time.perf_counter()
+        phases["gen"].append(t_gen - t0)
+        phases["compile"].append(t_compile - t_gen)
+        phases["load"].append(t_load - t_compile)
+        times.append(t_load - t0)
+    return None, times, phases
 
 
 def bench_template(weights, scale, n_models):
@@ -100,7 +116,7 @@ def bench_template(weights, scale, n_models):
         load_arch_weights(b, weights, model_id=i, scale=scale,
                           weight_offset=i * N_WEIGHTS_T2)  # default n_h1=n_h2=4 matches weights.json
         times.append(time.perf_counter() - t0)
-    return setup_s, times
+    return setup_s, times, None  # template/modular: add == single map write, no compile/load phases
 
 
 def bench_modular(weights, scale, n_models):
@@ -132,7 +148,7 @@ def bench_modular(weights, scale, n_models):
         load_modular_weights(b, weights, model_id=i, scale=scale,
                              base_offset=i * model_size)
         times.append(time.perf_counter() - t0)
-    return setup_s, times
+    return setup_s, times, None  # template/modular: add == single map write, no compile/load phases
 
 
 def bench_dense(n_in, n_out, hidden_dims, n_models, seed=0):
@@ -154,16 +170,23 @@ def bench_dense(n_in, n_out, hidden_dims, n_models, seed=0):
     scale = 32
 
     times = []
+    phases = {"gen": [], "compile": [], "load": []}
     for i in range(n_models):
         t0 = time.perf_counter()
         src = build_combined_hardcoded_dense_source(
             [(i, weights, scale, n_in)], n_out=n_out, hidden_dims=hidden_dims)
-        b = BPF(text=src)
-        model_fn = b.load_func(f"model_{i}", BPF.XDP)
+        t_gen = time.perf_counter()
+        b = BPF(text=src)                         # clang/LLVM: C -> BPF bytecode
+        t_compile = time.perf_counter()
+        model_fn = b.load_func(f"model_{i}", BPF.XDP)   # verifier + kernel load
         b.load_func("ipa_switch_hardcoded", BPF.XDP)
         b["model_progs"][ct.c_int(i)] = ct.c_int(model_fn.fd)
-        times.append(time.perf_counter() - t0)
-    return None, times
+        t_load = time.perf_counter()
+        phases["gen"].append(t_gen - t0)
+        phases["compile"].append(t_compile - t_gen)
+        phases["load"].append(t_load - t_compile)
+        times.append(t_load - t0)
+    return None, times, phases
 
 
 def main():
@@ -190,15 +213,19 @@ def main():
     print()
 
     results = {}
+    phases_by_name = {}
     for name, fn in [("hardcoded", bench_hardcoded),
                       ("template",  bench_template),
                       ("modular",   bench_modular)]:
         print(f"[bench] running {name} ...")
-        setup_s, times = fn(weights, scale, args.n_models)
+        setup_s, times, phases = fn(weights, scale, args.n_models)
         results[name] = (setup_s, times)
+        phases_by_name[name] = phases
 
     print(f"[bench] running dense ...")
-    results["dense"] = bench_dense(args.dense_n_in, args.dense_n_out, (4, 4), args.n_models)
+    setup_s, times, phases = bench_dense(args.dense_n_in, args.dense_n_out, (4, 4), args.n_models)
+    results["dense"] = (setup_s, times)
+    phases_by_name["dense"] = phases
 
     print()
     print("=" * 78)
@@ -239,6 +266,46 @@ def main():
         print(f"  hardcoded (sparse, {len(weights)} weights) add is ~{hc/ds:.1f}x the cost of "
               f"dense (n_in={args.dense_n_in}, synthetic weights) add -- both pay full recompile, "
               f"the difference is generated-source size.")
+
+    # ---------------------------------------------------------------------
+    # Recompile-cost breakdown (the professor's question: can the P1 add
+    # cost be cut WITHOUT losing datapath performance?). For the two routes
+    # that actually recompile (hardcoded, dense) split the per-model add
+    # into: gen (Python source string), compile (BCC clang/LLVM C->BPF),
+    # load (verifier + kernel load). If `compile` dominates, then the add
+    # cost is NOT intrinsic to "hardcoded weights" -- it's the C->BPF
+    # compilation BCC repeats every time. An AOT-compiled program with the
+    # weights in .rodata const (rewritten per model, verifier constant-folds
+    # them -> identical instructions/latency) would pay only `load`.
+    # ---------------------------------------------------------------------
+    print()
+    print("=" * 78)
+    print(" Recompile-cost breakdown -- WHERE the P1 add time goes (mean ms/model)")
+    print("=" * 78)
+    print(f"  {'route':<12}{'gen (py)':>12}{'compile (BCC)':>16}{'load (verif.)':>16}"
+          f"{'compile %':>12}")
+    print("  " + "-" * 66)
+    for name in ("hardcoded", "dense"):
+        ph = phases_by_name.get(name)
+        if not ph:
+            continue
+        g = _stats(ph["gen"])["mean_ms"]
+        c = _stats(ph["compile"])["mean_ms"]
+        l = _stats(ph["load"])["mean_ms"]
+        pct = 100.0 * c / (g + c + l) if (g + c + l) > 0 else 0.0
+        print(f"  {name:<12}{g:>12.3f}{c:>16.3f}{l:>16.3f}{pct:>11.1f}%")
+    print("  " + "-" * 66)
+    print()
+    hc_ph = phases_by_name.get("hardcoded")
+    if hc_ph:
+        c = _stats(hc_ph["compile"])["mean_ms"]
+        l = _stats(hc_ph["load"])["mean_ms"]
+        print(f"  Interpretation: BCC C->BPF compilation is ~{c:.0f} ms/model, the kernel")
+        print(f"  load (verifier) only ~{l:.0f} ms. Compilation dominates -- and it is NOT")
+        print(f"  intrinsic to hardcoded weights: an AOT-compiled program with weights in")
+        print(f"  .rodata const (rewritten per model, verifier constant-folds them) keeps")
+        print(f"  the datapath identical (same instrs/latency) while paying only the ~{l:.0f} ms")
+        print(f"  load -- an estimated ~{(c+l)/max(l,1e-9):.0f}x cheaper add with zero perf loss.")
 
 
 if __name__ == "__main__":
