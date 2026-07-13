@@ -9,6 +9,7 @@ Interface mapping (from lab.conf + darmstadt.startup):
 
 """
 import json
+import os
 import re
 from bcc import BPF
 
@@ -87,6 +88,46 @@ def neighbor_mac(iface: str):
             continue
         return [int(b, 16) for b in hw_addr.split(":")]
     return None
+
+
+def resolve_ifindex(name: str, fallback: str = None):
+    """
+    Resolve `name` -> (resolved_name, ifindex).
+
+    If `name` doesn't exist on this node:
+      - fallback given: fall back to it (with a warning), returning
+        whichever name actually resolved. Appropriate for a secondary/
+        egress lookup (e.g. populating a mac_table entry) where any
+        working interface is an acceptable substitute -- this is exactly
+        what bit method4_hardcoded.py on a node missing eth4/eth5: the
+        ifindex had a fallback already, but the interface NAME used to
+        read /sys/class/net/<name>/address for the MAC did not, and
+        crashed on a nonexistent interface.
+      - fallback is None (default): raise a clear RuntimeError listing
+        the interfaces that DO exist. Appropriate for the ingress/attach
+        target -- silently substituting a different interface there would
+        attach XDP to the wrong link without the caller ever noticing,
+        which is worse than a loud, actionable failure.
+    """
+    import socket
+    try:
+        return name, socket.if_nametoindex(name)
+    except OSError:
+        if fallback is not None:
+            try:
+                idx = socket.if_nametoindex(fallback)
+            except OSError:
+                idx = 2
+            print(f"[common] WARNING: interface {name} not found on this node -- "
+                  f"falling back to {fallback} (ifindex={idx})")
+            return fallback, idx
+        try:
+            available = sorted(os.listdir("/sys/class/net"))
+        except OSError:
+            available = []
+        raise RuntimeError(
+            f"interface {name!r} not found on this node. "
+            f"Available: {available}. Pass the correct --iface/iface=...")
 
 
 def resolve_egress_mac(iface: str, fallback_dst: list = None):

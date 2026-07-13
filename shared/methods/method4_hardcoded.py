@@ -31,7 +31,6 @@ Direct run:
 import os
 import sys
 import time
-import socket
 import ctypes
 import argparse
 
@@ -43,7 +42,7 @@ os.chdir(SHARED_DIR)
 from bcc import BPF
 from ebpf_program import load_and_generate
 from extract_weights import extract_weights_int8
-from common import resolve_egress_mac
+from common import resolve_egress_mac, resolve_ifindex
 
 
 DEFAULT_IFACES = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5"]
@@ -51,32 +50,30 @@ DEFAULT_IFACES = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5"]
 
 def _build_ifindex_table(iface_names: list) -> list:
     """
-    Build a list of 6 kernel ifindex values for the given interface names.
-    Missing interfaces fall back to ifindex of eth0 (or 2 if eth0 missing).
+    Build a list of 6 (resolved_name, kernel_ifindex) tuples for cls 0-5,
+    via common.resolve_ifindex(name, fallback="eth0") -- resolved_name is
+    the REAL interface that resolved (iface_names[cls] if it exists on
+    this node, otherwise the fallback). Returning the name alongside the
+    ifindex (not just the ifindex) matters: a node may not have all 6
+    interfaces (e.g. frankfurt only has a few real links), and any caller
+    that later does /sys/class/net/<name>/... (see resolve_egress_mac())
+    must use the interface that ACTUALLY exists, not the requested one
+    that silently fell back to a different ifindex.
     """
-    fallback = 2
-    try:
-        fallback = socket.if_nametoindex("eth0")
-    except OSError:
-        pass
-
-    result = []
-    for name in iface_names[:6]:
-        try:
-            result.append(socket.if_nametoindex(name))
-        except OSError:
-            result.append(fallback)
+    result = [resolve_ifindex(name, fallback="eth0") for name in iface_names[:6]]
     while len(result) < 6:
-        result.append(fallback)
+        result.append(resolve_ifindex("eth0", fallback="eth0"))
     return result
 
 
-def _populate_mac_table_hardcoded(b: BPF, egress_ifaces: list, ifindex_table: list):
+def _populate_mac_table_hardcoded(b: BPF, ifindex_table: list):
     """Install mac_table: egress class (0..5, the argmax output) ->
     {ifindex, src_mac, dst_mac}. Unlike P2/P3 (single shared egress iface),
     P1 supports a DISTINCT egress interface per class, so each class
-    resolves its own src/dst MAC via resolve_egress_mac(egress_ifaces[cls])
-    rather than sharing one pair for all classes."""
+    resolves its own src/dst MAC. ifindex_table entries are (name, idx)
+    pairs from _build_ifindex_table() -- name is the interface that
+    ACTUALLY exists on this node (already fallback-resolved), so
+    resolve_egress_mac() never gets asked for a nonexistent interface."""
     from ctypes import Structure, c_uint8, c_uint32
 
     class _FwdAction(Structure):
@@ -84,15 +81,14 @@ def _populate_mac_table_hardcoded(b: BPF, egress_ifaces: list, ifindex_table: li
         _fields_ = [("ifindex", c_uint32), ("src_mac", c_uint8 * 6), ("dst_mac", c_uint8 * 6)]
 
     mac = b.get_table("mac_table")
-    for cls in range(6):
-        iface = egress_ifaces[cls] if cls < len(egress_ifaces) else egress_ifaces[-1]
+    for cls, (iface, idx) in enumerate(ifindex_table):
         src_mac, dst_mac = resolve_egress_mac(iface)
-        action = _FwdAction(ifindex=ifindex_table[cls])
+        action = _FwdAction(ifindex=idx)
         for i in range(6):
             action.src_mac[i] = src_mac[i]
             action.dst_mac[i] = dst_mac[i]
         mac[c_uint32(cls)] = action
-        print(f"  cls {cls} -> {iface} (ifindex={ifindex_table[cls]}) "
+        print(f"  cls {cls} -> {iface} (ifindex={idx}) "
               f"src={':'.join(f'{x:02x}' for x in src_mac)} "
               f"dst={':'.join(f'{x:02x}' for x in dst_mac)}")
 
@@ -118,13 +114,21 @@ def run(
     if egress_ifaces is None:
         egress_ifaces = DEFAULT_IFACES
 
+    # No fallback for the ingress/attach target: silently attaching XDP to
+    # a DIFFERENT interface than requested would be worse than a loud,
+    # actionable error (see resolve_ifindex() docstring in common.py).
+    iface, _ = resolve_ifindex(iface)
+
     # ------------------------------------------------------------------
     # Step 1: resolve egress ifindex table at runtime
     # ------------------------------------------------------------------
-    ifindex_table = _build_ifindex_table(egress_ifaces)
+    resolved_table = _build_ifindex_table(egress_ifaces)  # [(name, ifindex), ...]
+    ifindex_table = [idx for _, idx in resolved_table]    # ints only, for the C codegen
     print(f"[P1-hardcoded] Egress ifindex table (cls 0-5):")
-    for cls_i, (name, idx) in enumerate(zip(egress_ifaces[:6], ifindex_table)):
-        print(f"  cls {cls_i} -> {name} (ifindex={idx})")
+    for cls_i, (name, idx) in enumerate(resolved_table):
+        requested = egress_ifaces[cls_i] if cls_i < len(egress_ifaces) else "?"
+        note = "" if name == requested else f" (fallback, {requested} not found on this node)"
+        print(f"  cls {cls_i} -> {name} (ifindex={idx}){note}")
     print(f"  cls 6 -> XDP_DROP")
 
     # ------------------------------------------------------------------
@@ -151,7 +155,7 @@ def run(
     # Step 3.5: populate mac_table (real per-class src/dst MAC + ifindex)
     # ------------------------------------------------------------------
     print(f"[P1-hardcoded] mac_table (per-class egress + MAC):")
-    _populate_mac_table_hardcoded(b, egress_ifaces, ifindex_table)
+    _populate_mac_table_hardcoded(b, resolved_table)
 
     # ------------------------------------------------------------------
     # Step 4: seed link_state and start the carrier monitor
@@ -238,8 +242,9 @@ if __name__ == "__main__":
 
     if args.verify_only:
         model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
-        ifindex_table = _build_ifindex_table(args.egress_ifaces)
-        print(f"[verify-only] ifindex_table={ifindex_table}")
+        resolved_table = _build_ifindex_table(args.egress_ifaces)
+        ifindex_table = [idx for _, idx in resolved_table]
+        print(f"[verify-only] ifindex_table={resolved_table}")
         src, w, s = load_and_generate(model_path, args.model_id, ifindex_table=ifindex_table)
         print(f"[verify-only] scale={s}, weights={len(w)}, source_chars={len(src)}")
         b = BPF(text=src)

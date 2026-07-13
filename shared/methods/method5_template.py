@@ -43,7 +43,7 @@ from ebpf_template_arch import (
 from common import (
     load_weights, attach_xdp,
     EGRESS_IFACE, INGRESS_IFACE,
-    resolve_egress_mac,
+    resolve_egress_mac, resolve_ifindex,
 )
 
 # Resolve the shared/ directory relative to this file regardless of cwd.
@@ -99,6 +99,10 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
            (distinct weights.json per model_id) to exercise it for real.
     """
     ingress_iface = iface if iface else INGRESS_IFACE
+    # No fallback here: silently attaching XDP to a DIFFERENT interface than
+    # requested would be worse than a loud, actionable error (see
+    # resolve_ifindex() docstring in common.py).
+    ingress_iface, _ = resolve_ifindex(ingress_iface)
     ids = list(model_ids) if model_ids else [model_id]
     dims = list(hidden_dims) if hidden_dims else [(4, 4)] * len(ids)
     if len(dims) != len(ids):
@@ -149,9 +153,14 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     # Attach dispatcher as the XDP entry point
     fn_dispatcher = b.load_func("ipa_switch_template", BPF.XDP)
 
-    # Populate the L2 next-hop dictionary (class -> ifindex + MACs)
-    egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
-    _populate_mac_t2(b, EGRESS_IFACE, egress_ifindex)
+    # Populate the L2 next-hop dictionary (class -> ifindex + MACs).
+    # fallback="eth0": if EGRESS_IFACE doesn't exist on this node (e.g. a
+    # topology with fewer real links), any working interface is an
+    # acceptable substitute for a mac_table entry -- unlike ingress, this
+    # doesn't change where packets are intercepted, just where they'd be
+    # redirected on a class that may not even fire in this run.
+    egress_iface_resolved, egress_ifindex = resolve_ifindex(EGRESS_IFACE, fallback="eth0")
+    _populate_mac_t2(b, egress_iface_resolved, egress_ifindex)
 
     # Seed link_state (egress up/down feature [0..5]) and start carrier monitor.
     from link_state_monitor import init_link_state_up, start_monitor_thread

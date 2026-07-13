@@ -47,7 +47,7 @@ from ebpf_modular import (
 from common import (
     load_weights, attach_xdp, detach_xdp,
     EGRESS_IFACE, INGRESS_IFACE,
-    resolve_egress_mac,
+    resolve_egress_mac, resolve_ifindex,
 )
 
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,6 +94,10 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
            different architecture.
     """
     ingress_iface = iface if iface else INGRESS_IFACE
+    # No fallback here: silently attaching XDP to a DIFFERENT interface than
+    # requested would be worse than a loud, actionable error (see
+    # resolve_ifindex() docstring in common.py).
+    ingress_iface, _ = resolve_ifindex(ingress_iface)
     ids = list(model_ids) if model_ids else [model_id]
     dims_by_model = (list(layer_dims_by_model) if layer_dims_by_model
                      else [[(65, 4), (4, 4), (4, 7)]] * len(ids))
@@ -146,9 +150,11 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     # Attach modular_dispatcher as the XDP entry point
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
 
-    # Populate the L2 next-hop dictionary
-    egress_ifindex = socket.if_nametoindex(EGRESS_IFACE)
-    _populate_mac_t3(b, EGRESS_IFACE, egress_ifindex)
+    # Populate the L2 next-hop dictionary. fallback="eth0": see the matching
+    # comment in method5_template.py -- egress can safely substitute a
+    # working interface, ingress (above) cannot.
+    egress_iface_resolved, egress_ifindex = resolve_ifindex(EGRESS_IFACE, fallback="eth0")
+    _populate_mac_t3(b, egress_iface_resolved, egress_ifindex)
 
     # Seed link_state and start carrier monitor
     from link_state_monitor import init_link_state_up, start_monitor_thread
