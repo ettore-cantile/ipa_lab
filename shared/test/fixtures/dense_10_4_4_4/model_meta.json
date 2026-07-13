@@ -1,0 +1,1 @@
+{"scenario": "dense", "n_in": 10, "n_out": 4, "hidden_dims": [4, 4], "scale_factor": 32}

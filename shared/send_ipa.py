@@ -48,14 +48,32 @@ import struct
 import sys
 import time
 
+import model_meta as _model_meta
+
 # IPA fixed header size
 IPA_HEADER_SIZE = 21
 N_WEIGHTS       = 319
 
 
-def build_ipa_header(model_id: int, scale_factor: int) -> bytes:
+def build_ipa_header(
+    model_id: int,
+    scale_factor: int,
+    input_size: int = 65,
+    output_size: int = 7,
+    hidden_layers: int = 2,
+    neurons_per_layer: int = 4,
+    feat2_count: int = 6,
+    feat3_count: int = 52,
+) -> bytes:
     """
     Build the 21-byte IPA header as specified in the paper.
+
+    input_size/output_size/hidden_layers/neurons_per_layer/feat2_count
+    (ingress-iface one-hot width)/feat3_count (node one-hot width) were
+    historically fixed at 65/7/2/4/6/52 -- the one FRR scenario's shape.
+    They now default to those same values (so every existing call site
+    keeps building byte-identical headers) but a caller can pass a
+    different model's resolved shape (see shared/model_meta.py) instead.
     """
     return struct.pack(
         ">BBBHBBBBB" "BBBBBBBB" "BBB",
@@ -65,20 +83,20 @@ def build_ipa_header(model_id: int, scale_factor: int) -> bytes:
         7,                 # param_size: int8 / 7-bit quantization
         scale_factor & 0xFFFF,  # scale_factor (big-endian u16)
         # Input Descriptor (5 bytes)
-        65,   # input_size
-        7,    # output_size
-        2,    # hidden_layers
-        4,    # neurons_per_layer
+        input_size,
+        output_size,
+        hidden_layers,
+        neurons_per_layer,
         4,    # n_feature_types
         # Feature Types (8 bytes: 4 x (code, count))
-        0x01, 1,    # feat0: model_id (1 feature)
-        0x02, 1,    # feat1: TTL      (1 feature)
-        0x03, 6,    # feat2: ingress iface one-hot (6 features)
-        0x04, 52,   # feat3: node/model one-hot   (52 features)
+        0x01, 1,            # feat0: model_id (1 feature)
+        0x02, 1,            # feat1: TTL      (1 feature)
+        0x03, feat2_count,  # feat2: ingress iface one-hot
+        0x04, feat3_count,  # feat3: node/model one-hot
         # Output Descriptor (3 bytes)
-        1,          # n_output_types
-        0x01,       # out0_code: next-hop index
-        7,          # out0_count: 7 classes
+        1,             # n_output_types
+        0x01,          # out0_code: next-hop index
+        output_size,   # out0_count
     )
 
 
@@ -87,6 +105,12 @@ def build_payload(weights_path: str, model_id: int) -> bytes:
     Build the IPA payload: 21-byte header + 319-byte weight blob.
     If weights_path is provided and valid, use real weights;
     otherwise fall back to zero-filled weights.
+
+    This is the "sparse" scenario's payload -- the datapath never reads
+    it (weights are loaded out-of-band at control-plane time), it only
+    exists here to produce a realistic packet size for testing. See
+    build_dense_payload() for the "dense" scenario, where the payload IS
+    read by the datapath (as the per-packet feature vector).
     """
     # Try to load real weights
     weights = None
@@ -113,6 +137,36 @@ def build_payload(weights_path: str, model_id: int) -> bytes:
     return header + payload
 
 
+def build_dense_payload(model_id: int, meta: dict, features: list = None) -> bytes:
+    """
+    Build the IPA payload for the "dense" scenario: 21-byte header + n_in
+    quantized int8 feature values -- the ACTUAL per-packet input vector,
+    read directly by generate_ebpf_hardcoded_dense() (ebpf_program.py) at
+    the datapath. This is unlike the sparse scenario's payload above,
+    which the datapath never reads.
+
+    features: explicit int8 feature values (length must be n_in); if None,
+    a random int8 vector is generated -- convenient for exercising the
+    dense codegen/verifier without a real trained dense model.
+    """
+    shape = _model_meta.derive_shape(meta)
+    n_in, n_out = shape["n_in"], shape["n_out"]
+    if features is None:
+        features = [random.randint(-128, 127) for _ in range(n_in)]
+    if len(features) != n_in:
+        raise ValueError(f"dense scenario expects {n_in} features, got {len(features)}")
+
+    scale  = int(meta.get("scale_factor", 128))
+    header = build_ipa_header(
+        model_id, scale, input_size=n_in, output_size=n_out,
+        hidden_layers=len(shape["hidden_dims"]),
+        neurons_per_layer=shape["hidden_dims"][0],
+        feat2_count=0, feat3_count=0,
+    )
+    payload = bytes(int(f) & 0xFF for f in features)
+    return header + payload
+
+
 def send_packets(
     dst: str,
     count: int,
@@ -122,12 +176,29 @@ def send_packets(
     interval: float,
     ttl_min: int,
     ttl_max: int,
+    scenario: str = "sparse",
+    model_meta_path: str = None,
+    features: list = None,
 ) -> None:
     """
     Send `count` IPA UDP packets to `dst`:`port`.
     Each packet has a random TTL drawn from [ttl_min, ttl_max].
+
+    scenario == "dense": builds the payload as the actual per-packet
+    feature vector (see build_dense_payload()) instead of a weight blob,
+    using model_meta_path (defaults to model_meta.json next to
+    `weights_path`, or shared/model_meta.json) to resolve n_in/n_out.
     """
-    payload = build_payload(weights_path, model_id)
+    if scenario == "dense":
+        meta = (_model_meta.load_model_meta(model_meta_path) if model_meta_path
+                else _model_meta.load_model_meta(weights_path or __file__))
+        if meta.get("scenario") != "dense" or "n_in" not in meta or "n_out" not in meta:
+            raise ValueError(
+                "--scenario dense requires a model_meta.json (see --model-meta) with "
+                "\"scenario\": \"dense\", \"n_in\": <int>, \"n_out\": <int> declared")
+        payload = build_dense_payload(model_id, meta, features=features)
+    else:
+        payload = build_payload(weights_path, model_id)
 
     # Resolve destination
     try:
@@ -139,8 +210,9 @@ def send_packets(
     print(f"[send_ipa] Packets     : {count}")
     print(f"[send_ipa] Model ID    : {model_id}")
     print(f"[send_ipa] TTL range   : {ttl_min}-{ttl_max} (random per packet)")
+    payload_kind = "features" if scenario == "dense" else "weights"
     print(f"[send_ipa] Payload     : {len(payload)}B  "
-          f"({IPA_HEADER_SIZE}B header + {len(payload)-IPA_HEADER_SIZE}B weights)")
+          f"({IPA_HEADER_SIZE}B header + {len(payload)-IPA_HEADER_SIZE}B {payload_kind})")
     print(f"[send_ipa] Interval    : {interval}s")
     print()
 
@@ -198,10 +270,23 @@ def main():
                         help="Minimum IP TTL (default: 64)")
     parser.add_argument("--ttl-max",  type=int,   default=64,
                         help="Maximum IP TTL (default: 64)")
+    parser.add_argument("--scenario", choices=["sparse", "dense"], default="sparse",
+                        help="'sparse' (default): payload is the (unread) weight blob, "
+                             "matching today's exact behavior. 'dense': payload is the "
+                             "actual per-packet feature vector, read by the dense eBPF "
+                             "codegen -- requires --model-meta to declare n_in/n_out.")
+    parser.add_argument("--model-meta", default=None,
+                        help="Path to model_meta.json for --scenario dense (default: "
+                             "model_meta.json next to --weights)")
+    parser.add_argument("--features", default=None,
+                        help="Comma-separated int8 feature values for --scenario dense "
+                             "(default: random, for exercising the verifier/codegen)")
     args = parser.parse_args()
 
     if args.ttl_min > args.ttl_max:
         parser.error("--ttl-min must be <= --ttl-max")
+
+    features = ([int(x) for x in args.features.split(",")] if args.features else None)
 
     send_packets(
         dst=args.dst,
@@ -212,6 +297,9 @@ def main():
         interval=args.interval,
         ttl_min=args.ttl_min,
         ttl_max=args.ttl_max,
+        scenario=args.scenario,
+        model_meta_path=args.model_meta,
+        features=features,
     )
 
 

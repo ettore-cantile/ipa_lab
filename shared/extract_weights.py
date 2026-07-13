@@ -46,10 +46,19 @@ def _load_from_json(json_path: str) -> list:
 
 
 def extract_weights_int8(
-    model_path: str = "frr_germany50_5_model_4x2.pt"
+    model_path: str = "frr_germany50_5_model_4x2.pt",
+    n_interfaces: int = None,
+    n_nodes: int = None,
+    hidden_dim: int = None,
 ) -> list:
     """
     Return a flat list of int8 weights for the FRR model.
+
+    n_interfaces/n_nodes/hidden_dim override the module defaults
+    (N_INTERFACES/N_NODES/HIDDEN_DIM) -- pass a model's resolved shape
+    (see shared/model_meta.py derive_shape()) to extract weights for a
+    topology other than the one checked-in 6/52/4 checkpoint. None means
+    "use the module default", so existing callers are unaffected.
 
     Priority:
       1. If torch is available: load from .pt checkpoint (authoritative).
@@ -57,8 +66,13 @@ def extract_weights_int8(
       3. Else raise ImportError with a helpful message.
 
     Returns:
-        list of int in [-128, 127], length 319
+        list of int in [-128, 127], length depends on shape (319 for the
+        default 65-4-4-7 topology)
     """
+    n_interfaces = N_INTERFACES if n_interfaces is None else n_interfaces
+    n_nodes      = N_NODES if n_nodes is None else n_nodes
+    hidden_dim   = HIDDEN_DIM if hidden_dim is None else hidden_dim
+
     # Resolve model path relative to this file if not absolute
     if not os.path.isabs(model_path):
         candidate = os.path.join(SHARED_DIR, model_path)
@@ -71,9 +85,9 @@ def extract_weights_int8(
         from FRR_model import FastRerouteMLP
 
         m = FastRerouteMLP(
-            n_interfaces=N_INTERFACES,
-            n_nodes=N_NODES,
-            hidden_dim=HIDDEN_DIM
+            n_interfaces=n_interfaces,
+            n_nodes=n_nodes,
+            hidden_dim=hidden_dim
         )
         m.load_state_dict(torch.load(model_path, map_location="cpu"))
         floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
@@ -151,5 +165,17 @@ if __name__ == "__main__":
     with open(os.path.join(SHARED_DIR, "weights_float.json"), "w") as f:
         json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
 
+    # model_meta.json: scenario shape metadata (see model_meta.py) so codegen
+    # can derive N_IN/N_OUT instead of assuming the fixed 65/7 constants.
+    model_meta = {
+        "scenario": "sparse",
+        "n_interfaces": N_INTERFACES,
+        "n_nodes": N_NODES,
+        "hidden_dims": [HIDDEN_DIM, HIDDEN_DIM],
+    }
+    with open(os.path.join(SHARED_DIR, "model_meta.json"), "w") as f:
+        json.dump(model_meta, f)
+
     print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
     print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
+    print(f"Saved scenario metadata -> model_meta.json: {model_meta}")
