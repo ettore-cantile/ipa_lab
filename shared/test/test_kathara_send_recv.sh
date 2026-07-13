@@ -88,11 +88,18 @@ echo ""
 # Step 3: start recv_ipa.py on frankfurt in background
 # ---------------------------------------------------------------------------
 echo "[Step 3] Starting recv_ipa.py on frankfurt (timeout=${RECV_TIMEOUT}s)..."
-kathara exec frankfurt -- bash -c \
-    "python3 /shared/recv_ipa.py \
-        --timeout ${RECV_TIMEOUT} \
-        --count ${N_PKTS} \
-        > /tmp/recv_ipa_send_recv.log 2>&1" &
+# Write a real script file instead of `kathara exec ... -- bash -c "..."`:
+# some kathara-manager versions reject nested `bash -c` invocations inside
+# `exec` as a form of self-execution ("Error, the program tried to call
+# itself with '-c' argument"). /shared is bind-mounted into the container,
+# so a plain script + plain `exec ... -- bash <script>` avoids the -c form.
+RECV_RUNNER="/shared/.recv_ipa_runner.sh"
+cat > "$(dirname "${BASH_SOURCE[0]}")/../.recv_ipa_runner.sh" <<EOF
+#!/usr/bin/env bash
+python3 /shared/recv_ipa.py --timeout ${RECV_TIMEOUT} --count ${N_PKTS} \
+    > /tmp/recv_ipa_send_recv.log 2>&1
+EOF
+kathara exec frankfurt -- bash "${RECV_RUNNER}" &
 RECV_PID=$!
 echo "  recv_ipa.py PID=${RECV_PID} (on host, wraps kathara exec)"
 sleep 2  # give the listener time to start
@@ -148,7 +155,14 @@ cat "${RECV_LOG}" 2>/dev/null || echo "  (empty log)"
 echo "--- End of output ---"
 echo ""
 
-RECEIVED=$(grep -c '\[recv_ipa\] #' "${RECV_LOG}" 2>/dev/null || echo 0)
+# NOTE: `grep -c` always prints a count (even "0" on no match) but exits 1
+# in that case -- `grep -c ... || echo 0` used to run BOTH branches (grep's
+# own "0" AND the fallback "0"), producing "0\n0" from the command
+# substitution, which broke the arithmetic below. grep -c's own output is
+# always a clean single integer (or empty if the file is missing entirely),
+# so just default an empty result to 0.
+RECEIVED=$(grep -c '\[recv_ipa\] #' "${RECV_LOG}" 2>/dev/null)
+RECEIVED=${RECEIVED:-0}
 PCT=$(( RECEIVED * 100 / N_PKTS ))
 
 echo "  Sent      : ${N_PKTS}"
