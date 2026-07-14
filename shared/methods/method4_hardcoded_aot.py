@@ -19,9 +19,8 @@ into a plain BPF .o (clang, libbpf dialect, weights as C literals). At runtime
 the datapath node only does bpf_object__open_file + bpf_object__load -> a few ms,
 NO clang. Because the weights are still C literals compiled by clang -O2, the
 per-weight strength reduction (x*0 folded away, x*8 -> shift) is preserved, so
-performance stays at the literal maximum -- unlike frozen .rodata weights, which
-lose it (see shared/poc_rodata/loader_full.c for the .rodata comparison, +38%
-full-path latency).
+performance stays at the literal maximum -- identical to BCC at the same
+architecture (measured: ~69 vs ~66 ns/pkt).
 
 What this script does (bench only -- it does NOT attach XDP to a real iface;
 that is method4's job):
@@ -56,7 +55,7 @@ import argparse
 import subprocess
 
 SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-POC_DIR    = os.path.join(SHARED_DIR, "poc_rodata")
+POC_DIR    = os.path.join(SHARED_DIR, "poc_aot")
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 if POC_DIR not in sys.path:

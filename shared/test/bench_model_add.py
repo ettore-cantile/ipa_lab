@@ -62,9 +62,9 @@ def bench_hardcoded(weights, scale, n_models):
     {"gen","compile","load"} so we can show WHERE the ~1.4s goes -- the key
     number for "can we cut the recompile cost?": if `compile` (clang/LLVM
     C->BPF, which BCC redoes every time) dominates, then an AOT-compiled
-    program whose weights live in .rodata (rewritten per model, no
-    recompile) would keep the datapath identical while collapsing the add
-    cost to just `load`."""
+    program whose weights are C literals (compiled offline once, loaded per
+    model) would keep the datapath identical while collapsing the add cost to
+    just `load`. See method4_hardcoded_aot.py."""
     from bcc import BPF
     import ctypes as ct
     from ebpf_program import build_combined_hardcoded_source
@@ -217,8 +217,8 @@ def main():
     # C->BPF), load (verifier + kernel load). If `compile` dominates, then the
     # add cost is NOT intrinsic to "hardcoded weights" -- it's the C->BPF
     # compilation BCC repeats every time. An AOT-compiled program with the
-    # weights in .rodata const (rewritten per model, verifier constant-folds
-    # them -> identical instructions/latency) would pay only `load`.
+    # weights as C literals (compiled offline once, loaded per model -> identical
+    # instructions/latency) would pay only `load`. See method4_hardcoded_aot.py.
     # ---------------------------------------------------------------------
     print()
     print("=" * 78)
@@ -244,8 +244,8 @@ def main():
         l = _stats(hc_ph["load"])["mean_ms"]
         print(f"  Interpretation: BCC C->BPF compilation is ~{c:.0f} ms/model, the kernel")
         print(f"  load (verifier) only ~{l:.0f} ms. Compilation dominates -- and it is NOT")
-        print(f"  intrinsic to hardcoded weights: an AOT-compiled program with weights in")
-        print(f"  .rodata const (rewritten per model, verifier constant-folds them) keeps")
+        print(f"  intrinsic to hardcoded weights: an AOT-compiled program with weights as")
+        print(f"  C literals (compiled offline once, loaded per model) keeps")
         print(f"  the datapath identical (same instrs/latency) while paying only the ~{l:.0f} ms")
         print(f"  load -- an estimated ~{(c+l)/max(l,1e-9):.0f}x cheaper add with zero perf loss.")
 
