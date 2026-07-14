@@ -8,6 +8,11 @@ guaranteed fallback). It exists to answer one question the professor may ask:
 can we keep the maximum hardcoded performance AND remove the ~1660 ms of
 clang-at-runtime that BCC pays on every (re)load?
 
+Topology dimensions (n_interfaces, n_nodes, n_queues) come from
+topology_config.json — a file that describes the NETWORK TOPOLOGY shared
+by all nodes in the same deployment. If absent, DEFAULT_TOPOLOGY_CONFIG
+(historical 6/52) is used.
+
 The problem (measured, method4 BCC path):
     [M1 update timing] redirect/reload (BPF compile+load): ~1660 ms
     -> 99.8% of that is clang compiling the weights-literal C at runtime, on the
@@ -24,8 +29,8 @@ architecture (measured: ~69 vs ~66 ns/pkt).
 
 What this script does (bench only -- it does NOT attach XDP to a real iface;
 that is method4's job):
-    1. load node_config.json from the node (authoritative for n_interfaces /
-       n_nodes / n_queues), verify N_IN consistency with the checkpoint,
+    1. load topology_config.json (authoritative network dimensions), verify
+       N_IN consistency with the checkpoint,
     2. generate the weights-literal libbpf C for the model (real int8 weights),
     3. clang-compile it to a .o OFFLINE and TIME that build (the cost you pay
        once, on the build box, NOT on the hot path),
@@ -35,21 +40,20 @@ that is method4's job):
        test_suite --kernel) to confirm the literal performance is preserved.
 
 Bound: this variant currently targets the DEFAULT FRR descriptor (65-4-4-7,
-node config 6/52). Sparse/heterogeneous per-model descriptors are supported by
-the BCC path (ebpf_program.py) but not yet by this offline generator -- porting
-the descriptor-driven IV codegen to libbpf dialect is future work. The script
-refuses a non-default descriptor with a clear message rather than silently
-producing a wrong program.
+topology config 6/52). Sparse/heterogeneous per-model descriptors are supported
+by the BCC path (ebpf_program.py) but not yet by this offline generator.
+The script refuses a non-default descriptor with a clear message rather than
+silently producing a wrong program.
 
-Requires (on the VM/build box): clang, llvm, libbpf-dev, linux headers. BCC
-already pulls clang/llvm; libbpf-dev is the only likely-missing one:
+Requires (on the VM/build box): clang, llvm, libbpf-dev, linux headers.
     sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)
 
 Run:
     sudo python3 shared/methods/method4_hardcoded_aot.py
-    sudo python3 shared/methods/method4_hardcoded_aot.py --model shared/frr_germany50_5_model_4x2.pt
     sudo python3 shared/methods/method4_hardcoded_aot.py \\
-        --node-config /etc/ipa/node_config.json
+        --model shared/frr_germany50_5_model_4x2.pt
+    sudo python3 shared/methods/method4_hardcoded_aot.py \\
+        --topology-config /etc/ipa/topology_config.json
 """
 
 import os
@@ -66,12 +70,11 @@ if POC_DIR not in sys.path:
     sys.path.insert(0, POC_DIR)
 _ORIGINAL_CWD = os.getcwd()
 
-# Default path for the per-node feature-dimension configuration.
-_DEFAULT_NODE_CONFIG_PATH = "/etc/ipa/node_config.json"
+_DEFAULT_TOPOLOGY_CONFIG_PATH = "/etc/ipa/topology_config.json"
 
 from model_meta import (
     load_model_meta,
-    load_node_config,
+    load_topology_config,
     derive_shape,
     verify_shape_vs_checkpoint,
 )
@@ -105,7 +108,6 @@ def _check_supported(shape):
 
 
 def _run(cmd, **kw):
-    """Run a command, streaming failures. Returns (rc, stdout, stderr)."""
     p = subprocess.run(cmd, capture_output=True, text=True, **kw)
     return p.returncode, p.stdout, p.stderr
 
@@ -114,12 +116,13 @@ def main():
     ap = argparse.ArgumentParser(description="Pipeline 1 AOT-literal deploy bench (libbpf)")
     ap.add_argument("--model", default=None, help="Path to .pt checkpoint (default: checked-in FRR)")
     ap.add_argument(
-        "--node-config",
-        default=_DEFAULT_NODE_CONFIG_PATH,
+        "--topology-config",
+        default=_DEFAULT_TOPOLOGY_CONFIG_PATH,
+        dest="topology_config",
         help=(
-            f"Path to node_config.json (default: {_DEFAULT_NODE_CONFIG_PATH}). "
-            "Provides authoritative n_interfaces / n_nodes / n_queues for the "
-            "node. Falls back to built-in defaults if the file doesn't exist."
+            f"Path to topology_config.json (default: {_DEFAULT_TOPOLOGY_CONFIG_PATH}). "
+            "Describes the network topology shared by all nodes (n_interfaces, "
+            "n_nodes, n_queues). Falls back to built-in defaults if absent."
         ),
     )
     ap.add_argument("--clang", default="clang", help="clang binary")
@@ -131,36 +134,32 @@ def main():
     model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
 
     # ------------------------------------------------------------------
-    # Step 0: load node_config (per-node dims) and model_meta (per-model
-    # descriptor), then derive the concrete shape.
-    # node_config is the authoritative source for n_interfaces/n_nodes/
-    # n_queues; any such keys in model_meta.json are ignored.
+    # Step 0: load topology_config (authoritative network dimensions) and
+    # model_meta (per-model feature descriptor), then derive the shape.
+    # topology_config is the authoritative source for n_interfaces /
+    # n_nodes / n_queues; any such keys in model_meta.json are ignored.
     # ------------------------------------------------------------------
-    node_cfg = load_node_config(args.node_config)
+    topo_cfg = load_topology_config(args.topology_config)
     meta     = load_model_meta(model_path)
-    shape    = derive_shape(meta, node_config=node_cfg)
+    shape    = derive_shape(meta, topology_config=topo_cfg)
 
     # ------------------------------------------------------------------
     # Step 0.5: verify that the checkpoint was trained with the same N_IN
-    # that node_config + feature types produce.  Raises a clear ValueError
-    # if they differ -- prevents silent wrong-inference.
+    # that topology_config + feature types produce. Raises a clear
+    # ValueError if they differ — prevents silent wrong-inference.
     # ------------------------------------------------------------------
     verify_shape_vs_checkpoint(shape, model_path)
 
     # ------------------------------------------------------------------
-    # Step 0.6: AOT-specific guard -- this offline generator only supports
-    # the default FRR descriptor (65-4-4-7, node config 6/52).  Must run
-    # AFTER the two checks above so N_IN errors surface before this one.
+    # Step 0.6: AOT-specific guard — this offline generator only supports
+    # the default FRR descriptor (65-4-4-7, topology config 6/52). Runs
+    # AFTER the two checks above so topology errors surface first.
     # ------------------------------------------------------------------
     _check_supported(shape)
 
     print(f"[AOT] model={model_path}")
     print(f"[AOT] shape={shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']} (default FRR descriptor)")
 
-    # 1) generate the weights-literal libbpf C from the real model weights.
-    #    ARCH-FAITHFUL: dispatcher + PROG_ARRAY tail-call + model that re-parses
-    #    (double parse) == the BCC hardcoded topology, so the bench is
-    #    apples-to-apples with test_suite --kernel hardcoded.
     from gen_full_c import generate_arch_literal_c
     c_src = generate_arch_literal_c(model_path if args.model else None)
     c_path = os.path.join(POC_DIR, "nn_aot_arch.bpf.c")
@@ -169,8 +168,6 @@ def main():
         f.write(c_src)
     print(f"[AOT] generated {os.path.relpath(c_path, _ORIGINAL_CWD)} ({len(c_src)} chars)")
 
-    # 2) OFFLINE build: clang-compile the literal C to a .o, TIMED. This is the
-    #    "recompile" cost -- but it happens once, on a build box, off the hot path.
     bpf_cflags = ["-O2", "-g", "-target", "bpf", "-D__TARGET_ARCH_x86"]
     t0 = time.perf_counter()
     rc, out, err = _run([args.clang, *bpf_cflags, "-c", c_path, "-o", o_path], cwd=POC_DIR)
@@ -179,7 +176,6 @@ def main():
         sys.exit(f"[AOT] clang failed (rc={rc}):\n{err}")
     print(f"[AOT] OFFLINE build (clang -> .o): {build_ms:.1f} ms  [paid once, on the build box]")
 
-    # 3) build the libbpf loader if missing (or stale)
     loader_c   = os.path.join(POC_DIR, "loader_aot.c")
     loader_bin = os.path.join(POC_DIR, "loader_aot")
     if (not os.path.exists(loader_bin)
@@ -190,7 +186,6 @@ def main():
                      "      Need libbpf-dev: sudo apt-get install libbpf-dev")
         print(f"[AOT] built loader_aot")
 
-    # 4) run the loader: it TIMES runtime open+load and BPF_PROG_TEST_RUNs
     print(f"[AOT] running loader_aot on the prebuilt .o ...\n")
     rc, out, err = _run([loader_bin, o_path], cwd=POC_DIR)
     sys.stdout.write(out)

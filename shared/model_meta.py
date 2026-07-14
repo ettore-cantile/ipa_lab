@@ -1,5 +1,5 @@
 """
-model_meta.py — Per-model feature descriptor + per-node feature dimensions
+model_meta.py — Per-model feature descriptor + per-topology feature dimensions
 (shared by extract_weights.py, ebpf_program.py, methods/method4_hardcoded.py).
 
 Pipeline 1 (hardcoded) builds the model's input vector (IV) ON THE NODE from
@@ -13,19 +13,27 @@ only the subset its model needs.
 
 Two separate concerns:
 
-  * PER-NODE / PER-NETWORK: the DIMENSION of each feature type. A feature's
-    size is a property of where the model runs, NOT of the model: link_state
-    has one slot per egress interface OF THIS NODE, node one-hot has one slot
-    per node IN THIS NETWORK, etc. All models operating on the same node/
-    network see the SAME size for the same feature type.
+  * PER-TOPOLOGY / PER-NETWORK: the DIMENSION of each feature type.
+    A feature's size is a property of the NETWORK TOPOLOGY, shared by every
+    node in the same deployment — NOT a property of any individual node and
+    NOT a property of the model:
+      - link_state  has one slot per egress interface IN THE LARGEST NODE
+                    of the network (fixed at training time).
+      - node        one-hot has one slot per node IN THE NETWORK.
+      - queue_occ   has one slot per queue per interface.
+    A node with 3 physical interfaces still builds a link_state feature of
+    size n_interfaces (the network maximum) — unused slots are structurally
+    zero and their weights are folded away by the compiler.
+    All models operating on ANY node of the same topology see the SAME size
+    for the same feature type.
 
-    This is now read from node_config.json on the node
-    (load_node_config()). If that file doesn't exist the code falls back to
-    DEFAULT_NODE_CONFIG (historical 6-interface / 52-node topology).
+    This is now read from topology_config.json on the node
+    (load_topology_config()). If that file doesn't exist the code falls back
+    to DEFAULT_TOPOLOGY_CONFIG (historical 6-interface / 52-node topology).
 
     Any n_interfaces / n_nodes / n_queues keys present in a model's
-    model_meta.json are IGNORED when a node_config is supplied — they are
-    properties of the node, not of the model.
+    model_meta.json are IGNORED when a topology_config is supplied — they
+    are properties of the network, not of the model.
 
   * PER-MODEL: which feature TYPES the model uses (an ordered list, the order
     the model was trained on) and its output width n_out. This is the model
@@ -37,11 +45,11 @@ A model_meta.json therefore looks like:
       "n_out": 7,
       "hidden_dims": [4, 4]
     }
-N_IN = sum of the (node-derived) sizes of those feature types.
+N_IN = sum of the (topology-derived) sizes of those feature types.
 
 Absence of a "features" list falls back to the historical fixed encoding
 [link_state, ingress_iface, ttl, node] with n_out = n_interfaces+1, so a model
-with no descriptor (the checked-in 65-4-4-7 model, node config 6/52)
+with no descriptor (the checked-in 65-4-4-7 model, topology config 6/52)
 reproduces the original N_IN=65/N_OUT=7 program.
 """
 
@@ -49,14 +57,18 @@ import json
 import os
 
 # ---------------------------------------------------------------------------
-# Per-node / per-network defaults
-# Overridden at runtime by node_config.json (see load_node_config()).
+# Per-topology / per-network defaults
+# Overridden at runtime by topology_config.json (see load_topology_config()).
 # ---------------------------------------------------------------------------
-DEFAULT_NODE_CONFIG = {
+DEFAULT_TOPOLOGY_CONFIG = {
     "n_interfaces": 6,
     "n_nodes": 52,
     "n_queues": 4,
 }
+
+# Keep the old name as an alias so any external code that imported
+# DEFAULT_NODE_CONFIG directly keeps working without changes.
+DEFAULT_NODE_CONFIG = DEFAULT_TOPOLOGY_CONFIG
 
 DEFAULT_META = {
     "n_interfaces": 6,   # kept for backward compat with callers reading it directly
@@ -73,7 +85,7 @@ MAX_N_OUT = 32
 # Feature catalog: the feature *types* the switch knows how to build locally.
 # Each entry declares:
 #   kind     -- how the feature enters the fc1 dot product (see below)
-#   dim_key  -- which node_config entry gives its size (per-node), OR
+#   dim_key  -- which topology_config entry gives its size (per-topology), OR
 #   dim      -- a fixed size (scalars only)
 #   map      -- (dense_vector_map only) the BPF map holding its per-slot values
 #
@@ -104,40 +116,51 @@ _DEFAULT_FEATURE_TYPES = ["link_state", "ingress_iface", "ttl", "node"]
 
 
 # ---------------------------------------------------------------------------
-# node_config loading  (Problema 1)
+# topology_config loading  (Problema 1)
 # ---------------------------------------------------------------------------
 
-def load_node_config(path: str = "/etc/ipa/node_config.json") -> dict:
+def load_topology_config(path: str = "/etc/ipa/topology_config.json") -> dict:
     """
-    Load the per-node feature-dimension configuration from *path*.
+    Load the per-network topology configuration from *path*.
 
-    This file is a property of the NODE / NETWORK, not of any individual
-    model.  It must contain at minimum the keys that are referenced by
-    FEATURE_CATALOG entries with a "dim_key" (currently n_interfaces,
-    n_nodes, n_queues).
+    This file describes the NETWORK TOPOLOGY shared by all nodes in the
+    same deployment — it is NOT a per-node file. It contains the maximum
+    feature dimensions that every node must use to build an input vector
+    compatible with the trained checkpoint:
 
-    If the file does not exist the function returns DEFAULT_NODE_CONFIG
+      n_interfaces  — number of IV slots for link_state / ingress_iface
+                      (= max interfaces across any node in the network)
+      n_nodes       — number of IV slots for the node one-hot
+                      (= total nodes in the network topology)
+      n_queues      — number of IV slots for queue_occupancy
+                      (= queues per interface)
+
+    A node with fewer physical interfaces than n_interfaces still builds
+    a link_state vector of size n_interfaces — unused slots are zero and
+    their weights are folded away at compile time.
+
+    If the file does not exist the function returns DEFAULT_TOPOLOGY_CONFIG
     (historical 6-interface / 52-node topology) so existing setups that
-    have no node_config.json keep working unchanged.
-
-    Callers (method4_hardcoded.run, verify-only path, …) should pass the
-    returned dict to derive_shape() instead of relying on values embedded
-    in model_meta.json.
+    have no topology_config.json keep working unchanged.
     """
     if os.path.exists(path):
         with open(path) as f:
             cfg = json.load(f)
-        print(f"[node_config] loaded from {path}: {cfg}")
+        print(f"[topology_config] loaded from {path}: {cfg}")
         # Merge with defaults so callers don't need to guard for missing keys
-        merged = dict(DEFAULT_NODE_CONFIG)
+        merged = dict(DEFAULT_TOPOLOGY_CONFIG)
         merged.update(cfg)
         return merged
     else:
         print(
-            f"[node_config] {path} not found — "
-            f"using DEFAULT_NODE_CONFIG: {DEFAULT_NODE_CONFIG}"
+            f"[topology_config] {path} not found — "
+            f"using DEFAULT_TOPOLOGY_CONFIG: {DEFAULT_TOPOLOGY_CONFIG}"
         )
-        return dict(DEFAULT_NODE_CONFIG)
+        return dict(DEFAULT_TOPOLOGY_CONFIG)
+
+
+# Keep the old name as an alias for backward compatibility.
+load_node_config = load_topology_config
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +180,7 @@ def load_model_meta(model_path: str) -> dict:
 
     Note: n_interfaces / n_nodes / n_queues in model_meta.json are retained
     here for backward compatibility but are IGNORED by derive_shape() when
-    an explicit node_config dict is supplied.  They are only used by the
+    an explicit topology_config dict is supplied.  They are only used by the
     legacy node_config_for() helper kept below.
     """
     meta = dict(DEFAULT_META)
@@ -170,31 +193,31 @@ def load_model_meta(model_path: str) -> dict:
 
 
 def node_config_for(meta: dict) -> dict:
-    """[LEGACY] Resolve per-node dimensions from a meta dict.
+    """[LEGACY] Resolve per-topology dimensions from a meta dict.
 
     Kept for backward compatibility with code that calls derive_shape(meta)
-    without passing a node_config.  New callers should use load_node_config()
-    and pass the result to derive_shape(meta, node_config=...) explicitly.
+    without passing a topology_config.  New callers should use
+    load_topology_config() and pass the result to
+    derive_shape(meta, topology_config=...) explicitly.
 
-    Priority: DEFAULT_NODE_CONFIG <- meta top-level keys <- meta["node_config"].
-    n_interfaces/n_nodes/n_queues inside model_meta.json are intentionally
-    lower priority than a real node_config.json loaded at runtime.
+    Priority: DEFAULT_TOPOLOGY_CONFIG <- meta top-level keys <- meta["node_config"].
     """
-    cfg = dict(DEFAULT_NODE_CONFIG)
+    cfg = dict(DEFAULT_TOPOLOGY_CONFIG)
     for k in ("n_interfaces", "n_nodes", "n_queues"):
         if k in meta:
             cfg[k] = meta[k]
     cfg.update(meta.get("node_config", {}))
+    cfg.update(meta.get("topology_config", {}))
     return cfg
 
 
-def feature_size(feature_type: str, node_config: dict) -> int:
-    """Size (number of IV slots) of a feature type on a node -- from the node
-    config (per-node/per-network), not from the model."""
+def feature_size(feature_type: str, topology_config: dict) -> int:
+    """Size (number of IV slots) of a feature type — from the topology
+    config (per-network), not from the model."""
     entry = FEATURE_CATALOG[feature_type]
     if "dim" in entry:
         return int(entry["dim"])
-    return int(node_config[entry["dim_key"]])
+    return int(topology_config[entry["dim_key"]])
 
 
 def _validate_feature_types(types: list) -> None:
@@ -205,44 +228,40 @@ def _validate_feature_types(types: list) -> None:
         if t not in FEATURE_CATALOG:
             raise ValueError(f"unknown feature type {t!r}; known: {sorted(FEATURE_CATALOG)}")
         if t in seen:
-            # The codegen uses per-type C variable names (_ttl, ls*, w_iface_j,
-            # ...), so a type may appear at most once per descriptor.
             raise ValueError(f"feature type {t!r} appears more than once in the descriptor")
         seen.add(t)
 
 
-def derive_shape(meta: dict, node_config: dict = None) -> dict:
+def derive_shape(meta: dict, node_config: dict = None,
+                 topology_config: dict = None) -> dict:
     """
     Resolve a model_meta dict into a concrete shape:
-      {"n_in", "n_out", "hidden_dims", "features", "node_config", ...}
-    where "features" is the resolved descriptor -- a list of {"type","size"}
-    with each size taken from the node config -- which the codegen iterates
-    over.
+      {"n_in", "n_out", "hidden_dims", "features", "topology_config", ...}
+    where "features" is the resolved descriptor — a list of {"type","size"}
+    with each size taken from the topology config.
 
     Args:
-        meta:        model descriptor loaded by load_model_meta().
-        node_config: per-node dimensions loaded by load_node_config().
-                     This is the AUTHORITATIVE source for n_interfaces,
-                     n_nodes, n_queues — any values with those keys in
-                     *meta* (model_meta.json) are IGNORED when node_config
-                     is supplied.
-                     If None, falls back to the legacy node_config_for(meta)
-                     behaviour (reads dims from meta itself) so callers that
-                     have not yet been updated continue to work.
+        meta:            model descriptor loaded by load_model_meta().
+        topology_config: per-network dimensions loaded by
+                         load_topology_config(). AUTHORITATIVE source for
+                         n_interfaces, n_nodes, n_queues — any values with
+                         those keys in *meta* (model_meta.json) are IGNORED.
+        node_config:     [DEPRECATED] old name for topology_config; accepted
+                         for backward compatibility, topology_config takes
+                         precedence if both are supplied.
 
-    - explicit "features" list (of type names) -> sizes from the node config,
-      n_in = sum(sizes), n_out = meta["n_out"] (required).
-    - no "features" list -> historical default descriptor
-      [link_state, ingress_iface, ttl, node], n_out = n_interfaces+1.
-      Reproduces the original N_IN=65/N_OUT=7 model.
+    If neither topology_config nor node_config is supplied the function falls
+    back to the legacy node_config_for(meta) behaviour so callers that have
+    not yet been updated continue to work.
     """
     hidden_dims = meta.get("hidden_dims", [4, 4])
 
-    if node_config is not None:
-        # Authoritative: node_config.json values override anything in meta.
+    # Resolve which config to use: topology_config > node_config > legacy fallback
+    if topology_config is not None:
+        cfg = dict(topology_config)
+    elif node_config is not None:
         cfg = dict(node_config)
     else:
-        # Legacy fallback: read dims from the meta dict itself.
         cfg = node_config_for(meta)
 
     if meta.get("features"):
@@ -264,7 +283,10 @@ def derive_shape(meta: dict, node_config: dict = None) -> dict:
 
     shape = {
         "n_in": n_in, "n_out": n_out, "hidden_dims": hidden_dims,
-        "features": features, "node_config": cfg,
+        "features": features,
+        # Store under both keys so downstream code that reads either name works
+        "topology_config": cfg,
+        "node_config": cfg,  # backward compat alias
     }
     if not meta.get("features"):
         shape["n_interfaces"] = cfg["n_interfaces"]
@@ -278,21 +300,20 @@ def derive_shape(meta: dict, node_config: dict = None) -> dict:
 
 def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
     """
-    Verify that the N_IN computed from node_config + feature types matches
+    Verify that the N_IN computed from topology_config + feature types matches
     the actual first-layer input dimension of the PyTorch checkpoint.
 
     Reads fc1.weight.shape[1] from the state dict and compares it with
     shape['n_in'].  If they differ the function raises a clear, blocking
     ValueError — loading the wrong model on a mismatched topology would
-    silently produce wrong inference output, which is worse than a hard
-    error.
+    silently produce wrong inference output, which is worse than a hard error.
 
     Args:
         shape:      output of derive_shape().
         model_path: path to the .pt checkpoint file.
 
     Raises:
-        ValueError  if n_in from node_config != n_in from checkpoint.
+        ValueError   if n_in from topology_config != n_in from checkpoint.
         RuntimeError if torch is not available or the checkpoint cannot be read.
     """
     try:
@@ -309,13 +330,10 @@ def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
             f"Could not load PyTorch checkpoint from {model_path!r}: {exc}"
         ) from exc
 
-    # Support both bare state-dicts and dicts with a 'state_dict' key.
     if "state_dict" in state and isinstance(state["state_dict"], dict):
         state = state["state_dict"]
 
     if "fc1.weight" not in state:
-        # Cannot verify — skip with a warning rather than hard-fail so that
-        # checkpoints with non-standard layer names still load.
         print(
             "[verify] WARNING: 'fc1.weight' not found in checkpoint "
             f"({model_path!r}) — skipping N_IN consistency check."
@@ -323,31 +341,31 @@ def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
         return
 
     n_in_checkpoint = int(state["fc1.weight"].shape[1])
-    n_in_node       = shape["n_in"]
+    n_in_topo       = shape["n_in"]
 
-    if n_in_checkpoint != n_in_node:
+    if n_in_checkpoint != n_in_topo:
         feature_breakdown = ", ".join(
             f"{f['type']}={f['size']}" for f in shape["features"]
         )
         raise ValueError(
             f"\n"
-            f"  N_IN MISMATCH — model checkpoint is incompatible with the current node_config.\n"
+            f"  N_IN MISMATCH — model checkpoint is incompatible with the current topology_config.\n"
             f"\n"
-            f"  N_IN expected by the checkpoint  (fc1.weight.shape[1]): {n_in_checkpoint}\n"
-            f"  N_IN computed from node_config + feature types        : {n_in_node}\n"
+            f"  N_IN expected by the checkpoint   (fc1.weight.shape[1]): {n_in_checkpoint}\n"
+            f"  N_IN computed from topology_config + feature types      : {n_in_topo}\n"
             f"\n"
             f"  Feature breakdown: [{feature_breakdown}]\n"
-            f"  node_config used : {shape['node_config']}\n"
+            f"  topology_config used: {shape['topology_config']}\n"
             f"\n"
             f"  The checkpoint in {model_path!r} was trained on a different topology.\n"
-            f"  Either use a model trained with n_in={n_in_node}, or update\n"
-            f"  node_config.json so that it matches the topology the model expects\n"
+            f"  Either use a model trained with n_in={n_in_topo}, or update\n"
+            f"  topology_config.json so that it matches the topology the model expects\n"
             f"  (n_in={n_in_checkpoint})."
         )
 
     print(
-        f"[verify] N_IN={n_in_node} OK — "
-        f"checkpoint and node_config are consistent."
+        f"[verify] N_IN={n_in_topo} OK — "
+        f"checkpoint and topology_config are consistent."
     )
 
 
@@ -357,9 +375,7 @@ def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
 
 def feature_maps(features: list) -> dict:
     """Return {feature_type: map_name} for the map-backed (dense_vector_map)
-    features in a resolved descriptor -- the set of BPF maps the control plane
-    must seed for this model (e.g. link_state, queue_state). Features read
-    directly from the packet/node (scalar, onehot) contribute nothing here."""
+    features in a resolved descriptor."""
     out = {}
     for f in features:
         entry = FEATURE_CATALOG[f["type"]]
