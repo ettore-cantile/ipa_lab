@@ -123,10 +123,10 @@ def _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table):
     print(f"[verify-only] scale={scale}, weights={len(weights_int8)}, "
           f"source_chars={len(ebpf_src)}")
     b = BPF(text=ebpf_src)
-    dispatcher_fd = b["ipa_switch_hardcoded"].fd
-    model_fd      = b[f"model_{0}"].fd
-    print(f"[verify-only] Verifier PASSED — dispatcher fd={dispatcher_fd}, "
-          f"model_0 fd={model_fd}")
+    dispatcher_fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    model_fn      = b.load_func("model_0", BPF.XDP)
+    print(f"[verify-only] Verifier PASSED — dispatcher fd={dispatcher_fn.fd}, "
+          f"model_0 fd={model_fn.fd}")
 
 
 def _attach(ebpf_src, iface, shape):
