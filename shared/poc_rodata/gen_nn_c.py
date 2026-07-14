@@ -110,13 +110,18 @@ def _emit(w, rodata: bool) -> str:
     A("    signed char *p = data;")
     A("    // single bounds check covers p[0..N_IN-1] (constant indices below)")
     A("    if ((void *)(p + N_IN) > data_end) return XDP_PASS;")
-    for i in range(N_IN):
-        A(f"    long long iv{i} = (long long)p[{i}];")
     A("")
+    # NB: the input vector is read INLINE from the packet ((long long)p[i]) and
+    # never materialized as 65 stack longs -- that would be 65*8 = 520B and blow
+    # the 512B BPF stack limit (same budget constraint as ebpf_program.py). Each
+    # p[i] is reloaded per use; the verifier allows repeated constant-offset
+    # packet reads after the single bounds check above.
+    def iv(i):
+        return f"((long long)p[{i}])"
     # fc1
     for j in range(N_H1):
         terms = " + ".join(
-            f"iv{i} * {wref(off['fc1_w']+j*N_IN+i, fc1_w[j*N_IN+i])}" for i in range(N_IN))
+            f"{iv(i)} * {wref(off['fc1_w']+j*N_IN+i, fc1_w[j*N_IN+i])}" for i in range(N_IN))
         bias = wref(off["fc1_b"]+j, fc1_b[j])
         A(f"    long long a1_{j} = {terms} + {bias};")
         A(f"    long long h1_{j} = a1_{j} > 0 ? a1_{j} : 0;")
