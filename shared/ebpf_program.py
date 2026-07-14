@@ -645,6 +645,7 @@ def load_and_generate(
     model_id: int = 0,
     ifindex_table: list = None,
     meta: dict = None,
+    topology_config: dict = None,
 ) -> tuple:
     """
     Returns (ebpf_src, weights_int8, scale) -- a standalone combined source
@@ -667,7 +668,10 @@ def load_and_generate(
 
     if meta is None:
         meta = _model_meta.load_model_meta(model_path)
-    shape = _model_meta.derive_shape(meta)
+    # topology_config (per-network dimensions) is authoritative for feature
+    # sizes; when omitted, derive_shape falls back to the legacy meta-derived
+    # config so un-updated callers keep working.
+    shape = _model_meta.derive_shape(meta, topology_config=topology_config)
     model_dir = os.path.dirname(model_path) or "."
     weights_float_path = os.path.join(model_dir, "weights_float.json")
     weights_plain_path = os.path.join(model_dir, "weights.json")
