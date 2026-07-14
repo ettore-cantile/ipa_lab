@@ -24,11 +24,13 @@ architecture (measured: ~69 vs ~66 ns/pkt).
 
 What this script does (bench only -- it does NOT attach XDP to a real iface;
 that is method4's job):
-    1. generate the weights-literal libbpf C for the model (real int8 weights),
-    2. clang-compile it to a .o OFFLINE and TIME that build (the cost you pay
+    1. load node_config.json from the node (authoritative for n_interfaces /
+       n_nodes / n_queues), verify N_IN consistency with the checkpoint,
+    2. generate the weights-literal libbpf C for the model (real int8 weights),
+    3. clang-compile it to a .o OFFLINE and TIME that build (the cost you pay
        once, on the build box, NOT on the hot path),
-    3. build the libbpf loader (loader_aot) if needed,
-    4. run it: it TIMES the runtime open+load (the real deploy cost) and
+    4. build the libbpf loader (loader_aot) if needed,
+    5. run it: it TIMES the runtime open+load (the real deploy cost) and
        BPF_PROG_TEST_RUNs the program (full path, same methodology as
        test_suite --kernel) to confirm the literal performance is preserved.
 
@@ -46,6 +48,8 @@ already pulls clang/llvm; libbpf-dev is the only likely-missing one:
 Run:
     sudo python3 shared/methods/method4_hardcoded_aot.py
     sudo python3 shared/methods/method4_hardcoded_aot.py --model shared/frr_germany50_5_model_4x2.pt
+    sudo python3 shared/methods/method4_hardcoded_aot.py \\
+        --node-config /etc/ipa/node_config.json
 """
 
 import os
@@ -62,7 +66,15 @@ if POC_DIR not in sys.path:
     sys.path.insert(0, POC_DIR)
 _ORIGINAL_CWD = os.getcwd()
 
-from model_meta import load_model_meta, derive_shape
+# Default path for the per-node feature-dimension configuration.
+_DEFAULT_NODE_CONFIG_PATH = "/etc/ipa/node_config.json"
+
+from model_meta import (
+    load_model_meta,
+    load_node_config,
+    derive_shape,
+    verify_shape_vs_checkpoint,
+)
 
 # What the offline generator (gen_full_c.py) currently hardcodes. A model whose
 # resolved descriptor differs cannot be built by this AOT path yet.
@@ -101,6 +113,15 @@ def _run(cmd, **kw):
 def main():
     ap = argparse.ArgumentParser(description="Pipeline 1 AOT-literal deploy bench (libbpf)")
     ap.add_argument("--model", default=None, help="Path to .pt checkpoint (default: checked-in FRR)")
+    ap.add_argument(
+        "--node-config",
+        default=_DEFAULT_NODE_CONFIG_PATH,
+        help=(
+            f"Path to node_config.json (default: {_DEFAULT_NODE_CONFIG_PATH}). "
+            "Provides authoritative n_interfaces / n_nodes / n_queues for the "
+            "node. Falls back to built-in defaults if the file doesn't exist."
+        ),
+    )
     ap.add_argument("--clang", default="clang", help="clang binary")
     ap.add_argument("--cc", default="cc", help="C compiler for the loader")
     ap.add_argument("--keep", action="store_true", help="keep generated .bpf.c/.o")
@@ -108,8 +129,31 @@ def main():
     args.model = _resolve_cli_path(args.model)
 
     model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
-    shape = derive_shape(load_model_meta(model_path))
+
+    # ------------------------------------------------------------------
+    # Step 0: load node_config (per-node dims) and model_meta (per-model
+    # descriptor), then derive the concrete shape.
+    # node_config is the authoritative source for n_interfaces/n_nodes/
+    # n_queues; any such keys in model_meta.json are ignored.
+    # ------------------------------------------------------------------
+    node_cfg = load_node_config(args.node_config)
+    meta     = load_model_meta(model_path)
+    shape    = derive_shape(meta, node_config=node_cfg)
+
+    # ------------------------------------------------------------------
+    # Step 0.5: verify that the checkpoint was trained with the same N_IN
+    # that node_config + feature types produce.  Raises a clear ValueError
+    # if they differ -- prevents silent wrong-inference.
+    # ------------------------------------------------------------------
+    verify_shape_vs_checkpoint(shape, model_path)
+
+    # ------------------------------------------------------------------
+    # Step 0.6: AOT-specific guard -- this offline generator only supports
+    # the default FRR descriptor (65-4-4-7, node config 6/52).  Must run
+    # AFTER the two checks above so N_IN errors surface before this one.
+    # ------------------------------------------------------------------
     _check_supported(shape)
+
     print(f"[AOT] model={model_path}")
     print(f"[AOT] shape={shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']} (default FRR descriptor)")
 
