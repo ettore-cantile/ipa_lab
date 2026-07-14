@@ -118,32 +118,35 @@ def _emit(w, rodata: bool) -> str:
     # packet reads after the single bounds check above.
     def iv(i):
         return f"((long long)p[{i}])"
-    # Each neuron accumulates with a SINGLE reused accumulator (acc += term;),
-    # not one giant `t0 + t1 + ... + tN` expression. The big-expression form
-    # keeps all N products live at once, which clang spills to the stack and
-    # blows the 512B BPF stack limit for a dense 65-wide layer (esp. the rodata
-    # build, where each weight is a real load, not a folded immediate). The
-    # accumulator form keeps ~1 product live at a time. Both builds use it, so
-    # the literal-vs-rodata instruction comparison stays fair.
+    # ONE reused accumulator `acc` per neuron, computed fully before the next
+    # neuron starts. Independent per-neuron accumulators (a1_0..a1_3) let clang
+    # -O2 interleave the four dot products, keeping many weight loads live at
+    # once -> spill -> the 512B BPF stack limit is blown (only in the rodata
+    # build, where each weight is a real load the compiler can't fold). Reusing
+    # a single `acc` forces a serial dependency, so clang can't parallelize and
+    # the frame stays tiny. Both builds use the identical structure, so the
+    # literal-vs-rodata instruction comparison stays fair.
+    A("    long long acc;")
     # fc1
     for j in range(N_H1):
-        A(f"    long long a1_{j} = {wref(off['fc1_b']+j, fc1_b[j])};")
+        A(f"    acc = {wref(off['fc1_b']+j, fc1_b[j])};")
         for i in range(N_IN):
-            A(f"    a1_{j} += {iv(i)} * {wref(off['fc1_w']+j*N_IN+i, fc1_w[j*N_IN+i])};")
-        A(f"    long long h1_{j} = a1_{j} > 0 ? a1_{j} : 0;")
+            A(f"    acc += {iv(i)} * {wref(off['fc1_w']+j*N_IN+i, fc1_w[j*N_IN+i])};")
+        A(f"    long long h1_{j} = acc > 0 ? acc : 0;")
     A("")
     # fc2
     for j in range(N_H2):
-        A(f"    long long a2_{j} = {wref(off['fc2_b']+j, fc2_b[j])};")
+        A(f"    acc = {wref(off['fc2_b']+j, fc2_b[j])};")
         for i in range(N_H1):
-            A(f"    a2_{j} += h1_{i} * {wref(off['fc2_w']+j*N_H1+i, fc2_w[j*N_H1+i])};")
-        A(f"    long long h2_{j} = a2_{j} > 0 ? a2_{j} : 0;")
+            A(f"    acc += h1_{i} * {wref(off['fc2_w']+j*N_H1+i, fc2_w[j*N_H1+i])};")
+        A(f"    long long h2_{j} = acc > 0 ? acc : 0;")
     A("")
     # out
     for j in range(N_OUT):
-        A(f"    long long o_{j} = {wref(off['out_b']+j, out_b[j])};")
+        A(f"    acc = {wref(off['out_b']+j, out_b[j])};")
         for i in range(N_H2):
-            A(f"    o_{j} += h2_{i} * {wref(off['out_w']+j*N_H2+i, out_w[j*N_H2+i])};")
+            A(f"    acc += h2_{i} * {wref(off['out_w']+j*N_H2+i, out_w[j*N_H2+i])};")
+        A(f"    long long o_{j} = acc;")
     A("")
     # argmax
     A("    long long best_val = o_0; int best_cls = 0;")
