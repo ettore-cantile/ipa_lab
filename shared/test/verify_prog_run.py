@@ -769,7 +769,7 @@ def main():
                    default="hardcoded")
     p.add_argument("--model-id", type=int, default=0)
     p.add_argument("--model", default=MODEL_PT)
-    p.add_argument("--model-dir", default=os.path.join(SHARED_DIR, "test", "fixtures", "sparse_hetero_12"),
+    p.add_argument("--model-dir", default=os.path.join(SHARED_DIR, "test", "fixtures", "sparse_hetero_11"),
                    help="sparse-hetero: directory with model_meta.json (+ weights.json)")
     p.add_argument("--ttl-min", type=int, default=1)
     p.add_argument("--ttl-max", type=int, default=10)
