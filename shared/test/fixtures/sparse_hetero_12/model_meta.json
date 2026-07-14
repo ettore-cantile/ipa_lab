@@ -1,0 +1,1 @@
+{"features": ["link_state", "queue_occupancy", "ttl", "node"], "n_out": 5, "hidden_dims": [4, 4], "scale_factor": 32, "node_config": {"n_interfaces": 4, "n_nodes": 4, "n_queues": 3}}

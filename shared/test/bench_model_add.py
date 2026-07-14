@@ -151,53 +151,11 @@ def bench_modular(weights, scale, n_models):
     return setup_s, times, None  # template/modular: add == single map write, no compile/load phases
 
 
-def bench_dense(n_in, n_out, hidden_dims, n_models, seed=0):
-    """Dense route of Pipeline 1 (generate_ebpf_hardcoded_dense): same
-    'no incremental path' profile as bench_hardcoded() -- every add is a
-    full C regen + BPF compile + load_func -- but n_in/n_out come from a
-    declared shape instead of the protocol-fixed 65/7, and there's no
-    switch(_iface)/switch(_node) codegen (payload read directly), so the
-    generated source is smaller for a comparably-sized model."""
-    from bcc import BPF
-    import ctypes as ct
-    import random
-    from ebpf_program import build_combined_hardcoded_dense_source
-
-    n_h1, n_h2 = hidden_dims
-    n_weights = n_in*n_h1 + n_h1 + n_h1*n_h2 + n_h2 + n_h2*n_out + n_out
-    rng = random.Random(seed)
-    weights = [rng.randint(-30, 30) for _ in range(n_weights)]
-    scale = 32
-
-    times = []
-    phases = {"gen": [], "compile": [], "load": []}
-    for i in range(n_models):
-        t0 = time.perf_counter()
-        src = build_combined_hardcoded_dense_source(
-            [(i, weights, scale, n_in)], n_out=n_out, hidden_dims=hidden_dims)
-        t_gen = time.perf_counter()
-        b = BPF(text=src)                         # clang/LLVM: C -> BPF bytecode
-        t_compile = time.perf_counter()
-        model_fn = b.load_func(f"model_{i}", BPF.XDP)   # verifier + kernel load
-        b.load_func("ipa_switch_hardcoded", BPF.XDP)
-        b["model_progs"][ct.c_int(i)] = ct.c_int(model_fn.fd)
-        t_load = time.perf_counter()
-        phases["gen"].append(t_gen - t0)
-        phases["compile"].append(t_compile - t_gen)
-        phases["load"].append(t_load - t_compile)
-        times.append(t_load - t0)
-    return None, times, phases
-
-
 def main():
     parser = argparse.ArgumentParser(description="Bench: cost of adding a model to each IPA/eBPF pipeline")
     parser.add_argument("--model", default=MODEL_PT, help="Path to .pt checkpoint")
     parser.add_argument("--n-models", type=int, default=3,
                         help="How many successive model-add operations to time per pipeline (default 3)")
-    parser.add_argument("--dense-n-in", type=int, default=10,
-                        help="Dense route: input width for the synthetic bench model (default 10)")
-    parser.add_argument("--dense-n-out", type=int, default=4,
-                        help="Dense route: output width for the synthetic bench model (default 4)")
     args = parser.parse_args()
 
     if not sys.platform.startswith("linux"):
@@ -208,8 +166,6 @@ def main():
     from verify_prog_run import load_weights
     weights, scale = load_weights(args.model)
     print(f"[bench] weights={len(weights)} scale={scale} n_models={args.n_models}")
-    print(f"[bench] dense route: n_in={args.dense_n_in} n_out={args.dense_n_out} hidden_dims=(4,4) "
-          f"(synthetic weights -- no trained dense model exists yet)")
     print()
 
     results = {}
@@ -222,11 +178,6 @@ def main():
         results[name] = (setup_s, times)
         phases_by_name[name] = phases
 
-    print(f"[bench] running dense ...")
-    setup_s, times, phases = bench_dense(args.dense_n_in, args.dense_n_out, (4, 4), args.n_models)
-    results["dense"] = (setup_s, times)
-    phases_by_name["dense"] = phases
-
     print()
     print("=" * 78)
     print(" Model-add cost per pipeline (aggiornamento modello a runtime)")
@@ -234,7 +185,7 @@ def main():
     print(f"  {'pipeline':<12}{'one-time setup (ms)':>22}{'mean add (ms)':>18}"
           f"{'min':>10}{'max':>10}{'stdev':>10}")
     print("  " + "-" * 74)
-    for name in ("hardcoded", "template", "modular", "dense"):
+    for name in ("hardcoded", "template", "modular"):
         setup_s, times = results[name]
         s = _stats(times)
         setup_str = f"{setup_s*1000:.3f}" if setup_s is not None else "n/a (baked into add)"
@@ -248,32 +199,23 @@ def main():
     print("              (bpf_map_update_elem writes only, program stays loaded).")
     print("  modular   : one-time program load, then 'add' == load_modular_weights()")
     print("              (bpf_map_update_elem writes only, program stays loaded).")
-    print("  dense     : same no-incremental-path profile as hardcoded (still P1),")
-    print("              but n_in/n_out declared per-model instead of protocol-fixed;")
-    print("              smaller generated source (no switch(_iface)/switch(_node)).")
     print()
     hc = _stats(results["hardcoded"][1])["mean_ms"]
     tp = _stats(results["template"][1])["mean_ms"]
     md = _stats(results["modular"][1])["mean_ms"]
-    ds = _stats(results["dense"][1])["mean_ms"]
     if tp > 0:
         print(f"  hardcoded add is ~{hc/tp:.0f}x slower than template add "
               f"(recompile vs. map write).")
     if md > 0:
         print(f"  hardcoded add is ~{hc/md:.0f}x slower than modular add "
               f"(recompile vs. map write).")
-    if ds > 0:
-        print(f"  hardcoded (sparse, {len(weights)} weights) add is ~{hc/ds:.1f}x the cost of "
-              f"dense (n_in={args.dense_n_in}, synthetic weights) add -- both pay full recompile, "
-              f"the difference is generated-source size.")
 
     # ---------------------------------------------------------------------
     # Recompile-cost breakdown (the professor's question: can the P1 add
-    # cost be cut WITHOUT losing datapath performance?). For the two routes
-    # that actually recompile (hardcoded, dense) split the per-model add
-    # into: gen (Python source string), compile (BCC clang/LLVM C->BPF),
-    # load (verifier + kernel load). If `compile` dominates, then the add
-    # cost is NOT intrinsic to "hardcoded weights" -- it's the C->BPF
+    # cost be cut WITHOUT losing datapath performance?). Split the hardcoded
+    # per-model add into: gen (Python source string), compile (BCC clang/LLVM
+    # C->BPF), load (verifier + kernel load). If `compile` dominates, then the
+    # add cost is NOT intrinsic to "hardcoded weights" -- it's the C->BPF
     # compilation BCC repeats every time. An AOT-compiled program with the
     # weights in .rodata const (rewritten per model, verifier constant-folds
     # them -> identical instructions/latency) would pay only `load`.
@@ -285,7 +227,7 @@ def main():
     print(f"  {'route':<12}{'gen (py)':>12}{'compile (BCC)':>16}{'load (verif.)':>16}"
           f"{'compile %':>12}")
     print("  " + "-" * 66)
-    for name in ("hardcoded", "dense"):
+    for name in ("hardcoded",):
         ph = phases_by_name.get(name)
         if not ph:
             continue

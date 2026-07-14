@@ -187,13 +187,8 @@ def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
     ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, ttl, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
-    # NOTE: exactly 20 format letters (3 B + 1 H + 16 B) = 21 bytes, matching
-    # sizeof(struct ipa_hdr) in the eBPF C source. An earlier version of this
-    # format string carried a spurious 21st field (an extra trailing 'b'),
-    # producing a 22-byte header -- harmless for the sparse/template/modular
-    # routes (which never read past the header), but it silently shifted
-    # every payload byte by one position for the dense route, corrupting
-    # the feature vector it reads at ipa_hdr+1 (see build_frame_dense()).
+    # exactly 20 format letters (3 B + 1 H + 16 B) = 21 bytes, matching
+    # sizeof(struct ipa_hdr) in the eBPF C source.
     ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBB', model_id, 0, 0, scale, 65, 7, 2, 4, 3, 0, 65, 0, 0, 0, 0, 0, 0, 1, 0, 7)
     return eth + ip + udp + ipa
 
@@ -237,44 +232,67 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
             best_val, best_cls = acc, k
     return best_cls, best_val, h1, h2
 
-def build_frame_dense(model_id: int, features: list, scale: int, n_in: int, n_out: int) -> bytes:
-    """Same eth/ip/udp/ipa_hdr skeleton as build_frame(), but input_size/
-    output_size in the header reflect the dense scenario's real shape, and
-    the feature vector (quantized int8) is appended as payload -- the dense
-    datapath (generate_ebpf_hardcoded_dense) reads it directly, unlike the
-    sparse route where the payload is never touched. IP/UDP length fields
-    are dummy placeholders (as in build_frame): BPF_PROG_TEST_RUN derives
-    data_end from the actual buffer length, not from these fields."""
+
+def build_frame_sparse(model_id: int, ttl: int, scale: int, n_in: int, n_out: int) -> bytes:
+    """Frame for a heterogeneous sparse model: same skeleton as build_frame()
+    but the IPA header carries the descriptor's real input_size/output_size.
+    No payload -- the sparse route builds the IV locally (TTL from this frame's
+    IP header, dense_vector features from BPF maps seeded by the caller, node
+    one-hot from model_id, ingress_iface from ctx->ingress_ifindex)."""
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
-    ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, 64, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
+    ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, ttl, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
-    # Exactly 20 format letters (3 B + 1 H + 16 B) = 21 bytes == sizeof(struct
-    # ipa_hdr) -- must match precisely here (unlike build_frame()'s sparse
-    # frame, which never reads past the header): the dense datapath computes
-    # _feat = (__u8*)(ipa+1), so any extra/missing byte in this header
-    # shifts every feature read by one position.
     ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBB', model_id, 0, 0, scale, n_in, n_out, 2, 4,
                       0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, n_out)
-    payload = bytes(int(f) & 0xFF for f in features)
-    return eth + ip + udp + ipa + payload
+    return eth + ip + udp + ipa
 
 
-def ref_infer_dense(weights, features: list, hidden_dims, n_out: int):
-    """Python reference for generate_ebpf_hardcoded_dense()'s forward pass:
-    plain MLP dot product over the raw feature vector (no ttl/iface/node
-    derivation -- that's the whole point of the dense route). Returns
-    (best_cls, best_val); by convention best_cls == n_out-1 means DROP,
-    matching _gen_action_epilogue(f"best_cls >= {n_out-1}")."""
+def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
+                     map_values, ifindex, ifindex_table):
+    """Python reference for the heterogeneous sparse route: builds the input
+    vector feature by feature from the descriptor (mirroring the per-kind C
+    generators in ebpf_program.py), then runs the MLP + argmax. Returns
+    (best_cls, best_val); best_cls == n_out-1 means DROP.
+
+    map_values: {map_name: [values]} the caller seeded into the dense_vector
+    maps (link_state, queue_state). ifindex/ifindex_table: the raw
+    ctx->ingress_ifindex and the kernel-ifindex->logical mapping used by the
+    ingress_iface one-hot (mirrors generate_ebpf_hardcoded's default table)."""
+    import model_meta as mm
     def s8(v):
         return ct.c_int8(int(v) & 0xFF).value
-    n_in = len(features)
+
+    n_in = sum(f["size"] for f in features)
+    x = [0] * n_in
+    o = 0
+    for f in features:
+        t, size = f["type"], f["size"]
+        kind = mm.FEATURE_CATALOG[t]["kind"]
+        if kind == "scalar":                       # ttl
+            x[o] = ttl & 0xff
+        elif kind == "dense_vector_map":           # link_state / queue_occupancy
+            vals = map_values.get(mm.FEATURE_CATALOG[t]["map"], [0] * size)
+            for i in range(size):
+                x[o + i] = vals[i]
+        elif kind == "onehot" and t == "ingress_iface":
+            logical = 0
+            for li, ki in enumerate(ifindex_table[:size], start=1):
+                if ki == ifindex:
+                    logical = li
+                    break
+            if 1 <= logical <= size:
+                x[o + (logical - 1)] = 1
+        elif kind == "onehot" and t == "node":
+            if 0 <= model_id < size:
+                x[o + model_id] = 1
+        o += size
+
     n_h1, n_h2 = hidden_dims
     off_fc1_b = n_in * n_h1
     off_fc2_w = off_fc1_b + n_h1
     off_fc2_b = off_fc2_w + n_h1 * n_h2
     off_out_w = off_fc2_b + n_h2
     off_out_b = off_out_w + n_h2 * n_out
-    x = [s8(f) for f in features]
     h1 = []
     for j in range(n_h1):
         acc = s8(weights[off_fc1_b + j])
@@ -304,8 +322,8 @@ class _FwdAction(ct.Structure):
 def _install_mac_table(b, name, ifindex=2, n_classes=6):
     """Pre-install the class->action map for classes 0..n_classes-1 (the
     argmax output). The NN picks the class; this dictionary resolves it to
-    {ifindex, MACs}. n_classes defaults to 6 (sparse route's historical
-    egress count); pass n_out-1 for the dense route's egress count."""
+    {ifindex, MACs}. n_classes defaults to 6 (the historical egress count);
+    pass n_out-1 for a model with a different number of egress classes."""
     action = _FwdAction(
         ifindex=ifindex,
         src_mac=(ct.c_uint8 * 6)(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF),
@@ -448,43 +466,46 @@ def setup_modular(model_id: int, model_path: str):
     }
 
 
-def setup_dense(model_id: int, model_dir: str):
+def setup_sparse_hetero(model_id: int, model_dir: str):
     """
-    Load the dense-generic route of Pipeline 1 (generate_ebpf_hardcoded_dense),
-    from a directory holding model_meta.json (+ weights.json/weights_float.json,
-    see shared/model_meta.py). No .pt/torch involved -- same "no incremental
-    path, every add is a full recompile" cost profile as setup_hardcoded(),
-    just with n_in/n_out declared by model_meta.json instead of the protocol-
-    fixed 65/7.
+    Load a heterogeneous sparse model (explicit per-model feature descriptor,
+    see model_meta.py) from a fixture directory. Seeds every dense_vector map
+    the descriptor uses (link_state and/or queue_state) with KNOWN
+    deterministic values and returns them under "map_values" so
+    ref_infer_sparse can rebuild the same input vector on the Python side.
     """
     from ebpf_program import load_and_generate
     import model_meta as mm
 
-    model_path = os.path.join(model_dir, "model.pt")  # need not exist -- see model_meta.py
+    model_path = os.path.join(model_dir, "model.pt")  # need not exist
     meta = mm.load_model_meta(model_path)
-    if meta.get("scenario") != "dense":
-        raise ValueError(f"{model_dir}/model_meta.json is not scenario=\"dense\"")
+    if meta.get("scenario", "sparse") != "sparse" or not meta.get("features"):
+        raise ValueError(f"{model_dir}/model_meta.json is not a sparse model with a 'features' descriptor")
     shape = mm.derive_shape(meta)
 
-    t0 = time.perf_counter()
     src, weights, scale = load_and_generate(model_path, model_id=model_id, meta=meta)
     b = BPF(text=src)
     model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
     fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
     b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
-    t_redirect_s = time.perf_counter() - t0
 
-    n_egress = shape["n_out"] - 1  # last class = DROP, by convention (see ebpf_program.py)
-    _install_mac_table(b, "mac_table", n_classes=n_egress)
+    n_out = shape["n_out"]
+    _install_mac_table(b, "mac_table", n_classes=n_out - 1)
+
+    # Seed each dense_vector map with known values (deterministic, arbitrary).
+    map_values = {}
+    for feat_type, map_name in mm.feature_maps(shape["features"]).items():
+        size = next(f["size"] for f in shape["features"] if f["type"] == feat_type)
+        vals = [(i * 7 + 3) % 16 for i in range(size)]
+        for i, v in enumerate(vals):
+            b[map_name][ct.c_int(i)] = ct.c_uint32(v)
+        map_values[map_name] = vals
 
     return {
         "b": b, "fn": model_fn, "disp": fn,
         "weights": weights, "scale": scale, "shape": shape,
-        "cls_stats": b["cls_stats"],
-        "pkt_stats": b["pkt_stats"],
-        "pipeline": 1,
-        "t_redirect_s": t_redirect_s,
-        "t_insert_s": 0.0,
+        "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
+        "pipeline": 1, "map_values": map_values,
         "progs": {"ipa_switch_hardcoded": fn.fd, f"model_{model_id}": model_fn.fd},
     }
 
@@ -499,16 +520,9 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
     only this metric. Runs `repeat` packets through the dispatcher (the real
     per-packet path, tail calls included) and returns lookup_ctr[0]/repeat.
 
-    For method == "dense", `model_path` is actually a model_dir (directory
-    holding model_meta.json) -- see setup_dense(). Expect 0 lookups: the
-    dense route reads its feature vector straight from the packet payload,
-    no map read at all (not even link_state).
     """
     from common import instrument_map_lookups
-    frame_override = None
-
-    if method != "dense":
-        weights, scale = load_weights(model_path)
+    weights, scale = load_weights(model_path)
 
     if method == "hardcoded":
         from ebpf_program import build_combined_hardcoded_source
@@ -545,27 +559,10 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
                              layer_dims=[(65, 4), (4, 4), (4, 7)])
         _seed_link_state(b, 1)
         _install_mac_table(b, "mac_table_t3")
-    elif method == "dense":
-        from ebpf_program import load_and_generate
-        import model_meta as mm
-
-        model_dir = model_path
-        dummy_model_path = os.path.join(model_dir, "model.pt")
-        meta = mm.load_model_meta(dummy_model_path)
-        shape = mm.derive_shape(meta)
-        raw, weights, scale = load_and_generate(dummy_model_path, model_id=model_id, meta=meta)
-        src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
-        b = BPF(text=src)
-        model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
-        disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-        b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
-        _install_mac_table(b, "mac_table", n_classes=shape["n_out"] - 1)
-        features = [0] * shape["n_in"]
-        frame_override = build_frame_dense(model_id, features, scale, shape["n_in"], shape["n_out"])
     else:
         raise ValueError(f"count_lookups: unknown method {method!r}")
 
-    frame = frame_override if frame_override is not None else build_frame(model_id, ttl, scale)
+    frame = build_frame(model_id, ttl, scale)
     b["lookup_ctr"][ct.c_int(0)] = ct.c_ulonglong(0)
     prog_test_run(disp_fn.fd, frame, repeat=repeat)
     total = int(b["lookup_ctr"][ct.c_int(0)].value)
@@ -702,37 +699,47 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print(f"pkt_stats: HIT={_read_u64(ps,0)}  MISS={_read_u64(ps,1)}  DROP={_read_u64(ps,2)}")
     return failed
 
-def run_dense(model_dir: str, model_id: int, n_vectors: int, repeat: int, seed: int = 0) -> int:
+
+def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int, repeat: int) -> int:
     """
-    Dense-route counterpart to run(): instead of sweeping TTL against a
-    fixed 65-4-4-7 model (ttl is irrelevant here, features aren't derived
-    from packet metadata), exercise `n_vectors` random quantized feature
-    vectors and check the kernel's argmax/redirect against ref_infer_dense().
+    Heterogeneous-sparse counterpart to run(): a model with an explicit
+    per-model feature descriptor (different feature TYPES, not just sizes --
+    the professor's scenario). The IV is built locally from the seeded
+    dense_vector maps + the packet TTL + node one-hot; ref_infer_sparse
+    rebuilds the same IV and we sweep TTL to exercise the scalar feature.
     """
+    import model_meta as mm
     print("=" * 70)
-    print(f" IPA/eBPF BPF_PROG_TEST_RUN  --  method=dense  model_id={model_id}  dir={model_dir}")
+    print(f" IPA/eBPF BPF_PROG_TEST_RUN  --  method=sparse-hetero  model_id={model_id}  dir={model_dir}")
     print("=" * 70)
     print()
-    setup = setup_dense(model_id, model_dir)
+    setup = setup_sparse_hetero(model_id, model_dir)
     b, disp = setup["b"], setup["disp"]
     weights, scale, shape = setup["weights"], setup["scale"], setup["shape"]
     n_in, n_out, hidden_dims = shape["n_in"], shape["n_out"], tuple(shape["hidden_dims"])
+    features = shape["features"]
     ps, cs = setup["pkt_stats"], setup["cls_stats"]
+    map_values = setup["map_values"]
 
-    t_redir = setup.get("t_redirect_s", 0.0)
-    print(f"[dense update timing] redirect/reload (BPF compile+load): {t_redir*1000:.3f} ms")
-    print(f"[setup] scale={scale}  weights={len(weights)}  n_in={n_in}  n_out={n_out}  disp_fd={disp.fd}")
-    print(f"      Feature vector travels in the PAYLOAD (read directly by the datapath),")
-    print(f"      not derived from ttl/ingress-iface/model_id like the sparse route.")
-    print(f"      PASS = retval in {{0,4}} (redirect) AND cls_stats[ref_cls] > 0 "
-          f"(or XDP_DROP for ref_cls == {n_out - 1}).")
+    # ifindex table the generator used by default (only relevant if the
+    # descriptor has an ingress_iface feature); TEST_RUN default ingress
+    # ifindex is 1, which this table does not map -> no iface contribution.
+    iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
+    ifindex_table = list(range(2, 2 + max(iface_size, 1)))
 
-    rng = random.Random(seed)
+    feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in features)
+    print(f"[setup] scale={scale}  weights={len(weights)}  n_in={n_in}  n_out={n_out}")
+    print(f"      features: {feats_str}")
+    print(f"      seeded maps: {map_values}")
+    print(f"      IV built locally (maps + TTL + node one-hot). PASS = redirect on ref_cls "
+          f"(or DROP for ref_cls == {n_out - 1}).")
+
     passed = failed = 0
-    for v in range(n_vectors):
-        features = [rng.randint(-30, 30) for _ in range(n_in)]
-        ref_cls, ref_val = ref_infer_dense(weights, features, hidden_dims, n_out)
-        frame = build_frame_dense(model_id, features, scale, n_in, n_out)
+    for ttl in range(ttl_min, ttl_max + 1):
+        ref_cls, ref_val = ref_infer_sparse(
+            weights, features, hidden_dims, n_out, ttl, model_id,
+            map_values, ifindex=TEST_RUN_DEFAULT_INGRESS_IFINDEX, ifindex_table=ifindex_table)
+        frame = build_frame_sparse(model_id, ttl, scale, n_in, n_out)
         _reset_stats(setup, n_classes=n_out)
         retval, dur_ns = prog_test_run(disp.fd, frame, repeat=repeat)
         if ref_cls < n_out - 1:
@@ -749,28 +756,27 @@ def run_dense(model_dir: str, model_id: int, n_vectors: int, repeat: int, seed: 
             passed += 1
         else:
             failed += 1
-        print(f"  vec={v:3d}  ref_cls={ref_cls}  ref_val={ref_val:8d}  {detail}  lat={lat_us:.2f}us  [{status}]")
+        print(f"  TTL={ttl:3d}  ref_cls={ref_cls}  ref_val={ref_val:8d}  {detail}  lat={lat_us:.2f}us  [{status}]")
     print("-" * 70)
-    print(f"Results: {passed} PASS / {failed} FAIL  ({n_vectors} random feature vectors, n_in={n_in})")
+    print(f"Results: {passed} PASS / {failed} FAIL  (TTL range [{ttl_min},{ttl_max}])")
     print(f"pkt_stats: HIT={_read_u64(ps,0)}  MISS={_read_u64(ps,1)}  DROP={_read_u64(ps,2)}")
     return failed
 
 
 def main():
     p = argparse.ArgumentParser(description="IPA/eBPF pipeline verifier")
-    p.add_argument("--method", choices=["hardcoded", "template", "modular", "dense"], default="hardcoded")
+    p.add_argument("--method", choices=["hardcoded", "template", "modular", "sparse-hetero"],
+                   default="hardcoded")
     p.add_argument("--model-id", type=int, default=0)
     p.add_argument("--model", default=MODEL_PT)
-    p.add_argument("--model-dir", default=os.path.join(SHARED_DIR, "test", "fixtures", "dense_10_4_4_4"),
-                   help="dense only: directory with model_meta.json (+ weights.json)")
-    p.add_argument("--n-vectors", type=int, default=20,
-                   help="dense only: random feature vectors to test (default 20)")
+    p.add_argument("--model-dir", default=os.path.join(SHARED_DIR, "test", "fixtures", "sparse_hetero_12"),
+                   help="sparse-hetero: directory with model_meta.json (+ weights.json)")
     p.add_argument("--ttl-min", type=int, default=1)
     p.add_argument("--ttl-max", type=int, default=10)
     p.add_argument("--repeat", type=int, default=1000, help="BPF_PROG_TEST_RUN repeat count for latency measurement")
     args = p.parse_args()
-    if args.method == "dense":
-        sys.exit(run_dense(args.model_dir, args.model_id, args.n_vectors, args.repeat))
+    if args.method == "sparse-hetero":
+        sys.exit(run_sparse_hetero(args.model_dir, args.model_id, args.ttl_min, args.ttl_max, args.repeat))
     sys.exit(run(args.method, args.model_id, args.model, args.ttl_min, args.ttl_max, args.repeat))
 
 if __name__ == "__main__":

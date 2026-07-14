@@ -72,9 +72,8 @@ def _build_ifindex_table(iface_names: list, n_egress: int) -> list:
     resolve_egress_mac()) must use the interface that ACTUALLY exists, not
     the requested one that silently fell back to a different ifindex.
 
-    n_egress replaces the historical fixed 6 -- for the "sparse" scenario
-    this is n_interfaces, for "dense" it is n_out-1 (see model_meta.py /
-    run() below).
+    n_egress replaces the historical fixed 6 -- it is n_out-1 (the number of
+    egress classes; the last class is DROP). See model_meta.py / run().
     """
     result = [resolve_ifindex(name, fallback="eth0") for name in iface_names[:n_egress]]
     while len(result) < n_egress:
@@ -114,7 +113,6 @@ def run(
     iface: str = "eth1",
     model_path: str = None,
     egress_ifaces: list = None,
-    scenario: str = None,
 ) -> None:
     """
     Load Pipeline 1 (hardcoded) on `iface`.
@@ -125,23 +123,21 @@ def run(
         model_path    : path to .pt checkpoint; defaults to the shared one
         egress_ifaces : list of interface names that map to egress classes
                         0..n_egress-1. Defaults to eth0, eth1, ... sized to
-                        n_egress (n_interfaces for "sparse", n_out-1 for
-                        "dense" -- see model_meta.py).
-        scenario      : "sparse" or "dense", overriding whatever
-                        model_meta.json (next to model_path) declares. None
-                        (default) means "use model_meta.json", which itself
-                        falls back to "sparse"/6/52/[4,4] -- today's exact
-                        behavior -- when no model_meta.json exists.
+                        n_egress = n_out-1 (last class is DROP -- see
+                        model_meta.py). The model's feature descriptor and
+                        per-node feature sizes come from model_meta.json
+                        (defaulting to the historical 6/52 descriptor when
+                        absent).
     """
     if model_path is None:
         model_path = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
 
     meta = load_model_meta(model_path)
-    if scenario is not None:
-        meta = dict(meta, scenario=scenario)
     shape = derive_shape(meta)
-    is_dense  = meta.get("scenario", "sparse") == "dense"
-    n_egress  = (shape["n_out"] - 1) if is_dense else shape["n_interfaces"]
+    # last class is DROP by convention -> n_egress = n_out - 1. For the default
+    # descriptor n_out = n_interfaces+1, matching the historical egress count;
+    # for a custom descriptor n_out is explicit.
+    n_egress  = shape["n_out"] - 1
 
     if egress_ifaces is None:
         egress_ifaces = [f"eth{i}" for i in range(n_egress)]
@@ -156,7 +152,7 @@ def run(
     # ------------------------------------------------------------------
     resolved_table = _build_ifindex_table(egress_ifaces, n_egress)  # [(name, ifindex), ...]
     ifindex_table = [idx for _, idx in resolved_table]    # ints only, for the C codegen
-    print(f"[P1-hardcoded] scenario={meta.get('scenario', 'sparse')} shape={shape}")
+    print(f"[P1-hardcoded] shape={shape}")
     print(f"[P1-hardcoded] Egress ifindex table (cls 0-{n_egress - 1}):")
     for cls_i, (name, idx) in enumerate(resolved_table):
         requested = egress_ifaces[cls_i] if cls_i < len(egress_ifaces) else "?"
@@ -191,19 +187,31 @@ def run(
     _populate_mac_table_hardcoded(b, resolved_table)
 
     # ------------------------------------------------------------------
-    # Step 4: seed link_state and start the carrier monitor
-    # (dense route has no link_state map -- see _build_header(need_link_state=
-    # False) in ebpf_program.py -- features come from the payload, not from
-    # network state, so there's nothing to seed/monitor.)
+    # Step 4: seed the map-backed (dense_vector) feature maps this model uses
+    # and start their monitors. Which maps exist is driven by the model's
+    # descriptor: one map per dense_vector feature (link_state and/or
+    # queue_state). A model whose descriptor omits link_state won't have that
+    # map, so we only seed what the descriptor declares.
     # ------------------------------------------------------------------
-    if is_dense:
-        stop_monitor = None
-        print(f"[P1-hardcoded] dense scenario: no link_state map (features read from payload)")
-    else:
-        from link_state_monitor import init_link_state_up, start_monitor_thread
-        init_link_state_up(b, egress_ifaces)
-        stop_monitor = start_monitor_thread(b, egress_ifaces, interval=1.0)
-        print(f"[P1-hardcoded] link_state seeded (all up); carrier monitor running")
+    stop_monitors = []
+    from model_meta import feature_maps
+    maps = feature_maps(shape["features"])   # {feature_type: map_name}
+    if not maps:
+        print(f"[P1-hardcoded] model uses no map-backed features (nothing to seed)")
+    for feat_type, map_name in maps.items():
+        size = next(f["size"] for f in shape["features"] if f["type"] == feat_type)
+        if map_name == "link_state":
+            from link_state_monitor import init_link_state_up, start_monitor_thread
+            init_link_state_up(b, egress_ifaces)
+            stop_monitors.append(start_monitor_thread(b, egress_ifaces, interval=1.0))
+            print(f"[P1-hardcoded] link_state seeded (all up); carrier monitor running")
+        elif map_name == "queue_state":
+            from queue_state_monitor import init_queue_state, start_monitor_thread as _q_start
+            init_queue_state(b, size, seed=1)
+            stop_monitors.append(_q_start(b, size, interval=1.0))
+            print(f"[P1-hardcoded] queue_state seeded ({size} synthetic values); monitor running")
+        else:
+            print(f"[P1-hardcoded] WARNING: feature '{feat_type}' map '{map_name}' has no seeder")
 
     # ------------------------------------------------------------------
     # Step 5: attach XDP on ingress iface (SKB/generic mode)
@@ -234,8 +242,8 @@ def run(
     except KeyboardInterrupt:
         pass
     finally:
-        if stop_monitor is not None:
-            stop_monitor.set()
+        for _stop in stop_monitors:
+            _stop.set()
         b.remove_xdp(iface, flags=XDP_FLAGS_SKB_MODE)
         print(f"\n[P1-hardcoded] XDP removed from {iface}")
         _print_final_stats(b, egress_ifaces, n_egress)
@@ -278,11 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("--egress-ifaces", nargs="+",
                         default=None,
                         help="Egress interfaces for the egress classes (default: eth0..ethN-1, "
-                             "N derived from the model's scenario shape -- see model_meta.py)")
-    parser.add_argument("--scenario", choices=["sparse", "dense"], default=None,
-                        help="Override the scenario declared in model_meta.json next to "
-                             "--model (default: read model_meta.json, falling back to 'sparse' "
-                             "with the historical 6-interface/52-node shape if absent)")
+                             "N = n_out-1 from the model's descriptor -- see model_meta.py)")
     parser.add_argument("--verify-only", action="store_true",
                         help="Load+verify eBPF program but do NOT attach XDP")
     args = parser.parse_args()
@@ -291,16 +295,13 @@ if __name__ == "__main__":
     if args.verify_only:
         model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
         meta = load_model_meta(model_path)
-        if args.scenario is not None:
-            meta = dict(meta, scenario=args.scenario)
         shape = derive_shape(meta)
-        is_dense = meta.get("scenario", "sparse") == "dense"
-        n_egress = (shape["n_out"] - 1) if is_dense else shape["n_interfaces"]
+        n_egress = shape["n_out"] - 1
         egress_ifaces = args.egress_ifaces or [f"eth{i}" for i in range(n_egress)]
 
         resolved_table = _build_ifindex_table(egress_ifaces, n_egress)
         ifindex_table = [idx for _, idx in resolved_table]
-        print(f"[verify-only] scenario={meta.get('scenario', 'sparse')} shape={shape}")
+        print(f"[verify-only] shape={shape}")
         print(f"[verify-only] ifindex_table={resolved_table}")
         src, w, s = load_and_generate(model_path, args.model_id, ifindex_table=ifindex_table, meta=meta)
         print(f"[verify-only] scale={s}, weights={len(w)}, source_chars={len(src)}")
@@ -315,5 +316,4 @@ if __name__ == "__main__":
         iface=args.iface,
         model_path=args.model,
         egress_ifaces=args.egress_ifaces,
-        scenario=args.scenario,
     )

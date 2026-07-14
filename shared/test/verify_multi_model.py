@@ -45,7 +45,7 @@ os.chdir(SHARED_DIR)
 from bcc import BPF
 from verify_prog_run import (
     load_weights, build_frame, prog_test_run, _install_mac_table,
-    _seed_link_state, MODEL_PT, build_frame_dense, ref_infer_dense,
+    _seed_link_state, MODEL_PT,
 )
 
 PASS_RETVALS = frozenset({0, 4})
@@ -103,40 +103,6 @@ def synth_weights(layer_dims: list, seed: int) -> list:
     n = sum(n_in * n_out + n_out for (n_in, n_out) in layer_dims)
     rng = random.Random(seed)
     return [rng.randint(-30, 30) for _ in range(n)]
-
-
-def synth_weights_dense(n_in: int, hidden_dims, n_out: int, seed: int) -> list:
-    """Deterministic pseudo-random int8 weights for a synthetic dense-route
-    model of the given (n_in, hidden_dims, n_out) shape -- mirrors
-    synth_weights() above but for the flat layout generate_ebpf_hardcoded_dense
-    expects (no protocol-fixed n_in=65 assumption)."""
-    n_h1, n_h2 = hidden_dims
-    n = n_in*n_h1 + n_h1 + n_h1*n_h2 + n_h2 + n_h2*n_out + n_out
-    rng = random.Random(seed)
-    return [rng.randint(-30, 30) for _ in range(n)]
-
-
-def _check_dense(name, model_id, disp_fd, ps, cs, weights, n_in, n_out, hidden_dims, seed):
-    """Dense-route counterpart to _check(): the reference forward pass reads
-    a random feature vector directly (no ttl/ingress-iface/model_id derivation
-    -- that's the whole point of the dense route), matching
-    generate_ebpf_hardcoded_dense()'s payload-reading datapath."""
-    rng = random.Random(seed)
-    features = [rng.randint(-30, 30) for _ in range(n_in)]
-    ref_cls, ref_val = ref_infer_dense(weights, features, hidden_dims, n_out)
-    frame = build_frame_dense(model_id, features, 32, n_in, n_out)
-    _reset(ps, cs, n_cls=n_out)
-    retval, _ = prog_test_run(disp_fd, frame, repeat=1)
-    if ref_cls < n_out - 1:
-        got = _read_u64(cs, ref_cls)
-        ok = (retval in PASS_RETVALS) and got > 0
-    else:
-        got = _read_u64(ps, 2)
-        ok = (retval == 1) and got > 0
-    tag = "PASS" if ok else "FAIL"
-    print(f"  [{tag}] {name:10s} model_id={model_id} n_in={n_in:3d} n_out={n_out} "
-          f"ref_cls={ref_cls} ref_val={ref_val:>8} retval={retval} hit={got>0}")
-    return ok
 
 
 def _read_u64(table, key_val):
@@ -278,32 +244,6 @@ def test_modular():
     return ok
 
 
-def test_dense():
-    print("\n--- Pipeline 1 (dense route): 2 model_id, DIFFERENT n_in, same n_out/hidden_dims ---")
-    from ebpf_program import build_combined_hardcoded_dense_source
-    n_out, hidden_dims = 4, (4, 4)
-    n_in0, n_in1 = 10, 15
-    weights0 = synth_weights_dense(n_in0, hidden_dims, n_out, seed=42)
-    weights1 = synth_weights_dense(n_in1, hidden_dims, n_out, seed=99)
-
-    src = build_combined_hardcoded_dense_source(
-        [(0, weights0, 32, n_in0), (1, weights1, 32, n_in1)],
-        n_out=n_out, hidden_dims=hidden_dims)
-    b = BPF(text=src)
-    model0_fn = b.load_func("model_0", BPF.XDP)
-    model1_fn = b.load_func("model_1", BPF.XDP)
-    disp_fn   = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(0)] = ct.c_int(model0_fn.fd)
-    b["model_progs"][ct.c_int(1)] = ct.c_int(model1_fn.fd)
-    _install_mac_table(b, "mac_table", n_classes=n_out - 1)
-
-    ps, cs = b["pkt_stats"], b["cls_stats"]
-    ok = True
-    ok &= _check_dense("dense", 0, disp_fn.fd, ps, cs, weights0, n_in0, n_out, hidden_dims, seed=1)
-    ok &= _check_dense("dense", 1, disp_fn.fd, ps, cs, weights1, n_in1, n_out, hidden_dims, seed=2)
-    return ok
-
-
 def main():
     print("=" * 70)
     print(" IPA/eBPF multi-model concurrent registration -- design-space proof")
@@ -316,7 +256,6 @@ def main():
         "hardcoded": test_hardcoded(),
         "template":  test_template(),
         "modular":   test_modular(),
-        "dense":     test_dense(),
     }
     print()
     print("=" * 70)

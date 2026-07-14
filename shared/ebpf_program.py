@@ -13,35 +13,25 @@ Design space position:
     next-hop -- so the packet's Ethernet header is rewritten before
     leaving, not just its egress iface.
 
-Two scenario "kinds" (see shared/model_meta.py), both zero-weight-lookup
-and fully unrolled -- neither costs anything vs. the original fixed
-65-4-4-7 program when the default shape is used:
+Generic input vector (see shared/model_meta.py), zero-weight-lookup and
+fully unrolled -- costs nothing vs. the original fixed 65-4-4-7 program
+when the default descriptor is used:
 
-  "sparse" (generate_ebpf_hardcoded / build_combined_hardcoded_source):
-    generalizes the ORIGINAL encoding. The feature vector is still derived
-    from packet metadata (link_state map + ingress ifindex + ttl +
-    model_id), but n_interfaces/n_nodes (previously fixed at 6/52) are now
-    parameters:
-      N_IN  = 2*n_interfaces + 1 + n_nodes
-              (link_state[n_interfaces] + iface one-hot[n_interfaces]
-               + ttl[1] + node one-hot[n_nodes])
-      N_OUT = n_interfaces + 1        (n_interfaces egress classes + drop)
-    Defaults (n_interfaces=6, n_nodes=52) reproduce the historical
-    65-4-4-7 program byte-for-byte.
+  generate_ebpf_hardcoded / build_combined_hardcoded_source:
+    The input vector is built ON THE NODE from a per-model descriptor: an
+    ordered list of feature TYPES (from model_meta.FEATURE_CATALOG), each
+    read from its local source (packet TTL, link_state / queue_state maps,
+    ingress iface, node). A feature's SIZE is a per-node/per-network
+    property (model_meta node config), NOT a model parameter: link_state
+    has one slot per egress interface of the node, node one-hot one slot
+    per node in the network, etc. N_IN = sum of the sizes; N_OUT is the
+    number of output classes (last class = DROP). Different models may use
+    different feature-type SETS; each program builds only its own subset.
+    The default descriptor [link_state, ingress_iface, ttl, node] with node
+    config 6/52 reproduces the historical 65-4-4-7 program.
 
-  "dense" (generate_ebpf_hardcoded_dense / build_combined_hardcoded_dense_source):
-    no FRR-specific semantics assumed. n_in/n_out are declared directly by
-    the model (bounded by MAX_N_IN/MAX_N_OUT in model_meta.py). The actual
-    per-packet feature vector (already quantized to int8) is read straight
-    from the IPA packet PAYLOAD -- the same bytes that, in the sparse
-    route (and in P2/P3), carry an unused weight blob; the datapath never
-    reads that payload today, so repurposing it costs nothing. One bounds
-    check (`(void*)(ipa+1) + n_in > data_end`), then a fully-unrolled dot
-    product against hardcoded weights -- no map lookup at all (cheaper
-    than the sparse route's link_state reads).
-
-Stack budget (why the sparse route reads packet metadata sparsely instead
-of materializing a dense feature array):
+Stack budget (why the input vector is read sparsely instead of
+materializing a dense feature array):
   iv[65] as int array  -> 260B (too much)
   iv0..iv64 long long  -> 520B (exceeds 512B alone)
 
@@ -193,8 +183,8 @@ int ipa_switch_hardcoded(struct xdp_md *ctx) {
 
     /* Single tail call, no map lookup for weights, no intermediate state --
      * model_progs is indexed directly by the protocol's model_id byte.
-     * Shape-agnostic: works the same for any registered model, sparse or
-     * dense. */
+     * Descriptor-agnostic: works the same for any registered model, whatever
+     * feature set its input vector is built from. */
     __u32 mid = (__u32)ipa->model_id;
     model_progs.call(ctx, mid);
     return XDP_PASS;   /* reached only if model_id has no registered program */
@@ -202,31 +192,30 @@ int ipa_switch_hardcoded(struct xdp_md *ctx) {
 """
 
 
-def _build_header(n_interfaces: int, n_out: int, need_link_state: bool) -> str:
+def _build_header(dense_vector_maps: dict, n_out: int) -> str:
     """
     Build the map/struct declarations for a combined hardcoded source.
 
-    n_interfaces sizes link_state (sparse route only -- dense passes
-    need_link_state=False and this map is omitted entirely, since dense
-    inputs come from the packet payload, not from network-state maps).
+    dense_vector_maps: {map_name: size} for the map-backed feature types the
+    model(s) use (e.g. {"link_state": 6} for the default model, plus
+    "queue_state" for a model using queue_occupancy). Each becomes a
+    BPF_ARRAY the control plane seeds. A model that uses no map-backed
+    features passes {} (its whole input vector comes from the packet TTL
+    and one-hot indices).
     n_out sizes cls_stats and the mac_table capacity -- generalizes what
     used to be fixed at 7/8 respectively.
     """
-    if need_link_state:
-        link_state_decl = (
-            "/* link_state[i] = operational up/down of egress iface i (feature slots\n"
-            " * 0..n_interfaces-1). Written by the userspace carrier monitor\n"
-            " * (link_state_monitor.py); read here into the first n_interfaces\n"
-            " * feature-vector entries. 1 = link up, 0 = link down. This is the ONLY\n"
-            " * map read in the sparse-route inference path -- it is an INPUT feature,\n"
-            " * not a weight (weights remain C literals in both routes). */\n"
-            f"BPF_ARRAY(link_state, __u32, {n_interfaces});\n"
+    map_decls = ""
+    for map_name, size in sorted(dense_vector_maps.items()):
+        map_decls += (
+            f"/* {map_name}[i]: per-slot values for a dense_vector feature, written by\n"
+            f" * the userspace seeder ({map_name}_monitor.py / carrier monitor) and read\n"
+            f" * into the input vector. INPUT feature, not a weight. */\n"
+            f"BPF_ARRAY({map_name}, __u32, {size});\n"
         )
-    else:
-        link_state_decl = ""  # dense route: no network-state map, inputs come from the payload
     mac_capacity = max(8, n_out)
     return _COMMON_STRUCTS + f"""
-{link_state_decl}BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(no mac_table entry) [2]=drop */
+{map_decls}BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(no mac_table entry) [2]=drop */
 BPF_ARRAY(cls_stats,        __u64, {n_out});   /* per-class redirect counter */
 
 /* mac_table: egress class (the argmax output) -> {{ifindex, src/dst MAC}}.
@@ -252,10 +241,8 @@ def _gen_dense_layer(prev_terms: list, n_cur: int, w: list, b: list,
     Emit `n_cur` neurons of a fully-connected layer as single-expression C
     statements: out_prefix_j = RELU_LL(sum_i(prev_terms[i] * w[j,i]) + b[j]).
     `prev_terms` are pre-rendered C expressions for the previous layer's
-    activations (either `h*_i` locals or, for the dense route's first
-    layer, direct payload-byte reads) -- shared between the sparse route's
-    fc2/out stages and the dense route's fc1/fc2/out stages, since those
-    stages are identical once the previous layer's values are in hand.
+    activations (the `h*_i` locals) -- shared by the fc2 and output stages,
+    which are identical once the previous layer's values are in hand.
     """
     n_prev = len(prev_terms)
     lines = []
@@ -284,9 +271,8 @@ def _gen_argmax(n_out: int, out_prefix: str = "out") -> list:
 def _gen_action_epilogue(drop_cls_expr: str) -> str:
     """
     Shared post-argmax epilogue: class -> mac_table[class] -> MAC rewrite
-    -> bpf_redirect (or DROP if best_cls indicates the drop class).
-    Identical for the sparse and dense routes -- the action never assumed
-    anything about the feature encoding, only about `best_cls`.
+    -> bpf_redirect (or DROP if best_cls indicates the drop class). Never
+    assumes anything about the feature encoding, only about `best_cls`.
     """
     return f"""
     /* --- Action: class -> mac_table[class] -> MAC rewrite -> bpf_redirect --- */
@@ -339,7 +325,128 @@ _PACKET_PROLOGUE = r"""
 
 
 # ---------------------------------------------------------------------------
-# Sparse route: generalizes the original FRR feature encoding.
+# Per-feature C generators (the "catalog" of how each feature type in
+# model_meta.FEATURE_CATALOG is read locally and enters the fc1 dot product).
+# Each returns (preamble_lines, term_fn): `preamble_lines` are emitted once
+# (declarations / map reads / the single one-hot switch), `term_fn(j)` gives
+# the C expression for that feature's contribution to hidden neuron j.
+#
+# Weight layout: for hidden neuron j, feature f's weights occupy
+# fc1_w[j*n_in + offset .. offset+size-1], where `offset` is the running sum
+# of the sizes of the features before it in the descriptor (so the flat
+# weight order matches the descriptor order the model was trained on).
+#
+# A feature type appears at most once per descriptor (enforced in
+# model_meta._validate_descriptor), so these per-type variable names
+# (_ttl, _iface, _node, ls*, qs*, w_iface_j, w_node_j) never collide.
+# ---------------------------------------------------------------------------
+_SCALAR_SOURCE = {
+    # type -> (C var name, C expression reading it from the packet in transit)
+    "ttl": ("_ttl", "((__u32)ip->ttl) & 0xff"),
+}
+_DENSEVEC_SOURCE = {
+    # type -> (C var prefix, BPF map name holding the per-slot values)
+    "link_state":      ("ls", "link_state"),
+    "queue_occupancy": ("qs", "queue_state"),
+}
+
+
+def _gen_feature_scalar(feat, offset, n_in, fc1_w, n_h1):
+    var, expr = _SCALAR_SOURCE[feat["type"]]
+    preamble = [f"    __u32 {var} = {expr};   /* feature '{feat['type']}' (scalar) */"]
+    def term(j):
+        return f"(__s64){var} * {_lit(fc1_w[j * n_in + offset])}LL"
+    return preamble, term
+
+
+def _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1):
+    prefix, map_name = _DENSEVEC_SOURCE[feat["type"]]
+    size = feat["size"]
+    lines = [
+        f"    /* feature '{feat['type']}': {size} values read once from map {map_name} */",
+        "    long long " + ", ".join(f"{prefix}{i}=0LL" for i in range(size)) + ";",
+        "    { int _k; __u32 *_p;",
+    ]
+    for i in range(size):
+        lines.append(
+            f"       _k={i}; _p={map_name}.lookup(&_k); if (_p) {prefix}{i}=(long long)(*_p);")
+    lines.append("    }")
+    def term(j):
+        return " + ".join(
+            f"{prefix}{i} * {_lit(fc1_w[j * n_in + offset + i])}LL" for i in range(size))
+    return lines, term
+
+
+def _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
+    """ingress-iface one-hot: exactly one active logical port (1..size), the
+    weight switch selects fc1_w[j, offset + (port-1)]. One switch total (not
+    per neuron) -- verifier-safe (see module docstring / prof_Notes.md #8)."""
+    size = feat["size"]
+    lines = ["    /* feature 'ingress_iface' (one-hot): raw ifindex -> logical 1..size */",
+             "    __u32 _iface = 0U;",
+             "    switch (ctx->ingress_ifindex) {"]
+    seen = set()
+    for logical_idx, kern in enumerate(ifindex_table[:size], start=1):
+        ki = int(kern)
+        if ki in seen:
+            continue
+        seen.add(ki)
+        lines.append(f"        case {ki}U: _iface = {logical_idx}U; break;")
+    lines.append("        default: break;")
+    lines.append("    }")
+    for j in range(n_h1):
+        lines.append(f"    long long w_iface_{j} = 0LL;")
+    lines.append("    switch (_iface) {")
+    for k in range(1, size + 1):
+        assigns = " ".join(
+            f"w_iface_{j} = {_lit(fc1_w[j * n_in + offset + (k - 1)])}LL;" for j in range(n_h1))
+        lines.append(f"        case {k}: {assigns} break;")
+    lines.append("        default: break;")
+    lines.append("    }")
+    def term(j):
+        return f"w_iface_{j}"
+    return lines, term
+
+
+def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1):
+    """node one-hot: active index = model_id (0..size-1), weight switch selects
+    fc1_w[j, offset + node]. One switch total, verifier-safe."""
+    size = feat["size"]
+    lines = ["    /* feature 'node' (one-hot): active index = model_id */",
+             "    __u32 _node = (__u32)ipa->model_id;  /* switch default zeroes out-of-range */"]
+    for j in range(n_h1):
+        lines.append(f"    long long w_node_{j} = 0LL;")
+    lines.append("    switch (_node) {")
+    for k in range(size):
+        assigns = " ".join(
+            f"w_node_{j} = {_lit(fc1_w[j * n_in + offset + k])}LL;" for j in range(n_h1))
+        lines.append(f"        case {k}: {assigns} break;")
+    lines.append("        default: break;")
+    lines.append("    }")
+    def term(j):
+        return f"w_node_{j}"
+    return lines, term
+
+
+def _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
+    """Dispatch to the right per-kind generator for one descriptor entry."""
+    t = feat["type"]
+    kind = _model_meta.FEATURE_CATALOG[t]["kind"]
+    if kind == "scalar":
+        return _gen_feature_scalar(feat, offset, n_in, fc1_w, n_h1)
+    if kind == "dense_vector_map":
+        return _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1)
+    if kind == "onehot":
+        if t == "ingress_iface":
+            return _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1, ifindex_table)
+        if t == "node":
+            return _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1)
+    raise ValueError(f"no C generator for feature type {t!r} (kind {kind!r})")
+
+
+# ---------------------------------------------------------------------------
+# Sparse route: builds the input vector locally on the node, feature by
+# feature, from a per-model descriptor (model_meta.FEATURE_CATALOG).
 # ---------------------------------------------------------------------------
 def generate_ebpf_hardcoded(
     weights_int8: list,
@@ -350,50 +457,63 @@ def generate_ebpf_hardcoded(
     n_interfaces: int = 6,
     n_nodes: int = 52,
     hidden_dims: tuple = (4, 4),
+    features: list = None,
+    n_out: int = None,
 ) -> str:
     """
     Generate an eBPF XDP program, function name `model_<model_id>`, for
     model `model_id`. Reachable only via a tail call from
     EBPF_HARDCODED_DISPATCHER's `model_progs[model_id]`.
 
-    n_interfaces/n_nodes replace the historical fixed 6/52 -- the feature
-    vector is N_IN = 2*n_interfaces + 1 + n_nodes wide (link_state +
-    iface one-hot + ttl + node one-hot), N_OUT = n_interfaces + 1 (egress
-    classes + drop). Defaults reproduce the original 65-4-4-7 shape
-    byte-for-byte. hidden_dims = (n_h1, n_h2).
+    The input vector is built locally on the node from a per-model
+    *descriptor* (`features`): an ordered list of {"type","size"} entries,
+    each a feature type from model_meta.FEATURE_CATALOG read from its local
+    source (packet TTL, link_state / queue_state maps, ingress iface, node).
+    N_IN = sum of the sizes; N_OUT is the number of output classes (last
+    class = DROP). hidden_dims = (n_h1, n_h2).
+
+    Backward compatibility: if `features` is None, a default descriptor is
+    built from n_interfaces/n_nodes in the historical order
+    [link_state, ingress_iface, ttl, node] with n_out = n_interfaces+1, so
+    the checked-in 65-4-4-7 model still generates a functionally identical
+    program. (`n_out` is required when `features` is given explicitly.)
 
     After argmax the program:
       - resolves the action via mac_table[best_cls] -> {ifindex, src_mac, dst_mac}
-      - cls < n_interfaces: rewrites eth->h_source/h_dest, bpf_redirect(ifindex, 0)
+      - cls < n_out-1: rewrites eth->h_source/h_dest, bpf_redirect(ifindex, 0)
                  -> pkt_stats[0]++, cls_stats[cls]++
-      - cls < n_interfaces but mac_table has no entry: pkt_stats[1]++, XDP_PASS
-      - cls == n_interfaces:  XDP_DROP    -> pkt_stats[2]++
+      - cls < n_out-1 but mac_table has no entry: pkt_stats[1]++, XDP_PASS
+      - cls == n_out-1:  XDP_DROP    -> pkt_stats[2]++
       - inference always runs (pure hardcoded, no cache gate)
       - mac_table itself is populated by the CALLER (method4_hardcoded.py)
 
-    ifindex_table: list of up to n_interfaces integers mapping cls
-                   0..n_interfaces-1 to kernel ifindex, used for the INPUT
-                   ingress-iface one-hot feature. Defaults to
-                   [2, 3, ..., n_interfaces+1].
-
-    include_header: True returns header+body (a standalone compilable
-      source). False returns only the function body, for concatenating
-      several models + EBPF_HARDCODED_DISPATCHER into one compilation unit
-      (see build_combined_hardcoded_source).
+    ifindex_table: kernel ifindex -> logical port mapping for the
+                   ingress_iface one-hot feature (if present in the
+                   descriptor). Defaults to [2, 3, ...].
     """
     n_h1, n_h2 = hidden_dims
-    n_in  = 2 * n_interfaces + 1 + n_nodes
-    n_out = n_interfaces + 1
-    n_weights = n_in * n_h1 + n_h1 + n_h1 * n_h2 + n_h2 + n_h2 * n_out + n_out
 
+    if features is None:
+        _shape = _model_meta.derive_shape({"n_interfaces": n_interfaces, "n_nodes": n_nodes})
+        features = _shape["features"]
+        n_out = _shape["n_out"]
+    if n_out is None:
+        raise ValueError("generate_ebpf_hardcoded: n_out is required when 'features' is given")
+    _model_meta._validate_feature_types([f["type"] for f in features])
+
+    n_in = sum(f["size"] for f in features)
+    n_weights = n_in * n_h1 + n_h1 + n_h1 * n_h2 + n_h2 + n_h2 * n_out + n_out
     if len(weights_int8) != n_weights:
         raise ValueError(f"Expected {n_weights} weights, got {len(weights_int8)}")
 
+    # ifindex_table sized to the ingress_iface feature (if any); default
+    # [2,3,...]. For a descriptor without ingress_iface it is unused.
+    iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
     if ifindex_table is None:
-        ifindex_table = list(range(2, 2 + n_interfaces))
-    ifindex_table = list(ifindex_table[:n_interfaces])
-    if len(ifindex_table) < n_interfaces:
-        ifindex_table += [2] * (n_interfaces - len(ifindex_table))
+        ifindex_table = list(range(2, 2 + max(iface_size, 1)))
+    ifindex_table = list(ifindex_table[:max(iface_size, 1)])
+    while len(ifindex_table) < iface_size:
+        ifindex_table.append(2)
 
     w = weights_int8
     fc1_w = w[0             : n_in*n_h1]
@@ -405,61 +525,23 @@ def generate_ebpf_hardcoded(
     out_w = w[base3         : base3 + n_h2*n_out]
     out_b = w[base3+n_h2*n_out : base3+n_h2*n_out+n_out]
 
+    # --- fc1: build the IV feature by feature, in descriptor order ---
+    # Running weight offset per feature; each feature emits its preamble
+    # (declarations / map reads / the single one-hot switch) and a term_fn(j)
+    # for its contribution to hidden neuron j.
     fc1_lines = []
-    fc1_lines.append("    /* fc1: only 3 live features -- ttl, iface one-hot, node one-hot */")
-    fc1_lines.append("    __u32 _ttl  = ((__u32)ip->ttl) & 0xff;")
-    fc1_lines.append("    __u32 _node = (__u32)ipa->model_id;  /* switch default zeroes anything outside 0..n_nodes-1 */")
-
-    fc1_lines.append("    /* FIX(#5): map raw kernel ifindex -> logical 1..n_interfaces for one-hot */")
-    fc1_lines.append("    __u32 _iface = 0U;")
-    fc1_lines.append("    switch (ctx->ingress_ifindex) {")
-    _seen_ifindex = set()
-    for logical_idx, kern_ifindex in enumerate(ifindex_table, start=1):
-        ki = int(kern_ifindex)
-        if ki in _seen_ifindex:
-            continue
-        _seen_ifindex.add(ki)
-        fc1_lines.append(f"        case {ki}U: _iface = {logical_idx}U; break;")
-    fc1_lines.append("        default: break;")
-    fc1_lines.append("    }")
+    term_fns  = []
+    offset = 0
+    for feat in features:
+        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table)
+        fc1_lines.extend(pre)
+        term_fns.append(term)
+        offset += feat["size"]
 
     for j in range(n_h1):
-        fc1_lines.append(f"    long long w_iface_{j} = 0LL, w_node_{j} = 0LL;")
-
-    fc1_lines.append("    switch (_iface) {")
-    for iface in range(1, n_interfaces + 1):
-        assigns = " ".join(
-            f"w_iface_{j} = {_lit(fc1_w[j * n_in + n_interfaces - 1 + iface])}LL;"
-            for j in range(n_h1)
-        )
-        fc1_lines.append(f"        case {iface}: {assigns} break;")
-    fc1_lines.append("        default: break;")
-    fc1_lines.append("    }")
-
-    fc1_lines.append("    switch (_node) {")
-    for node in range(n_nodes):
-        assigns = " ".join(
-            f"w_node_{j} = {_lit(fc1_w[j * n_in + 2*n_interfaces + 1 + node])}LL;"
-            for j in range(n_h1)
-        )
-        fc1_lines.append(f"        case {node}: {assigns} break;")
-    fc1_lines.append("        default: break;")
-    fc1_lines.append("    }")
-
-    for j in range(n_h1):
-        w_ttl = int(fc1_w[j * n_in + 2 * n_interfaces])
-        b_j   = int(fc1_b[j])
-        ls_terms = " + ".join(
-            f"ls{i} * {_lit(fc1_w[j * n_in + i])}LL" for i in range(n_interfaces)
-        )
+        terms = " + ".join(tf(j) for tf in term_fns)
         fc1_lines.append(
-            f"    long long h1_{j} = RELU_LL("
-            f"(__s64)_ttl * {_lit(w_ttl)}LL"
-            f" + w_iface_{j}"
-            f" + w_node_{j}"
-            f" + {ls_terms}"
-            f" + {_lit(b_j)}LL);"
-        )
+            f"    long long h1_{j} = RELU_LL({terms} + {_lit(fc1_b[j])}LL);")
 
     h1_names = [f"h1_{j}" for j in range(n_h1)]
     fc2_lines  = _gen_dense_layer(h1_names, n_h2, fc2_w, fc2_b, "h2", relu=True)
@@ -467,20 +549,14 @@ def generate_ebpf_hardcoded(
     out_lines  = _gen_dense_layer(h2_names, n_out, out_w, out_b, "out", relu=False)
     argmax_lines = _gen_argmax(n_out)
 
-    ls_read_lines = ["    long long " + ", ".join(f"ls{i}=0LL" for i in range(n_interfaces)) + ";"]
-    ls_read_lines.append("    { int _lk; __u32 *_lp;")
-    for i in range(n_interfaces):
-        ls_read_lines.append(
-            f"       _lk={i}; _lp=link_state.lookup(&_lk); if (_lp) ls{i}=(long long)(*_lp);"
-        )
-    ls_read_lines.append("    }")
-
     fc1_src    = "\n".join(fc1_lines)
     fc2_src    = "\n".join(fc2_lines)
     out_src    = "\n".join(out_lines)
     argmax_src = "\n".join(argmax_lines)
-    ls_src     = "\n".join(ls_read_lines)
-    epilogue   = _gen_action_epilogue(f"best_cls >= {n_interfaces}")
+    epilogue   = _gen_action_epilogue(f"best_cls >= {n_out - 1}")
+
+    shape_str = "-".join(str(f["size"]) for f in features) + f" -> {n_in}-{n_h1}-{n_h2}-{n_out}"
+    feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in features)
 
     fn_name = f"model_{model_id}"
     body = f"""
@@ -491,9 +567,7 @@ int {fn_name}(struct xdp_md *ctx) {{
     __u16 scale = {scale}U;
     if (scale == 0) return XDP_PASS;
 
-    /* link_state[0..{n_interfaces-1}]: egress up/down read from map into feature slots. */
-{ls_src}
-
+    /* Input vector built locally, features: {feats_str} */
 {fc1_src}
 
 {fc2_src}
@@ -505,9 +579,20 @@ int {fn_name}(struct xdp_md *ctx) {{
 """
     src = body if not include_header else (
         f"/* Pipeline 1 (sparse) — model_id={model_id}, scale={scale}, "
-        f"shape={n_in}-{n_h1}-{n_h2}-{n_out} */\n" + body
+        f"features=[{feats_str}], shape={shape_str} */\n" + body
     )
     return src
+
+
+def _dense_vector_maps_for(features: list) -> dict:
+    """{map_name: size} for the map-backed feature types in a descriptor --
+    the BPF maps _build_header must declare and the control plane must seed."""
+    dvmaps = {}
+    for f in features:
+        entry = _model_meta.FEATURE_CATALOG[f["type"]]
+        if entry["kind"] == "dense_vector_map":
+            dvmaps[entry["map"]] = f["size"]
+    return dvmaps
 
 
 def build_combined_hardcoded_source(
@@ -515,132 +600,43 @@ def build_combined_hardcoded_source(
     n_interfaces: int = 6,
     n_nodes: int = 52,
     hidden_dims: tuple = (4, 4),
+    features: list = None,
+    n_out: int = None,
 ) -> str:
     """
     models: list of (model_id, weights_int8, scale, ifindex_table) tuples,
-    all sharing the same (n_interfaces, n_nodes, hidden_dims) shape (mixing
-    shapes in one compiled object isn't meaningful -- each shape needs its
-    own map sizes; register differently-shaped models via separate BPF
-    objects/method4_hardcoded.py runs instead).
+    all sharing the same feature descriptor / n_out / hidden_dims (the map
+    sizes and cls range are shared by the whole compiled object; register
+    differently-shaped models via separate method4_hardcoded.py runs).
 
-    Returns one compilation unit: header (incl. model_progs) + dispatcher +
-    one model_<id> function per entry in `models`. Caller loads
-    "ipa_switch_hardcoded" as the XDP entry point, loads each "model_<id>",
-    and wires model_progs[model_id] = model_<id>.fd.
+    Feature descriptor: pass `features` (+ `n_out`) for a heterogeneous
+    feature set, or leave them None to build the historical default
+    descriptor from n_interfaces/n_nodes (n_out = n_interfaces+1) -- keeps
+    every existing caller (tests, benches) working unchanged.
+
+    Returns one compilation unit: header (incl. the dense_vector maps the
+    descriptor needs + model_progs) + dispatcher + one model_<id> function
+    per entry in `models`.
     """
-    n_out = n_interfaces + 1
-    src = _build_header(n_interfaces, n_out, need_link_state=True) + "\n" + EBPF_HARDCODED_DISPATCHER
+    if features is None:
+        _shape = _model_meta.derive_shape({"n_interfaces": n_interfaces, "n_nodes": n_nodes})
+        features = _shape["features"]
+        n_out = _shape["n_out"]
+    if n_out is None:
+        raise ValueError("build_combined_hardcoded_source: n_out required when 'features' is given")
+
+    dvmaps = _dense_vector_maps_for(features)
+    src = _build_header(dvmaps, n_out) + "\n" + EBPF_HARDCODED_DISPATCHER
     for model_id, weights_int8, scale, ifindex_table in models:
         src += "\n" + generate_ebpf_hardcoded(
             weights_int8, scale, model_id, ifindex_table, include_header=False,
-            n_interfaces=n_interfaces, n_nodes=n_nodes, hidden_dims=hidden_dims)
+            hidden_dims=hidden_dims, features=features, n_out=n_out)
     return src
 
 
 # ---------------------------------------------------------------------------
-# Dense route: no FRR-specific semantics -- feature vector read straight
-# from the IPA packet payload, n_in/n_out declared by the model.
-# ---------------------------------------------------------------------------
-def generate_ebpf_hardcoded_dense(
-    weights_int8: list,
-    scale: int,
-    model_id: int = 0,
-    n_in: int = 10,
-    n_out: int = 4,
-    hidden_dims: tuple = (4, 4),
-    include_header: bool = True,
-) -> str:
-    """
-    Generate an eBPF XDP program, function name `model_<model_id>`, for a
-    "dense-generic" scenario model: the per-packet feature vector (int8,
-    length n_in) is read directly from the IPA payload -- no link_state
-    map, no ttl/ingress-iface/model_id feature derivation. n_out is a
-    plain argmax width (no implicit "classes + drop" meaning is assumed
-    by the datapath itself; by convention the last class, n_out-1, is
-    still treated as DROP so the action epilogue matches the sparse
-    route/mac_table semantics -- see _gen_action_epilogue()).
-
-    Bounds check: one comparison against data_end covers the whole n_in-byte
-    read (same idiom already used for struct ipa_hdr itself), then each
-    feat[i] access is a plain constant-offset byte read -- no per-byte
-    re-check needed, and no map lookup at all (cheaper than the sparse
-    route's link_state reads).
-    """
-    n_h1, n_h2 = hidden_dims
-    n_weights = n_in * n_h1 + n_h1 + n_h1 * n_h2 + n_h2 + n_h2 * n_out + n_out
-    if len(weights_int8) != n_weights:
-        raise ValueError(f"Expected {n_weights} weights, got {len(weights_int8)}")
-
-    w = weights_int8
-    fc1_w = w[0             : n_in*n_h1]
-    fc1_b = w[n_in*n_h1     : n_in*n_h1 + n_h1]
-    base2 = n_in*n_h1 + n_h1
-    fc2_w = w[base2         : base2 + n_h1*n_h2]
-    fc2_b = w[base2+n_h1*n_h2 : base2+n_h1*n_h2+n_h2]
-    base3 = base2 + n_h1*n_h2 + n_h2
-    out_w = w[base3         : base3 + n_h2*n_out]
-    out_b = w[base3+n_h2*n_out : base3+n_h2*n_out+n_out]
-
-    feat_terms = [f"(long long)(__s8)_feat[{i}]" for i in range(n_in)]
-    fc1_lines  = _gen_dense_layer(feat_terms, n_h1, fc1_w, fc1_b, "h1", relu=True)
-    h1_names   = [f"h1_{j}" for j in range(n_h1)]
-    fc2_lines  = _gen_dense_layer(h1_names, n_h2, fc2_w, fc2_b, "h2", relu=True)
-    h2_names   = [f"h2_{j}" for j in range(n_h2)]
-    out_lines  = _gen_dense_layer(h2_names, n_out, out_w, out_b, "out", relu=False)
-    argmax_lines = _gen_argmax(n_out)
-
-    fc1_src    = "\n".join(fc1_lines)
-    fc2_src    = "\n".join(fc2_lines)
-    out_src    = "\n".join(out_lines)
-    argmax_src = "\n".join(argmax_lines)
-    epilogue   = _gen_action_epilogue(f"best_cls >= {n_out - 1}")
-
-    fn_name = f"model_{model_id}"
-    body = f"""
-int {fn_name}(struct xdp_md *ctx) {{
-{_PACKET_PROLOGUE}
-    __u16 scale = {scale}U;
-    if (scale == 0) return XDP_PASS;
-
-    /* Dense-generic: feature vector is the payload itself, n_in={n_in}
-     * quantized int8 values, one bounds check covers all of them. */
-    __u8 *_feat = (__u8 *)(ipa + 1);
-    if ((void *)(_feat + {n_in}) > data_end) return XDP_PASS;
-
-{fc1_src}
-
-{fc2_src}
-
-{out_src}
-
-{argmax_src}
-{epilogue}}}
-"""
-    src = body if not include_header else (
-        f"/* Pipeline 1 (dense) — model_id={model_id}, scale={scale}, "
-        f"shape={n_in}-{n_h1}-{n_h2}-{n_out} */\n" + body
-    )
-    return src
-
-
-def build_combined_hardcoded_dense_source(models: list, n_out: int, hidden_dims: tuple = (4, 4)) -> str:
-    """
-    models: list of (model_id, weights_int8, scale, n_in) tuples, all
-    sharing the same n_out/hidden_dims (cls_stats/mac_table are sized by
-    n_out; different n_in per model is fine since each model_<id> function
-    declares its own bounds check independently).
-    """
-    src = _build_header(n_interfaces=0, n_out=n_out, need_link_state=False) + "\n" + EBPF_HARDCODED_DISPATCHER
-    for model_id, weights_int8, scale, n_in in models:
-        src += "\n" + generate_ebpf_hardcoded_dense(
-            weights_int8, scale, model_id, n_in=n_in, n_out=n_out,
-            hidden_dims=hidden_dims, include_header=False)
-    return src
-
-
-# ---------------------------------------------------------------------------
-# Loader: resolves a model's scenario metadata (shared/model_meta.py) and
-# dispatches to the sparse or dense generator.
+# Loader: resolves a model's descriptor (shared/model_meta.py) and generates
+# the combined hardcoded source.
 # ---------------------------------------------------------------------------
 def load_and_generate(
     model_path: str = "shared/frr_germany50_5_model_4x2.pt",
@@ -656,13 +652,14 @@ def load_and_generate(
 
     meta: optional model_meta dict (see model_meta.py); if None, loaded
     from model_meta.json next to model_path, defaulting to the historical
-    sparse/6/52/[4,4] shape when absent -- so existing callers that never
+    6/52 default descriptor when absent -- so existing callers that never
     heard of model_meta.json keep getting exactly today's behavior.
 
-    scenario == "dense" never touches FastRerouteMLP/torch (there is no
-    trained dense checkpoint format in this repo yet) -- it loads a flat
-    int8 weight list straight from weights.json/weights_float.json next to
-    model_path, matching whatever shape model_meta.json declares.
+    Weights come from torch/extract_weights ONLY for the default-descriptor
+    model (the trained 65-4-4-7 checkpoint). A model with an explicit
+    heterogeneous "features" descriptor has no trained checkpoint, so it
+    loads a flat int8 weight list straight from weights.json/weights_float.json
+    next to model_path (synthetic weights), never touching torch.
     """
     import json, os
 
@@ -673,47 +670,46 @@ def load_and_generate(
     weights_float_path = os.path.join(model_dir, "weights_float.json")
     weights_plain_path = os.path.join(model_dir, "weights.json")
 
-    if meta.get("scenario", "sparse") == "dense":
+    def _load_weights_from_json():
         from extract_weights import _load_from_json
         if os.path.exists(weights_float_path):
             with open(weights_float_path) as f:
-                scale = int(json.load(f).get("scale_factor", meta.get("scale_factor", 128)))
-            weights_int8 = _load_from_json(weights_float_path)
-        elif os.path.exists(weights_plain_path):
-            scale = int(meta.get("scale_factor", 128))
-            weights_int8 = _load_from_json(weights_plain_path)
-        else:
-            raise FileNotFoundError(
-                f"dense scenario needs weights.json or weights_float.json in {model_dir}")
-        ebpf_src = build_combined_hardcoded_dense_source(
-            [(model_id, weights_int8, scale, shape["n_in"])],
-            n_out=shape["n_out"], hidden_dims=tuple(shape["hidden_dims"]))
-        return ebpf_src, weights_int8, scale
+                sc = int(json.load(f).get("scale_factor", meta.get("scale_factor", 128)))
+            return _load_from_json(weights_float_path), sc
+        if os.path.exists(weights_plain_path):
+            return _load_from_json(weights_plain_path), int(meta.get("scale_factor", 128))
+        raise FileNotFoundError(
+            f"synthetic-shape model needs weights.json or weights_float.json in {model_dir}")
 
-    # scenario == "sparse" (default, backward compatible)
-    from extract_weights import extract_weights_int8
-    if os.path.exists(weights_float_path):
-        with open(weights_float_path) as f:
-            scale = int(json.load(f)["scale_factor"])
+    # A custom heterogeneous descriptor has no trained checkpoint -> synthetic
+    # weights from json; the default descriptor is the real trained 65-4-4-7
+    # model -> torch/extract_weights.
+    if meta.get("features"):
+        weights_int8, scale = _load_weights_from_json()
     else:
-        import torch
-        from FRR_model import FastRerouteMLP
-        m = FastRerouteMLP(n_interfaces=shape["n_interfaces"], n_nodes=shape["n_nodes"],
-                           hidden_dim=shape["hidden_dims"][0])
-        m.load_state_dict(torch.load(model_path))
-        floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
-        max_abs = max(abs(w) for w in floats)
-        scale   = int(127 / max_abs)
+        from extract_weights import extract_weights_int8
+        if os.path.exists(weights_float_path):
+            with open(weights_float_path) as f:
+                scale = int(json.load(f)["scale_factor"])
+        else:
+            import torch
+            from FRR_model import FastRerouteMLP
+            m = FastRerouteMLP(n_interfaces=shape["n_interfaces"], n_nodes=shape["n_nodes"],
+                               hidden_dim=shape["hidden_dims"][0])
+            m.load_state_dict(torch.load(model_path))
+            floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
+            max_abs = max(abs(w) for w in floats)
+            scale   = int(127 / max_abs)
+        weights_int8 = extract_weights_int8(
+            model_path,
+            n_interfaces=shape["n_interfaces"],
+            n_nodes=shape["n_nodes"],
+            hidden_dim=shape["hidden_dims"][0],
+        )
 
-    weights_int8 = extract_weights_int8(
-        model_path,
-        n_interfaces=shape["n_interfaces"],
-        n_nodes=shape["n_nodes"],
-        hidden_dim=shape["hidden_dims"][0],
-    )
     ebpf_src = build_combined_hardcoded_source(
         [(model_id, weights_int8, scale, ifindex_table)],
-        n_interfaces=shape["n_interfaces"], n_nodes=shape["n_nodes"],
+        features=shape["features"], n_out=shape["n_out"],
         hidden_dims=tuple(shape["hidden_dims"]))
     return ebpf_src, weights_int8, scale
 

@@ -165,10 +165,12 @@ if __name__ == "__main__":
     with open(os.path.join(SHARED_DIR, "weights_float.json"), "w") as f:
         json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
 
-    # model_meta.json: scenario shape metadata (see model_meta.py) so codegen
-    # can derive N_IN/N_OUT instead of assuming the fixed 65/7 constants.
+    # model_meta.json: per-node feature dimensions so codegen can derive
+    # N_IN/N_OUT instead of assuming the fixed 65/7 constants. No explicit
+    # "features" list -> the default descriptor [link_state, ingress_iface,
+    # ttl, node] with n_out = n_interfaces+1 (see model_meta.derive_shape),
+    # i.e. exactly the historical 65-4-4-7 model.
     model_meta = {
-        "scenario": "sparse",
         "n_interfaces": N_INTERFACES,
         "n_nodes": N_NODES,
         "hidden_dims": [HIDDEN_DIM, HIDDEN_DIM],
@@ -178,4 +180,4 @@ if __name__ == "__main__":
 
     print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
     print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
-    print(f"Saved scenario metadata -> model_meta.json: {model_meta}")
+    print(f"Saved feature metadata -> model_meta.json: {model_meta}")

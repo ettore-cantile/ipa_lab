@@ -14,16 +14,12 @@
 #   - /shared mounted on both nodes
 #
 # Usage:
-#   bash shared/test/test_kathara_send_recv.sh [N_PKTS] [METHOD] [MODEL_ID] [SCENARIO]
+#   bash shared/test/test_kathara_send_recv.sh [N_PKTS] [METHOD] [MODEL_ID]
 #   bash shared/test/test_kathara_send_recv.sh 20 hardcoded 42
 #   bash shared/test/test_kathara_send_recv.sh 50 template  42
 #   bash shared/test/test_kathara_send_recv.sh 50 modular   42
-#   bash shared/test/test_kathara_send_recv.sh 20 hardcoded 5 dense
-#     (SCENARIO=dense: darmstadt must run method4_hardcoded.py --scenario dense
-#      with a model_meta.json declaring n_in/n_out -- see model_meta.py. Every
-#      packet carries a real feature vector, not just a header.)
 #
-# Default: 20 packets, hardcoded method, model_id=42, scenario=sparse
+# Default: 20 packets, hardcoded method, model_id=42
 # =============================================================================
 
 set -euo pipefail
@@ -31,7 +27,6 @@ set -euo pipefail
 N_PKTS="${1:-20}"
 METHOD="${2:-hardcoded}"
 MODEL_ID="${3:-42}"
-SCENARIO="${4:-sparse}"
 MIN_DELIVERY=80   # minimum expected packet delivery percentage
 RECV_TIMEOUT=30   # recv timeout in seconds
 LOG_DIR="/tmp/ipa_test_logs"
@@ -44,7 +39,7 @@ NC="\033[0m"
 mkdir -p "${LOG_DIR}"
 
 echo -e "${COLOR_YELLOW}=== KATHARA SEND/RECV TEST ===${NC}"
-echo "  Packets: ${N_PKTS} | Method: ${METHOD} | model_id: ${MODEL_ID} | scenario: ${SCENARIO}"
+echo "  Packets: ${N_PKTS} | Method: ${METHOD} | model_id: ${MODEL_ID}"
 echo "  Minimum expected delivery: ${MIN_DELIVERY}%"
 echo ""
 
@@ -70,13 +65,7 @@ echo "[Step 2] Checking eBPF pipeline on darmstadt..."
 if ! kathara exec darmstadt -- bash -c 'bpftool prog list 2>/dev/null | grep -q xdp' 2>/dev/null; then
     echo -e "${COLOR_YELLOW}[WARN]${NC} No XDP program detected on darmstadt."
     echo "  Load the pipeline with:"
-    if [ "${SCENARIO}" = "dense" ]; then
-        echo "    kathara exec darmstadt -- python3 /shared/methods/method4_hardcoded.py \\"
-        echo "        --scenario dense --model-id ${MODEL_ID} \\"
-        echo "        --model /shared/test/fixtures/dense_10_4_4_4/model.pt"
-    else
-        echo "    kathara exec darmstadt -- python3 /shared/execute_pipeline.py --method ${METHOD} --model-id ${MODEL_ID}"
-    fi
+    echo "    kathara exec darmstadt -- python3 /shared/execute_pipeline.py --method ${METHOD} --model-id ${MODEL_ID}"
     echo ""
     # Not blocking: could be an environment without bpftool but with XDP active
 else
@@ -108,22 +97,12 @@ echo ""
 # ---------------------------------------------------------------------------
 # Step 4: send packets from darmstadt
 # ---------------------------------------------------------------------------
-echo "[Step 4] Sending ${N_PKTS} IPA packets from darmstadt (scenario=${SCENARIO})..."
-if [ "${SCENARIO}" = "dense" ]; then
-    kathara exec darmstadt -- python3 /shared/test/test_ipa.py \
-        --dest frankfurt \
-        --count "${N_PKTS}" \
-        --model-id "${MODEL_ID}" \
-        --scenario dense \
-        --model-meta /shared/test/fixtures/dense_10_4_4_4/model_meta.json \
-        --delay 0.05
-else
-    kathara exec darmstadt -- python3 /shared/test/test_ipa.py \
-        --dest frankfurt \
-        --count "${N_PKTS}" \
-        --model-id "${MODEL_ID}" \
-        --delay 0.05
-fi
+echo "[Step 4] Sending ${N_PKTS} IPA packets from darmstadt..."
+kathara exec darmstadt -- python3 /shared/test/test_ipa.py \
+    --dest frankfurt \
+    --count "${N_PKTS}" \
+    --model-id "${MODEL_ID}" \
+    --delay 0.05
 echo ""
 
 # ---------------------------------------------------------------------------

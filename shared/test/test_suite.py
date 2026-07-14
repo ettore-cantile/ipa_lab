@@ -1046,21 +1046,14 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         return True
     import resource
     mp = model_path or V.MODEL_PT
-    # Dense route (Pipeline 1, generic input/output shape) uses a fixture
-    # directory (model_meta.json + weights.json, see model_meta.py) instead
-    # of a .pt checkpoint -- there is no trained dense model in the repo,
-    # only the synthetic shape used to prove the mechanism (see
-    # shared/test/fixtures/dense_10_4_4_4/).
-    dense_dir = os.path.join(SHARED_DIR, "test", "fixtures", "dense_10_4_4_4")
     methods = [
-        ("hardcoded", V.setup_hardcoded, 1, False),
-        ("template",  V.setup_template,  2, False),
-        ("modular",   V.setup_modular,   3, False),
-        ("dense",     lambda mid, _mp: V.setup_dense(mid, dense_dir), 1, True),
+        ("hardcoded", V.setup_hardcoded, 1),
+        ("template",  V.setup_template,  2),
+        ("modular",   V.setup_modular,   3),
     ]
     rows = []
     all_ok = True
-    for name, setup_fn, pl, is_dense in methods:
+    for name, setup_fn, pl in methods:
         try:
             setup = setup_fn(0, mp)
         except PermissionError:
@@ -1084,11 +1077,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
                 jit_total += (jb or 0)
                 per_prog.append((pname, ic))
         disp_fd = setup["disp"].fd
-        if is_dense:
-            shape = setup["shape"]
-            frame = V.build_frame_dense(0, [0] * shape["n_in"], setup["scale"], shape["n_in"], shape["n_out"])
-        else:
-            frame = V.build_frame(0, ttl_max, setup["scale"])
+        frame = V.build_frame(0, ttl_max, setup["scale"])
         try:
             V.prog_test_run(disp_fd, frame, repeat=1000)
         except OSError as e:
@@ -1114,7 +1103,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         if n_tail is None:
             n_tail = max(0, len(setup.get("progs", {})) - 1)
         try:
-            lookups = V.count_lookups(name, 0, dense_dir if is_dense else mp)
+            lookups = V.count_lookups(name, 0, mp)
         except Exception as e:
             info(f"{name}: map-lookup count skipped ({e})")
             lookups = None
@@ -1146,18 +1135,13 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         info(f"{r['name']:9s} programs: {detail}")
     if verify:
         print()
-        for name, _, _, is_dense in methods:
+        for name, _, _ in methods:
             try:
-                if is_dense:
-                    failed = V.run_dense(dense_dir, 0, n_vectors=20, repeat=1000)
-                    range_str = "20 random feature vectors"
-                else:
-                    failed = V.run(name, 0, mp, ttl_min, ttl_max, repeat=1000)
-                    range_str = f"TTL {ttl_min}-{ttl_max}"
+                failed = V.run(name, 0, mp, ttl_min, ttl_max, repeat=1000)
                 if failed == 0:
-                    ok(f"dispatch {name}: PASS ({range_str})")
+                    ok(f"dispatch {name}: PASS (TTL {ttl_min}-{ttl_max})")
                 else:
-                    fail(f"dispatch {name}: {failed} cases failed")
+                    fail(f"dispatch {name}: {failed} TTL failed")
                     all_ok = False
             except Exception as e:
                 fail(f"dispatch {name}: error ({e})")
