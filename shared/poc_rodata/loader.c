@@ -106,6 +106,50 @@ err:
     return -1;
 }
 
+// Per-packet latency + throughput via BPF_PROG_TEST_RUN (repeat=REPS): runs
+// the program REPS times in-kernel on one crafted frame and returns the mean
+// per-run duration. No interface, no flood -- safe on a small VM (unlike the
+// veth+pktgen path). opts.duration is nanoseconds per single run.
+static int bench_latency(const char *path, const signed char *weights,
+                         long *insns, double *ns_per_pkt, double *mpps) {
+    struct bpf_object *obj = bpf_object__open_file(path, NULL);
+    if (!obj || libbpf_get_error(obj)) { fprintf(stderr, "open %s\n", path); return -1; }
+    if (weights) {
+        struct bpf_map *ro = find_rodata(obj);
+        if (!ro) { fprintf(stderr, "no .rodata in %s\n", path); goto err; }
+        size_t vsz = bpf_map__value_size(ro);
+        unsigned char *buf = calloc(1, vsz);
+        memcpy(buf, weights, vsz < N_WEIGHTS ? vsz : N_WEIGHTS);
+        int e = bpf_map__set_initial_value(ro, buf, vsz);
+        free(buf);
+        if (e) { fprintf(stderr, "set_initial_value %d\n", e); goto err; }
+    }
+    if (bpf_object__load(obj)) { fprintf(stderr, "load %s\n", path); goto err; }
+    int fd = first_prog_fd(obj);
+
+    struct bpf_prog_info info; __u32 len = sizeof(info);
+    memset(&info, 0, sizeof(info));
+    if (bpf_obj_get_info_by_fd(fd, &info, &len) == 0)
+        *insns = info.xlated_prog_len / 8;
+
+    // one XDP frame: 128 bytes is enough for the prog's p[0..64] read
+    unsigned char in[128], out[256];
+    memset(in, 1, sizeof(in));    // nonzero input vector
+    LIBBPF_OPTS(bpf_test_run_opts, o,
+        .data_in = in, .data_size_in = sizeof(in),
+        .data_out = out, .data_size_out = sizeof(out),
+        .repeat = 1000000);
+    if (bpf_prog_test_run_opts(fd, &o)) { fprintf(stderr, "test_run %s\n", path); goto err; }
+    *ns_per_pkt = (double)o.duration;
+    *mpps = *ns_per_pkt > 0 ? 1000.0 / *ns_per_pkt : 0.0;   // 1e9/ns / 1e6
+
+    bpf_object__close(obj);
+    return 0;
+err:
+    bpf_object__close(obj);
+    return -1;
+}
+
 int main(int argc, char **argv) {
     const char *lit_o  = argc > 1 ? argv[1] : "nn_literal.o";
     const char *rod_o  = argc > 2 ? argv[2] : "nn_rodata.o";
@@ -121,18 +165,24 @@ int main(int argc, char **argv) {
     printf(" PoC: weights-as-literal vs weights-in-.rodata (65-4-4-7 XDP MLP)\n");
     printf("================================================================\n\n");
 
-    // (1) performance: xlated insn count, literal vs rodata (same weights).
-    double ms_lit = 0, ms_rod = 0;
-    long insn_lit = load_once(lit_o, NULL, &ms_lit);       // literals baked in .o
-    long insn_rod = load_once(rod_o, wa,   &ms_rod);       // weights injected
-    if (insn_lit < 0 || insn_rod < 0) return 1;
+    // (1) performance: xlated insns + REAL per-packet latency & throughput
+    // (BPF_PROG_TEST_RUN, repeat=1e6), literal vs rodata (same weights).
+    long insn_lit = -1, insn_rod = -1;
+    double ns_lit = 0, ns_rod = 0, mpps_lit = 0, mpps_rod = 0;
+    if (bench_latency(lit_o, NULL, &insn_lit, &ns_lit, &mpps_lit)) return 1;
+    if (bench_latency(rod_o, wa,   &insn_rod, &ns_rod, &mpps_rod)) return 1;
 
-    printf("[perf] xlated instructions (per-packet cost proxy):\n");
-    printf("   literal build : %5ld insns\n", insn_lit);
-    printf("   rodata  build : %5ld insns   (+%ld, %.1f%% vs literal)\n",
-           insn_rod, insn_rod - insn_lit,
-           100.0 * (insn_rod - insn_lit) / (double)insn_lit);
-    printf("   -> this gap is what moving weights to frozen .rodata costs.\n\n");
+    printf("[perf] per-packet cost (BPF_PROG_TEST_RUN, 1e6 reps):\n");
+    printf("   %-14s %10s %12s %10s\n", "build", "xlated", "latency", "throughput");
+    printf("   %-14s %10s %12s %10s\n", "", "insns", "ns/pkt", "Mpps");
+    printf("   %-14s %10ld %11.1f %10.2f\n", "literal", insn_lit, ns_lit, mpps_lit);
+    printf("   %-14s %10ld %11.1f %10.2f\n", "rodata",  insn_rod, ns_rod, mpps_rod);
+    printf("   delta          %+9ld %+10.1f%% %9.1f%%\n",
+           insn_rod - insn_lit,
+           100.0 * (ns_rod - ns_lit) / ns_lit,
+           100.0 * (mpps_rod - mpps_lit) / mpps_lit);
+    printf("   -> latency/throughput gap is the real cost of frozen .rodata\n");
+    printf("      weights vs baked literals (same code, volatile acc both).\n\n");
 
     // (2) redeploy without clang: reload nn_rodata.o with a DIFFERENT model.
     // Each iteration = open(.o) + inject weights + load. NO clang anywhere.
