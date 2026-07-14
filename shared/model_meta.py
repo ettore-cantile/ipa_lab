@@ -27,9 +27,9 @@ Two separate concerns:
     All models operating on ANY node of the same topology see the SAME size
     for the same feature type.
 
-    This is now read from topology_config.json on the node
-    (load_topology_config()). If that file doesn't exist the code falls back
-    to DEFAULT_TOPOLOGY_CONFIG (historical 6-interface / 52-node topology).
+    Read from topology_config.json at runtime via load_topology_config().
+    Falls back to DEFAULT_TOPOLOGY_CONFIG (historical 6-interface / 52-node
+    topology) when the file is absent.
 
     Any n_interfaces / n_nodes / n_queues keys present in a model's
     model_meta.json are IGNORED when a topology_config is supplied — they
@@ -57,7 +57,7 @@ import json
 import os
 
 # ---------------------------------------------------------------------------
-# Per-topology / per-network defaults
+# Per-topology / per-network defaults.
 # Overridden at runtime by topology_config.json (see load_topology_config()).
 # ---------------------------------------------------------------------------
 DEFAULT_TOPOLOGY_CONFIG = {
@@ -66,8 +66,8 @@ DEFAULT_TOPOLOGY_CONFIG = {
     "n_queues": 4,
 }
 
-# Keep the old name as an alias so any external code that imported
-# DEFAULT_NODE_CONFIG directly keeps working without changes.
+# Backward-compat alias — external code that imported DEFAULT_NODE_CONFIG
+# directly keeps working without changes.
 DEFAULT_NODE_CONFIG = DEFAULT_TOPOLOGY_CONFIG
 
 DEFAULT_META = {
@@ -85,7 +85,7 @@ MAX_N_OUT = 32
 # Feature catalog: the feature *types* the switch knows how to build locally.
 # Each entry declares:
 #   kind     -- how the feature enters the fc1 dot product (see below)
-#   dim_key  -- which topology_config entry gives its size (per-topology), OR
+#   dim_key  -- which topology_config key gives its size (per-topology), OR
 #   dim      -- a fixed size (scalars only)
 #   map      -- (dense_vector_map only) the BPF map holding its per-slot values
 #
@@ -95,7 +95,7 @@ MAX_N_OUT = 32
 #                        (sum_i vec[i]*w[j,o+i]).
 #   onehot            -- exactly one active index k in [0,size); a single
 #                        switch per feature (NOT per neuron) picks the weight
-#                        (w[j,o+k]) -- verifier-safe (prof_Notes.md section 8),
+#                        (w[j,o+k]) — verifier-safe (prof_Notes.md section 8),
 #                        the CFG stays O(size) instead of O(size^n_h1).
 #
 # The C generation for each kind lives in ebpf_program.py (_gen_feature_*).
@@ -147,7 +147,6 @@ def load_topology_config(path: str = "/etc/ipa/topology_config.json") -> dict:
         with open(path) as f:
             cfg = json.load(f)
         print(f"[topology_config] loaded from {path}: {cfg}")
-        # Merge with defaults so callers don't need to guard for missing keys
         merged = dict(DEFAULT_TOPOLOGY_CONFIG)
         merged.update(cfg)
         return merged
@@ -159,7 +158,7 @@ def load_topology_config(path: str = "/etc/ipa/topology_config.json") -> dict:
         return dict(DEFAULT_TOPOLOGY_CONFIG)
 
 
-# Keep the old name as an alias for backward compatibility.
+# Backward-compat alias.
 load_node_config = load_topology_config
 
 
@@ -180,8 +179,8 @@ def load_model_meta(model_path: str) -> dict:
 
     Note: n_interfaces / n_nodes / n_queues in model_meta.json are retained
     here for backward compatibility but are IGNORED by derive_shape() when
-    an explicit topology_config dict is supplied.  They are only used by the
-    legacy node_config_for() helper kept below.
+    an explicit topology_config is supplied — they are properties of the
+    network topology, not of the model.
     """
     meta = dict(DEFAULT_META)
     path = _meta_path_for(model_path)
@@ -192,23 +191,29 @@ def load_model_meta(model_path: str) -> dict:
     return meta
 
 
-def node_config_for(meta: dict) -> dict:
+def topology_config_for(meta: dict) -> dict:
     """[LEGACY] Resolve per-topology dimensions from a meta dict.
 
-    Kept for backward compatibility with code that calls derive_shape(meta)
-    without passing a topology_config.  New callers should use
-    load_topology_config() and pass the result to
-    derive_shape(meta, topology_config=...) explicitly.
+    Kept for backward compatibility with call sites that invoke
+    derive_shape(meta) without passing an explicit topology_config.
+    New callers should use load_topology_config() and pass the result
+    to derive_shape(meta, topology_config=...) directly.
 
-    Priority: DEFAULT_TOPOLOGY_CONFIG <- meta top-level keys <- meta["node_config"].
+    Priority (lowest to highest):
+      DEFAULT_TOPOLOGY_CONFIG
+      <- top-level n_interfaces / n_nodes / n_queues keys in meta
+      <- meta["topology_config"] sub-dict
     """
     cfg = dict(DEFAULT_TOPOLOGY_CONFIG)
     for k in ("n_interfaces", "n_nodes", "n_queues"):
         if k in meta:
             cfg[k] = meta[k]
-    cfg.update(meta.get("node_config", {}))
     cfg.update(meta.get("topology_config", {}))
     return cfg
+
+
+# Backward-compat alias.
+node_config_for = topology_config_for
 
 
 def feature_size(feature_type: str, topology_config: dict) -> int:
@@ -232,37 +237,35 @@ def _validate_feature_types(types: list) -> None:
         seen.add(t)
 
 
-def derive_shape(meta: dict, node_config: dict = None,
-                 topology_config: dict = None) -> dict:
+def derive_shape(meta: dict, topology_config: dict = None,
+                 node_config: dict = None) -> dict:
     """
     Resolve a model_meta dict into a concrete shape:
-      {"n_in", "n_out", "hidden_dims", "features", "topology_config", ...}
-    where "features" is the resolved descriptor — a list of {"type","size"}
+      {"n_in", "n_out", "hidden_dims", "features", "topology_config"}
+    where "features" is the resolved descriptor — a list of {"type", "size"}
     with each size taken from the topology config.
 
     Args:
         meta:            model descriptor loaded by load_model_meta().
-        topology_config: per-network dimensions loaded by
-                         load_topology_config(). AUTHORITATIVE source for
-                         n_interfaces, n_nodes, n_queues — any values with
-                         those keys in *meta* (model_meta.json) are IGNORED.
-        node_config:     [DEPRECATED] old name for topology_config; accepted
-                         for backward compatibility, topology_config takes
-                         precedence if both are supplied.
+        topology_config: per-network dimensions loaded by load_topology_config().
+                         AUTHORITATIVE source for n_interfaces, n_nodes,
+                         n_queues — any such keys in *meta* (model_meta.json)
+                         are ignored.
+        node_config:     [DEPRECATED] accepted for backward compatibility only;
+                         topology_config takes precedence if both are supplied.
 
-    If neither topology_config nor node_config is supplied the function falls
-    back to the legacy node_config_for(meta) behaviour so callers that have
-    not yet been updated continue to work.
+    If neither argument is supplied the function falls back to the legacy
+    topology_config_for(meta) behaviour so un-updated callers keep working.
     """
     hidden_dims = meta.get("hidden_dims", [4, 4])
 
-    # Resolve which config to use: topology_config > node_config > legacy fallback
+    # Resolution order: topology_config > node_config (deprecated) > legacy fallback
     if topology_config is not None:
         cfg = dict(topology_config)
     elif node_config is not None:
         cfg = dict(node_config)
     else:
-        cfg = node_config_for(meta)
+        cfg = topology_config_for(meta)
 
     if meta.get("features"):
         types = list(meta["features"])
@@ -282,11 +285,11 @@ def derive_shape(meta: dict, node_config: dict = None,
         raise ValueError(f"n_out={n_out} outside [1, {MAX_N_OUT}]")
 
     shape = {
-        "n_in": n_in, "n_out": n_out, "hidden_dims": hidden_dims,
+        "n_in": n_in,
+        "n_out": n_out,
+        "hidden_dims": hidden_dims,
         "features": features,
-        # Store under both keys so downstream code that reads either name works
         "topology_config": cfg,
-        "node_config": cfg,  # backward compat alias
     }
     if not meta.get("features"):
         shape["n_interfaces"] = cfg["n_interfaces"]
@@ -304,7 +307,7 @@ def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
     the actual first-layer input dimension of the PyTorch checkpoint.
 
     Reads fc1.weight.shape[1] from the state dict and compares it with
-    shape['n_in'].  If they differ the function raises a clear, blocking
+    shape['n_in']. If they differ the function raises a clear, blocking
     ValueError — loading the wrong model on a mismatched topology would
     silently produce wrong inference output, which is worse than a hard error.
 
@@ -349,7 +352,7 @@ def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
         )
         raise ValueError(
             f"\n"
-            f"  N_IN MISMATCH — model checkpoint is incompatible with the current topology_config.\n"
+            f"  N_IN MISMATCH — checkpoint incompatible with current topology_config.\n"
             f"\n"
             f"  N_IN expected by the checkpoint   (fc1.weight.shape[1]): {n_in_checkpoint}\n"
             f"  N_IN computed from topology_config + feature types      : {n_in_topo}\n"
