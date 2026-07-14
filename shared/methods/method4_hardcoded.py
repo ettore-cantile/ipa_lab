@@ -89,12 +89,15 @@ def run(args=None):
     # Step 3: generate the eBPF C source, compile, attach (or just verify).
     # ------------------------------------------------------------------
     from ebpf_program import load_and_generate
-    from common import get_ifindex_table
 
-    ifindex_table = get_ifindex_table(
-        n_interfaces=shape["n_in"],  # use network-max, not physical count
-        iface_prefix=args.iface,
-    )
+    # ifindex_table maps each kernel ingress ifindex -> logical port for the
+    # ingress_iface one-hot. Size it to that feature (0 if the model doesn't
+    # use it); the default [2, 2+size) convention matches ebpf_program's
+    # generator and the kernel tests (verify_prog_run). None -> generator
+    # applies the same default.
+    iface_size = next(
+        (f["size"] for f in shape["features"] if f["type"] == "ingress_iface"), 0)
+    ifindex_table = list(range(2, 2 + max(iface_size, 1)))
 
     ebpf_src, weights_int8, scale = load_and_generate(
         model_path=model_path,
