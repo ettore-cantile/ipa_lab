@@ -11,6 +11,7 @@ Interface mapping (from lab.conf + darmstadt.startup):
 import json
 import os
 import re
+import ctypes
 from bcc import BPF
 
 INGRESS_IFACE = "eth0"   # darmstadt[0]=l59, link to frankfurt (10.0.0.233/30)
@@ -24,6 +25,34 @@ N_WEIGHTS = 319
 def load_weights(path: str) -> list:
     with open(path, "r") as f:
         return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# dense_vector feature maps (link_state, queue_state): stored as a SINGLE
+# struct-valued entry `struct {__u32 v[N];}` at key 0, so the datapath reads
+# all N slots with ONE bpf_map_lookup_elem instead of N separate lookups (was
+# 6 for link_state + 4 for queue_occupancy = 10 helper calls per packet).
+# These helpers write that single entry from userspace (the seeders/monitors).
+# ---------------------------------------------------------------------------
+def write_vector_map(bpf_obj, map_name: str, values) -> None:
+    """Write the per-slot list `values` into the single key-0 entry of a
+    struct-valued dense_vector map. Extra values are ignored, missing slots
+    stay 0."""
+    tbl = bpf_obj[map_name]
+    leaf = tbl.Leaf()
+    n = len(leaf.v)
+    for i, val in enumerate(list(values)[:n]):
+        leaf.v[i] = int(val) & 0xFFFFFFFF
+    tbl[ctypes.c_int(0)] = leaf
+
+
+def set_vector_slot(bpf_obj, map_name: str, idx: int, val: int) -> None:
+    """Set one slot of a struct-valued dense_vector map (read-modify-write the
+    key-0 entry). Used e.g. to flip a single link down in tests."""
+    tbl = bpf_obj[map_name]
+    leaf = tbl[ctypes.c_int(0)]
+    leaf.v[idx] = int(val) & 0xFFFFFFFF
+    tbl[ctypes.c_int(0)] = leaf
 
 
 _LOOKUP_CALL_RE = re.compile(r'(\b\w+)\.lookup\(([^()]*)\)')

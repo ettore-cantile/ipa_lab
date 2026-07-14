@@ -226,9 +226,11 @@ struct fwd_action {
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 
-/* link_state[i] = egress iface i up/down (feature [0..5]); written by the
- * userspace carrier monitor, read by the leaf arch program. 1=up, 0=down. */
-BPF_ARRAY(link_state, __u32, 6);
+/* link_state: 6 egress up/down slots (feature [0..5]), held in ONE struct-valued
+ * entry (key 0) so the leaf reads the whole vector with a SINGLE lookup instead
+ * of 6. Written by the userspace carrier monitor. 1=up, 0=down. */
+struct ls_vec { __u32 v[6]; };
+BPF_ARRAY(link_state, struct ls_vec, 1);
 
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_PROG_ARRAY(arch_progs, 8);
@@ -331,7 +333,8 @@ struct fwd_action {
 
 #define MAX_WEIGHT_ENTRIES 1024
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
-BPF_ARRAY(link_state, __u32, 6);
+struct ls_vec { __u32 v[6]; };
+BPF_ARRAY(link_state, struct ls_vec, 1);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
@@ -394,14 +397,15 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     __u32 _iface     = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
     __u32 _node      = ((__u32)ipa->model_id) & 0x3f;
 
-    /* Read link_state[0..5] ONCE (feature [0..5]); reused across all neurons.
-     * (Previously read inside the neuron loop = 6*N_H1 redundant lookups.) */
+    /* Read link_state[0..5] with a SINGLE lookup (the whole vector lives in one
+     * struct-valued entry); reused across all neurons. */
     long long ls[6];
-    #pragma unroll
-    for (int i = 0; i < 6; i++) {
-        int lsk = i;
-        __u32 *lsp = link_state.lookup(&lsk);
-        ls[i] = lsp ? (long long)(*lsp) : 0LL;
+    {
+        int lsz = 0;
+        struct ls_vec *lsp = link_state.lookup(&lsz);
+        #pragma unroll
+        for (int i = 0; i < 6; i++)
+            ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL;
     }
 
     long long h1[T2_MAX_H1];

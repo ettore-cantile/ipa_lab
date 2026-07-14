@@ -34,8 +34,11 @@ import time
 QUEUE_STATE_MAP = "queue_state"
 
 
-def _write_map(bpf_obj, idx: int, value: int) -> None:
-    bpf_obj[QUEUE_STATE_MAP][ctypes.c_int(idx)] = ctypes.c_uint32(int(value) & 0xFFFFFFFF)
+def _write_vector(bpf_obj, values) -> None:
+    """Write all slots into the single struct-valued queue_state entry (key 0)
+    with one map update -- the datapath reads them with one lookup."""
+    from common import write_vector_map
+    write_vector_map(bpf_obj, QUEUE_STATE_MAP, values)
 
 
 def init_queue_state(bpf_obj, size: int, seed: int = 0) -> list:
@@ -47,8 +50,7 @@ def init_queue_state(bpf_obj, size: int, seed: int = 0) -> list:
     else:
         rng = random.Random(seed)
         values = [rng.randint(0, 15) for _ in range(size)]
-    for i, v in enumerate(values):
-        _write_map(bpf_obj, i, v)
+    _write_vector(bpf_obj, values)
     return values
 
 
@@ -56,8 +58,7 @@ def update_queue_state(bpf_obj, size: int, t: float) -> list:
     """Write a synthetic occupancy vector (a slow deterministic sweep of `t`),
     so a running demo shows the feature actually changing. Returns the values."""
     values = [int(8 + 7 * ((i + t) % 4) / 4.0) for i in range(size)]
-    for i, v in enumerate(values):
-        _write_map(bpf_obj, i, v)
+    _write_vector(bpf_obj, values)
     return values
 
 

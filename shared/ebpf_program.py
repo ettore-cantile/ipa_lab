@@ -208,10 +208,12 @@ def _build_header(dense_vector_maps: dict, n_out: int) -> str:
     map_decls = ""
     for map_name, size in sorted(dense_vector_maps.items()):
         map_decls += (
-            f"/* {map_name}[i]: per-slot values for a dense_vector feature, written by\n"
-            f" * the userspace seeder ({map_name}_monitor.py / carrier monitor) and read\n"
-            f" * into the input vector. INPUT feature, not a weight. */\n"
-            f"BPF_ARRAY({map_name}, __u32, {size});\n"
+            f"/* {map_name}: {size} per-slot values for a dense_vector feature, held in\n"
+            f" * ONE struct-valued entry (key 0) so the datapath reads the whole vector\n"
+            f" * with a SINGLE bpf_map_lookup_elem instead of {size}. Written by the\n"
+            f" * userspace seeder ({map_name}_monitor.py). INPUT feature, not a weight. */\n"
+            f"struct {map_name}_vec {{ __u32 v[{size}]; }};\n"
+            f"BPF_ARRAY({map_name}, struct {map_name}_vec, 1);\n"
         )
     mac_capacity = max(8, n_out)
     return _COMMON_STRUCTS + f"""
@@ -363,14 +365,14 @@ def _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1):
     prefix, map_name = _DENSEVEC_SOURCE[feat["type"]]
     size = feat["size"]
     lines = [
-        f"    /* feature '{feat['type']}': {size} values read once from map {map_name} */",
+        f"    /* feature '{feat['type']}': {size} values read with ONE lookup from {map_name} */",
         "    long long " + ", ".join(f"{prefix}{i}=0LL" for i in range(size)) + ";",
-        "    { int _k; __u32 *_p;",
+        f"    {{ int _z=0; struct {map_name}_vec *_p = {map_name}.lookup(&_z);",
+        "      if (_p) {",
     ]
     for i in range(size):
-        lines.append(
-            f"       _k={i}; _p={map_name}.lookup(&_k); if (_p) {prefix}{i}=(long long)(*_p);")
-    lines.append("    }")
+        lines.append(f"        {prefix}{i}=(long long)_p->v[{i}];")
+    lines.append("      } }")
     def term(j):
         return " + ".join(
             f"{prefix}{i} * {_lit(fc1_w[j * n_in + offset + i])}LL" for i in range(size))

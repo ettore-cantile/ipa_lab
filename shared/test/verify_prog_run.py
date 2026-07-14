@@ -353,8 +353,8 @@ def _seed_link_state(b, val: int = 1):
     (egress up/down). Verify runs the 'all links up' baseline, so it must match
     ref_infer's x[0..5]=1."""
     try:
-        for i in range(6):
-            b["link_state"][ct.c_int(i)] = ct.c_uint32(int(val))
+        from common import write_vector_map
+        write_vector_map(b, "link_state", [int(val)] * 6)
     except Exception:
         pass
 
@@ -493,12 +493,13 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
     _install_mac_table(b, "mac_table", n_classes=n_out - 1)
 
     # Seed each dense_vector map with known values (deterministic, arbitrary).
+    # Each map holds all its slots in one struct-valued entry (single lookup).
+    from common import write_vector_map
     map_values = {}
     for feat_type, map_name in mm.feature_maps(shape["features"]).items():
         size = next(f["size"] for f in shape["features"] if f["type"] == feat_type)
         vals = [(i * 7 + 3) % 16 for i in range(size)]
-        for i, v in enumerate(vals):
-            b[map_name][ct.c_int(i)] = ct.c_uint32(v)
+        write_vector_map(b, map_name, vals)
         map_values[map_name] = vals
 
     return {
@@ -622,9 +623,10 @@ def probe_link_down(model_path, model_id: int = 0, ttl_min: int = 1, ttl_max: in
         _reset_stats(setup)
         prog_test_run(fn.fd, frame, repeat=1)
         cls_up = _fired_cls_p1(setup)
+        from common import set_vector_slot
         for k in range(6):
             _seed_link_state(b, 1)
-            b["link_state"][ct.c_int(k)] = ct.c_uint32(0)
+            set_vector_slot(b, "link_state", k, 0)
             _reset_stats(setup)
             prog_test_run(fn.fd, frame, repeat=1)
             cls_down = _fired_cls_p1(setup)

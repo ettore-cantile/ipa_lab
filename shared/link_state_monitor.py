@@ -62,15 +62,18 @@ def carrier_state(iface: str) -> int:
         return 0
 
 
-def _write_map(bpf_obj, idx: int, value: int) -> None:
-    bpf_obj[LINK_STATE_MAP][ctypes.c_int(idx)] = ctypes.c_uint32(value)
+def _write_vector(bpf_obj, values) -> None:
+    """Write all 6 slots into the single struct-valued link_state entry (key 0)
+    with one map update -- the datapath then reads them with one lookup. (Lazy
+    import so this module stays importable without BCC for the dry-run below.)"""
+    from common import write_vector_map
+    write_vector_map(bpf_obj, LINK_STATE_MAP, values)
 
 
 def init_link_state_up(bpf_obj, ifaces=None) -> None:
     """Seed all 6 egress slots to 'up' (1). Called once at pipeline startup so
     the model sees the normal all-links-healthy baseline before the first poll."""
-    for i in range(N_EGRESS):
-        _write_map(bpf_obj, i, 1)
+    _write_vector(bpf_obj, [1] * N_EGRESS)
 
 
 def update_link_state(bpf_obj, ifaces=None, verbose: bool = False) -> list:
@@ -81,10 +84,10 @@ def update_link_state(bpf_obj, ifaces=None, verbose: bool = False) -> list:
     for i in range(N_EGRESS):
         name = ifaces[i] if i < len(ifaces) else f"eth{i}"
         st = carrier_state(name)
-        _write_map(bpf_obj, i, st)
         states.append(st)
         if verbose:
             print(f"  link_state[{i}] {name:6s} = {st}")
+    _write_vector(bpf_obj, states)
     return states
 
 

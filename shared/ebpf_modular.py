@@ -160,9 +160,11 @@ BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
 #define MAX_LAYER_WEIGHT_ENTRIES 2048
 BPF_ARRAY(layer_weights, __u8, MAX_LAYER_WEIGHT_ENTRIES);
 
-/* link_state[i] = egress iface i up/down (feature [0..5]); written by the
- * userspace carrier monitor, read directly by layer_first. 1=up, 0=down. */
-BPF_ARRAY(link_state, __u32, 6);
+/* link_state: 6 egress up/down slots (feature [0..5]), held in ONE struct-valued
+ * entry (key 0) so layer_first reads the whole vector with a SINGLE lookup
+ * instead of 6. Written by the userspace carrier monitor. 1=up, 0=down. */
+struct ls_vec { __u32 v[6]; };
+BPF_ARRAY(link_state, struct ls_vec, 1);
 
 /* Layer chain tail-call map: slot 0 = layer_first.fd, slots 1..15 =
  * layer_hidden.fd -- see module docstring for why this never conflicts
@@ -360,13 +362,15 @@ int layer_first(struct xdp_md *ctx) {
     __u32 _node = ((__u32)model_id) & 0x3f;
     __u32 _node_active = (_node <= 51) ? 1 : 0;
 
-    /* Read link_state[0..5] ONCE; reused across all neurons. */
+    /* Read link_state[0..5] with a SINGLE lookup (whole vector in one
+     * struct-valued entry); reused across all neurons. */
     long long ls[6];
-    #pragma unroll
-    for (int i = 0; i < 6; i++) {
-        int lsk = i;
-        __u32 *lsp = link_state.lookup(&lsk);
-        ls[i] = lsp ? (long long)(*lsp) : 0LL;
+    {
+        int lsz = 0;
+        struct ls_vec *lsp = link_state.lookup(&lsz);
+        #pragma unroll
+        for (int i = 0; i < 6; i++)
+            ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL;
     }
 
     long long out[ML1_MAX_H1];
