@@ -26,6 +26,8 @@ Usage (via execute_pipeline.py):
 
 Direct run:
     sudo python3 shared/methods/method4_hardcoded.py --iface eth1 --model-id 0
+    sudo python3 shared/methods/method4_hardcoded.py --iface eth1 \\
+        --node-config /etc/ipa/node_config.json
 """
 
 import os
@@ -44,6 +46,11 @@ if SHARED_DIR not in sys.path:
 _ORIGINAL_CWD = os.getcwd()
 os.chdir(SHARED_DIR)
 
+# Default path for the per-node feature-dimension configuration.
+# Can be overridden via --node-config CLI flag or the node_config_path
+# argument to run().
+_DEFAULT_NODE_CONFIG_PATH = "/etc/ipa/node_config.json"
+
 
 def _resolve_cli_path(path):
     """Resolve a CLI-provided path against the ORIGINAL cwd (pre-chdir),
@@ -57,7 +64,12 @@ from bcc import BPF
 from ebpf_program import load_and_generate
 from extract_weights import extract_weights_int8
 from common import resolve_egress_mac, resolve_ifindex
-from model_meta import load_model_meta, derive_shape
+from model_meta import (
+    load_model_meta,
+    load_node_config,
+    derive_shape,
+    verify_shape_vs_checkpoint,
+)
 
 
 def _build_ifindex_table(iface_names: list, n_egress: int) -> list:
@@ -113,30 +125,47 @@ def run(
     iface: str = "eth1",
     model_path: str = None,
     egress_ifaces: list = None,
+    node_config_path: str = _DEFAULT_NODE_CONFIG_PATH,
 ) -> None:
     """
     Load Pipeline 1 (hardcoded) on `iface`.
 
     Args:
-        model_id      : model identifier embedded in the eBPF program
-        iface         : ingress interface to attach XDP to (default eth1 on frankfurt)
-        model_path    : path to .pt checkpoint; defaults to the shared one
-        egress_ifaces : list of interface names that map to egress classes
-                        0..n_egress-1. Defaults to eth0, eth1, ... sized to
-                        n_egress = n_out-1 (last class is DROP -- see
-                        model_meta.py). The model's feature descriptor and
-                        per-node feature sizes come from model_meta.json
-                        (defaulting to the historical 6/52 descriptor when
-                        absent).
+        model_id         : model identifier embedded in the eBPF program
+        iface            : ingress interface to attach XDP to (default eth1)
+        model_path       : path to .pt checkpoint; defaults to the shared one
+        egress_ifaces    : list of interface names that map to egress classes
+                           0..n_egress-1. Defaults to eth0, eth1, … sized to
+                           n_egress = n_out-1 (last class is DROP).
+        node_config_path : path to the per-node feature-dimension config file.
+                           n_interfaces / n_nodes / n_queues are read from
+                           there (authoritative). Falls back to
+                           DEFAULT_NODE_CONFIG if the file doesn't exist.
+                           Any matching keys in model_meta.json are ignored.
     """
     if model_path is None:
         model_path = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
 
-    meta = load_model_meta(model_path)
-    shape = derive_shape(meta)
-    # last class is DROP by convention -> n_egress = n_out - 1. For the default
-    # descriptor n_out = n_interfaces+1, matching the historical egress count;
-    # for a custom descriptor n_out is explicit.
+    # ------------------------------------------------------------------
+    # Step 0: load node_config (per-node dims) and model_meta (per-model
+    # descriptor), then derive the concrete shape.
+    # node_config is the authoritative source for n_interfaces/n_nodes/
+    # n_queues; any such keys in model_meta.json are ignored.
+    # ------------------------------------------------------------------
+    node_cfg = load_node_config(node_config_path)
+    meta     = load_model_meta(model_path)
+    shape    = derive_shape(meta, node_config=node_cfg)
+
+    # ------------------------------------------------------------------
+    # Step 0.5: verify that the checkpoint was trained with the same N_IN
+    # that node_config + feature types produce.  Raises a clear ValueError
+    # if they differ — prevents silent wrong-inference.
+    # ------------------------------------------------------------------
+    verify_shape_vs_checkpoint(shape, model_path)
+
+    # last class is DROP by convention -> n_egress = n_out - 1. For the
+    # default descriptor n_out = n_interfaces+1, matching the historical
+    # egress count; for a custom descriptor n_out is explicit.
     n_egress  = shape["n_out"] - 1
 
     if egress_ifaces is None:
@@ -187,11 +216,8 @@ def run(
     _populate_mac_table_hardcoded(b, resolved_table)
 
     # ------------------------------------------------------------------
-    # Step 4: seed the map-backed (dense_vector) feature maps this model uses
-    # and start their monitors. Which maps exist is driven by the model's
-    # descriptor: one map per dense_vector feature (link_state and/or
-    # queue_state). A model whose descriptor omits link_state won't have that
-    # map, so we only seed what the descriptor declares.
+    # Step 4: seed the map-backed (dense_vector) feature maps this model
+    # uses and start their monitors.
     # ------------------------------------------------------------------
     stop_monitors = []
     from model_meta import feature_maps
@@ -283,6 +309,15 @@ if __name__ == "__main__":
     parser.add_argument("--iface",    default="eth1",   help="Ingress interface (default: eth1)")
     parser.add_argument("--model-id", type=int, default=0, help="Model ID")
     parser.add_argument("--model",    default=None,     help="Path to .pt checkpoint")
+    parser.add_argument(
+        "--node-config",
+        default=_DEFAULT_NODE_CONFIG_PATH,
+        help=(
+            f"Path to node_config.json (default: {_DEFAULT_NODE_CONFIG_PATH}). "
+            "Provides authoritative n_interfaces / n_nodes / n_queues for the "
+            "node. Falls back to built-in defaults if the file doesn't exist."
+        ),
+    )
     parser.add_argument("--egress-ifaces", nargs="+",
                         default=None,
                         help="Egress interfaces for the egress classes (default: eth0..ethN-1, "
@@ -294,8 +329,14 @@ if __name__ == "__main__":
 
     if args.verify_only:
         model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
-        meta = load_model_meta(model_path)
-        shape = derive_shape(meta)
+
+        node_cfg = load_node_config(args.node_config)
+        meta     = load_model_meta(model_path)
+        shape    = derive_shape(meta, node_config=node_cfg)
+
+        # Verify N_IN consistency before generating any C code.
+        verify_shape_vs_checkpoint(shape, model_path)
+
         n_egress = shape["n_out"] - 1
         egress_ifaces = args.egress_ifaces or [f"eth{i}" for i in range(n_egress)]
 
@@ -316,4 +357,5 @@ if __name__ == "__main__":
         iface=args.iface,
         model_path=args.model,
         egress_ifaces=args.egress_ifaces,
+        node_config_path=args.node_config,
     )
