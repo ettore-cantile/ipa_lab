@@ -13,7 +13,7 @@ int xdp_nn(struct xdp_md *ctx) {
     // single bounds check covers p[0..N_IN-1] (constant indices below)
     if ((void *)(p + N_IN) > data_end) return XDP_PASS;
 
-    long long acc;
+    volatile long long acc;
     acc = -36LL;
     acc += ((long long)p[0]) * 8LL;
     acc += ((long long)p[1]) * 7LL;

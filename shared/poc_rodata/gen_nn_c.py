@@ -126,7 +126,13 @@ def _emit(w, rodata: bool) -> str:
     # a single `acc` forces a serial dependency, so clang can't parallelize and
     # the frame stays tiny. Both builds use the identical structure, so the
     # literal-vs-rodata instruction comparison stays fair.
-    A("    long long acc;")
+    # `volatile` pins acc to the stack: each `acc += ...` becomes load-add-store,
+    # so only 2-3 GP registers are live at any point and the frame stays ~const
+    # (~128B) regardless of the 65-wide dense layer. Without it clang's BPF
+    # backend spills the long non-foldable rodata chain past the 512B stack
+    # limit. Applied to BOTH builds so the literal-vs-rodata delta reflects only
+    # the weight-access cost (immediate vs .rodata load), nothing else.
+    A("    volatile long long acc;")
     # fc1
     for j in range(N_H1):
         A(f"    acc = {wref(off['fc1_b']+j, fc1_b[j])};")
