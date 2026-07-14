@@ -96,8 +96,9 @@ def _emit(w, rodata: bool) -> str:
     A("} __attribute__((packed));")
     A("struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));")
     A("")
-    A("struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, %d);" % N_LS)
-    A("         __type(key, __u32); __type(value, __u32); } link_state SEC(\".maps\");")
+    A("struct ls_vec { __u32 v[%d]; };" % N_LS)
+    A("struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);")
+    A("         __type(key, __u32); __type(value, struct ls_vec); } link_state SEC(\".maps\");")
     A("struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 3);")
     A("         __type(key, __u32); __type(value, __u64); } pkt_stats SEC(\".maps\");")
     A("struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, %d);" % N_OUT)
@@ -127,12 +128,13 @@ def _emit(w, rodata: bool) -> str:
     A("    if ((void *)(ipa + 1) > data_end) return XDP_PASS;")
     A("")
     A("    long long ttl = (long long)ip->ttl;")
-    A("    // link_state[6] from the real BPF array map (6 helper lookups) -- INPUT feature")
+    A("    // link_state[6] from the real BPF array map (ONE lookup, vector-map layout) -- INPUT feature")
     A("    long long ls0=0,ls1=0,ls2=0,ls3=0,ls4=0,ls5=0;")
-    A("    { __u32 k; __u32 *v;")
+    A("    { __u32 z=0; struct ls_vec *lv = bpf_map_lookup_elem(&link_state,&z);")
+    A("      if (lv) {")
     for i in range(N_LS):
-        A(f"      k={i}; v=bpf_map_lookup_elem(&link_state,&k); if(v) ls{i}=(long long)(*v);")
-    A("    }")
+        A(f"        ls{i}=(long long)(lv->v[{i}]);")
+    A("      } }")
     A("    // ingress_iface one-hot: kernel ifindex -> logical 1..6")
     A("    __u32 _iface = 0;")
     A("    switch (ctx->ingress_ifindex) {")
@@ -212,6 +214,18 @@ def _emit(w, rodata: bool) -> str:
     A("")
     A("char _license[] SEC(\"license\") = \"GPL\";")
     return "\n".join(L) + "\n"
+
+
+def generate_literal_c(model_path: str = None) -> str:
+    """Importable: return the FULL-PATH *literal* libbpf C for the default FRR
+    descriptor (65-4-4-7), with real int8 weights from model_path (or the
+    checked-in checkpoint when None). Used by method4_hardcoded_aot.py to build
+    the AOT .o. rodata variant stays available via _emit(w, rodata=True)."""
+    from extract_weights import extract_weights_int8
+    w = extract_weights_int8(model_path) if model_path else _weights()
+    if len(w) != N_WEIGHTS:
+        raise SystemExit(f"expected {N_WEIGHTS} weights, got {len(w)}")
+    return _emit(w, rodata=False)
 
 
 def main():

@@ -68,10 +68,12 @@ static int seed_maps(struct bpf_object *obj) {
     struct bpf_map *mt = bpf_object__find_map_by_name(obj, "mac_table");
     if (!ls || !mt) { fprintf(stderr, "missing link_state/mac_table\n"); return -1; }
     int lsfd = bpf_map__fd(ls), mtfd = bpf_map__fd(mt);
-    for (__u32 k = 0; k < 6; k++) {           // link_state[0..5] = 1..6
-        __u32 v = k + 1;
-        bpf_map_update_elem(lsfd, &k, &v, BPF_ANY);
-    }
+    // link_state: single struct-valued entry {u32 v[6]} at key 0 (vector-map
+    // layout -- one lookup in the datapath, matches gen_full_c.py).
+    struct { __u32 v[6]; } lv;
+    for (int i = 0; i < 6; i++) lv.v[i] = i + 1;
+    __u32 z = 0;
+    bpf_map_update_elem(lsfd, &z, &lv, BPF_ANY);
     for (__u32 c = 0; c < 6; c++) {           // mac_table classes 0..5
         struct fwd_action a; memset(&a, 0, sizeof(a));
         a.ifindex = 1;
