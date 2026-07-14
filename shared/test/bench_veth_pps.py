@@ -91,17 +91,22 @@ def pktgen_available():
     return os.path.exists(PKTGEN_CTRL)
 
 
-def pktgen_setup(dst_mac, count, pkt_size, model_id):
+def pktgen_setup(dst_mac, count, pkt_size, model_id, delay=0):
     """Configure pktgen on VETH_SRC: UDP dport 9999 so the dispatcher accepts
     the frame; payload is pktgen's default fill (zero on most builds -> IPA
-    model_id 0)."""
+    model_id 0).
+
+    delay = nanoseconds between packets. 0 = max rate (can starve softirq and
+    LOCK a small VM, especially in SKB/generic XDP). A nonzero delay caps the
+    rate so the box stays responsive; the measured pps is then generator-bound,
+    but the RELATIVE P1/P2/P3 ordering still holds (same delay for all)."""
     _write(PKTGEN_THREAD0, "rem_device_all")
     _write(PKTGEN_THREAD0, f"add_device {VETH_SRC}")
     dev = f"/proc/net/pktgen/{VETH_SRC}"
     _write(dev, f"count {count}")
     _write(dev, "clone_skb 0")
     _write(dev, f"pkt_size {pkt_size}")
-    _write(dev, "delay 0")
+    _write(dev, f"delay {delay}")
     _write(dev, f"dst_mac {dst_mac}")
     _write(dev, "dst 10.0.0.2")
     _write(dev, "udp_dst_min 9999")
@@ -128,7 +133,7 @@ def _pkt_stats_sum(setup):
     return total
 
 
-def bench_one(name, setup_fn, model_path, model_id, count, pkt_size, mode):
+def bench_one(name, setup_fn, model_path, model_id, count, pkt_size, mode, delay):
     from bcc import BPF
     setup = setup_fn(model_id, model_path)
     b, disp = setup["b"], setup["disp"]
@@ -147,7 +152,7 @@ def bench_one(name, setup_fn, model_path, model_id, count, pkt_size, mode):
             raise
 
     dst_mac = iface_mac(VETH_DST)
-    pktgen_setup(dst_mac, count, pkt_size, model_id)
+    pktgen_setup(dst_mac, count, pkt_size, model_id, delay=delay)
 
     before = _pkt_stats_sum(setup)
     wall = pktgen_run()
@@ -175,11 +180,23 @@ def main():
     p.add_argument("--model", default=os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt"))
     p.add_argument("--model-id", type=int, default=0,
                    help="IPA model_id; must match pktgen's first payload byte (default 0 = zero-fill)")
-    p.add_argument("--count", type=int, default=10_000_000, help="packets to send per pipeline")
+    p.add_argument("--count", type=int, default=None,
+                   help="packets to send per pipeline (default: 2M native, 300k skb)")
     p.add_argument("--pkt-size", type=int, default=64, help="frame bytes (>=63 to hold eth+ip+udp+ipa_hdr)")
     p.add_argument("--mode", choices=["native", "skb"], default="native",
                    help="XDP attach mode on veth (native falls back to skb if unsupported)")
+    p.add_argument("--delay", type=int, default=None,
+                   help="nanoseconds between packets (default: 0 native, 2000 skb). "
+                        "0 = max rate; on a small VM the SKB path at delay 0 starves "
+                        "softirq and LOCKS the box -- keep nonzero for skb.")
     args = p.parse_args()
+
+    # Safe defaults: SKB/generic XDP shares CPUs with pktgen and can lock a
+    # small VM at full rate, so cap it (fewer packets + inter-packet delay).
+    if args.count is None:
+        args.count = 300_000 if args.mode == "skb" else 2_000_000
+    if args.delay is None:
+        args.delay = 2000 if args.mode == "skb" else 0
 
     if not sys.platform.startswith("linux"):
         print("[bench] Needs Linux + BCC + root + pktgen. Run on the Linux host / Kathara.")
@@ -200,7 +217,7 @@ def main():
     chosen = list(methods.items()) if args.method == "all" else [(args.method, methods[args.method])]
 
     print(f"[bench] veth {VETH_SRC}<->{VETH_DST} | model={os.path.basename(args.model)} "
-          f"| count={args.count} | pkt_size={args.pkt_size} | mode={args.mode}")
+          f"| count={args.count} | pkt_size={args.pkt_size} | mode={args.mode} | delay={args.delay}ns")
     print(f"[bench] measuring pps the XDP program actually processes under pktgen flood")
     print()
 
@@ -211,7 +228,7 @@ def main():
             print(f"[bench] running {name} ...")
             try:
                 rows.append(bench_one(name, fn, args.model, args.model_id,
-                                      args.count, args.pkt_size, args.mode))
+                                      args.count, args.pkt_size, args.mode, args.delay))
             except Exception as e:
                 print(f"  [{name}] FAILED: {e}")
     finally:
