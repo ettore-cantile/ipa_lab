@@ -114,11 +114,14 @@ def main():
     print(f"[AOT] model={model_path}")
     print(f"[AOT] shape={shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']} (default FRR descriptor)")
 
-    # 1) generate the weights-literal libbpf C from the real model weights
-    from gen_full_c import generate_literal_c
-    c_src = generate_literal_c(model_path if args.model else None)
-    c_path = os.path.join(POC_DIR, "nn_aot_literal.bpf.c")
-    o_path = os.path.join(POC_DIR, "nn_aot_literal.o")
+    # 1) generate the weights-literal libbpf C from the real model weights.
+    #    ARCH-FAITHFUL: dispatcher + PROG_ARRAY tail-call + model that re-parses
+    #    (double parse) == the BCC hardcoded topology, so the bench is
+    #    apples-to-apples with test_suite --kernel hardcoded.
+    from gen_full_c import generate_arch_literal_c
+    c_src = generate_arch_literal_c(model_path if args.model else None)
+    c_path = os.path.join(POC_DIR, "nn_aot_arch.bpf.c")
+    o_path = os.path.join(POC_DIR, "nn_aot_arch.o")
     with open(c_path, "w") as f:
         f.write(c_src)
     print(f"[AOT] generated {os.path.relpath(c_path, _ORIGINAL_CWD)} ({len(c_src)} chars)")

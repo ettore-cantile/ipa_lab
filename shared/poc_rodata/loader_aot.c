@@ -7,14 +7,17 @@
 // .o is built OFFLINE (once, on a build box); at runtime the datapath node only
 // does bpf_object__open_file + bpf_object__load -- no clang -> a few ms.
 //
-// It loads a PREBUILT literal .o, TIMES the open+load (the real deploy cost),
-// seeds link_state/mac_table, crafts a UDP/IPA frame and BPF_PROG_TEST_RUNs it
-// 1e6 times (same methodology as test_suite --kernel) to report that the AOT
-// build keeps the FULL literal performance (clang strength-reduction preserved,
-// unlike frozen .rodata -- see loader_full.c for that comparison).
+// ARCHITECTURE-FAITHFUL: the .o contains the SAME topology as the BCC path --
+// a dispatcher (xdp_dispatch) that parses and bpf_tail_calls into the model
+// (xdp_model), which RE-parses (the double parse) and infers. We populate the
+// model_progs PROG_ARRAY, seed link_state/mac_table, and BPF_PROG_TEST_RUN the
+// DISPATCHER, so this measures the identical per-packet work test_suite
+// --kernel measures (dispatcher + tail call + double parse + full path). The
+// reported instruction count is the SUM of both programs' xlated length, to
+// match test_suite (ipa_switch_hardcoded + model_0).
 //
 // Build: cc -O2 loader_aot.c -o loader_aot -lbpf
-// Run  : sudo ./loader_aot <literal.o>        (defaults to nn_full_literal.o)
+// Run  : sudo ./loader_aot <literal.o>        (defaults to nn_aot_arch.o)
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -32,7 +35,7 @@ static double now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-// Build a minimal Ethernet/IPv4/UDP/IPA frame (63 bytes) into buf.
+// Ethernet/IPv4/UDP/IPA frame (63 bytes), model_id=0 to match test_suite.
 static int build_frame(unsigned char *buf) {
     memset(buf, 0, 128);
     unsigned char *p = buf;
@@ -42,8 +45,15 @@ static int build_frame(unsigned char *buf) {
     unsigned char *udp = p + 34;
     udp[2] = (9999 >> 8) & 0xff; udp[3] = 9999 & 0xff;  // dest port 9999 (BE)
     unsigned char *ipa = p + 42;
-    ipa[0] = 1;                                // model_id = 1 (node one-hot case 1)
+    ipa[0] = 0;                                // model_id = 0 (node one-hot case 0)
     return 63;
+}
+
+static long prog_insns(int fd) {
+    struct bpf_prog_info info; __u32 len = sizeof(info);
+    memset(&info, 0, sizeof(info));
+    if (bpf_obj_get_info_by_fd(fd, &info, &len)) return -1;
+    return info.xlated_prog_len / 8;
 }
 
 static int seed_maps(struct bpf_object *obj) {
@@ -51,10 +61,10 @@ static int seed_maps(struct bpf_object *obj) {
     struct bpf_map *mt = bpf_object__find_map_by_name(obj, "mac_table");
     if (!ls || !mt) { fprintf(stderr, "missing link_state/mac_table\n"); return -1; }
     int lsfd = bpf_map__fd(ls), mtfd = bpf_map__fd(mt);
-    // link_state: single struct-valued entry {u32 v[6]} at key 0 (vector-map
-    // layout, matches ebpf_program.py / gen_full_c.py single-lookup read).
+    // link_state: single struct-valued entry {u32 v[6]}=all-up at key 0
+    // (vector-map layout; all-up matches the test_suite ref baseline).
     struct { __u32 v[6]; } lv;
-    for (int i = 0; i < 6; i++) lv.v[i] = i + 1;
+    for (int i = 0; i < 6; i++) lv.v[i] = 1;
     __u32 z = 0;
     bpf_map_update_elem(lsfd, &z, &lv, BPF_ANY);
     for (__u32 c = 0; c < 6; c++) {           // mac_table classes 0..5
@@ -66,7 +76,7 @@ static int seed_maps(struct bpf_object *obj) {
 }
 
 int main(int argc, char **argv) {
-    const char *lit = argc > 1 ? argv[1] : "nn_full_literal.o";
+    const char *lit = argc > 1 ? argv[1] : "nn_aot_arch.o";
 
     // --- deploy cost: open + load a prebuilt literal .o (no clang) ---
     double t0 = now_ms();
@@ -76,39 +86,50 @@ int main(int argc, char **argv) {
     if (bpf_object__load(obj)) { fprintf(stderr, "load %s\n", lit); goto err; }
     double t2 = now_ms();
 
+    // wire the tail-call: model_progs[0] = fd(xdp_model), exactly as the BCC
+    // control plane does b["model_progs"][0] = model_fn.fd.
+    struct bpf_program *disp = bpf_object__find_program_by_name(obj, "xdp_dispatch");
+    struct bpf_program *model = bpf_object__find_program_by_name(obj, "xdp_model");
+    struct bpf_map *progs = bpf_object__find_map_by_name(obj, "model_progs");
+    if (!disp || !model || !progs) { fprintf(stderr, "missing dispatch/model/model_progs\n"); goto err; }
+    int disp_fd = bpf_program__fd(disp), model_fd = bpf_program__fd(model);
+    __u32 mid = 0, mfd = (__u32)model_fd;
+    if (bpf_map_update_elem(bpf_map__fd(progs), &mid, &mfd, BPF_ANY)) {
+        fprintf(stderr, "prog_array update\n"); goto err;
+    }
+
     if (seed_maps(obj)) goto err;
 
-    struct bpf_program *prog = bpf_object__next_program(obj, NULL);
-    int fd = bpf_program__fd(prog);
-    long insns = -1;
-    struct bpf_prog_info info; __u32 len = sizeof(info);
-    memset(&info, 0, sizeof(info));
-    if (bpf_obj_get_info_by_fd(fd, &info, &len) == 0) insns = info.xlated_prog_len / 8;
+    long insn_disp = prog_insns(disp_fd), insn_model = prog_insns(model_fd);
+    long insn_total = insn_disp + insn_model;   // matches test_suite (disp + model)
 
+    // run the DISPATCHER (parse -> tail call -> model re-parse -> infer -> action)
     unsigned char in[128], out[256];
     build_frame(in);
     LIBBPF_OPTS(bpf_test_run_opts, o,
         .data_in = in, .data_size_in = 63,
         .data_out = out, .data_size_out = sizeof(out),
         .repeat = 1000000);
-    if (bpf_prog_test_run_opts(fd, &o)) { fprintf(stderr, "test_run %s\n", lit); goto err; }
+    if (bpf_prog_test_run_opts(disp_fd, &o)) { fprintf(stderr, "test_run %s\n", lit); goto err; }
     double ns = (double)o.duration;
     double mpps = ns > 0 ? 1000.0 / ns : 0.0;
 
     printf("================================================================\n");
-    printf(" AOT-literal deploy bench (Pipeline 1, full path, prebuilt .o)\n");
+    printf(" AOT-literal deploy bench (Pipeline 1, ARCH-FAITHFUL)\n");
+    printf(" dispatcher + tail-call + double-parse == BCC hardcoded topology\n");
     printf("================================================================\n\n");
     printf("[deploy] runtime cost of loading a prebuilt literal .o (NO clang):\n");
     printf("   open_file           : %8.3f ms\n", t1 - t0);
     printf("   load (verify+JIT)   : %8.3f ms\n", t2 - t1);
     printf("   total deploy        : %8.3f ms\n", t2 - t0);
     printf("   (BCC method4 recompile for the same model: ~1660 ms of clang)\n\n");
-    printf("[perf] full-path per-packet cost (BPF_PROG_TEST_RUN, 1e6 reps, retval=%u):\n", o.retval);
-    printf("   xlated insns        : %8ld\n", insns);
+    printf("[perf] full-path per-packet cost (BPF_PROG_TEST_RUN on dispatcher, 1e6 reps, retval=%u):\n", o.retval);
+    printf("   xlated insns        : %8ld   (dispatch %ld + model %ld)\n", insn_total, insn_disp, insn_model);
     printf("   latency             : %8.1f ns/pkt\n", ns);
     printf("   throughput          : %8.2f Mpps\n", mpps);
-    printf("\n   AOT keeps the FULL literal perf (clang strength-reduction baked\n");
-    printf("   into the .o), unlike frozen .rodata weights.\n");
+    printf("\n   Same topology and methodology as test_suite --kernel hardcoded,\n");
+    printf("   so these are directly comparable to the BCC numbers. AOT keeps the\n");
+    printf("   full literal perf (clang strength-reduction baked into the .o).\n");
 
     bpf_object__close(obj);
     return 0;
