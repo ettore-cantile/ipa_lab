@@ -698,14 +698,22 @@ def load_and_generate(
             with open(weights_float_path) as f:
                 scale = int(json.load(f)["scale_factor"])
         else:
-            import torch
-            from FRR_model import FastRerouteMLP
-            m = FastRerouteMLP(n_interfaces=shape["n_interfaces"], n_nodes=shape["n_nodes"],
-                               hidden_dim=shape["hidden_dims"][0])
-            m.load_state_dict(torch.load(model_path))
-            floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
-            max_abs = max(abs(w) for w in floats)
-            scale   = int(127 / max_abs)
+            # Deriving scale from the .pt needs torch; deployment nodes (Kathara)
+            # have no torch and run from the prebuilt json instead. Fall back to
+            # the json/meta scale rather than hard-failing.
+            try:
+                import torch
+                from FRR_model import FastRerouteMLP
+                m = FastRerouteMLP(n_interfaces=shape["n_interfaces"], n_nodes=shape["n_nodes"],
+                                   hidden_dim=shape["hidden_dims"][0])
+                m.load_state_dict(torch.load(model_path))
+                floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
+                max_abs = max(abs(w) for w in floats)
+                scale   = int(127 / max_abs)
+            except ImportError:
+                _, scale = _load_weights_from_json()
+                print(f"[load_and_generate] torch not available — using scale={scale} "
+                      f"from json (deployment node).")
         weights_int8 = extract_weights_int8(
             model_path,
             n_interfaces=shape["n_interfaces"],

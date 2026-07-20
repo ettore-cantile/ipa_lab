@@ -174,9 +174,10 @@ For the full metric comparison across pipelines:
             # method4_hardcoded.run() takes a CLI-style args LIST (not kwargs
             # like method5/6), so build argv explicitly.
             from methods.method4_hardcoded import run
-            argv = ["--iface", args.iface, "--model-id", str(args.model_id)]
-            if args.model:
-                argv += ["--model", args.model]
+            # Always pass the resolved absolute model_path so model_dir points at
+            # /shared and weights_float.json is found (no torch needed on the node).
+            argv = ["--iface", args.iface, "--model-id", str(args.model_id),
+                    "--model", model_path]
             run(argv)
 
     elif args.method == "template":
