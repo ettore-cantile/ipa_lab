@@ -44,8 +44,10 @@ NOT installed in this lab's Kathara images -- use bpf_introspect.py instead):
 """
 import argparse
 import multiprocessing
+import re
 import socket
 import struct
+import sys
 import time
 
 # Matches shared/test/test_ipa.py's IPA_HDR layout exactly (21 bytes):
@@ -93,6 +95,20 @@ def main():
                          "use several processes (not threads) to push closer to "
                          "the real ceiling.")
     args = ap.parse_args()
+
+    # REFUSE a non-numeric destination. socket.connect() silently resolves
+    # hostnames via the system resolver -- if that resolves to something that
+    # doesn't actually cross the fabric (e.g. a loopback/self address), the
+    # send() loop still "succeeds" (UDP is fire-and-forget) and reports a
+    # huge, MEANINGLESS pkt/s number with nothing ever reaching the receiver.
+    # This happened in testing: --dest-ip frankfurt (a hostname) reported
+    # 1.27M pkt/s, ~40-100x this script's own documented expectation for a
+    # Python sender -- the tell that packets never left the local stack.
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", args.dest_ip):
+        sys.exit(f"[flood] REFUSING: --dest-ip {args.dest_ip!r} is not a dotted IPv4 address. "
+                 f"A hostname resolves silently and can give a fake high pkt/s with zero "
+                 f"packets actually delivered (see module docstring). Find the real IP with:\n"
+                 f"    kathara exec <receiver> -- ip -o -4 addr show dev <ingress-iface>")
 
     print(f"[flood] -> {args.dest_ip}:{args.port}  model_id={args.model_id}  "
           f"workers={args.workers}  duration={args.duration}s")

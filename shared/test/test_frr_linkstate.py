@@ -124,23 +124,48 @@ def main():
     _run(_kexec(args.switch, "ip", "link", "set", "dev", args.ingress_iface, "xdp", "off"))
 
     print(f"\n[frr-test] Starting pipeline on {args.switch} (background)...")
+    # `python3 -u`: without it, the REMOTE python's stdout is fully buffered
+    # (not line-buffered) once it's piped rather than attached to a TTY --
+    # every print() sits in the child's internal buffer and this side's
+    # readline() sees nothing for a long time (observed in testing: hung
+    # right after BCC's compile warnings, nothing else ever arrived until
+    # Ctrl-C). -u forces unbuffered stdio in the remote process.
     pipeline_proc = subprocess.Popen(
-        _kexec(args.switch, "python3", "/shared/execute_pipeline.py",
+        _kexec(args.switch, "python3", "-u", "/shared/execute_pipeline.py",
                "--method", args.method, "--iface", args.ingress_iface,
                "--model-id", str(args.model_id)),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
+    # readline() itself has no timeout -- a naive `while time.time() < deadline:
+    # line = f.readline()` loop can block PAST the deadline on a single call
+    # if the child goes quiet for a while (e.g. mid BCC-verify/JIT for a
+    # large program). Read on a background thread instead and enforce the
+    # deadline with Queue.get(timeout=...), which actually works.
+    import queue
+    import threading
+    line_q = queue.Queue()
+
+    def _reader():
+        for line in pipeline_proc.stdout:
+            line_q.put(line)
+        line_q.put(None)   # EOF sentinel
+
+    threading.Thread(target=_reader, daemon=True).start()
+
     class_to_iface = {}
-    t_wait = time.time() + 15
-    while time.time() < t_wait:
-        line = pipeline_proc.stdout.readline()
-        if not line:
+    deadline = time.time() + 30   # generous: BCC verify/JIT for template/modular can take real seconds
+    while time.time() < deadline:
+        try:
+            line = line_q.get(timeout=max(0.1, deadline - time.time()))
+        except queue.Empty:
+            break
+        if line is None:
             break
         print(f"    [pipeline] {line.rstrip()}")
         m = re.search(rf"{mac_table}: class (\d+) -> (eth\d+)", line)
         if m:
             class_to_iface[int(m.group(1))] = m.group(2)
-        if "Stats:" in line or len(class_to_iface) >= 1 and "TRUE HIT" in line:
+        if "Stats:" in line or (len(class_to_iface) >= 1 and "TRUE HIT" in line):
             break
 
     fail_class = next((c for c, ifc in class_to_iface.items() if ifc == args.fail_iface), None)
