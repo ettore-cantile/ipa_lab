@@ -111,7 +111,7 @@ def run(args=None):
         _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table)
         return
 
-    _attach(ebpf_src, args.iface, shape)
+    _attach(ebpf_src, args.iface, shape, model_id=args.model_id)
 
 
 def _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table):
@@ -129,23 +129,82 @@ def _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table):
           f"model_0 fd={model_fn.fd}")
 
 
-def _attach(ebpf_src, iface, shape):
-    """Compile and attach the XDP program to *iface*."""
-    from bcc import BPF
+def _populate_mac(b, egress_iface, egress_ifindex, n_fwd):
+    """Install mac_table: egress class (0..n_fwd-1, the argmax output) ->
+    {ifindex, src_mac, dst_mac}. The NN decides the port; this map only resolves
+    the L2 next-hop (same pattern as method5's mac_table_t2). In this lab all
+    classes point at the same egress iface (single next-hop)."""
     import ctypes
-    print(f"[method4] Attaching to {iface}, shape={shape}")
+    from common import resolve_egress_mac
+    src_mac, dst_mac = resolve_egress_mac(egress_iface)
+    mac    = b.get_table("mac_table")
+    action = mac.Leaf()
+    action.ifindex = egress_ifindex
+    for i in range(6):
+        action.src_mac[i] = src_mac[i]
+        action.dst_mac[i] = dst_mac[i]
+    for cls in range(n_fwd):
+        mac[ctypes.c_uint32(cls)] = action
+    print(f"[mac] mac_table loaded: class 0..{n_fwd-1} -> ifindex={egress_ifindex} "
+          f"src={':'.join(f'{x:02x}' for x in src_mac)} dst={':'.join(f'{x:02x}' for x in dst_mac)}")
+
+
+def _attach(ebpf_src, iface, shape, model_id=0):
+    """Compile, wire the tail-call (dispatcher -> model_progs[model_id] ->
+    model_<id>), seed link_state + mac_table, attach to *iface* and show live
+    pkt_stats (HIT|MISS|DROP) -- same live behaviour as the template/modular
+    pipelines. Without wiring model_progs + seeding the maps the dispatcher's
+    tail call falls through to XDP_PASS and never infers/forwards."""
+    from bcc import BPF
+    import ctypes, time
+    from common import attach_xdp, resolve_ifindex, EGRESS_IFACE
+
+    iface, _ = resolve_ifindex(iface)
+    print(f"[method4] Compiling hardcoded program, shape="
+          f"{shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']}")
     b = BPF(text=ebpf_src)
-    fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b.attach_xdp(iface, fn, 0)
-    print(f"[method4] XDP program attached to {iface}. Ctrl-C to detach.")
+
+    # Wire the tail-call: dispatcher -> model_progs[model_id] -> model_<id>.
+    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
+    disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    b["model_progs"][ctypes.c_int(model_id)] = ctypes.c_int(model_fn.fd)
+
+    # Seed link_state (all egress links up) + start the carrier monitor.
+    try:
+        from link_state_monitor import init_link_state_up, start_monitor_thread
+        init_link_state_up(b)
+        start_monitor_thread(b, interval=1.0)
+        print("[method4] link_state seeded (all up); carrier monitor running")
+    except Exception as e:
+        print(f"[method4] link_state seed skipped ({e})")
+
+    # Populate mac_table (class -> egress next-hop). n_out-1 forward classes,
+    # last class = DROP.
+    egress_iface, egress_ifindex = resolve_ifindex(EGRESS_IFACE, fallback=iface)
+    _populate_mac(b, egress_iface, egress_ifindex, n_fwd=shape["n_out"] - 1)
+
+    attach_xdp(b, disp_fn, iface=iface)
+    print(f"[method4] Pipeline 1 (hardcoded) running on {iface}. "
+          f"Stats: pkt_stats [HIT | MISS | DROP]. Ctrl-C to detach.")
+
+    stats = b["pkt_stats"]
+    print(f"\n{'HIT':<16}{'MISS':<16}{'DROP':<16}")
+    print("-" * 48)
     try:
         while True:
-            import time; time.sleep(1)
+            time.sleep(1)
+            hit  = stats[stats.Key(0)].value
+            miss = stats[stats.Key(1)].value
+            drop = stats[stats.Key(2)].value
+            print(f"\r{hit:<16}{miss:<16}{drop:<16}", end="", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
-        b.remove_xdp(iface, 0)
-        print(f"[method4] XDP program detached from {iface}.")
+        try:
+            b.remove_xdp(iface, 0)
+        except Exception:
+            pass
+        print(f"\n[method4] XDP program detached from {iface}.")
 
 
 if __name__ == "__main__":
