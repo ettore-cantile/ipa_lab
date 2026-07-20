@@ -88,14 +88,6 @@ For the full metric comparison across pipelines:
         action="store_true",
         help="Load and verify eBPF program without attaching XDP (safe for testing)"
     )
-    parser.add_argument(
-        "--hardcoded-backend",
-        choices=["aot", "bcc"],
-        default="aot",
-        help="hardcoded (Pipeline 1) deploy backend: 'aot' (prebuilt .o attached "
-             "live, NO clang on this node -- default) or 'bcc' (legacy clang at "
-             "runtime via method4_hardcoded). Ignored by template/modular."
-    )
     args = parser.parse_args()
 
     model_path = args.model or os.path.join(
@@ -159,9 +151,15 @@ For the full metric comparison across pipelines:
                 os.path.join(SHARED_DIR, "methods", "method4_hardcoded.py"),
                 run_name="__main__"
             )
-        elif args.hardcoded_backend == "aot":
-            # DEFAULT: AOT-literal deploy — prebuilt .o attached live, NO clang on
-            # this node (the recompilation win). See method4_hardcoded_aot.py.
+        else:
+            # AOT-literal deploy — the ONLY hardcoded deploy backend. Prebuilt
+            # .o attached live, NO clang/libbpf-dev needed on this node (see
+            # method4_hardcoded_aot.py and shared/poc_aot/loader_aot.c, now
+            # statically linked against libbpf for exactly this reason).
+            # BCC is no longer used to deploy hardcoded; it is still used
+            # internally by the test suite (verify_prog_run.py etc.) to
+            # compile-and-verify offline, which is a different concern from
+            # what actually runs on the datapath node.
             sys.argv = ["method4_hardcoded_aot.py", "--iface", args.iface]
             if args.model:
                 sys.argv += ["--model", args.model]
@@ -169,16 +167,6 @@ For the full metric comparison across pipelines:
                 os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py"),
                 run_name="__main__"
             )
-        else:
-            # Legacy BCC live attach (clang at runtime), kept as fallback.
-            # method4_hardcoded.run() takes a CLI-style args LIST (not kwargs
-            # like method5/6), so build argv explicitly.
-            from methods.method4_hardcoded import run
-            # Always pass the resolved absolute model_path so model_dir points at
-            # /shared and weights_float.json is found (no torch needed on the node).
-            argv = ["--iface", args.iface, "--model-id", str(args.model_id),
-                    "--model", model_path]
-            run(argv)
 
     elif args.method == "template":
         # Pipeline 2 — architectural template, weights in BPF_ARRAY

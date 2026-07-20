@@ -114,9 +114,12 @@ lab il traffico per `frankfurt` (IP loopback `10.255.255.17`) entra su **eth1** 
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method template  --iface eth1 --model-id 0
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method modular   --iface eth1 --model-id 0
 
-# hardcoded: due backend. Su Kathara (niente clang) usa BCC.
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1 --hardcoded-backend bcc
-#   --hardcoded-backend aot (default) = .o prebuilt, richiede clang+libbpf (host/build box, non i nodi Kathara)
+# hardcoded: AOT-literal è l'UNICO backend di deploy (BCC live-attach rimosso su
+# richiesta esplicita del relatore). Serve un .o prebuilt (build offline su host
+# con clang) + loader_aot linkato staticamente contro libbpf (nessuna dipendenza
+# runtime su libbpf.so sul nodo Kathara). BCC resta solo internamente ai test
+# (verify_prog_run.py ecc.), mai per il deploy.
+kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
 
 # solo verifica del caricamento, senza restare in ascolto
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --verify-only
@@ -264,52 +267,7 @@ minimo-su-N-trial di `bench_depth_vs_width.py`. Il delta stampato è il costo
 
 ---
 
-## 9. Traffico reale end-to-end (`bench_live_throughput.py`)
-
-Tutte le metriche di throughput finora (baseline/P1/P2/P3 in tabella, i tier
-di `bench_depth_vs_width.py`) sono **derivate** da `BPF_PROG_TEST_RUN`: il
-programma gira isolato, senza interrupt di NIC reale, senza driver, senza
-contesa di cache con altro traffico. È esattamente il tipo di scarto che la
-letteratura sul benchmarking ("Benchmarking Crimes", Heiser, arXiv:1801.02381;
-talk USENIX LISA21 di Verizon) segnala: un timer sintetico in-kernel può
-divergere silenziosamente da cosa succede quando i pacchetti arrivano
-davvero dal cavo. Nuovo script che genera traffico **reale**:
-
-```bash
-# sul nodo mittente (es. darmstadt)
-python3 shared/test/bench_live_throughput.py --dest-ip 10.0.0.234 --duration 10
-python3 shared/test/bench_live_throughput.py --dest-ip 10.0.0.234 --duration 10 --workers 4
-
-# sul nodo ricevente (es. frankfurt), in un'altra shell
-# (bpftool NON è installato nelle immagini Kathara di questo lab -- confermato
-#  "executable file not found" -- usa bpf_introspect.py, stessa sintassi bpf() raw)
-kathara exec frankfurt -- python3 /shared/bpf_introspect.py pkt_stats 3
-```
-
-**Onestà sui limiti**: è un sender Python, aspettati decine di migliaia di
-pkt/s al massimo, non i milioni di pkt/s che `BPF_PROG_TEST_RUN` deriva. Il
-confronto che conta è **relativo** (l'ordine P1/P2/P3 regge sotto consegna
-reale?), non il numero assoluto di pkt/s. Usa un socket UDP connesso in un
-loop stretto (non `scapy.send()` per pacchetto come `test_ipa.py`, che nella
-sessione ha misurato ~28-200 pkt/s — troppo lento per un vero test di
-throughput). **Importante**: `--dest-ip` deve essere l'IP reale
-dell'interfaccia direttamente connessa del ricevente (il vicino su quel
-link), non il suo hostname/loopback — il fabric Kathara non instrada
-UDP:9999 fino al loopback (sez. 5).
-
-### Profiling con contatori hardware — provato, non disponibile in questo lab
-
-La letteratura (talk USENIX LISA21) raccomanda `bpftool prog profile` per cicli/cache-miss/
-branch-miss. **Provato e non disponibile**: `bpftool` non è installato nelle immagini
-Kathara di questo lab (`exec: "bpftool": executable file not found in $PATH`, confermato
-in sessione — non solo il subcomando `prog profile`, il binario stesso manca). Non è un
-limite di PMU/virtualizzazione, è proprio assente dal filesystem del container. Per
-usarlo servirebbe una immagine Kathara custom con `bpftool` installato (fuori scope) —
-altrimenti questa via resta chiusa in questo ambiente.
-
----
-
-## 10. Architetture alternative dentro `test_suite.py --only kernel`
+## 9. Architetture alternative dentro `test_suite.py --only kernel`
 
 Prima, `test_suite --only kernel` verificava **una sola architettura** (65-4-4-7) su
 tutte e 3 le pipeline — un vuoto reale rispetto alla tesi "P1/P2/P3 gestiscono profondità/
@@ -330,50 +288,13 @@ sudo python3 shared/test/test_suite.py --only kernel
 
 ---
 
-## 11. Reroute su guasto REALE (`test_frr_linkstate.py`)
-
-Il probe "link_state reroute" esistente (sez. 2) scrive **direttamente nella mappa**
-`link_state[k]=0` — non tocca mai un'interfaccia reale, il rilevamento di carrier, o il
-thread `link_state_monitor` che dovrebbe tenerli allineati. Nuovo script che orchestra
-**da fuori Kathara** (host, via `kathara exec`) un guasto vero mentre la pipeline è
-attaccata dal vivo e c'è traffico reale (`bench_live_throughput.py`, sez. 9):
-
-```bash
-python3 shared/test/test_frr_linkstate.py \
-    --switch frankfurt --ingress-iface eth1 --fail-iface eth2 \
-    --sender darmstadt --method template --model-id 0
-
-# vedi la sequenza esatta di comandi senza eseguirla:
-python3 shared/test/test_frr_linkstate.py --switch frankfurt --ingress-iface eth1 \
-    --fail-iface eth2 --sender darmstadt --dry-run
-```
-
-Sequenza: attacca la pipeline dal vivo → avvia il flood reale → snapshot `cls_stats` →
-abbatte **davvero** `--fail-iface` (`ip link set down`) → aspetta il polling
-(`link_state_monitor`) → nuovo snapshot → confronta i delta per classe (la classe
-dell'interfaccia guasta deve fermarsi, le altre devono crescere) → ripristina tutto.
-
-Legge `cls_stats*` via `shared/bpf_introspect.py` (syscall `bpf()` raw, niente `bpftool`
-— assente da questa immagine Kathara, vedi sez. 9). `--n-classes` deve combaciare con
-`n_out` del modello registrato (default 7).
-
-**Onestà**: non misura un tempo di failover in stile SLA, solo se il reroute avviene
-entro un intervallo di polling. Se il verdetto sembra sbagliato, `--dry-run` stampa ogni
-comando singolarmente per rifarlo a mano e ispezionare `bpf_introspect.py` manualmente.
-
----
-
 ## Risultati (kernel, `test_suite.py --only kernel`, 4 CPU, modello 65→4→4→7, scale=24)
 
 Aggiornati dopo: IV **descrittore-driven** in P2/P3 (registry `model_desc`), AOT-literal
 universale in P1, riga **baseline** (parse + redirect, **nessuna inferenza**) come pavimento.
 
-⚠️ **Numeri sotto = metodologia a singolo campione (obsoleta)**: catturati prima del fix
-min-su-N-trial (sez. 2). Latenza/throughput qui possono differire 2-5× da un run reale con
-la metodologia corretta — rilancia `sudo python3 shared/test/test_suite.py --only kernel`
-(default ora min-su-7-trial) e sostituisci questa tabella con i nuovi numeri prima di
-usarla in tesi. Istruzioni/jited/tail-call/memoria non dipendono da `BPF_PROG_TEST_RUN`
-quindi restano validi.
+Metodologia: minimo su 7 trial indipendenti (sez. 2) — p50/max riportati per trasparenza,
+non solo il minimo. Numeri dal run più recente (box Linux, 4 CPU).
 
 | Metrica                    | baseline | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|---------:|-------------:|------------:|-----------:|
@@ -382,20 +303,22 @@ quindi restano validi.
 | Tail calls / pacchetto     |        0 |            1 |           1 |          3 |
 | Map lookup / pacchetto (reali) |    0 |          4.0 |       147.0 |      160.0 |
 | Memoria mappe (byte)       |      280 |          308 |       8 052 |     16 884 |
-| Latenza (ns/pacchetto)     |     29.0 |         77.0 |       523.0 |    1 030.0 |
-| Throughput (Mpps)          |   34.483 |       12.987 |       1.912 |      0.971 |
-| CPU (%)                    |       39 |           59 |          80 |         82 |
-| Dispatch (correttezza)     |        — |     10/10 PASS |   5/5 PASS |   5/5 PASS |
+| Latenza min (ns/pacchetto) |     21.0 |         35.0 |       262.0 |      442.0 |
+| Latenza p50 (ns/pacchetto) |     26.0 |         40.0 |       292.0 |      478.0 |
+| Latenza max (ns/pacchetto) |     60.0 |         81.0 |       326.0 |      675.0 |
+| Throughput (Mpps, da min)  |   47.619 |       28.571 |       3.817 |      2.262 |
+| CPU (%)                    |       34 |           30 |          57 |         51 |
+| Dispatch (correttezza)     |        — |      5/5 PASS |   5/5 PASS |   5/5 PASS |
 | link_state reroute         |          | PASS (5/30 casi cambiano uscita) |||
 
 ### Baseline vs hardcoded (la domanda "perché l'hardcoded è così veloce?")
 
 Il **baseline** riceve il pacchetto in XDP, fa lo stesso parse del dispatcher e un
 `bpf_redirect` — **niente tail-call, niente MLP**. È il *pavimento* del framework:
-**29 ns / 34.5 Mpps**. L'hardcoded (**77 ns**) aggiunge ~48 ns per tail-call + double-parse +
-la rete. Quindi l'hardcoded **non** è sospettosamente veloce: è **2.6× più lento** del
-do-nothing. Il throughput alto è il pavimento XDP+parse+redirect; la rete int8 65-4-4-7
-unrolled costa poco in confronto.
+**21 ns / 47.6 Mpps** (minimo su 7 trial). L'hardcoded (**35 ns**) aggiunge ~14 ns per
+tail-call + double-parse + la rete. Quindi l'hardcoded **non** è sospettosamente veloce:
+è **1.7× più lento** del do-nothing. Il throughput alto è il pavimento XDP+parse+redirect;
+la rete int8 65-4-4-7 unrolled costa poco in confronto.
 
 ### AOT-literal deploy (P1, `method4_hardcoded_aot.py`)
 

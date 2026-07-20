@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """
-method4_hardcoded_aot.py  --  Pipeline 1 ALTERNATIVE loader: AOT-literal (libbpf).
+method4_hardcoded_aot.py  --  Pipeline 1 deploy loader: AOT-literal (libbpf).
 
-This is a SEPARATE, optional variant of Pipeline 1. It does NOT replace
-method4_hardcoded.py (the BCC literal path stays byte-identical and is the
-guaranteed fallback). It exists to answer one question the professor may ask:
-can we keep the maximum hardcoded performance AND remove the ~1660 ms of
-clang-at-runtime that BCC pays on every (re)load?
+This is the ONLY deploy backend for Pipeline 1 (hardcoded) -- per the
+professor's explicit request, it replaces the old BCC live-attach path
+(method4_hardcoded.py's `run()`/`_attach`), which execute_pipeline.py no
+longer calls. method4_hardcoded.py itself still exists and is still used,
+but only as an internal compile-and-verify tool for the test suite
+(verify_prog_run.py, bench_model_add.py, ...) via ebpf_program.py -- that
+never runs on the datapath node in production, so it is a separate concern
+from what this script does.
+
+loader_aot (built below) is statically linked against libbpf (+ libelf,
+zlib): the Kathara node images used in this lab have neither clang nor
+libbpf installed, so a dynamically-linked loader copied there would fail to
+even start ("cannot open shared object file") -- the whole point of
+building it elsewhere is defeated if it still needs libbpf.so present on
+every node it runs on.
+
+This removes the ~1660 ms of clang-at-runtime that the old BCC path paid on
+every (re)load, while keeping the exact same literal-weights performance.
 
 Topology dimensions (n_interfaces, n_nodes, n_queues) come from
 topology_config.json — a file that describes the NETWORK TOPOLOGY shared
@@ -27,8 +40,10 @@ per-weight strength reduction (x*0 folded away, x*8 -> shift) is preserved, so
 performance stays at the literal maximum -- identical to BCC at the same
 architecture (measured: ~69 vs ~66 ns/pkt).
 
-What this script does (bench only -- it does NOT attach XDP to a real iface;
-that is method4's job):
+What this script does:
+    0. with --iface: LIVE DEPLOY -- attach the prebuilt .o to that interface
+       and stay resident (this is the real production path, see below).
+    Without --iface, runs the bench instead:
     1. load topology_config.json (authoritative network dimensions), verify
        N_IN consistency with the checkpoint,
     2. generate the weights-literal libbpf C for the model (real int8 weights),
@@ -169,20 +184,34 @@ def main():
         sys.exit(
             f"[AOT] '{args.clang}' not found and no prebuilt "
             f"{os.path.relpath(o_path, _ORIGINAL_CWD)}.\n"
-            f"      The AOT model builds the .o OFFLINE on a build box with clang, then\n"
-            f"      deploys the prebuilt .o. Build it there (python3 "
-            f"shared/methods/method4_hardcoded_aot.py),\n"
-            f"      copy nn_aot_arch.o onto this node, or use the BCC path "
-            f"(--hardcoded-backend bcc).")
+            f"      AOT-literal is the only hardcoded deploy backend now (BCC live-attach\n"
+            f"      was removed at the professor's request). Build the .o OFFLINE on a\n"
+            f"      box with clang (python3 shared/methods/method4_hardcoded_aot.py),\n"
+            f"      then copy nn_aot_arch.o onto this node.")
 
     loader_c   = os.path.join(POC_DIR, "loader_aot.c")
     loader_bin = os.path.join(POC_DIR, "loader_aot")
     if (not os.path.exists(loader_bin)
             or os.path.getmtime(loader_bin) < os.path.getmtime(loader_c)):
-        rc, out, err = _run([args.cc, "-O2", loader_c, "-o", loader_bin, "-lbpf"], cwd=POC_DIR)
+        # Statically link libbpf (+ libelf/zlib, its own dependencies) so the
+        # resulting binary has NO runtime dependency on libbpf.so being
+        # installed on the datapath node -- Kathara node images have neither
+        # clang nor libbpf, so a dynamically-linked loader_aot copied there
+        # would fail to even start ("cannot open shared object file"), which
+        # would defeat the whole point of building it elsewhere. Only libc
+        # stays dynamic (present on essentially any Linux, unlike libbpf).
+        static_link = [args.cc, "-O2", loader_c, "-o", loader_bin,
+                       "-l:libbpf.a", "-l:libelf.a", "-l:libz.a"]
+        rc, out, err = _run(static_link, cwd=POC_DIR)
         if rc != 0:
-            sys.exit(f"[AOT] loader build failed (rc={rc}):\n{err}\n"
-                     "      Need libbpf-dev: sudo apt-get install libbpf-dev")
+            print(f"[AOT] static link failed (rc={rc}), falling back to dynamic -lbpf "
+                 f"(the resulting binary will need libbpf.so present on every node it runs on):")
+            print(f"      {err.strip().splitlines()[-1] if err.strip() else '(no stderr)'}")
+            rc, out, err = _run([args.cc, "-O2", loader_c, "-o", loader_bin, "-lbpf"], cwd=POC_DIR)
+            if rc != 0:
+                sys.exit(f"[AOT] loader build failed (rc={rc}):\n{err}\n"
+                         "      Need libbpf-dev (+ libelf-dev, zlib1g-dev for the static path): "
+                         "sudo apt-get install libbpf-dev libelf-dev zlib1g-dev")
         print(f"[AOT] built loader_aot")
 
     if args.iface:
