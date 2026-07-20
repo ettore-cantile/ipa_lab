@@ -106,6 +106,11 @@ def main():
     ap.add_argument("--clang", default="clang", help="clang binary")
     ap.add_argument("--cc", default="cc", help="C compiler for the loader")
     ap.add_argument("--keep", action="store_true", help="keep generated .bpf.c/.o")
+    ap.add_argument(
+        "--iface", default=None,
+        help="LIVE DEPLOY: attach the prebuilt .o to this interface (real XDP "
+             "attach, stays resident until Ctrl-C) instead of the TEST_RUN bench. "
+             "This is the AOT alternative to method4_hardcoded's BCC live attach.")
     args = ap.parse_args()
     args.model = _resolve_cli_path(args.model)
 
@@ -161,6 +166,23 @@ def main():
             sys.exit(f"[AOT] loader build failed (rc={rc}):\n{err}\n"
                      "      Need libbpf-dev: sudo apt-get install libbpf-dev")
         print(f"[AOT] built loader_aot")
+
+    if args.iface:
+        # LIVE DEPLOY: attach the prebuilt .o to a real interface and stay
+        # resident (no clang on this node). Runs the loader in --attach mode
+        # with inherited stdio so output streams and Ctrl-C detaches.
+        import socket
+        try:
+            ifindex = socket.if_nametoindex(args.iface)
+        except OSError:
+            sys.exit(f"[AOT] interface {args.iface!r} not found")
+        print(f"[AOT] LIVE deploy: attaching prebuilt .o to {args.iface} "
+              f"(ifindex={ifindex}); no clang on this node. Ctrl-C to detach.\n")
+        rc = subprocess.run([loader_bin, o_path, "--attach", str(ifindex)],
+                            cwd=POC_DIR).returncode
+        if rc != 0:
+            sys.exit(f"[AOT] loader_aot live attach failed (rc={rc})")
+        return
 
     print(f"[AOT] running loader_aot on the prebuilt .o ...\n")
     rc, out, err = _run([loader_bin, o_path], cwd=POC_DIR)

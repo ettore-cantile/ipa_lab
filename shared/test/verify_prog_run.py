@@ -359,6 +359,87 @@ def _seed_link_state(b, val: int = 1):
         pass
 
 
+EBPF_BASELINE = r"""
+#include <uapi/linux/if_ether.h>
+#include <uapi/linux/ip.h>
+#include <uapi/linux/udp.h>
+#include <uapi/linux/in.h>
+
+struct ipa_hdr {
+    __u8 model_id; __u8 model_type; __u8 param_size; __be16 scale_factor;
+    __u8 input_size; __u8 output_size; __u8 hidden_layers; __u8 neurons_per_layer;
+    __u8 n_feature_types;
+    __u8 f0c,f0n,f1c,f1n,f2c,f2n,f3c,f3n; __u8 n_output_types; __u8 o0c,o0n;
+} __attribute__((packed));
+
+struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
+
+BPF_HASH(mac_table, __u32, struct fwd_action, 8);
+BPF_ARRAY(pkt_stats, __u64, 3);
+BPF_ARRAY(cls_stats, __u64, 7);
+
+/* EMPTY/BASELINE pipeline: the SAME packet parse as the hardcoded dispatcher
+ * (eth/ip/udp/ipa, bounds-checked) + the SAME action (mac_table -> MAC rewrite
+ * -> bpf_redirect), but NO dispatch tail-call and NO neural-net inference. It
+ * redirects a FIXED class 0 (no argmax). Measured with the identical
+ * BPF_PROG_TEST_RUN harness as the real pipelines, so it is the reference floor:
+ * hardcoded_latency - baseline_latency isolates the cost of the extra work
+ * hardcoded does (tail-call + double parse + the MLP). If hardcoded ~ baseline,
+ * the XDP+parse+redirect FRAMEWORK floor dominates and the int8 65-4-4-7 net is
+ * nearly free -- which is why the hardcoded --kernel throughput looks so high. */
+int xdp_baseline(struct xdp_md *ctx) {
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    struct iphdr *ip = (struct iphdr *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return XDP_PASS;
+    if (ip->protocol != IPPROTO_UDP) return XDP_PASS;
+    struct udphdr *udp = (struct udphdr *)(ip + 1);
+    if ((void *)(udp + 1) > data_end) return XDP_PASS;
+    if (udp->dest != bpf_htons(9999)) return XDP_PASS;
+    struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
+    if ((void *)(ipa + 1) > data_end) return XDP_PASS;
+
+    __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
+    struct fwd_action *action = mac_table.lookup(&cls);
+    if (action) {
+        int si = 0; __u64 *v = pkt_stats.lookup(&si);
+        if (v) __sync_fetch_and_add(v, 1);
+        __u64 *cv = cls_stats.lookup(&cls);
+        if (cv) __sync_fetch_and_add(cv, 1);
+        __builtin_memcpy(eth->h_source, action->src_mac, 6);
+        __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
+        return bpf_redirect(action->ifindex, 0);
+    }
+    int mi = 1; __u64 *mv = pkt_stats.lookup(&mi);
+    if (mv) __sync_fetch_and_add(mv, 1);
+    return XDP_PASS;
+}
+"""
+
+
+def setup_baseline(model_id: int, model_path: str):
+    """Empty/baseline pipeline: XDP parse + redirect, NO neural-net inference,
+    NO tail-call. Same BPF_PROG_TEST_RUN harness as the real pipelines, so it is
+    the reference FLOOR for the throughput/latency comparison -- it answers "how
+    much of the hardcoded number is just the XDP+parse+redirect framework vs the
+    actual inference". Returns the same dict shape as the other setups."""
+    weights, scale = load_weights(model_path)
+    b = BPF(text=EBPF_BASELINE)
+    fn = b.load_func("xdp_baseline", BPF.XDP)
+    _install_mac_table(b, "mac_table")
+    return {
+        "b": b, "fn": fn, "disp": fn,
+        "weights": weights, "scale": scale,
+        "cls_stats": b["cls_stats"],
+        "pkt_stats": b["pkt_stats"],
+        "pipeline": 0,
+        "progs": {"xdp_baseline": fn.fd},
+        "n_tail": 0,
+    }
+
+
 def setup_hardcoded(model_id: int, model_path: str):
     """
     Load the pure hardcoded eBPF program (Pipeline 1).

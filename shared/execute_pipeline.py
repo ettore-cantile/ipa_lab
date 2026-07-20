@@ -88,6 +88,14 @@ For the full metric comparison across pipelines:
         action="store_true",
         help="Load and verify eBPF program without attaching XDP (safe for testing)"
     )
+    parser.add_argument(
+        "--hardcoded-backend",
+        choices=["aot", "bcc"],
+        default="aot",
+        help="hardcoded (Pipeline 1) deploy backend: 'aot' (prebuilt .o attached "
+             "live, NO clang on this node -- default) or 'bcc' (legacy clang at "
+             "runtime via method4_hardcoded). Ignored by template/modular."
+    )
     args = parser.parse_args()
 
     model_path = args.model or os.path.join(
@@ -139,9 +147,9 @@ For the full metric comparison across pipelines:
     print("=" * 60)
 
     if args.method == "hardcoded":
-        # Pipeline 1 — weights hardcoded in the C source, unrolled inference
-        from methods.method4_hardcoded import run
+        # Pipeline 1 — weights hardcoded as C literals, unrolled inference.
         if args.verify_only:
+            # Verifier smoke test via the BCC generator (no attach, no offline clang).
             sys.argv = ["method4_hardcoded.py", "--verify-only",
                         "--iface", args.iface,
                         "--model-id", str(args.model_id)]
@@ -151,7 +159,19 @@ For the full metric comparison across pipelines:
                 os.path.join(SHARED_DIR, "methods", "method4_hardcoded.py"),
                 run_name="__main__"
             )
+        elif args.hardcoded_backend == "aot":
+            # DEFAULT: AOT-literal deploy — prebuilt .o attached live, NO clang on
+            # this node (the recompilation win). See method4_hardcoded_aot.py.
+            sys.argv = ["method4_hardcoded_aot.py", "--iface", args.iface]
+            if args.model:
+                sys.argv += ["--model", args.model]
+            runpy.run_path(
+                os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py"),
+                run_name="__main__"
+            )
         else:
+            # Legacy BCC live attach (clang at runtime), kept as fallback.
+            from methods.method4_hardcoded import run
             run(model_id=args.model_id, iface=args.iface, model_path=model_path)
 
     elif args.method == "template":

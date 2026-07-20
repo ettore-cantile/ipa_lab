@@ -1047,6 +1047,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
     import resource
     mp = model_path or V.MODEL_PT
     methods = [
+        ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
         ("hardcoded", V.setup_hardcoded, 1),
         ("template",  V.setup_template,  2),
         ("modular",   V.setup_modular,   3),
@@ -1136,6 +1137,8 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
     if verify:
         print()
         for name, _, _ in methods:
+            if name == "baseline":
+                continue   # baseline has no inference to verify (pure parse+redirect)
             try:
                 failed = V.run(name, 0, mp, ttl_min, ttl_max, repeat=1000)
                 if failed == 0:

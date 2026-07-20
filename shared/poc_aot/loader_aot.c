@@ -17,7 +17,10 @@
 // match test_suite (ipa_switch_hardcoded + model_0).
 //
 // Build: cc -O2 loader_aot.c -o loader_aot -lbpf
-// Run  : sudo ./loader_aot <literal.o>        (defaults to nn_aot_arch.o)
+// Run  : sudo ./loader_aot <literal.o>                 (bench: TEST_RUN)
+//        sudo ./loader_aot <literal.o> --attach <ifidx> (LIVE deploy: attach
+//              xdp_dispatch to the interface, stay resident until Ctrl-C, then
+//              detach -- the AOT alternative to method4_hardcoded's BCC attach)
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -26,8 +29,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
+#include <unistd.h>
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
+
+/* Set by SIGINT/SIGTERM so the live-attach deploy mode can detach cleanly. */
+static volatile sig_atomic_t g_stop = 0;
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 static double now_ms(void) {
     struct timespec ts;
@@ -92,7 +101,17 @@ static int seed_maps(struct bpf_object *obj) {
 }
 
 int main(int argc, char **argv) {
-    const char *lit = argc > 1 ? argv[1] : "nn_aot_arch.o";
+    // Args: <literal.o> [--attach <ifindex>]
+    //   no --attach  -> bench mode  (BPF_PROG_TEST_RUN, deploy-cost + perf)
+    //   --attach N   -> deploy mode (attach xdp_dispatch to ifindex N, stay
+    //                   resident until Ctrl-C, then detach). This is the LIVE
+    //                   datapath alternative to BCC's method4_hardcoded attach.
+    const char *lit = "nn_aot_arch.o";
+    int attach_ifindex = -1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--attach") && i + 1 < argc) attach_ifindex = atoi(argv[++i]);
+        else lit = argv[i];
+    }
 
     // --- deploy cost: open + load a prebuilt literal .o (no clang) ---
     double t0 = now_ms();
@@ -115,6 +134,30 @@ int main(int argc, char **argv) {
     }
 
     if (seed_maps(obj)) goto err;
+
+    // --- LIVE DEPLOY mode: attach xdp_dispatch to a real interface and stay
+    // resident (the AOT alternative to BCC's method4_hardcoded live attach).
+    // Requires libbpf >= 0.7 for bpf_xdp_attach/detach. ---
+    if (attach_ifindex >= 0) {
+        if (bpf_xdp_attach(attach_ifindex, disp_fd, 0, NULL)) {
+            fprintf(stderr, "bpf_xdp_attach(ifindex=%d) failed\n", attach_ifindex);
+            goto err;
+        }
+        signal(SIGINT,  on_signal);
+        signal(SIGTERM, on_signal);
+        printf("================================================================\n");
+        printf(" AOT-literal LIVE deploy (Pipeline 1) -- NO clang on this node\n");
+        printf("================================================================\n");
+        printf("[deploy] open+load (verify+JIT): %.3f ms  "
+               "(BCC method4 recompile for the same model: ~1660 ms of clang)\n", t2 - t0);
+        printf("[deploy] xdp_dispatch attached to ifindex %d. Ctrl-C to detach.\n",
+               attach_ifindex);
+        while (!g_stop) pause();
+        bpf_xdp_detach(attach_ifindex, 0, NULL);
+        printf("\n[deploy] detached from ifindex %d.\n", attach_ifindex);
+        bpf_object__close(obj);
+        return 0;
+    }
 
     long insn_disp = prog_insns(disp_fd), insn_model = prog_insns(model_fd);
     long insn_total = insn_disp + insn_model;   // matches test_suite (disp + model)
