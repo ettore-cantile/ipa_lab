@@ -52,27 +52,6 @@ from common import (
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _populate_mac_t2(b: BPF, egress_iface: str, egress_ifindex: int):
-    """Install mac_table_t2: egress class (0..5, the argmax output) ->
-    {ifindex, src_mac, dst_mac}. The NN decides the port; this map only
-    resolves the L2 next-hop. No key computation, no per-TTL validation.
-    src_mac/dst_mac are resolved from the kernel (own iface MAC + ARP table
-    for the neighbor), not hardcoded constants. In this lab all classes
-    point to the same egress iface (single next-hop); a real deployment
-    would map each class to its own neighbour + MACs."""
-    src_mac, dst_mac = resolve_egress_mac(egress_iface)
-    mac    = b.get_table("mac_table_t2")
-    action = mac.Leaf()
-    action.ifindex = egress_ifindex
-    for i in range(6):
-        action.src_mac[i] = src_mac[i]
-        action.dst_mac[i] = dst_mac[i]
-    for cls in range(6):
-        mac[ctypes.c_uint32(cls)] = action
-    print(f"[mac_t2] mac_table_t2 loaded: class 0..5 -> ifindex={egress_ifindex} "
-          f"src={':'.join(f'{b:02x}' for b in src_mac)} dst={':'.join(f'{b:02x}' for b in dst_mac)}")
-
-
 def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         hidden_dims: list = None):
     """
@@ -155,14 +134,12 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     # Attach dispatcher as the XDP entry point
     fn_dispatcher = b.load_func("ipa_switch_template", BPF.XDP)
 
-    # Populate the L2 next-hop dictionary (class -> ifindex + MACs).
-    # fallback="eth0": if EGRESS_IFACE doesn't exist on this node (e.g. a
-    # topology with fewer real links), any working interface is an
-    # acceptable substitute for a mac_table entry -- unlike ingress, this
-    # doesn't change where packets are intercepted, just where they'd be
-    # redirected on a class that may not even fire in this run.
-    egress_iface_resolved, egress_ifindex = resolve_ifindex(EGRESS_IFACE, fallback="eth0")
-    _populate_mac_t2(b, egress_iface_resolved, egress_ifindex)
+    # Populate the L2 next-hop dictionary with a DISTINCT egress port per class
+    # (class i -> eth<i>, ARP-resolved MAC of that port) so the NN's argmax
+    # actually selects the physical egress. Classes whose interface is absent on
+    # this node are left unmapped (that class -> MISS). 6 forward classes (T2_N_OUT-1).
+    from common import install_mac_per_class
+    install_mac_per_class(b, "mac_table_t2", n_fwd=6)
 
     # Seed link_state (egress up/down feature [0..5]) and start carrier monitor.
     from link_state_monitor import init_link_state_up, start_monitor_thread

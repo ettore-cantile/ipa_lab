@@ -175,6 +175,50 @@ def resolve_egress_mac(iface: str, fallback_dst: list = None):
     return src, dst
 
 
+def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = None):
+    """Populate `table_name` (BPF_HASH class -> fwd_action) with a DISTINCT
+    next-hop PER egress class: class i -> egress_ifaces[i], src = that iface's own
+    MAC, dst = the ARP-resolved MAC of its neighbour (fallback until ARP resolves).
+
+    This makes the NN's argmax class actually select the physical egress port,
+    instead of every class redirecting out the same interface (the old behaviour:
+    one iface resolved, the same action written to all classes).
+
+    egress_ifaces: class -> interface name. Default ['eth0','eth1',...], i.e. the
+    argmax class index == egress port index (same order as the link_state slots).
+    Classes whose interface is absent on this node are left UNMAPPED -> that class
+    resolves to MISS at runtime. Pass an explicit list to match a different
+    class->port convention.
+    """
+    import ctypes
+    if egress_ifaces is None:
+        egress_ifaces = [f"eth{i}" for i in range(n_fwd)]
+    mac = b.get_table(table_name)
+    installed = []
+    for cls in range(n_fwd):
+        name = egress_ifaces[cls] if cls < len(egress_ifaces) else None
+        if not name:
+            continue
+        try:
+            iface_r, ifindex = resolve_ifindex(name)
+            src_mac, dst_mac = resolve_egress_mac(iface_r)
+        except Exception as e:
+            print(f"[mac] class {cls}: egress '{name}' unavailable ({e}) -> unmapped (MISS)")
+            continue
+        action = mac.Leaf()
+        action.ifindex = ifindex
+        for i in range(6):
+            action.src_mac[i] = src_mac[i]
+            action.dst_mac[i] = dst_mac[i]
+        mac[ctypes.c_uint32(cls)] = action
+        installed.append((cls, iface_r, ifindex))
+    for cls, ifc, idx in installed:
+        print(f"[mac] {table_name}: class {cls} -> {ifc} (ifindex={idx})")
+    if not installed:
+        print(f"[mac] WARNING: {table_name} -- no egress interface resolved; every class -> MISS")
+    return installed
+
+
 def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
     print(f"[xdp] Attaching XDP to {iface}...")
     try:

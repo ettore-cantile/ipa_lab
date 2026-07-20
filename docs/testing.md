@@ -34,8 +34,10 @@ python3 shared/test/test_suite.py --model shared/frr_germany50_5_model_4x2.pt --
 
 ## 2. Test nel kernel (`--only kernel`) — richiede Linux + BCC + root
 
-Carica i tre programmi XDP reali ed esegue `BPF_PROG_TEST_RUN`. Misura le metriche
-del design space direttamente dal kernel e verifica il dispatch (redirect) per ogni TTL.
+Carica i programmi XDP reali ed esegue `BPF_PROG_TEST_RUN`. Misura le metriche del design
+space direttamente dal kernel e verifica il dispatch (redirect) per ogni TTL. La tabella
+include ora una colonna **baseline** (parse + redirect, nessuna inferenza) come pavimento di
+riferimento — utile per capire quanto costa davvero l'inferenza rispetto al solo framework XDP.
 
 ```bash
 # Su host Linux con BCC installato
@@ -91,18 +93,40 @@ Ogni nodo esegue `shared/fix_bpf.sh` al boot (monta debugfs, abilita ip_forward,
 
 ## 4. Attaccare una pipeline a un'interfaccia (XDP reale sul fabric)
 
+Attacca sull'interfaccia dove **entra** il traffico (XDP conta solo l'ingresso). In questo
+lab il traffico per `frankfurt` (IP loopback `10.255.255.17`) entra su **eth1** — verifica con
+`kathara exec frankfurt -- tcpdump -i any -n udp port 9999`.
+
 ```bash
-# sul nodo che fa da switch (es. frankfurt)
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1 --model-id 0
+# sul nodo che fa da switch (es. frankfurt), su eth1
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method template  --iface eth1 --model-id 0
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method modular   --iface eth1 --model-id 0
 
+# hardcoded: due backend. Su Kathara (niente clang) usa BCC.
+kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1 --hardcoded-backend bcc
+#   --hardcoded-backend aot (default) = .o prebuilt, richiede clang+libbpf (host/build box, non i nodi Kathara)
+
 # solo verifica del caricamento, senza restare in ascolto
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --verify-only
+
+# se un XDP resta appeso da un run precedente ("File exists"): staccalo
+kathara exec frankfurt -- ip link set dev eth1 xdp off
 ```
 
-Le pipeline popolano `mac_table` (class → ifindex + MAC) da sole all'avvio; non serve uno
-step separato di setup della tabella di forwarding.
+Tutte e tre stampano `HIT | MISS | DROP` dal vivo. Popolano `mac_table` (classe → ifindex +
+MAC) e `link_state` da sole all'avvio; non serve un setup separato.
+
+### AOT-literal deploy / bench (P1, host con clang o build box)
+
+```bash
+# bench (deploy-cost + perf, via BPF_PROG_TEST_RUN)
+sudo python3 shared/methods/method4_hardcoded_aot.py
+# deploy LIVE: builda il .o e lo attacca all'interfaccia (resta resident)
+sudo python3 shared/methods/method4_hardcoded_aot.py --iface enp0s3
+```
+
+Il modello AOT è **build offline** (macchina con clang) → deploy del `.o` prebuilt sul nodo
+(nessun clang). Su un nodo senza clang, se `nn_aot_arch.o` è già presente viene riusato.
 
 Le pipeline avviano automaticamente il monitor `link_state` (thread di polling che tiene
 `link_state[0..5]` allineato al carrier reale delle interfacce egress). Per un dry-run dei
@@ -151,31 +175,75 @@ in `docs/pipeline_design_space.html` (sezione Risultati Sperimentali).
 
 ---
 
-## Risultati (kernel, TTL 1–5, modello 65→4→4→7, scale=24)
+## Risultati (kernel, `test_suite.py --only kernel`, 4 CPU, modello 65→4→4→7, scale=24)
 
-| Metrica                    | P1 hardcoded | P2 template | P3 modular |
-|----------------------------|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated)   |          996 |       2 618 |     13 441 |
-| Codice jited (byte)        |        4 658 |      11 464 |     57 224 |
-| Tail calls / pacchetto     |     0 (leaf) |           1 |          3 |
-| Map lookup / pacchetto (stima) | 8 (0 pesi) |         322 |        384 |
-| Memoria mappe (byte)       |          264 |       7 560 |     20 232 |
-| Latenza (ns/pacchetto)     |         32.0 |       125.0 |      590.0 |
-| Throughput (Mpps)          |       31.250 |       8.000 |      1.695 |
-| CPU (%)                    |           38 |          53 |         60 |
-| Dispatch (TTL 1–5)         |    5/5 PASS  |   5/5 PASS  |  5/5 PASS  |
-| link_state reroute         |         PASS (5/30 casi cambiano uscita) |||
+Aggiornati dopo: IV **descrittore-driven** in P2/P3 (registry `model_desc`), AOT-literal
+universale in P1, riga **baseline** (parse + redirect, **nessuna inferenza**) come pavimento.
 
-Misurate con `test_suite.py --only kernel` (4 CPU, scale 24) dopo il refactor `mac_table`
-(sostituisce `fwd_table`/`valid_keys`) e la correzione del match di `ingress_ifindex` in
-`BPF_PROG_TEST_RUN` (nessun `ctx_in` custom, vedi sotto).
+| Metrica                    | baseline | P1 hardcoded | P2 template | P3 modular |
+|----------------------------|---------:|-------------:|------------:|-----------:|
+| Istruzioni eBPF (xlated)   |      113 |          980 |      16 988 |     15 767 |
+| Codice jited (byte)        |      542 |        4 684 |      84 587 |     76 376 |
+| Tail calls / pacchetto     |        0 |            1 |           1 |          3 |
+| Map lookup / pacchetto (reali) |    0 |          4.0 |       147.0 |      160.0 |
+| Memoria mappe (byte)       |      280 |          308 |       8 052 |     16 884 |
+| Latenza (ns/pacchetto)     |     29.0 |         77.0 |       523.0 |    1 030.0 |
+| Throughput (Mpps)          |   34.483 |       12.987 |       1.912 |      0.971 |
+| CPU (%)                    |       39 |           59 |          80 |         82 |
+| Dispatch (correttezza)     |        — |     10/10 PASS |   5/5 PASS |   5/5 PASS |
+| link_state reroute         |          | PASS (5/30 casi cambiano uscita) |||
 
-Note oneste:
-- **P1 hardcoded è il più veloce** (32 ns, 31.2 Mpps), il più compatto (264 B, 996 istr) e senza tail call né lookup pesi: massime prestazioni, minima flessibilità. **P3 modular** all'opposto (590 ns, 3 tail call, ~20 KB). **P2 template** nel mezzo (125 ns). Ordine coerente con la tassonomia.
-- Ogni metrica di costo (istruzioni, jited, tail call, map lookup, memoria) cresce monotona P1→P2→P3; le prestazioni di picco calano nello stesso ordine.
-- **P1 = meno memoria mappe** (264 B): nessun `model_cache` (prima 83 KB, il 99%), restano solo i contatori + `link_state` a 6 slot.
-- **Inferenza identica** nelle 3 pipeline (stesso MLP, stessi pesi, stesso argmax): verificata dal check di corrispondenza di classe (classe kernel = classe riferimento Python). Differiscono solo per *come* calcolano l'inferenza.
-- **Azione uniforme (mac_table)**: tutte fanno `argmax → mac_table[classe] → bpf_redirect`. La NN decide la porta; `mac_table` è un dizionario `classe → {ifindex, MAC}` (in P1 hardcoded in uno `switch`, 0 lookup). Rimossa la vecchia `fwd_table` indicizzata dal valore + validazione per-TTL (`valid_keys`): memoria mappe P2/P3 scesa rispettivamente da 15 796→7 560 B e 28 468→20 232 B (hash 256 slot → 8 slot).
-- `link_state[0..5]` = stato up/down delle 6 interfacce egress (segnale fast-reroute), letto dalla map condivisa; aggiornato dal monitor carrier. Il probe conferma che un link giù cambia l'uscita (5/30 casi).
-- **Nessun `ctx_in` custom nel verifier**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox cade fuori sia dalla `ifindex_table` di P1 sia dal clamp `[1,6]` di P2/P3, quindi tutte e tre risolvono a "nessuna iface di ingresso" (`_iface=0`) nello stesso modo — il riferimento Python usa `ifindex=0` senza bisogno di forzare il contesto.
+### Baseline vs hardcoded (la domanda "perché l'hardcoded è così veloce?")
+
+Il **baseline** riceve il pacchetto in XDP, fa lo stesso parse del dispatcher e un
+`bpf_redirect` — **niente tail-call, niente MLP**. È il *pavimento* del framework:
+**29 ns / 34.5 Mpps**. L'hardcoded (**77 ns**) aggiunge ~48 ns per tail-call + double-parse +
+la rete. Quindi l'hardcoded **non** è sospettosamente veloce: è **2.6× più lento** del
+do-nothing. Il throughput alto è il pavimento XDP+parse+redirect; la rete int8 65-4-4-7
+unrolled costa poco in confronto.
+
+### AOT-literal deploy (P1, `method4_hardcoded_aot.py`)
+
+| | valore |
+|---|---:|
+| open_file | 0.27 ms |
+| load (verify+JIT) | 4.40 ms |
+| **deploy totale** | **4.66 ms** |
+| BCC ricompila lo stesso modello | ~1660 ms |
+| perf: insn (disp 28 + model 982) | 1010 |
+| perf: latenza / throughput | 90 ns / 11.1 Mpps |
+
+Perf ≈ BCC hardcoded (varianza run-to-run): l'AOT preserva il massimo literal, ma sposta
+`clang` **offline** → deploy sul nodo ~4.7 ms invece di ~1660 ms.
+
+### Costo di aggiunta modello (`bench_model_add.py`, 3 modelli)
+
+| pipeline | add medio (ms) | come |
+|---|---:|---|
+| hardcoded | 1435.8 | ricompilazione completa (clang = 99.7%) |
+| template | 4.9 | solo `bpf_map_update_elem` |
+| modular | 8.4 | solo `bpf_map_update_elem` |
+
+Hardcoded ~294× più lento di template, ~172× di modular. L'AOT stima ~4 ms di load →
+**~341× più economico** del BCC, **senza perdita di perf**.
+
+### Multi-model (`verify_multi_model.py`) — regge shape custom
+
+`model_desc` popolato correttamente anche per shape non-default: P2 `model_id=1` = 65-**6-5**-7,
+P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
+
+## Note oneste
+
+- **Ordine design-space confermato**: costo (istruzioni, jited, tail call, lookup, memoria)
+  cresce monotono baseline→P1→P2→P3; le prestazioni calano nello stesso ordine.
+- **Costo della flessibilità IV runtime (Task 3)**: rendere P2/P3 descrittore-driven ha
+  aumentato il loro conteggio istruzioni (P2 template ~2 618→16 988, latenza 125→523 ns): il
+  loop generico per-feature unrolled (`MAX_FEAT` × neuroni × dense) pesa. È il prezzo della
+  flessibilità a runtime, coerente con la posizione di P2/P3 (flessibilità > velocità).
+- **P1 = meno memoria mappe** (308 B): nessun `model_cache`, solo contatori + `link_state`.
+- **Inferenza identica** nelle 3 pipeline (stesso MLP/pesi/argmax): verificata dal match di
+  classe kernel vs riferimento Python (10/10 e 5/5 PASS).
+- **Azione uniforme (`mac_table`)**: `argmax → mac_table[classe] → bpf_redirect`.
+- **Nessun `ctx_in` custom**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox cade
+  fuori dalla `ifindex_table` di P1 e dal clamp `[1,6]` di P2/P3 → tutte risolvono `_iface=0`.
 - Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`.

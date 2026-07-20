@@ -129,26 +129,6 @@ def _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table):
           f"model_0 fd={model_fn.fd}")
 
 
-def _populate_mac(b, egress_iface, egress_ifindex, n_fwd):
-    """Install mac_table: egress class (0..n_fwd-1, the argmax output) ->
-    {ifindex, src_mac, dst_mac}. The NN decides the port; this map only resolves
-    the L2 next-hop (same pattern as method5's mac_table_t2). In this lab all
-    classes point at the same egress iface (single next-hop)."""
-    import ctypes
-    from common import resolve_egress_mac
-    src_mac, dst_mac = resolve_egress_mac(egress_iface)
-    mac    = b.get_table("mac_table")
-    action = mac.Leaf()
-    action.ifindex = egress_ifindex
-    for i in range(6):
-        action.src_mac[i] = src_mac[i]
-        action.dst_mac[i] = dst_mac[i]
-    for cls in range(n_fwd):
-        mac[ctypes.c_uint32(cls)] = action
-    print(f"[mac] mac_table loaded: class 0..{n_fwd-1} -> ifindex={egress_ifindex} "
-          f"src={':'.join(f'{x:02x}' for x in src_mac)} dst={':'.join(f'{x:02x}' for x in dst_mac)}")
-
-
 def _attach(ebpf_src, iface, shape, model_id=0):
     """Compile, wire the tail-call (dispatcher -> model_progs[model_id] ->
     model_<id>), seed link_state + mac_table, attach to *iface* and show live
@@ -157,7 +137,7 @@ def _attach(ebpf_src, iface, shape, model_id=0):
     tail call falls through to XDP_PASS and never infers/forwards."""
     from bcc import BPF
     import ctypes, time
-    from common import attach_xdp, resolve_ifindex, EGRESS_IFACE
+    from common import attach_xdp, resolve_ifindex, install_mac_per_class
 
     iface, _ = resolve_ifindex(iface)
     print(f"[method4] Compiling hardcoded program, shape="
@@ -178,10 +158,9 @@ def _attach(ebpf_src, iface, shape, model_id=0):
     except Exception as e:
         print(f"[method4] link_state seed skipped ({e})")
 
-    # Populate mac_table (class -> egress next-hop). n_out-1 forward classes,
-    # last class = DROP.
-    egress_iface, egress_ifindex = resolve_ifindex(EGRESS_IFACE, fallback=iface)
-    _populate_mac(b, egress_iface, egress_ifindex, n_fwd=shape["n_out"] - 1)
+    # Populate mac_table: DISTINCT egress port per class (class i -> eth<i>,
+    # ARP-resolved). n_out-1 forward classes, last class = DROP.
+    install_mac_per_class(b, "mac_table", n_fwd=shape["n_out"] - 1)
 
     attach_xdp(b, disp_fn, iface=iface)
     print(f"[method4] Pipeline 1 (hardcoded) running on {iface}. "

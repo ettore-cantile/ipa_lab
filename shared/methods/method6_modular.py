@@ -53,19 +53,6 @@ from common import (
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _populate_mac_t3(b: BPF, egress_iface: str, egress_ifindex: int):
-    """Install mac_table_t3: egress class (0..5) -> {ifindex, src_mac, dst_mac}."""
-    src_mac, dst_mac = resolve_egress_mac(egress_iface)
-    mac    = b.get_table("mac_table_t3")
-    action = mac.Leaf()
-    action.ifindex = egress_ifindex
-    for i in range(6):
-        action.src_mac[i] = src_mac[i]
-        action.dst_mac[i] = dst_mac[i]
-    for cls in range(6):
-        mac[ctypes.c_uint32(cls)] = action
-    print(f"[mac_t3] mac_table_t3 loaded: class 0..5 -> ifindex={egress_ifindex} "
-          f"src={':'.join(f'{b:02x}' for b in src_mac)} dst={':'.join(f'{b:02x}' for b in dst_mac)}")
 
 
 def run(model_id: int = 42, iface: str = None, model_ids: list = None,
@@ -152,11 +139,11 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     # Attach modular_dispatcher as the XDP entry point
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
 
-    # Populate the L2 next-hop dictionary. fallback="eth0": see the matching
-    # comment in method5_template.py -- egress can safely substitute a
-    # working interface, ingress (above) cannot.
-    egress_iface_resolved, egress_ifindex = resolve_ifindex(EGRESS_IFACE, fallback="eth0")
-    _populate_mac_t3(b, egress_iface_resolved, egress_ifindex)
+    # Populate the L2 next-hop dictionary with a DISTINCT egress port per class
+    # (class i -> eth<i>, ARP-resolved MAC of that port) so the NN's argmax
+    # selects the physical egress. Absent interfaces -> that class MISSes.
+    from common import install_mac_per_class
+    install_mac_per_class(b, "mac_table_t3", n_fwd=6)
 
     # Seed link_state and start carrier monitor
     from link_state_monitor import init_link_state_up, start_monitor_thread
