@@ -251,6 +251,11 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
     watchlist = [(cls, iface) for cls, iface in egress_ifaces
                  if iface in existing]
 
+    # Print the actual (post-filter) watchlist so the log reflects only the
+    # interfaces that will really be polled (not phantom eth4/eth5 etc.).
+    watch_names = [iface for _, iface in watchlist]
+    print(f"[mac] MAC refresh thread started for: {watch_names}")
+
     if not watchlist:
         return None   # nothing to watch
 
