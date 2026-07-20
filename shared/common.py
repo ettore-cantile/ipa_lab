@@ -12,6 +12,8 @@ import json
 import os
 import re
 import ctypes
+import threading
+import time
 from bcc import BPF
 
 INGRESS_IFACE = "eth0"   # darmstadt[0]=l59, link to frankfurt (10.0.0.233/30)
@@ -217,6 +219,56 @@ def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = 
     if not installed:
         print(f"[mac] WARNING: {table_name} -- no egress interface resolved; every class -> MISS")
     return installed
+
+
+def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
+                             interval: float = 5.0):
+    """Start a daemon thread that periodically re-reads /proc/net/arp and
+    updates mac_table BPF entries that still use the fallback MAC with the
+    real ARP-resolved neighbor MAC as soon as it becomes available.
+
+    This removes the need for manual ARP warmup before launching the pipeline:
+    within `interval` seconds of OSPF/FRR generating the first L3 traffic on
+    a link the real neighbor MAC is detected and the BPF map entry corrected.
+
+    egress_ifaces: list of (cls, iface_name) pairs -- only the ifaces that
+    were installed with a fallback MAC need to be watched.
+    """
+    mac_tbl = b.get_table(table_name)
+    fallback = DST_MAC
+
+    def _refresh():
+        pending = list(egress_ifaces)   # [(cls, iface), ...] still on fallback
+        while pending:
+            time.sleep(interval)
+            still_pending = []
+            for cls, iface in pending:
+                dst = neighbor_mac(iface)
+                if dst is None or dst == fallback:
+                    still_pending.append((cls, iface))
+                    continue
+                # Real MAC now available — update the BPF entry.
+                try:
+                    src = local_mac(iface)
+                    _, ifindex = resolve_ifindex(iface)
+                    action = mac_tbl.Leaf()
+                    action.ifindex = ifindex
+                    for i in range(6):
+                        action.src_mac[i] = src[i]
+                        action.dst_mac[i] = dst[i]
+                    mac_tbl[ctypes.c_uint32(cls)] = action
+                    dst_str = ":".join(f"{b:02x}" for b in dst)
+                    print(f"[mac_refresh] class {cls} ({iface}): "
+                          f"dst_mac updated to {dst_str}")
+                except Exception as e:
+                    print(f"[mac_refresh] class {cls} ({iface}): update failed ({e})")
+                    still_pending.append((cls, iface))
+            pending = still_pending
+        print("[mac_refresh] all ifaces resolved — thread exiting")
+
+    t = threading.Thread(target=_refresh, daemon=True, name="mac_refresh")
+    t.start()
+    return t
 
 
 def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
