@@ -171,8 +171,13 @@ For the full metric comparison across pipelines:
             )
         else:
             # Legacy BCC live attach (clang at runtime), kept as fallback.
+            # method4_hardcoded.run() takes a CLI-style args LIST (not kwargs
+            # like method5/6), so build argv explicitly.
             from methods.method4_hardcoded import run
-            run(model_id=args.model_id, iface=args.iface, model_path=model_path)
+            argv = ["--iface", args.iface, "--model-id", str(args.model_id)]
+            if args.model:
+                argv += ["--model", args.model]
+            run(argv)
 
     elif args.method == "template":
         # Pipeline 2 — architectural template, weights in BPF_ARRAY
