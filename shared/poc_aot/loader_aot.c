@@ -10,7 +10,7 @@
 // ARCHITECTURE-FAITHFUL: the .o contains the SAME topology as the BCC path --
 // a dispatcher (xdp_dispatch) that parses and bpf_tail_calls into the model
 // (xdp_model), which RE-parses (the double parse) and infers. We populate the
-// model_progs PROG_ARRAY, seed link_state/mac_table, and BPF_PROG_TEST_RUN the
+// model_progs PROG_ARRAY, seed the descriptor's feature maps + mac_table, and BPF_PROG_TEST_RUN the
 // DISPATCHER, so this measures the identical per-packet work test_suite
 // --kernel measures (dispatcher + tail call + double parse + full path). The
 // reported instruction count is the SUM of both programs' xlated length, to
@@ -56,18 +56,34 @@ static long prog_insns(int fd) {
     return info.xlated_prog_len / 8;
 }
 
-static int seed_maps(struct bpf_object *obj) {
-    struct bpf_map *ls = bpf_object__find_map_by_name(obj, "link_state");
-    struct bpf_map *mt = bpf_object__find_map_by_name(obj, "mac_table");
-    if (!ls || !mt) { fprintf(stderr, "missing link_state/mac_table\n"); return -1; }
-    int lsfd = bpf_map__fd(ls), mtfd = bpf_map__fd(mt);
-    // link_state: single struct-valued entry {u32 v[6]}=all-up at key 0
-    // (vector-map layout; all-up matches the test_suite ref baseline).
-    struct { __u32 v[6]; } lv;
-    for (int i = 0; i < 6; i++) lv.v[i] = 1;
+// Seed a dense_vector_map feature map ({u32 v[N]} at key 0) if it exists in the
+// loaded object. Size is taken from the map's value_size, so it adapts to any
+// topology; absent maps (descriptor doesn't use that feature) are skipped.
+static void seed_vec_map(struct bpf_object *obj, const char *name, __u32 fill) {
+    struct bpf_map *m = bpf_object__find_map_by_name(obj, name);
+    if (!m) return;                                  // not used by this descriptor
+    __u32 vsz = bpf_map__value_size(m);
+    unsigned char buf[512];
+    if (vsz > sizeof(buf)) vsz = sizeof(buf);
+    memset(buf, 0, sizeof(buf));
+    for (__u32 i = 0; i + 4 <= vsz; i += 4) *(__u32 *)(buf + i) = fill;   // u32 slots
     __u32 z = 0;
-    bpf_map_update_elem(lsfd, &z, &lv, BPF_ANY);
-    for (__u32 c = 0; c < 6; c++) {           // mac_table classes 0..5
+    bpf_map_update_elem(bpf_map__fd(m), &z, buf, BPF_ANY);
+}
+
+// Descriptor-agnostic seeding: dense-feature maps are seeded only when present,
+// mac_table forward classes are 0..n_out-2 (n_out read from cls_stats), the last
+// class being DROP (no entry).
+static int seed_maps(struct bpf_object *obj) {
+    struct bpf_map *mt = bpf_object__find_map_by_name(obj, "mac_table");
+    struct bpf_map *cs = bpf_object__find_map_by_name(obj, "cls_stats");
+    if (!mt) { fprintf(stderr, "missing mac_table\n"); return -1; }
+    seed_vec_map(obj, "link_state",  1);    // all-up baseline (matches test_suite ref)
+    seed_vec_map(obj, "queue_state", 1);    // nonzero occupancy baseline
+    __u32 n_out = cs ? bpf_map__max_entries(cs) : 7;
+    __u32 n_fwd = n_out > 0 ? n_out - 1 : 0;
+    int mtfd = bpf_map__fd(mt);
+    for (__u32 c = 0; c < n_fwd; c++) {      // mac_table forward classes 0..n_out-2
         struct fwd_action a; memset(&a, 0, sizeof(a));
         a.ifindex = 1;
         bpf_map_update_elem(mtfd, &c, &a, BPF_ANY);

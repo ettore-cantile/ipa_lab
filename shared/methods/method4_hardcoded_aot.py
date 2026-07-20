@@ -39,11 +39,11 @@ that is method4's job):
        BPF_PROG_TEST_RUNs the program (full path, same methodology as
        test_suite --kernel) to confirm the literal performance is preserved.
 
-Bound: this variant currently targets the DEFAULT FRR descriptor (65-4-4-7,
-topology config 6/52). Sparse/heterogeneous per-model descriptors are supported
-by the BCC path (ebpf_program.py) but not yet by this offline generator.
-The script refuses a non-default descriptor with a clear message rather than
-silently producing a wrong program.
+Descriptor support: the offline generator (gen_full_c.py) is descriptor-driven
+— it ports the three feature kinds (scalar / dense_vector_map / onehot) to the
+libbpf dialect, so ANY descriptor the BCC path (ebpf_program.py) accepts is now
+AOT-compilable too. The default [link_state, ingress_iface, ttl, node] / n_out=7
+still produces the byte-identical 65-4-4-7 program.
 
 Requires (on the VM/build box): clang, llvm, libbpf-dev, linux headers.
     sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)
@@ -79,32 +79,10 @@ from model_meta import (
     verify_shape_vs_checkpoint,
 )
 
-# What the offline generator (gen_full_c.py) currently hardcodes. A model whose
-# resolved descriptor differs cannot be built by this AOT path yet.
-_SUPPORTED = {
-    "n_in": 65, "n_out": 7, "hidden_dims": [4, 4],
-    "features": [("link_state", 6), ("ingress_iface", 6), ("ttl", 1), ("node", 52)],
-}
-
-
 def _resolve_cli_path(path):
     if path is None or os.path.isabs(path):
         return path
     return os.path.normpath(os.path.join(_ORIGINAL_CWD, path))
-
-
-def _check_supported(shape):
-    feats = [(f["type"], f["size"]) for f in shape["features"]]
-    if (shape["n_in"], shape["n_out"], list(shape["hidden_dims"]), feats) != (
-        _SUPPORTED["n_in"], _SUPPORTED["n_out"], _SUPPORTED["hidden_dims"],
-        _SUPPORTED["features"]):
-        sys.exit(
-            "[AOT] this offline variant only supports the default FRR descriptor "
-            f"(65-4-4-7, features {_SUPPORTED['features']}).\n"
-            f"      got n_in={shape['n_in']} n_out={shape['n_out']} "
-            f"hidden={shape['hidden_dims']} features={feats}.\n"
-            "      Use the BCC path (method4_hardcoded.py) for custom descriptors; "
-            "porting the descriptor-driven IV codegen to libbpf dialect is future work.")
 
 
 def _run(cmd, **kw):
@@ -150,18 +128,16 @@ def main():
     # ------------------------------------------------------------------
     verify_shape_vs_checkpoint(shape, model_path)
 
-    # ------------------------------------------------------------------
-    # Step 0.6: AOT-specific guard — this offline generator only supports
-    # the default FRR descriptor (65-4-4-7, topology config 6/52). Runs
-    # AFTER the two checks above so topology errors surface first.
-    # ------------------------------------------------------------------
-    _check_supported(shape)
-
+    feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in shape["features"])
     print(f"[AOT] model={model_path}")
-    print(f"[AOT] shape={shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']} (default FRR descriptor)")
+    print(f"[AOT] shape={shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']}  "
+          f"descriptor=[{feats_str}]")
 
+    # Descriptor-driven generator: pass the resolved meta + topology so a custom
+    # descriptor produces the matching program (default -> byte-identical 65-4-4-7).
     from gen_full_c import generate_arch_literal_c
-    c_src = generate_arch_literal_c(model_path if args.model else None)
+    c_src = generate_arch_literal_c(
+        model_path if args.model else None, meta=meta, topology_config=topo_cfg)
     c_path = os.path.join(POC_DIR, "nn_aot_arch.bpf.c")
     o_path = os.path.join(POC_DIR, "nn_aot_arch.o")
     with open(c_path, "w") as f:

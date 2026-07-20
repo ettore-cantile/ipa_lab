@@ -66,10 +66,6 @@ DEFAULT_TOPOLOGY_CONFIG = {
     "n_queues": 4,
 }
 
-# Backward-compat alias — external code that imported DEFAULT_NODE_CONFIG
-# directly keeps working without changes.
-DEFAULT_NODE_CONFIG = DEFAULT_TOPOLOGY_CONFIG
-
 DEFAULT_META = {
     "n_interfaces": 6,   # kept for backward compat with callers reading it directly
     "n_nodes": 52,
@@ -158,10 +154,6 @@ def load_topology_config(path: str = "/etc/ipa/topology_config.json") -> dict:
         return dict(DEFAULT_TOPOLOGY_CONFIG)
 
 
-# Backward-compat alias.
-load_node_config = load_topology_config
-
-
 # ---------------------------------------------------------------------------
 # model_meta loading
 # ---------------------------------------------------------------------------
@@ -210,10 +202,6 @@ def topology_config_for(meta: dict) -> dict:
             cfg[k] = meta[k]
     cfg.update(meta.get("topology_config", {}))
     return cfg
-
-
-# Backward-compat alias.
-node_config_for = topology_config_for
 
 
 def feature_size(feature_type: str, topology_config: dict) -> int:
