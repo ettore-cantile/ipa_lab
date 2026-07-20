@@ -106,9 +106,37 @@ FEATURE_CATALOG = {
     "node":            {"kind": "onehot",           "dim_key": "n_nodes"},
 }
 
+# Numeric wire/registry code per feature type — single source of truth shared by
+# the on-wire IPA header (feat*_code), the descriptor-driven eBPF programs
+# (model_desc registry) and their control planes. Matches the historical codes
+# in test_ipa.py (link_state=1, ingress_iface=2, ttl=3, node=4); queue_occupancy
+# is the added type (5).
+FEATURE_CODE = {
+    "link_state":      0x01,
+    "ingress_iface":   0x02,
+    "ttl":             0x03,
+    "node":            0x04,
+    "queue_occupancy": 0x05,
+}
+
 # Historical fixed feature layout, in the exact order the 65-4-4-7 model was
 # trained on. Used when a model declares no explicit "features" list.
 _DEFAULT_FEATURE_TYPES = ["link_state", "ingress_iface", "ttl", "node"]
+
+
+def resolve_descriptor(features: list) -> list:
+    """Turn a resolved descriptor (list of {"type","size"}) into the flat layout
+    the model_desc registry needs: a list of {"code","size","col_off"} where
+    col_off is the feature's starting column within the fc1 input row (the
+    running sum of preceding feature sizes). Shared by the P2/P3 control planes
+    so the runtime IV matches the trained weight layout exactly."""
+    out = []
+    col = 0
+    for f in features:
+        out.append({"code": FEATURE_CODE[f["type"]], "size": int(f["size"]),
+                    "col_off": col})
+        col += int(f["size"])
+    return out
 
 
 # ---------------------------------------------------------------------------

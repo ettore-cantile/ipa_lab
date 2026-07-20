@@ -136,9 +136,11 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
                     + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER)
     b = BPF(text=combined_src)
 
-    # Populate arch_registry and arch_weights map: one non-overlapping weight
-    # block per model_id, sized to that model's own hidden widths, all
-    # pointing at the same generic arch program.
+    # Populate arch_registry, arch_weights and model_desc: one non-overlapping
+    # weight block per model_id, sized to that model's own hidden widths, all
+    # pointing at the same generic arch program. load_arch_weights also seeds
+    # model_desc (default 65-feature descriptor) so the leaf builds its IV
+    # generically.
     weight_offset = 0
     for mid, (n_h1, n_h2) in zip(ids, dims):
         load_arch_weights(b, integer_weights, model_id=mid, scale=SCALE_FACTOR,

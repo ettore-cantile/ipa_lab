@@ -126,8 +126,10 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     # from the combined source
     b = BPF(text=EBPF_MODULAR_FULL)
 
-    # Populate layer_registry/layer_shapes/layer_weights: one non-overlapping
-    # weight block per model_id, sized to that model's own depth/width.
+    # Populate layer_registry/layer_shapes/layer_weights/model_desc: one
+    # non-overlapping weight block per model_id, sized to that model's own
+    # depth/width. load_modular_weights also seeds model_desc (default
+    # 65-feature descriptor) so layer_first builds its first-hop IV generically.
     base_offset = 0
     for mid, layer_dims in zip(ids, dims_by_model):
         consumed = load_modular_weights(b, integer_weights, model_id=mid, scale=SCALE_FACTOR,

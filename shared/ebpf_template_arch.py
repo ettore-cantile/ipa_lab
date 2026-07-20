@@ -70,11 +70,14 @@ T2_MAX_H1 = 8
 T2_MAX_H2 = 8
 
 
-def arch_weight_count(n_h1: int, n_h2: int) -> int:
-    """Flat int8 weight count for a T2_N_IN -> n_h1 -> n_h2 -> T2_N_OUT MLP
+def arch_weight_count(n_h1: int, n_h2: int, n_in: int = T2_N_IN) -> int:
+    """Flat int8 weight count for an n_in -> n_h1 -> n_h2 -> T2_N_OUT MLP
     (fc1 weights+bias, fc2 weights+bias, out weights+bias), matching the
-    flat layout load_arch_weights() writes and the eBPF program reads."""
-    return (T2_N_IN * n_h1 + n_h1) + (n_h1 * n_h2 + n_h2) + (n_h2 * T2_N_OUT + T2_N_OUT)
+    flat layout load_arch_weights() writes and the eBPF program reads. n_in
+    defaults to the protocol-standard 65 (the default descriptor); a custom
+    descriptor with a different N_IN passes its own n_in so the weight block
+    size stays consistent with the runtime IV width read from model_desc."""
+    return (n_in * n_h1 + n_h1) + (n_h1 * n_h2 + n_h2) + (n_h2 * T2_N_OUT + T2_N_OUT)
 
 
 # Weight count for the one model currently in the repo (65-4-4-7 = 319),
@@ -232,6 +235,22 @@ BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 struct ls_vec { __u32 v[6]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 
+/* queue_occupancy feature: n_queues occupancy slots in one struct-valued entry
+ * (key 0), seeded by queue_state_monitor.py. Present so a descriptor can use the
+ * queue_occupancy feature type; unused if the model's descriptor omits it. */
+struct qs_vec { __u32 v[4]; };
+BPF_ARRAY(queue_state, struct qs_vec, 1);
+
+/* Per-model feature descriptor (model_desc registry): which feature types the
+ * model uses, their size and starting column in the fc1 input row. Populated by
+ * the control plane from model_meta.resolve_descriptor(); read at runtime by
+ * arch_generic_2layer to build the IV generically -> different models use
+ * different feature subsets/orders WITHOUT recompiling. */
+#define MAX_FEAT 4
+struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
+struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
+BPF_HASH(model_desc, __u8, struct model_desc, 256);
+
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_PROG_ARRAY(arch_progs, 8);
 /* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
@@ -291,6 +310,14 @@ EBPF_ARCH_GENERIC_2LAYER = r"""
 #define T2_N_OUT     7
 #define T2_MAX_H1    8
 #define T2_MAX_H2    8
+#define T2_N_QUEUES  4
+#define MAX_N_IN     128
+#define MAX_FEAT     4
+#define FEAT_LINK_STATE  0x01
+#define FEAT_INGRESS_IF  0x02
+#define FEAT_TTL         0x03
+#define FEAT_NODE_ID     0x04
+#define FEAT_QUEUE_OCC   0x05
 #define RELU(x)  ((x) > 0 ? (x) : 0)
 
 #ifndef IPA_ARCH_COMBINED
@@ -335,6 +362,11 @@ struct fwd_action {
 BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
 struct ls_vec { __u32 v[6]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
+struct qs_vec { __u32 v[4]; };
+BPF_ARRAY(queue_state, struct qs_vec, 1);
+struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
+struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
+BPF_HASH(model_desc, __u8, struct model_desc, 256);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
@@ -383,10 +415,20 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     __u32 n_h2 = entry->n_h2;
     if (n_h1 == 0 || n_h1 > T2_MAX_H1 || n_h2 == 0 || n_h2 > T2_MAX_H2) return XDP_PASS;
 
+    /* Per-model feature descriptor: which feature types the model uses, their
+     * size and starting column in the fc1 input row. n_in (= sum of feature
+     * sizes) is read here and drives the flat weight layout below -> the IV is
+     * built GENERICALLY from the descriptor instead of the old hardcoded
+     * 65-feature layout. Populated by the CP via model_meta.resolve_descriptor. */
+    struct model_desc *desc = model_desc.lookup(&model_id);
+    if (!desc) return XDP_PASS;
+    __u32 n_in = desc->n_in;
+    if (n_in == 0 || n_in > MAX_N_IN) return XDP_PASS;
+
     /* Flat weight layout offsets (relative to woff), sized for THIS model's
-     * hidden widths -- mirrors arch_weight_count() on the Python side. */
+     * n_in + hidden widths -- mirrors arch_weight_count() on the Python side. */
     __u32 fc1_w_off = 0;
-    __u32 fc1_b_off = T2_N_IN * n_h1;
+    __u32 fc1_b_off = n_in * n_h1;
     __u32 fc2_w_off = fc1_b_off + n_h1;
     __u32 fc2_b_off = fc2_w_off + n_h1 * n_h2;
     __u32 out_w_off = fc2_b_off + n_h2;
@@ -394,19 +436,19 @@ int arch_generic_2layer(struct xdp_md *ctx) {
 
     __u32 _ttl       = ((__u32)ip->ttl) & 0xff;
     __u32 _raw_iface = ctx->ingress_ifindex;
-    __u32 _iface     = (_raw_iface >= 1 && _raw_iface <= 6) ? _raw_iface : 0;
-    __u32 _node      = ((__u32)ipa->model_id) & 0x3f;
+    __u32 _node      = (__u32)ipa->model_id;
 
-    /* Read link_state[0..5] with a SINGLE lookup (the whole vector lives in one
-     * struct-valued entry); reused across all neurons. */
+    /* dense feature vectors, each read once with a SINGLE lookup, reused across
+     * neurons. Sized to the topology (link_state=6, queue=T2_N_QUEUES); the
+     * descriptor's per-feature size gates how many slots actually contribute. */
     long long ls[6];
-    {
-        int lsz = 0;
-        struct ls_vec *lsp = link_state.lookup(&lsz);
-        #pragma unroll
-        for (int i = 0; i < 6; i++)
-            ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL;
-    }
+    { int lsz = 0; struct ls_vec *lsp = link_state.lookup(&lsz);
+      #pragma unroll
+      for (int i = 0; i < 6; i++) ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
+    long long qs[T2_N_QUEUES];
+    { int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
+      #pragma unroll
+      for (int i = 0; i < T2_N_QUEUES; i++) qs[i] = qsp ? (long long)(qsp->v[i]) : 0LL; }
 
     long long h1[T2_MAX_H1];
     #pragma unroll
@@ -418,34 +460,58 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         char *bp = arch_weights.lookup(&bidx);
         long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
 
-        int ttl_idx = woff + fc1_w_off + j * T2_N_IN + 12;
-        if (ttl_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-        char *ttl_wp = arch_weights.lookup(&ttl_idx);
-        if (ttl_wp) acc += (long long)_ttl * (long long)(*(signed char *)ttl_wp);
-
-        /* link_state features [0..5]: acc += ls[i] * w[j, i] */
+        /* Descriptor-driven IV: accumulate each declared feature's contribution
+         * at its runtime column offset (fc1 row = j*n_in + col_off). Unrolled to
+         * MAX_FEAT; slots past the model's n_feat are skipped. One-hot features
+         * (iface/node) are a single runtime-indexed weight; dense features
+         * (link_state/queue) unroll to their topology size, gated by feat size. */
         #pragma unroll
-        for (int i = 0; i < 6; i++) {
-            if (ls[i]) {
-                int ls_idx = woff + fc1_w_off + j * T2_N_IN + i;
-                if (ls_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-                char *ls_wp = arch_weights.lookup(&ls_idx);
-                if (ls_wp) acc += ls[i] * (long long)(*(signed char *)ls_wp);
+        for (int f = 0; f < MAX_FEAT; f++) {
+            if (f < desc->n_feat) {
+                __u8  code = desc->feats[f].code;
+                __u32 sz   = desc->feats[f].size;
+                __u32 base = woff + fc1_w_off + j * n_in + desc->feats[f].col_off;
+                if (code == FEAT_TTL) {
+                    int idx = base;
+                    if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+                    char *wp = arch_weights.lookup(&idx);
+                    if (wp) acc += (long long)_ttl * (long long)(*(signed char *)wp);
+                } else if (code == FEAT_LINK_STATE) {
+                    #pragma unroll
+                    for (int i = 0; i < 6; i++) {
+                        if ((__u32)i < sz && ls[i]) {
+                            int idx = base + i;
+                            if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+                            char *wp = arch_weights.lookup(&idx);
+                            if (wp) acc += ls[i] * (long long)(*(signed char *)wp);
+                        }
+                    }
+                } else if (code == FEAT_QUEUE_OCC) {
+                    #pragma unroll
+                    for (int i = 0; i < T2_N_QUEUES; i++) {
+                        if ((__u32)i < sz && qs[i]) {
+                            int idx = base + i;
+                            if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+                            char *wp = arch_weights.lookup(&idx);
+                            if (wp) acc += qs[i] * (long long)(*(signed char *)wp);
+                        }
+                    }
+                } else if (code == FEAT_INGRESS_IF) {
+                    if (_raw_iface >= 1 && _raw_iface <= sz) {
+                        int idx = base + (_raw_iface - 1);
+                        if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+                        char *wp = arch_weights.lookup(&idx);
+                        if (wp) acc += (long long)(*(signed char *)wp);
+                    }
+                } else if (code == FEAT_NODE_ID) {
+                    if (_node < sz) {
+                        int idx = base + _node;
+                        if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
+                        char *wp = arch_weights.lookup(&idx);
+                        if (wp) acc += (long long)(*(signed char *)wp);
+                    }
+                }
             }
-        }
-
-        if (_iface >= 1 && _iface <= 6) {
-            int iface_idx = woff + fc1_w_off + j * T2_N_IN + 5 + _iface;
-            if (iface_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-            char *iface_wp = arch_weights.lookup(&iface_idx);
-            if (iface_wp) acc += (long long)(*(signed char *)iface_wp);
-        }
-
-        if (_node <= 51) {
-            int node_idx = woff + fc1_w_off + j * T2_N_IN + 13 + _node;
-            if (node_idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-            char *node_wp = arch_weights.lookup(&node_idx);
-            if (node_wp) acc += (long long)(*(signed char *)node_wp);
         }
 
         h1[j] = RELU(acc);
@@ -523,7 +589,8 @@ int arch_generic_2layer(struct xdp_md *ctx) {
 def load_arch_weights(bpf_obj, weights_int8: list,
                       model_id: int = 0, scale: int = 128,
                       weight_offset: int = 0,
-                      n_h1: int = 4, n_h2: int = 4) -> None:
+                      n_h1: int = 4, n_h2: int = 4,
+                      features: list = None, n_in: int = None) -> None:
     """
     Populate arch_weights and arch_registry for Pipeline 2.
 
@@ -558,7 +625,18 @@ def load_arch_weights(bpf_obj, weights_int8: list,
             f"T2_MAX_H1={T2_MAX_H1}/T2_MAX_H2={T2_MAX_H2} -- raise the "
             f"ceiling in ebpf_template_arch.py and reload to support it")
 
-    n_weights = arch_weight_count(n_h1, n_h2)
+    # Resolve the feature descriptor (default 65-feature layout unless a custom
+    # one is passed). n_in drives both the flat weight-block size here and the
+    # runtime IV width read from model_desc -> they stay consistent.
+    if features is None:
+        from model_meta import derive_shape, DEFAULT_META, DEFAULT_TOPOLOGY_CONFIG
+        _sh = derive_shape(dict(DEFAULT_META), topology_config=dict(DEFAULT_TOPOLOGY_CONFIG))
+        features = _sh["features"]
+        n_in = _sh["n_in"]
+    elif n_in is None:
+        n_in = sum(f["size"] for f in features)
+
+    n_weights = arch_weight_count(n_h1, n_h2, n_in)
     arch_id   = 0
     map_fd    = bpf_obj["arch_weights"].map_fd
 
@@ -602,3 +680,61 @@ def load_arch_weights(bpf_obj, weights_int8: list,
           f"shape=65-{n_h1}-{n_h2}-7 weights={n_weights}")
     print(f"[Pipeline2] NOTE: arch_progs wiring is caller's responsibility "
           f"(setup_template already does: b['arch_progs'][0]=leaf_fn.fd)")
+
+    # Seed the per-model feature descriptor so the leaf builds its IV
+    # generically. Folded in here so every existing caller (methods + test
+    # harnesses) registers model_desc without a separate call.
+    load_model_desc(bpf_obj, features, n_in, model_id=model_id)
+
+
+# Max features per descriptor -- must match MAX_FEAT in the eBPF source.
+T2_MAX_FEAT = 4
+
+
+def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> None:
+    """
+    Populate model_desc[model_id] so arch_generic_2layer builds the input vector
+    GENERICALLY from a per-model descriptor (instead of the old hardcoded
+    65-feature layout). Call once per registered model_id, alongside
+    load_arch_weights().
+
+    features: resolved descriptor (list of {"type","size"}, from
+              model_meta.derive_shape) -- feature types + topology sizes, in the
+              exact order the model was trained on. Its flat (code,size,col_off)
+              form comes from model_meta.resolve_descriptor(); col_off is the
+              feature's starting column in the fc1 input row, so the runtime IV
+              matches the trained weight layout.
+    n_in:     sum of feature sizes (fc1 input width).
+
+    With the default descriptor [link_state, ingress_iface, ttl, node] / n_in=65
+    the registry reproduces the historical layout (link_state cols 0-5, iface
+    6-11, ttl 12, node 13-64) -> byte-compatible with the old fixed program.
+    """
+    from ctypes import c_uint8, Structure
+    from model_meta import resolve_descriptor
+
+    ents = resolve_descriptor(features)
+    if len(ents) > T2_MAX_FEAT:
+        raise ValueError(
+            f"descriptor has {len(ents)} features, exceeds MAX_FEAT={T2_MAX_FEAT} "
+            f"(raise MAX_FEAT in ebpf_template_arch.py and reload to support it)")
+    if n_in > 128:  # MAX_N_IN in the eBPF source
+        raise ValueError(f"n_in={n_in} exceeds MAX_N_IN=128")
+
+    class FeatEnt(Structure):
+        _pack_ = 1
+        _fields_ = [("code", c_uint8), ("size", c_uint8),
+                    ("col_off", c_uint8), ("_pad", c_uint8)]
+
+    class ModelDesc(Structure):
+        _pack_ = 1
+        _fields_ = [("n_feat", c_uint8), ("n_in", c_uint8),
+                    ("_p0", c_uint8), ("_p1", c_uint8),
+                    ("feats", FeatEnt * T2_MAX_FEAT)]
+
+    d = ModelDesc(n_feat=len(ents), n_in=n_in)
+    for i, e in enumerate(ents):
+        d.feats[i] = FeatEnt(code=e["code"], size=e["size"], col_off=e["col_off"])
+    bpf_obj["model_desc"][c_uint8(model_id)] = d
+    print(f"[Pipeline2] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
+          f"feats={[(e['code'], e['size'], e['col_off']) for e in ents]}")

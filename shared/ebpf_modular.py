@@ -166,6 +166,22 @@ BPF_ARRAY(layer_weights, __u8, MAX_LAYER_WEIGHT_ENTRIES);
 struct ls_vec { __u32 v[6]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 
+/* queue_occupancy feature: n_queues occupancy slots in one struct-valued entry
+ * (key 0), seeded by queue_state_monitor.py. Present so a descriptor can use the
+ * queue_occupancy feature type; unused if the model's descriptor omits it. */
+struct qs_vec { __u32 v[4]; };
+BPF_ARRAY(queue_state, struct qs_vec, 1);
+
+/* Per-model feature descriptor (model_desc registry): which feature types the
+ * first-hop input uses, their size and starting column in the layer-0 input
+ * row. Populated by the control plane from model_meta.resolve_descriptor(); read
+ * at runtime by layer_first to build the IV generically instead of the old
+ * hardcoded 65-feature layout. */
+#define ML_MAX_FEAT 4
+struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
+struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[ML_MAX_FEAT]; };
+BPF_HASH(model_desc, __u8, struct model_desc, 256);
+
 /* Layer chain tail-call map: slot 0 = layer_first.fd, slots 1..15 =
  * layer_hidden.fd -- see module docstring for why this never conflicts
  * across concurrently-registered models of different depths. */
@@ -318,6 +334,13 @@ int modular_dispatcher(struct xdp_md *ctx) {
 EBPF_LAYER_FIRST = EBPF_MODULAR_COMMON_HEADER + r"""
 #define PROTO_N_IN  65
 #define ML1_MAX_H1   8
+#define ML_N_QUEUES  4
+#define ML_MAX_N_IN  128
+#define FEAT_LINK_STATE  0x01
+#define FEAT_INGRESS_IF  0x02
+#define FEAT_TTL         0x03
+#define FEAT_NODE_ID     0x04
+#define FEAT_QUEUE_OCC   0x05
 
 int layer_first(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
@@ -344,10 +367,19 @@ int layer_first(struct xdp_md *ctx) {
     struct layer_shape_entry *shape = layer_shapes.lookup(&key);
     if (!shape) return XDP_PASS;
 
-    __u32 n_out = shape->n_out;   /* n_in is always PROTO_N_IN by protocol */
+    __u32 n_out = shape->n_out;
     __u32 woff  = shape->weight_offset;
     if (n_out == 0 || n_out > ML1_MAX_H1) return XDP_PASS;
-    __u32 bias_off = PROTO_N_IN * n_out;
+
+    /* Per-model feature descriptor: n_in (= sum of feature sizes) + feature
+     * layout, read at runtime -> the first-hop IV is built GENERICALLY instead
+     * of the old hardcoded 65-feature layout. Populated by the CP via
+     * model_meta.resolve_descriptor(). */
+    struct model_desc *desc = model_desc.lookup(&model_id);
+    if (!desc) return XDP_PASS;
+    __u32 n_in = desc->n_in;
+    if (n_in == 0 || n_in > ML_MAX_N_IN) return XDP_PASS;
+    __u32 bias_off = n_in * n_out;
 
     int mtl = META_TTL;
     long long *ttlp = scratch_meta.lookup(&mtl);
@@ -356,22 +388,19 @@ int layer_first(struct xdp_md *ctx) {
     int mif = META_INGRESS_IF;
     long long *ifp = scratch_meta.lookup(&mif);
     __u32 _raw_iface = ifp ? (__u32)(*ifp) : 0;
-    __u32 _iface_active = (_raw_iface >= 1 && _raw_iface <= 6) ? 1 : 0;
-    __u32 _iface = _iface_active ? _raw_iface : 0;
 
-    __u32 _node = ((__u32)model_id) & 0x3f;
-    __u32 _node_active = (_node <= 51) ? 1 : 0;
+    __u32 _node = (__u32)model_id;
 
-    /* Read link_state[0..5] with a SINGLE lookup (whole vector in one
-     * struct-valued entry); reused across all neurons. */
+    /* dense feature vectors, each read once (single lookup), reused per neuron.
+     * Sized to the topology; the descriptor's per-feature size gates the slots. */
     long long ls[6];
-    {
-        int lsz = 0;
-        struct ls_vec *lsp = link_state.lookup(&lsz);
-        #pragma unroll
-        for (int i = 0; i < 6; i++)
-            ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL;
-    }
+    { int lsz = 0; struct ls_vec *lsp = link_state.lookup(&lsz);
+      #pragma unroll
+      for (int i = 0; i < 6; i++) ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
+    long long qs[ML_N_QUEUES];
+    { int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
+      #pragma unroll
+      for (int i = 0; i < ML_N_QUEUES; i++) qs[i] = qsp ? (long long)(qsp->v[i]) : 0LL; }
 
     long long out[ML1_MAX_H1];
     long long best_val = -9999999LL;
@@ -385,27 +414,52 @@ int layer_first(struct xdp_md *ctx) {
         __u8 *bp = layer_weights.lookup(&bidx);
         long long acc = bp ? (long long)WEIGHT(bp) : 0LL;
 
-        int ttl_idx = woff + j * PROTO_N_IN + 12;
-        __u8 *ttl_wp = layer_weights.lookup(&ttl_idx);
-        if (ttl_wp) acc += (long long)_ttl * (long long)WEIGHT(ttl_wp);
-
+        /* Descriptor-driven IV: each declared feature contributes at its runtime
+         * column offset (layer-0 row = j*n_in + col_off). Unrolled to
+         * ML_MAX_FEAT; slots past n_feat skipped. Dense features gate on feat
+         * size; one-hot (iface/node) is a single runtime-indexed weight. */
         #pragma unroll
-        for (int i = 0; i < 6; i++) {
-            int ls_idx = woff + j * PROTO_N_IN + i;
-            __u8 *ls_wp = layer_weights.lookup(&ls_idx);
-            if (ls_wp) acc += ls[i] * (long long)WEIGHT(ls_wp);
-        }
-
-        {
-            int iface_idx = woff + j * PROTO_N_IN + 5 + _iface;
-            __u8 *iface_wp = layer_weights.lookup(&iface_idx);
-            if (iface_wp) acc += (long long)_iface_active * (long long)WEIGHT(iface_wp);
-        }
-
-        {
-            int node_idx = woff + j * PROTO_N_IN + 13 + _node;
-            __u8 *node_wp = layer_weights.lookup(&node_idx);
-            if (node_wp) acc += (long long)_node_active * (long long)WEIGHT(node_wp);
+        for (int f = 0; f < ML_MAX_FEAT; f++) {
+            if (f < desc->n_feat) {
+                __u8  code = desc->feats[f].code;
+                __u32 sz   = desc->feats[f].size;
+                __u32 base = woff + j * n_in + desc->feats[f].col_off;
+                if (code == FEAT_TTL) {
+                    int idx = base;
+                    __u8 *wp = layer_weights.lookup(&idx);
+                    if (wp) acc += (long long)_ttl * (long long)WEIGHT(wp);
+                } else if (code == FEAT_LINK_STATE) {
+                    #pragma unroll
+                    for (int i = 0; i < 6; i++) {
+                        if ((__u32)i < sz) {
+                            int idx = base + i;
+                            __u8 *wp = layer_weights.lookup(&idx);
+                            if (wp) acc += ls[i] * (long long)WEIGHT(wp);
+                        }
+                    }
+                } else if (code == FEAT_QUEUE_OCC) {
+                    #pragma unroll
+                    for (int i = 0; i < ML_N_QUEUES; i++) {
+                        if ((__u32)i < sz) {
+                            int idx = base + i;
+                            __u8 *wp = layer_weights.lookup(&idx);
+                            if (wp) acc += qs[i] * (long long)WEIGHT(wp);
+                        }
+                    }
+                } else if (code == FEAT_INGRESS_IF) {
+                    if (_raw_iface >= 1 && _raw_iface <= sz) {
+                        int idx = base + (_raw_iface - 1);
+                        __u8 *wp = layer_weights.lookup(&idx);
+                        if (wp) acc += (long long)WEIGHT(wp);
+                    }
+                } else if (code == FEAT_NODE_ID) {
+                    if (_node < sz) {
+                        int idx = base + _node;
+                        __u8 *wp = layer_weights.lookup(&idx);
+                        if (wp) acc += (long long)WEIGHT(wp);
+                    }
+                }
+            }
         }
 
         if (is_last) {
@@ -530,6 +584,7 @@ def load_modular_weights(
     scale: int = 128,
     layer_dims: list = None,
     base_offset: int = 0,
+    features: list = None,
 ) -> int:
     """
     Populate layer_registry, layer_shapes and layer_weights for Pipeline 3.
@@ -579,10 +634,13 @@ def load_modular_weights(
 
     for i, (n_in, n_out) in enumerate(layer_dims):
         if i == 0:
-            if n_in != PROTO_N_IN:
+            # First-layer n_in = the descriptor's N_IN (sum of feature sizes),
+            # no longer fixed to 65: layer_first now builds the IV generically
+            # from model_desc. Must match the model_desc seeded for this model_id
+            # (see load_model_desc) and stay within the compiled ceiling.
+            if n_in <= 0 or n_in > 128:  # MAX_N_IN / ML_MAX_N_IN in the eBPF source
                 raise ValueError(
-                    f"first layer n_in must be PROTO_N_IN={PROTO_N_IN} "
-                    f"(protocol feature vector), got {n_in}")
+                    f"first layer n_in={n_in} outside [1, 128] (ML_MAX_N_IN)")
             if n_out <= 0 or n_out > ML1_MAX_H1:
                 raise ValueError(
                     f"first layer n_out={n_out} exceeds the compiled ceiling "
@@ -639,4 +697,62 @@ def load_modular_weights(
     print(f"[Pipeline3] model_id={model_id} registered: scale={scale}, "
           f"shape={shape_str}, n_layers={n_layers}, "
           f"base_offset={base_offset}, total_weights={total_weights}")
+
+    # Seed the first-hop feature descriptor (default 65-feature layout unless a
+    # custom one is passed) so layer_first builds its IV generically. Folded in
+    # here so every existing caller (methods + test harnesses) registers
+    # model_desc without a separate call. n_in must equal the first layer's n_in.
+    if features is None:
+        from model_meta import derive_shape, DEFAULT_META, DEFAULT_TOPOLOGY_CONFIG
+        features = derive_shape(dict(DEFAULT_META),
+                                topology_config=dict(DEFAULT_TOPOLOGY_CONFIG))["features"]
+    load_model_desc(bpf_obj, features, n_in=layer_dims[0][0], model_id=model_id)
     return total_weights
+
+
+# Max features per descriptor -- must match ML_MAX_FEAT in the eBPF source.
+ML_MAX_FEAT = 4
+
+
+def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> None:
+    """
+    Populate model_desc[model_id] so layer_first builds the first-hop input
+    vector GENERICALLY from a per-model descriptor (instead of the old hardcoded
+    65-feature layout). Call once per registered model_id, alongside
+    load_modular_weights(); n_in must equal layer_dims[0][0].
+
+    features: resolved descriptor (list of {"type","size"}, from
+              model_meta.derive_shape) in the order the model was trained on;
+              its flat (code,size,col_off) form comes from
+              model_meta.resolve_descriptor(). Default [link_state,
+              ingress_iface, ttl, node] / n_in=65 reproduces the historical
+              layer-0 layout byte-for-byte.
+    """
+    from ctypes import c_uint8, Structure
+    from model_meta import resolve_descriptor
+
+    ents = resolve_descriptor(features)
+    if len(ents) > ML_MAX_FEAT:
+        raise ValueError(
+            f"descriptor has {len(ents)} features, exceeds ML_MAX_FEAT={ML_MAX_FEAT} "
+            f"(raise ML_MAX_FEAT in ebpf_modular.py and reload to support it)")
+    if n_in > 128:  # ML_MAX_N_IN in the eBPF source
+        raise ValueError(f"n_in={n_in} exceeds ML_MAX_N_IN=128")
+
+    class FeatEnt(Structure):
+        _pack_ = 1
+        _fields_ = [("code", c_uint8), ("size", c_uint8),
+                    ("col_off", c_uint8), ("_pad", c_uint8)]
+
+    class ModelDesc(Structure):
+        _pack_ = 1
+        _fields_ = [("n_feat", c_uint8), ("n_in", c_uint8),
+                    ("_p0", c_uint8), ("_p1", c_uint8),
+                    ("feats", FeatEnt * ML_MAX_FEAT)]
+
+    d = ModelDesc(n_feat=len(ents), n_in=n_in)
+    for i, e in enumerate(ents):
+        d.feats[i] = FeatEnt(code=e["code"], size=e["size"], col_off=e["col_off"])
+    bpf_obj["model_desc"][c_uint8(model_id)] = d
+    print(f"[Pipeline3] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
+          f"feats={[(e['code'], e['size'], e['col_off']) for e in ents]}")
