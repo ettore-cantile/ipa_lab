@@ -10,6 +10,11 @@ for each (hidden_dims) shape and times the dispatcher with
 BPF_PROG_TEST_RUN. Random int8 weights -- this measures SHAPE cost only,
 not inference correctness (that is already covered by test_suite).
 
+Shapes that overflow the 512-byte eBPF per-function stack (verifier/clang
+rejects them at compile time) are reported as FAILED, not silently skipped
+or crashed on -- see first_layer_stack_estimate() for why WIDENING the
+first hidden layer is much more stack-expensive than adding a layer.
+
 Run on Linux (Kathara or bare VM) with bcc installed:
     sudo python3 shared/test/bench_depth_vs_width.py
     sudo python3 shared/test/bench_depth_vs_width.py --repeat 5000
@@ -57,19 +62,49 @@ def weight_count(n_in, dims, n_out):
     return sum(sizes[i - 1] * sizes[i] + sizes[i] for i in range(1, len(sizes)))
 
 
+def first_layer_stack_estimate(shape, n_h1):
+    """Estimated live-stack bytes for the FIRST hidden layer's `long long`
+    locals: ebpf_program._gen_feature_onehot_{iface,node} each declare their
+    OWN n_h1-sized temp array (w_iface_j / w_node_j) IN ADDITION to the
+    final h1_j output array, and _gen_feature_dense_vector declares one
+    `long long` per value of that feature. clang/BCC does not appear to
+    reuse these slots across the un-scoped C, so they all count toward the
+    eBPF 512-byte per-function stack ceiling simultaneously. This is why
+    WIDENING the first layer is far more expensive, byte for byte, than
+    adding an extra (narrower) layer: every additional onehot feature in the
+    descriptor multiplies the first layer's per-neuron stack cost, while
+    layers 2+ (_gen_dense_layer) cost only 1 array each, no multiplier."""
+    n_onehot = sum(1 for f in shape["features"]
+                   if mm.FEATURE_CATALOG[f["type"]]["kind"] == "onehot")
+    n_dense_vals = sum(f["size"] for f in shape["features"]
+                       if mm.FEATURE_CATALOG[f["type"]]["kind"] == "dense_vector_map")
+    return (1 + n_onehot) * n_h1 * 8 + n_dense_vals * 8
+
+
 def bench_shape(label, dims, shape, repeat):
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
+    n_h1 = dims[0] if dims else n_out
+    stack_est = first_layer_stack_estimate(shape, n_h1)
+    shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{n_out}"
+
     rng = random.Random(42)
     weights = [rng.randint(-100, 100) for _ in range(nw)]
     scale = 128
 
-    src = build_combined_hardcoded_source(
-        models=[(0, weights, scale, list(range(2, 3)))],
-        features=shape["features"], n_out=n_out, hidden_dims=dims)
-    b = BPF(text=src)
-    model_fn = b.load_func("model_0", BPF.XDP)
-    disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    try:
+        src = build_combined_hardcoded_source(
+            models=[(0, weights, scale, list(range(2, 3)))],
+            features=shape["features"], n_out=n_out, hidden_dims=dims)
+        b = BPF(text=src)
+        model_fn = b.load_func("model_0", BPF.XDP)
+        disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    except Exception as e:
+        msg = str(e).splitlines()[-1][:80] if str(e) else type(e).__name__
+        print(f"{label:<16} {shape_str:<22} weights={nw:<6} "
+              f"stack_est(L1)={stack_est:<5}  SKIPPED (compile/verifier failure: {msg})")
+        return None, nw, None, stack_est
+
     b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
 
     xlated, jited = prog_insn_count(disp_fn.fd)
@@ -77,16 +112,17 @@ def bench_shape(label, dims, shape, repeat):
 
     frame = build_frame_sparse(model_id=0, ttl=42, scale=scale,
                                n_in=n_in, n_out=n_out)
-    # Warm-up run (JIT/branch predictor), then the timed run.
-    prog_test_run(disp_fn.fd, frame, repeat=repeat)
-    retval, dur_ns = prog_test_run(disp_fn.fd, frame, repeat=repeat)
-    ns_per_pkt = dur_ns / max(1, repeat)
+    # dur_ns from BPF_PROG_TEST_RUN is already the per-repetition average
+    # (kernel divides internally) -- test_suite.py uses it the same way, do
+    # NOT divide by repeat again here.
+    prog_test_run(disp_fn.fd, frame, repeat=repeat)   # warm-up (JIT icache)
+    retval, ns_per_pkt = prog_test_run(disp_fn.fd, frame, repeat=repeat)
 
-    shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{n_out}"
     print(f"{label:<16} {shape_str:<22} weights={nw:<6} "
+          f"stack_est(L1)={stack_est:<5} "
           f"xlated_insn(disp+model)={xlated}+{xlated_model:<5} "
           f"{ns_per_pkt:7.1f} ns/pkt  retval={retval}")
-    return ns_per_pkt, nw, xlated + xlated_model
+    return ns_per_pkt, nw, xlated + xlated_model, stack_est
 
 
 def main():
@@ -100,14 +136,16 @@ def main():
     print("-" * 100)
     rows = []
     for tier, label, dims in SHAPES:
-        ns, nw, insns = bench_shape(label, dims, base_shape, args.repeat)
-        rows.append((tier, label, dims, ns, nw, insns))
+        ns, nw, insns, stack_est = bench_shape(label, dims, base_shape, args.repeat)
+        rows.append((tier, label, dims, ns, nw, insns, stack_est))
     print("-" * 100)
 
     # Per-tier summary: weight-count spread actually achieved (never assumed
     # equal) and ns/pkt relative to the tier's WIDEST (1-layer) shape, since
     # that is the natural reference for "does adding depth cost more than the
-    # extra weights alone would predict".
+    # extra weights alone would predict". Shapes that failed to compile
+    # (stack overflow) are reported as such -- their absence is itself the
+    # depth-vs-width datapoint, not a gap in the table.
     tiers = {}
     for row in rows:
         tiers.setdefault(row[0], []).append(row)
@@ -116,10 +154,15 @@ def main():
         spread = (max(nws) - min(nws)) / min(nws)
         print(f"\nTier {tier} -- weight-count spread across shapes: {spread:.1%} "
               f"(min={min(nws)}, max={max(nws)})")
-        ref_ns = group[0][3]
-        for _, label, dims, ns, nw, insns in group:
-            print(f"  {label:<14} weights={nw:<6} {ns:7.1f} ns/pkt  "
-                  f"({ns/ref_ns:+.1%} vs {group[0][1].strip()})  {insns} insns")
+        ref_ns = next((r[3] for r in group if r[3] is not None), None)
+        ref_label = group[0][1].strip()
+        for _, label, dims, ns, nw, insns, stack_est in group:
+            if ns is None:
+                print(f"  {label:<14} weights={nw:<6} stack_est(L1)={stack_est:<5}  FAILED (stack overflow)")
+            else:
+                rel = f"({ns/ref_ns:+.1%} vs {ref_label})" if ref_ns else ""
+                print(f"  {label:<14} weights={nw:<6} stack_est(L1)={stack_est:<5} "
+                      f"{ns:7.1f} ns/pkt  {rel}  {insns} insns")
 
 
 if __name__ == "__main__":
