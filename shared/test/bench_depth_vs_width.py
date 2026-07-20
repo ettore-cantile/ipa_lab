@@ -30,11 +30,13 @@ benchmarked in its OWN subprocess (this same script re-invoked with
 sweep continues. first_layer_stack_estimate() is kept as an informational
 column only, not a gate.
 
-Timing is reported as the MEDIAN of 7 independent trials, with the
-[min-max] range printed alongside -- a single repeat=N sample turned out to
-swing 5-10x on some shapes with no correlation to instruction count (pure
-system noise: scheduler preemption, an unrelated process on the same host),
-so a one-shot measurement is not trustworthy here.
+Timing is reported as the MIN of 7 independent trials (median/max printed
+alongside for context) -- a single repeat=N sample turned out to swing up
+to 20x on some shapes with no correlation to instruction count (pure
+one-sided system noise: scheduler preemption, an unrelated process on the
+same host, CPU frequency scaling -- it can only slow a trial down, never
+speed it up), so min is the statistic that estimates the interference-free
+cost, the same reasoning tools like hyperfine / Google Benchmark use.
 
 `retval` (1=XDP_DROP or 2=XDP_PASS) is benign noise, not a defect: this
 bench never populates mac_table, so a forward-class argmax always misses
@@ -156,13 +158,14 @@ def _bench_one(descriptor_name, dims, repeat):
     #
     # A SINGLE repeat=N measurement is not enough: transient system noise
     # (scheduler preemption, interrupts, an unrelated cgroup on the same
-    # host) can dominate one sample and produce swings of 5-10x that do not
-    # correlate with instruction count at all -- exactly what a one-shot run
-    # of this sweep showed. TRIALS independent repeat=`repeat` measurements
-    # are taken and the MEDIAN is reported (standard practice for
-    # microbenchmarks: min is sometimes preferred, but median is more
-    # robust here since a shape that is genuinely slower should still show
-    # up as slower across most trials, not just the fastest one).
+    # host, CPU frequency scaling) can dominate one sample -- an earlier run
+    # of this sweep showed swings up to 20x (e.g. 44 to 998 ns) with no
+    # correlation to instruction count. This noise is ONE-SIDED: it can only
+    # slow a trial down (an interrupt landing mid-loop), never speed one up
+    # below the true cost. That makes MIN the right statistic (the same
+    # reasoning tools like hyperfine / Google Benchmark use), not median or
+    # mean -- across TRIALS independent repeat=`repeat` measurements, the
+    # smallest is the closest approximation to the interference-free cost.
     TRIALS = 7
     prog_test_run(disp_fn.fd, frame, repeat=repeat)   # warm-up (JIT icache)
     samples = []
@@ -170,12 +173,11 @@ def _bench_one(descriptor_name, dims, repeat):
         retval, ns = prog_test_run(disp_fn.fd, frame, repeat=repeat)
         samples.append(ns)
     samples.sort()
-    median_ns = samples[TRIALS // 2]
 
     print(json.dumps({
         "ok": True, "nw": nw, "stack_est": stack_est,
-        "insns": xlated + xlated_model, "ns": median_ns, "retval": retval,
-        "ns_min": samples[0], "ns_max": samples[-1],
+        "insns": xlated + xlated_model, "ns": samples[0], "retval": retval,
+        "ns_median": samples[TRIALS // 2], "ns_max": samples[-1],
         "shape_str": f"{n_in}-{'-'.join(map(str, dims))}-{n_out}",
     }))
 
@@ -232,8 +234,8 @@ def run_descriptor(name, repeat):
         if r["ok"]:
             print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
                   f"stack_est(L1)~{r['stack_est']:<5} insns={r['insns']:<6} "
-                  f"{r['ns']:7.1f} ns/pkt  [{r['ns_min']:.0f}-{r['ns_max']:.0f}]  "
-                  f"retval={r['retval']}")
+                  f"{r['ns']:7.1f} ns/pkt (min)  [median={r['ns_median']:.0f} "
+                  f"max={r['ns_max']:.0f}]  retval={r['retval']}")
         else:
             print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
                   f"stack_est(L1)~{r['stack_est']:<5} CRASHED ({r['detail']})")
