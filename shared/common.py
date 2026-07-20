@@ -231,14 +231,31 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
     within `interval` seconds of OSPF/FRR generating the first L3 traffic on
     a link the real neighbor MAC is detected and the BPF map entry corrected.
 
-    egress_ifaces: list of (cls, iface_name) pairs -- only the ifaces that
-    were installed with a fallback MAC need to be watched.
+    egress_ifaces: list of (cls, iface_name) pairs to watch.
+
+    Ifaces that do not exist on this node (/sys/class/net) are silently
+    skipped: the model may produce classes pointing to eth4/eth5 on nodes
+    that only have eth0-eth3, but those classes already map to MISS in the
+    BPF mac_table (install_mac_per_class leaves them unmapped), so there is
+    nothing to update and retrying them forever would be wasteful.
     """
     mac_tbl = b.get_table(table_name)
     fallback = DST_MAC
 
+    # Filter out ifaces that don't exist on this node — they are already
+    # MISS in the BPF map and will never have an ARP entry to resolve.
+    try:
+        existing = set(os.listdir("/sys/class/net"))
+    except OSError:
+        existing = set()
+    watchlist = [(cls, iface) for cls, iface in egress_ifaces
+                 if iface in existing]
+
+    if not watchlist:
+        return None   # nothing to watch
+
     def _refresh():
-        pending = list(egress_ifaces)   # [(cls, iface), ...] still on fallback
+        pending = list(watchlist)
         while pending:
             time.sleep(interval)
             still_pending = []
@@ -250,14 +267,15 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
                 # Real MAC now available — update the BPF entry.
                 try:
                     src = local_mac(iface)
-                    _, ifindex = resolve_ifindex(iface)
+                    import socket as _socket
+                    ifindex = _socket.if_nametoindex(iface)
                     action = mac_tbl.Leaf()
                     action.ifindex = ifindex
                     for i in range(6):
                         action.src_mac[i] = src[i]
                         action.dst_mac[i] = dst[i]
                     mac_tbl[ctypes.c_uint32(cls)] = action
-                    dst_str = ":".join(f"{b:02x}" for b in dst)
+                    dst_str = ":".join(f"{x:02x}" for x in dst)
                     print(f"[mac_refresh] class {cls} ({iface}): "
                           f"dst_mac updated to {dst_str}")
                 except Exception as e:
