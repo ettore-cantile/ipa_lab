@@ -1032,6 +1032,111 @@ _PIPELINE_MAP_NAMES = [
 ]
 
 
+def verify_alt_architectures(ttl_min=1, ttl_max=5):
+    """
+    Everything above this point in suite_kernel() exercises exactly ONE
+    architecture (the checked-in 65-4-4-7 model) across the 3 pipelines --
+    a real risk of a design-space claim ("P1/P2/P3 handle arbitrary shapes")
+    going untested. This closes that gap:
+      - P1 hardcoded: two SEPARATELY COMPILED programs with DIFFERENT depths
+        ((8,) one hidden layer, (4,4,4) three hidden layers -- exercising the
+        variable-depth generalization), same default feature descriptor,
+        random synthetic weights, checked against the generalized
+        ref_infer_sparse() (handles any hidden_dims length).
+      - P2 template / P3 modular: delegates to verify_multi_model.py's
+        existing alt-shape checks (65-6-5-7 for P2, 65-5-6-4-7 for P3,
+        registered ALONGSIDE the real model in the SAME compiled object --
+        the actual "multi-model concurrent" claim, not just routing).
+    Returns True iff every alt-architecture check passes.
+    """
+    import ctypes as ct
+    import random as _random
+    import verify_prog_run as V
+    from bcc import BPF
+    import model_meta as mm
+    from ebpf_program import build_combined_hardcoded_source
+    from common import write_vector_map
+
+    print(f"\n{YELLOW}--- Architetture alternative (non solo 65-4-4-7) ---{NC}")
+    all_ok = True
+
+    # --- P1 hardcoded: variable depth, same descriptor -------------------
+    shape = mm.derive_shape({"n_interfaces": 6, "n_nodes": 52})
+    features, n_out, n_in = shape["features"], shape["n_out"], shape["n_in"]
+    iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
+    ifindex_table = list(range(2, 2 + max(iface_size, 1)))
+
+    def n_weights(dims):
+        sizes = [n_in] + list(dims) + [n_out]
+        return sum(sizes[i - 1] * sizes[i] + sizes[i] for i in range(1, len(sizes)))
+
+    for dims, seed in [((8,), 111), ((4, 4, 4), 222)]:
+        rng = _random.Random(seed)
+        weights = [rng.randint(-30, 30) for _ in range(n_weights(dims))]
+        scale = 24
+        src = build_combined_hardcoded_source(
+            models=[(0, weights, scale, ifindex_table)],
+            features=features, n_out=n_out, hidden_dims=dims)
+        try:
+            b = BPF(text=src)
+            model_fn = b.load_func("model_0", BPF.XDP)
+            disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+        except Exception as e:
+            fail(f"hardcoded alt-arch {dims}: compile/verifier failed ({e})")
+            all_ok = False
+            continue
+        b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+        write_vector_map(b, "link_state", [1] * 6)
+        V._install_mac_table(b, "mac_table", n_classes=n_out - 1)
+        ps, cs = b["pkt_stats"], b["cls_stats"]
+
+        shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{n_out}"
+        passed = failed = 0
+        for ttl in range(ttl_min, ttl_max + 1):
+            ref_cls, ref_val = V.ref_infer_sparse(
+                weights, features, dims, n_out, ttl, model_id=0,
+                map_values={"link_state": [1] * 6},
+                ifindex=V.TEST_RUN_DEFAULT_INGRESS_IFINDEX, ifindex_table=ifindex_table)
+            frame = V.build_frame_sparse(model_id=0, ttl=ttl, scale=scale, n_in=n_in, n_out=n_out)
+            for i in range(3):
+                ps[ct.c_int(i)] = ct.c_ulonglong(0)
+            for i in range(n_out):
+                try:
+                    cs[ct.c_int(i)] = ct.c_ulonglong(0)
+                except Exception:
+                    pass
+            retval, _ = V.prog_test_run(disp_fn.fd, frame, repeat=1)
+            if ref_cls < n_out - 1:
+                got = int(cs[ct.c_int(ref_cls)].value)
+                good = (retval in V.XDP_REDIRECT_PASS) and got > 0
+            else:
+                got = int(ps[ct.c_int(2)].value)
+                good = (retval == 1) and got > 0
+            passed += good
+            failed += not good
+        if failed == 0:
+            ok(f"hardcoded alt-arch {shape_str}: {passed}/{passed} PASS")
+        else:
+            fail(f"hardcoded alt-arch {shape_str}: {failed}/{passed + failed} FAIL")
+            all_ok = False
+
+    # --- P2 template / P3 modular: delegate to verify_multi_model.py -----
+    try:
+        import verify_multi_model as VM
+        t_ok = VM.test_template()
+        m_ok = VM.test_modular()
+        (ok if t_ok else fail)(f"template alt-arch (65-6-5-7, concurrent w/ 65-4-4-7): "
+                              f"{'PASS' if t_ok else 'FAIL'}")
+        (ok if m_ok else fail)(f"modular alt-arch (65-5-6-4-7, concurrent w/ 65-4-4-7): "
+                               f"{'PASS' if m_ok else 'FAIL'}")
+        all_ok = all_ok and t_ok and m_ok
+    except Exception as e:
+        fail(f"template/modular alt-arch: error ({e})")
+        all_ok = False
+
+    return all_ok
+
+
 def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=True):
     print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
     if not sys.platform.startswith("linux"):
@@ -1165,6 +1270,16 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
                 all_ok = False
         except Exception as e:
             fail(f"link_state reroute probe: error ({e})")
+            all_ok = False
+
+        # Everything above tests ONE architecture (65-4-4-7). Prove the
+        # design-space claim ("arbitrary depth/width per pipeline") actually
+        # holds in the kernel, not just in the Python generator.
+        try:
+            alt_ok = verify_alt_architectures(ttl_min, ttl_max)
+            all_ok = all_ok and alt_ok
+        except Exception as e:
+            fail(f"alt-architecture verification: error ({e})")
             all_ok = False
     print(f"\n{'='*52}")
     print(f" kernel suite: {'PASS' if all_ok else 'FAIL'}")

@@ -439,6 +439,100 @@ def setup_baseline(model_id: int, model_path: str):
     }
 
 
+EBPF_BASELINE_TAILCALL = r"""
+#include <uapi/linux/if_ether.h>
+#include <uapi/linux/ip.h>
+#include <uapi/linux/udp.h>
+#include <uapi/linux/in.h>
+
+struct ipa_hdr {
+    __u8 model_id; __u8 model_type; __u8 param_size; __be16 scale_factor;
+    __u8 input_size; __u8 output_size; __u8 hidden_layers; __u8 neurons_per_layer;
+    __u8 n_feature_types;
+    __u8 f0c,f0n,f1c,f1n,f2c,f2n,f3c,f3n; __u8 n_output_types; __u8 o0c,o0n;
+} __attribute__((packed));
+
+struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
+
+BPF_HASH(mac_table, __u32, struct fwd_action, 8);
+BPF_ARRAY(pkt_stats, __u64, 3);
+BPF_ARRAY(cls_stats, __u64, 7);
+BPF_PROG_ARRAY(tail_progs, 2);
+
+/* SAME parse + SAME action as xdp_baseline (EBPF_BASELINE), but the action is
+ * reached via ONE bpf_tail_call hop instead of inline. Comparing this
+ * program's latency against xdp_baseline's isolates PURE tail-call overhead
+ * (one PROG_ARRAY jump), with the parse and the redirect logic held
+ * identical -- neither MLP cost nor a second packet parse is in this delta,
+ * unlike hardcoded_latency - baseline_latency which bundles tail-call +
+ * double-parse + MLP together. */
+int xdp_baseline_dispatch(struct xdp_md *ctx) {
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    struct iphdr *ip = (struct iphdr *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return XDP_PASS;
+    if (ip->protocol != IPPROTO_UDP) return XDP_PASS;
+    struct udphdr *udp = (struct udphdr *)(ip + 1);
+    if ((void *)(udp + 1) > data_end) return XDP_PASS;
+    if (udp->dest != bpf_htons(9999)) return XDP_PASS;
+    struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
+    if ((void *)(ipa + 1) > data_end) return XDP_PASS;
+
+    tail_progs.call(ctx, 0);
+    /* fallthrough only if the tail call itself failed to attach */
+    int mi = 1; __u64 *mv = pkt_stats.lookup(&mi);
+    if (mv) __sync_fetch_and_add(mv, 1);
+    return XDP_PASS;
+}
+
+int xdp_baseline_action(struct xdp_md *ctx) {
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return XDP_PASS;
+
+    __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
+    struct fwd_action *action = mac_table.lookup(&cls);
+    if (action) {
+        int si = 0; __u64 *v = pkt_stats.lookup(&si);
+        if (v) __sync_fetch_and_add(v, 1);
+        __u64 *cv = cls_stats.lookup(&cls);
+        if (cv) __sync_fetch_and_add(cv, 1);
+        __builtin_memcpy(eth->h_source, action->src_mac, 6);
+        __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
+        return bpf_redirect(action->ifindex, 0);
+    }
+    int mi = 1; __u64 *mv = pkt_stats.lookup(&mi);
+    if (mv) __sync_fetch_and_add(mv, 1);
+    return XDP_PASS;
+}
+"""
+
+
+def setup_baseline_tailcall(model_id: int, model_path: str):
+    """Same floor as setup_baseline(), but the redirect action is reached via
+    ONE bpf_tail_call hop (see EBPF_BASELINE_TAILCALL docstring). Comparing
+    against setup_baseline() isolates pure tail-call overhead, decoupled from
+    any MLP cost or second packet parse."""
+    weights, scale = load_weights(model_path)
+    b = BPF(text=EBPF_BASELINE_TAILCALL)
+    fn_disp   = b.load_func("xdp_baseline_dispatch", BPF.XDP)
+    fn_action = b.load_func("xdp_baseline_action", BPF.XDP)
+    b["tail_progs"][ct.c_int(0)] = ct.c_int(fn_action.fd)
+    _install_mac_table(b, "mac_table")
+    return {
+        "b": b, "fn": fn_disp, "disp": fn_disp,
+        "weights": weights, "scale": scale,
+        "cls_stats": b["cls_stats"],
+        "pkt_stats": b["pkt_stats"],
+        "pipeline": 0,
+        "progs": {"xdp_baseline_dispatch": fn_disp.fd, "xdp_baseline_action": fn_action.fd},
+        "n_tail": 1,
+    }
+
+
 def setup_hardcoded(model_id: int, model_path: str):
     """
     Load the pure hardcoded eBPF program (Pipeline 1).

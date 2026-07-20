@@ -30,8 +30,9 @@ benchmarked in its OWN subprocess (this same script re-invoked with
 sweep continues. first_layer_stack_estimate() is kept as an informational
 column only, not a gate.
 
-Timing is reported as the MIN of 7 independent trials (median/max printed
-alongside for context) -- a single repeat=N sample turned out to swing up
+Timing is reported as the MIN of 15 independent trials (p50/p90/max printed
+alongside for context, since the literature emphasizes tail latency, not
+just a central tendency) -- a single repeat=N sample turned out to swing up
 to 20x on some shapes with no correlation to instruction count (pure
 one-sided system noise: scheduler preemption, an unrelated process on the
 same host, CPU frequency scaling -- it can only slow a trial down, never
@@ -166,7 +167,13 @@ def _bench_one(descriptor_name, dims, repeat):
     # reasoning tools like hyperfine / Google Benchmark use), not median or
     # mean -- across TRIALS independent repeat=`repeat` measurements, the
     # smallest is the closest approximation to the interference-free cost.
-    TRIALS = 7
+    # TRIALS=15 (not 7): the literature on evaluating this kind of datapath
+    # (see docs/testing.md sec. 7-8 sources) stresses TAIL latency, not just
+    # a central tendency -- p90/p99 need enough samples to mean something,
+    # and a min-of-7 already looked reasonable but gave no sense of the
+    # right tail shape (which matters if this were ever load-bearing for a
+    # real SLA-style claim, not just a relative width-vs-depth comparison).
+    TRIALS = 15
     prog_test_run(disp_fn.fd, frame, repeat=repeat)   # warm-up (JIT icache)
     samples = []
     for _ in range(TRIALS):
@@ -174,10 +181,14 @@ def _bench_one(descriptor_name, dims, repeat):
         samples.append(ns)
     samples.sort()
 
+    def pct(p):
+        idx = min(TRIALS - 1, int(round(p * (TRIALS - 1))))
+        return samples[idx]
+
     print(json.dumps({
         "ok": True, "nw": nw, "stack_est": stack_est,
         "insns": xlated + xlated_model, "ns": samples[0], "retval": retval,
-        "ns_median": samples[TRIALS // 2], "ns_max": samples[-1],
+        "ns_p50": pct(0.50), "ns_p90": pct(0.90), "ns_max": samples[-1],
         "shape_str": f"{n_in}-{'-'.join(map(str, dims))}-{n_out}",
     }))
 
@@ -234,8 +245,8 @@ def run_descriptor(name, repeat):
         if r["ok"]:
             print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
                   f"stack_est(L1)~{r['stack_est']:<5} insns={r['insns']:<6} "
-                  f"{r['ns']:7.1f} ns/pkt (min)  [median={r['ns_median']:.0f} "
-                  f"max={r['ns_max']:.0f}]  retval={r['retval']}")
+                  f"{r['ns']:7.1f} ns/pkt (min)  [p50={r['ns_p50']:.0f} "
+                  f"p90={r['ns_p90']:.0f} max={r['ns_max']:.0f}]  retval={r['retval']}")
         else:
             print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
                   f"stack_est(L1)~{r['stack_est']:<5} CRASHED ({r['detail']})")

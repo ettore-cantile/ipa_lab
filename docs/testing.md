@@ -175,6 +175,182 @@ in `docs/pipeline_design_space.html` (sezione Risultati Sperimentali).
 
 ---
 
+## 7. Trade-off larghezza vs profondità in P1 hardcoded (`bench_depth_vs_width.py`)
+
+P1 hardcoded ora supporta un numero **variabile** di hidden layer (`hidden_dims` di
+qualunque lunghezza: `(4,4)` storico, `(8,)`, `(4,4,4,4)`, `()` lineare puro — non più
+fisso a 2). Domanda del relatore: a parità di budget-pesi, conviene allargare un layer o
+aggiungerne uno nuovo? Script dedicato:
+
+```bash
+sudo python3 shared/test/bench_depth_vs_width.py                      # tutti e 4 i descrittori
+sudo python3 shared/test/bench_depth_vs_width.py --descriptor no_onehot
+sudo python3 shared/test/bench_depth_vs_width.py --repeat 5000        # più stabile, più lento
+```
+
+**Metodologia** (vedi il file per il codice completo):
+- 3 tier a **budget-pesi abbinato** (A ~300, B ~1200, C ~4700 pesi): per ciascuno, una forma
+  larga (1 layer) e due profonde (4 e 8 layer); lo scarto di pesi è stampato esplicitamente,
+  mai assunto "circa uguale".
+- **4 descrittori di feature** (`default` 2 one-hot, `no_onehot` 0, `small_onehot` 1 piccola,
+  `big_onehot` 1 grande = `node`, size 52) per isolare l'effetto del descrittore da un
+  effetto generale larghezza/profondità — il descrittore di default ha una one-hot
+  (`node`) molto costosa che da sola avrebbe potuto falsare la conclusione.
+- **Minimo su 7 trial indipendenti**, non un solo campione: un run con `repeat` singolo
+  oscillava fino a 20× senza correlazione con le istruzioni — rumore di sistema **a senso
+  unico** (interrupt/scheduling possono solo rallentare, mai accelerare un trial), quindi
+  il minimo stima il costo al netto delle interferenze (stesso principio di hyperfine /
+  Google Benchmark).
+- **Ogni cella (descrittore × forma) in un subprocess isolato**: oltre un certo budget lo
+  stack eBPF (512 byte) va in overflow e il backend LLVM di BCC termina con un abort
+  **fatale, non catturabile** come eccezione Python. Isolare ogni cella in un subprocess fa
+  sì che un crash marchi solo quella cella (`CRASHED`) senza fermare lo sweep.
+
+**Risultato** (minimo su 7 trial, range osservato sui 4 descrittori):
+
+| Tier | Forma | Pesi | ns/pkt (min) |
+|---|---|---:|---:|
+| A (~100-320 pesi) | baseline / wide 1 layer | ~90-320 | 44 - 56 ns |
+| A | deep 8×3 | ~150-310 | 57 - 76 ns (overhead profondità: +13/+32 ns) |
+| B (~300-1300 pesi) | wide 1×16 | ~310-1175 | **103 - 111 ns (sempre il più veloce)** |
+| B | deep 4×11 | ~610-1210 | 203 - 236 ns (~2× più lento) |
+| B | deep 8×9 | ~810-1295 | 269 - 301 ns (~2.5-3× più lento) |
+| C (~1200-4700 pesi) | tutte (wide / deep 4 / deep 8) | — | **CRASH sempre**, ogni descrittore, ogni forma |
+
+**Cosa significa**: a parità di budget-pesi, **allargare batte approfondire** — risultato
+coerente sui 4 descrittori indipendenti (non un artefatto delle feature one-hot del
+descrittore di default). Ogni hidden layer in più costa un overhead fisso (~15-40 ns/layer,
+transizione + ReLU) indipendente dalla composizione delle feature. Oltre ~1200-1300 pesi lo
+stack eBPF va in overflow **sempre**, larga o profonda che sia la rete: non è una scelta di
+design larghezza/profondità, è un limite strutturale dell'architettura "tutto srotolato in
+un'unica funzione C, pesi come literal" — per modelli più grandi serve spostare gli array
+grandi in una `BPF per-cpu array map` (suggerimento diretto del compilatore nel messaggio di
+errore), non redistribuire gli stessi pesi su più layer.
+
+---
+
+## 8. Isolare il costo del tail-call (`bench_tailcall_overhead.py`)
+
+Le tre metriche esistenti (baseline, hardcoded, map-lookup) non isolavano MAI
+il costo del solo hop `bpf_tail_call`: `hardcoded_latency - baseline_latency`
+(sez. "Baseline vs hardcoded") impacchetta insieme tail-call + secondo parse
+del pacchetto + MLP. La letteratura sul design tail-call-based (vedi fonti
+in sez. 7-8 sotto) elenca il tail-call come una delle tre componenti di costo
+separabili — mancava una misura dedicata.
+
+```bash
+sudo python3 shared/test/bench_tailcall_overhead.py
+sudo python3 shared/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
+```
+
+Confronta due varianti minime, **stesso parse, stessa azione di redirect**,
+l'unica differenza è un hop `PROG_ARRAY` in mezzo: `xdp_baseline` (0 tail
+call, già esistente) vs `xdp_baseline_dispatch → xdp_baseline_action` (1 tail
+call, nuovo, in `verify_prog_run.EBPF_BASELINE_TAILCALL`). Stessa metodologia
+minimo-su-N-trial di `bench_depth_vs_width.py`. Il delta stampato è il costo
+**puro** del salto, isolato da qualunque aritmetica MLP o doppio parsing.
+
+---
+
+## 9. Traffico reale end-to-end (`bench_live_throughput.py`)
+
+Tutte le metriche di throughput finora (baseline/P1/P2/P3 in tabella, i tier
+di `bench_depth_vs_width.py`) sono **derivate** da `BPF_PROG_TEST_RUN`: il
+programma gira isolato, senza interrupt di NIC reale, senza driver, senza
+contesa di cache con altro traffico. È esattamente il tipo di scarto che la
+letteratura sul benchmarking ("Benchmarking Crimes", Heiser, arXiv:1801.02381;
+talk USENIX LISA21 di Verizon) segnala: un timer sintetico in-kernel può
+divergere silenziosamente da cosa succede quando i pacchetti arrivano
+davvero dal cavo. Nuovo script che genera traffico **reale**:
+
+```bash
+# sul nodo mittente (es. darmstadt)
+python3 shared/test/bench_live_throughput.py --dest-ip 10.0.0.234 --duration 10
+python3 shared/test/bench_live_throughput.py --dest-ip 10.0.0.234 --duration 10 --workers 4
+
+# sul nodo ricevente (es. frankfurt), in un'altra shell
+kathara exec frankfurt -- bpftool map dump name pkt_stats
+```
+
+**Onestà sui limiti**: è un sender Python, aspettati decine di migliaia di
+pkt/s al massimo, non i milioni di pkt/s che `BPF_PROG_TEST_RUN` deriva. Il
+confronto che conta è **relativo** (l'ordine P1/P2/P3 regge sotto consegna
+reale?), non il numero assoluto di pkt/s. Usa un socket UDP connesso in un
+loop stretto (non `scapy.send()` per pacchetto come `test_ipa.py`, che nella
+sessione ha misurato ~28-200 pkt/s — troppo lento per un vero test di
+throughput). **Importante**: `--dest-ip` deve essere l'IP reale
+dell'interfaccia direttamente connessa del ricevente (il vicino su quel
+link), non il suo hostname/loopback — il fabric Kathara non instrada
+UDP:9999 fino al loopback (sez. 5).
+
+### Profiling con contatori hardware (se disponibili)
+
+La letteratura (talk USENIX LISA21) raccomanda `bpftool prog profile` per cicli/cache-miss/
+branch-miss — nessun codice nuovo serve, solo il comando:
+
+```bash
+kathara exec frankfurt -- bpftool prog profile name ipa_switch_hardcoded duration 5 \
+    cycles instructions llc_misses branch_misses
+```
+
+**Onestà**: richiede contatori hardware (PMU) esposti al kernel guest — spesso **non
+disponibili** sotto virtualizzazione (VirtualBox/Kathara). Se il comando fallisce o ritorna
+zeri, è un limite noto dell'ambiente, non un errore di misura — prova comunque prima di
+scartarlo.
+
+---
+
+## 10. Architetture alternative dentro `test_suite.py --only kernel`
+
+Prima, `test_suite --only kernel` verificava **una sola architettura** (65-4-4-7) su
+tutte e 3 le pipeline — un vuoto reale rispetto alla tesi "P1/P2/P3 gestiscono profondità/
+larghezza arbitrarie". Ora `suite_kernel()` chiama anche `verify_alt_architectures()`:
+
+- **P1 hardcoded**: due programmi compilati **separatamente** con profondità diverse
+  (`(8,)` un hidden layer, `(4,4,4)` tre hidden layer — esercita la generalizzazione a
+  profondità variabile del Task 7), stesso descrittore di default, pesi sintetici,
+  verificati contro `ref_infer_sparse` generalizzato (qualunque lunghezza di `hidden_dims`).
+- **P2 template / P3 modular**: richiama i controlli già esistenti in
+  `verify_multi_model.py` (65-6-5-7 per P2, 65-5-6-4-7 per P3, registrati **insieme** al
+  modello reale nello stesso oggetto compilato — la vera prova "multi-model concorrente").
+
+Nessun comando nuovo — è già dentro:
+```bash
+sudo python3 shared/test/test_suite.py --only kernel
+```
+
+---
+
+## 11. Reroute su guasto REALE (`test_frr_linkstate.py`)
+
+Il probe "link_state reroute" esistente (sez. 2) scrive **direttamente nella mappa**
+`link_state[k]=0` — non tocca mai un'interfaccia reale, il rilevamento di carrier, o il
+thread `link_state_monitor` che dovrebbe tenerli allineati. Nuovo script che orchestra
+**da fuori Kathara** (host, via `kathara exec`) un guasto vero mentre la pipeline è
+attaccata dal vivo e c'è traffico reale (`bench_live_throughput.py`, sez. 9):
+
+```bash
+python3 shared/test/test_frr_linkstate.py \
+    --switch frankfurt --ingress-iface eth1 --fail-iface eth2 \
+    --sender darmstadt --method template --model-id 0
+
+# vedi la sequenza esatta di comandi senza eseguirla:
+python3 shared/test/test_frr_linkstate.py --switch frankfurt --ingress-iface eth1 \
+    --fail-iface eth2 --sender darmstadt --dry-run
+```
+
+Sequenza: attacca la pipeline dal vivo → avvia il flood reale → snapshot `cls_stats` →
+abbatte **davvero** `--fail-iface` (`ip link set down`) → aspetta il polling
+(`link_state_monitor`) → nuovo snapshot → confronta i delta per classe (la classe
+dell'interfaccia guasta deve fermarsi, le altre devono crescere) → ripristina tutto.
+
+**Onestà**: il parsing di `bpftool map dump` è best-effort (formato testuale, non
+garantito identico su ogni versione di bpftool/kernel) — se il verdetto sembra sbagliato,
+`--dry-run` stampa ogni comando singolarmente per rifarlo a mano. Non misura un tempo di
+failover in stile SLA, solo se il reroute avviene entro un intervallo di polling.
+
+---
+
 ## Risultati (kernel, `test_suite.py --only kernel`, 4 CPU, modello 65→4→4→7, scale=24)
 
 Aggiornati dopo: IV **descrittore-driven** in P2/P3 (registry `model_desc`), AOT-literal
@@ -246,4 +422,13 @@ P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
 - **Azione uniforme (`mac_table`)**: `argmax → mac_table[classe] → bpf_redirect`.
 - **Nessun `ctx_in` custom**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox cade
   fuori dalla `ifindex_table` di P1 e dal clamp `[1,6]` di P2/P3 → tutte risolvono `_iface=0`.
-- Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`.
+- Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`
+  (fino a 20× su un singolo campione, rumore a senso unico — vedi sez. 7): tutti gli script
+  di benchmark aggiunti in questa sessione (7, 8) usano minimo su N trial indipendenti, mai
+  un campione singolo.
+- **Limiti dell'ambiente (onestà, cfr. Heiser "Benchmarking Crimes", arXiv:1801.02381)**:
+  nessun CPU pinning/isolamento core, nessuna frequenza CPU fissata, nessun C-state
+  disabilitato, VM/Kathara — i numeri assoluti (ns/pacchetto, Mpps) non sono comparabili con
+  paper su bare-metal. Il confronto **relativo** fra le pipeline sullo stesso nodo, stesse
+  condizioni, è l'unica misura difendibile con questo setup — è quello su cui si basano
+  tutte le conclusioni di questo documento (ordine P1/P2/P3, larghezza-vs-profondità).
