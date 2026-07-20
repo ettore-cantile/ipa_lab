@@ -287,31 +287,30 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
                 x[o + model_id] = 1
         o += size
 
-    n_h1, n_h2 = hidden_dims
-    off_fc1_b = n_in * n_h1
-    off_fc2_w = off_fc1_b + n_h1
-    off_fc2_b = off_fc2_w + n_h1 * n_h2
-    off_out_w = off_fc2_b + n_h2
-    off_out_b = off_out_w + n_h2 * n_out
-    h1 = []
-    for j in range(n_h1):
-        acc = s8(weights[off_fc1_b + j])
-        for i in range(n_in):
-            acc += x[i] * s8(weights[j * n_in + i])
-        h1.append(max(0, acc))
-    h2 = []
-    for j in range(n_h2):
-        acc = s8(weights[off_fc2_b + j])
-        for i in range(n_h1):
-            acc += h1[i] * s8(weights[off_fc2_w + j * n_h1 + i])
-        h2.append(max(0, acc))
+    # Generic per-layer reference: layer_sizes = [n_in, h1, ..., hk, n_out].
+    # Same weight layout ebpf_program.generate_ebpf_hardcoded now emits (n_prev*n_cur
+    # weights then n_cur biases, layer by layer) -- reduces to the historical
+    # 2-hidden-layer math when hidden_dims == (n_h1, n_h2).
+    layer_sizes = [n_in] + [int(d) for d in hidden_dims] + [n_out]
+    off = 0
+    acts = x
+    for li in range(1, len(layer_sizes)):
+        n_prev, n_cur = layer_sizes[li - 1], layer_sizes[li]
+        w_off, b_off = off, off + n_prev * n_cur
+        off = b_off + n_cur
+        is_out = (li == len(layer_sizes) - 1)
+        nxt = []
+        for j in range(n_cur):
+            acc = s8(weights[b_off + j])
+            for i in range(n_prev):
+                acc += acts[i] * s8(weights[w_off + j * n_prev + i])
+            nxt.append(acc if is_out else max(0, acc))
+        acts = nxt
+
     best_val, best_cls = -10**9, 0
-    for k in range(n_out):
-        acc = s8(weights[off_out_b + k])
-        for i in range(n_h2):
-            acc += h2[i] * s8(weights[off_out_w + k * n_h2 + i])
-        if acc > best_val:
-            best_val, best_cls = acc, k
+    for k, v in enumerate(acts):
+        if v > best_val:
+            best_val, best_cls = v, k
     return best_cls, best_val
 
 

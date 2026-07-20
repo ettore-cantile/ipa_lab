@@ -472,7 +472,9 @@ def generate_ebpf_hardcoded(
     each a feature type from model_meta.FEATURE_CATALOG read from its local
     source (packet TTL, link_state / queue_state maps, ingress iface, node).
     N_IN = sum of the sizes; N_OUT is the number of output classes (last
-    class = DROP). hidden_dims = (n_h1, n_h2).
+    class = DROP). hidden_dims = any-length sequence of hidden widths
+    (e.g. (4, 4), (8,), (4, 4, 4, 4), () for a pure linear model): DEPTH is
+    variable, not fixed at 2.
 
     Backward compatibility: if `features` is None, a default descriptor is
     built from n_interfaces/n_nodes in the historical order
@@ -493,7 +495,7 @@ def generate_ebpf_hardcoded(
                    ingress_iface one-hot feature (if present in the
                    descriptor). Defaults to [2, 3, ...].
     """
-    n_h1, n_h2 = hidden_dims
+    dims = [int(d) for d in hidden_dims]
 
     if features is None:
         _shape = _model_meta.derive_shape({"n_interfaces": n_interfaces, "n_nodes": n_nodes})
@@ -504,9 +506,19 @@ def generate_ebpf_hardcoded(
     _model_meta._validate_feature_types([f["type"] for f in features])
 
     n_in = sum(f["size"] for f in features)
-    n_weights = n_in * n_h1 + n_h1 + n_h1 * n_h2 + n_h2 + n_h2 * n_out + n_out
+
+    # Layer sizes: [n_in, h1, h2, ..., hk, n_out]. `hidden_dims` may hold ANY
+    # number of hidden layers (0 = pure linear model). Weight layout is the
+    # generic per-layer one — n_prev*n_cur weights then n_cur biases, layer by
+    # layer — which reduces exactly to the historical 2-hidden-layer layout
+    # when hidden_dims == (n_h1, n_h2), so existing checkpoints are unchanged.
+    layer_sizes = [n_in] + dims + [n_out]
+    n_weights = sum(layer_sizes[i - 1] * layer_sizes[i] + layer_sizes[i]
+                    for i in range(1, len(layer_sizes)))
     if len(weights_int8) != n_weights:
-        raise ValueError(f"Expected {n_weights} weights, got {len(weights_int8)}")
+        raise ValueError(
+            f"Expected {n_weights} weights for shape "
+            f"{'-'.join(map(str, layer_sizes))}, got {len(weights_int8)}")
 
     # ifindex_table sized to the ingress_iface feature (if any); default
     # [2,3,...]. For a descriptor without ingress_iface it is unused.
@@ -518,19 +530,23 @@ def generate_ebpf_hardcoded(
         ifindex_table.append(2)
 
     w = weights_int8
-    fc1_w = w[0             : n_in*n_h1]
-    fc1_b = w[n_in*n_h1     : n_in*n_h1 + n_h1]
-    base2 = n_in*n_h1 + n_h1
-    fc2_w = w[base2         : base2 + n_h1*n_h2]
-    fc2_b = w[base2+n_h1*n_h2 : base2+n_h1*n_h2+n_h2]
-    base3 = base2 + n_h1*n_h2 + n_h2
-    out_w = w[base3         : base3 + n_h2*n_out]
-    out_b = w[base3+n_h2*n_out : base3+n_h2*n_out+n_out]
+    layers = []            # [(W, B)] one entry per layer, input -> output
+    off = 0
+    for i in range(1, len(layer_sizes)):
+        n_prev, n_cur = layer_sizes[i - 1], layer_sizes[i]
+        layers.append((w[off : off + n_prev * n_cur],
+                       w[off + n_prev * n_cur : off + n_prev * n_cur + n_cur]))
+        off += n_prev * n_cur + n_cur
 
     # --- fc1: build the IV feature by feature, in descriptor order ---
     # Running weight offset per feature; each feature emits its preamble
     # (declarations / map reads / the single one-hot switch) and a term_fn(j)
-    # for its contribution to hidden neuron j.
+    # for its contribution to first-layer neuron j.
+    fc1_w, fc1_b = layers[0]
+    n_h1 = layer_sizes[1]
+    # With zero hidden layers the first layer IS the output layer: no ReLU and
+    # the "out_" prefix argmax reads directly.
+    first_prefix = "h1" if dims else "out"
     fc1_lines = []
     term_fns  = []
     offset = 0
@@ -542,22 +558,32 @@ def generate_ebpf_hardcoded(
 
     for j in range(n_h1):
         terms = " + ".join(tf(j) for tf in term_fns)
+        expr = f"{terms} + {_lit(fc1_b[j])}LL"
         fc1_lines.append(
-            f"    long long h1_{j} = RELU_LL({terms} + {_lit(fc1_b[j])}LL);")
+            f"    long long {first_prefix}_{j} = "
+            + (f"RELU_LL({expr});" if dims else f"{expr};"))
 
-    h1_names = [f"h1_{j}" for j in range(n_h1)]
-    fc2_lines  = _gen_dense_layer(h1_names, n_h2, fc2_w, fc2_b, "h2", relu=True)
-    h2_names = [f"h2_{j}" for j in range(n_h2)]
-    out_lines  = _gen_dense_layer(h2_names, n_out, out_w, out_b, "out", relu=False)
+    # --- remaining layers: h2..hk (ReLU), then the output layer (no ReLU) ---
+    rest_lines = []
+    prev_names = [f"{first_prefix}_{j}" for j in range(n_h1)]
+    for li in range(1, len(layers)):
+        W, B = layers[li]
+        n_cur = layer_sizes[li + 1]
+        is_out = (li == len(layers) - 1)
+        prefix = "out" if is_out else f"h{li + 1}"
+        rest_lines.extend(_gen_dense_layer(prev_names, n_cur, W, B, prefix,
+                                           relu=not is_out))
+        prev_names = [f"{prefix}_{j}" for j in range(n_cur)]
+
     argmax_lines = _gen_argmax(n_out)
 
     fc1_src    = "\n".join(fc1_lines)
-    fc2_src    = "\n".join(fc2_lines)
-    out_src    = "\n".join(out_lines)
+    rest_src   = "\n".join(rest_lines)
     argmax_src = "\n".join(argmax_lines)
     epilogue   = _gen_action_epilogue(f"best_cls >= {n_out - 1}")
 
-    shape_str = "-".join(str(f["size"]) for f in features) + f" -> {n_in}-{n_h1}-{n_h2}-{n_out}"
+    shape_str = ("-".join(str(f["size"]) for f in features)
+                 + " -> " + "-".join(str(s) for s in layer_sizes))
     feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in features)
 
     fn_name = f"model_{model_id}"
@@ -572,9 +598,7 @@ int {fn_name}(struct xdp_md *ctx) {{
     /* Input vector built locally, features: {feats_str} */
 {fc1_src}
 
-{fc2_src}
-
-{out_src}
+{rest_src}
 
 {argmax_src}
 {epilogue}}}

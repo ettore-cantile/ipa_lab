@@ -191,22 +191,37 @@ def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = 
     Classes whose interface is absent on this node are left UNMAPPED -> that class
     resolves to MISS at runtime. Pass an explicit list to match a different
     class->port convention.
+
+    Returns {"installed": [(cls, iface, ifindex)],
+             "pending":   [(cls, iface)]}
+    where `pending` lists exactly the classes whose dst_mac is still the
+    fallback because ARP hasn't resolved yet. Callers feed `pending` straight
+    into start_mac_refresh_thread() -- they must NOT re-derive it by calling
+    neighbor_mac() again: a second /proc/net/arp read can disagree with the one
+    used here (ARP may resolve in between), which would either leave a fallback
+    MAC unwatched or spawn a refresh thread for an already-correct entry.
     """
     import ctypes
     if egress_ifaces is None:
         egress_ifaces = [f"eth{i}" for i in range(n_fwd)]
     mac = b.get_table(table_name)
-    installed = []
+    installed, pending = [], []
     for cls in range(n_fwd):
         name = egress_ifaces[cls] if cls < len(egress_ifaces) else None
         if not name:
             continue
         try:
             iface_r, ifindex = resolve_ifindex(name)
-            src_mac, dst_mac = resolve_egress_mac(iface_r)
+            src_mac = local_mac(iface_r)
+            dst_mac = neighbor_mac(iface_r)
         except Exception as e:
             print(f"[mac] class {cls}: egress '{name}' unavailable ({e}) -> unmapped (MISS)")
             continue
+        if dst_mac is None:
+            # No ARP entry yet (idle link). Install a fallback so the class is
+            # not a hard MISS, and hand this class to the refresh thread.
+            dst_mac = DST_MAC
+            pending.append((cls, iface_r))
         action = mac.Leaf()
         action.ifindex = ifindex
         for i in range(6):
@@ -214,11 +229,13 @@ def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = 
             action.dst_mac[i] = dst_mac[i]
         mac[ctypes.c_uint32(cls)] = action
         installed.append((cls, iface_r, ifindex))
+    pending_cls = {c for c, _ in pending}
     for cls, ifc, idx in installed:
-        print(f"[mac] {table_name}: class {cls} -> {ifc} (ifindex={idx})")
+        state = "ARP pending -> fallback dst_mac" if cls in pending_cls else "ARP resolved"
+        print(f"[mac] {table_name}: class {cls} -> {ifc} (ifindex={idx}) [{state}]")
     if not installed:
         print(f"[mac] WARNING: {table_name} -- no egress interface resolved; every class -> MISS")
-    return installed
+    return {"installed": installed, "pending": pending}
 
 
 def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
@@ -260,16 +277,21 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
         return None   # nothing to watch
 
     def _refresh():
-        pending = list(watchlist)
-        while pending:
+        # Keep polling for the whole pipeline lifetime instead of exiting once
+        # every class has resolved: an ARP entry can go stale/expire, and the
+        # next hop behind a port can change (link flap, neighbour reboot). A
+        # thread that stopped at first resolution would leave the BPF map
+        # pointing at a dead MAC with no way to notice. Cost is one
+        # /proc/net/arp read per interval, so re-polling forever is cheap.
+        # Writes happen only when the resolved MAC actually differs from what
+        # is already in the map, so the steady state is read-only.
+        current = {}          # cls -> last dst_mac written
+        while True:
             time.sleep(interval)
-            still_pending = []
-            for cls, iface in pending:
+            for cls, iface in watchlist:
                 dst = neighbor_mac(iface)
-                if dst is None or dst == fallback:
-                    still_pending.append((cls, iface))
+                if dst is None or dst == fallback or current.get(cls) == dst:
                     continue
-                # Real MAC now available — update the BPF entry.
                 try:
                     src = local_mac(iface)
                     import socket as _socket
@@ -280,14 +302,12 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
                         action.src_mac[i] = src[i]
                         action.dst_mac[i] = dst[i]
                     mac_tbl[ctypes.c_uint32(cls)] = action
+                    current[cls] = dst
                     dst_str = ":".join(f"{x:02x}" for x in dst)
                     print(f"[mac_refresh] class {cls} ({iface}): "
                           f"dst_mac updated to {dst_str}")
                 except Exception as e:
                     print(f"[mac_refresh] class {cls} ({iface}): update failed ({e})")
-                    still_pending.append((cls, iface))
-            pending = still_pending
-        print("[mac_refresh] all ifaces resolved — thread exiting")
 
     t = threading.Thread(target=_refresh, daemon=True, name="mac_refresh")
     t.start()

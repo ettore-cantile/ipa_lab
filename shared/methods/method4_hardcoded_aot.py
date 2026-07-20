@@ -150,6 +150,7 @@ def main():
     print(f"[AOT] generated {os.path.relpath(c_path, _ORIGINAL_CWD)} ({len(c_src)} chars)")
 
     import shutil
+    build_ms = None
     if shutil.which(args.clang):
         bpf_cflags = ["-O2", "-g", "-target", "bpf", "-D__TARGET_ARCH_x86"]
         t0 = time.perf_counter()
@@ -212,8 +213,9 @@ def main():
     print("\n" + "=" * 64)
     print(" SUMMARY: BCC (runtime clang) vs AOT-literal (offline .o)")
     print("=" * 64)
+    build_str = f"{build_ms:>7.1f} ms" if build_ms is not None else "  (reused prebuilt .o -- no clang on this node)"
     print(f"  BCC method4 (re)load    : ~1660 ms  (clang at runtime, every model)")
-    print(f"  AOT offline build       : {build_ms:>7.1f} ms  (clang once, on build box)")
+    print(f"  AOT offline build       : {build_str}  (clang once, on build box)")
     print(f"  AOT runtime deploy      : ~few ms   (open+load only -- see [deploy] above)")
     print(f"  performance             : literal maximum preserved (see [perf] above)")
     print("=" * 64)

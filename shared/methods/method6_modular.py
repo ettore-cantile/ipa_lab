@@ -97,19 +97,10 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
 
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
 
-    from common import install_mac_per_class, start_mac_refresh_thread, neighbor_mac, DST_MAC
-    installed = install_mac_per_class(b, "mac_table_t3", n_fwd=6)
-
-    # Start background MAC refresh for ifaces that got a fallback MAC at startup.
-    fallback_ifaces = [
-        (cls, f"eth{cls}")
-        for cls in range(6)
-        if neighbor_mac(f"eth{cls}") in (None, DST_MAC)
-    ]
-    if fallback_ifaces:
-        start_mac_refresh_thread(b, "mac_table_t3", fallback_ifaces, interval=5.0)
-        print(f"[Method 6] MAC refresh thread started for: "
-              f"{[ifc for _, ifc in fallback_ifaces]}")
+    from common import install_mac_per_class, start_mac_refresh_thread
+    mac_info = install_mac_per_class(b, "mac_table_t3", n_fwd=6)
+    if mac_info["pending"]:
+        start_mac_refresh_thread(b, "mac_table_t3", mac_info["pending"], interval=5.0)
 
     from link_state_monitor import init_link_state_up, start_monitor_thread
     init_link_state_up(b)
