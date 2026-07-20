@@ -11,19 +11,24 @@ BPF_PROG_TEST_RUN. Random int8 weights -- this measures SHAPE cost only,
 not inference correctness (that is already covered by test_suite).
 
 Swept across SEVERAL feature descriptors (not just the historical default),
-because the width-vs-depth verdict turned out to depend on the descriptor's
-feature mix: onehot features (ingress_iface, node) generate a switch-case
-that costs stack/instructions proportional to (that feature's size * n_h1),
-paid only by the FIRST hidden layer. A descriptor with no onehot features,
-or a small one instead of the 52-slot 'node' one, changes both the stack
-ceiling AND which architecture is actually faster -- so a conclusion drawn
-from one descriptor alone is not safe to generalize. See FEATURE_SETS.
+because the width-vs-depth verdict depends on the descriptor's feature mix:
+onehot features (ingress_iface, node) generate a switch-case whose cost is
+proportional to (that feature's size * n_h1), paid only by the FIRST hidden
+layer. A conclusion drawn from one descriptor is not safe to generalize --
+see FEATURE_SETS for the 0/1/2-onehot, small/big-onehot variants tested.
 
-Shapes predicted to overflow the 512-byte eBPF per-function stack are
-SKIPPED BEFORE compiling (not try/except'd): BCC's LLVM backend reports that
-failure via a fatal-error abort, which terminates the process -- a Python
-try/except around BPF(text=...) cannot catch it. first_layer_stack_estimate()
-is the (empirically confirmed) predictor used to decide what's safe to try.
+Stack-overflow safety: whether a given (descriptor, hidden_dims) shape
+overflows the 512-byte eBPF per-function stack is NOT reliably predictable
+from a simple formula -- two independent attempts at one (see git history)
+were each contradicted by clang/BCC's actual -O2 stack-slot coalescing,
+which seems to depend on total code size/layer count in ways not worth
+reverse-engineering. And BCC's LLVM backend reports a real overflow via a
+process-fatal abort (not a Python exception), so a bad guess crashes the
+whole sweep. The robust fix used here: each (descriptor, shape) pair is
+benchmarked in its OWN subprocess (this same script re-invoked with
+--_worker); a subprocess crash only marks that one cell CRASHED and the
+sweep continues. first_layer_stack_estimate() is kept as an informational
+column only, not a gate.
 
 Run on Linux (Kathara or bare VM) with bcc installed:
     sudo python3 shared/test/bench_depth_vs_width.py
@@ -32,8 +37,10 @@ Run on Linux (Kathara or bare VM) with bcc installed:
 """
 import os
 import sys
+import json
 import random
 import argparse
+import subprocess
 import ctypes as ct
 
 _TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -42,10 +49,7 @@ for p in (SHARED_DIR, _TEST_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from bcc import BPF
 import model_meta as mm
-from ebpf_program import build_combined_hardcoded_source
-from verify_prog_run import prog_test_run, prog_insn_count, build_frame_sparse
 
 # ---------------------------------------------------------------------------
 # Feature descriptors to sweep. Isolates onehot COUNT (0 / 1 / 2) and onehot
@@ -55,10 +59,10 @@ from verify_prog_run import prog_test_run, prog_insn_count, build_frame_sparse
 # All variants keep n_out=7 so tier weight-budgets stay comparable.
 # ---------------------------------------------------------------------------
 FEATURE_SETS = {
-    "default":     ["link_state", "ingress_iface", "ttl", "node"],   # 2 onehot (6 + 52)
-    "no_onehot":   ["link_state", "ttl", "queue_occupancy"],         # 0 onehot
-    "small_onehot": ["link_state", "ttl", "ingress_iface"],          # 1 onehot, size 6
-    "big_onehot":  ["link_state", "ttl", "node"],                    # 1 onehot, size 52
+    "default":      ["link_state", "ingress_iface", "ttl", "node"],   # 2 onehot (6 + 52)
+    "no_onehot":    ["link_state", "ttl", "queue_occupancy"],         # 0 onehot
+    "small_onehot": ["link_state", "ttl", "ingress_iface"],           # 1 onehot, size 6
+    "big_onehot":   ["link_state", "ttl", "node"],                    # 1 onehot, size 52
 }
 
 # (tier, label, hidden_dims) -- SAME architecture grid tested against every
@@ -75,11 +79,6 @@ SHAPES = [
     ("C (~4700 w)", "deep   8x21",  (21, 21, 21, 21, 21, 21, 21, 21)),
 ]
 
-# Empirical safety margin under the real 512-byte ceiling: leaves headroom
-# for the packet-parse locals (eth/ip/udp/ipa pointers) that live on the same
-# stack frame alongside the feature-building temporaries this estimates.
-STACK_SAFETY_LIMIT = 480
-
 
 def build_shape(descriptor_name: str, n_out: int = 7) -> dict:
     types = FEATURE_SETS[descriptor_name]
@@ -93,17 +92,15 @@ def weight_count(n_in, dims, n_out):
 
 
 def first_layer_stack_estimate(shape, n_h1):
-    """Estimated live-stack bytes for the FIRST hidden layer's `long long`
-    locals: ebpf_program._gen_feature_onehot_{iface,node} each declare their
-    OWN n_h1-sized temp array (w_iface_j / w_node_j) IN ADDITION to the
-    final h1_j output array, and _gen_feature_dense_vector declares one
-    `long long` per value of that feature. clang/BCC does not appear to
-    reuse these slots across the un-scoped C, so they all count toward the
-    eBPF 512-byte per-function stack ceiling simultaneously. This is why
-    WIDENING the first layer is far more expensive, byte for byte, than
-    adding an extra (narrower) layer: every additional onehot feature in the
-    descriptor multiplies the first layer's per-neuron stack cost, while
-    layers 2+ (_gen_dense_layer) cost only 1 array each, no multiplier."""
+    """INFORMATIONAL ONLY (not a safety gate, see module docstring): estimated
+    live-stack bytes for just the FIRST hidden layer's `long long` locals --
+    ebpf_program._gen_feature_onehot_{iface,node} each declare their OWN
+    n_h1-sized temp array in addition to the h1_j output array, and
+    _gen_feature_dense_vector declares one `long long` per feature value.
+    Deeper layers (_gen_dense_layer) add their own n_cur-sized array each,
+    not counted here -- empirically, whether those get stack-coalesced by
+    -O2 is NOT reliably predictable, which is why this is a diagnostic
+    number only, never used to decide whether to attempt a shape."""
     n_onehot = sum(1 for f in shape["features"]
                    if mm.FEATURE_CATALOG[f["type"]]["kind"] == "onehot")
     n_dense_vals = sum(f["size"] for f in shape["features"]
@@ -111,18 +108,19 @@ def first_layer_stack_estimate(shape, n_h1):
     return (1 + n_onehot) * n_h1 * 8 + n_dense_vals * 8
 
 
-def bench_shape(label, dims, shape, repeat):
+def _bench_one(descriptor_name, dims, repeat):
+    """Runs in the WORKER subprocess. Prints exactly one JSON line to stdout
+    (the parent's only contract) and exits 0/1. Any BCC/clang diagnostics go
+    to stderr and are ignored by the parent unless this process crashes."""
+    from bcc import BPF
+    from ebpf_program import build_combined_hardcoded_source
+    from verify_prog_run import prog_test_run, prog_insn_count, build_frame_sparse
+
+    shape = build_shape(descriptor_name)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     n_h1 = dims[0] if dims else n_out
     stack_est = first_layer_stack_estimate(shape, n_h1)
-    shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{n_out}"
-
-    if stack_est > STACK_SAFETY_LIMIT:
-        print(f"  {label:<14} {shape_str:<24} weights={nw:<6} "
-              f"stack_est(L1)={stack_est:<5}  SKIPPED (predicted > {STACK_SAFETY_LIMIT}B "
-              f"stack ceiling -- not attempted, BCC's compile failure is unrecoverable)")
-        return None, nw, None, stack_est
 
     rng = random.Random(42)
     weights = [rng.randint(-100, 100) for _ in range(nw)]
@@ -137,21 +135,54 @@ def bench_shape(label, dims, shape, repeat):
     b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
 
     xlated, jited = prog_insn_count(disp_fn.fd)
-    xlated_model, jited_model = prog_insn_count(model_fn.fd)
+    xlated_model, _ = prog_insn_count(model_fn.fd)
 
-    frame = build_frame_sparse(model_id=0, ttl=42, scale=scale,
-                               n_in=n_in, n_out=n_out)
+    frame = build_frame_sparse(model_id=0, ttl=42, scale=scale, n_in=n_in, n_out=n_out)
     # dur_ns from BPF_PROG_TEST_RUN is already the per-repetition average
     # (kernel divides internally) -- test_suite.py uses it the same way, do
     # NOT divide by repeat again here.
     prog_test_run(disp_fn.fd, frame, repeat=repeat)   # warm-up (JIT icache)
     retval, ns_per_pkt = prog_test_run(disp_fn.fd, frame, repeat=repeat)
 
-    print(f"  {label:<14} {shape_str:<24} weights={nw:<6} "
-          f"stack_est(L1)={stack_est:<5} "
-          f"xlated_insn(disp+model)={xlated}+{xlated_model:<5} "
-          f"{ns_per_pkt:7.1f} ns/pkt  retval={retval}")
-    return ns_per_pkt, nw, xlated + xlated_model, stack_est
+    print(json.dumps({
+        "ok": True, "nw": nw, "stack_est": stack_est,
+        "insns": xlated + xlated_model, "ns": ns_per_pkt, "retval": retval,
+        "shape_str": f"{n_in}-{'-'.join(map(str, dims))}-{n_out}",
+    }))
+
+
+def bench_shape_isolated(descriptor_name, label, dims, repeat):
+    """Runs _bench_one for (descriptor_name, dims) in a fresh subprocess so a
+    fatal LLVM stack-overflow abort (uncatchable in-process) only kills that
+    subprocess. Returns a result dict; on crash, {"ok": False, "detail":...}
+    still carries nw/stack_est (computed here, cheaply, without compiling)."""
+    shape = build_shape(descriptor_name)
+    n_in, n_out = shape["n_in"], shape["n_out"]
+    nw = weight_count(n_in, dims, n_out)
+    n_h1 = dims[0] if dims else n_out
+    stack_est = first_layer_stack_estimate(shape, n_h1)
+    shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{n_out}"
+
+    dims_arg = ",".join(map(str, dims))
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__),
+         "--_worker", descriptor_name, dims_arg, str(repeat)],
+        capture_output=True, text=True)
+
+    result = {"nw": nw, "stack_est": stack_est, "shape_str": shape_str,
+              "label": label, "dims": dims}
+    last_line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else None
+    if proc.returncode == 0 and last_line:
+        try:
+            parsed = json.loads(last_line)
+            result.update(parsed)
+            return result
+        except json.JSONDecodeError:
+            pass
+    detail = (proc.stderr.strip().splitlines()[-1] if proc.stderr.strip()
+             else f"exit code {proc.returncode} (likely a fatal LLVM abort -- stack overflow)")
+    result.update({"ok": False, "detail": detail[:90]})
+    return result
 
 
 def run_descriptor(name, repeat):
@@ -166,26 +197,35 @@ def run_descriptor(name, repeat):
 
     rows = []
     for tier, label, dims in SHAPES:
-        ns, nw, insns, stack_est = bench_shape(label, dims, shape, repeat)
-        rows.append((tier, label, dims, ns, nw, insns, stack_est))
+        r = bench_shape_isolated(name, label, dims, repeat)
+        r["tier"] = tier
+        rows.append(r)
+        if r["ok"]:
+            print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
+                  f"stack_est(L1)~{r['stack_est']:<5} insns={r['insns']:<6} "
+                  f"{r['ns']:7.1f} ns/pkt  retval={r['retval']}")
+        else:
+            print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
+                  f"stack_est(L1)~{r['stack_est']:<5} CRASHED ({r['detail']})")
 
     tiers = {}
     for row in rows:
-        tiers.setdefault(row[0], []).append(row)
+        tiers.setdefault(row["tier"], []).append(row)
     for tier, group in tiers.items():
-        nws = [r[4] for r in group]
+        nws = [r["nw"] for r in group]
         spread = (max(nws) - min(nws)) / min(nws)
         print(f"\n  Tier {tier} -- weight-count spread: {spread:.1%} "
               f"(min={min(nws)}, max={max(nws)})")
-        ref_ns = next((r[3] for r in group if r[3] is not None), None)
-        ref_label = group[0][1].strip()
-        for _, label, dims, ns, nw, insns, stack_est in group:
-            if ns is None:
-                print(f"    {label:<14} weights={nw:<6} stack_est(L1)={stack_est:<5}  SKIPPED")
+        ref = next((r for r in group if r["ok"]), None)
+        for r in group:
+            if not r["ok"]:
+                print(f"    {r['label']:<14} weights={r['nw']:<6} "
+                      f"stack_est(L1)~{r['stack_est']:<5}  CRASHED ({r['detail']})")
             else:
-                rel = f"({ns/ref_ns:+.1%} vs {ref_label})" if ref_ns else ""
-                print(f"    {label:<14} weights={nw:<6} stack_est(L1)={stack_est:<5} "
-                      f"{ns:7.1f} ns/pkt  {rel}  {insns} insns")
+                rel = f"({r['ns']/ref['ns']:+.1%} vs {ref['label'].strip()})" if ref else ""
+                print(f"    {r['label']:<14} weights={r['nw']:<6} "
+                      f"stack_est(L1)~{r['stack_est']:<5} {r['ns']:7.1f} ns/pkt  "
+                      f"{rel}  {r['insns']} insns")
     print()
     return rows
 
@@ -195,7 +235,19 @@ def main():
     ap.add_argument("--repeat", type=int, default=2000)
     ap.add_argument("--descriptor", choices=list(FEATURE_SETS) + ["all"], default="all",
                     help="Which feature descriptor(s) to sweep (default: all)")
+    ap.add_argument("--_worker", nargs=3, default=None,
+                    help=argparse.SUPPRESS)  # internal: descriptor, "d1,d2,...", repeat
     args = ap.parse_args()
+
+    if args._worker:
+        descriptor_name, dims_str, repeat_str = args._worker
+        dims = tuple(int(x) for x in dims_str.split(",")) if dims_str else ()
+        try:
+            _bench_one(descriptor_name, dims, int(repeat_str))
+        except Exception as e:
+            print(json.dumps({"ok": False, "detail": str(e)[:200]}))
+            sys.exit(1)
+        return
 
     names = list(FEATURE_SETS) if args.descriptor == "all" else [args.descriptor]
     for name in names:
