@@ -91,7 +91,7 @@ def update_link_state(bpf_obj, ifaces=None, verbose: bool = False) -> list:
     return states
 
 
-def monitor_loop(bpf_obj, ifaces=None, interval: float = 1.0,
+def monitor_loop(bpf_obj, ifaces=None, interval: float = 0.5,
                  stop_event: "threading.Event" = None) -> None:
     """Poll carrier state every `interval` seconds until stop_event is set,
     writing changes into the link_state map."""
@@ -107,7 +107,7 @@ def monitor_loop(bpf_obj, ifaces=None, interval: float = 1.0,
         time.sleep(interval)
 
 
-def start_monitor_thread(bpf_obj, ifaces=None, interval: float = 1.0
+def start_monitor_thread(bpf_obj, ifaces=None, interval: float = 0.5
                          ) -> "threading.Event":
     """Start monitor_loop in a daemon thread. Returns the stop_event; call
     stop_event.set() to end the loop."""
