@@ -137,7 +137,10 @@ def _attach(ebpf_src, iface, shape, model_id=0):
     tail call falls through to XDP_PASS and never infers/forwards."""
     from bcc import BPF
     import ctypes, time
-    from common import attach_xdp, resolve_ifindex, install_mac_per_class
+    from common import (
+        attach_xdp, resolve_ifindex, install_mac_per_class,
+        start_mac_refresh_thread, neighbor_mac, DST_MAC,
+    )
 
     iface, _ = resolve_ifindex(iface)
     print(f"[method4] Compiling hardcoded program, shape="
@@ -160,7 +163,22 @@ def _attach(ebpf_src, iface, shape, model_id=0):
 
     # Populate mac_table: DISTINCT egress port per class (class i -> eth<i>,
     # ARP-resolved). n_out-1 forward classes, last class = DROP.
-    install_mac_per_class(b, "mac_table", n_fwd=shape["n_out"] - 1)
+    n_fwd = shape["n_out"] - 1
+    installed = install_mac_per_class(b, "mac_table", n_fwd=n_fwd)
+
+    # Start background MAC refresh thread for any iface that got a fallback
+    # MAC at startup (ARP not yet resolved). The thread re-reads /proc/net/arp
+    # every 5 s and updates the BPF map entry as soon as the real MAC appears,
+    # without requiring manual ARP warmup (ping) before launching the pipeline.
+    fallback_ifaces = [
+        (cls, f"eth{cls}")
+        for cls in range(n_fwd)
+        if neighbor_mac(f"eth{cls}") in (None, DST_MAC)
+    ]
+    if fallback_ifaces:
+        start_mac_refresh_thread(b, "mac_table", fallback_ifaces, interval=5.0)
+        print(f"[method4] MAC refresh thread started for: "
+              f"{[ifc for _, ifc in fallback_ifaces]}")
 
     attach_xdp(b, disp_fn, iface=iface)
     print(f"[method4] Pipeline 1 (hardcoded) running on {iface}. "
