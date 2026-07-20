@@ -30,6 +30,18 @@ benchmarked in its OWN subprocess (this same script re-invoked with
 sweep continues. first_layer_stack_estimate() is kept as an informational
 column only, not a gate.
 
+Timing is reported as the MEDIAN of 7 independent trials, with the
+[min-max] range printed alongside -- a single repeat=N sample turned out to
+swing 5-10x on some shapes with no correlation to instruction count (pure
+system noise: scheduler preemption, an unrelated process on the same host),
+so a one-shot measurement is not trustworthy here.
+
+`retval` (1=XDP_DROP or 2=XDP_PASS) is benign noise, not a defect: this
+bench never populates mac_table, so a forward-class argmax always misses
+(XDP_PASS) and only the random weights landing on the drop class gives
+XDP_DROP -- the map lookup cost is the same either way, so it does not bias
+the timing.
+
 Run on Linux (Kathara or bare VM) with bcc installed:
     sudo python3 shared/test/bench_depth_vs_width.py
     sudo python3 shared/test/bench_depth_vs_width.py --repeat 5000
@@ -141,12 +153,29 @@ def _bench_one(descriptor_name, dims, repeat):
     # dur_ns from BPF_PROG_TEST_RUN is already the per-repetition average
     # (kernel divides internally) -- test_suite.py uses it the same way, do
     # NOT divide by repeat again here.
+    #
+    # A SINGLE repeat=N measurement is not enough: transient system noise
+    # (scheduler preemption, interrupts, an unrelated cgroup on the same
+    # host) can dominate one sample and produce swings of 5-10x that do not
+    # correlate with instruction count at all -- exactly what a one-shot run
+    # of this sweep showed. TRIALS independent repeat=`repeat` measurements
+    # are taken and the MEDIAN is reported (standard practice for
+    # microbenchmarks: min is sometimes preferred, but median is more
+    # robust here since a shape that is genuinely slower should still show
+    # up as slower across most trials, not just the fastest one).
+    TRIALS = 7
     prog_test_run(disp_fn.fd, frame, repeat=repeat)   # warm-up (JIT icache)
-    retval, ns_per_pkt = prog_test_run(disp_fn.fd, frame, repeat=repeat)
+    samples = []
+    for _ in range(TRIALS):
+        retval, ns = prog_test_run(disp_fn.fd, frame, repeat=repeat)
+        samples.append(ns)
+    samples.sort()
+    median_ns = samples[TRIALS // 2]
 
     print(json.dumps({
         "ok": True, "nw": nw, "stack_est": stack_est,
-        "insns": xlated + xlated_model, "ns": ns_per_pkt, "retval": retval,
+        "insns": xlated + xlated_model, "ns": median_ns, "retval": retval,
+        "ns_min": samples[0], "ns_max": samples[-1],
         "shape_str": f"{n_in}-{'-'.join(map(str, dims))}-{n_out}",
     }))
 
@@ -203,7 +232,8 @@ def run_descriptor(name, repeat):
         if r["ok"]:
             print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
                   f"stack_est(L1)~{r['stack_est']:<5} insns={r['insns']:<6} "
-                  f"{r['ns']:7.1f} ns/pkt  retval={r['retval']}")
+                  f"{r['ns']:7.1f} ns/pkt  [{r['ns_min']:.0f}-{r['ns_max']:.0f}]  "
+                  f"retval={r['retval']}")
         else:
             print(f"  {label:<14} {r['shape_str']:<24} weights={r['nw']:<6} "
                   f"stack_est(L1)~{r['stack_est']:<5} CRASHED ({r['detail']})")
