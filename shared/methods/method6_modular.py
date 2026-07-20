@@ -26,8 +26,7 @@ Compatibility notes with the existing codebase:
   - Attaches to iface param (default: INGRESS_IFACE from common.py)
   - pkt_stats_t3 + mac_table_t3 (class -> ifindex + MACs) used as separate maps
   - All three programs (dispatcher + layer_first + layer_hidden) compiled
-    from EBPF_MODULAR_FULL so BCC sees them as a single compilation unit —
-    no separate .o files needed
+    from EBPF_MODULAR_FULL so BCC sees them as a single compilation unit
 
 Files used (paths resolved relative to this file, not hardcoded /shared/):
   ../weights.json       : int8 weights (319 values)
@@ -53,37 +52,9 @@ from common import (
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-
-
 def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         layer_dims_by_model: list = None):
-    """
-    iface: network interface to attach XDP to.
-           Defaults to INGRESS_IFACE from common.py if not specified.
-    model_ids: optional list of model_id's to register concurrently, all
-           sharing the same compiled layer_first/layer_hidden programs --
-           depth and width may differ per model (see layer_dims_by_model),
-           since the "is this the last layer" decision is made at runtime
-           from data, not from which program is wired at a given tail-call
-           slot.
-           Each gets its own, non-overlapping slice of layer_weights, so the
-           dispatcher can serve several models in the same run without a
-           reload. Defaults to [model_id] (single-model, backward compatible).
-    layer_dims_by_model: optional list of per-model layer_dims (one entry
-           per model_ids[i]), each a list of (n_in, n_out) tuples -- see
-           load_modular_weights() in ebpf_modular.py. Defaults to the
-           checked-in 65-4-4-7 shape for every model
-           ([[(65,4),(4,4),(4,7)]] * len(ids)).
-           NOTE: today only one trained model (65-4-4-7) is checked into the
-           repo, so multiple model_ids with the default shape only exercise
-           the registry/dispatch mechanism with repeated weights -- pass a
-           real per-model layer_dims/weights source to exercise a genuinely
-           different architecture.
-    """
     ingress_iface = iface if iface else INGRESS_IFACE
-    # No fallback here: silently attaching XDP to a DIFFERENT interface than
-    # requested would be worse than a loud, actionable error (see
-    # resolve_ifindex() docstring in common.py).
     ingress_iface, _ = resolve_ifindex(ingress_iface)
     ids = list(model_ids) if model_ids else [model_id]
     dims_by_model = (list(layer_dims_by_model) if layer_dims_by_model
@@ -109,43 +80,37 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     print(f"  Total weights : {len(integer_weights)}")
     print(f"  Ingress iface : {ingress_iface} (ifindex={socket.if_nametoindex(ingress_iface)})")
 
-    # Compile all three eBPF functions (dispatcher + layer_first + layer_hidden)
-    # from the combined source
     b = BPF(text=EBPF_MODULAR_FULL)
 
-    # Populate layer_registry/layer_shapes/layer_weights/model_desc: one
-    # non-overlapping weight block per model_id, sized to that model's own
-    # depth/width. load_modular_weights also seeds model_desc (default
-    # 65-feature descriptor) so layer_first builds its first-hop IV generically.
     base_offset = 0
     for mid, layer_dims in zip(ids, dims_by_model):
         consumed = load_modular_weights(b, integer_weights, model_id=mid, scale=SCALE_FACTOR,
                                         layer_dims=layer_dims, base_offset=base_offset)
         base_offset += consumed
 
-    # Wire the tail-call chain: slot 0 = layer_first (always the first hop
-    # for any model), slots 1..15 = layer_hidden (always a later hop for
-    # any model). Which hop is ALSO "the last layer" is decided at runtime
-    # per model (layer_idx+1 == n_layers), not by which program sits at a
-    # given slot -- so this wiring never needs to change when a model's
-    # depth differs from another concurrently-registered model's depth.
     fn_first  = b.load_func("layer_first",  BPF.XDP)
     fn_hidden = b.load_func("layer_hidden", BPF.XDP)
     chain = b.get_table("layer_chain")
     chain[ctypes.c_int(0)] = ctypes.c_int(fn_first.fd)
-    for i in range(1, 16):  # LAYER_CHAIN_SIZE in ebpf_modular.py
+    for i in range(1, 16):
         chain[ctypes.c_int(i)] = ctypes.c_int(fn_hidden.fd)
 
-    # Attach modular_dispatcher as the XDP entry point
     fn_disp = b.load_func("modular_dispatcher", BPF.XDP)
 
-    # Populate the L2 next-hop dictionary with a DISTINCT egress port per class
-    # (class i -> eth<i>, ARP-resolved MAC of that port) so the NN's argmax
-    # selects the physical egress. Absent interfaces -> that class MISSes.
-    from common import install_mac_per_class
-    install_mac_per_class(b, "mac_table_t3", n_fwd=6)
+    from common import install_mac_per_class, start_mac_refresh_thread, neighbor_mac, DST_MAC
+    installed = install_mac_per_class(b, "mac_table_t3", n_fwd=6)
 
-    # Seed link_state and start carrier monitor
+    # Start background MAC refresh for ifaces that got a fallback MAC at startup.
+    fallback_ifaces = [
+        (cls, f"eth{cls}")
+        for cls in range(6)
+        if neighbor_mac(f"eth{cls}") in (None, DST_MAC)
+    ]
+    if fallback_ifaces:
+        start_mac_refresh_thread(b, "mac_table_t3", fallback_ifaces, interval=5.0)
+        print(f"[Method 6] MAC refresh thread started for: "
+              f"{[ifc for _, ifc in fallback_ifaces]}")
+
     from link_state_monitor import init_link_state_up, start_monitor_thread
     init_link_state_up(b)
     stop_monitor = start_monitor_thread(b, interval=1.0)

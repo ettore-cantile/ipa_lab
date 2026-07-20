@@ -47,40 +47,12 @@ from common import (
 )
 
 # Resolve the shared/ directory relative to this file regardless of cwd.
-# Inside Kathara: this file lives at /shared/methods/method5_template.py
-# Outside Kathara: path is resolved the same way via __file__.
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         hidden_dims: list = None):
-    """
-    iface: network interface to attach XDP to.
-           Defaults to INGRESS_IFACE from common.py if not specified.
-           Pass the correct interface for the lab topology (e.g. 'eth0' for
-           darmstadt->frankfurt direct link l59 in lab.conf).
-    model_ids: optional list of model_id's to register concurrently, all
-           sharing the arch_generic_2layer program (same 2-hidden-layer
-           topology, hidden widths may differ per model -- see hidden_dims).
-           Each gets its own, non-overlapping slice of the arch_weights map,
-           so the dispatcher can serve several models in the same run without
-           a reload -- the flexibility hardcoded Pipeline 1 cannot offer.
-           Defaults to [model_id] (single-model, backward compatible).
-    hidden_dims: optional list of (n_h1, n_h2) tuples, one per entry in
-           model_ids/ids, for models whose hidden widths differ from the
-           checked-in weights.json (65-4-4-7). Must fit under T2_MAX_H1/
-           T2_MAX_H2 (ebpf_template_arch.py) -- load_arch_weights() raises
-           a clear error otherwise instead of silently corrupting the map.
-           Defaults to (4, 4) for every model, matching weights.json.
-           NOTE: today only one trained model (65-4-4-7) is checked into the
-           repo, so this only demonstrates the registry/dispatch mechanism
-           with repeated weights -- wire a real per-model weights source
-           (distinct weights.json per model_id) to exercise it for real.
-    """
     ingress_iface = iface if iface else INGRESS_IFACE
-    # No fallback here: silently attaching XDP to a DIFFERENT interface than
-    # requested would be worse than a loud, actionable error (see
-    # resolve_ifindex() docstring in common.py).
     ingress_iface, _ = resolve_ifindex(ingress_iface)
     ids = list(model_ids) if model_ids else [model_id]
     dims = list(hidden_dims) if hidden_dims else [(4, 4)] * len(ids)
@@ -98,7 +70,7 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         float_data = json.load(f)
 
     SCALE_FACTOR = float_data["scale_factor"]
-    cp_weights   = float_data["weights"][:4]   # first 4 weights for fwd key
+    cp_weights   = float_data["weights"][:4]
 
     integer_weights = load_weights(weights_path)
 
@@ -106,42 +78,36 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     print(f"  Total weights : {len(integer_weights)} (expected {N_WEIGHTS_T2})")
     print(f"  Ingress iface : {ingress_iface} (ifindex={socket.if_nametoindex(ingress_iface)})")
 
-    # Load the combined dispatcher + arch program
-    # BCC compiles both functions from the concatenated source.
-    # EBPF_ARCH_GENERIC_2LAYER re-declares the shared structs/maps behind
-    # #ifndef IPA_ARCH_COMBINED; define it so the concatenation compiles once
-    # (without it BCC errors "redefinition of 'ipa_hdr'" etc.).
     combined_src = ("#define IPA_ARCH_COMBINED 1\n"
                     + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER)
     b = BPF(text=combined_src)
 
-    # Populate arch_registry, arch_weights and model_desc: one non-overlapping
-    # weight block per model_id, sized to that model's own hidden widths, all
-    # pointing at the same generic arch program. load_arch_weights also seeds
-    # model_desc (default 65-feature descriptor) so the leaf builds its IV
-    # generically.
     weight_offset = 0
     for mid, (n_h1, n_h2) in zip(ids, dims):
         load_arch_weights(b, integer_weights, model_id=mid, scale=SCALE_FACTOR,
                           weight_offset=weight_offset, n_h1=n_h1, n_h2=n_h2)
         weight_offset += arch_weight_count(n_h1, n_h2)
 
-    # Register arch_generic_2layer function in the arch_progs tail-call map
     fn_arch = b.load_func("arch_generic_2layer", BPF.XDP)
     arch_progs = b.get_table("arch_progs")
     arch_progs[ctypes.c_int(0)] = ctypes.c_int(fn_arch.fd)
 
-    # Attach dispatcher as the XDP entry point
     fn_dispatcher = b.load_func("ipa_switch_template", BPF.XDP)
 
-    # Populate the L2 next-hop dictionary with a DISTINCT egress port per class
-    # (class i -> eth<i>, ARP-resolved MAC of that port) so the NN's argmax
-    # actually selects the physical egress. Classes whose interface is absent on
-    # this node are left unmapped (that class -> MISS). 6 forward classes (T2_N_OUT-1).
-    from common import install_mac_per_class
-    install_mac_per_class(b, "mac_table_t2", n_fwd=6)
+    from common import install_mac_per_class, start_mac_refresh_thread, neighbor_mac, DST_MAC
+    installed = install_mac_per_class(b, "mac_table_t2", n_fwd=6)
 
-    # Seed link_state (egress up/down feature [0..5]) and start carrier monitor.
+    # Start background MAC refresh for ifaces that got a fallback MAC at startup.
+    fallback_ifaces = [
+        (cls, f"eth{cls}")
+        for cls in range(6)
+        if neighbor_mac(f"eth{cls}") in (None, DST_MAC)
+    ]
+    if fallback_ifaces:
+        start_mac_refresh_thread(b, "mac_table_t2", fallback_ifaces, interval=5.0)
+        print(f"[Method 5] MAC refresh thread started for: "
+              f"{[ifc for _, ifc in fallback_ifaces]}")
+
     from link_state_monitor import init_link_state_up, start_monitor_thread
     init_link_state_up(b)
     stop_monitor = start_monitor_thread(b, interval=1.0)
