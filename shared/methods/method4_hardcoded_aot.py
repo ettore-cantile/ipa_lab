@@ -149,13 +149,30 @@ def main():
         f.write(c_src)
     print(f"[AOT] generated {os.path.relpath(c_path, _ORIGINAL_CWD)} ({len(c_src)} chars)")
 
-    bpf_cflags = ["-O2", "-g", "-target", "bpf", "-D__TARGET_ARCH_x86"]
-    t0 = time.perf_counter()
-    rc, out, err = _run([args.clang, *bpf_cflags, "-c", c_path, "-o", o_path], cwd=POC_DIR)
-    build_ms = (time.perf_counter() - t0) * 1000.0
-    if rc != 0:
-        sys.exit(f"[AOT] clang failed (rc={rc}):\n{err}")
-    print(f"[AOT] OFFLINE build (clang -> .o): {build_ms:.1f} ms  [paid once, on the build box]")
+    import shutil
+    if shutil.which(args.clang):
+        bpf_cflags = ["-O2", "-g", "-target", "bpf", "-D__TARGET_ARCH_x86"]
+        t0 = time.perf_counter()
+        rc, out, err = _run([args.clang, *bpf_cflags, "-c", c_path, "-o", o_path], cwd=POC_DIR)
+        build_ms = (time.perf_counter() - t0) * 1000.0
+        if rc != 0:
+            sys.exit(f"[AOT] clang failed (rc={rc}):\n{err}")
+        print(f"[AOT] OFFLINE build (clang -> .o): {build_ms:.1f} ms  [paid once, on the build box]")
+    elif os.path.exists(o_path):
+        # No clang on this node: the AOT model builds the .o OFFLINE (on a build
+        # box with clang) and deploys the prebuilt .o -- so reuse it as-is. This
+        # is exactly the "no clang on the datapath node" win.
+        print(f"[AOT] '{args.clang}' not found -- reusing prebuilt "
+              f"{os.path.relpath(o_path, _ORIGINAL_CWD)} (AOT deploy, no clang on this node).")
+    else:
+        sys.exit(
+            f"[AOT] '{args.clang}' not found and no prebuilt "
+            f"{os.path.relpath(o_path, _ORIGINAL_CWD)}.\n"
+            f"      The AOT model builds the .o OFFLINE on a build box with clang, then\n"
+            f"      deploys the prebuilt .o. Build it there (python3 "
+            f"shared/methods/method4_hardcoded_aot.py),\n"
+            f"      copy nn_aot_arch.o onto this node, or use the BCC path "
+            f"(--hardcoded-backend bcc).")
 
     loader_c   = os.path.join(POC_DIR, "loader_aot.c")
     loader_bin = os.path.join(POC_DIR, "loader_aot")
