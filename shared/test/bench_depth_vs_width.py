@@ -34,14 +34,21 @@ from verify_prog_run import (
     TEST_RUN_DEFAULT_INGRESS_IFINDEX,
 )
 
-# (label, hidden_dims) -- grouped in pairs of roughly equal total weight count
-# at the default 65-in/7-out shape, wide vs deep.
+# (tier, label, hidden_dims) -- 3 budget tiers; within each tier the 1-layer
+# (wide), 4-layer and 8-layer (deep) shapes are chosen so their TOTAL WEIGHT
+# COUNT matches as closely as an integer per-layer width allows (see the
+# search that produced these in the design notes -- residual spread is
+# printed per-tier below, never hand-waved as "roughly equal").
 SHAPES = [
-    ("baseline (2x4)",  (4, 4)),
-    ("wide  1x16",       (16,)),
-    ("deep  4x4",        (4, 4, 4, 4)),
-    ("wide  1x64",       (64,)),
-    ("deep  8x8",        (8, 8, 8, 8, 8, 8, 8, 8)),
+    ("A (~300 w)",  "baseline 2x4", (4, 4)),
+    ("A (~300 w)",  "wide   1x4",   (4,)),
+    ("A (~300 w)",  "deep   8x3",   (3, 3, 3, 3, 3, 3, 3, 3)),
+    ("B (~1200 w)", "wide   1x16",  (16,)),
+    ("B (~1200 w)", "deep   4x11",  (11, 11, 11, 11)),
+    ("B (~1200 w)", "deep   8x9",   (9, 9, 9, 9, 9, 9, 9, 9)),
+    ("C (~4700 w)", "wide   1x64",  (64,)),
+    ("C (~4700 w)", "deep   4x29",  (29, 29, 29, 29)),
+    ("C (~4700 w)", "deep   8x21",  (21, 21, 21, 21, 21, 21, 21, 21)),
 ]
 
 
@@ -91,14 +98,28 @@ def main():
     print(f"descriptor: {[f['type'] for f in base_shape['features']]}  "
           f"n_in={base_shape['n_in']}  n_out={base_shape['n_out']}")
     print("-" * 100)
-    results = []
-    for label, dims in SHAPES:
-        results.append((label, dims, *bench_shape(label, dims, base_shape, args.repeat)))
+    rows = []
+    for tier, label, dims in SHAPES:
+        ns, nw, insns = bench_shape(label, dims, base_shape, args.repeat)
+        rows.append((tier, label, dims, ns, nw, insns))
     print("-" * 100)
-    base_ns = results[0][2]
-    for label, dims, ns, nw, insns in results:
-        print(f"{label:<16} {ns:7.1f} ns/pkt  ({ns/base_ns:+.1%} vs baseline)  "
-              f"{insns} insns  {nw} weights")
+
+    # Per-tier summary: weight-count spread actually achieved (never assumed
+    # equal) and ns/pkt relative to the tier's WIDEST (1-layer) shape, since
+    # that is the natural reference for "does adding depth cost more than the
+    # extra weights alone would predict".
+    tiers = {}
+    for row in rows:
+        tiers.setdefault(row[0], []).append(row)
+    for tier, group in tiers.items():
+        nws = [r[4] for r in group]
+        spread = (max(nws) - min(nws)) / min(nws)
+        print(f"\nTier {tier} -- weight-count spread across shapes: {spread:.1%} "
+              f"(min={min(nws)}, max={max(nws)})")
+        ref_ns = group[0][3]
+        for _, label, dims, ns, nw, insns in group:
+            print(f"  {label:<14} weights={nw:<6} {ns:7.1f} ns/pkt  "
+                  f"({ns/ref_ns:+.1%} vs {group[0][1].strip()})  {insns} insns")
 
 
 if __name__ == "__main__":
