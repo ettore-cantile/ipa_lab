@@ -337,10 +337,15 @@ def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
     """
     try:
         import torch
-    except ImportError as exc:
-        raise RuntimeError(
-            "torch is required for checkpoint verification but could not be imported."
-        ) from exc
+    except ImportError:
+        # Deployment nodes (e.g. Kathara containers) run from the prebuilt
+        # weights.json and have no torch/.pt. The checkpoint N_IN cross-check is
+        # a dev-machine safety net, not a runtime requirement -- skip it here
+        # instead of hard-failing the whole pipeline.
+        print("[verify] torch not available — skipping N_IN checkpoint "
+              "consistency check (expected on deployment nodes that use the "
+              "prebuilt weights.json).")
+        return
 
     try:
         state = torch.load(model_path, map_location="cpu")
