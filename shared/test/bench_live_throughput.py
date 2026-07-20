@@ -11,7 +11,8 @@ synthetic in-kernel timer can silently diverge from what happens when
 packets actually arrive through the wire. This script generates REAL
 traffic -- as many packets/sec as this Python process can push through a
 real UDP socket -- so the RECEIVING node's pkt_stats counter (HIT/MISS/DROP,
-printed live by method4/5/6, or read via `bpftool map dump name pkt_stats`)
+printed live by method4/5/6, or read via `bpf_introspect.py` -- NOT bpftool,
+which is not installed in this lab's Kathara node images)
 gives a genuinely independent throughput number to compare against the
 BPF_PROG_TEST_RUN-derived one in docs/testing.md.
 
@@ -37,8 +38,9 @@ Usage (from the sender node, e.g. darmstadt):
 
 On the receiver (e.g. frankfurt), in a separate shell, either watch the
 running pipeline's live HIT/MISS/DROP printout (started via
-execute_pipeline.py) or read the counter directly before/after:
-    kathara exec frankfurt -- bpftool map dump name pkt_stats
+execute_pipeline.py) or read the counter directly before/after (bpftool is
+NOT installed in this lab's Kathara images -- use bpf_introspect.py instead):
+    kathara exec frankfurt -- python3 /shared/bpf_introspect.py pkt_stats 3
 """
 import argparse
 import multiprocessing
@@ -116,8 +118,9 @@ def main():
 
     pps = total_sent / elapsed
     print(f"\n[flood] TOTAL: {total_sent} pkt in {elapsed:.2f}s  =  {pps:,.0f} pkt/s")
-    print(f"[flood] Now read the RECEIVER's pkt_stats delta over this same window:")
-    print(f"    kathara exec <receiver> -- bpftool map dump name pkt_stats")
+    print(f"[flood] Now read the RECEIVER's pkt_stats delta over this same window")
+    print(f"[flood] (replace RECEIVER_NODE below with the actual node name, e.g. frankfurt):")
+    print(f"    kathara exec RECEIVER_NODE -- python3 /shared/bpf_introspect.py pkt_stats 3")
     print(f"[flood] Compare {pps:,.0f} pkt/s (this sender's REAL ceiling) against the "
           f"BPF_PROG_TEST_RUN-derived Mpps in docs/testing.md -- the isolated number is "
           f"an upper bound on the DATAPATH's own cost, not a promise about real delivered "

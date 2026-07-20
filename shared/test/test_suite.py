@@ -1137,7 +1137,7 @@ def verify_alt_architectures(ttl_min=1, ttl_max=5):
     return all_ok
 
 
-def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=True):
+def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=True, trials=7):
     print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
     if not sys.platform.startswith("linux"):
         info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
@@ -1190,14 +1190,28 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
             fail(f"{name}: BPF_PROG_TEST_RUN failed ({e})")
             all_ok = False
             continue
+        # A SINGLE BPF_PROG_TEST_RUN sample is not trustworthy: system noise
+        # (scheduler preemption, interrupts, an unrelated process on the same
+        # host) is ONE-SIDED -- it can only slow a trial down, never speed one
+        # up below the true cost -- which is exactly why this table's
+        # throughput used to look wildly different run to run (e.g. hardcoded
+        # swinging 10-25 Mpps, baseline 10-50 Mpps). MIN across `trials`
+        # independent measurements is the standard fix for this (same
+        # reasoning as hyperfine / Google Benchmark, and the same fix already
+        # applied in bench_depth_vs_width.py after it hit the identical issue).
+        samples = []
         ru0 = resource.getrusage(resource.RUSAGE_SELF)
         w0  = time.perf_counter()
-        retval, dur_ns = V.prog_test_run(disp_fd, frame, repeat=repeat)
+        for _ in range(trials):
+            retval, dur_ns = V.prog_test_run(disp_fd, frame, repeat=repeat)
+            samples.append(dur_ns)
         wall = time.perf_counter() - w0
         ru1 = resource.getrusage(resource.RUSAGE_SELF)
         cpu_s   = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
         cpu_pct = 100.0 * cpu_s / wall if wall > 0 else 0.0
-        lat_ns  = float(dur_ns) if dur_ns else (wall * 1e9 / repeat)
+        samples.sort()
+        lat_min, lat_p50, lat_max = samples[0], samples[trials // 2], samples[-1]
+        lat_ns  = float(lat_min) if lat_min else (wall * 1e9 / (repeat * trials))
         mpps    = (1000.0 / lat_ns) if lat_ns > 0 else 0.0
         mem = 0
         for mname in _PIPELINE_MAP_NAMES:
@@ -1217,8 +1231,10 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
             "name": name, "pl": pl, "insn": insn_total, "jit": jit_total,
             "per": per_prog, "lat": lat_ns, "mpps": mpps, "cpu": cpu_pct,
             "retval": retval, "mem": mem, "n_tail": n_tail, "lookups": lookups,
+            "lat_p50": lat_p50, "lat_max": lat_max,
         })
-        ok(f"{name:9s}: {insn_total:5d} eBPF instr | lat={lat_ns:8.1f} ns | {mpps:6.3f} Mpps | CPU={cpu_pct:4.0f}% | retval={retval} | tail={n_tail}")
+        ok(f"{name:9s}: {insn_total:5d} eBPF instr | lat={lat_ns:8.1f} ns (min of {trials})"
+           f" [p50={lat_p50:.0f} max={lat_max:.0f}] | {mpps:6.3f} Mpps | CPU={cpu_pct:4.0f}% | retval={retval} | tail={n_tail}")
     if not rows:
         return all_ok
     print()
@@ -1231,8 +1247,10 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
     line("Tail calls / packet",   "n_tail", lambda v: f"{v}")
     line("Map lookups / packet (real)", "lookups", lambda v: "n/a" if v is None else f"{v:.1f}")
     line("Map memory (bytes)",     "mem",    lambda v: f"{v}")
-    line("Latency (ns/pkt)",         "lat",    lambda v: f"{v:.1f}")
-    line("Throughput (Mpps)",        "mpps",   lambda v: f"{v:.3f}")
+    line(f"Latency (ns/pkt, min of {trials})", "lat", lambda v: f"{v:.1f}")
+    line("  ...p50",                 "lat_p50", lambda v: f"{v:.1f}")
+    line("  ...max",                 "lat_max", lambda v: f"{v:.1f}")
+    line("Throughput (Mpps, from min)", "mpps", lambda v: f"{v:.3f}")
     line("CPU (%)",                  "cpu",    lambda v: f"{v:.0f}")
     print("  " + "-" * (32 + 16 * len(rows)))
     print()
@@ -1316,6 +1334,7 @@ def main():
     parser.add_argument('--samples', type=int, default=200, help='Samples for pktstats/quant')
     parser.add_argument('--seed', type=int, default=42, help='Seed for pktstats')
     parser.add_argument('--kernel-repeat', type=int, default=50000, help='BPF_PROG_TEST_RUN repeats for the kernel suite')
+    parser.add_argument('--kernel-trials', type=int, default=7, help='Independent min-of-N trials per pipeline (fixes run-to-run volatility, see suite_kernel docstring)')
     parser.add_argument('--no-verify', action='store_true', help='Kernel suite: skip the dispatch gate (metrics only)')
     args = parser.parse_args()
     all_suites = ['core', 'pktstats', 'extract', 'quant', 'robust', 'kernel']
@@ -1338,7 +1357,7 @@ def main():
     if 'robust' in which:
         results['robust'] = suite_robust()
     if 'kernel' in which:
-        results['kernel'] = suite_kernel(args.model, repeat=args.kernel_repeat, verify=not args.no_verify)
+        results['kernel'] = suite_kernel(args.model, repeat=args.kernel_repeat, verify=not args.no_verify, trials=args.kernel_trials)
     print(f"{YELLOW}{'#'*52}{NC}")
     print(f"{YELLOW}#  SUITE SUMMARY{NC}")
     for name, res in results.items():

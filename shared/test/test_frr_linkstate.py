@@ -25,9 +25,11 @@ Usage:
         --switch frankfurt --ingress-iface eth1 --fail-iface eth2 \\
         --sender darmstadt --method template --model-id 0
 
-If any single step's automation doesn't match your bpftool/kathara version,
-every step is also printable/runnable BY HAND -- pass --dry-run to print the
-exact command sequence without executing it.
+If any single step's automation doesn't match your kathara version, every
+step is also printable/runnable BY HAND -- pass --dry-run to print the exact
+command sequence without executing it. Map reads use bpf_introspect.py (a
+raw bpf() syscall reader), NOT bpftool -- bpftool is not installed in this
+lab's Kathara node images.
 
 Honesty about what this proves and what it doesn't (same spirit as
 docs/testing.md's benchmarking notes): this is a Kathara/VM lab, not
@@ -36,8 +38,8 @@ switch actually stop using the dead link within one polling interval?), not
 an absolute failover-time SLA number.
 """
 import argparse
+import json
 import re
-import struct
 import subprocess
 import sys
 import time
@@ -62,30 +64,22 @@ def get_iface_ip(node, iface):
     return m.group(1)
 
 
-def bpftool_map_dump(node, map_name):
-    """Parses `bpftool map dump name X` plaintext output (key/value as hex
-    byte sequences) into {key_int: value_int}. Robust to the common bpftool
-    output format; if your bpftool prints BTF-decoded struct fields instead
-    of raw hex, this will return an empty dict -- fall back to reading the
-    value manually with `bpftool map dump name X` and eyeballing it."""
-    r = _run(_kexec(node, "bpftool", "map", "dump", "name", map_name))
-    out = {}
-    key_hex, val_hex = None, None
-    for line in r.stdout.splitlines():
-        km = re.search(r"key:\s*([0-9a-f ]+?)(?=\s*value:|$)", line)
-        vm = re.search(r"value:\s*([0-9a-f ]+)$", line)
-        if km:
-            key_hex = km.group(1).strip()
-        if vm:
-            val_hex = vm.group(1).strip()
-        if key_hex and val_hex:
-            kbytes = bytes.fromhex(key_hex.replace(" ", ""))
-            vbytes = bytes.fromhex(val_hex.replace(" ", ""))
-            key = int.from_bytes(kbytes, "little")
-            val = struct.unpack("<Q", vbytes[:8].ljust(8, b"\0"))[0]
-            out[key] = val
-            key_hex = val_hex = None
-    return out
+def bpf_map_dump(node, map_name, max_entries):
+    """Reads a live BPF array map by name from `node` via bpf_introspect.py
+    (raw bpf() syscall, no bpftool -- bpftool is NOT installed in this lab's
+    Kathara images, confirmed: 'executable file not found in $PATH'). Runs
+    the reader script INSIDE the node (kathara exec) since the map lives in
+    that node's kernel/namespace. Returns {key_int: value_int}."""
+    r = _run(_kexec(node, "python3", "/shared/bpf_introspect.py", map_name, str(max_entries)))
+    if r.returncode != 0:
+        print(f"[frr-test] WARNING: bpf_introspect failed on {node} for {map_name}: "
+              f"{r.stdout.strip()} {r.stderr.strip()}")
+        return {}
+    try:
+        return {int(k): v for k, v in json.loads(r.stdout.strip()).items()}
+    except (json.JSONDecodeError, ValueError):
+        print(f"[frr-test] WARNING: could not parse bpf_introspect output: {r.stdout!r}")
+        return {}
 
 
 def main():
@@ -96,6 +90,8 @@ def main():
     ap.add_argument("--sender", required=True, help="Node that floods traffic toward --switch (e.g. darmstadt)")
     ap.add_argument("--method", choices=["hardcoded", "template", "modular"], default="template")
     ap.add_argument("--model-id", type=int, default=0)
+    ap.add_argument("--n-classes", type=int, default=7,
+                    help="Size of cls_stats (n_out of the registered model; default 7 = 6 egress + drop)")
     ap.add_argument("--pre-seconds", type=float, default=5.0, help="Flood time before the flap")
     ap.add_argument("--post-seconds", type=float, default=5.0, help="Flood time after the flap")
     ap.add_argument("--dry-run", action="store_true", help="Print the command sequence, execute nothing")
@@ -164,14 +160,14 @@ def main():
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         time.sleep(args.pre_seconds)
-        snap_a = bpftool_map_dump(args.switch, cls_map)
+        snap_a = bpf_map_dump(args.switch, cls_map, args.n_classes)
         print(f"[frr-test] snapshot A (pre-flap) cls_stats: {snap_a}")
 
         print(f"\n[frr-test] Flapping {args.fail_iface} DOWN on {args.switch}...")
         _run(_kexec(args.switch, "ip", "link", "set", "dev", args.fail_iface, "down"))
 
         time.sleep(args.post_seconds)
-        snap_b = bpftool_map_dump(args.switch, cls_map)
+        snap_b = bpf_map_dump(args.switch, cls_map, args.n_classes)
         print(f"[frr-test] snapshot B (post-flap) cls_stats: {snap_b}")
 
         try:

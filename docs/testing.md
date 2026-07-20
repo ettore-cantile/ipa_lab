@@ -49,13 +49,25 @@ kathara exec frankfurt -- python3 /shared/test/test_suite.py --only kernel
 # Solo metriche, senza il gate di dispatch
 sudo python3 shared/test/test_suite.py --only kernel --no-verify
 
-# Più ripetizioni per una latenza più stabile
+# Più ripetizioni per una latenza più stabile (per-trial repeat)
 sudo python3 shared/test/test_suite.py --only kernel --kernel-repeat 200000
+
+# Più trial indipendenti (default 7) se il risultato è ancora volatile
+sudo python3 shared/test/test_suite.py --only kernel --kernel-trials 15
 ```
 
-Output atteso: tabella metriche (istruzioni/jited/tail-call/memoria/latenza/throughput/CPU)
-+ `5 PASS / 0 FAIL` per ciascuna pipeline + il probe `link_state reroute` (un link giù cambia
-l'uscita) + `kernel suite: PASS`.
+**Volatilità corretta**: la tabella misurava latenza/throughput con un **singolo** campione
+`BPF_PROG_TEST_RUN` — rumore di sistema a senso unico (scheduler/interrupt possono solo
+rallentare un trial, mai accelerarlo) lo faceva oscillare anche 2-5× da un run all'altro
+(es. hardcoded 10-25 Mpps, baseline 10-50 Mpps — esattamente il problema già trovato e
+corretto in `bench_depth_vs_width.py`). Ora ogni pipeline gira `--kernel-trials` volte
+(default 7) e riporta il **minimo** (la statistica giusta per rumore a senso unico, stesso
+principio di hyperfine/Google Benchmark) — la tabella mostra anche p50 e max per
+trasparenza, non solo il minimo.
+
+Output atteso: tabella metriche (istruzioni/jited/tail-call/memoria/latenza min/p50/max/
+throughput/CPU) + `5 PASS / 0 FAIL` per ciascuna pipeline + il probe `link_state reroute`
+(un link giù cambia l'uscita) + `kernel suite: PASS`.
 
 Cosa verifica in più oltre al dispatch:
 - **Corrispondenza di classe** (single-pass, uniforme sulle 3 pipeline): pre-installa `mac_table[0..5]`,
@@ -269,7 +281,9 @@ python3 shared/test/bench_live_throughput.py --dest-ip 10.0.0.234 --duration 10
 python3 shared/test/bench_live_throughput.py --dest-ip 10.0.0.234 --duration 10 --workers 4
 
 # sul nodo ricevente (es. frankfurt), in un'altra shell
-kathara exec frankfurt -- bpftool map dump name pkt_stats
+# (bpftool NON è installato nelle immagini Kathara di questo lab -- confermato
+#  "executable file not found" -- usa bpf_introspect.py, stessa sintassi bpf() raw)
+kathara exec frankfurt -- python3 /shared/bpf_introspect.py pkt_stats 3
 ```
 
 **Onestà sui limiti**: è un sender Python, aspettati decine di migliaia di
@@ -283,20 +297,15 @@ dell'interfaccia direttamente connessa del ricevente (il vicino su quel
 link), non il suo hostname/loopback — il fabric Kathara non instrada
 UDP:9999 fino al loopback (sez. 5).
 
-### Profiling con contatori hardware (se disponibili)
+### Profiling con contatori hardware — provato, non disponibile in questo lab
 
 La letteratura (talk USENIX LISA21) raccomanda `bpftool prog profile` per cicli/cache-miss/
-branch-miss — nessun codice nuovo serve, solo il comando:
-
-```bash
-kathara exec frankfurt -- bpftool prog profile name ipa_switch_hardcoded duration 5 \
-    cycles instructions llc_misses branch_misses
-```
-
-**Onestà**: richiede contatori hardware (PMU) esposti al kernel guest — spesso **non
-disponibili** sotto virtualizzazione (VirtualBox/Kathara). Se il comando fallisce o ritorna
-zeri, è un limite noto dell'ambiente, non un errore di misura — prova comunque prima di
-scartarlo.
+branch-miss. **Provato e non disponibile**: `bpftool` non è installato nelle immagini
+Kathara di questo lab (`exec: "bpftool": executable file not found in $PATH`, confermato
+in sessione — non solo il subcomando `prog profile`, il binario stesso manca). Non è un
+limite di PMU/virtualizzazione, è proprio assente dal filesystem del container. Per
+usarlo servirebbe una immagine Kathara custom con `bpftool` installato (fuori scope) —
+altrimenti questa via resta chiusa in questo ambiente.
 
 ---
 
@@ -344,10 +353,13 @@ abbatte **davvero** `--fail-iface` (`ip link set down`) → aspetta il polling
 (`link_state_monitor`) → nuovo snapshot → confronta i delta per classe (la classe
 dell'interfaccia guasta deve fermarsi, le altre devono crescere) → ripristina tutto.
 
-**Onestà**: il parsing di `bpftool map dump` è best-effort (formato testuale, non
-garantito identico su ogni versione di bpftool/kernel) — se il verdetto sembra sbagliato,
-`--dry-run` stampa ogni comando singolarmente per rifarlo a mano. Non misura un tempo di
-failover in stile SLA, solo se il reroute avviene entro un intervallo di polling.
+Legge `cls_stats*` via `shared/bpf_introspect.py` (syscall `bpf()` raw, niente `bpftool`
+— assente da questa immagine Kathara, vedi sez. 9). `--n-classes` deve combaciare con
+`n_out` del modello registrato (default 7).
+
+**Onestà**: non misura un tempo di failover in stile SLA, solo se il reroute avviene
+entro un intervallo di polling. Se il verdetto sembra sbagliato, `--dry-run` stampa ogni
+comando singolarmente per rifarlo a mano e ispezionare `bpf_introspect.py` manualmente.
 
 ---
 
@@ -355,6 +367,13 @@ failover in stile SLA, solo se il reroute avviene entro un intervallo di polling
 
 Aggiornati dopo: IV **descrittore-driven** in P2/P3 (registry `model_desc`), AOT-literal
 universale in P1, riga **baseline** (parse + redirect, **nessuna inferenza**) come pavimento.
+
+⚠️ **Numeri sotto = metodologia a singolo campione (obsoleta)**: catturati prima del fix
+min-su-N-trial (sez. 2). Latenza/throughput qui possono differire 2-5× da un run reale con
+la metodologia corretta — rilancia `sudo python3 shared/test/test_suite.py --only kernel`
+(default ora min-su-7-trial) e sostituisci questa tabella con i nuovi numeri prima di
+usarla in tesi. Istruzioni/jited/tail-call/memoria non dipendono da `BPF_PROG_TEST_RUN`
+quindi restano validi.
 
 | Metrica                    | baseline | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|---------:|-------------:|------------:|-----------:|
