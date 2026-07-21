@@ -1,54 +1,183 @@
-import torch
+"""
+extract_weights.py  (design-space-docs branch)
+==============================================
+Extracts int8-quantized weights from the FRR model checkpoint.
+
+When run directly:  produces weights.json and weights_float.json
+When imported:      provides extract_weights_int8() used by pipeline_benchmark.py
+                    and method5/method6.
+
+Architecture fixed to the germany50/5 checkpoint:
+  n_interfaces=6, n_nodes=52, hidden_dim=4
+  -> 319 total int8 weights  (matches N_WEIGHTS in common.py)
+
+Quantization: PTQ with SCALE_FACTOR = floor(127 / max|w|)
+
+Fallback (no torch):
+  If torch is not installed (e.g. inside Kathara containers), and a
+  precomputed weights.json exists in the same directory, extract_weights_int8()
+  returns its contents directly without loading the .pt file.
+"""
 import json
+import os
 
-from FRR_model import FastRerouteMLP
+# Architecture constants matching frr_germany50_5_model_4x2.pt
+N_INTERFACES = 6
+N_NODES      = 52
+HIDDEN_DIM   = 4
+# fc1(65*4+4=264) + fc2(4*4+4=20) + out(4*7+7=35) = 319 weights
 
-print("Extracting weights from PyTorch model...")
+SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 
-model = FastRerouteMLP(n_interfaces=6, n_nodes=52, hidden_dim=4)
-model.load_state_dict(torch.load("frr_germany50_5_model_4x2.pt"))
+
+def _load_from_json(json_path: str) -> list:
+    """Load precomputed int8 weights from weights.json."""
+    with open(json_path) as f:
+        data = json.load(f)
+    # weights.json is a plain list; weights_float.json has {scale_factor, weights}
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "weights" in data:
+        # weights_float.json — re-quantize on the fly
+        floats  = data["weights"]
+        scale   = data.get("scale_factor", 1)
+        return [max(-128, min(127, int(round(wf * scale)))) for wf in floats]
+    raise ValueError(f"Unrecognized format in {json_path}")
+
+
+def extract_weights_int8(
+    model_path: str = "frr_germany50_5_model_4x2.pt",
+    n_interfaces: int = None,
+    n_nodes: int = None,
+    hidden_dim: int = None,
+) -> list:
+    """
+    Return a flat list of int8 weights for the FRR model.
+
+    n_interfaces/n_nodes/hidden_dim override the module defaults
+    (N_INTERFACES/N_NODES/HIDDEN_DIM) -- pass a model's resolved shape
+    (see shared/model_meta.py derive_shape()) to extract weights for a
+    topology other than the one checked-in 6/52/4 checkpoint. None means
+    "use the module default", so existing callers are unaffected.
+
+    Priority:
+      1. If torch is available: load from .pt checkpoint (authoritative).
+      2. Else if weights.json exists next to this file: use it (container mode).
+      3. Else raise ImportError with a helpful message.
+
+    Returns:
+        list of int in [-128, 127], length depends on shape (319 for the
+        default 65-4-4-7 topology)
+    """
+    n_interfaces = N_INTERFACES if n_interfaces is None else n_interfaces
+    n_nodes      = N_NODES if n_nodes is None else n_nodes
+    hidden_dim   = HIDDEN_DIM if hidden_dim is None else hidden_dim
+
+    # Resolve model path relative to this file if not absolute
+    if not os.path.isabs(model_path):
+        candidate = os.path.join(SHARED_DIR, model_path)
+        if os.path.exists(candidate):
+            model_path = candidate
+
+    # --- Path 1: torch available ---
+    try:
+        import torch
+        from FRR_model import FastRerouteMLP
+
+        m = FastRerouteMLP(
+            n_interfaces=n_interfaces,
+            n_nodes=n_nodes,
+            hidden_dim=hidden_dim
+        )
+        m.load_state_dict(torch.load(model_path, map_location="cpu"))
+        floats  = [w for p in m.parameters() for w in p.data.view(-1).tolist()]
+        max_abs = max(abs(w) for w in floats)
+        scale   = int(127 / max_abs)
+        return [max(-128, min(127, int(round(wf * scale)))) for wf in floats]
+
+    except ImportError:
+        pass  # torch not installed — fall through to JSON fallback
+
+    # --- Path 2: JSON fallback (no torch) ---
+    json_path = os.path.join(SHARED_DIR, "weights.json")
+    if os.path.exists(json_path):
+        import warnings
+        warnings.warn(
+            "torch not available — loading precomputed weights from weights.json",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _load_from_json(json_path)
+
+    raise ImportError(
+        "torch is not installed and weights.json not found in {}. "
+        "Either install torch or generate weights.json first with: "
+        "python3 extract_weights.py".format(SHARED_DIR)
+    )
+
 
 # ---------------------------------------------------------------------------
-# Method 1 - PTQ: SCALE_FACTOR computed automatically from the maximum weight.
-#
-# SCALE_FACTOR = floor(127 / max(|w|))
-# Ensures no weight exceeds int8 range [-128, 127] after multiplication,
-# eliminating clamping that would cause TABLE MISS.
-#
-# The SCALE_FACTOR is saved in weights_float.json along with the original
-# float weights, and is written into the IPA header 'scaling' field by send_ipa.
-# The kernel reads it from the header and uses it as a divisor (instead of shift).
+# __main__: produce weights.json and weights_float.json
+# Requires torch — intended to run on the host, not inside Kathara.
 # ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        import torch
+        from FRR_model import FastRerouteMLP
+    except ImportError as e:
+        print(f"ERROR: {e}")
+        print("Run this script on the host (not inside Kathara) where torch is installed.")
+        raise SystemExit(1)
 
-all_floats = [w for param in model.parameters() for w in param.data.view(-1).tolist()]
-max_abs    = max(abs(w) for w in all_floats)
-SCALE_FACTOR = int(127 / max_abs)
+    MODEL_PATH = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
+    print("Extracting weights from PyTorch model...")
 
-print(f"Max |weight| = {max_abs:.6f}")
-print(f"SCALE_FACTOR = floor(127 / {max_abs:.6f}) = {SCALE_FACTOR}")
+    model = FastRerouteMLP(
+        n_interfaces=N_INTERFACES,
+        n_nodes=N_NODES,
+        hidden_dim=HIDDEN_DIM
+    )
+    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
 
-integer_weights = []
-for w_float in all_floats:
-    w_int = int(round(w_float * SCALE_FACTOR))
-    w_int = max(-128, min(127, w_int))  # safety clamp (should not trigger)
-    integer_weights.append(w_int)
+    all_floats   = [w for p in model.parameters() for w in p.data.view(-1).tolist()]
+    max_abs      = max(abs(w) for w in all_floats)
+    SCALE_FACTOR = int(127 / max_abs)
 
-# Verify that no weight was clamped
-clamped = sum(1 for w, wf in zip(integer_weights, all_floats)
-              if w != int(round(wf * SCALE_FACTOR)))
-if clamped:
-    print(f"[WARN] {clamped} weights clamped (max_abs may not be the true maximum)")
-else:
-    print("No weights were clamped. int8 range respected for all weights.")
+    print(f"Max |weight| = {max_abs:.6f}")
+    print(f"SCALE_FACTOR = {SCALE_FACTOR}")
 
-# int8 weights -> eBPF kernel
-with open("weights.json", "w") as f:
-    json.dump(integer_weights, f)
+    integer_weights = []
+    for wf in all_floats:
+        wi = int(round(wf * SCALE_FACTOR))
+        integer_weights.append(max(-128, min(127, wi)))
 
-# original float weights + SCALE_FACTOR -> control plane for Method 1
-with open("weights_float.json", "w") as f:
-    json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
+    clamped = sum(
+        1 for w, wf in zip(integer_weights, all_floats)
+        if w != int(round(wf * SCALE_FACTOR))
+    )
+    if clamped:
+        print(f"[WARN] {clamped} weights clamped")
+    else:
+        print("No weights clamped. int8 range respected.")
 
-print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
-print(f"Saved float weights + scale_factor={SCALE_FACTOR} -> weights_float.json")
-print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
+    with open(os.path.join(SHARED_DIR, "weights.json"), "w") as f:
+        json.dump(integer_weights, f)
+    with open(os.path.join(SHARED_DIR, "weights_float.json"), "w") as f:
+        json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
+
+    # model_meta.json: per-node feature dimensions so codegen can derive
+    # N_IN/N_OUT instead of assuming the fixed 65/7 constants. No explicit
+    # "features" list -> the default descriptor [link_state, ingress_iface,
+    # ttl, node] with n_out = n_interfaces+1 (see model_meta.derive_shape),
+    # i.e. exactly the historical 65-4-4-7 model.
+    model_meta = {
+        "n_interfaces": N_INTERFACES,
+        "n_nodes": N_NODES,
+        "hidden_dims": [HIDDEN_DIM, HIDDEN_DIM],
+    }
+    with open(os.path.join(SHARED_DIR, "model_meta.json"), "w") as f:
+        json.dump(model_meta, f)
+
+    print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
+    print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")
+    print(f"Saved feature metadata -> model_meta.json: {model_meta}")

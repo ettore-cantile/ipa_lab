@@ -1,0 +1,1 @@
+{"features": ["link_state", "queue_occupancy", "ttl"], "n_out": 7, "hidden_dims": [4, 4], "scale_factor": 32}

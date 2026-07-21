@@ -1,0 +1,13 @@
+# Python bytecode caches (were tracked by mistake; root-owned copies from
+# sudo/kathara runs blocked `git pull`). Never track these.
+__pycache__/
+*.pyc
+*.pyo
+
+# Ephemeral test scaffolding written by test_kathara.sh / krun()
+shared/_krun_*.sh
+shared/_stats_*.py
+
+# Office temp/lock files
+~$*
+*.tmp
