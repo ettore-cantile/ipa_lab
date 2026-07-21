@@ -152,6 +152,11 @@ int main(int argc, char **argv) {
                "(BCC method4 recompile for the same model: ~1660 ms of clang)\n", t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d. Ctrl-C to detach.\n",
                attach_ifindex);
+        /* Flush now: when stdout is a pipe (e.g. under `kathara exec`, not a
+         * TTY) C stdio is fully buffered, so without this the messages above
+         * would sit in the buffer -- invisible -- while the loader blocks in
+         * pause(), making a working, attached deploy look like a hang. */
+        fflush(stdout);
         while (!g_stop) pause();
         bpf_xdp_detach(attach_ifindex, 0, NULL);
         printf("\n[deploy] detached from ifindex %d.\n", attach_ifindex);
