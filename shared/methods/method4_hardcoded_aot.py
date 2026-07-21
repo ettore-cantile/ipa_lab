@@ -191,8 +191,27 @@ def main():
 
     loader_c   = os.path.join(POC_DIR, "loader_aot.c")
     loader_bin = os.path.join(POC_DIR, "loader_aot")
-    if (not os.path.exists(loader_bin)
-            or os.path.getmtime(loader_bin) < os.path.getmtime(loader_c)):
+    needs_build = (not os.path.exists(loader_bin)
+                  or os.path.getmtime(loader_bin) < os.path.getmtime(loader_c))
+    if needs_build and not shutil.which(args.cc):
+        # Same fallback pattern as the model .o above: Kathara node images
+        # have no C compiler at all (no clang, no cc/gcc), so the loader --
+        # like the model .o -- must be built ONCE on a box that has one
+        # (with libbpf-dev/libelf-dev/zlib1g-dev for the static link below),
+        # then the resulting binary just needs to exist at this same path
+        # (shared/poc_aot/loader_aot) -- e.g. built directly on the host,
+        # which shares this directory with every Kathara node via the bind
+        # mount, so no manual copy step is needed once it is built there.
+        sys.exit(
+            f"[AOT] '{args.cc}' not found on this node and no prebuilt "
+            f"{os.path.relpath(loader_bin, _ORIGINAL_CWD)}.\n"
+            f"      Build it ONCE on a box with a C compiler + libbpf-dev/libelf-dev/"
+            f"zlib1g-dev\n      (e.g. the host, not inside kathara exec):\n"
+            f"          python3 shared/methods/method4_hardcoded_aot.py\n"
+            f"      The binary is statically linked (no runtime libbpf.so needed), and "
+            f"since\n      shared/ is bind-mounted into every Kathara node, building it once "
+            f"on the\n      host makes it immediately available on every node -- no copy step.")
+    if needs_build:
         # Statically link libbpf (+ libelf/zlib, its own dependencies) so the
         # resulting binary has NO runtime dependency on libbpf.so being
         # installed on the datapath node -- Kathara node images have neither

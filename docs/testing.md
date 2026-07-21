@@ -143,6 +143,19 @@ sudo python3 shared/methods/method4_hardcoded_aot.py --iface enp0s3
 Il modello AOT è **build offline** (macchina con clang) → deploy del `.o` prebuilt sul nodo
 (nessun clang). Su un nodo senza clang, se `nn_aot_arch.o` è già presente viene riusato.
 
+**`loader_aot` va costruito allo stesso modo, una volta sola, fuori da Kathara**: anche
+`cc`/gcc manca nei nodi Kathara (oltre a clang), quindi non si può compilare il loader
+dentro `kathara exec`. Costruiscilo **sull'host** (dove gcc + `libbpf-dev`/`libelf-dev`/
+`zlib1g-dev` ci sono, o vanno installati):
+```bash
+python3 shared/methods/method4_hardcoded_aot.py   # sull'host, non via kathara exec
+```
+Il binario è linkato **staticamente** (niente `libbpf.so` richiesto a runtime) e vive in
+`shared/poc_aot/loader_aot` — poiché `shared/` è montato via bind mount in ogni nodo
+Kathara, una volta costruito sull'host è **immediatamente visibile** su tutti i nodi,
+nessuna copia manuale. Se manca sia `cc` sia un `loader_aot` prebuilt, lo script si ferma
+con un errore che spiega questo stesso passaggio.
+
 Le pipeline avviano automaticamente il monitor `link_state` (thread di polling che tiene
 `link_state[0..5]` allineato al carrier reale delle interfacce egress). Per un dry-run dei
 carrier senza caricare eBPF:
