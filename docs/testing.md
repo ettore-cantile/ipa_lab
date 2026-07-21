@@ -145,16 +145,35 @@ Il modello AOT è **build offline** (macchina con clang) → deploy del `.o` pre
 
 **`loader_aot` va costruito allo stesso modo, una volta sola, fuori da Kathara**: anche
 `cc`/gcc manca nei nodi Kathara (oltre a clang), quindi non si può compilare il loader
-dentro `kathara exec`. Costruiscilo **sull'host** (dove gcc + `libbpf-dev`/`libelf-dev`/
-`zlib1g-dev` ci sono, o vanno installati):
+dentro `kathara exec`. Costruiscilo **sull'host** (come utente normale, non `sudo` — il
+build non richiede root; solo l'attach XDP finale lo richiede):
 ```bash
+# dev-lib per il link statico (una volta):
+sudo apt-get install -y libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
 python3 shared/methods/method4_hardcoded_aot.py   # sull'host, non via kathara exec
 ```
 Il binario è linkato **staticamente** (niente `libbpf.so` richiesto a runtime) e vive in
 `shared/poc_aot/loader_aot` — poiché `shared/` è montato via bind mount in ogni nodo
 Kathara, una volta costruito sull'host è **immediatamente visibile** su tutti i nodi,
-nessuna copia manuale. Se manca sia `cc` sia un `loader_aot` prebuilt, lo script si ferma
-con un errore che spiega questo stesso passaggio.
+nessuna copia manuale.
+
+Note pratiche emerse costruendolo davvero:
+- Il link statico di libbpf tira dentro dipendenze transitive che devono anch'esse essere
+  statiche: `libelf`, `zlib`, e — su elfutils recente che comprime le sezioni ELF —
+  anche `libzstd` e `liblzma`. Lo script prova prima la riga a 3 librerie, poi quella a 5
+  (con `zstd`/`lzma`); su Ubuntu recente serve la seconda. Se fallisce stampa l'errore
+  `ld` completo per capire quale `.a` manca.
+- I file generati sotto `shared/poc_aot/` (`nn_aot_arch.bpf.c`, `.o`, `loader_aot`) prendono
+  il proprietario dell'utente che li crea: se un run precedente è stato fatto con `sudo`/
+  `kathara exec` (root), un run successivo come utente normale fallisce con
+  `PermissionError`. Rimedio: `sudo chown -R $USER:$USER ~/percorso/ipa_lab`.
+- Sui nodi Kathara di questo lab `libbpf.so.1` **è presente** (tirato dentro da BCC), quindi
+  anche un loader linkato dinamicamente (`-lbpf`) funzionerebbe lì; il link statico resta
+  comunque la scelta preferita perché non dipende da questo dettaglio dell'immagine.
+- Il bench sull'host (`method4_hardcoded_aot.py` senza `--iface`) carica un programma BPF e
+  quindi richiede root: eseguito come utente normale fallisce con `RLIMIT_MEMLOCK -EPERM`.
+  Non è un problema del deploy — il caricamento reale avviene sul nodo Kathara, che gira
+  come root.
 
 Le pipeline avviano automaticamente il monitor `link_state` (thread di polling che tiene
 `link_state[0..5]` allineato al carrier reale delle interfacce egress). Per un dry-run dei

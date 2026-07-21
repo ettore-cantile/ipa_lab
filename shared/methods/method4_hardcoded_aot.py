@@ -220,26 +220,52 @@ def main():
         #
         # A static libbpf.a pulls in a chain of transitive dependencies that
         # ALSO have to be static: libelf (from elfutils) and zlib, plus --
-        # on recent distros where elfutils compresses sections -- libzstd
-        # and liblzma. Missing any one of these .a files makes ld fail with
-        # "cannot find -l:libX.a" or a wall of undefined references. We try
-        # progressively larger static link lines (most systems only need the
-        # first), and only fall back to dynamic if none links; the FULL ld
-        # error is printed (not just the last line) so the missing lib is
-        # actually diagnosable.
+        # on recent distros where elfutils compresses sections -- libzstd,
+        # liblzma and sometimes libbz2. Missing any one makes ld fail with
+        # "cannot find -l:libX.a" or a wall of undefined references.
+        #
+        # Crucially, linking libbpf statically is NOT enough by itself: the
+        # binary still links glibc DYNAMICALLY, and a glibc binary is not
+        # backward compatible -- built on a newer glibc (e.g. the host's
+        # Ubuntu) it fails on an older one ("GLIBC_2.38 not found") on the
+        # Kathara node. The fix is a FULLY static binary (-static, glibc
+        # included): loader_aot only makes bpf syscalls + file I/O, no
+        # hostname resolution / dlopen, so fully-static is safe here. So the
+        # preferred attempts pass -static; the non-static ones are kept only
+        # as a last resort for the case where a matching-glibc host is used.
+        base3 = ["-l:libbpf.a", "-l:libelf.a", "-l:libz.a"]
+        base5 = base3 + ["-l:libzstd.a", "-l:liblzma.a"]
+        base6 = base5 + ["-l:libbz2.a"]
         static_attempts = [
-            ["-l:libbpf.a", "-l:libelf.a", "-l:libz.a"],
-            ["-l:libbpf.a", "-l:libelf.a", "-l:libz.a", "-l:libzstd.a", "-l:liblzma.a"],
+            ["-static", *base6],   # fully static (glibc too) -- runs on any node regardless of its glibc
+            ["-static", *base5],
+            ["-static", *base3],
+            base5,                 # libbpf static, glibc dynamic (only OK if node glibc >= build glibc)
+            base3,
         ]
         built = False
+        won_fully_static = False
         last_err = ""
         for extra in static_attempts:
             rc, out, err = _run([args.cc, "-O2", loader_c, "-o", loader_bin, *extra], cwd=POC_DIR)
             if rc == 0:
-                print(f"[AOT] built loader_aot (static: {' '.join(extra)})")
+                won_fully_static = ("-static" in extra)
+                kind = "fully static" if won_fully_static else "libbpf-static, glibc-DYNAMIC"
+                print(f"[AOT] built loader_aot ({kind}: {' '.join(extra)})")
                 built = True
                 break
             last_err = err
+        if built and not won_fully_static:
+            # Linked, but glibc is dynamic: this binary runs only where the
+            # node's glibc is >= the build host's. On this lab that produced
+            # "GLIBC_2.38 not found" on the Kathara node. Warn loudly instead
+            # of pretending the build is deployable everywhere.
+            print(f"[AOT] WARNING: the fully-static (-static) link did not succeed, so this")
+            print(f"      loader links glibc DYNAMICALLY and may fail on a node with an OLDER")
+            print(f"      glibc than this host (symptom: 'GLIBC_x.yy not found'). To get a")
+            print(f"      portable fully-static binary, install the static libs it still needs:")
+            print(f"      sudo apt-get install libc6-dev libbz2-dev libzstd-dev liblzma-dev")
+            print(f"      then rebuild: rm shared/poc_aot/loader_aot && python3 <this script>")
         if not built:
             print(f"[AOT] static link failed on all attempts. Full ld error:")
             print("      " + "\n      ".join(last_err.strip().splitlines()[-8:]))
