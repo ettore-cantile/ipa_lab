@@ -212,26 +212,47 @@ def main():
             f"since\n      shared/ is bind-mounted into every Kathara node, building it once "
             f"on the\n      host makes it immediately available on every node -- no copy step.")
     if needs_build:
-        # Statically link libbpf (+ libelf/zlib, its own dependencies) so the
-        # resulting binary has NO runtime dependency on libbpf.so being
-        # installed on the datapath node -- Kathara node images have neither
-        # clang nor libbpf, so a dynamically-linked loader_aot copied there
-        # would fail to even start ("cannot open shared object file"), which
-        # would defeat the whole point of building it elsewhere. Only libc
-        # stays dynamic (present on essentially any Linux, unlike libbpf).
-        static_link = [args.cc, "-O2", loader_c, "-o", loader_bin,
-                       "-l:libbpf.a", "-l:libelf.a", "-l:libz.a"]
-        rc, out, err = _run(static_link, cwd=POC_DIR)
-        if rc != 0:
-            print(f"[AOT] static link failed (rc={rc}), falling back to dynamic -lbpf "
-                 f"(the resulting binary will need libbpf.so present on every node it runs on):")
-            print(f"      {err.strip().splitlines()[-1] if err.strip() else '(no stderr)'}")
+        # Statically link libbpf so the resulting binary has NO runtime
+        # dependency on libbpf.so being installed on the datapath node --
+        # Kathara node images may lack libbpf, so a dynamically-linked
+        # loader_aot copied there would fail to even start ("cannot open
+        # shared object file"). Only libc stays dynamic.
+        #
+        # A static libbpf.a pulls in a chain of transitive dependencies that
+        # ALSO have to be static: libelf (from elfutils) and zlib, plus --
+        # on recent distros where elfutils compresses sections -- libzstd
+        # and liblzma. Missing any one of these .a files makes ld fail with
+        # "cannot find -l:libX.a" or a wall of undefined references. We try
+        # progressively larger static link lines (most systems only need the
+        # first), and only fall back to dynamic if none links; the FULL ld
+        # error is printed (not just the last line) so the missing lib is
+        # actually diagnosable.
+        static_attempts = [
+            ["-l:libbpf.a", "-l:libelf.a", "-l:libz.a"],
+            ["-l:libbpf.a", "-l:libelf.a", "-l:libz.a", "-l:libzstd.a", "-l:liblzma.a"],
+        ]
+        built = False
+        last_err = ""
+        for extra in static_attempts:
+            rc, out, err = _run([args.cc, "-O2", loader_c, "-o", loader_bin, *extra], cwd=POC_DIR)
+            if rc == 0:
+                print(f"[AOT] built loader_aot (static: {' '.join(extra)})")
+                built = True
+                break
+            last_err = err
+        if not built:
+            print(f"[AOT] static link failed on all attempts. Full ld error:")
+            print("      " + "\n      ".join(last_err.strip().splitlines()[-8:]))
+            print(f"[AOT] To fix the STATIC link (needed for Kathara nodes without libbpf.so):")
+            print(f"      sudo apt-get install libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev")
+            print(f"[AOT] Falling back to DYNAMIC -lbpf. WARNING: this binary needs libbpf.so at")
+            print(f"      runtime -- it will NOT run on a node that lacks it (check with:")
+            print(f"      kathara exec <node> -- ldconfig -p | grep bpf).")
             rc, out, err = _run([args.cc, "-O2", loader_c, "-o", loader_bin, "-lbpf"], cwd=POC_DIR)
             if rc != 0:
-                sys.exit(f"[AOT] loader build failed (rc={rc}):\n{err}\n"
-                         "      Need libbpf-dev (+ libelf-dev, zlib1g-dev for the static path): "
-                         "sudo apt-get install libbpf-dev libelf-dev zlib1g-dev")
-        print(f"[AOT] built loader_aot")
+                sys.exit(f"[AOT] loader build failed even dynamically (rc={rc}):\n{err}\n"
+                         "      Need at least libbpf-dev: sudo apt-get install libbpf-dev")
+            print(f"[AOT] built loader_aot (DYNAMIC -- libbpf.so required at runtime)")
 
     if args.iface:
         # LIVE DEPLOY: attach the prebuilt .o to a real interface and stay
