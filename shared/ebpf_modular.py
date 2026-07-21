@@ -189,7 +189,7 @@ BPF_PROG_ARRAY(layer_chain, 16);
 
 /* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
  * The NN decides the port; this only resolves the L2 next-hop. */
-BPF_HASH(mac_table_t3, __u32, struct fwd_action, 8);
+BPF_ARRAY(mac_table_t3, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
 
@@ -265,7 +265,7 @@ int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end, int best_c
 
     __u32 cls = (__u32)best_cls;
     struct fwd_action *action = mac_table_t3.lookup(&cls);
-    if (action != NULL) {
+    if (action != NULL && action->ifindex != 0) {
         int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         __u64 *cv = cls_stats_t3.lookup(&cls);

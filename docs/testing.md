@@ -131,14 +131,27 @@ kathara exec frankfurt -- ip link set dev eth1 xdp off
 Tutte e tre stampano `HIT | MISS | DROP` dal vivo. Popolano `mac_table` (classe → ifindex +
 MAC) e `link_state` da sole all'avvio; non serve un setup separato.
 
-### AOT-literal deploy / bench (P1, host con clang o build box)
+### AOT-literal deploy / bench (P1) — unico backend hardcoded per il deploy
+
+Su richiesta del relatore, il deploy della pipeline hardcoded avviene **solo via
+AOT-literal** (il vecchio live-attach BCC è stato rimosso). Il flusso è: build offline del
+`.o` + del loader statico su un box con compilatore (l'host), poi attach del `.o` prebuilt
+sul nodo datapath, che non ha bisogno di clang/cc/libbpf.
 
 ```bash
-# bench (deploy-cost + perf, via BPF_PROG_TEST_RUN)
+# bench (deploy-cost + perf, via BPF_PROG_TEST_RUN) -- richiede root sull'host
 sudo python3 shared/methods/method4_hardcoded_aot.py
-# deploy LIVE: builda il .o e lo attacca all'interfaccia (resta resident)
-sudo python3 shared/methods/method4_hardcoded_aot.py --iface enp0s3
+# deploy LIVE su Kathara (via execute_pipeline, backend AOT di default):
+kathara exec frankfurt -- ip link set dev eth1 xdp off
+kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
 ```
+
+**Verificato end-to-end** su nodo Kathara `frankfurt` (che NON ha clang, cc né `libbpf.so`
+usabile per il link): il loader fully-static carica il `.o` prebuilt e attacca il programma
+XDP; `ip link show dev eth1` mostra `prog/xdp id ... name xdp_dispatch ... jited`, cioè il
+dispatcher AOT agganciato e JIT-compilato. Il comando di deploy resta resident (loop
+`pause()`) finché non lo si interrompe con Ctrl-C, che stacca l'XDP. La correttezza
+dell'inferenza è coperta separatamente da `test_suite --only kernel` (5/5 PASS per TTL).
 
 Il modello AOT è **build offline** (macchina con clang) → deploy del `.o` prebuilt sul nodo
 (nessun clang). Su un nodo senza clang, se `nn_aot_arch.o` è già presente viene riusato.

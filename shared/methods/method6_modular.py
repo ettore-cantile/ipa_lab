@@ -104,7 +104,7 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
 
     from link_state_monitor import init_link_state_up, start_monitor_thread
     init_link_state_up(b)
-    stop_monitor = start_monitor_thread(b, interval=1.0)
+    stop_monitor = start_monitor_thread(b, interval=0.5)
     print("[Method 6] link_state seeded (all up); carrier monitor running")
 
     attach_xdp(b, fn_disp, iface=ingress_iface)

@@ -223,8 +223,12 @@ BPF_ARRAY(cls_stats,        __u64, {n_out});   /* per-class redirect counter */
 /* mac_table: egress class (the argmax output) -> {{ifindex, src/dst MAC}}.
  * Same struct/role as P2/P3's mac_table_t2/t3 -- the NN decides the port,
  * this only resolves the L2 next-hop and rewrites the Ethernet header
- * before bpf_redirect(). */
-BPF_HASH(mac_table, __u32, struct fwd_action, {mac_capacity});
+ * before bpf_redirect(). A BPF_ARRAY (not a hash): the key is the dense
+ * class index 0..n_out-1, so a direct O(1) array index is both correct and
+ * cheaper than hashing. Unlike a hash, an ARRAY lookup NEVER returns NULL
+ * (every slot exists, zero-initialised), so "class not provisioned" is
+ * detected by ifindex==0 (never a valid egress ifindex) instead of NULL. */
+BPF_ARRAY(mac_table, struct fwd_action, {mac_capacity});
 
 /* model_progs: dispatcher -> model_<id>, indexed directly by ipa->model_id.
  * A single tail call, matching the design-space spec's hardcoded pipeline
@@ -286,7 +290,7 @@ def _gen_action_epilogue(drop_cls_expr: str) -> str:
 
     __u32 _cls = (__u32)best_cls;
     struct fwd_action *_action = mac_table.lookup(&_cls);
-    if (_action != NULL) {{
+    if (_action != NULL && _action->ifindex != 0) {{
         int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
         if (_hv) __sync_fetch_and_add(_hv, 1);
         __u64 *_cv = cls_stats.lookup(&_cls);

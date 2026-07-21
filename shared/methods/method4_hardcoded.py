@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-method4_hardcoded.py — Pipeline 1: Hardcoded Model loader (BCC path).
+method4_hardcoded.py — Pipeline 1: Hardcoded Model, BCC compile-and-verify path.
 
-Loads a PyTorch checkpoint, generates a weights-literal eBPF XDP program,
-compiles it with BCC (clang at runtime), and attaches it to an interface.
+Loads a PyTorch checkpoint, generates a weights-literal eBPF XDP program and
+compiles it with BCC (clang at runtime) to run the in-kernel verifier on it.
+It does NOT attach to an interface: live deploy of the hardcoded pipeline is
+done exclusively via the AOT-literal loader (method4_hardcoded_aot.py), which
+replaced BCC as the sole datapath backend. BCC remains here — and in the test
+suite — only to compile-and-verify the generated C offline.
 
 Topology dimensions (n_interfaces, n_nodes, n_queues) are read from
 topology_config.json — a file that describes the NETWORK TOPOLOGY shared
@@ -12,12 +16,9 @@ does not exist the code falls back to DEFAULT_TOPOLOGY_CONFIG (historical
 6/52 defaults).
 
 Usage:
-    sudo python3 shared/methods/method4_hardcoded.py --iface eth0
-    sudo python3 shared/methods/method4_hardcoded.py \\
+    sudo python3 shared/methods/method4_hardcoded.py --verify-only \\
         --model shared/frr_germany50_5_model_4x2.pt \\
         --topology-config /etc/ipa/topology_config.json
-    sudo python3 shared/methods/method4_hardcoded.py --verify-only \\
-        --model shared/frr_germany50_5_model_4x2.pt
 """
 
 import os
@@ -54,10 +55,12 @@ def _build_parser():
             "network topology. Falls back to built-in defaults if absent."
         ),
     )
-    ap.add_argument("--iface", default="eth0", help="Interface to attach XDP to")
+    ap.add_argument("--iface", default="eth0",
+                    help="Accepted for CLI compatibility; unused (this path never "
+                         "attaches — live deploy is AOT via method4_hardcoded_aot.py)")
     ap.add_argument("--verify-only", action="store_true",
-                    help="Derive shape, verify checkpoint, generate C source, "
-                         "run the BPF verifier — but do NOT attach to any interface")
+                    help="Kept for backward compatibility; this path is always "
+                         "verify-only now (generate C + run the BPF verifier, no attach)")
     ap.add_argument("--model-id", type=int, default=0)
     return ap
 
@@ -107,11 +110,17 @@ def run(args=None):
         topology_config=topo_cfg,
     )
 
-    if args.verify_only:
-        _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table)
-        return
-
-    _attach(ebpf_src, args.iface, shape, model_id=args.model_id)
+    # This module is now the BCC *compile-and-verify* path only. Live deploy of
+    # the hardcoded pipeline is done exclusively via AOT-literal
+    # (method4_hardcoded_aot.py), so BCC no longer attaches to an interface;
+    # the old BCC live-attach was removed once AOT replaced it as the sole
+    # datapath backend. BCC stays here (and in the test suite) purely to
+    # compile the generated C and run the in-kernel verifier offline.
+    if not args.verify_only:
+        print("[method4] NOTE: hardcoded live deploy is AOT-only "
+              "(method4_hardcoded_aot.py / execute_pipeline.py --method hardcoded). "
+              "Running the BCC verifier check instead of attaching.")
+    _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table)
 
 
 def _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table):
@@ -127,74 +136,6 @@ def _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table):
     model_fn      = b.load_func("model_0", BPF.XDP)
     print(f"[verify-only] Verifier PASSED — dispatcher fd={dispatcher_fn.fd}, "
           f"model_0 fd={model_fn.fd}")
-
-
-def _attach(ebpf_src, iface, shape, model_id=0):
-    """Compile, wire the tail-call (dispatcher -> model_progs[model_id] ->
-    model_<id>), seed link_state + mac_table, attach to *iface* and show live
-    pkt_stats (HIT|MISS|DROP) -- same live behaviour as the template/modular
-    pipelines. Without wiring model_progs + seeding the maps the dispatcher's
-    tail call falls through to XDP_PASS and never infers/forwards."""
-    from bcc import BPF
-    import ctypes, time
-    from common import (
-        attach_xdp, resolve_ifindex, install_mac_per_class,
-        start_mac_refresh_thread,
-    )
-
-    iface, _ = resolve_ifindex(iface)
-    print(f"[method4] Compiling hardcoded program, shape="
-          f"{shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']}")
-    b = BPF(text=ebpf_src)
-
-    # Wire the tail-call: dispatcher -> model_progs[model_id] -> model_<id>.
-    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
-    disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ctypes.c_int(model_id)] = ctypes.c_int(model_fn.fd)
-
-    # Seed link_state (all egress links up) + start the carrier monitor.
-    try:
-        from link_state_monitor import init_link_state_up, start_monitor_thread
-        init_link_state_up(b)
-        start_monitor_thread(b, interval=1.0)
-        print("[method4] link_state seeded (all up); carrier monitor running")
-    except Exception as e:
-        print(f"[method4] link_state seed skipped ({e})")
-
-    # Populate mac_table: DISTINCT egress port per class (class i -> eth<i>,
-    # ARP-resolved). n_out-1 forward classes, last class = DROP.
-    n_fwd = shape["n_out"] - 1
-    mac_info = install_mac_per_class(b, "mac_table", n_fwd=n_fwd)
-
-    # Start background MAC refresh for exactly the classes install_mac_per_class
-    # reports as still on the fallback MAC (ARP not resolved yet). The thread
-    # re-reads /proc/net/arp every 5 s and corrects the BPF entry as soon as the
-    # real MAC appears -- no manual ARP warmup (ping) needed before launching.
-    if mac_info["pending"]:
-        start_mac_refresh_thread(b, "mac_table", mac_info["pending"], interval=5.0)
-
-    attach_xdp(b, disp_fn, iface=iface)
-    print(f"[method4] Pipeline 1 (hardcoded) running on {iface}. "
-          f"Stats: pkt_stats [HIT | MISS | DROP]. Ctrl-C to detach.")
-
-    stats = b["pkt_stats"]
-    print(f"\n{'HIT':<16}{'MISS':<16}{'DROP':<16}")
-    print("-" * 48)
-    try:
-        while True:
-            time.sleep(1)
-            hit  = stats[stats.Key(0)].value
-            miss = stats[stats.Key(1)].value
-            drop = stats[stats.Key(2)].value
-            print(f"\r{hit:<16}{miss:<16}{drop:<16}", end="", flush=True)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            b.remove_xdp(iface, 0)
-        except Exception:
-            pass
-        print(f"\n[method4] XDP program detached from {iface}.")
 
 
 if __name__ == "__main__":

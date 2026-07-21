@@ -373,7 +373,7 @@ struct ipa_hdr {
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
-BPF_HASH(mac_table, __u32, struct fwd_action, 8);
+BPF_ARRAY(mac_table, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats, __u64, 3);
 BPF_ARRAY(cls_stats, __u64, 7);
 
@@ -402,7 +402,7 @@ int xdp_baseline(struct xdp_md *ctx) {
 
     __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
     struct fwd_action *action = mac_table.lookup(&cls);
-    if (action) {
+    if (action && action->ifindex != 0) {
         int si = 0; __u64 *v = pkt_stats.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         __u64 *cv = cls_stats.lookup(&cls);
@@ -454,7 +454,7 @@ struct ipa_hdr {
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
-BPF_HASH(mac_table, __u32, struct fwd_action, 8);
+BPF_ARRAY(mac_table, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats, __u64, 3);
 BPF_ARRAY(cls_stats, __u64, 7);
 BPF_PROG_ARRAY(tail_progs, 2);
@@ -495,7 +495,7 @@ int xdp_baseline_action(struct xdp_md *ctx) {
 
     __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
     struct fwd_action *action = mac_table.lookup(&cls);
-    if (action) {
+    if (action && action->ifindex != 0) {
         int si = 0; __u64 *v = pkt_stats.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         __u64 *cv = cls_stats.lookup(&cls);

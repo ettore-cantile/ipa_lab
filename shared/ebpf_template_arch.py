@@ -256,7 +256,7 @@ BPF_PROG_ARRAY(arch_progs, 8);
 /* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
  * The NN decides the port; this is only the L2 next-hop dictionary. No routing
  * decision here, no output validation -- just resolve the physical action. */
-BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
+BPF_ARRAY(mac_table_t2, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t2, __u64, 7);   /* per-class redirect counter */
 
@@ -368,7 +368,7 @@ struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
-BPF_HASH(mac_table_t2, __u32, struct fwd_action, 8);
+BPF_ARRAY(mac_table_t2, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
 BPF_ARRAY(cls_stats_t2, __u64, 7);
 #ifdef IPA_COUNT_LOOKUPS
@@ -569,7 +569,7 @@ int arch_generic_2layer(struct xdp_md *ctx) {
      * no output validation -- resolve the L2 next-hop and redirect. */
     __u32 cls = (__u32)best_cls;
     struct fwd_action *action = mac_table_t2.lookup(&cls);
-    if (action != NULL) {
+    if (action != NULL && action->ifindex != 0) {
         int si = 0; __u64 *v = pkt_stats_t2.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         __u64 *cv = cls_stats_t2.lookup(&cls);
