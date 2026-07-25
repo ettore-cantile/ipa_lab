@@ -703,13 +703,25 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
     per-packet path, tail calls included) and returns lookup_ctr[0]/repeat.
 
     """
-    from common import instrument_map_lookups
+    from common import instrument_map_lookups, count_instrumented_sites
+
+    def _report(raw_src):
+        """Print where the instrumentation weight lands, per eBPF function, so a
+        'program too large' rejection of the measurement build is diagnosable
+        from the log instead of being a bare failure."""
+        sites = count_instrumented_sites(raw_src)
+        total = sum(sites.values())
+        detail = "  ".join(f"{k}={v}" for k, v in sorted(sites.items()))
+        print(f"[count_lookups] {method}: instrumenting {total} lookup sites "
+              f"({detail})")
+
     weights, scale = load_weights(model_path)
 
     if method == "hardcoded":
         from ebpf_program import build_combined_hardcoded_source
         raw = build_combined_hardcoded_source([(model_id, weights, scale, None)])
         src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
+        _report(raw)
         b = BPF(text=src)
         model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
         disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
@@ -720,6 +732,7 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
         from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER, load_arch_weights)
         raw = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER
         src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
+        _report(raw)
         b = BPF(text=src)
         disp_fn = b.load_func("ipa_switch_template", BPF.XDP)
         leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
@@ -730,6 +743,7 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
     elif method == "modular":
         from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
         src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(EBPF_MODULAR_FULL)
+        _report(EBPF_MODULAR_FULL)
         b = BPF(text=src)
         disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)
         fn_first  = b.load_func("layer_first",  BPF.XDP)
@@ -745,9 +759,13 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
         raise ValueError(f"count_lookups: unknown method {method!r}")
 
     frame = build_frame(model_id, ttl, scale)
-    b["lookup_ctr"][ct.c_int(0)] = ct.c_ulonglong(0)
+    # lookup_ctr is a BPF_PERCPU_ARRAY (no atomic on the hot path -- the same
+    # per-CPU counter pattern the design-space analysis recommends for
+    # pkt_stats/cls_stats). Zero every CPU's copy, then sum them back.
+    ctr = b["lookup_ctr"]
+    ctr[ct.c_int(0)] = ctr.Leaf()          # zeroed per-CPU array
     prog_test_run(disp_fn.fd, frame, repeat=repeat)
-    total = int(b["lookup_ctr"][ct.c_int(0)].value)
+    total = sum(int(v) for v in ctr[ct.c_int(0)])
     return total / float(repeat)
 
 

@@ -146,11 +146,11 @@ struct fwd_action {
  * see common.py instrument_map_lookups() / verify_prog_run.count_lookups()).
  * A no-op otherwise, so production/performance builds are unaffected. */
 #ifdef IPA_COUNT_LOOKUPS
-BPF_ARRAY(lookup_ctr, __u64, 1);
+BPF_PERCPU_ARRAY(lookup_ctr, __u64, 1);
 static inline __attribute__((always_inline)) void ctr_inc(void) {
     int _lci = 0;
     __u64 *_lcv = lookup_ctr.lookup(&_lci);
-    if (_lcv) __sync_fetch_and_add(_lcv, 1);
+    if (_lcv) *_lcv += 1;   /* per-CPU: no atomic needed */
 }
 #define CTR_INC() ctr_inc()
 #else

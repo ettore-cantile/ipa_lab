@@ -182,15 +182,23 @@ def main():
     print("=" * 78)
     print(" Model-add cost per pipeline (aggiornamento modello a runtime)")
     print("=" * 78)
-    print(f"  {'pipeline':<12}{'one-time setup (ms)':>22}{'mean add (ms)':>18}"
-          f"{'min':>10}{'max':>10}{'stdev':>10}")
+    # Headline statistic is the MINIMUM, not the mean -- same methodology the
+    # rest of the suite uses (see docs/testing.md section 2): the noise here is
+    # ONE-SIDED (scheduling, page faults on first touch of a fresh map can only
+    # make an add slower, never faster), so the minimum is the estimate of the
+    # real cost. The mean is dominated by the first add, which pays map-page
+    # faults the later ones do not -- e.g. template: min 0.245 ms but mean
+    # 5.07 ms with stdev 6.75, i.e. the mean describes the outlier, not the
+    # operation. Mean/max/stdev stay visible for transparency.
+    print(f"  {'pipeline':<12}{'one-time setup (ms)':>22}{'MIN add (ms)':>18}"
+          f"{'mean':>10}{'max':>10}{'stdev':>10}")
     print("  " + "-" * 74)
     for name in ("hardcoded", "template", "modular"):
         setup_s, times = results[name]
         s = _stats(times)
         setup_str = f"{setup_s*1000:.3f}" if setup_s is not None else "n/a (baked into add)"
-        print(f"  {name:<12}{setup_str:>22}{s['mean_ms']:>18.3f}"
-              f"{s['min_ms']:>10.3f}{s['max_ms']:>10.3f}{s['stdev_ms']:>10.3f}")
+        print(f"  {name:<12}{setup_str:>22}{s['min_ms']:>18.3f}"
+              f"{s['mean_ms']:>10.3f}{s['max_ms']:>10.3f}{s['stdev_ms']:>10.3f}")
     print("  " + "-" * 74)
     print()
     print("  hardcoded : no incremental path -- 'add' == full BPF compile+load_func")
@@ -200,9 +208,11 @@ def main():
     print("  modular   : one-time program load, then 'add' == load_modular_weights()")
     print("              (bpf_map_update_elem writes only, program stays loaded).")
     print()
-    hc = _stats(results["hardcoded"][1])["mean_ms"]
-    tp = _stats(results["template"][1])["mean_ms"]
-    md = _stats(results["modular"][1])["mean_ms"]
+    # Ratios from the minima too, so they describe the operation and not the
+    # first-add outlier (see the note above the table).
+    hc = _stats(results["hardcoded"][1])["min_ms"]
+    tp = _stats(results["template"][1])["min_ms"]
+    md = _stats(results["modular"][1])["min_ms"]
     if tp > 0:
         print(f"  hardcoded add is ~{hc/tp:.0f}x slower than template add "
               f"(recompile vs. map write).")

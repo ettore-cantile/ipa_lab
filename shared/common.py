@@ -91,6 +91,33 @@ def instrument_map_lookups(src: str) -> str:
     return _LOOKUP_CALL_RE.sub(_wrap, src)
 
 
+def count_instrumented_sites(src: str) -> dict:
+    """
+    How many `.lookup()` call sites instrument_map_lookups() would wrap, broken
+    down per eBPF function (`int <name>(struct xdp_md *ctx)`), plus a "<header>"
+    bucket for sites outside any function (shared always_inline helpers).
+
+    Diagnostic only: when an instrumented measurement build gets rejected for
+    exceeding the kernel's program-size cap, this says WHERE the added
+    instrumentation weight lands, instead of leaving a bare "program too large".
+    Used by verify_prog_run.count_lookups().
+    """
+    fn_re = re.compile(r'^\s*int\s+(\w+)\s*\(\s*struct\s+xdp_md', re.M)
+    bounds = [(m.start(), m.group(1)) for m in fn_re.finditer(src)]
+    out = {}
+    for m in _LOOKUP_CALL_RE.finditer(src):
+        if m.group(1) == "lookup_ctr":
+            continue
+        owner = "<header>"
+        for pos, name in bounds:
+            if m.start() >= pos:
+                owner = name
+            else:
+                break
+        out[owner] = out.get(owner, 0) + 1
+    return out
+
+
 def local_mac(iface: str) -> list:
     """Real MAC address of `iface`, read from the kernel (/sys/class/net) --
     always available, unlike the neighbor's MAC which requires a resolved
