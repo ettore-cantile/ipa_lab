@@ -343,26 +343,63 @@ non solo il minimo. Numeri dal run più recente (box Linux, 4 CPU).
 
 | Metrica                    | baseline | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|---------:|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated)   |      113 |          980 |      16 988 |     15 767 |
-| Codice jited (byte)        |      542 |        4 684 |      84 587 |     76 376 |
+| Istruzioni eBPF (xlated)   |      129 |          997 |       9 962 |      8 209 |
+| Codice jited (byte)        |      600 |        4 751 |      48 640 |     40 635 |
 | Tail calls / pacchetto     |        0 |            1 |           1 |          3 |
-| Map lookup / pacchetto (reali) |    0 |          4.0 |       147.0 |      160.0 |
-| Memoria mappe (byte)       |      280 |          308 |       8 052 |     16 884 |
-| Latenza min (ns/pacchetto) |     21.0 |         35.0 |       262.0 |      442.0 |
-| Latenza p50 (ns/pacchetto) |     26.0 |         40.0 |       292.0 |      478.0 |
-| Latenza max (ns/pacchetto) |     60.0 |         81.0 |       326.0 |      675.0 |
-| Throughput (Mpps, da min)  |   47.619 |       28.571 |       3.817 |      2.262 |
-| CPU (%)                    |       34 |           30 |          57 |         51 |
+| Map lookup / pacchetto (reali) |    0 |          4.0 |         8.0 |       26.0 |
+| Memoria mappe (byte)       |      280 |          308 |       3 960 |      8 188 |
+| Latenza min (ns/pacchetto) |     28.0 |         47.0 |       224.0 |      387.0 |
+| **Latenza normalizzata (× baseline)** | **1.00** | **1.68** | **8.00** | **13.82** |
+| Throughput (Mpps, da min)  |   35.714 |       21.277 |       4.464 |      2.584 |
+| CPU (%)                    |       49 |           39 |          68 |         61 |
+
 | Dispatch (correttezza)     |        — |      5/5 PASS |   5/5 PASS |   5/5 PASS |
 | link_state reroute         |          | PASS (5/30 casi cambiano uscita) |||
+
+> **Attenzione a confrontare i ns assoluti con tabelle più vecchie.** Questi numeri
+> vengono da una macchina diversa (e più lenta) rispetto alle misure precedenti: il
+> **baseline**, che è lo stesso identico programma, è passato da 21 a 28 ns. Per un
+> confronto valido fra macchine usa la riga **normalizzata**. Caso di controllo: P1
+> non è stato modificato e il suo rapporto sul baseline è 1.67 prima e 1.68 dopo —
+> la normalizzazione regge.
+
+### Blocco pesi a valore strutturato (P2/P3) — cosa è cambiato
+
+`arch_weights` e `layer_weights` erano `BPF_ARRAY` con valore da 1 byte: **una
+`lookup` + un NULL-check per ogni peso**. Contati sul sorgente generato, ~139 delle
+147 lookup di P2 erano esattamente questo. Ora ciascuna mappa è **una sola entry a
+valore strutturato** che contiene l'intero blocco: una `lookup`, poi accessi diretti
+su puntatore. L'indice runtime resta verifier-safe con la maschera `& (SIZE-1)`
+(SIZE potenza di due), che elimina anche i ~139 bound-check espliciti. Stesso
+trattamento per `scratch_acts` di P3, che veniva riletta per **ogni coppia**
+(neurone di uscita, ingresso) invece di una volta per hop.
+
+| | P2 prima | P2 dopo | P3 prima | P3 dopo |
+|---|---:|---:|---:|---:|
+| Map lookup / pacchetto | 147.0 | **8.0** | 160.0 | **26.0** |
+| Istruzioni xlated | 16 988 | 9 962 | 15 767 | 8 209 |
+| Jited (byte) | 84 587 | 48 640 | 76 376 | 40 635 |
+| Memoria mappe (byte) | 8 052 | 3 960 | 16 884 | 8 188 |
+| Latenza normalizzata (× baseline) | 12.48 | **8.00** | 21.05 | **13.82** |
+
+Inferenza **invariata**: stessa classe scelta su tutta la suite contro il riferimento
+Python, multi-model e alt-arch inclusi. Lato control plane, registrare un modello è
+ora **una** `bpf_map_update_elem` sull'intero blocco invece di 319 (P2) / 2048 (P3).
+
+Lettura onesta del risultato: ~1/3 del costo per pacchetto di P2 e P3 **non era il
+prezzo della flessibilità**, era il prezzo di una codifica del contenitore dei pesi.
+L'ordinamento del design space non cambia, ma il divario ha due componenti da
+separare: una *strutturale* (tail call + indirezione dei pesi a runtime) e una
+*implementativa*, che va misurata e sottratta prima di attribuirla al design space.
 
 ### Baseline vs hardcoded (la domanda "perché l'hardcoded è così veloce?")
 
 Il **baseline** riceve il pacchetto in XDP, fa lo stesso parse del dispatcher e un
 `bpf_redirect` — **niente tail-call, niente MLP**. È il *pavimento* del framework:
-**21 ns / 47.6 Mpps** (minimo su 7 trial). L'hardcoded (**35 ns**) aggiunge ~14 ns per
+**28 ns / 35.7 Mpps** (minimo su 14 trial). L'hardcoded (**47 ns**) aggiunge ~19 ns per
 tail-call + double-parse + la rete. Quindi l'hardcoded **non** è sospettosamente veloce:
-è **1.7× più lento** del do-nothing. Il throughput alto è il pavimento XDP+parse+redirect;
+è **1.68× più lento** del do-nothing — rapporto identico a quello misurato sulla
+macchina precedente (1.67), che è la verifica che la normalizzazione funziona. Il throughput alto è il pavimento XDP+parse+redirect;
 la rete int8 65-4-4-7 unrolled costa poco in confronto.
 
 ### AOT-literal deploy (P1, `method4_hardcoded_aot.py`)
@@ -381,14 +418,22 @@ Perf ≈ BCC hardcoded (varianza run-to-run): l'AOT preserva il massimo literal,
 
 ### Costo di aggiunta modello (`bench_model_add.py`, 3 modelli)
 
-| pipeline | add medio (ms) | come |
-|---|---:|---|
-| hardcoded | 1435.8 | ricompilazione completa (clang = 99.7%) |
-| template | 4.9 | solo `bpf_map_update_elem` |
-| modular | 8.4 | solo `bpf_map_update_elem` |
+| pipeline | add **min** (ms) | media | come |
+|---|---:|---:|---|
+| hardcoded | 1146.4 | 1299.2 | ricompilazione completa (clang = 99.7%) |
+| template | **0.346** | 4.86 | una `bpf_map_update_elem` sul blocco pesi |
+| modular | **0.385** | 0.73 | una `bpf_map_update_elem` sul blocco pesi |
 
-Hardcoded ~294× più lento di template, ~172× di modular. L'AOT stima ~4 ms di load →
-**~341× più economico** del BCC, **senza perdita di perf**.
+Hardcoded ~3313× più lento di template, ~2977× di modular. L'AOT stima ~3 ms di load →
+**~432× più economico** del BCC, **senza perdita di perf**.
+
+La statistica riportata è il **minimo**, non la media — coerente con la sezione 2:
+il rumore è a senso unico e con soli 3 modelli la media è dominata dal primo add,
+che paga il primo accesso alle pagine di una mappa appena creata (template: min
+0.346 ms ma max 13.85, stdev 6.36 — la media descrive l'outlier, non l'operazione).
+Il crollo rispetto alle misure precedenti viene da **due** cause da non confondere:
+il passaggio media→minimo, e il fatto che registrare un modello sia ora **una**
+`bpf_map_update_elem` invece di 319 (P2) / 2048 (P3).
 
 ### Multi-model (`verify_multi_model.py`) — regge shape custom
 
@@ -400,15 +445,28 @@ P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
 - **Ordine design-space confermato**: costo (istruzioni, jited, tail call, lookup, memoria)
   cresce monotono baseline→P1→P2→P3; le prestazioni calano nello stesso ordine.
 - **Costo della flessibilità IV runtime (Task 3)**: rendere P2/P3 descrittore-driven ha
-  aumentato il loro conteggio istruzioni (P2 template ~2 618→16 988, latenza 125→523 ns): il
-  loop generico per-feature unrolled (`MAX_FEAT` × neuroni × dense) pesa. È il prezzo della
-  flessibilità a runtime, coerente con la posizione di P2/P3 (flessibilità > velocità).
+  aumentato il loro conteggio istruzioni (P2 template ~2 618→16 988): il loop generico
+  per-feature unrolled (`MAX_FEAT` × neuroni × dense) pesa. Parte di quel costo è però
+  rientrata col blocco pesi strutturato (16 988→9 962): vedi la sezione dedicata sopra —
+  non tutto ciò che sembrava prezzo della flessibilità lo era davvero.
 - **P1 = meno memoria mappe** (308 B): nessun `model_cache`, solo contatori + `link_state`.
 - **Inferenza identica** nelle 3 pipeline (stesso MLP/pesi/argmax): verificata dal match di
   classe kernel vs riferimento Python (10/10 e 5/5 PASS).
 - **Azione uniforme (`mac_table`)**: `argmax → mac_table[classe] → bpf_redirect`.
-- **Nessun `ctx_in` custom**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox cade
-  fuori dalla `ifindex_table` di P1 e dal clamp `[1,6]` di P2/P3 → tutte risolvono `_iface=0`.
+- **Nessun `ctx_in` custom**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox vale 1.
+  P1 lo traduce attraverso la propria `ifindex_table` (default `[2..7]`), che **non** mappa 1
+  → `_iface=0`. P2/P3 invece usano l'ifindex **grezzo** come indice one-hot e `1` cade dentro
+  il clamp `[1,sz]` → contribuiscono la colonna 0. **Le due semantiche divergono**, e non solo
+  in sandbox: su un nodo reale `eth0` ha ifindex 2, quindi P1 sceglie la colonna 0 e P2/P3 la
+  colonna 1 per lo stesso pacchetto. Non è ancora stato uniformato — su questo modello sposta
+  solo argmax quasi pari (la classe 0 domina), ma va allineato prima di trarre conclusioni
+  sull'equivalenza delle tre pipeline. Vedi il commento in `verify_prog_run.py` (`ref_ifindex`).
+- **P2/P3 non caricano dentro Kathara**: il nodo applica il cap storico di 4096 istruzioni per
+  programma, e `arch_generic_2layer` ne conta 9 318 compilato nel container (`bpf: Program too
+  large`). Le misure di questa tabella vengono da `BPF_PROG_TEST_RUN` **sull'host**, dove il
+  cap non si applica. È un limite preesistente e non una regressione — prima del blocco pesi
+  strutturato lo stesso programma era circa il doppio — ma va detto: **P2 e P3 non hanno mai
+  girato end-to-end sul fabric**, solo P1. Servirebbe un altro ~2.3× di riduzione istruzioni.
 - Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`
   (fino a 20× su un singolo campione, rumore a senso unico — vedi sez. 7): tutti gli script
   di benchmark aggiunti in questa sessione (7, 8) usano minimo su N trial indipendenti, mai
