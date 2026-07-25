@@ -339,8 +339,15 @@ def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, layer_idx: int, in
     offset for that layer comes from layer_shapes[{model_id, layer_idx}]
     (already populated by load_modular_weights), not from scratch_meta --
     unlike the old fixed 3-block design there is no w_off_out slot anymore."""
-    for i, v in enumerate(h2[:4]):
-        b["scratch_acts"][ct.c_int(i)] = _percpu_arr(v)
+    # scratch_acts is now ONE struct-valued per-CPU entry (struct act_vec) holding
+    # the whole activation vector, not one entry per slot -- see ebpf_modular.py.
+    # Seed key 0 with the activations placed in the struct's v[] array.
+    acts_tbl = b["scratch_acts"]
+    leaf = acts_tbl.Leaf()
+    for cpu in range(len(leaf)):
+        for i, v in enumerate(h2[:4]):
+            leaf[cpu].v[i] = int(v)
+    acts_tbl[ct.c_int(0)] = leaf
     meta = {0: model_id, 1: scale, 2: layer_idx, 3: ingress_ifindex, 4: ttl}
     for slot, val in meta.items():
         b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)

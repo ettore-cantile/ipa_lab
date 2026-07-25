@@ -107,7 +107,24 @@ def extract_weights_int8(
             RuntimeWarning,
             stacklevel=2,
         )
-        return _load_from_json(json_path)
+        w = _load_from_json(json_path)
+        # weights.json holds ONE shape (the checked-in 65-4-4-7 checkpoint). The
+        # torch path above honours n_interfaces/n_nodes/hidden_dim; this fallback
+        # cannot -- so a caller asking for a different topology would silently get
+        # the default-shape weights and generate a program whose literals do not
+        # match its declared shape. Fail loudly instead.
+        n_in = n_interfaces + n_interfaces + 1 + n_nodes
+        expected = (n_in * hidden_dim + hidden_dim
+                    + hidden_dim * hidden_dim + hidden_dim
+                    + hidden_dim * (n_interfaces + 1) + (n_interfaces + 1))
+        if len(w) != expected:
+            raise ValueError(
+                f"{json_path} holds {len(w)} weights but the requested shape "
+                f"(n_interfaces={n_interfaces}, n_nodes={n_nodes}, "
+                f"hidden_dim={hidden_dim}) needs {expected}. weights.json is "
+                f"single-shape; regenerate it on a box with torch for this "
+                f"topology, or pass the matching shape.")
+        return w
 
     raise ImportError(
         "torch is not installed and weights.json not found in {}. "

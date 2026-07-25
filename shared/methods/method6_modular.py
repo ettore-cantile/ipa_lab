@@ -126,7 +126,6 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
                 drops  = stats[stats.Key(2)].value
                 print(f"\r{hits:>12} {misses:>10} {drops:>10}",
                       end="", flush=True)
-                print()
             except Exception:
                 pass
     except KeyboardInterrupt:

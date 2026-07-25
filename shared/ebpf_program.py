@@ -756,7 +756,19 @@ def load_and_generate(
     return ebpf_src, weights_int8, scale
 
 
-EBPF_PROGRAM = build_combined_hardcoded_source([(0, [0]*N_WEIGHTS, 128, None)])
+def __getattr__(name):
+    """Lazy `EBPF_PROGRAM`: the historical all-zero-weights sample program.
+
+    It used to be built eagerly at import time, so EVERY importer of this
+    module (the whole test suite, and every subprocess-isolated sweep cell in
+    bench_depth_vs_width.py) paid a full 65-4-4-7 codegen -- including the
+    52-case node switch -- for a constant nothing in the repo reads. Building
+    it on first attribute access keeps the name working for any external
+    caller while costing importers nothing."""
+    if name == "EBPF_PROGRAM":
+        return build_combined_hardcoded_source([(0, [0] * N_WEIGHTS, 128, None)])
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 if __name__ == "__main__":
     import sys

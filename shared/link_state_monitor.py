@@ -96,12 +96,17 @@ def monitor_loop(bpf_obj, ifaces=None, interval: float = 0.5,
     """Poll carrier state every `interval` seconds until stop_event is set,
     writing changes into the link_state map."""
     ifaces = ifaces or DEFAULT_IFACES
+    # Pad to N_EGRESS with the same eth<i> convention update_link_state() uses,
+    # so a caller passing FEWER than N_EGRESS names cannot IndexError below.
+    # (It ran in a daemon thread: the exception killed carrier monitoring
+    # silently and link_state stayed frozen at its startup all-up seed.)
+    names = [ifaces[i] if i < len(ifaces) else f"eth{i}" for i in range(N_EGRESS)]
     prev = None
     while not (stop_event and stop_event.is_set()):
         states = update_link_state(bpf_obj, ifaces)
         if states != prev:
-            up = [ifaces[i] for i in range(N_EGRESS) if states[i]]
-            down = [ifaces[i] for i in range(N_EGRESS) if not states[i]]
+            up = [names[i] for i in range(N_EGRESS) if states[i]]
+            down = [names[i] for i in range(N_EGRESS) if not states[i]]
             print(f"[link_state] up={up} down={down}")
             prev = states
         time.sleep(interval)

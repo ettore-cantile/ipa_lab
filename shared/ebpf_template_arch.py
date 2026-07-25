@@ -45,11 +45,20 @@ Action (mac_table):
 
 Implementation notes:
   - Inference uses a sparse dot-product over the one-hot feature vector via
-    BPF_ARRAY index arithmetic, avoiding a large on-stack activation array.
+    index arithmetic into the weight block, avoiding a large on-stack
+    activation array.
+  - arch_weights is ONE struct-valued entry holding the whole weight block, so
+    the datapath pays a SINGLE bpf_map_lookup_elem for all the weights instead
+    of one helper call per weight byte (~139 of P2's former 147 lookups per
+    packet). Same "N lookups -> 1" transformation as the dense feature vectors.
   - ingress_ifindex is clamped to [0,6]; under BPF_PROG_TEST_RUN it is a
     sandbox value outside that range and is treated as "no ingress iface".
-  - Weights are written through the raw bpf(2) syscall (libbcc does not export
-    a stable bpf_update_elem); the real map slot size is detected via
+    NOTE: unlike Pipeline 1, this does NOT translate the kernel ifindex into a
+    logical port through an ifindex_table -- the raw ifindex is used as the
+    one-hot index. On a real node (eth0 = ifindex 2) the two pipelines
+    therefore select DIFFERENT columns for the same packet.
+  - The weight block is written through the raw bpf(2) syscall (libbcc does not
+    export a stable bpf_update_elem); the real map value size is detected via
     BPF_OBJ_GET_INFO_BY_FD before writing.
 """
 
@@ -144,33 +153,9 @@ def _get_map_value_size(map_fd: int) -> int:
     return max(1, int(info.value_size))
 
 
-def _bpf_map_update_char(map_fd: int, value_size: int,
-                         index: int, int8_val: int) -> None:
-    """
-    Write int8_val into a BPF_ARRAY[index] via raw BPF_MAP_UPDATE_ELEM.
-    Allocates a zeroed buffer of value_size bytes; places int8 at byte 0.
-    """
-    key_buf = ct.c_uint32(index)
-    val_buf = (ct.c_uint8 * value_size)()
-    val_buf[0] = ct.c_uint8(ct.c_int8(int8_val).value & 0xFF).value
-
-    attr = _BpfAttrMapElem(
-        map_fd = map_fd,
-        _pad   = 0,
-        key    = ct.cast(ct.byref(key_buf), ct.c_void_p).value,
-        value  = ct.cast(val_buf, ct.c_void_p).value,
-        flags  = _BPF_ANY,
-    )
-    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_UPDATE_ELEM,
-                        ct.byref(attr), ct.sizeof(attr))
-    if ret != 0:
-        e = ct.get_errno()
-        raise OSError(e, f"BPF_MAP_UPDATE_ELEM arch_weights[{index}]="
-                         f"{int8_val} (value_size={value_size}): {os.strerror(e)}")
-
-
-def _bpf_map_lookup_char(map_fd: int, value_size: int, index: int) -> int:
-    """Read arch_weights[index]; return as signed int8 (for post-load verification)."""
+def _bpf_map_read_blk(map_fd: int, value_size: int, index: int = 0) -> bytearray:
+    """Read the whole struct-valued arch_weights entry (key `index`) as bytes.
+    Returns a zeroed buffer if the entry cannot be read (fresh map)."""
     key_buf = ct.c_uint32(index)
     val_buf = (ct.c_uint8 * value_size)()
     attr = _BpfAttrMapElem(
@@ -183,8 +168,28 @@ def _bpf_map_lookup_char(map_fd: int, value_size: int, index: int) -> int:
     ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_LOOKUP_ELEM,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
-        return None
-    return ct.c_int8(val_buf[0]).value
+        return bytearray(value_size)
+    return bytearray(val_buf)
+
+
+def _bpf_map_write_blk(map_fd: int, blk: bytearray, index: int = 0) -> None:
+    """Write the whole struct-valued arch_weights entry (key `index`) in ONE
+    BPF_MAP_UPDATE_ELEM, replacing the previous one-syscall-per-weight loop."""
+    key_buf = ct.c_uint32(index)
+    val_buf = (ct.c_uint8 * len(blk)).from_buffer_copy(bytes(blk))
+    attr = _BpfAttrMapElem(
+        map_fd = map_fd,
+        _pad   = 0,
+        key    = ct.cast(ct.byref(key_buf), ct.c_void_p).value,
+        value  = ct.cast(val_buf, ct.c_void_p).value,
+        flags  = _BPF_ANY,
+    )
+    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_UPDATE_ELEM,
+                        ct.byref(attr), ct.sizeof(attr))
+    if ret != 0:
+        e = ct.get_errno()
+        raise OSError(e, f"BPF_MAP_UPDATE_ELEM arch_weights block "
+                         f"({len(blk)} bytes): {os.strerror(e)}")
 
 
 EBPF_TEMPLATE_ARCH_DISPATCHER = r"""
@@ -225,9 +230,31 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-/* 'char' leaf: BCC str2ctype knows 'char'; '__s8'/'signed char' are not. */
+/* arch_weights: the WHOLE weight block in ONE struct-valued entry (key 0),
+ * so the datapath reads every weight it needs after a SINGLE
+ * bpf_map_lookup_elem instead of one helper call per weight byte. This is the
+ * same "N lookups -> 1" transformation already applied to the dense feature
+ * vectors (link_state / queue_state, see common.py): all the values live in
+ * one map entry anyway, so making the entry a struct turns per-weight helper
+ * calls into plain pointer reads, which cost the verifier nothing.
+ *
+ * Measured before this change: ~139 of P2's 147 map lookups per packet were
+ * single-byte weight reads (one lookup + one NULL check per weight).
+ *
+ * __u8 storage (not 'char'): the value is never a BCC leaf type here -- the
+ * control plane writes the block through the raw bpf(2) syscall below -- and
+ * the eBPF side re-casts each byte to __s8 via AW_W(), exactly like Pipeline
+ * 3's WEIGHT() macro. */
 #define MAX_WEIGHT_ENTRIES 1024
-BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
+struct aw_blk { __u8 w[MAX_WEIGHT_ENTRIES]; };
+BPF_ARRAY(arch_weights, struct aw_blk, 1);
+
+/* Read weight `i` out of an already-looked-up block. The AND is what makes the
+ * variable index verifier-safe: MAX_WEIGHT_ENTRIES is a power of two, so the
+ * masked index is provably within the map value's size and needs no per-access
+ * bound check. It never actually wraps -- arch_generic_2layer bound-checks the
+ * model's whole block ONCE, up front (see the woff + out_b_off check). */
+#define AW_W(blk, i) ((long long)(__s8)((blk)->w[(__u32)(i) & (MAX_WEIGHT_ENTRIES - 1)]))
 
 /* link_state: 6 egress up/down slots (feature [0..5]), held in ONE struct-valued
  * entry (key 0) so the leaf reads the whole vector with a SINGLE lookup instead
@@ -359,7 +386,9 @@ struct fwd_action {
 } __attribute__((packed));
 
 #define MAX_WEIGHT_ENTRIES 1024
-BPF_ARRAY(arch_weights, char, MAX_WEIGHT_ENTRIES);
+struct aw_blk { __u8 w[MAX_WEIGHT_ENTRIES]; };
+BPF_ARRAY(arch_weights, struct aw_blk, 1);
+#define AW_W(blk, i) ((long long)(__s8)((blk)->w[(__u32)(i) & (MAX_WEIGHT_ENTRIES - 1)]))
 struct ls_vec { __u32 v[6]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 struct qs_vec { __u32 v[4]; };
@@ -434,6 +463,20 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     __u32 out_w_off = fc2_b_off + n_h2;
     __u32 out_b_off = out_w_off + n_h2 * T2_N_OUT;
 
+    /* ONE bound check for this model's whole weight block, replacing the ~139
+     * per-weight `if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS` checks that
+     * used to guard every single weight read. out_b_off + T2_N_OUT is the
+     * highest index the loops below can reach (the fc2/out inner loops run to
+     * the compiled ceiling with a smaller runtime stride, but those overshoots
+     * stay inside the block and are multiplied by a zeroed activation). */
+    if (woff + out_b_off + T2_N_OUT > MAX_WEIGHT_ENTRIES) return XDP_PASS;
+
+    /* Whole weight block in ONE lookup -- every AW_W() below is a plain
+     * pointer read, not a helper call. */
+    int _awz = 0;
+    struct aw_blk *AW = arch_weights.lookup(&_awz);
+    if (!AW) return XDP_PASS;
+
     __u32 _ttl       = ((__u32)ip->ttl) & 0xff;
     __u32 _raw_iface = ctx->ingress_ifindex;
     __u32 _node      = (__u32)ipa->model_id;
@@ -445,20 +488,30 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     { int lsz = 0; struct ls_vec *lsp = link_state.lookup(&lsz);
       #pragma unroll
       for (int i = 0; i < 6; i++) ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
+    /* queue_state is only read if the model's descriptor actually declares the
+     * queue_occupancy feature. The default descriptor does not, so this saves
+     * an unconditional lookup on the common path. */
     long long qs[T2_N_QUEUES];
-    { int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
-      #pragma unroll
-      for (int i = 0; i < T2_N_QUEUES; i++) qs[i] = qsp ? (long long)(qsp->v[i]) : 0LL; }
+    #pragma unroll
+    for (int i = 0; i < T2_N_QUEUES; i++) qs[i] = 0LL;
+    __u8 _need_qs = 0;
+    #pragma unroll
+    for (int f = 0; f < MAX_FEAT; f++)
+        if (f < desc->n_feat && desc->feats[f].code == FEAT_QUEUE_OCC) _need_qs = 1;
+    if (_need_qs) {
+      int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
+      if (qsp) {
+        #pragma unroll
+        for (int i = 0; i < T2_N_QUEUES; i++) qs[i] = (long long)(qsp->v[i]);
+      }
+    }
 
     long long h1[T2_MAX_H1];
     #pragma unroll
     for (int j = 0; j < T2_MAX_H1; j++) {
         if (j >= n_h1) { h1[j] = 0LL; continue; }
 
-        int bidx = woff + fc1_b_off + j;
-        if (bidx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-        char *bp = arch_weights.lookup(&bidx);
-        long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
+        long long acc = AW_W(AW, woff + fc1_b_off + j);
 
         /* Descriptor-driven IV: accumulate each declared feature's contribution
          * at its runtime column offset (fc1 row = j*n_in + col_off). Unrolled to
@@ -472,44 +525,25 @@ int arch_generic_2layer(struct xdp_md *ctx) {
                 __u32 sz   = desc->feats[f].size;
                 __u32 base = woff + fc1_w_off + j * n_in + desc->feats[f].col_off;
                 if (code == FEAT_TTL) {
-                    int idx = base;
-                    if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-                    char *wp = arch_weights.lookup(&idx);
-                    if (wp) acc += (long long)_ttl * (long long)(*(signed char *)wp);
+                    acc += (long long)_ttl * AW_W(AW, base);
                 } else if (code == FEAT_LINK_STATE) {
                     #pragma unroll
                     for (int i = 0; i < 6; i++) {
-                        if ((__u32)i < sz && ls[i]) {
-                            int idx = base + i;
-                            if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-                            char *wp = arch_weights.lookup(&idx);
-                            if (wp) acc += ls[i] * (long long)(*(signed char *)wp);
-                        }
+                        if ((__u32)i < sz && ls[i])
+                            acc += ls[i] * AW_W(AW, base + i);
                     }
                 } else if (code == FEAT_QUEUE_OCC) {
                     #pragma unroll
                     for (int i = 0; i < T2_N_QUEUES; i++) {
-                        if ((__u32)i < sz && qs[i]) {
-                            int idx = base + i;
-                            if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-                            char *wp = arch_weights.lookup(&idx);
-                            if (wp) acc += qs[i] * (long long)(*(signed char *)wp);
-                        }
+                        if ((__u32)i < sz && qs[i])
+                            acc += qs[i] * AW_W(AW, base + i);
                     }
                 } else if (code == FEAT_INGRESS_IF) {
-                    if (_raw_iface >= 1 && _raw_iface <= sz) {
-                        int idx = base + (_raw_iface - 1);
-                        if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-                        char *wp = arch_weights.lookup(&idx);
-                        if (wp) acc += (long long)(*(signed char *)wp);
-                    }
+                    if (_raw_iface >= 1 && _raw_iface <= sz)
+                        acc += AW_W(AW, base + (_raw_iface - 1));
                 } else if (code == FEAT_NODE_ID) {
-                    if (_node < sz) {
-                        int idx = base + _node;
-                        if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-                        char *wp = arch_weights.lookup(&idx);
-                        if (wp) acc += (long long)(*(signed char *)wp);
-                    }
+                    if (_node < sz)
+                        acc += AW_W(AW, base + _node);
                 }
             }
         }
@@ -524,16 +558,10 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     for (int j = 0; j < T2_MAX_H2; j++) {
         if (j >= n_h2) { h2[j] = 0LL; continue; }
 
-        int bidx = woff + fc2_b_off + j;
-        if (bidx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-        char *bp = arch_weights.lookup(&bidx);
-        long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
+        long long acc = AW_W(AW, woff + fc2_b_off + j);
         #pragma unroll
         for (int i = 0; i < T2_MAX_H1; i++) {
-            int widx = woff + fc2_w_off + j * n_h1 + i;
-            if (widx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-            char *wp = arch_weights.lookup(&widx);
-            if (wp) acc += h1[i] * (long long)(*(signed char *)wp);
+            acc += h1[i] * AW_W(AW, woff + fc2_w_off + j * n_h1 + i);
         }
         h2[j] = RELU(acc);
     }
@@ -544,16 +572,10 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     int best_cls = 0;
     #pragma unroll
     for (int k = 0; k < T2_N_OUT; k++) {
-        int bidx = woff + out_b_off + k;
-        if (bidx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-        char *bp = arch_weights.lookup(&bidx);
-        long long acc = bp ? (long long)(*(signed char *)bp) : 0LL;
+        long long acc = AW_W(AW, woff + out_b_off + k);
         #pragma unroll
         for (int i = 0; i < T2_MAX_H2; i++) {
-            int widx = woff + out_w_off + k * n_h2 + i;
-            if (widx >= MAX_WEIGHT_ENTRIES) return XDP_PASS;
-            char *wp = arch_weights.lookup(&widx);
-            if (wp) acc += h2[i] * (long long)(*(signed char *)wp);
+            acc += h2[i] * AW_W(AW, woff + out_w_off + k * n_h2 + i);
         }
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
@@ -650,16 +672,23 @@ def load_arch_weights(bpf_obj, weights_int8: list,
             f"n_h1={n_h1}/n_h2={n_h2} needs {n_weights} weights, "
             f"got only {len(weights_int8)}")
 
+    # arch_weights is ONE struct-valued entry holding the whole 1024-byte weight
+    # block (see the aw_blk declaration in the eBPF source). Registering a model
+    # is therefore a read-modify-write of that single entry -- ONE update syscall
+    # instead of one per weight (was 319 for the 65-4-4-7 model). Read-modify
+    # matters: several model_id's share the block at different weight_offsets,
+    # so writing a fresh buffer would wipe the models registered before this one.
     value_size = _get_map_value_size(map_fd)
-    print(f"[Pipeline2] arch_weights fd={map_fd} value_size={value_size} bytes/slot")
+    print(f"[Pipeline2] arch_weights fd={map_fd} block={value_size} bytes")
 
+    blk = _bpf_map_read_blk(map_fd, value_size)
     for idx, w in enumerate(weights_int8[:n_weights]):
-        _bpf_map_update_char(map_fd, value_size,
-                             index=weight_offset + idx,
-                             int8_val=int(w))
+        blk[weight_offset + idx] = int(w) & 0xFF
+    _bpf_map_write_blk(map_fd, blk)
 
-    # Post-load sanity check: read back weight[0] of this model's block.
-    v0       = _bpf_map_lookup_char(map_fd, value_size, weight_offset)
+    # Post-load sanity check: read the block back and check weight[0] of this
+    # model's slice survived the round trip.
+    v0       = ct.c_int8(_bpf_map_read_blk(map_fd, value_size)[weight_offset]).value
     expected = ct.c_int8(int(weights_int8[0])).value
     ok       = "OK" if v0 == expected else f"MISMATCH got={v0} expected={expected}"
     print(f"[Pipeline2] arch_weights[{weight_offset}] verify: {ok}")

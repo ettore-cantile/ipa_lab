@@ -372,7 +372,18 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
     shape, ifindex_table = _resolve_shape(model_path, meta, topology_config)
     sizes = _layer_sizes(shape)
     n_weights = _weight_count(sizes)
-    w = extract_weights_int8(model_path) if model_path else extract_weights_int8()
+    # Pass the RESOLVED topology through, exactly like the BCC path
+    # (ebpf_program.load_and_generate) does. Without this the extractor built
+    # a FastRerouteMLP with its own hardcoded 6/52/4 defaults, so any
+    # topology_config other than the historical one produced weights for the
+    # wrong shape -- caught below as a count mismatch at best, and silently
+    # mis-sliced when the counts happened to coincide.
+    tcfg = shape["topology_config"]
+    kw = {"n_interfaces": tcfg["n_interfaces"],
+          "n_nodes":      tcfg["n_nodes"],
+          "hidden_dim":   int(shape["hidden_dims"][0]) if shape["hidden_dims"] else 0}
+    w = (extract_weights_int8(model_path, **kw) if model_path
+         else extract_weights_int8(**kw))
     if len(w) != n_weights:
         raise SystemExit(f"expected {n_weights} weights for "
                          f"{'-'.join(map(str, sizes))}, got {len(w)}")

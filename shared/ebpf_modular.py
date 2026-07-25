@@ -63,13 +63,17 @@ of different depths:
   slot itself.
 
 Maps:
-  scratch_acts     : BPF_PERCPU_ARRAY  index -> long long  (hidden activations,
-                      NOT used for the first layer -- that reads scratch_meta
-                      + link_state directly, see layer_first)
+  scratch_acts     : BPF_PERCPU_ARRAY  0 -> struct act_vec {long long v[N]}
+                      (hidden activations, the WHOLE vector in one entry so a
+                      layer reads it with a single lookup and writes it back
+                      through the same pointer; NOT used for the first layer --
+                      that reads scratch_meta + link_state directly)
   scratch_meta      : BPF_PERCPU_ARRAY  0 -> {model_id, scale, layer_idx, ingress_if, ttl}
-  layer_weights     : BPF_ARRAY  (flat index) -> __u8  (unsigned byte storage;
-                      eBPF C code casts to __s8 for signed arithmetic via WEIGHT() macro;
-                      Python side stores int8 as c_uint8(v & 0xFF) two's complement)
+  layer_weights     : BPF_ARRAY  0 -> struct lw_blk {__u8 w[N]}  (the WHOLE weight
+                      block in ONE struct-valued entry, so all the weights cost a
+                      SINGLE bpf_map_lookup_elem instead of one helper call per
+                      byte; eBPF C code casts each byte to __s8 via LW_W();
+                      Python side stores int8 as v & 0xFF two's complement)
   layer_chain       : BPF_PROG_ARRAY  0 -> layer_first.fd, 1..15 -> layer_hidden.fd
   layer_registry    : model_id -> {scale_factor, n_layers}
   layer_shapes      : {model_id, layer_idx} -> {n_in, n_out, weight_offset}
@@ -91,10 +95,9 @@ Feature encoding (protocol-fixed, independent of hidden depth/width):
 Weight storage:
   layer_weights uses an unsigned-byte leaf (__u8). The libbcc build in the
   Kathara container cannot resolve a signed-byte leaf type, so signedness is
-  handled explicitly: the eBPF C code casts each byte to __s8 via WEIGHT()
+  handled explicitly: the eBPF C code casts each byte to __s8 via LW_W()
   before arithmetic, and load_modular_weights() stores each int8 as
-  c_uint8(v & 0xFF) (identical two's-complement bits), bypassing the BCC leaf
-  encoder for the map write.
+  v & 0xFF (identical two's-complement bits) inside the struct-valued block.
 """
 
 # Scratch map layout constants
@@ -144,21 +147,41 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-/* Scratch maps: PERCPU to avoid contention */
+/* Scratch maps: PERCPU to avoid contention.
+ *
+ * scratch_acts holds the WHOLE activation vector in ONE struct-valued per-CPU
+ * entry (key 0) instead of one entry per slot. layer_hidden used to call
+ * scratch_acts.lookup() once per (output neuron, input) PAIR -- the same few
+ * activations re-read for every output neuron -- and every layer re-wrote them
+ * with one .update() per slot. With a struct the whole vector is one lookup per
+ * hop, and the writes go straight through the returned pointer (a per-CPU
+ * lookup returns THIS cpu's writable copy), so the .update() helper calls
+ * disappear too. Same "N lookups -> 1" transformation already applied to the
+ * dense feature vectors (see common.py). */
 #define SCRATCH_ACT_SIZE   128
 #define SCRATCH_META_SLOTS  16
-BPF_PERCPU_ARRAY(scratch_acts, long long, SCRATCH_ACT_SIZE);
+struct act_vec { long long v[SCRATCH_ACT_SIZE]; };
+BPF_PERCPU_ARRAY(scratch_acts, struct act_vec, 1);
 BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
 
-/* Weight map: __u8 leaf (unsigned byte storage).
- * Using __u8 instead of __s8 avoids KeyError: 'signed char' in BCC
- * str2ctype on older libbcc versions (< 0.20) present in the Kathara
- * container.  __s8 expands to 'signed char' which is absent from
- * str2ctype; __u8 expands to 'unsigned char' which IS present.
- * Sign semantics are preserved: eBPF C code casts each retrieved byte
- * to (__s8) via the WEIGHT() macro before any multiply-accumulate. */
+/* Weight map: the WHOLE weight block in ONE struct-valued entry (key 0), so a
+ * layer reads every weight it needs after a SINGLE bpf_map_lookup_elem instead
+ * of one helper call per weight byte. Measured before this change: the large
+ * majority of P3's 160 map lookups per packet were single-byte weight reads.
+ *
+ * __u8 storage (not __s8): BCC's str2ctype on the libbcc in the Kathara
+ * container has no 'signed char', only 'unsigned char'. Sign semantics are
+ * preserved -- the eBPF code re-casts each byte to (__s8) via LW_W(). */
 #define MAX_LAYER_WEIGHT_ENTRIES 2048
-BPF_ARRAY(layer_weights, __u8, MAX_LAYER_WEIGHT_ENTRIES);
+struct lw_blk { __u8 w[MAX_LAYER_WEIGHT_ENTRIES]; };
+BPF_ARRAY(layer_weights, struct lw_blk, 1);
+
+/* Read weight `i` out of an already-looked-up block. The AND is what makes the
+ * variable index verifier-safe: MAX_LAYER_WEIGHT_ENTRIES is a power of two, so
+ * the masked index is provably inside the map value and needs no per-access
+ * bound check. It never actually wraps -- load_modular_weights() rejects any
+ * model whose block would not fit. */
+#define LW_W(blk, i) ((long long)(__s8)((blk)->w[(__u32)(i) & (MAX_LAYER_WEIGHT_ENTRIES - 1)]))
 
 /* link_state: 6 egress up/down slots (feature [0..5]), held in ONE struct-valued
  * entry (key 0) so layer_first reads the whole vector with a SINGLE lookup
@@ -397,10 +420,27 @@ int layer_first(struct xdp_md *ctx) {
     { int lsz = 0; struct ls_vec *lsp = link_state.lookup(&lsz);
       #pragma unroll
       for (int i = 0; i < 6; i++) ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
+    /* queue_state is only read if this model's descriptor declares the
+     * queue_occupancy feature -- the default descriptor does not. */
     long long qs[ML_N_QUEUES];
-    { int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
-      #pragma unroll
-      for (int i = 0; i < ML_N_QUEUES; i++) qs[i] = qsp ? (long long)(qsp->v[i]) : 0LL; }
+    #pragma unroll
+    for (int i = 0; i < ML_N_QUEUES; i++) qs[i] = 0LL;
+    __u8 _need_qs = 0;
+    #pragma unroll
+    for (int f = 0; f < ML_MAX_FEAT; f++)
+        if (f < desc->n_feat && desc->feats[f].code == FEAT_QUEUE_OCC) _need_qs = 1;
+    if (_need_qs) {
+      int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
+      if (qsp) {
+        #pragma unroll
+        for (int i = 0; i < ML_N_QUEUES; i++) qs[i] = (long long)(qsp->v[i]);
+      }
+    }
+
+    /* Whole weight block in ONE lookup -- every LW_W() below is a pointer read. */
+    int _lwz = 0;
+    struct lw_blk *LW = layer_weights.lookup(&_lwz);
+    if (!LW) return XDP_PASS;
 
     long long out[ML1_MAX_H1];
     long long best_val = -9999999LL;
@@ -410,9 +450,7 @@ int layer_first(struct xdp_md *ctx) {
     for (int j = 0; j < ML1_MAX_H1; j++) {
         if (j >= n_out) { out[j] = 0LL; continue; }
 
-        int bidx = woff + bias_off + j;
-        __u8 *bp = layer_weights.lookup(&bidx);
-        long long acc = bp ? (long long)WEIGHT(bp) : 0LL;
+        long long acc = LW_W(LW, woff + bias_off + j);
 
         /* Descriptor-driven IV: each declared feature contributes at its runtime
          * column offset (layer-0 row = j*n_in + col_off). Unrolled to
@@ -425,39 +463,25 @@ int layer_first(struct xdp_md *ctx) {
                 __u32 sz   = desc->feats[f].size;
                 __u32 base = woff + j * n_in + desc->feats[f].col_off;
                 if (code == FEAT_TTL) {
-                    int idx = base;
-                    __u8 *wp = layer_weights.lookup(&idx);
-                    if (wp) acc += (long long)_ttl * (long long)WEIGHT(wp);
+                    acc += (long long)_ttl * LW_W(LW, base);
                 } else if (code == FEAT_LINK_STATE) {
                     #pragma unroll
                     for (int i = 0; i < 6; i++) {
-                        if ((__u32)i < sz) {
-                            int idx = base + i;
-                            __u8 *wp = layer_weights.lookup(&idx);
-                            if (wp) acc += ls[i] * (long long)WEIGHT(wp);
-                        }
+                        if ((__u32)i < sz)
+                            acc += ls[i] * LW_W(LW, base + i);
                     }
                 } else if (code == FEAT_QUEUE_OCC) {
                     #pragma unroll
                     for (int i = 0; i < ML_N_QUEUES; i++) {
-                        if ((__u32)i < sz) {
-                            int idx = base + i;
-                            __u8 *wp = layer_weights.lookup(&idx);
-                            if (wp) acc += qs[i] * (long long)WEIGHT(wp);
-                        }
+                        if ((__u32)i < sz)
+                            acc += qs[i] * LW_W(LW, base + i);
                     }
                 } else if (code == FEAT_INGRESS_IF) {
-                    if (_raw_iface >= 1 && _raw_iface <= sz) {
-                        int idx = base + (_raw_iface - 1);
-                        __u8 *wp = layer_weights.lookup(&idx);
-                        if (wp) acc += (long long)WEIGHT(wp);
-                    }
+                    if (_raw_iface >= 1 && _raw_iface <= sz)
+                        acc += LW_W(LW, base + (_raw_iface - 1));
                 } else if (code == FEAT_NODE_ID) {
-                    if (_node < sz) {
-                        int idx = base + _node;
-                        __u8 *wp = layer_weights.lookup(&idx);
-                        if (wp) acc += (long long)WEIGHT(wp);
-                    }
+                    if (_node < sz)
+                        acc += LW_W(LW, base + _node);
                 }
             }
         }
@@ -470,11 +494,13 @@ int layer_first(struct xdp_md *ctx) {
     }
 
     if (!is_last) {
+        /* ONE lookup of this CPU's activation vector, then plain stores through
+         * the returned pointer -- replaces ML1_MAX_H1 separate .update() calls. */
+        int _az = 0;
+        struct act_vec *ACT = scratch_acts.lookup(&_az);
+        if (!ACT) return XDP_PASS;
         #pragma unroll
-        for (int j = 0; j < ML1_MAX_H1; j++) {
-            int ki = j;
-            scratch_acts.update(&ki, &out[j]);
-        }
+        for (int j = 0; j < ML1_MAX_H1; j++) ACT->v[j] = out[j];
         int li = META_LAYER_IDX;
         long long nv = 1LL;
         scratch_meta.update(&li, &nv);
@@ -525,6 +551,17 @@ int layer_hidden(struct xdp_md *ctx) {
     if (n_in == 0 || n_in > MLH_MAX_H || n_out == 0 || n_out > MLH_MAX_H) return XDP_PASS;
     __u32 bias_off = n_in * n_out;
 
+    /* Weight block and this CPU's activation vector, each read ONCE for the
+     * whole layer. Previously the inner loop did a layer_weights lookup AND a
+     * scratch_acts lookup per (output neuron, input) pair -- so the same few
+     * activations were re-fetched for every output neuron. */
+    int _lwz = 0;
+    struct lw_blk *LW = layer_weights.lookup(&_lwz);
+    if (!LW) return XDP_PASS;
+    int _az = 0;
+    struct act_vec *ACT = scratch_acts.lookup(&_az);
+    if (!ACT) return XDP_PASS;
+
     long long out[MLH_MAX_H];
     long long best_val = -9999999LL;
     int best_cls = 0;
@@ -532,18 +569,11 @@ int layer_hidden(struct xdp_md *ctx) {
     #pragma unroll
     for (int j = 0; j < MLH_MAX_H; j++) {
         if (j >= n_out) { out[j] = 0LL; continue; }
-        int bidx = woff + bias_off + j;
-        __u8 *bp = layer_weights.lookup(&bidx);
-        long long acc = bp ? (long long)WEIGHT(bp) : 0LL;
+        long long acc = LW_W(LW, woff + bias_off + j);
         #pragma unroll
         for (int i = 0; i < MLH_MAX_H; i++) {
             if (i >= n_in) continue;
-            int fi = i;
-            long long *xp = scratch_acts.lookup(&fi);
-            long long x = xp ? *xp : 0LL;
-            int widx = woff + j * n_in + i;
-            __u8 *wp = layer_weights.lookup(&widx);
-            if (wp) acc += x * (long long)WEIGHT(wp);
+            acc += ACT->v[i] * LW_W(LW, woff + j * n_in + i);
         }
         if (is_last) {
             if (acc > best_val) { best_val = acc; best_cls = j; }
@@ -553,11 +583,10 @@ int layer_hidden(struct xdp_md *ctx) {
     }
 
     if (!is_last) {
+        /* Stores through the pointer already looked up above -- no extra
+         * helper call per slot. */
         #pragma unroll
-        for (int j = 0; j < MLH_MAX_H; j++) {
-            int ki = j;
-            scratch_acts.update(&ki, &out[j]);
-        }
+        for (int j = 0; j < MLH_MAX_H; j++) ACT->v[j] = out[j];
         int li = META_LAYER_IDX;
         long long nv = (long long)(layer_idx + 1);
         scratch_meta.update(&li, &nv);
@@ -668,10 +697,17 @@ def load_modular_weights(
         layer_offsets.append(offset)
         offset += n_in * n_out + n_out
 
+    # layer_weights is ONE struct-valued entry holding the whole weight block
+    # (see the lw_blk declaration in the eBPF source), so registering a model is
+    # a read-modify-write of that single entry -- ONE map update instead of one
+    # per weight. Read-modify matters: several model_id's share the block at
+    # different base_offsets, so writing a fresh buffer would wipe the models
+    # registered before this one.
+    lw_tbl = bpf_obj["layer_weights"]
+    blk = lw_tbl[c_uint32(0)]
     for idx, w in enumerate(weights_int8[:total_weights]):
-        key = c_uint32(base_offset + idx)
-        val = c_uint8(int(w) & 0xFF)
-        bpf_obj["layer_weights"][key] = val
+        blk.w[base_offset + idx] = int(w) & 0xFF
+    lw_tbl[c_uint32(0)] = blk
 
     class LayerShapeKey(Structure):
         _pack_ = 1
