@@ -223,12 +223,14 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
         for i in range(N_H1):
             acc += h1[i] * s8(weights[off_fc2_w + j * N_H1 + i])
         h2.append(max(0, acc))
-    best_val, best_cls = -10**9, 0
+    # No numeric sentinel: the logits are unbounded int64-scale accumulations, so
+    # any finite starting value can be above ALL of them and pin best_cls to 0.
+    best_val, best_cls = None, 0
     for k in range(N_OUT):
         acc = s8(weights[off_out_b + k])
         for i in range(N_H2):
             acc += h2[i] * s8(weights[off_out_w + k * N_H2 + i])
-        if acc > best_val:
+        if best_val is None or acc > best_val:
             best_val, best_cls = acc, k
     return best_cls, best_val, h1, h2
 
@@ -307,9 +309,9 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
             nxt.append(acc if is_out else max(0, acc))
         acts = nxt
 
-    best_val, best_cls = -10**9, 0
+    best_val, best_cls = None, 0
     for k, v in enumerate(acts):
-        if v > best_val:
+        if best_val is None or v > best_val:
             best_val, best_cls = v, k
     return best_cls, best_val
 

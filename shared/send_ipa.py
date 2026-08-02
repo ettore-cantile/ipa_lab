@@ -165,6 +165,7 @@ def send_packets(
     print()
 
     # Use raw IP socket to set TTL per-packet
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl_max)
@@ -187,7 +188,11 @@ def send_packets(
         print("[send_ipa] PermissionError: try running with sudo")
         sys.exit(1)
     finally:
-        sock.close()
+        # socket() itself can raise (e.g. PermissionError), in which case `sock`
+        # was never bound -- closing it unconditionally masked the real error
+        # with a NameError.
+        if sock is not None:
+            sock.close()
 
 
 def main():

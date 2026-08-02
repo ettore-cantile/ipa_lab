@@ -198,6 +198,12 @@ EBPF_TEMPLATE_ARCH_DISPATCHER = r"""
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
 
+/* Same fallback ebpf_program.py carries: some Kathara/minimal-header setups do
+ * not get IPPROTO_UDP from the includes above. RFC 791 value. */
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 17
+#endif
+
 struct ipa_hdr {
     __u8   model_id;
     __u8   model_type;
@@ -314,9 +320,18 @@ int ipa_switch_template(struct xdp_md *ctx) {
 
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
-    if (ip->protocol != IPPROTO_UDP)  return XDP_PASS;
+    /* Same FIX(#4) Pipeline 1 already applies (see ebpf_program.py): read the
+     * protocol at its absolute RFC 791 offset (byte 9) instead of ip->protocol,
+     * because struct iphdr's ihl:4/version:4 bitfield can be packed differently
+     * by clang against the minimal headers in the Kathara images, making every
+     * UDP packet fail the check; and derive the UDP header from the real ihl*4
+     * instead of sizeof(struct iphdr), which is wrong when IP options present. */
+    __u8 ip_proto = *((__u8 *)ip + 9);
+    if (ip_proto != IPPROTO_UDP)  return XDP_PASS;
 
-    struct udphdr *udp = (struct udphdr *)(ip + 1);
+    __u32 _ip_hlen = (((__u8 *)ip)[0] & 0x0fU) << 2U;
+    if (_ip_hlen < 20U) return XDP_PASS;
+    struct udphdr *udp = (struct udphdr *)((void *)ip + _ip_hlen);
     if ((void *)(udp + 1) > data_end) return XDP_PASS;
     if (udp->dest != bpf_htons(9999))  return XDP_PASS;
 
@@ -421,8 +436,12 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end)  return XDP_PASS;
-    if (ip->protocol != IPPROTO_UDP)   return XDP_PASS;
-    struct udphdr *udp = (struct udphdr *)(ip + 1);
+    /* FIX(#4), same as the dispatcher above: byte-9 protocol read + ihl*4. */
+    __u8 ip_proto = *((__u8 *)ip + 9);
+    if (ip_proto != IPPROTO_UDP)   return XDP_PASS;
+    __u32 _ip_hlen = (((__u8 *)ip)[0] & 0x0fU) << 2U;
+    if (_ip_hlen < 20U) return XDP_PASS;
+    struct udphdr *udp = (struct udphdr *)((void *)ip + _ip_hlen);
     if ((void *)(udp + 1) > data_end)  return XDP_PASS;
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end)  return XDP_PASS;
@@ -568,7 +587,15 @@ int arch_generic_2layer(struct xdp_md *ctx) {
 
     /* Same trick: h2[i]==0 for i>=n_h2, so the output loop is always
      * unrolled to T2_MAX_H2 regardless of this model's actual n_h2. */
-    long long best_val = -9999999LL;
+    /* Sentinel must be LOWER than any reachable logit, otherwise a model whose
+     * output logits are ALL below it never updates best_cls and silently
+     * argmaxes to class 0. That is reachable here: h1/h2 are unbounded int64
+     * ReLU accumulations (ttl up to 255 x int8 weights, then two more int8
+     * layers), so |logit| can reach ~1e9 -- far past the old -9999999 (-1e7)
+     * sentinel. It also has to match the Python reference argmax in
+     * verify_prog_run.ref_infer*, which uses a true minimum. LLONG_MIN written
+     * as (-MAX - 1) so the literal itself stays in range. */
+    long long best_val = -9223372036854775807LL - 1LL;
     int best_cls = 0;
     #pragma unroll
     for (int k = 0; k < T2_N_OUT; k++) {

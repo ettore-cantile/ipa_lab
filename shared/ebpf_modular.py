@@ -123,6 +123,12 @@ EBPF_MODULAR_COMMON_HEADER = r"""
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
 
+/* Same fallback ebpf_program.py carries: some Kathara/minimal-header setups do
+ * not get IPPROTO_UDP from the includes above. RFC 791 value. */
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 17
+#endif
+
 struct ipa_hdr {
     __u8   model_id;
     __u8   model_type;
@@ -323,7 +329,12 @@ int modular_dispatcher(struct xdp_md *ctx) {
      * to avoid bitfield packing ambiguity -- see ebpf_program.py FIX(#4). */
     __u8 ip_proto = *((__u8 *)ip + 9);
     if (ip_proto != IPPROTO_UDP)   return XDP_PASS;
-    struct udphdr *udp = (struct udphdr *)(ip + 1);
+    /* ...and derive the UDP header from the real ihl*4, not sizeof(struct
+     * iphdr): the second half of the same FIX(#4), which was applied to the
+     * protocol read here but not to this offset. Wrong whenever ihl > 5. */
+    __u32 _ip_hlen = (((__u8 *)ip)[0] & 0x0fU) << 2U;
+    if (_ip_hlen < 20U) return XDP_PASS;
+    struct udphdr *udp = (struct udphdr *)((void *)ip + _ip_hlen);
     if ((void *)(udp + 1) > data_end)  return XDP_PASS;
     if (udp->dest != bpf_htons(9999))  return XDP_PASS;
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
@@ -443,7 +454,11 @@ int layer_first(struct xdp_md *ctx) {
     if (!LW) return XDP_PASS;
 
     long long out[ML1_MAX_H1];
-    long long best_val = -9999999LL;
+    /* LLONG_MIN, not -1e7: the logits of a 1-layer model are unbounded int64
+     * accumulations (ttl up to 255 x int8 weights), so an all-negative output
+     * row below the old -9999999 sentinel would leave best_cls at its initial
+     * 0 instead of the real argmax. Same fix as ebpf_template_arch.py. */
+    long long best_val = -9223372036854775807LL - 1LL;
     int best_cls = 0;
 
     #pragma unroll
@@ -563,7 +578,8 @@ int layer_hidden(struct xdp_md *ctx) {
     if (!ACT) return XDP_PASS;
 
     long long out[MLH_MAX_H];
-    long long best_val = -9999999LL;
+    /* LLONG_MIN sentinel -- see layer_first / ebpf_template_arch.py. */
+    long long best_val = -9223372036854775807LL - 1LL;
     int best_cls = 0;
 
     #pragma unroll

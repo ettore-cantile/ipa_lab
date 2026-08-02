@@ -142,11 +142,14 @@ For the full metric comparison across pipelines:
         # Pipeline 1 — weights hardcoded as C literals, unrolled inference.
         if args.verify_only:
             # Verifier smoke test via the BCC generator (no attach, no offline clang).
+            # Forward the RESOLVED model_path, not args.model: this process has
+            # already os.chdir'd into SHARED_DIR, so method4_hardcoded.py's own
+            # default ("shared/frr_...pt", relative) would resolve to
+            # shared/shared/frr_...pt and fail to load.
             sys.argv = ["method4_hardcoded.py", "--verify-only",
                         "--iface", args.iface,
-                        "--model-id", str(args.model_id)]
-            if args.model:
-                sys.argv += ["--model", args.model]
+                        "--model-id", str(args.model_id),
+                        "--model", model_path]
             runpy.run_path(
                 os.path.join(SHARED_DIR, "methods", "method4_hardcoded.py"),
                 run_name="__main__"
@@ -160,9 +163,9 @@ For the full metric comparison across pipelines:
             # internally by the test suite (verify_prog_run.py etc.) to
             # compile-and-verify offline, which is a different concern from
             # what actually runs on the datapath node.
-            sys.argv = ["method4_hardcoded_aot.py", "--iface", args.iface]
-            if args.model:
-                sys.argv += ["--model", args.model]
+            # Same reason as above: pass the already-resolved absolute path.
+            sys.argv = ["method4_hardcoded_aot.py", "--iface", args.iface,
+                        "--model", model_path]
             runpy.run_path(
                 os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py"),
                 run_name="__main__"

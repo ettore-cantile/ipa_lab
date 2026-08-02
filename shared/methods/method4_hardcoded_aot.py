@@ -316,11 +316,16 @@ def main():
     print("=" * 64)
 
     if not args.keep:
-        for p in (c_path, o_path):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        # Only the generated .c is disposable. The .o must SURVIVE: it is the
+        # prebuilt artifact the no-clang deploy path reuses (see the
+        # "reusing prebuilt" branch above, and the --iface live deploy), and
+        # shared/ is bind-mounted into every Kathara node -- deleting it here
+        # meant a single bench run on the host wiped the object the datapath
+        # nodes load.
+        try:
+            os.remove(c_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

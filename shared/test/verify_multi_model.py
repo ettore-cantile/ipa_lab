@@ -79,7 +79,11 @@ def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int, if
         offset += n_in * n_out + n_out
 
     acts = x
-    best_cls, best_val = 0, -10**9
+    # best_val starts undefined rather than at a finite sentinel: the logits are
+    # unbounded int64-scale accumulations, so an all-below-sentinel output row
+    # would pin best_cls to 0 instead of the real argmax (same fix as the eBPF
+    # side in ebpf_template_arch.py / ebpf_modular.py).
+    best_cls, best_val = 0, None
     for li, (n_in, n_out) in enumerate(layer_dims):
         woff = layer_offsets[li]
         bias_off = n_in * n_out
@@ -89,7 +93,7 @@ def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int, if
             acc = s8(weights[woff + bias_off + j])
             for i in range(n_in):
                 acc += acts[i] * s8(weights[woff + j * n_in + i])
-            if is_last and acc > best_val:
+            if is_last and (best_val is None or acc > best_val):
                 best_val, best_cls = acc, j
             out.append(acc if is_last else max(0, acc))
         acts = out
