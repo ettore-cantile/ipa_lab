@@ -368,7 +368,7 @@ def suite_core(model, verbose=False):
     passed = total = 0
 
     print(f"{YELLOW}[Test 1] Output consistency & argmax ({N} samples){NC}")
-    mm = {2: 0, 3: 0}
+    mm = {1: 0, 2: 0, 3: 0}
     me = {1: 0.0, 2: 0.0, 3: 0.0}
     for i in range(N):
         x = make_input(I)
@@ -380,20 +380,39 @@ def suite_core(model, verbose=False):
         me[1] = max(me[1], float(np.max(np.abs(o1 - ref))))
         me[2] = max(me[2], float(np.max(np.abs(o2 - ref))))
         me[3] = max(me[3], float(np.max(np.abs(o3 - ref))))
-        a2, a3 = int(np.argmax(o2)), int(np.argmax(o3))
+        a1, a2, a3 = int(np.argmax(o1)), int(np.argmax(o2)), int(np.argmax(o3))
+        if a1 != nr:
+            mm[1] += 1
         if a2 != nr:
             mm[2] += 1
         if a3 != nr:
             mm[3] += 1
         if verbose:
             print(f"    [sample {i:02d}] ref={decode_nexthop(nr)} "
-                  f"| M1={decode_nexthop(int(np.argmax(o1)))} "
+                  f"| M1={decode_nexthop(a1)} "
                   f"| M2={decode_nexthop(a2)} "
                   f"| M3={decode_nexthop(a3)}")
 
+    # Method 1's agreement used to be asserted without ever being computed: mm
+    # had no key 1, the loop never compared a1 against nr, and the line below
+    # printed "argmax 100% correct" with an unconditional passed += 1. It could
+    # not fail. It is a real (if trivially satisfied) check now.
+    #
+    # What it does and does NOT establish: Method1_Hardcoded here holds the
+    # model's FLOAT weights and does a float matmul, so it is numerically the
+    # same computation as pytorch_ref -- agreement is expected by construction
+    # and max_err is ~0. This is a self-consistency check on the harness, NOT
+    # evidence about the deployed int8-literal Pipeline 1. That evidence comes
+    # from the kernel suite, which compares the real XDP program's argmax
+    # against an independent integer Python reference (verify_prog_run.ref_infer).
     total += 1
-    passed += 1
-    ok(f"Method 1 (hardcoded): argmax 100% correct | max_err={me[1]:.6f}")
+    if mm[1] == 0:
+        passed += 1
+        ok(f"Method 1 (float reference, no quantization): argmax {N}/{N} == PyTorch "
+           f"| max_err={me[1]:.6f}  [harness self-check; quantized P1 is covered by --only kernel]")
+    else:
+        fail(f"Method 1 (float reference): {mm[1]}/{N} argmax differ from PyTorch "
+             f"| max_err={me[1]:.6f} -- the float path must match exactly, this is a harness bug")
 
     for mid, name in [(2, 'template'), (3, 'modular')]:
         total += 1
@@ -414,14 +433,20 @@ def suite_core(model, verbose=False):
             fail(f"Method {mid} ({name}): quant error HIGH ({me[mid]:.4f} > {tol:.4f})")
 
     print(f"\n{YELLOW}[Test 2] Weight update latency (10 updates){NC}")
-    # M1_REDIRECT_SIM_MS is the *nominal* duration chosen to simulate the
-    # eBPF program redirect/reload step for Method 1 (bpf_prog_load + iface
-    # attach).  It is printed here so that it is always visible next to the
-    # measured times, making clear what portion of Method 1's total latency
-    # comes from the redirect and what comes from the actual weight copy.
-    info(f"Method 1 redirect/reload simulation: nominal={M1_REDIRECT_SIM_MS:.1f} ms "
-         f"(models the cost of bpf_prog_load + iface attach in the real eBPF case)")
-    info("Method 2/3 have no redirect step — their update = map insert only")
+    # M1_REDIRECT_SIM_MS is a PLACEHOLDER sleep, not a measurement, and it is
+    # three orders of magnitude below the real thing. Stating that loudly here
+    # matters: the numbers below would otherwise read as "Method 1 updates in
+    # ~1 ms", the exact opposite of the design-space result the kernel suite
+    # actually measures (regenerating the C, running clang and reloading the
+    # program costs ~1.1-1.3 s -- see the "[M1 update timing]" line in
+    # --only kernel, and bench_model_add.py for the per-phase breakdown).
+    # The placeholder is kept small deliberately so --only core stays fast;
+    # only the M2/M3 numbers in this test are real measurements.
+    info(f"Method 1 redirect/reload: PLACEHOLDER sleep of {M1_REDIRECT_SIM_MS:.1f} ms — NOT a measurement.")
+    info("      The REAL cost (regenerate C + clang + reload) is ~1.1-1.3 s, i.e. ~1000x this")
+    info("      placeholder. Measured by: --only kernel ([M1 update timing]) and bench_model_add.py.")
+    info("      Do NOT quote the Method 1 rows below as a result.")
+    info("Method 2/3 have no redirect step — their update = map insert only (these ARE measured)")
     print()
 
     times = {
@@ -442,25 +467,30 @@ def suite_core(model, verbose=False):
         times[3].append(m3.update_weights(nm) * 1000)
         times['3s'].append(m3.update_weights(nm, layer_idx=2) * 1000)
 
+    # Headline statistic is the MINIMUM, matching bench_model_add.py and the
+    # kernel suite: the noise here is one-sided (scheduler/interrupts can only
+    # slow a sample down, never speed it below its true cost), and the mean is
+    # dominated by the first update, which pays first-touch page faults the
+    # later ones do not. avg/max are kept alongside for transparency.
     for key, lbl in [
-        ('1_redirect', 'Method 1 hardcoded (redirect/reload only) [sim]'),
+        ('1_redirect', 'Method 1 hardcoded (redirect/reload)      [PLACEHOLDER, not measured]'),
         ('1_insert',   'Method 1 hardcoded (weight insert only)   [fair vs M2/M3]'),
-        ('1_total',    'Method 1 hardcoded (redirect + weight insert, total)'),
+        ('1_total',    'Method 1 hardcoded (redirect + insert)    [PLACEHOLDER-dominated]'),
         (2,            'Method 2 template  (map update)'),
         (3,            'Method 3 modular   (all layers)'),
         ('3s',         'Method 3 modular   (single layer hot-swap)')
     ]:
-        avg = sum(times[key]) / 10
-        info(f"{lbl}: avg={avg:.3f}ms  max={max(times[key]):.3f}ms")
+        vals = times[key]
+        info(f"{lbl}: min={min(vals):.3f}ms  avg={sum(vals)/len(vals):.3f}ms  max={max(vals):.3f}ms")
 
     print()
     info("NOTE: to compare M1 fairly against M2/M3, use 'weight insert only'.")
-    info(f"      The redirect/reload overhead (~{M1_REDIRECT_SIM_MS:.1f} ms nominal) is an")
-    info("      architectural cost specific to M1 and must be reported separately.")
+    info("      M1's real architectural cost is the recompile+reload, which this suite")
+    info("      does NOT measure — see --only kernel / bench_model_add.py.")
 
     total += 1
     passed += 1
-    ok("Update latency measured — Method 1 split into redirect and weight insert")
+    ok("Update latency measured for M2/M3 (M1 redirect is a placeholder — see --only kernel)")
 
     print(f"\n{YELLOW}[Test 3] Determinism (100 runs){NC}")
     xf = make_input(I)

@@ -6,13 +6,19 @@ Uses the same paper-compliant IPA_HDR as send_ipa.py (21 fixed bytes).
 Sends N packets with random TTL values (30-64) and configurable model_id.
 
 scale_factor note in the IPA header:
-  The kernel does NOT use scale_factor from the header for inference -
-  it always uses the one from model_cache loaded by the CP.
-  The field is still populated correctly (default 128) for paper-format
-  completeness and for Method 4 (used by the CP).
+  The kernel does NOT use scale_factor from the header for inference. Each
+  pipeline uses the scale its control plane registered: baked into the C
+  literals (P1), arch_registry (P2), layer_registry (P3). The field is still
+  populated correctly (default 128) for paper-format completeness.
+  The only header field the datapath actually reads is model_id, which selects
+  the registered model to run.
 
-For Method 4, use --weights-file: the FIRST packet embeds the weights,
-and the following packets are sent without payload (model already in cache).
+--weights-file is a leftover from the old "model travels in the packet" demo:
+the FIRST packet embeds the weights in its payload. NONE of the three current
+pipelines reads that payload -- they all load weights out-of-band at control-plane
+registration time -- so the flag only changes the packet SIZE. Kept because a
+realistically sized first packet is still useful, and because an in-band
+cache-miss path would reuse exactly this framing.
 
 Usage:
   python3 shared/test/test_ipa.py [--dest HOST] [--count N] [--delay SEC]
@@ -32,11 +38,18 @@ import json
 from scapy.all import send, IP, UDP, Packet, Raw
 from scapy.fields import ByteField, ShortField
 
+# Feature codes -- must match model_meta.FEATURE_CODE (the single source of
+# truth shared by the descriptor registries of all three pipelines).
 FEAT_LINK_STATE = 0x01
 FEAT_INGRESS_IF = 0x02
 FEAT_TTL        = 0x03
 FEAT_NODE_ID    = 0x04
-OUT_NEXT_HOP    = 0x05
+# Output codes live in their OWN namespace (they describe what the model
+# predicts, not what it reads), so this 0x01 does not clash with
+# FEAT_LINK_STATE. It was 0x05 here and 0x01 in send_ipa.py, which made the
+# two senders emit different header bytes for the same model; aligned on 0x01.
+# The datapath reads neither -- only model_id.
+OUT_NEXT_HOP    = 0x01
 
 
 class IPA_HDR(Packet):

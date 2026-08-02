@@ -18,18 +18,21 @@ even start ("cannot open shared object file") -- the whole point of
 building it elsewhere is defeated if it still needs libbpf.so present on
 every node it runs on.
 
-This removes the ~1660 ms of clang-at-runtime that the old BCC path paid on
-every (re)load, while keeping the exact same literal-weights performance.
+This removes the ~1.3 s of clang-at-runtime that the old BCC path paid on
+every (re)load, while keeping the literal-weights performance.
 
 Topology dimensions (n_interfaces, n_nodes, n_queues) come from
 topology_config.json — a file that describes the NETWORK TOPOLOGY shared
 by all nodes in the same deployment. If absent, DEFAULT_TOPOLOGY_CONFIG
 (historical 6/52) is used.
 
-The problem (measured, method4 BCC path):
-    [M1 update timing] redirect/reload (BPF compile+load): ~1660 ms
-    -> 99.8% of that is clang compiling the weights-literal C at runtime, on the
-       datapath node, for EVERY new/modified model.
+The problem (measured, method4 BCC path -- the "[M1 update timing]" line printed
+by verify_prog_run.py / test_suite.py --only kernel):
+    [M1 update timing] redirect/reload (BPF compile+load): ~1.3 s
+    -> the large majority of that is clang compiling the weights-literal C at
+       runtime, on the datapath node, for EVERY new/modified model.
+    The exact figure is machine-dependent (observed 1.26-1.66 s across boxes);
+    always quote the number your own run printed, not one from this comment.
 
 The alternative, for the "models known a priori" case (exactly the hardcoded
 assumption): compile the weights-literal program OFFLINE, once, on a build box,
@@ -37,8 +40,13 @@ into a plain BPF .o (clang, libbpf dialect, weights as C literals). At runtime
 the datapath node only does bpf_object__open_file + bpf_object__load -> a few ms,
 NO clang. Because the weights are still C literals compiled by clang -O2, the
 per-weight strength reduction (x*0 folded away, x*8 -> shift) is preserved, so
-performance stays at the literal maximum -- identical to BCC at the same
-architecture (measured: ~69 vs ~66 ns/pkt).
+performance stays in the same class as BCC at the same architecture -- NOT
+bit-identical, though: the two go through different clang versions and different
+map-access dialects, so the generated programs differ slightly. A recent run
+measured 1026 xlated instructions (28 dispatcher + 998 model) at 57 ns/pkt for
+AOT against 997 (29 + 968) at 48 ns/pkt for BCC in the same session. Both
+numbers are machine- and toolchain-dependent; re-measure rather than quoting
+these.
 
 What this script does:
     0. with --iface: LIVE DEPLOY -- attach the prebuilt .o to that interface
@@ -309,7 +317,12 @@ def main():
     print(" SUMMARY: BCC (runtime clang) vs AOT-literal (offline .o)")
     print("=" * 64)
     build_str = f"{build_ms:>7.1f} ms" if build_ms is not None else "  (reused prebuilt .o -- no clang on this node)"
-    print(f"  BCC method4 (re)load    : ~1660 ms  (clang at runtime, every model)")
+    # Reference value, NOT measured by this script (it never runs the BCC path).
+    # Say so, so the line is not read as a fresh measurement sitting next to
+    # three that are. The live figure is the "[M1 update timing]" line printed
+    # by test_suite.py --only kernel on this same machine.
+    print(f"  BCC method4 (re)load    : ~1.3 s    (reference, NOT measured here --")
+    print(f"                                       see '[M1 update timing]' in --only kernel)")
     print(f"  AOT offline build       : {build_str}  (clang once, on build box)")
     print(f"  AOT runtime deploy      : ~few ms   (open+load only -- see [deploy] above)")
     print(f"  performance             : literal maximum preserved (see [perf] above)")

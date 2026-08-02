@@ -4,8 +4,9 @@ extract_weights.py  (design-space-docs branch)
 Extracts int8-quantized weights from the FRR model checkpoint.
 
 When run directly:  produces weights.json and weights_float.json
-When imported:      provides extract_weights_int8() used by pipeline_benchmark.py
-                    and method5/method6.
+When imported:      provides extract_weights_int8(), used by ebpf_program.py
+                    (Pipeline 1 codegen), poc_aot/gen_full_c.py (AOT literal
+                    generator) and test/verify_prog_run.py.
 
 Architecture fixed to the germany50/5 checkpoint:
   n_interfaces=6, n_nodes=52, hidden_dim=4

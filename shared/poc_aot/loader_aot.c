@@ -1,8 +1,10 @@
 // loader_aot.c -- AOT-literal deploy bench for Pipeline 1 (alternative to BCC).
 //
 // The BCC hardcoded path (method4_hardcoded.py) compiles the weights-literal C
-// with clang AT RUNTIME on every (re)load -> ~1660 ms of clang on the datapath
-// node for each new/modified model. This loader demonstrates the alternative
+// with clang AT RUNTIME on every (re)load -> ~1.3 s of clang on the datapath
+// node for each new/modified model (machine-dependent; 1.26-1.66 s observed --
+// the live figure is the "[M1 update timing]" line printed by
+// test_suite.py --only kernel). This loader demonstrates the alternative
 // for the "models known a priori" case (the hardcoded assumption): the literal
 // .o is built OFFLINE (once, on a build box); at runtime the datapath node only
 // does bpf_object__open_file + bpf_object__load -- no clang -> a few ms.
@@ -149,7 +151,8 @@ int main(int argc, char **argv) {
         printf(" AOT-literal LIVE deploy (Pipeline 1) -- NO clang on this node\n");
         printf("================================================================\n");
         printf("[deploy] open+load (verify+JIT): %.3f ms  "
-               "(BCC method4 recompile for the same model: ~1660 ms of clang)\n", t2 - t0);
+               "(BCC recompile of the same model: ~1.3 s, reference not measured here)\n",
+               t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d. Ctrl-C to detach.\n",
                attach_ifindex);
         /* Flush now: when stdout is a pipe (e.g. under `kathara exec`, not a
@@ -186,7 +189,8 @@ int main(int argc, char **argv) {
     printf("   open_file           : %8.3f ms\n", t1 - t0);
     printf("   load (verify+JIT)   : %8.3f ms\n", t2 - t1);
     printf("   total deploy        : %8.3f ms\n", t2 - t0);
-    printf("   (BCC method4 recompile for the same model: ~1660 ms of clang)\n\n");
+    printf("   (BCC recompile of the same model: ~1.3 s -- reference value, NOT\n");
+    printf("    measured by this loader; see '[M1 update timing]' in --only kernel)\n\n");
     printf("[perf] full-path per-packet cost (BPF_PROG_TEST_RUN on dispatcher, 1e6 reps, retval=%u):\n", o.retval);
     printf("   xlated insns        : %8ld   (dispatch %ld + model %ld)\n", insn_total, insn_disp, insn_model);
     printf("   latency             : %8.1f ns/pkt\n", ns);

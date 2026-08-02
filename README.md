@@ -32,7 +32,7 @@ The experimental setup uses the **Germany50** topology from the [SNDlib reposito
 | Destination host | `h_dst` attached to **Flensburg** |
 | Max simultaneous failures | 10 |
 
-The topology is imported from `germany50.xml` via `importSNDLib.py`, which also generates the Kathara-compatible `germany_kathara.xml` lab configuration.
+The topology lives in `germany50.xml` (SNDlib format). `genera_lab.py` parses it and emits the Kathara lab: `lab.conf` (collision domains and interface assignment) plus one `<node>.startup` per node (IP addressing, loopbacks, `/etc/hosts`, FRR/OSPF configuration). `importSNDLib.py` is a separate analysis helper that loads the same XML into a NetworkX graph for topology statistics and plotting.
 
 ---
 
@@ -40,361 +40,224 @@ The topology is imported from `germany50.xml` via `importSNDLib.py`, which also 
 
 ```
 ipa_lab/
-├── shared/
-│   ├── switch_core.py          # Entry point: selects and runs the chosen method
-│   ├── ebpf_program.py         # eBPF/XDP C code shared by all methods
-│   ├── common.py               # Shared helpers (load_bpf, populate tables, stats_loop…)
-│   ├── send_ipa.py             # Scapy sender: builds and sends a single IPA packet
-│   ├── test/test_ipa.py        # Scapy sender: performance tester (N packets)
-│   ├── weights.json            # Int8 weights — PTQ (Method 1)
-│   ├── weights_float.json      # Float weights + scale_factor — PTQ reference
-│   ├── weights_method2.json    # Int8 weights — QAT (Method 2, 3, 4)
-│   └── methods/
-│       ├── method1_ptq.py      # Method 1 — Post-Training Quantization
-│       ├── method2_qat.py      # Method 2 — Quantization-Aware Training
-│       ├── method3_openflow.py # Method 3 — OpenFlow-like on-demand CP
-│       └── method4_ipa_demo.py # Method 4 — IPA Demo (model travels in packet)
-├── execute_pipeline.py          # Training pipeline (PTQ or QAT)
-└── extract_weights.py          # Exports float/int8 weights to JSON
+├── genera_lab.py                    # Generates lab.conf + <node>.startup from germany50.xml
+├── importSNDLib.py                  # SNDlib XML -> NetworkX topology (analysis helper)
+├── germany50.xml                    # SNDlib Germany50 topology
+├── lab.conf, <node>.startup         # Generated Kathara lab (52 nodes)
+├── Dockerfile                       # kathara/frr_ebpf image (FRR + BCC + eBPF headers)
+├── docs/
+│   ├── testing.md                   # Test guide + measured results
+│   └── tesi_ipa.tex                 # Thesis text
+└── shared/                          # Bind-mounted into every Kathara node as /shared
+    ├── execute_pipeline.py          # SINGLE ENTRY POINT: --method hardcoded|template|modular
+    ├── model_meta.py                # Feature catalog, topology_config, shape derivation
+    ├── ebpf_program.py              # Pipeline 1 codegen (weights as C literals, BCC dialect)
+    ├── ebpf_template_arch.py        # Pipeline 2 eBPF source + arch_weights control plane
+    ├── ebpf_modular.py              # Pipeline 3 eBPF source + layer_weights control plane
+    ├── common.py                    # mac_table install, ARP refresh, XDP attach/detach
+    ├── link_state_monitor.py        # Seeds link_state[] from real carrier state
+    ├── queue_state_monitor.py       # Seeds queue_state[] (synthetic, demo feature)
+    ├── extract_weights.py           # .pt -> weights.json / weights_float.json
+    ├── FRR_model.py                 # PyTorch MLP definition (training-side)
+    ├── frr_germany50_5_model_4x2.pt # Trained checkpoint (65-4-4-7)
+    ├── weights.json                 # int8 weights (319 values, scale=24)
+    ├── weights_float.json           # float weights + scale_factor
+    ├── send_ipa.py                  # Single/N-packet IPA sender (struct.pack)
+    ├── recv_ipa.py                  # IPA listener (use only with XDP detached)
+    ├── methods/
+    │   ├── method4_hardcoded.py     # P1 compile-and-verify (BCC, no attach)
+    │   ├── method4_hardcoded_aot.py # P1 deploy: AOT-literal .o + libbpf loader
+    │   ├── method5_template.py      # P2 deploy
+    │   └── method6_modular.py       # P3 deploy
+    ├── poc_aot/
+    │   ├── gen_full_c.py            # Descriptor-driven libbpf-dialect literal generator
+    │   ├── loader_aot.c             # Static libbpf loader (bench + live attach)
+    │   └── nn_aot_arch.o            # Prebuilt object, deployed to nodes without clang
+    └── test/
+        ├── test_suite.py            # All suites: core/pktstats/extract/quant/robust/kernel
+        ├── verify_prog_run.py       # Per-pipeline kernel verifier (BPF_PROG_TEST_RUN)
+        ├── verify_multi_model.py    # Concurrent multi-model registration proof
+        ├── bench_model_add.py       # Real cost of registering a new model_id
+        ├── bench_depth_vs_width.py  # Width-vs-depth trade-off sweep (P1)
+        ├── bench_tailcall_overhead.py # Isolated bpf_tail_call cost
+        └── test_ipa.py              # Scapy multi-packet sender
 ```
+
+> **Historical note.** The preliminary phase of this project was organised around
+> `switch_core.py` and four *methods* (PTQ / QAT / OpenFlow-like / IPA-demo)
+> exploring quantization and table-population strategies, with a deliberately
+> minimal four-term dot product in the kernel and two maps (`model_cache`,
+> `fwd_table`). That code is preserved, with its own README, on the
+> **`ipa-poc-preliminare`** branch. `main` is organised instead around a **design
+> space of three eBPF pipelines** that all run the *same* quantized multi-layer
+> model and differ only in *where the weights live and what can change without
+> recompiling*. The two branches are successive stages of one project, not
+> alternatives; the narrative link between them is in `docs/tesi_ipa.tex`.
+
+---
+
+## The three pipelines
+
+All three parse `Ethernet → IP → UDP:9999 → IPA header`, build the model's input
+vector **locally on the node**, run the same integer MLP, take the argmax, and
+resolve it to a physical action through a `mac_table` (class → `{ifindex,
+src_mac, dst_mac}` → `bpf_redirect`). The last class is DROP.
+
+| | **P1 hardcoded** | **P2 template** | **P3 modular** |
+|---|---|---|---|
+| Where the weights live | C literals in the program | `arch_weights` map | `layer_weights` map |
+| Changeable without recompiling | nothing | layer **widths** | widths **and** depth |
+| Compiled eBPF programs | one per model | one per architecture family | two, generic |
+| Tail calls per packet | 1 | 1 | N (= depth) |
+| Intermediate state | none (fully unrolled) | none | per-CPU scratch |
+| Strength reduction | yes | no | no |
+| Model update cost | recompile + reload | one map write | one map write |
+| Per-packet cost | lowest | middle | highest |
+
+The trade-off is structural, not an implementation defect: per-packet cost and
+model-update cost move in **opposite** directions along the progression. Which
+pipeline wins depends on the scenario, not on code quality.
+
+---
+
+## Input vector (descriptor-driven)
+
+The input vector is **not** carried in the packet. It is built on the node from a
+per-model *descriptor* — an ordered list of feature types from
+`model_meta.FEATURE_CATALOG`:
+
+| Feature type | Kind | Read from | Default size |
+|---|---|---|---|
+| `link_state` | dense vector map | `link_state` BPF map (real carrier state) | `n_interfaces` = 6 |
+| `ingress_iface` | one-hot | `ctx->ingress_ifindex` | `n_interfaces` = 6 |
+| `ttl` | scalar | `ip->ttl` | 1 |
+| `node` | one-hot | `ipa->model_id` | `n_nodes` = 52 |
+| `queue_occupancy` | dense vector map | `queue_state` BPF map (synthetic) | `n_queues` = 4 |
+
+Feature **sizes** are a property of the network topology, read from
+`topology_config.json` (falling back to 6 / 52 / 4). Feature **types and order**
+are a property of the model, read from `model_meta.json`. The default descriptor
+`[link_state, ingress_iface, ttl, node]` with `n_out = n_interfaces + 1` gives
+the historical `65-4-4-7` shape.
+
+> **Known limitation — `ingress_iface` is inert on this lab.** P1 maps the kernel
+> ifindex to a logical port through an `ifindex_table` defaulting to `[2..7]`;
+> P2/P3 use the raw ifindex clamped to `[1, n_interfaces]`. Real Kathara nodes get
+> ifindexes like 201/209/217/223, which match neither — so this feature contributes
+> zero on all three pipelines in the live lab. Under `BPF_PROG_TEST_RUN` the
+> sandbox ifindex is 1, which P2/P3 *do* accept and P1 does not, so the two
+> semantics also disagree there (`verify_prog_run.py` models this explicitly with
+> `ref_ifindex = 0 if pipeline == 1 else 1`). Fixing it means resolving real
+> ifindexes at startup and giving P2/P3 an ifindex→port map.
+
+---
+
+## IPA header (21 bytes, on UDP port 9999)
+
+```
+model_id:1  model_type:1  param_size:1  scale_factor:2(BE)
+input_size:1  output_size:1  hidden_layers:1  neurons_per_layer:1
+n_feature_types:1  (feat_code, feat_count) x 4 = 8
+n_output_types:1  out0_code:1  out0_count:1
+```
+
+The datapath reads only `model_id` from this header — it selects which registered
+model to run. **The weight payload that follows is not read by any of the three
+pipelines**: weights are loaded out-of-band by the control plane at registration
+time. The payload exists to keep packets realistically sized. Making the weights
+travel in-band (a true IPA cache-miss path) is future work; see the discussion in
+`docs/tesi_ipa.tex`.
 
 ---
 
 ## How to Run
 
-All commands are run **inside the Kathara containers** from `/shared`.
-`switch_core.py` is launched on the **router node** (e.g. `frankfurt`);
-`test_ipa.py` is launched on a **sender node** (e.g. `darmstadt`).
+### Start the lab
 
 ```bash
-# Method 1 — PTQ (default)
-python3 /shared/switch_core.py ptq
-
-# Method 2 — QAT
-python3 /shared/switch_core.py qat
-
-# Method 3 — OpenFlow-like
-python3 /shared/switch_core.py openflow
-
-# Method 4 — IPA Demo
-python3 /shared/switch_core.py ipa_demo
-
-# Custom model_id (any method)
-python3 /shared/switch_core.py qat 99
+kathara lstart      # 52 nodes, germany50 topology
+kathara linfo
+kathara lclean      # tear down
 ```
+
+### Attach a pipeline (XDP, on the ingress interface)
+
+```bash
+kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method template  --iface eth1 --model-id 0
+kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method modular   --iface eth1 --model-id 0
+kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
+
+# load + verifier check only, no attach
+sudo python3 shared/execute_pipeline.py --method hardcoded --verify-only
+
+# detach a stale program
+kathara exec frankfurt -- ip link set dev eth1 xdp off
+```
+
+All three populate `mac_table` and `link_state` themselves at startup and print
+live `HIT | MISS | DROP` counters. XDP only sees **ingress** traffic, so attach on
+the interface the traffic arrives on (check with `tcpdump -i any -n udp port 9999`).
+
+**Pipeline 1 deploys via AOT only.** The BCC live-attach path was removed; the
+`.o` is built offline on a box with clang and the statically linked `loader_aot`
+attaches it on nodes that have neither clang nor `libbpf.so`. Build both once on
+the host — `shared/` is bind-mounted, so they appear on every node:
+
+```bash
+sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
+python3 shared/methods/method4_hardcoded_aot.py     # builds .o + loader, then benches
+```
+
+### Send traffic
+
+```bash
+kathara exec darmstadt -- python3 /shared/send_ipa.py --dst frankfurt --count 100
+kathara exec darmstadt -- python3 /shared/test/test_ipa.py --dest frankfurt --count 100 --model-id 0
+```
+
+`recv_ipa.py` is only meaningful with **XDP detached**: a TRUE HIT means the
+packet was redirected and never reaches the local IP stack, so the listener
+correctly sees nothing while a pipeline is attached.
 
 ---
 
 ## Testing
 
-All commands below assume the router node is `frankfurt` and the sender node is `darmstadt`.
-Replace node names and `--model-id` as needed for your topology.
-
-### Method 1 — PTQ
+Full guide with expected output in [`docs/testing.md`](docs/testing.md).
 
 ```bash
-# Router (frankfurt)
-python3 /shared/switch_core.py ptq
+# userspace suites (torch + numpy, no root)
+python3 shared/test/test_suite.py --only core
 
-# Sender (darmstadt) — no weight payload needed
-python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
+# in-kernel metrics + dispatch correctness (Linux + BCC + root)
+sudo python3 shared/test/test_suite.py --only kernel
+
+# per-pipeline verifier
+sudo python3 shared/test/verify_prog_run.py --method hardcoded|template|modular|sparse-hetero
+
+# concurrent multi-model registration
+sudo python3 shared/test/verify_multi_model.py
 ```
 
-**Expected:** high FAKE HIT (PTQ quantization error), few or no TRUE HIT, some MISS.
+Correctness criterion, identical across pipelines: pre-install `mac_table`, run
+the program, require the return value to be a redirect or a drop **and** the
+per-class counter of the chosen class to increment, with the chosen class
+compared against an independent integer Python reference that replicates the same
+arithmetic. Accuracy is deliberately an *invariant*, not a variable: all three
+pipelines compute the same integer MLP on the same weights.
+
+Latency is reported as the **minimum of N independent trials**, not the mean:
+system noise here is one-sided (scheduling and interrupts can only slow a sample
+down, never speed it below its true cost), the same reasoning behind `hyperfine`
+and Google Benchmark.
 
 ---
 
-### Method 2 — QAT
+## Regenerating the lab
 
 ```bash
-# Router (frankfurt)
-python3 /shared/switch_core.py qat
-
-# Sender (darmstadt)
-python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
+python3 genera_lab.py     # rewrites lab.conf and every <node>.startup from germany50.xml
 ```
-
-**Expected:** TRUE HIT ~100%, FAKE HIT = 0, MISS = 0.
-
----
-
-### Method 3 — OpenFlow
-
-```bash
-# Router (frankfurt)
-python3 /shared/switch_core.py openflow
-
-# Sender (darmstadt) — first round: all MISS while fwd_table is being populated
-python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
-
-# Sender (darmstadt) — second round: TRUE HIT for TTLs already seen
-python3 /shared/test/test_ipa.py --dest frankfurt --count 30 --model-id 42
-```
-
-**Expected first round:** all MISS + router logs `[CP] FWD MISS | TTL=X -> INSTALLED` for each new TTL.
-
-**Expected second round:** TRUE HIT growing, MISS only for TTL values not yet seen.
-
----
-
-### Method 4 — IPA Demo
-
-```bash
-# Router (frankfurt) — model_cache and fwd_table start empty
-python3 /shared/switch_core.py ipa_demo
-
-# Sender (darmstadt) — first packet carries the model weights in the payload
-python3 /shared/test/test_ipa.py --dest frankfurt --count 30 \
-        --model-id 42 --weights-file /shared/weights_method2.json
-```
-
-The first packet triggers on the router:
-```
-[CP] MODEL MISS | model_id=42 | weights extracted from packet: [42, 35, 127, -58]
-[cache] Model 42 loaded | 4 weights | scale_factor=128
-[CP] model_id=42 LOADED & rule INSTALLED | key=XXXXX | TTL=YY | elapsed=1.XX ms
-[CP] Next packets for model_id=42 -> TRUE HIT (<1 ms)
-```
-
-Subsequent packets with the same TTL produce TRUE HIT directly from the kernel.
-Unseen TTL values trigger `[CP] FWD MISS (safety net)` until their rules are installed.
-
-**Expected at the end:** TRUE HIT growing, FAKE HIT = 0.
-
----
-
-### Single-packet sender (`send_ipa.py`)
-
-```bash
-# Packet without weights (model already in cache)
-python3 /shared/send_ipa.py frankfurt 42
-
-# Packet with weights in payload (Method 4, first packet)
-python3 /shared/send_ipa.py frankfurt 42 /shared/weights_method2.json
-
-# Custom model_id
-python3 /shared/send_ipa.py frankfurt 99 /shared/weights_method2.json
-```
-
----
-
-## Training Pipeline
-
-Run the full pipeline from your local machine (requires Python 3.10+, PyTorch, pandas, networkx, scikit-learn):
-
-```bash
-# Method 1 — standard float training (PTQ)
-python execute_pipeline.py
-
-# Method 2 — Quantization-Aware Training
-python execute_pipeline.py --method qat
-```
-
-The pipeline produces:
-- `frr_germany50_5_model_4x2.pt` (Method 1) or `frr_qat_model.pt` (Method 2)
-- `weights.json` — int8 quantized weights for the eBPF switch
-- `weights_float.json` — float weights + `scale_factor` (PTQ reference)
-
-Copy `weights.json` (and `weights_float.json` for Method 1) into `shared/` before starting the Kathara lab.
-
----
-
-## eBPF Kernel Architecture
-
-`ebpf_program.py` contains the XDP C program shared by all four methods. The kernel:
-
-1. Parses Ethernet → IP → UDP → IPA header from each incoming packet on port 9999.
-2. Looks up the model weights in `model_cache` (keyed by `model_id`).
-3. If the model is **not** in cache, emits a `model_miss_event` to userspace carrying the raw weight bytes extracted from the packet payload (Method 4 only).
-4. Computes the forwarding key via integer dot-product:
-
-```c
-iv[0] = ipa->model_id;   iv[1] = ip->ttl;
-iv[2] = ingress_ifindex; iv[3] = ipa->input_size;
-
-output_raw = sum(iv[i] * (signed char)weights[i]);
-key        = (output_raw + OUTPUT_OFFSET * scale) / scale;
-```
-
-5. Looks up `key` in `fwd_table` → redirects with `bpf_redirect()` or sends a `miss_event` to userspace.
-6. Classifies the packet using `valid_keys` (TTL → correct CP key):
-
-| Result | Condition |
-|---|---|
-| **TRUE HIT** | `fwd_table[key]` found **and** `valid_keys[ttl] == key` |
-| **FAKE HIT** | `fwd_table[key]` found **but** `valid_keys[ttl] != key` |
-| **MISS** | `fwd_table[key]` not found |
-
----
-
-## Forwarding Methods
-
-### Method 1 — Post-Training Quantization (PTQ)
-
-The model is trained in float32 and quantized *a posteriori*. The Control Plane uses the **original float weights** to populate `fwd_table` and `valid_keys`, while the kernel uses the int8 weights. This **intentional asymmetry** produces measurable FAKE HIT and MISS — which quantify the accuracy loss of PTQ.
-
-```python
-# Intentionally uses float weights -> diverges from kernel
-populate_fwd_and_valid_keys(b, action, cp_weights, SCALE_FACTOR,
-                            integer_arithmetic=False)
-```
-
-**Experimental results (30 packets):**
-
-| TRUE HIT | FAKE HIT | MISS |
-|---|---|---|
-| 0 (0%) | 18 (60%) | 12 (40%) |
-
----
-
-### Method 2 — Quantization-Aware Training (QAT)
-
-The model is trained directly with int8 weights using fake-quantization (STE). `SCALE_FACTOR` is fixed at 128. Kernel and CP use identical **pure integer arithmetic** → keys always match.
-
-```python
-# Pure integer arithmetic — identical to kernel
-populate_fwd_and_valid_keys(b, action, int8_weights, SCALE_FACTOR,
-                            integer_arithmetic=True)
-
-# key = (sum(iv[i] * int8(w[i])) + OFFSET * scale) // scale
-```
-
-The `//` operator in Python replicates the C integer division exactly, eliminating the ±1 rounding error that floats introduce.
-
-**Experimental results (30 packets):**
-
-| TRUE HIT | FAKE HIT | MISS |
-|---|---|---|
-| 30 (100%) | 0 (0%) | 0 (0%) |
-
----
-
-### Method 3 — OpenFlow-like (Control Plane on-demand)
-
-`fwd_table` starts **empty**. On every MISS the kernel sends a `miss_event` to the CP via `BPF_PERF_OUTPUT`. The CP installs the rule using `ev.key` directly — no recomputation in user space, zero risk of mismatch.
-
-```python
-def handle_miss(cpu, data, size):
-    ev  = MissEvent.from_buffer_copy(...)
-    key = ev.key  # already computed by kernel — use directly
-    fwd[ctypes.c_ulonglong(key)] = action
-    vk[ctypes.c_uint8(ev.ttl)]   = ctypes.c_ulonglong(key)
-```
-
-**Packet lifecycle:**
-- **First packet** (new TTL) → MISS → CP installs rule → `XDP_PASS`
-- **Subsequent packets** (same TTL) → TRUE HIT → `bpf_redirect`
-- **Warm-up FAKE HIT** → accidental key collisions while table is filling; disappear after convergence
-
-Unlike Methods 1/2, this approach scales to **any** IV combination without hardcoded TTL ranges.
-
-**Experimental results (30 packets — warm-up snapshot):**
-
-| TRUE HIT | FAKE HIT | MISS |
-|---|---|---|
-| 5 (17%) | 14 (47%) | 11 (37%) |
-
-> After convergence (all distinct TTLs seen at least once): TRUE HIT grow steadily, MISS plateau at the number of distinct TTLs in traffic.
-
----
-
-### Method 4 — IPA Demo ("Wow Factor")
-
-This is the **core demonstration of the IPA paradigm** as described in IPA_Demo.pdf. It is a direct evolution of Method 3: both start with empty tables and install rules on-demand, but Method 4 takes one step further — the **model itself travels inside the packet payload** and is unknown to the router at boot time.
-
-#### How it works
-
-`model_cache` **and** `fwd_table` start completely empty. No model is pre-loaded, no rules are pre-installed.
-
-When the **first packet** for a new `model_id` arrives:
-1. The kernel detects the model is missing from `model_cache`.
-2. It reads the 4 raw int8 weight bytes embedded in the UDP payload immediately after the IPA header.
-3. It emits a `model_miss_event` to userspace carrying those weights.
-4. The CP extracts the weights, loads them into `model_cache`, and installs the forwarding rule for that TTL — all in a single callback (~2 ms).
-5. Subsequent TTL values not yet seen trigger `FWD MISS` → safety net installs rules on-demand.
-
-From the **second packet** onwards (same TTL):
-- The kernel finds the model in cache, computes the key, finds the rule → **TRUE HIT** (<1 ms). The CP is never involved again.
-
-#### Sending packets
-
-```bash
-# First packet — embeds the model weights in the payload
-python3 /shared/send_ipa.py frankfurt 99 /shared/weights_method2.json
-
-# Output on the router:
-# [CP] MODEL MISS | model_id=99 | weights extracted from packet: [42, 35, 127, -58]
-# Model 99 loaded into eBPF cache (scale_factor=128)
-# [CP] model_id=99 LOADED & rule INSTALLED | key=100221 | TTL=64 | elapsed=1.89 ms
-# [CP] Next packets for model_id=99 -> TRUE HIT (<1 ms)
-
-# Subsequent packets — no weights needed, model already in cache
-python3 /shared/send_ipa.py frankfurt 99
-
-# Output on the router:
-# TRUE HIT counter increments directly — CP is silent
-```
-
-#### Why the verifier accepts this
-
-eBPF forbids pointer arithmetic on `data_end`. The weight copy uses **4 fixed-offset reads** with a single bound check instead of a loop:
-
-```c
-__u8 *w = (__u8 *)(ipa + 1);
-if ((void *)(w + 4) > data_end) return XDP_PASS;  // one check
-mev.w0 = w[0]; mev.w1 = w[1]; mev.w2 = w[2]; mev.w3 = w[3];
-```
-
-#### Method 3 vs Method 4
-
-| | Method 3 (OpenFlow) | Method 4 (IPA Demo) |
-|---|---|---|
-| `model_cache` at boot | Pre-populated | **Empty** |
-| `fwd_table` at boot | Empty | Empty |
-| Model source | Local file at boot | **Packet payload** |
-| First packet | Fwd MISS → rule install | **Model MISS → extract + install** |
-| Subsequent packets | TRUE HIT | TRUE HIT |
-| Latency (1st pkt) | ~1 ms | ~2 ms |
-| Latency (2nd+ pkt) | <1 ms | <1 ms |
-
-Method 4 is the proof that the IPA paradigm works end-to-end: the intelligence is in the packet, the router learns it on the fly, and from that moment on it forwards autonomously at kernel speed.
-
----
-
-## Comparative Summary
-
-| | Method 1 (PTQ) | Method 2 (QAT) | Method 3 (OpenFlow) | Method 4 (IPA Demo) |
-|---|---|---|---|---|
-| **CP weights** | Float originals | Int8 raw | N/A — uses `ev.key` | Extracted from packet |
-| **CP/kernel alignment** | ✗ Intentional | ✓ Perfect | ✓ Perfect | ✓ Perfect |
-| **model_cache at boot** | Pre-populated | Pre-populated | Pre-populated | **Empty** |
-| **Table population** | Static at startup | Static at startup | Dynamic on-demand | Dynamic on-demand |
-| **Model source** | Local file | Local file | Local file | **Packet payload** |
-| **TRUE HIT** | ~0% | ~100% | ~100% post warm-up | ~100% post 1st pkt |
-| **FAKE HIT** | High (PTQ error) | 0% | Warm-up only | 0% |
-| **MISS** | Medium | 0% | One per new TTL | One (very first pkt) |
-| **Scalability** | Fixed TTL range | Fixed TTL range | Unlimited | Unlimited |
-| **SCALE_FACTOR** | Fixed 128 | Fixed 128 | Fixed 128 | Fixed 128 |
-
----
-
-## Implementation Notes
-
-### BCC: `__u8`/`__u64` not recognized
-The installed BCC version cannot auto-generate a Python class from `struct miss_event` because it does not recognize kernel types `__u8`, `__u32`, `__u64`. Solution: `MissEvent` and `ModelMissEvent` are defined manually as `ctypes.Structure` with `from_buffer_copy()` parsing.
-
-### C struct padding
-The compiler inserts implicit padding in the (non-packed) `miss_event`:
-- 2 bytes after `ttl` to align `__u32 ingress_ifindex`
-- 7 bytes after `input_size` to align `__u64 key` at offset 16
-
-Total: 24 bytes. The Python struct replicates this with `_pack_=1` and explicit `_pad` fields.
-
-### Float rounding error (±1)
-Computing the key with floats produces results that differ by ±1 from the kernel's integer division. Methods 2, 3, and 4 use `//` (Python integer division) to replicate the C truncation exactly. In Method 1 this divergence is intentional — it is the PTQ error metric.
-
-### eBPF verifier: no pointer arithmetic on `data_end`
-The eBPF verifier rejects any loop where the bound check involves incrementing a pointer derived from `data_end`. Method 4 avoids this by reading exactly 4 weight bytes at fixed offsets with a single static bound check.
 
 ---
 

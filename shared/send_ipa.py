@@ -26,10 +26,14 @@ IPA header structure (Section III of the paper):
     n_feature_types : u8   (4)
 
   [Feature Types]         8 byte
-    feat0: code=0x01 count=1   (model_id)
-    feat1: code=0x02 count=1   (TTL)
-    feat2: code=0x03 count=6   (ingress iface one-hot)
-    feat3: code=0x04 count=52  (node/model one-hot)
+    Codes per model_meta.FEATURE_CODE (the single source of truth):
+      0x01 link_state   0x02 ingress_iface   0x03 ttl
+      0x04 node         0x05 queue_occupancy
+    Default descriptor, in the order the 65-4-4-7 model was trained on:
+    feat0: code=0x01 count=6   (link_state, one slot per egress interface)
+    feat1: code=0x02 count=6   (ingress iface one-hot)
+    feat2: code=0x03 count=1   (TTL)
+    feat3: code=0x04 count=52  (node one-hot)
 
   [Output Descriptor]     3 byte
     n_output_types  : u8  (1)
@@ -60,18 +64,26 @@ def build_ipa_header(
     output_size: int = 7,
     hidden_layers: int = 2,
     neurons_per_layer: int = 4,
-    feat2_count: int = 6,
-    feat3_count: int = 52,
+    link_state_count: int = 6,
+    ingress_iface_count: int = 6,
+    ttl_count: int = 1,
+    node_count: int = 52,
 ) -> bytes:
     """
     Build the 21-byte IPA header as specified in the paper.
 
-    input_size/output_size/hidden_layers/neurons_per_layer/feat2_count
-    (ingress-iface one-hot width)/feat3_count (node one-hot width) were
-    historically fixed at 65/7/2/4/6/52 -- the default model's shape.
-    They default to those same values (so every existing call site keeps
-    building byte-identical headers) but a caller can pass a different
-    model's resolved shape (see shared/model_meta.py) instead.
+    The four (code, count) pairs describe the model's input vector and now
+    match model_meta.FEATURE_CODE and the default descriptor order
+    [link_state, ingress_iface, ttl, node] -- which is what the pipelines
+    actually build and what test/test_ipa.py already emitted. They previously
+    declared (model_id,1), (ttl,1), (ingress_iface,6), (node,52): wrong codes
+    AND wrong widths, so the two senders in this repo produced different
+    header bytes for the same model. No datapath behaviour depended on it --
+    the eBPF programs read only model_id -- but the header is documentation on
+    the wire, so it should not contradict the descriptor registry.
+
+    Sizes default to the checked-in 65-4-4-7 model's shape; pass a different
+    model's resolved shape (see shared/model_meta.py derive_shape) instead.
     """
     return struct.pack(
         ">BBBHBBBBB" "BBBBBBBB" "BBB",
@@ -86,14 +98,15 @@ def build_ipa_header(
         hidden_layers,
         neurons_per_layer,
         4,    # n_feature_types
-        # Feature Types (8 bytes: 4 x (code, count))
-        0x01, 1,            # feat0: model_id (1 feature)
-        0x02, 1,            # feat1: TTL      (1 feature)
-        0x03, feat2_count,  # feat2: ingress iface one-hot
-        0x04, feat3_count,  # feat3: node/model one-hot
+        # Feature Types (8 bytes: 4 x (code, count)), descriptor order
+        0x01, link_state_count,      # feat0: link_state
+        0x02, ingress_iface_count,   # feat1: ingress iface one-hot
+        0x03, ttl_count,             # feat2: ttl
+        0x04, node_count,            # feat3: node one-hot
         # Output Descriptor (3 bytes)
         1,             # n_output_types
-        0x01,          # out0_code: next-hop index
+        0x01,          # out0_code: next-hop index (output codes are their own
+                       # namespace, unrelated to FEATURE_CODE; unused by the datapath)
         output_size,   # out0_count
     )
 

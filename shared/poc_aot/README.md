@@ -6,7 +6,7 @@ Pipeline 1 (hardcoded) bakes the model weights as **C literals** in the eBPF
 source. BCC is clang-at-runtime, so **every new or modified model triggers a
 full clang recompile** — measured at ~99.8% of the load cost (verifier + load
 itself is a few ms). Retraining the same 65-4-4-7 model changes only 319
-integers, yet the whole program is recompiled from scratch (~1660 ms).
+integers, yet the whole program is recompiled from scratch (~1.3 s; machine-dependent, 1.26-1.66 s observed).
 
 ## The idea under test
 
@@ -53,7 +53,7 @@ sudo ./loader_aot nn_aot_arch.o
 ## What to read in the output
 
 1. **`[deploy]` total** — runtime open+load of the prebuilt `.o`, no clang
-   (~ms). Compare against `method4_hardcoded.py`'s BCC compile (~1660 ms) to see
+   (~ms). Compare against `method4_hardcoded.py`'s BCC compile (~1.3 s) to see
    the recompile saved.
 2. **`[perf]`** — xlated insns / latency / throughput on the dispatcher, same
    methodology as `test_suite --kernel`. These land on the BCC hardcoded

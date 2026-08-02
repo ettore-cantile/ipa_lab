@@ -72,12 +72,31 @@ throughput/CPU) + `5 PASS / 0 FAIL` per ciascuna pipeline + il probe `link_state
 Cosa verifica in più oltre al dispatch:
 - **Corrispondenza di classe** (single-pass, uniforme sulle 3 pipeline): pre-installa `mac_table[0..5]`,
   esegue una volta e controlla che la classe scelta dal kernel = classe del riferimento Python
-  (`cls_stats[ref_cls] > 0`). Nessun `ctx_in` custom: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex`
-  di sandbox cade fuori sia dalla `ifindex_table` di P1 sia dal clamp `[1,6]` di P2/P3, quindi tutte
-  e tre risolvono a "nessuna iface di ingresso" (`_iface=0`) — il riferimento Python usa `ifindex=0`
-  per combaciare, senza bisogno di forzare il contesto.
+  (`cls_stats[ref_cls] > 0`). Nessun `ctx_in` custom: le semantiche di `ctx_in` per `xdp_md` non
+  sono portabili fra kernel, quindi si usa l'`ingress_ifindex` di default del device di test.
 - **Reroute su guasto**: per ogni TTL e interfaccia `k`, esegue P1 con tutti i link up e poi con
   `link_state[k]=0`, e conferma che l'argmax cambia uscita in almeno un caso.
+
+> ⚠️ **`ingress_iface`: le tre pipeline NON concordano, e in laboratorio la feature è
+> inerte.** P1 traduce l'ifindex del kernel in porta logica tramite `ifindex_table`
+> (default `[2..7]`); P2/P3 usano l'ifindex **grezzo** con clamp `[1, n_interfaces]`.
+>
+> - Sotto `BPF_PROG_TEST_RUN` il sandbox espone `ingress_ifindex = 1`
+>   (`verify_prog_run.TEST_RUN_DEFAULT_INGRESS_IFINDEX`): P1 non lo mappa → `_iface=0`,
+>   P2/P3 lo accettano → colonna 0 della one-hot attiva. Il riferimento Python modella
+>   correttamente le due semantiche con `ref_ifindex = 0 if pipeline == 1 else 1`, ed è
+>   per questo che i `ref_val` stampati per P1 differiscono da quelli di P2/P3 pur
+>   restando la stessa classe. **Non è un bug della suite** — è la suite che documenta
+>   una divergenza reale fra le pipeline.
+> - Su un nodo Kathara vero gli ifindex sono 201/209/217/223: non stanno né in `[2..7]`
+>   né in `[1,6]`, quindi **tutte e tre** azzerano la feature. 6 dei 65 input sono
+>   costantemente nulli e il modello non sa mai da quale porta è entrato il pacchetto.
+>
+> Ne segue un limite di validità esterna da dichiarare: la suite misura una
+> configurazione dell'input vector che **in produzione non si verifica**. Sistemarlo
+> significa risolvere gli ifindex reali all'avvio (`socket.if_nametoindex`) e dare a
+> P2/P3 una mappa ifindex→porta; cambia l'output dell'inferenza e va rifatto anche il
+> riferimento, quindi non è stato fatto.
 
 ### Verifier standalone (equivalente al gate di dispatch)
 
@@ -341,27 +360,49 @@ universale in P1, riga **baseline** (parse + redirect, **nessuna inferenza**) co
 Metodologia: minimo su 7 trial indipendenti (sez. 2) — p50/max riportati per trasparenza,
 non solo il minimo. Numeri dal run più recente (box Linux, 4 CPU).
 
+Due run indipendenti sono riportati affiancati, perché il confronto fra i due dice
+qualcosa che nessuno dei due da solo direbbe (vedi la nota sulla normalizzazione).
+
 | Metrica                    | baseline | P1 hardcoded | P2 template | P3 modular |
 |----------------------------|---------:|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated)   |      129 |          997 |       9 962 |      8 209 |
-| Codice jited (byte)        |      600 |        4 751 |      48 640 |     40 635 |
+| Istruzioni eBPF (xlated) — run A |  129 |          997 |       9 962 |      8 209 |
+| Istruzioni eBPF (xlated) — run B |  129 |          997 |       9 916 |      8 201 |
+| Codice jited (byte) — run A |     600 |        4 751 |      48 640 |     40 635 |
+| Codice jited (byte) — run B |     600 |        4 751 |      50 306 |     40 544 |
 | Tail calls / pacchetto     |        0 |            1 |           1 |          3 |
 | Map lookup / pacchetto (reali) |    0 |          4.0 |         8.0 |       26.0 |
 | Memoria mappe (byte)       |      280 |          308 |       3 960 |      8 188 |
-| Latenza min (ns/pacchetto) |     28.0 |         47.0 |       224.0 |      387.0 |
-| **Latenza normalizzata (× baseline)** | **1.00** | **1.68** | **8.00** | **13.82** |
-| Throughput (Mpps, da min)  |   35.714 |       21.277 |       4.464 |      2.584 |
-| CPU (%)                    |       49 |           39 |          68 |         61 |
+| Latenza min (ns/pkt) — run A |   28.0 |         47.0 |       224.0 |      387.0 |
+| Latenza min (ns/pkt) — run B |   14.0 |         48.0 |       165.0 |      392.0 |
+| ...p50 — run B             |     21.0 |         73.0 |       251.0 |      450.0 |
+| ...max — run B             |     23.0 |         94.0 |       468.0 |      499.0 |
+| Throughput (Mpps, da min) — run B | 71.429 |   20.833 |       6.061 |      2.551 |
+| CPU (%) — run B            |       27 |           34 |          59 |         62 |
 
 | Dispatch (correttezza)     |        — |      5/5 PASS |   5/5 PASS |   5/5 PASS |
 | link_state reroute         |          | PASS (5/30 casi cambiano uscita) |||
 
-> **Attenzione a confrontare i ns assoluti con tabelle più vecchie.** Questi numeri
-> vengono da una macchina diversa (e più lenta) rispetto alle misure precedenti: il
-> **baseline**, che è lo stesso identico programma, è passato da 21 a 28 ns. Per un
-> confronto valido fra macchine usa la riga **normalizzata**. Caso di controllo: P1
-> non è stato modificato e il suo rapporto sul baseline è 1.67 prima e 1.68 dopo —
-> la normalizzazione regge.
+> **La latenza normalizzata sul baseline NON è una statistica stabile — non usarla.**
+> Una versione precedente di questa tabella riportava una riga "latenza normalizzata
+> (× baseline)" e la giustificava così: il baseline è lo stesso identico programma su
+> ogni macchina, quindi dividere per esso rende i numeri comparabili fra box diversi.
+> Il caso di controllo citato era P1, invariato, con rapporto 1.67 e poi 1.68.
+>
+> Il run B falsifica questa affermazione. Le latenze **assolute** delle tre pipeline
+> riproducono bene (P1 47→48 ns, P3 387→392 ns); è il **baseline** a essere passato da
+> 28 a 14 ns. Di conseguenza il rapporto di P1 salta da 1.68× a 3.43×, quello di P3 da
+> 13.8× a 28×. Il numeratore è stabile, il denominatore no.
+>
+> La causa è che il baseline è troppo economico (129 istruzioni) perché il minimo-su-N
+> sia stabile: nel run B `min=14, p50=21, max=23`, uno spread del 50% su un valore che
+> dividerebbe l'intera colonna. Con così poche istruzioni l'overhead per iterazione di
+> `BPF_PROG_TEST_RUN` è dello stesso ordine del programma misurato.
+>
+> **Conseguenza pratica:** riporta le latenze assolute insieme alle specifiche della
+> macchina, e usa il baseline come *pavimento qualitativo* ("l'inferenza costa molto
+> più del solo framework XDP"), non come divisore quantitativo. Quello che riproduce
+> fra i run è l'**ordinamento** — baseline < P1 < P2 < P3 — insieme a istruzioni,
+> lookup e memoria mappe, che sono deterministici.
 
 ### Blocco pesi a valore strutturato (P2/P3) — cosa è cambiato
 
@@ -380,7 +421,10 @@ trattamento per `scratch_acts` di P3, che veniva riletta per **ogni coppia**
 | Istruzioni xlated | 16 988 | 9 962 | 15 767 | 8 209 |
 | Jited (byte) | 84 587 | 48 640 | 76 376 | 40 635 |
 | Memoria mappe (byte) | 8 052 | 3 960 | 16 884 | 8 188 |
-| Latenza normalizzata (× baseline) | 12.48 | **8.00** | 21.05 | **13.82** |
+| Latenza min (ns/pkt, stessa sessione) | 349.7 | **224.0** | 590.0 | **387.0** |
+
+(Prima/dopo misurati nella stessa sessione sulla stessa macchina, quindi qui le
+latenze assolute sono direttamente confrontabili senza normalizzare.)
 
 Inferenza **invariata**: stessa classe scelta su tutta la suite contro il riferimento
 Python, multi-model e alt-arch inclusi. Lato control plane, registrare un modello è
@@ -396,25 +440,46 @@ separare: una *strutturale* (tail call + indirezione dei pesi a runtime) e una
 
 Il **baseline** riceve il pacchetto in XDP, fa lo stesso parse del dispatcher e un
 `bpf_redirect` — **niente tail-call, niente MLP**. È il *pavimento* del framework:
-**28 ns / 35.7 Mpps** (minimo su 14 trial). L'hardcoded (**47 ns**) aggiunge ~19 ns per
-tail-call + double-parse + la rete. Quindi l'hardcoded **non** è sospettosamente veloce:
-è **1.68× più lento** del do-nothing — rapporto identico a quello misurato sulla
-macchina precedente (1.67), che è la verifica che la normalizzazione funziona. Il throughput alto è il pavimento XDP+parse+redirect;
-la rete int8 65-4-4-7 unrolled costa poco in confronto.
+**28 ns** nel run A, **14 ns** nel run B. L'hardcoded costa 47-48 ns in entrambi,
+cioè aggiunge ~20-34 ns per tail-call + double-parse + la rete.
+
+La lettura qualitativa regge in entrambi i run: l'hardcoded **non** è sospettosamente
+veloce, sta nello stesso ordine di grandezza del do-nothing, e il throughput elevato
+è in larga parte il pavimento XDP+parse+redirect — la rete int8 65-4-4-7 srotolata
+costa poco in confronto. Il *fattore* preciso però non riproduce (1.68× vs 3.43×),
+perché è il baseline a oscillare: vedi la nota sulla normalizzazione sopra. Per
+quantificare davvero il costo del solo salto usa `bench_tailcall_overhead.py` (sez. 8),
+che confronta due programmi che differiscono **solo** per un hop `PROG_ARRAY` e non
+dipende da questo rapporto.
 
 ### AOT-literal deploy (P1, `method4_hardcoded_aot.py`)
 
-| | valore |
-|---|---:|
-| open_file | 0.27 ms |
-| load (verify+JIT) | 4.40 ms |
-| **deploy totale** | **4.66 ms** |
-| BCC ricompila lo stesso modello | ~1660 ms |
-| perf: insn (disp 28 + model 982) | 1010 |
-| perf: latenza / throughput | 90 ns / 11.1 Mpps |
+| | run A | run B |
+|---|---:|---:|
+| open_file | 0.27 ms | 0.16 ms |
+| load (verify+JIT) | 4.40 ms | 6.00 ms |
+| **deploy totale** | **4.66 ms** | **6.15 ms** |
+| build offline (clang → .o) | — | 147 ms |
+| perf: insn totali | 1 010 (disp 28 + model 982) | 1 026 (disp 28 + model 998) |
+| perf: latenza / throughput | 90 ns / 11.1 Mpps | 57 ns / 17.5 Mpps |
 
-Perf ≈ BCC hardcoded (varianza run-to-run): l'AOT preserva il massimo literal, ma sposta
-`clang` **offline** → deploy sul nodo ~4.7 ms invece di ~1660 ms.
+Confronto con BCC hardcoded **nella stessa sessione del run B**: BCC 997 istruzioni
+(29 + 968) a 48 ns, AOT 1 026 (28 + 998) a 57 ns. Cioè AOT è nello stesso ordine di
+grandezza ma **non identico**: i due passano per versioni di clang diverse e dialetti
+di accesso alle mappe diversi (BCC rewriter vs `bpf_map_lookup_elem` di libbpf), quindi
+il codice generato differisce di qualche punto percentuale. Affermazioni tipo
+"byte-identical" o "prestazioni identiche" non sono supportate dai dati; quello che è
+supportato è che **la strength reduction sui pesi letterali è preservata** e il costo
+per pacchetto resta nella classe della hardcoded, lontanissimo da P2/P3.
+
+Il guadagno vero non è la latenza per pacchetto ma il **costo di deploy sul nodo**:
+~5-6 ms di `open+load` contro ~1.3 s di `clang` a runtime, cioè oltre due ordini di
+grandezza, e senza bisogno di clang sul nodo datapath.
+
+> Il numero "~1.3 s" citato qui è il costo di ricompilazione BCC misurato dalla riga
+> `[M1 update timing]` di `--only kernel` (1 258.9 ms nel run B; 1.26-1.66 s osservati
+> su box diversi). Non è misurato da `method4_hardcoded_aot.py`, che non esegue mai il
+> percorso BCC: quello script lo stampa come valore di riferimento, non come misura.
 
 ### Costo di aggiunta modello (`bench_model_add.py`, 3 modelli)
 
