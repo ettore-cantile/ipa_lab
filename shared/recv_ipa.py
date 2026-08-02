@@ -22,7 +22,7 @@ Esempio output:
 import argparse
 import signal
 import sys
-from scapy.all import sniff, IP, UDP, Raw
+from scapy.all import sniff, IP, UDP
 
 
 class IPAStats:
@@ -79,12 +79,19 @@ def parse_ipa_header(raw_bytes):
 def packet_handler(pkt):
     if not (pkt.haslayer(UDP) and pkt[UDP].dport == PORT):
         return
-    if not pkt.haslayer(Raw):
-        return
 
     src        = pkt[IP].src if pkt.haslayer(IP) else "?"
     ttl        = pkt[IP].ttl if pkt.haslayer(IP) else 0
-    raw        = bytes(pkt[Raw].load)
+    # Serialize the whole UDP payload instead of reading pkt[Raw].load: scapy
+    # guesses an upper layer from the port numbers, so a sender that leaves the
+    # default UDP sport of 53 gets its payload dissected as DNS and pkt[Raw]
+    # holds only the 9 bytes past DNS's 12-byte header -- which read as
+    # MALFORMED even though the wire bytes were a valid 21-byte IPA header.
+    # bytes(pkt[UDP].payload) re-serializes whatever scapy guessed, so the
+    # original bytes come back regardless.
+    raw        = bytes(pkt[UDP].payload)
+    if not raw:
+        return
     hdr        = parse_ipa_header(raw)
     payload_len = len(raw) - 21 if len(raw) >= 21 else len(raw)
 

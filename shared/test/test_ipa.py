@@ -108,7 +108,13 @@ for i in range(N):
     ttl = random.randint(30, 64)
     mid = MODEL_IDS[i % len(MODEL_IDS)]
     ipa_hdr = IPA_HDR(model_id=mid, scale_factor=SCALE_FACTOR)
-    packet  = IP(dst=DEST, ttl=ttl) / UDP(dport=9999) / ipa_hdr
+    # Explicit sport: scapy's UDP.sport defaults to 53, and scapy binds DNS to
+    # UDP sport 53 -- so a receiver dissecting these packets decoded the IPA
+    # header as a 12-byte DNS header and exposed only the 9-byte remainder as
+    # Raw ("MALFORMED len=9B" in recv_ipa.py). The bytes on the wire were always
+    # correct; only the dissection was. 12345 matches the frames the kernel test
+    # harness builds (verify_prog_run.build_frame_sparse).
+    packet  = IP(dst=DEST, ttl=ttl) / UDP(sport=12345, dport=9999) / ipa_hdr
 
     if i == 0 and weights_payload:
         packet = packet / Raw(load=weights_payload)
