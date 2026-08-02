@@ -1179,7 +1179,6 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         info(f"kernel suite skipped: BCC/verify_prog_run not importable ({e}).")
         info("Needs Linux + BCC + root. In Kathara: kathara exec frankfurt -- python3 /shared/test_suite.py --only kernel")
         return True
-    import resource
     mp = model_path or V.MODEL_PT
     methods = [
         ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
@@ -1229,16 +1228,34 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         # independent measurements is the standard fix for this (same
         # reasoning as hyperfine / Google Benchmark, and the same fix already
         # applied in bench_depth_vs_width.py after it hit the identical issue).
+        #
+        # NOTE on the baseline's role: it is by far the cheapest program here
+        # (129 instructions), and correspondingly the NOISIEST in relative
+        # terms -- across runs its (max-min)/min has been ~112% against 31-38%
+        # for the three pipelines. Its minimum therefore needs MORE trials than
+        # theirs to settle, which is why a "latency normalized on the baseline"
+        # column was removed from the reported table: dividing every pipeline
+        # by the least stable measurement propagates that instability to the
+        # whole column. Report absolute latency plus the machine, and use the
+        # baseline as a qualitative floor.
+        #
+        # There used to be a "CPU (%)" column here, computed as the process's
+        # (utime+stime) over the wall time of this loop. It has been REMOVED,
+        # deliberately -- do not re-add it. All the work happens inside a
+        # blocking bpf_prog_test_run() syscall, so that ratio does not measure
+        # how much CPU the eBPF program costs; it measures how much of the wall
+        # time the scheduler left this single thread on-CPU. It came out
+        # non-monotonic (template below both baseline and hardcoded despite
+        # costing 4x the latency) and non-reproducible across runs (59% then
+        # 47% for the same pipeline), i.e. it reported system interference, not
+        # a property of the pipeline. Per-pipeline CPU cost is already captured
+        # by the latency and instruction columns.
         samples = []
-        ru0 = resource.getrusage(resource.RUSAGE_SELF)
         w0  = time.perf_counter()
         for _ in range(trials):
             retval, dur_ns = V.prog_test_run(disp_fd, frame, repeat=repeat)
             samples.append(dur_ns)
         wall = time.perf_counter() - w0
-        ru1 = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_s   = (ru1.ru_utime + ru1.ru_stime) - (ru0.ru_utime + ru0.ru_stime)
-        cpu_pct = 100.0 * cpu_s / wall if wall > 0 else 0.0
         samples.sort()
         lat_min, lat_p50, lat_max = samples[0], samples[trials // 2], samples[-1]
         lat_ns  = float(lat_min) if lat_min else (wall * 1e9 / (repeat * trials))
@@ -1259,12 +1276,13 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
             lookups = None
         rows.append({
             "name": name, "pl": pl, "insn": insn_total, "jit": jit_total,
-            "per": per_prog, "lat": lat_ns, "mpps": mpps, "cpu": cpu_pct,
+            "per": per_prog, "lat": lat_ns, "mpps": mpps,
             "retval": retval, "mem": mem, "n_tail": n_tail, "lookups": lookups,
             "lat_p50": lat_p50, "lat_max": lat_max,
+            "spread": (lat_max - lat_min) / lat_min * 100.0 if lat_min else 0.0,
         })
         ok(f"{name:9s}: {insn_total:5d} eBPF instr | lat={lat_ns:8.1f} ns (min of {trials})"
-           f" [p50={lat_p50:.0f} max={lat_max:.0f}] | {mpps:6.3f} Mpps | CPU={cpu_pct:4.0f}% | retval={retval} | tail={n_tail}")
+           f" [p50={lat_p50:.0f} max={lat_max:.0f}] | {mpps:6.3f} Mpps | retval={retval} | tail={n_tail}")
     if not rows:
         return all_ok
     print()
@@ -1280,9 +1298,18 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
     line(f"Latency (ns/pkt, min of {trials})", "lat", lambda v: f"{v:.1f}")
     line("  ...p50",                 "lat_p50", lambda v: f"{v:.1f}")
     line("  ...max",                 "lat_max", lambda v: f"{v:.1f}")
+    # Relative spread makes explicit which row is a reliable measurement and
+    # which is not: the cheaper the program, the wider its spread, and the
+    # baseline is consistently the worst of the four.
+    line("  ...spread (max-min)/min %", "spread", lambda v: f"{v:.0f}%")
     line("Throughput (Mpps, from min)", "mpps", lambda v: f"{v:.3f}")
-    line("CPU (%)",                  "cpu",    lambda v: f"{v:.0f}")
     print("  " + "-" * (32 + 16 * len(rows)))
+    print()
+    print("  NOTE: 'eBPF instructions' is the STATIC size of the loaded program, not the")
+    print("        number executed per packet. Pipeline 1 unrolls a 52-case switch for the")
+    print("        node one-hot of which exactly ONE case runs, so its executed path is a")
+    print("        fraction of the count shown; dividing instructions by latency would give")
+    print("        an impossible instructions-per-cycle figure. See docs/testing.md.")
     print()
     for r in rows:
         detail = "  ".join(f"{p}={c}" for p, c in r["per"])

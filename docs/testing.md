@@ -3,7 +3,7 @@
 Tre pipeline (P1 hardcoded, P2 template, P3 modular) verificate su due piani:
 
 - **userspace** (numerico, PyTorch/NumPy) — accuratezza, quantizzazione, robustezza, struttura;
-- **kernel** (`BPF_PROG_TEST_RUN` sui programmi XDP reali) — istruzioni eBPF, latenza, throughput, CPU, memoria mappe + dispatch reale.
+- **kernel** (`BPF_PROG_TEST_RUN` sui programmi XDP reali) — istruzioni eBPF, latenza (min/p50/max/spread), throughput, memoria mappe + dispatch reale.
 
 Tutto è raccolto in un unico script: `shared/test/test_suite.py`. Tutti gli script di test
 (compreso `bench_model_add.py`, vedi §6) vivono ora sotto `shared/test/`.
@@ -66,7 +66,7 @@ principio di hyperfine/Google Benchmark) — la tabella mostra anche p50 e max p
 trasparenza, non solo il minimo.
 
 Output atteso: tabella metriche (istruzioni/jited/tail-call/memoria/latenza min/p50/max/
-throughput/CPU) + `5 PASS / 0 FAIL` per ciascuna pipeline + il probe `link_state reroute`
+spread/throughput) + `5 PASS / 0 FAIL` per ciascuna pipeline + il probe `link_state reroute`
 (un link giù cambia l'uscita) + `kernel suite: PASS`.
 
 Cosa verifica in più oltre al dispatch:
@@ -357,52 +357,98 @@ sudo python3 shared/test/test_suite.py --only kernel
 Aggiornati dopo: IV **descrittore-driven** in P2/P3 (registry `model_desc`), AOT-literal
 universale in P1, riga **baseline** (parse + redirect, **nessuna inferenza**) come pavimento.
 
-Metodologia: minimo su 7 trial indipendenti (sez. 2) — p50/max riportati per trasparenza,
-non solo il minimo. Numeri dal run più recente (box Linux, 4 CPU).
+Metodologia: minimo su N trial indipendenti (sez. 2), con p50/max e spread relativo
+riportati per trasparenza. Sono riportate **tre esecuzioni indipendenti**, perche' il
+confronto fra loro e' esso stesso un risultato metodologico (vedi la nota sotto).
 
-Due run indipendenti sono riportati affiancati, perché il confronto fra i due dice
-qualcosa che nessuno dei due da solo direbbe (vedi la nota sulla normalizzazione).
+| Metrica | run | baseline | P1 hardcoded | P2 template | P3 modular |
+|---|---|---:|---:|---:|---:|
+| Istruzioni eBPF (xlated) | A | 129 | 997 | 9 962 | 8 209 |
+| Istruzioni eBPF (xlated) | B, C | 129 | 997 | 9 916 | 8 201 |
+| Codice jited (byte) | A | 600 | 4 751 | 48 640 | 40 635 |
+| Codice jited (byte) | B, C | 600 | 4 751 | 50 306 | 40 544 |
+| Tail call / pacchetto | — | 0 | 1 | 1 | 3 |
+| Map lookup / pacchetto (reali) | — | 0 | 4.0 | 8.0 | 26.0 |
+| Memoria mappe (byte) | — | 280 | 308 | 3 960 | 8 188 |
+| **Latenza min (ns/pkt)** | **A** (7 trial) | **28.0** | **47.0** | **224.0** | **387.0** |
+| **Latenza min (ns/pkt)** | **B** (7 trial) | **14.0** | **48.0** | **165.0** | **392.0** |
+| **Latenza min (ns/pkt)** | **C** (15 trial) | **25.0** | **51.0** | **234.0** | **391.0** |
+| ...p50 | C | 33.0 | 52.0 | 244.0 | 419.0 |
+| ...max | C | 53.0 | 67.0 | 323.0 | 529.0 |
+| ...spread (max−min)/min | C | **112%** | 31% | 38% | 35% |
+| Throughput (Mpps, da min) | C | 40.000 | 19.608 | 4.274 | 2.558 |
 
-| Metrica                    | baseline | P1 hardcoded | P2 template | P3 modular |
-|----------------------------|---------:|-------------:|------------:|-----------:|
-| Istruzioni eBPF (xlated) — run A |  129 |          997 |       9 962 |      8 209 |
-| Istruzioni eBPF (xlated) — run B |  129 |          997 |       9 916 |      8 201 |
-| Codice jited (byte) — run A |     600 |        4 751 |      48 640 |     40 635 |
-| Codice jited (byte) — run B |     600 |        4 751 |      50 306 |     40 544 |
-| Tail calls / pacchetto     |        0 |            1 |           1 |          3 |
-| Map lookup / pacchetto (reali) |    0 |          4.0 |         8.0 |       26.0 |
-| Memoria mappe (byte)       |      280 |          308 |       3 960 |      8 188 |
-| Latenza min (ns/pkt) — run A |   28.0 |         47.0 |       224.0 |      387.0 |
-| Latenza min (ns/pkt) — run B |   14.0 |         48.0 |       165.0 |      392.0 |
-| ...p50 — run B             |     21.0 |         73.0 |       251.0 |      450.0 |
-| ...max — run B             |     23.0 |         94.0 |       468.0 |      499.0 |
-| Throughput (Mpps, da min) — run B | 71.429 |   20.833 |       6.061 |      2.551 |
-| CPU (%) — run B            |       27 |           34 |          59 |         62 |
+| Dispatch (correttezza) | — | 5/5 PASS | 5/5 PASS | 5/5 PASS |
+| link_state reroute | PASS (5/30 casi cambiano uscita) |||
 
-| Dispatch (correttezza)     |        — |      5/5 PASS |   5/5 PASS |   5/5 PASS |
-| link_state reroute         |          | PASS (5/30 casi cambiano uscita) |||
+### Attendibilita' dei numeri di latenza
 
-> **La latenza normalizzata sul baseline NON è una statistica stabile — non usarla.**
-> Una versione precedente di questa tabella riportava una riga "latenza normalizzata
-> (× baseline)" e la giustificava così: il baseline è lo stesso identico programma su
-> ogni macchina, quindi dividere per esso rende i numeri comparabili fra box diversi.
-> Il caso di controllo citato era P1, invariato, con rapporto 1.67 e poi 1.68.
->
-> Il run B falsifica questa affermazione. Le latenze **assolute** delle tre pipeline
-> riproducono bene (P1 47→48 ns, P3 387→392 ns); è il **baseline** a essere passato da
-> 28 a 14 ns. Di conseguenza il rapporto di P1 salta da 1.68× a 3.43×, quello di P3 da
-> 13.8× a 28×. Il numeratore è stabile, il denominatore no.
->
-> La causa è che il baseline è troppo economico (129 istruzioni) perché il minimo-su-N
-> sia stabile: nel run B `min=14, p50=21, max=23`, uno spread del 50% su un valore che
-> dividerebbe l'intera colonna. Con così poche istruzioni l'overhead per iterazione di
-> `BPF_PROG_TEST_RUN` è dello stesso ordine del programma misurato.
->
-> **Conseguenza pratica:** riporta le latenze assolute insieme alle specifiche della
-> macchina, e usa il baseline come *pavimento qualitativo* ("l'inferenza costa molto
-> più del solo framework XDP"), non come divisore quantitativo. Quello che riproduce
-> fra i run è l'**ordinamento** — baseline < P1 < P2 < P3 — insieme a istruzioni,
-> lookup e memoria mappe, che sono deterministici.
+**Le latenze assolute delle pipeline riproducono bene.** Su tre esecuzioni indipendenti
+P1 misura 47 / 48 / 51 ns e P3 misura 387 / 392 / 391 ns: variazione sotto il 10% su P1 e
+sotto l'1.5% su P3. Anche l'ordine di grandezza e' quello atteso in letteratura per XDP
+sotto `BPF_PROG_TEST_RUN` (un programma minimale sta sui 10-20 ns, un redirect sui 25-50):
+il baseline a 25-28 ns e' esattamente li'.
+
+Il modello di costo torna. A circa 3 GHz, 25 ns sono ~75 cicli (parse + redirect), 51 ns
+~153 cicli (P1: piu' una tail call, un secondo parsing e l'intera rete), 391 ns ~1 170
+cicli per P3 — di cui la maggior parte spiegabile con le sole 26 letture di mappa e le 3
+tail call. E' esattamente la tesi che il capitolo sostiene: in questo regime dominano
+lookup e salti, non l'aritmetica.
+
+> ⚠️ **Le istruzioni sono un conteggio STATICO, non il percorso eseguito.** Dividere
+> 997 istruzioni per 51 ns darebbe ~6.5 istruzioni per ciclo, impossibile su x86 (il
+> massimo pratico e' 3-4). Non e' una contraddizione: `xlated` misura la dimensione del
+> programma caricato, non quante istruzioni girano per pacchetto. In P1 lo switch della
+> one-hot `node` ha 52 casi ma ne esegue **uno solo**, e quello di `ingress_iface` ne ha
+> 6 ed esegue uno; inoltre, con i pesi come letterali, clang applica strength reduction
+> (i pesi a zero spariscono, quelli potenza di due diventano shift). Il percorso dinamico
+> e' quindi una frazione dei 997 — ed e' precisamente il vantaggio strutturale che la
+> hardcoded ha sulle altre due. Vale la pena saperlo perche' e' la prima obiezione
+> naturale davanti a questa tabella.
+
+### Perche' la riga "latenza normalizzata sul baseline" e' stata rimossa
+
+Una versione precedente riportava una riga *latenza normalizzata (× baseline)*,
+giustificata cosi': il baseline e' lo stesso identico programma ovunque, quindi
+dividere per esso rende confrontabili misure prese su macchine diverse. Il caso di
+controllo era P1, invariato, con rapporto 1.67 e poi 1.68.
+
+I tre run mostrano che il metodo e' **fragile quanto la stima del baseline**:
+
+| run | trial | P1/base | P2/base | P3/base |
+|---|---:|---:|---:|---:|
+| A | 7 | 1.68 | 8.00 | 13.82 |
+| B | 7 | 3.43 | 11.79 | 28.00 |
+| C | 15 | 2.04 | 9.36 | 15.64 |
+
+A e C concordano entro il ~20%; B e' anomalo, ma va notato che lo e' su **due** colonne
+insieme (baseline 14 ns *e* template 165 ns), quindi era la macchina in uno stato diverso,
+non un difetto della metrica. Con 15 trial il baseline torna a 25 ns, vicino ai 28 del
+run A: il valore di 14 ns era un outlier da troppi pochi campioni.
+
+La causa strutturale resta pero' valida e si legge direttamente nella riga *spread*: il
+baseline ha uno spread relativo del **112%** contro il 31-38% delle tre pipeline. Essendo
+il programma piu' economico (129 istruzioni), l'overhead per iterazione di
+`BPF_PROG_TEST_RUN` e' dello stesso ordine di grandezza di cio' che si vuole misurare,
+quindi il suo minimo ha bisogno di **piu'** trial di quelli delle pipeline per assestarsi.
+
+**Conseguenza pratica:** la normalizzazione non e' priva di senso, ma non e' abbastanza
+stabile da essere riportata come numero in tesi — con 7 trial oscilla di un fattore 2, con
+15 resta entro il ~20%. Riporta quindi le latenze **assolute** insieme alle specifiche
+della macchina, e usa il baseline come *pavimento qualitativo* ("l'inferenza costa molto
+piu' del solo framework XDP"). Cio' che riproduce sempre e' l'**ordinamento** —
+baseline < P1 < P2 < P3 — insieme a istruzioni, lookup e memoria mappe, deterministici.
+
+### La colonna CPU (%) e' stata rimossa
+
+Era calcolata come `(utime + stime del processo) / wall time` del ciclo di misura. Ma
+tutto il lavoro avviene dentro una `bpf_prog_test_run()` **bloccante**, quindi quel
+rapporto non misura quanta CPU costi il programma eBPF: misura quanto lo scheduler ha
+lasciato il thread sulla CPU, cioe' l'interferenza di sistema. I dati lo confermano —
+risultava **non monotona** (template al 47%, sotto sia baseline 53% sia hardcoded 57%,
+pur costando 4× la latenza) e **non riproducibile** (59% e poi 47% per la stessa
+pipeline fra due run). Il costo per pipeline e' gia' descritto dalle colonne latenza e
+istruzioni. Il codice porta un commento che spiega perche' non va reintrodotta.
 
 ### Blocco pesi a valore strutturato (P2/P3) — cosa è cambiato
 
