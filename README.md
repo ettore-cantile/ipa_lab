@@ -88,7 +88,7 @@ ipa_lab/
 > exploring quantization and table-population strategies, with a deliberately
 > minimal four-term dot product in the kernel and two maps (`model_cache`,
 > `fwd_table`). That code is preserved, with its own README, on the
-> **`ipa-poc-preliminare`** branch. `main` is organised instead around a **design
+> **`ipa-poc-preliminar`** branch. `main` is organised instead around a **design
 > space of three eBPF pipelines** that all run the *same* quantized multi-layer
 > model and differ only in *where the weights live and what can change without
 > recompiling*. The two branches are successive stages of one project, not
