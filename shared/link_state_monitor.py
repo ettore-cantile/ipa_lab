@@ -37,11 +37,14 @@ LINK_STATE_MAP = "link_state"
 
 # Number of link_state slots in the input vector. This is the MODEL's feature
 # width, fixed by the trained checkpoint (the 65-4-4-7 model was trained with
-# n_interfaces=6, so fc1 reserves 6 columns for link_state) -- it is NOT the
-# number of interfaces any node actually has. The generated Germany50 lab has
-# max degree 5, so slot 5 is structurally unreachable on every node. The vector
-# width must stay at the trained value or the fc1 column offsets desync from
-# the weights; see model_meta.derive_shape / verify_shape_vs_checkpoint.
+# n_interfaces=6, so fc1 reserves 6 columns for link_state) -- which is the
+# degree of the LARGEST node in the network, not the degree of the node this
+# runs on. In the generated Germany50 lab that maximum is 6 (karlsruhe, once
+# h_src is attached to it), but node degrees range from 2 to 6, so on every
+# node except karlsruhe some of these slots have no interface behind them.
+# The vector width must stay at the trained value or the fc1 column offsets
+# desync from the weights; see model_meta.derive_shape /
+# verify_shape_vs_checkpoint.
 N_EGRESS = 6
 DEFAULT_IFACES = [f"eth{i}" for i in range(N_EGRESS)]
 
@@ -141,9 +144,10 @@ def monitor_loop(bpf_obj, ifaces=None, interval: float = 0.5,
     absent = [n for n, p in zip(names, present) if not p]
     if absent:
         # Say this once, up front, instead of listing these slots as "down"
-        # every poll: they are model padding (the checkpoint reserves
-        # N_EGRESS=6 link_state columns, this lab's nodes have at most 5
-        # interfaces), not links that failed.
+        # every poll. The checkpoint reserves N_EGRESS=6 link_state columns
+        # because the network's largest node has degree 6; this node has fewer
+        # interfaces than that, so the extra slots have nothing behind them.
+        # They are not links that failed.
         print(f"[link_state] slots with no interface on this node: {absent} "
               f"-- structurally 0, not a link failure")
     prev = None

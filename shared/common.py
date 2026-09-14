@@ -220,8 +220,12 @@ def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = 
     class->port convention.
 
     Returns {"installed": [(cls, iface, ifindex)],
-             "pending":   [(cls, iface)]}
-    where `pending` lists exactly the classes whose dst_mac is still the
+             "pending":   [(cls, iface)],
+             "absent":    [(cls, iface)]}
+    where `absent` lists the classes whose egress interface does not exist on
+    this node at all -- structural on any node below the network's maximum
+    degree, and reported separately from a real provisioning failure -- and
+    `pending` lists exactly the classes whose dst_mac is still the
     fallback because ARP hasn't resolved yet. Callers feed `pending` straight
     into start_mac_refresh_thread() -- they must NOT re-derive it by calling
     neighbor_mac() again: a second /proc/net/arp read can disagree with the one
@@ -274,8 +278,9 @@ def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = 
         print(f"[mac] {table_name}: {len(absent)} of {n_fwd} egress classes have no "
               f"interface on this node -> permanent MISS: {names}")
         print("[mac]   Structural, not a failure: the model reserves one egress "
-              "class per interface of the network's largest node, so this node "
-              f"(degree {len(installed)}) always has unreachable classes.")
+              "class per interface of the network's LARGEST node, and this node "
+              f"has degree {len(installed)}. Only a maximum-degree node uses "
+              f"every class.")
     if not installed:
         print(f"[mac] WARNING: {table_name} -- no egress interface resolved; every class -> MISS")
     return {"installed": installed, "pending": pending, "absent": absent}

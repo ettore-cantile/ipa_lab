@@ -25,46 +25,64 @@ The experimental setup uses the **Germany50** topology from the [SNDlib reposito
 
 | Property | Value |
 |---|---|
-| Nodes in the emulated lab | 50 |
-| Links | 88 |
-| Max node degree | 5 (interfaces `eth0`..`eth4`) |
+| Backbone routers | 50 |
+| End hosts | 2 (`h_src`, `h_dst`) |
+| Nodes in the emulated lab | **52** |
+| Links | 90 (88 backbone + 2 access) |
+| Max node degree | **6** (`karlsruhe`, interfaces `eth0`..`eth5`) |
+| Source host | `h_src` attached to **Karlsruhe** |
+| Destination host | `h_dst` attached to **Flensburg** |
 | Max simultaneous failures | 10 |
 
-> **The lab has 50 nodes and no end hosts.** `genera_lab.py` emits exactly the 50
-> SNDlib backbone routers. The `h_src` / `h_dst` end hosts exist only in
-> `importSNDLib.py`, the NetworkX analysis helper — they are never written to
-> `lab.conf` and have no `.startup` file. Traffic in the lab is generated
-> router-to-router (`send_ipa.py` runs on a router, e.g. `darmstadt`).
+> **Why 52 and 6, and why they are not arbitrary.** The checked-in checkpoint is
+> trained with `n_interfaces=6` and `n_nodes=52`, which is where its input width
+> comes from: `N_IN = 6 + 6 + 1 + 52 = 65`, `n_out = 6 + 1 = 7`. Both numbers are
+> properties of the topology the model was trained on, which
+> `importSNDLib.load_sndlib_topology()` builds as the 50 SNDlib routers **plus
+> the two end hosts**:
 >
-> **The model's feature widths are larger than the deployed topology needs.**
-> The checked-in checkpoint was trained with `n_interfaces=6` and `n_nodes=52`
-> (`N_IN = 6 + 6 + 1 + 52 = 65`), while the generated lab has max degree 5 and
-> 50 nodes. Those dimensions are fixed by the checkpoint and **must not be
-> lowered** — `n_interfaces=5` would give `N_IN=63` and
-> `model_meta.verify_shape_vs_checkpoint()` would (correctly) refuse to load.
-> The consequences to be aware of when reading results:
-> - `link_state[5]` is structurally always 0 — no node has a 6th interface.
-> - Egress **class 5 maps to `eth5`, which exists on no node**, so it is a
->   permanent MISS.
-> - Node one-hot slots 50 and 51 are never reachable.
+> ```python
+> load_sndlib_topology('germany50.xml',
+>                      attach_h_src_to='Karlsruhe',
+>                      attach_h_dst_to='Flensburg')
+> # -> 52 nodes, max degree 6
+> ```
 >
-> The code does not hide any of this, and it distinguishes padding from failure:
-> - `link_state_monitor` seeds slots backed by a real interface to `up` and
->   slots with no interface to `0`, and reports the second group **once** as
->   `slots with no interface on this node: ['eth5'] -- structurally 0, not a
->   link failure`. It no longer lists them in the per-poll `down=[...]` set,
->   where a padding slot was indistinguishable from a link that had just failed
->   — the exact signal this lab measures.
-> - `install_mac_per_class` separates *absent* egress classes (structural, on
->   every node of less than maximum degree) from *present but unusable* ones
->   (a real provisioning error), and prints the node's degree alongside.
-> - `n_fwd` is derived from the model's `n_out - 1` rather than a literal 6, so
->   a model with a different output width cannot silently leave its top classes
->   unmapped.
+> Karlsruhe has degree 5 in bare Germany50; attaching `h_src` makes it the unique
+> degree-6 node. So `n_interfaces=6` is Karlsruhe-with-its-host, and `n_nodes=52`
+> is `50 + 2`. The model and the environment agree exactly — there is no padding
+> and no mismatch to explain away.
 >
-> None of this changes the input vector: the link_state slot count stays at the
-> trained `N_EGRESS = 6`, or the fc1 column offsets would desync from the
-> weights.
+> `genera_lab.py` previously emitted only the 50 routers, giving a lab of 50
+> nodes with max degree 5. That made the checkpoint's 6/52 look like dimensions
+> invented for no reason, with `link_state[5]` permanently 0 and egress class 5
+> a permanent MISS on every node. The generator now emits the hosts, so the lab
+> is the topology the model was trained for. Run `genera_lab.py` and it reports
+> the check explicitly:
+>
+> ```
+> Max node degree: 6 (karlsruhe, interfaces eth0..eth5)
+> Model compatibility: n_nodes=52, n_interfaces=6 -> N_IN = 6 + 6 + 1 + 52 = 65, n_out = 7
+> ```
+>
+> `--no-hosts` still generates the bare 50-router backbone, byte-identical to the
+> old output, for comparison — but that lab does **not** match the checkpoint.
+
+Germany50 is not regular: node degrees range from 2 to 6, so `karlsruhe` is the
+only node that can use all six egress classes. A degree-2 node cannot forward
+through classes 2..5, and `link_state[2..5]` has no interface behind it there.
+That is inherent to one model serving every node of a non-regular topology — it
+is not the 6-vs-topology mismatch described above, which is gone. The code names
+it rather than letting it look like a fault:
+
+- `link_state_monitor` seeds only slots backed by a real interface to `up`, and
+  reports the rest **once** as `slots with no interface on this node ... --
+  structurally 0, not a link failure`, instead of listing them in the per-poll
+  `down=[...]` set where they were indistinguishable from a link that had just
+  failed — the exact signal this lab measures.
+- `install_mac_per_class` separates *absent* egress classes from *present but
+  unusable* ones, and prints the node's degree alongside.
+- `n_fwd` comes from the model's `n_out - 1`, not a literal 6.
 
 The topology lives in `germany50.xml` (SNDlib format). `genera_lab.py` parses it and emits the Kathara lab: `lab.conf` (collision domains and interface assignment) plus one `<node>.startup` per node (IP addressing, loopbacks, `/etc/hosts`, FRR/OSPF configuration). `importSNDLib.py` is a separate analysis helper that loads the same XML into a NetworkX graph for topology statistics and plotting.
 
@@ -77,7 +95,7 @@ ipa_lab/
 ├── genera_lab.py                    # Generates lab.conf + <node>.startup from germany50.xml
 ├── importSNDLib.py                  # SNDlib XML -> NetworkX topology (analysis helper)
 ├── germany50.xml                    # SNDlib Germany50 topology
-├── lab.conf, <node>.startup         # Generated Kathara lab (50 nodes, 88 links)
+├── lab.conf, <node>.startup         # Generated Kathara lab (52 nodes, 90 links)
 ├── Dockerfile                       # kathara/frr_ebpf image (FRR + BCC + eBPF headers)
 ├── docs/
 │   ├── testing.md                   # Test guide + measured results
@@ -235,7 +253,7 @@ the command to run.
 ### Start the lab
 
 ```bash
-kathara lstart      # 50 nodes, germany50 topology
+kathara lstart      # 52 nodes (50 routers + h_src/h_dst), germany50 topology
 kathara linfo
 kathara lclean      # tear down
 ```
@@ -291,6 +309,10 @@ python3 shared/methods/method4_hardcoded_aot.py     # builds .o + loader, then b
 ### Send traffic
 
 ```bash
+# end-to-end, the way the topology is meant to be driven
+kathara exec h_src -- python3 /shared/send_ipa.py --dst h_dst --count 100
+
+# or router-to-router, to exercise a specific hop
 kathara exec darmstadt -- python3 /shared/send_ipa.py --dst frankfurt --count 100
 kathara exec darmstadt -- python3 /shared/test/test_ipa.py --dest frankfurt --count 100 --model-id 0
 ```
@@ -338,7 +360,15 @@ and Google Benchmark.
 ```bash
 python3 genera_lab.py                      # rewrites lab.conf + every <node>.startup
 python3 genera_lab.py --xml other.xml --out /tmp/lab   # different topology / output dir
+python3 genera_lab.py --host h_src=berlin              # attach a host elsewhere
+python3 genera_lab.py --no-hosts                       # bare 50-router backbone
 ```
+
+`--host` and `--no-hosts` change the topology the lab presents to the model.
+The defaults (`h_src=karlsruhe`, `h_dst=flensburg`) are the attachment points the
+checked-in checkpoint was trained on; anything else changes `n_nodes` or the max
+degree and the checkpoint no longer matches. The generator prints the resulting
+`N_IN` so the mismatch is visible immediately.
 
 Runs from any working directory and only writes when invoked as a script
 (importing it has no side effects). It prints the node count, link count and max

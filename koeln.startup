@@ -63,6 +63,8 @@ echo '10.255.255.47 trier' >> /etc/hosts
 echo '10.255.255.48 ulm' >> /etc/hosts
 echo '10.255.255.49 wesel' >> /etc/hosts
 echo '10.255.255.50 wuerzburg' >> /etc/hosts
+echo '10.255.255.51 h_src' >> /etc/hosts
+echo '10.255.255.52 h_dst' >> /etc/hosts
 ip addr add 10.0.0.13/30 dev eth0
 ip link set eth0 up
 ip addr add 10.0.0.18/30 dev eth1
