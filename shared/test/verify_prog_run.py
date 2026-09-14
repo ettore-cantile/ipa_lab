@@ -385,6 +385,33 @@ BPF_ARRAY(mac_table, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats, __u64, 3);
 BPF_ARRAY(cls_stats, __u64, 7);
 
+/* CTR_INC(): real per-packet map-lookup counter, active only when
+ * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
+ * see common.py instrument_map_lookups()). No-op otherwise, so the baseline
+ * program whose instructions and latency are measured is byte-identical to
+ * what it was before this block existed.
+ *
+ * Added so the baseline gets a MEASURED lookup count like the three pipelines.
+ * count_lookups() had no 'baseline' branch, so the design-space table printed
+ * n/a for it -- and the figure that had been reported for the baseline was 0,
+ * which is wrong: the hit path below does three lookups (mac_table, pkt_stats,
+ * cls_stats). The baseline is the reference floor the other pipelines are
+ * compared against, so its floor of map lookups has to be measured, not
+ * assumed to be zero. */
+#ifdef IPA_COUNT_LOOKUPS
+BPF_PERCPU_ARRAY(lookup_ctr, __u64, 1);
+/* BCC's rewriter refuses table.lookup() calls that appear textually inside a
+ * macro expansion -- must be a real function, not a #define body. */
+static inline __attribute__((always_inline)) void ctr_inc(void) {
+    int _lci = 0;
+    __u64 *_lcv = lookup_ctr.lookup(&_lci);
+    if (_lcv) *_lcv += 1;   /* per-CPU: no atomic needed */
+}
+#define CTR_INC() ctr_inc()
+#else
+#define CTR_INC() do {} while (0)
+#endif
+
 /* EMPTY/BASELINE pipeline: the SAME packet parse as the hardcoded dispatcher
  * (eth/ip/udp/ipa, bounds-checked) + the SAME action (mac_table -> MAC rewrite
  * -> bpf_redirect), but NO dispatch tail-call and NO neural-net inference. It
@@ -718,7 +745,16 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
 
     weights, scale = load_weights(model_path)
 
-    if method == "hardcoded":
+    if method == "baseline":
+        # The reference floor: same parse + same mac_table action as the real
+        # pipelines, no inference. Its lookups are the framework cost every
+        # pipeline pays, so subtracting it isolates the model's own lookups.
+        src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(EBPF_BASELINE)
+        _report(EBPF_BASELINE)
+        b = BPF(text=src)
+        disp_fn = b.load_func("xdp_baseline", BPF.XDP)
+        _install_mac_table(b, "mac_table")
+    elif method == "hardcoded":
         from ebpf_program import build_combined_hardcoded_source
         raw = build_combined_hardcoded_source([(model_id, weights, scale, None)])
         src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
@@ -742,7 +778,8 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
         _seed_link_state(b, 1)
         _install_mac_table(b, "mac_table_t2")
     elif method == "modular":
-        from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
+        from ebpf_modular import (EBPF_MODULAR_FULL, load_modular_weights,
+                                  LAYER_CHAIN_SIZE)
         src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(EBPF_MODULAR_FULL)
         _report(EBPF_MODULAR_FULL)
         b = BPF(text=src)
@@ -750,7 +787,7 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
         fn_first  = b.load_func("layer_first",  BPF.XDP)
         fn_hidden = b.load_func("layer_hidden", BPF.XDP)
         b["layer_chain"][ct.c_int(0)] = ct.c_int(fn_first.fd)
-        for i in range(1, 16):
+        for i in range(1, LAYER_CHAIN_SIZE):
             b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_hidden.fd)
         load_modular_weights(b, weights, model_id=model_id, scale=scale,
                              layer_dims=[(65, 4), (4, 4), (4, 7)])
