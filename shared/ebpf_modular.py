@@ -117,6 +117,16 @@ ML1_MAX_H1   = 8    # first layer's output width ceiling
 MLH_MAX_H    = 8    # later layers' input/output width ceiling
 LAYER_CHAIN_SIZE = 16
 
+# Size of the single shared layer_weights block, in int8 slots. MUST stay
+# equal to the MAX_LAYER_WEIGHT_ENTRIES #define in the eBPF source below (and
+# a power of two: the datapath masks its weight index with
+# MAX_LAYER_WEIGHT_ENTRIES-1 to keep a runtime-variable index verifier-safe).
+# Every concurrently registered model_id carves a non-overlapping slice out of
+# this one block, so this constant is also the hard cap on concurrent models.
+# Exported so callers check the cap against the real value instead of
+# re-hardcoding 2048.
+MAX_LAYER_WEIGHT_ENTRIES = 2048
+
 EBPF_MODULAR_COMMON_HEADER = r"""
 #include <uapi/linux/if_ether.h>
 #include <uapi/linux/ip.h>
@@ -697,10 +707,12 @@ def load_modular_weights(
                     f"MLH_MAX_H={MLH_MAX_H} -- raise it in ebpf_modular.py and reload")
 
     total_weights = sum(n_in * n_out + n_out for (n_in, n_out) in layer_dims)
-    if base_offset + total_weights > 2048:  # MAX_LAYER_WEIGHT_ENTRIES in the eBPF source
+    if base_offset + total_weights > MAX_LAYER_WEIGHT_ENTRIES:
         raise ValueError(
             f"base_offset={base_offset} + total_weights={total_weights} "
-            f"exceeds MAX_LAYER_WEIGHT_ENTRIES=2048 -- too many concurrent model_id's")
+            f"exceeds MAX_LAYER_WEIGHT_ENTRIES={MAX_LAYER_WEIGHT_ENTRIES} -- too "
+            f"many concurrent model_id's. Raise it here AND the matching #define "
+            f"in the eBPF source (keep it a power of two).")
     if len(weights_int8) < total_weights:
         raise ValueError(
             f"layer_dims={layer_dims} needs {total_weights} weights, "

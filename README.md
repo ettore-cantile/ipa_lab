@@ -25,12 +25,46 @@ The experimental setup uses the **Germany50** topology from the [SNDlib reposito
 
 | Property | Value |
 |---|---|
-| Nodes | 50 (+ 2 virtual hosts) |
-| Max node degree | 6 |
-| Total nodes in emulation | 52 |
-| Source host | `h_src` attached to **Karlsruhe** |
-| Destination host | `h_dst` attached to **Flensburg** |
+| Nodes in the emulated lab | 50 |
+| Links | 88 |
+| Max node degree | 5 (interfaces `eth0`..`eth4`) |
 | Max simultaneous failures | 10 |
+
+> **The lab has 50 nodes and no end hosts.** `genera_lab.py` emits exactly the 50
+> SNDlib backbone routers. The `h_src` / `h_dst` end hosts exist only in
+> `importSNDLib.py`, the NetworkX analysis helper — they are never written to
+> `lab.conf` and have no `.startup` file. Traffic in the lab is generated
+> router-to-router (`send_ipa.py` runs on a router, e.g. `darmstadt`).
+>
+> **The model's feature widths are larger than the deployed topology needs.**
+> The checked-in checkpoint was trained with `n_interfaces=6` and `n_nodes=52`
+> (`N_IN = 6 + 6 + 1 + 52 = 65`), while the generated lab has max degree 5 and
+> 50 nodes. Those dimensions are fixed by the checkpoint and **must not be
+> lowered** — `n_interfaces=5` would give `N_IN=63` and
+> `model_meta.verify_shape_vs_checkpoint()` would (correctly) refuse to load.
+> The consequences to be aware of when reading results:
+> - `link_state[5]` is structurally always 0 — no node has a 6th interface.
+> - Egress **class 5 maps to `eth5`, which exists on no node**, so it is a
+>   permanent MISS.
+> - Node one-hot slots 50 and 51 are never reachable.
+>
+> The code does not hide any of this, and it distinguishes padding from failure:
+> - `link_state_monitor` seeds slots backed by a real interface to `up` and
+>   slots with no interface to `0`, and reports the second group **once** as
+>   `slots with no interface on this node: ['eth5'] -- structurally 0, not a
+>   link failure`. It no longer lists them in the per-poll `down=[...]` set,
+>   where a padding slot was indistinguishable from a link that had just failed
+>   — the exact signal this lab measures.
+> - `install_mac_per_class` separates *absent* egress classes (structural, on
+>   every node of less than maximum degree) from *present but unusable* ones
+>   (a real provisioning error), and prints the node's degree alongside.
+> - `n_fwd` is derived from the model's `n_out - 1` rather than a literal 6, so
+>   a model with a different output width cannot silently leave its top classes
+>   unmapped.
+>
+> None of this changes the input vector: the link_state slot count stays at the
+> trained `N_EGRESS = 6`, or the fc1 column offsets would desync from the
+> weights.
 
 The topology lives in `germany50.xml` (SNDlib format). `genera_lab.py` parses it and emits the Kathara lab: `lab.conf` (collision domains and interface assignment) plus one `<node>.startup` per node (IP addressing, loopbacks, `/etc/hosts`, FRR/OSPF configuration). `importSNDLib.py` is a separate analysis helper that loads the same XML into a NetworkX graph for topology statistics and plotting.
 
@@ -43,7 +77,7 @@ ipa_lab/
 ├── genera_lab.py                    # Generates lab.conf + <node>.startup from germany50.xml
 ├── importSNDLib.py                  # SNDlib XML -> NetworkX topology (analysis helper)
 ├── germany50.xml                    # SNDlib Germany50 topology
-├── lab.conf, <node>.startup         # Generated Kathara lab (52 nodes)
+├── lab.conf, <node>.startup         # Generated Kathara lab (50 nodes, 88 links)
 ├── Dockerfile                       # kathara/frr_ebpf image (FRR + BCC + eBPF headers)
 ├── docs/
 │   ├── testing.md                   # Test guide + measured results
@@ -55,6 +89,8 @@ ipa_lab/
     ├── ebpf_template_arch.py        # Pipeline 2 eBPF source + arch_weights control plane
     ├── ebpf_modular.py              # Pipeline 3 eBPF source + layer_weights control plane
     ├── common.py                    # mac_table install, ARP refresh, XDP attach/detach
+    ├── fix_bpf.sh                   # (per node, at boot) symlinks host_headers for BCC
+    ├── fetch_host_headers.sh        # (on the host, once) populates host_headers/
     ├── link_state_monitor.py        # Seeds link_state[] from real carrier state
     ├── queue_state_monitor.py       # Seeds queue_state[] (synthetic, demo feature)
     ├── extract_weights.py           # .pt -> weights.json / weights_float.json
@@ -140,6 +176,16 @@ are a property of the model, read from `model_meta.json`. The default descriptor
 `[link_state, ingress_iface, ttl, node]` with `n_out = n_interfaces + 1` gives
 the historical `65-4-4-7` shape.
 
+> **Known limitation — `node` is driven by `model_id`, not by node identity.**
+> The datapath sets the node one-hot index from `ipa->model_id`
+> (`__u32 _node = (__u32)ipa->model_id;` in all three pipelines), not from any
+> per-node identifier. With a single registered model (`--model-id 0`, the
+> default) the one-hot therefore fires slot 0 on **every** node, so the feature
+> contributes the same constant everywhere and carries no topological
+> information. Making it a real node feature means seeding a per-node id at
+> startup (each node knows its own name from the Kathara lab) and reading that
+> instead of `model_id`.
+
 > **Known limitation — `ingress_iface` is inert on this lab.** P1 maps the kernel
 > ifindex to a logical port through an `ifindex_table` defaulting to `[2..7]`;
 > P2/P3 use the raw ifindex clamped to `[1, n_interfaces]`. Real Kathara nodes get
@@ -172,10 +218,24 @@ travel in-band (a true IPA cache-miss path) is future work; see the discussion i
 
 ## How to Run
 
+### First run after cloning
+
+The Kathara nodes compile eBPF with BCC against the **host's** kernel headers,
+bind-mounted through `shared/`. Those headers are ~114 MB of generated files
+pinned to one exact kernel version, so they are **not tracked in git**. Populate
+them once per machine (and again after a kernel upgrade):
+
+```bash
+bash shared/fetch_host_headers.sh     # copies /usr/src/linux-headers-$(uname -r)
+```
+
+Without this, every pipeline fails at BPF compilation and `fix_bpf.sh` prints
+the command to run.
+
 ### Start the lab
 
 ```bash
-kathara lstart      # 52 nodes, germany50 topology
+kathara lstart      # 50 nodes, germany50 topology
 kathara linfo
 kathara lclean      # tear down
 ```
@@ -197,6 +257,26 @@ kathara exec frankfurt -- ip link set dev eth1 xdp off
 All three populate `mac_table` and `link_state` themselves at startup and print
 live `HIT | MISS | DROP` counters. XDP only sees **ingress** traffic, so attach on
 the interface the traffic arrives on (check with `tcpdump -i any -n udp port 9999`).
+
+A failed XDP attach raises — it does not print a warning and carry on — so if a
+pipeline prints `running`, the program really is on the wire. All three detach
+the program and stop the carrier monitor on **any** exit path, not only Ctrl-C.
+
+**Concurrent models are capped by the shared weight block.** `--model-ids` packs
+every registered model into one BPF map entry, so the cap is
+`MAX_WEIGHT_ENTRIES / weights-per-model`:
+
+| | block size | per model (65-4-4-7) | max concurrent models |
+|---|---|---|---|
+| P2 template | `MAX_WEIGHT_ENTRIES` = 1024 | 319 | **3** |
+| P3 modular | `MAX_LAYER_WEIGHT_ENTRIES` = 2048 | 319 | **6** |
+
+Both are checked before the eBPF program is compiled, so asking for more fails
+immediately with the numbers rather than part-way through registration. Raising
+a cap means changing the Python constant **and** the matching `#define` in the
+eBPF source together (keep it a power of two — the datapath masks its weight
+index with `size - 1` to keep a runtime-variable index verifier-safe), and it
+changes the map-memory figures reported by `test_suite.py --only kernel`.
 
 **Pipeline 1 deploys via AOT only.** The BCC live-attach path was removed; the
 `.o` is built offline on a box with clang and the statically linked `loader_aot`
@@ -256,8 +336,14 @@ and Google Benchmark.
 ## Regenerating the lab
 
 ```bash
-python3 genera_lab.py     # rewrites lab.conf and every <node>.startup from germany50.xml
+python3 genera_lab.py                      # rewrites lab.conf + every <node>.startup
+python3 genera_lab.py --xml other.xml --out /tmp/lab   # different topology / output dir
 ```
+
+Runs from any working directory and only writes when invoked as a script
+(importing it has no side effects). It prints the node count, link count and max
+node degree it produced — a quick check that the lab matches what the model and
+the docs assume.
 
 ---
 

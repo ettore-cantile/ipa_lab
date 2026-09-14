@@ -93,13 +93,16 @@ def bench_template(weights, scale, n_models):
     from bcc import BPF
     from ebpf_template_arch import (
         EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER,
-        load_arch_weights, N_WEIGHTS_T2,
+        load_arch_weights, N_WEIGHTS_T2, MAX_WEIGHT_ENTRIES,
     )
 
-    max_models = 1024 // N_WEIGHTS_T2  # MAX_WEIGHT_ENTRIES bound
+    # Cap read from the exported constant, not a literal: the eBPF #define and
+    # this bound have to move together, and a stale literal here would silently
+    # bench more models than arch_weights can actually hold.
+    max_models = MAX_WEIGHT_ENTRIES // N_WEIGHTS_T2
     if n_models > max_models:
         print(f"[bench] template: capping n_models {n_models} -> {max_models} "
-              f"(MAX_WEIGHT_ENTRIES=1024 / N_WEIGHTS_T2={N_WEIGHTS_T2})")
+              f"(MAX_WEIGHT_ENTRIES={MAX_WEIGHT_ENTRIES} / N_WEIGHTS_T2={N_WEIGHTS_T2})")
         n_models = max_models
 
     src = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER
@@ -122,18 +125,23 @@ def bench_template(weights, scale, n_models):
 def bench_modular(weights, scale, n_models):
     """One-time compile+load, then N incremental load_modular_weights() calls."""
     from bcc import BPF
-    from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
+    from ebpf_modular import (EBPF_MODULAR_FULL, load_modular_weights,
+                              MAX_LAYER_WEIGHT_ENTRIES)
 
     model_size = len(weights)
-    max_models = 2048 // model_size  # MAX_LAYER_WEIGHT_ENTRIES bound
+    max_models = MAX_LAYER_WEIGHT_ENTRIES // model_size
     if n_models > max_models:
         print(f"[bench] modular: capping n_models {n_models} -> {max_models} "
-              f"(MAX_LAYER_WEIGHT_ENTRIES=2048 / model_size={model_size})")
+              f"(MAX_LAYER_WEIGHT_ENTRIES={MAX_LAYER_WEIGHT_ENTRIES} / "
+              f"model_size={model_size})")
         n_models = max_models
 
     t0 = time.perf_counter()
     b = BPF(text=EBPF_MODULAR_FULL)
-    disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)
+    # disp_fn is never referenced again but must stay alive: dropping the last
+    # reference to a BCC-loaded program lets it be garbage-collected, which
+    # closes its fd and unloads the program mid-benchmark.
+    disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)  # noqa: F841  (keeps the program loaded)
     fn_first  = b.load_func("layer_first",  BPF.XDP)
     fn_hidden = b.load_func("layer_hidden", BPF.XDP)
     # slot 0 = layer_first, slots 1..15 = layer_hidden.
@@ -159,8 +167,8 @@ def main():
     args = parser.parse_args()
 
     if not sys.platform.startswith("linux"):
-        print(f"[bench] Needs Linux + BCC + root. Run inside Kathara, e.g.:")
-        print(f"  kathara exec frankfurt -- python3 /shared/bench_model_add.py")
+        print("[bench] Needs Linux + BCC + root. Run inside Kathara, e.g.:")
+        print("  kathara exec frankfurt -- python3 /shared/bench_model_add.py")
         sys.exit(1)
 
     from verify_prog_run import load_weights
@@ -254,8 +262,8 @@ def main():
         l = _stats(hc_ph["load"])["mean_ms"]
         print(f"  Interpretation: BCC C->BPF compilation is ~{c:.0f} ms/model, the kernel")
         print(f"  load (verifier) only ~{l:.0f} ms. Compilation dominates -- and it is NOT")
-        print(f"  intrinsic to hardcoded weights: an AOT-compiled program with weights as")
-        print(f"  C literals (compiled offline once, loaded per model) keeps")
+        print("  intrinsic to hardcoded weights: an AOT-compiled program with weights as")
+        print("  C literals (compiled offline once, loaded per model) keeps")
         print(f"  the datapath identical (same instrs/latency) while paying only the ~{l:.0f} ms")
         print(f"  load -- an estimated ~{(c+l)/max(l,1e-9):.0f}x cheaper add with zero perf loss.")
 

@@ -268,25 +268,25 @@ def main():
             # node's glibc is >= the build host's. On this lab that produced
             # "GLIBC_2.38 not found" on the Kathara node. Warn loudly instead
             # of pretending the build is deployable everywhere.
-            print(f"[AOT] WARNING: the fully-static (-static) link did not succeed, so this")
-            print(f"      loader links glibc DYNAMICALLY and may fail on a node with an OLDER")
-            print(f"      glibc than this host (symptom: 'GLIBC_x.yy not found'). To get a")
-            print(f"      portable fully-static binary, install the static libs it still needs:")
-            print(f"      sudo apt-get install libc6-dev libbz2-dev libzstd-dev liblzma-dev")
-            print(f"      then rebuild: rm shared/poc_aot/loader_aot && python3 <this script>")
+            print("[AOT] WARNING: the fully-static (-static) link did not succeed, so this")
+            print("      loader links glibc DYNAMICALLY and may fail on a node with an OLDER")
+            print("      glibc than this host (symptom: 'GLIBC_x.yy not found'). To get a")
+            print("      portable fully-static binary, install the static libs it still needs:")
+            print("      sudo apt-get install libc6-dev libbz2-dev libzstd-dev liblzma-dev")
+            print("      then rebuild: rm shared/poc_aot/loader_aot && python3 <this script>")
         if not built:
-            print(f"[AOT] static link failed on all attempts. Full ld error:")
+            print("[AOT] static link failed on all attempts. Full ld error:")
             print("      " + "\n      ".join(last_err.strip().splitlines()[-8:]))
-            print(f"[AOT] To fix the STATIC link (needed for Kathara nodes without libbpf.so):")
-            print(f"      sudo apt-get install libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev")
-            print(f"[AOT] Falling back to DYNAMIC -lbpf. WARNING: this binary needs libbpf.so at")
-            print(f"      runtime -- it will NOT run on a node that lacks it (check with:")
-            print(f"      kathara exec <node> -- ldconfig -p | grep bpf).")
+            print("[AOT] To fix the STATIC link (needed for Kathara nodes without libbpf.so):")
+            print("      sudo apt-get install libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev")
+            print("[AOT] Falling back to DYNAMIC -lbpf. WARNING: this binary needs libbpf.so at")
+            print("      runtime -- it will NOT run on a node that lacks it (check with:")
+            print("      kathara exec <node> -- ldconfig -p | grep bpf).")
             rc, out, err = _run([args.cc, "-O2", loader_c, "-o", loader_bin, "-lbpf"], cwd=POC_DIR)
             if rc != 0:
                 sys.exit(f"[AOT] loader build failed even dynamically (rc={rc}):\n{err}\n"
                          "      Need at least libbpf-dev: sudo apt-get install libbpf-dev")
-            print(f"[AOT] built loader_aot (DYNAMIC -- libbpf.so required at runtime)")
+            print("[AOT] built loader_aot (DYNAMIC -- libbpf.so required at runtime)")
 
     if args.iface:
         # LIVE DEPLOY: attach the prebuilt .o to a real interface and stay
@@ -305,7 +305,7 @@ def main():
             sys.exit(f"[AOT] loader_aot live attach failed (rc={rc})")
         return
 
-    print(f"[AOT] running loader_aot on the prebuilt .o ...\n")
+    print("[AOT] running loader_aot on the prebuilt .o ...\n")
     rc, out, err = _run([loader_bin, o_path], cwd=POC_DIR)
     sys.stdout.write(out)
     if err.strip():
@@ -321,11 +321,11 @@ def main():
     # Say so, so the line is not read as a fresh measurement sitting next to
     # three that are. The live figure is the "[M1 update timing]" line printed
     # by test_suite.py --only kernel on this same machine.
-    print(f"  BCC method4 (re)load    : ~1.3 s    (reference, NOT measured here --")
-    print(f"                                       see '[M1 update timing]' in --only kernel)")
+    print("  BCC method4 (re)load    : ~1.3 s    (reference, NOT measured here --")
+    print("                                       see '[M1 update timing]' in --only kernel)")
     print(f"  AOT offline build       : {build_str}  (clang once, on build box)")
-    print(f"  AOT runtime deploy      : ~few ms   (open+load only -- see [deploy] above)")
-    print(f"  performance             : literal maximum preserved (see [perf] above)")
+    print("  AOT runtime deploy      : ~few ms   (open+load only -- see [deploy] above)")
+    print("  performance             : literal maximum preserved (see [perf] above)")
     print("=" * 64)
 
     if not args.keep:

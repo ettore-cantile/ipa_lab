@@ -10,7 +10,6 @@ shared/, so SHARED_DIR is added to sys.path below.
 import os
 import sys
 import json
-import random
 import struct
 import time
 import argparse
@@ -847,7 +846,10 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print()
     setup_fn = {"hardcoded": setup_hardcoded, "template": setup_template, "modular": setup_modular}[method]
     setup = setup_fn(model_id, model_path)
-    b, fn, disp = setup["b"], setup["fn"], setup["disp"]
+    # b and fn are not referenced again but must stay in scope: they own the
+    # BCC object and the loaded program: letting them be garbage-collected
+    # closes the map/program fds the TEST_RUN calls below still use.
+    b, fn, disp = setup["b"], setup["fn"], setup["disp"]  # noqa: F841
     weights = setup["weights"]
     scale = setup["scale"]
     ps = setup["pkt_stats"]
@@ -911,13 +913,12 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
     dense_vector maps + the packet TTL + node one-hot; ref_infer_sparse
     rebuilds the same IV and we sweep TTL to exercise the scalar feature.
     """
-    import model_meta as mm
     print("=" * 70)
     print(f" IPA/eBPF BPF_PROG_TEST_RUN  --  method=sparse-hetero  model_id={model_id}  dir={model_dir}")
     print("=" * 70)
     print()
     setup = setup_sparse_hetero(model_id, model_dir)
-    b, disp = setup["b"], setup["disp"]
+    b, disp = setup["b"], setup["disp"]  # noqa: F841  (b keeps the maps/program alive)
     weights, scale, shape = setup["weights"], setup["scale"], setup["shape"]
     n_in, n_out, hidden_dims = shape["n_in"], shape["n_out"], tuple(shape["hidden_dims"])
     features = shape["features"]

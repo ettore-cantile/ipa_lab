@@ -585,15 +585,79 @@ def suite_core(model, verbose=False):
     except Exception:
         ncpus = 4
 
-    # Pure P1 hardcoded: no model_cache. Only link_state[6] + counters.
-    #   link_state 6*(4+4) + pkt_stats 3*(4+8) + cls_stats 7*(4+8) + debug 8*(4+8) = 264
-    # mac_table replaced the old fwd_table(256)+valid_keys(256): now class->action
-    # over 8 slots + a small cls_stats(7). Much smaller footprint on P2/P3.
-    MAP_MEM_BYTES = {
-        1: 6 * 8 + 3 * 12 + 7 * 12 + 8 * 12,
-        2: N_WEIGHTS * 1 + 256 * 7 + 8 * 20 + 3 * 8 + 7 * 8,
-        3: N_WEIGHTS * 2 + 256 * 14 + (H + 16) * 8 * ncpus + 8 * 20 + 3 * 8 + 7 * 8,
+    # ------------------------------------------------------------------
+    # BPF map footprint, itemised per declared map.
+    #
+    # This used to be three hand-written expressions scaled by N_WEIGHTS, which
+    # understated P2 and P3 by roughly 4x and P1 by 5x. Two reasons:
+    #   * arch_weights / layer_weights are ONE struct-valued entry of a FIXED
+    #     size (MAX_WEIGHT_ENTRIES / MAX_LAYER_WEIGHT_ENTRIES bytes), not
+    #     N_WEIGHTS bytes: the block is allocated whole regardless of how many
+    #     weights the registered model actually uses.
+    #   * the registry/dispatch maps were missing entirely -- model_progs (256
+    #     slots) on P1, model_desc + arch_registry on P2, model_desc +
+    #     layer_registry + layer_shapes on P3. Those dominate P2/P3.
+    #
+    # Each line is (map name, key_size, value_size, max_entries, per_cpu) taken
+    # straight from the BPF_* declaration in the corresponding eBPF source, and
+    # costed with EXACTLY the formula the kernel-suite measurement uses on the
+    # real map (verify_prog_run.map_bytes):
+    #     (key_size + value_size * ncpus_if_percpu) * max_entries
+    # so this userspace estimate and the kernel-measured figure are directly
+    # comparable instead of counting different things.
+    #
+    # Struct sizes (all packed, or all-__u8 hence alignment 1):
+    #   fwd_action 4+6+6=16     ls_vec 4*6=24        qs_vec 4*4=16
+    #   feat_ent 4, model_desc 4+4*4=20              arch_entry 1+4+2+1+1=9
+    #   layer_model_entry 2+1=3 layer_shape_key 2    layer_shape_entry 2+2+4=8
+    #   act_vec 8*SCRATCH_ACT_SIZE=1024
+    #
+    # This is the DECLARED capacity of the maps, not kernel RSS: the kernel adds
+    # per-element bookkeeping (bucket/link overhead on hash maps), so the real
+    # figure is higher. It is a like-for-like comparison across the three
+    # pipelines, which is what the design-space table is for.
+    # lookup_ctr is excluded: it only exists under IPA_COUNT_LOOKUPS
+    # (measurement builds), never in the programs these numbers describe.
+    MAX_WEIGHT_ENTRIES       = 1024   # aw_blk in ebpf_template_arch.py
+    MAX_LAYER_WEIGHT_ENTRIES = 2048   # lw_blk in ebpf_modular.py
+    ACT_VEC_BYTES            = 8 * 128  # act_vec: long long v[SCRATCH_ACT_SIZE]
+    mac_capacity             = max(8, O)
+
+    #                  name             key  value                     entries  percpu
+    MAP_BREAKDOWN = {
+        1: [("link_state",               4,  24,                        1,      False),
+            ("pkt_stats",                4,  8,                         3,      False),
+            ("cls_stats",                4,  8,                         O,      False),
+            ("mac_table",                4,  16,                        mac_capacity, False),
+            ("model_progs",              4,  4,                         256,    False)],
+        2: [("arch_weights",             4,  MAX_WEIGHT_ENTRIES,        1,      False),
+            ("link_state",               4,  24,                        1,      False),
+            ("queue_state",              4,  16,                        1,      False),
+            ("model_desc",               1,  20,                        256,    False),
+            ("arch_registry",            1,  9,                         256,    False),
+            ("arch_progs",               4,  4,                         8,      False),
+            ("mac_table_t2",             4,  16,                        8,      False),
+            ("pkt_stats_t2",             4,  8,                         3,      False),
+            ("cls_stats_t2",             4,  8,                         7,      False)],
+        3: [("layer_weights",            4,  MAX_LAYER_WEIGHT_ENTRIES,  1,      False),
+            ("scratch_acts",             4,  ACT_VEC_BYTES,             1,      True),
+            ("scratch_meta",             4,  8,                         16,     True),
+            ("link_state",               4,  24,                        1,      False),
+            ("queue_state",              4,  16,                        1,      False),
+            ("model_desc",               1,  20,                        256,    False),
+            ("layer_registry",           1,  3,                         256,    False),
+            ("layer_shapes",             2,  8,                         512,    False),
+            ("layer_chain",              4,  4,                         16,     False),
+            ("mac_table_t3",             4,  16,                        8,      False),
+            ("pkt_stats_t3",             4,  8,                         3,      False),
+            ("cls_stats_t3",             4,  8,                         7,      False)],
     }
+
+    def _map_bytes(key, val, entries, percpu):
+        return (key + val * (ncpus if percpu else 1)) * entries
+
+    MAP_MEM_BYTES = {k: sum(_map_bytes(ks, vs, n, pc) for _, ks, vs, n, pc in v)
+                     for k, v in MAP_BREAKDOWN.items()}
     FLEXIBILITY = {1: 'low',  2: 'medium',  3: 'high'}
     MODEL_UPDATE = {
         1: 'recompile + reload eBPF program',
@@ -616,10 +680,18 @@ def suite_core(model, verbose=False):
         {k: f"{throughputs[k][0]:.4f}" for k in [1, 2, 3]})
     row("Tail calls / packet",  TAIL_CALLS)
     row("Map lookups / packet (est.)", MAP_LOOKUPS)
-    row("BPF map memory (est.)",
+    row("BPF map memory (declared)",
         {k: f"{MAP_MEM_BYTES[k]//1024}KB ({MAP_MEM_BYTES[k]}B)" for k in [1, 2, 3]})
     row("Flexibility",             FLEXIBILITY)
     print(sep)
+    print()
+
+    info("BPF map memory breakdown (declared capacity per map, "
+         "excludes kernel per-element overhead):")
+    for mid, lbl in [(1, 'P1 hardcoded'), (2, 'P2 template'), (3, 'P3 modular')]:
+        parts = ", ".join(f"{name}={_map_bytes(ks, vs, n, pc)}B"
+                          for name, ks, vs, n, pc in MAP_BREAKDOWN[mid])
+        info(f"  {lbl:<12}: {parts} = {MAP_MEM_BYTES[mid]}B")
     print()
 
     info(f"Logical CPUs detected: {ncpus} (affects the PERCPU scratch map for P3)")
@@ -1048,16 +1120,29 @@ def suite_robust():
     return passed == total
 
 
+# Every map a pipeline declares, summed by map_bytes() from the kernel's own
+# BPF_OBJ_GET_INFO_BY_FD. A name absent from a given pipeline is skipped by the
+# try/except at the call site, so one list covers all three.
+#
+# This list was previously INCOMPLETE, and since the lookup failure is silently
+# swallowed, the omissions did not show up as errors -- they just made the
+# reported footprint smaller than the real one. Missing were: model_progs
+# (P1's 256-slot BPF_PROG_ARRAY, the single largest P1 map), queue_state and
+# model_desc (P2 and P3), and layer_shapes (P3's 512-entry map). Keep this list
+# in sync with the BPF_* declarations in the three eBPF sources.
 _PIPELINE_MAP_NAMES = [
-    # shared: link_state (egress up/down input feature, all 3 pipelines)
-    "link_state",
-    # P1 hardcoded (pure: no weight map -- only stats + mac_table)
-    "pkt_stats", "cls_stats", "mac_table",
+    # shared inputs: link_state (egress up/down) and queue_state (synthetic)
+    "link_state", "queue_state",
+    # shared per-model descriptor registry (P2 + P3)
+    "model_desc",
+    # P1 hardcoded (no weight map -- weights are C literals)
+    "pkt_stats", "cls_stats", "mac_table", "model_progs",
     # P2 template
     "arch_weights", "arch_registry", "arch_progs",
     "mac_table_t2", "pkt_stats_t2", "cls_stats_t2",
     # P3 modular
-    "layer_weights", "layer_registry", "layer_chain", "scratch_acts", "scratch_meta",
+    "layer_weights", "layer_registry", "layer_shapes", "layer_chain",
+    "scratch_acts", "scratch_meta",
     "mac_table_t3", "pkt_stats_t3", "cls_stats_t3",
 ]
 
@@ -1260,12 +1345,23 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
         lat_min, lat_p50, lat_max = samples[0], samples[trials // 2], samples[-1]
         lat_ns  = float(lat_min) if lat_min else (wall * 1e9 / (repeat * trials))
         mpps    = (1000.0 / lat_ns) if lat_ns > 0 else 0.0
+        # Sum the kernel's own view of every map this pipeline declares. A name
+        # this pipeline does not have raises and is skipped -- that is expected,
+        # one list covers all three. Record WHICH maps were counted so the total
+        # is auditable: the previous version swallowed the misses with no record,
+        # which is how four maps stayed missing from the reported footprint
+        # without anyone noticing (see _PIPELINE_MAP_NAMES).
         mem = 0
+        mem_parts = []
         for mname in _PIPELINE_MAP_NAMES:
             try:
-                mem += V.map_bytes(setup["b"][mname].map_fd, V._NR_CPUS)
+                mb = V.map_bytes(setup["b"][mname].map_fd, V._NR_CPUS)
             except Exception:
-                pass
+                continue
+            mem += mb
+            mem_parts.append((mname, mb))
+        info(f"{name}: map memory {mem}B from {len(mem_parts)} maps -- "
+             + ", ".join(f"{n}={v}B" for n, v in mem_parts))
         n_tail = setup.get("n_tail")
         if n_tail is None:
             n_tail = max(0, len(setup.get("progs", {})) - 1)

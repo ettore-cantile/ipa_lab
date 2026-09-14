@@ -74,8 +74,8 @@ def main():
     delta = r1["min"] - r0["min"]
     print("-" * 70)
     print(f"Pure tail-call overhead (min-based): {delta:+.1f} ns/hop")
-    print(f"(same parse, same redirect action on both sides -- the ONLY "
-          f"difference is the PROG_ARRAY jump)")
+    print("(same parse, same redirect action on both sides -- the ONLY "
+          "difference is the PROG_ARRAY jump)")
 
 
 if __name__ == "__main__":

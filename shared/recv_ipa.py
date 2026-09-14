@@ -131,8 +131,8 @@ if __name__ == "__main__":
     timeout_str = f"{args.timeout}s" if args.timeout > 0 else "unlimited"
     count_str   = str(args.count) if args.count > 0 else "unlimited"
     print(f"[recv_ipa] Listening on UDP :{PORT} | timeout={timeout_str} | count={count_str}")
-    print(f"[recv_ipa] frankfurt loopback=10.255.255.17 | eth1=10.0.0.234")
-    print(f"[recv_ipa] Waiting for packets from darmstadt (10.0.0.233)...")
+    print("[recv_ipa] frankfurt loopback=10.255.255.17 | eth1=10.0.0.234")
+    print("[recv_ipa] Waiting for packets from darmstadt (10.0.0.233)...")
     print()
 
     sniff(

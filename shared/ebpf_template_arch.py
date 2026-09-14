@@ -78,6 +78,16 @@ T2_N_OUT  = 7
 T2_MAX_H1 = 8
 T2_MAX_H2 = 8
 
+# Size of the single shared arch_weights block, in int8 slots. MUST stay equal
+# to the MAX_WEIGHT_ENTRIES #define in the eBPF source below (and a power of
+# two: the datapath masks its weight index with MAX_WEIGHT_ENTRIES-1 to keep a
+# runtime-variable index verifier-safe). Every concurrently registered model_id
+# carves a non-overlapping slice out of this one block, so this constant is
+# also the hard cap on concurrent models: 1024 / 319 = 3 for the 65-4-4-7
+# shape. Exported so callers check the cap against the real value instead of
+# re-hardcoding 1024.
+MAX_WEIGHT_ENTRIES = 1024
+
 
 def arch_weight_count(n_h1: int, n_h2: int, n_in: int = T2_N_IN) -> int:
     """Flat int8 weight count for an n_in -> n_h1 -> n_h2 -> T2_N_OUT MLP
@@ -689,10 +699,13 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     arch_id   = 0
     map_fd    = bpf_obj["arch_weights"].map_fd
 
-    if weight_offset + n_weights > 1024:  # MAX_WEIGHT_ENTRIES in the eBPF source
+    if weight_offset + n_weights > MAX_WEIGHT_ENTRIES:
         raise ValueError(
             f"weight_offset={weight_offset} + n_weights={n_weights} "
-            f"exceeds MAX_WEIGHT_ENTRIES=1024 -- too many concurrent model_id's")
+            f"exceeds MAX_WEIGHT_ENTRIES={MAX_WEIGHT_ENTRIES} -- too many "
+            f"concurrent model_id's ({MAX_WEIGHT_ENTRIES // n_weights} fit at "
+            f"{n_weights} weights each). Raise MAX_WEIGHT_ENTRIES here AND the "
+            f"matching #define in the eBPF source (keep it a power of two).")
 
     if len(weights_int8) < n_weights:
         raise ValueError(
@@ -733,9 +746,9 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
     print(f"[Pipeline2] arch_registry[{model_id}] = "
           f"arch_id={arch_id} woff={weight_offset} scale={scale} "
-          f"shape=65-{n_h1}-{n_h2}-7 weights={n_weights}")
-    print(f"[Pipeline2] NOTE: arch_progs wiring is caller's responsibility "
-          f"(setup_template already does: b['arch_progs'][0]=leaf_fn.fd)")
+          f"shape={n_in}-{n_h1}-{n_h2}-{T2_N_OUT} weights={n_weights}")
+    print("[Pipeline2] NOTE: arch_progs wiring is caller's responsibility "
+          "(setup_template already does: b['arch_progs'][0]=leaf_fn.fd)")
 
     # Seed the per-model feature descriptor so the leaf builds its IV
     # generically. Folded in here so every existing caller (methods + test

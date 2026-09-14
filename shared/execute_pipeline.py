@@ -35,10 +35,15 @@ import runpy
 SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
-os.chdir(SHARED_DIR)
 
 
 def main():
+    # chdir into shared/ so the pipeline modules resolve their relative data
+    # paths (weights.json, the .pt checkpoint) the way they expect. Done here
+    # rather than at module level: importing this module should not silently
+    # change the caller's working directory.
+    os.chdir(SHARED_DIR)
+
     parser = argparse.ArgumentParser(
         description="IPA/eBPF design-space pipeline launcher",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -109,14 +114,14 @@ For the full metric comparison across pipelines:
     print("=" * 60)
 
     if os.path.exists(weights_path) and os.path.exists(float_path):
-        print(f"[pipeline] Step 1 — weights already present, skipping extract_weights.py")
+        print("[pipeline] Step 1 — weights already present, skipping extract_weights.py")
         print(f"[pipeline]   {weights_path} ({os.path.getsize(weights_path)} bytes)")
         print(f"[pipeline]   {float_path} ({os.path.getsize(float_path)} bytes)")
     else:
         if not os.path.exists(model_path):
             print(f"[ERROR] Model not found: {model_path}")
-            print(f"[ERROR] And weights.json / weights_float.json are also missing.")
-            print(f"[ERROR] Run extract_weights.py on a machine with torch, then commit the JSON files.")
+            print("[ERROR] And weights.json / weights_float.json are also missing.")
+            print("[ERROR] Run extract_weights.py on a machine with torch, then commit the JSON files.")
             sys.exit(1)
         print(f"[pipeline] Step 1 — extracting weights from {model_path}")
         runpy.run_path(
@@ -127,7 +132,7 @@ For the full metric comparison across pipelines:
             print("[ERROR] weights.json not generated — exiting.")
             sys.exit(1)
 
-    print(f"[pipeline] weights.json OK")
+    print("[pipeline] weights.json OK")
 
     # ------------------------------------------------------------------
     # Step 2: launch the chosen pipeline

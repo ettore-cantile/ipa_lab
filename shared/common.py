@@ -11,6 +11,7 @@ Interface mapping (from lab.conf + darmstadt.startup):
 import json
 import os
 import re
+import socket
 import ctypes
 import threading
 import time
@@ -167,7 +168,6 @@ def resolve_ifindex(name: str, fallback: str = None):
         attach XDP to the wrong link without the caller ever noticing,
         which is worse than a loud, actionable failure.
     """
-    import socket
     try:
         return name, socket.if_nametoindex(name)
     except OSError:
@@ -228,21 +228,30 @@ def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = 
     used here (ARP may resolve in between), which would either leave a fallback
     MAC unwatched or spawn a refresh thread for an already-correct entry.
     """
-    import ctypes
     if egress_ifaces is None:
         egress_ifaces = [f"eth{i}" for i in range(n_fwd)]
     mac = b.get_table(table_name)
-    installed, pending = [], []
+    installed, pending, absent = [], [], []
     for cls in range(n_fwd):
         name = egress_ifaces[cls] if cls < len(egress_ifaces) else None
         if not name:
+            continue
+        if not os.path.isdir(f"/sys/class/net/{name}"):
+            # No such interface on this node. Expected and structural: the model
+            # has one egress class per interface of the LARGEST node in the
+            # network (6 for the checked-in checkpoint), so every node of lower
+            # degree has classes it can never forward through. Collected and
+            # reported once below rather than logged as a per-class failure --
+            # it is model padding, not a provisioning error.
+            absent.append((cls, name))
             continue
         try:
             iface_r, ifindex = resolve_ifindex(name)
             src_mac = local_mac(iface_r)
             dst_mac = neighbor_mac(iface_r)
         except Exception as e:
-            print(f"[mac] class {cls}: egress '{name}' unavailable ({e}) -> unmapped (MISS)")
+            print(f"[mac] class {cls}: egress '{name}' present but unusable "
+                  f"({e}) -> unmapped (MISS)")
             continue
         if dst_mac is None:
             # No ARP entry yet (idle link). Install a fallback so the class is
@@ -260,9 +269,16 @@ def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = 
     for cls, ifc, idx in installed:
         state = "ARP pending -> fallback dst_mac" if cls in pending_cls else "ARP resolved"
         print(f"[mac] {table_name}: class {cls} -> {ifc} (ifindex={idx}) [{state}]")
+    if absent:
+        names = ", ".join(f"class {c} ({n})" for c, n in absent)
+        print(f"[mac] {table_name}: {len(absent)} of {n_fwd} egress classes have no "
+              f"interface on this node -> permanent MISS: {names}")
+        print("[mac]   Structural, not a failure: the model reserves one egress "
+              "class per interface of the network's largest node, so this node "
+              f"(degree {len(installed)}) always has unreachable classes.")
     if not installed:
         print(f"[mac] WARNING: {table_name} -- no egress interface resolved; every class -> MISS")
-    return {"installed": installed, "pending": pending}
+    return {"installed": installed, "pending": pending, "absent": absent}
 
 
 def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
@@ -321,8 +337,7 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
                     continue
                 try:
                     src = local_mac(iface)
-                    import socket as _socket
-                    ifindex = _socket.if_nametoindex(iface)
+                    ifindex = socket.if_nametoindex(iface)
                     action = mac_tbl.Leaf()
                     action.ifindex = ifindex
                     for i in range(6):
@@ -342,12 +357,24 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
 
 
 def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
+    """Attach `fn` to `iface` in XDP native/driver mode (flags=2).
+
+    Raises on failure instead of printing and returning: a swallowed
+    exception let every caller print "Pipeline running" over an interface
+    with nothing attached, leaving the HIT/MISS/DROP counters frozen at 0
+    with no indication of why. Callers that want to survive a failed attach
+    must catch it explicitly.
+    """
     print(f"[xdp] Attaching XDP to {iface}...")
     try:
         b.attach_xdp(iface, fn, flags=2)
-        print(f"[xdp] XDP attached to {iface}")
     except Exception as e:
-        print(f"[xdp] Error: {e}")
+        raise RuntimeError(
+            f"XDP attach to {iface!r} failed: {e}. "
+            f"Check the interface exists, is up, and has no stale program "
+            f"(ip link set dev {iface} xdp off)."
+        ) from e
+    print(f"[xdp] XDP attached to {iface}")
 
 
 def detach_xdp(b: BPF, iface: str = INGRESS_IFACE):

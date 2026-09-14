@@ -32,19 +32,22 @@ import socket
 import os
 import sys
 import json
+import time
 from bcc import BPF
 from ebpf_template_arch import (
     EBPF_TEMPLATE_ARCH_DISPATCHER,
     EBPF_ARCH_GENERIC_2LAYER,
     load_arch_weights,
     arch_weight_count,
+    MAX_WEIGHT_ENTRIES,
     N_WEIGHTS_T2,
 )
 from common import (
-    load_weights, attach_xdp,
-    EGRESS_IFACE, INGRESS_IFACE,
-    resolve_egress_mac, resolve_ifindex,
+    load_weights, attach_xdp, detach_xdp, INGRESS_IFACE, resolve_ifindex,
+    install_mac_per_class, start_mac_refresh_thread,
 )
+from link_state_monitor import init_link_state_up, start_monitor_thread
+from model_meta import derive_shape, load_model_meta, load_topology_config
 
 # Resolve the shared/ directory relative to this file regardless of cwd.
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -70,13 +73,37 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         float_data = json.load(f)
 
     SCALE_FACTOR = float_data["scale_factor"]
-    cp_weights   = float_data["weights"][:4]
 
     integer_weights = load_weights(weights_path)
+
+    # Validate instead of only printing the expectation: a short weights.json
+    # used to be loaded silently, registering a model whose weight block is
+    # partly whatever the previous model left in arch_weights.
+    # Every model reads integer_weights from index 0 (weight_offset indexes the
+    # BPF map, not this list), so the file only has to satisfy the LARGEST
+    # registered model, not their sum.
+    per_model = [arch_weight_count(h1, h2) for h1, h2 in dims]
+    if len(integer_weights) < max(per_model):
+        print(f"[ERROR] {weights_path} holds {len(integer_weights)} weights, "
+              f"the largest requested model needs {max(per_model)}. "
+              f"Regenerate it with extract_weights.py.")
+        sys.exit(1)
 
     print(f"  SCALE_FACTOR  = {SCALE_FACTOR}")
     print(f"  Total weights : {len(integer_weights)} (expected {N_WEIGHTS_T2})")
     print(f"  Ingress iface : {ingress_iface} (ifindex={socket.if_nametoindex(ingress_iface)})")
+
+    # arch_weights is a single fixed block shared by every registered model, so
+    # the number of concurrent model_id's is capped by MAX_WEIGHT_ENTRIES. Check
+    # it up front: load_arch_weights would otherwise raise only after the eBPF
+    # program is compiled and loaded, leaving a half-registered map behind.
+    needed = sum(per_model)
+    if needed > MAX_WEIGHT_ENTRIES:
+        print(f"[ERROR] {len(ids)} models need {needed} weight slots but "
+              f"arch_weights holds only MAX_WEIGHT_ENTRIES={MAX_WEIGHT_ENTRIES}. "
+              f"At {N_WEIGHTS_T2} weights per 65-4-4-7 model that is "
+              f"{MAX_WEIGHT_ENTRIES // N_WEIGHTS_T2} concurrent models max.")
+        sys.exit(1)
 
     combined_src = ("#define IPA_ARCH_COMBINED 1\n"
                     + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER)
@@ -94,27 +121,40 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
 
     fn_dispatcher = b.load_func("ipa_switch_template", BPF.XDP)
 
-    from common import install_mac_per_class, start_mac_refresh_thread
-    mac_info = install_mac_per_class(b, "mac_table_t2", n_fwd=6)
+    # n_fwd = egress classes = n_out - 1 (the last class is DROP), derived from
+    # the model shape instead of a literal 6. The literal silently assumed the
+    # checked-in 65-4-4-7 checkpoint; a model with a different output width
+    # would have had its top classes left unmapped with no warning.
+    _shape = derive_shape(load_model_meta(weights_path),
+                          topology_config=load_topology_config())
+    n_fwd = _shape["n_out"] - 1
+    print(f"  Egress classes: {n_fwd} (n_out={_shape['n_out']}, last class = DROP)")
+    mac_info = install_mac_per_class(b, "mac_table_t2", n_fwd=n_fwd)
     if mac_info["pending"]:
         start_mac_refresh_thread(b, "mac_table_t2", mac_info["pending"], interval=5.0)
 
-    from link_state_monitor import init_link_state_up, start_monitor_thread
     init_link_state_up(b)
     stop_monitor = start_monitor_thread(b, interval=0.5)
-    print("[Method 5] link_state seeded (all up); carrier monitor running")
+    print("[Method 5] link_state seeded (present interfaces up, absent slots 0); carrier monitor running")
 
-    attach_xdp(b, fn_dispatcher, iface=ingress_iface)
-
-    print("[Method 5] Pipeline 2 (Arch Template) running. "
-          "Stats: pkt_stats_t2 [HIT | MISS | DROP]")
-
-    import time
-    from common import detach_xdp
-    stats = b.get_table("pkt_stats_t2")
-    print(f"\n{'TRUE HIT':<22} | {'MISS':<22} | {'DROP':<20}")
-    print("-" * 70)
+    # attach_xdp raises on failure now, so reaching the serve loop means the
+    # program really is on the wire. Everything past the attach runs under
+    # try/finally: ANY exit path (Ctrl-C, a map read blowing up, an unexpected
+    # error) must still stop the carrier monitor and take the program off the
+    # interface. Previously only KeyboardInterrupt detached, so any other
+    # exception left a live XDP program on the node with no way to notice.
     try:
+        attach_xdp(b, fn_dispatcher, iface=ingress_iface)
+    except Exception:
+        stop_monitor.set()
+        raise
+
+    try:
+        print("[Method 5] Pipeline 2 (Arch Template) running. "
+              "Stats: pkt_stats_t2 [HIT | MISS | DROP]")
+        stats = b.get_table("pkt_stats_t2")
+        print(f"\n{'TRUE HIT':<22} | {'MISS':<22} | {'DROP':<20}")
+        print("-" * 70)
         while True:
             time.sleep(1)
             try:
@@ -126,6 +166,8 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
             except Exception:
                 pass
     except KeyboardInterrupt:
+        pass
+    finally:
         stop_monitor.set()
         detach_xdp(b, iface=ingress_iface)
         print("\n\nXDP removed. Exiting.")

@@ -26,7 +26,6 @@ uses queue_occupancy):
     stop.set()                                # on shutdown
 """
 
-import ctypes
 import random
 import threading
 import time

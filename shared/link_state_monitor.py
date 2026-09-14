@@ -30,13 +30,25 @@ Usage:
 """
 
 import os
-import ctypes
 import threading
 import time
 
-DEFAULT_IFACES = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5"]
 LINK_STATE_MAP = "link_state"
+
+# Number of link_state slots in the input vector. This is the MODEL's feature
+# width, fixed by the trained checkpoint (the 65-4-4-7 model was trained with
+# n_interfaces=6, so fc1 reserves 6 columns for link_state) -- it is NOT the
+# number of interfaces any node actually has. The generated Germany50 lab has
+# max degree 5, so slot 5 is structurally unreachable on every node. The vector
+# width must stay at the trained value or the fc1 column offsets desync from
+# the weights; see model_meta.derive_shape / verify_shape_vs_checkpoint.
 N_EGRESS = 6
+DEFAULT_IFACES = [f"eth{i}" for i in range(N_EGRESS)]
+
+
+def iface_exists(iface: str) -> bool:
+    """Whether `iface` is a real interface on this node."""
+    return os.path.isdir(f"/sys/class/net/{iface}")
 
 
 def carrier_state(iface: str) -> int:
@@ -46,6 +58,13 @@ def carrier_state(iface: str) -> int:
     Primary source: /sys/class/net/<iface>/carrier (1/0). Reading it can raise
     EINVAL when the interface is administratively down, so fall back to
     /sys/class/net/<iface>/operstate ('up' -> 1). Unknown iface -> 0 (down).
+
+    Note the deliberate conflation at the map level: an ABSENT interface and a
+    DOWN interface both write 0, because the model has no third state -- a slot
+    it cannot forward through is a slot it must not pick. Only the LOGGING
+    separates the two (see monitor_loop): reporting a slot the node does not
+    physically have as "down" made a structural padding slot look like a live
+    link failure, which is exactly the signal this lab is measuring.
     """
     base = f"/sys/class/net/{iface}"
     carrier = os.path.join(base, "carrier")
@@ -70,19 +89,38 @@ def _write_vector(bpf_obj, values) -> None:
     write_vector_map(bpf_obj, LINK_STATE_MAP, values)
 
 
-def init_link_state_up(bpf_obj, ifaces=None) -> None:
-    """Seed all 6 egress slots to 'up' (1). Called once at pipeline startup so
-    the model sees the normal all-links-healthy baseline before the first poll."""
-    _write_vector(bpf_obj, [1] * N_EGRESS)
+def _slot_names(ifaces=None) -> list:
+    """Resolve the slot -> interface-name mapping, padded to N_EGRESS with the
+    eth<i> convention so a caller passing FEWER names cannot IndexError."""
+    ifaces = list(ifaces or DEFAULT_IFACES)
+    return [ifaces[i] if i < len(ifaces) else f"eth{i}" for i in range(N_EGRESS)]
+
+
+def init_link_state_up(bpf_obj, ifaces=None) -> list:
+    """Seed the baseline the model sees before the first carrier poll.
+
+    Slots backed by an interface that exists on this node are seeded 'up' (1);
+    slots with no such interface are seeded 0 and stay 0 forever. The `ifaces`
+    argument used to be accepted and then silently ignored (this always wrote
+    [1]*6), which seeded a confident 'up' into padding slots the node cannot
+    forward through. Returns the seeded vector.
+    """
+    names = _slot_names(ifaces)
+    states = [1 if iface_exists(n) else 0 for n in names]
+    absent = [n for n, s in zip(names, states) if not s]
+    _write_vector(bpf_obj, states)
+    if absent:
+        print(f"[link_state] seeded up={[n for n, s in zip(names, states) if s]}; "
+              f"slots with no interface on this node (permanently 0): {absent}")
+    return states
 
 
 def update_link_state(bpf_obj, ifaces=None, verbose: bool = False) -> list:
     """Read the carrier of each egress iface and write it into the map.
-    Returns the list of 6 states written (for logging/inspection)."""
-    ifaces = (ifaces or DEFAULT_IFACES)[:N_EGRESS]
+    Returns the list of N_EGRESS states written (for logging/inspection)."""
+    names = _slot_names(ifaces)
     states = []
-    for i in range(N_EGRESS):
-        name = ifaces[i] if i < len(ifaces) else f"eth{i}"
+    for i, name in enumerate(names):
         st = carrier_state(name)
         states.append(st)
         if verbose:
@@ -95,20 +133,34 @@ def monitor_loop(bpf_obj, ifaces=None, interval: float = 0.5,
                  stop_event: "threading.Event" = None) -> None:
     """Poll carrier state every `interval` seconds until stop_event is set,
     writing changes into the link_state map."""
-    ifaces = ifaces or DEFAULT_IFACES
-    # Pad to N_EGRESS with the same eth<i> convention update_link_state() uses,
-    # so a caller passing FEWER than N_EGRESS names cannot IndexError below.
-    # (It ran in a daemon thread: the exception killed carrier monitoring
-    # silently and link_state stayed frozen at its startup all-up seed.)
-    names = [ifaces[i] if i < len(ifaces) else f"eth{i}" for i in range(N_EGRESS)]
+    names = _slot_names(ifaces)
+    # Which slots are backed by a real interface is decided ONCE: interfaces do
+    # not appear or vanish over a lab's lifetime, and re-deciding per poll would
+    # make the log flap.
+    present = [iface_exists(n) for n in names]
+    absent = [n for n, p in zip(names, present) if not p]
+    if absent:
+        # Say this once, up front, instead of listing these slots as "down"
+        # every poll: they are model padding (the checkpoint reserves
+        # N_EGRESS=6 link_state columns, this lab's nodes have at most 5
+        # interfaces), not links that failed.
+        print(f"[link_state] slots with no interface on this node: {absent} "
+              f"-- structurally 0, not a link failure")
     prev = None
     while not (stop_event and stop_event.is_set()):
-        states = update_link_state(bpf_obj, ifaces)
-        if states != prev:
-            up = [names[i] for i in range(N_EGRESS) if states[i]]
-            down = [names[i] for i in range(N_EGRESS) if not states[i]]
-            print(f"[link_state] up={up} down={down}")
-            prev = states
+        try:
+            states = update_link_state(bpf_obj, ifaces)
+            if states != prev:
+                up = [n for n, s in zip(names, states) if s]
+                down = [n for n, s, p in zip(names, states, present) if p and not s]
+                print(f"[link_state] up={up} down={down}")
+                prev = states
+        except Exception as e:
+            # This runs in a daemon thread: an unhandled exception used to kill
+            # carrier monitoring silently, freezing link_state at its startup
+            # seed with the pipeline still reporting itself healthy. Log and
+            # keep polling -- a transient map error must not end the monitor.
+            print(f"[link_state] poll failed ({e}); retrying in {interval}s")
         time.sleep(interval)
 
 
@@ -131,8 +183,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description="Dry-run: print egress carrier states (no BPF map write)")
     p.add_argument("--ifaces", nargs="+", default=DEFAULT_IFACES,
-                   help="egress interfaces, cls 0..5 (default eth0..eth5)")
+                   help=f"egress interfaces, slot 0..{N_EGRESS - 1} "
+                        f"(default eth0..eth{N_EGRESS - 1})")
     args = p.parse_args()
-    print("Egress link carrier state (1=up, 0=down):")
-    for i, name in enumerate(args.ifaces[:N_EGRESS]):
-        print(f"  link_state[{i}] {name:6s} = {carrier_state(name)}")
+    print(f"Egress link carrier state over {N_EGRESS} model slots "
+          f"(1=up, 0=down/absent):")
+    for i, name in enumerate(_slot_names(args.ifaces)):
+        note = "" if iface_exists(name) else "   <- no such interface on this node"
+        print(f"  link_state[{i}] {name:6s} = {carrier_state(name)}{note}")

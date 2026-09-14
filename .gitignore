@@ -11,3 +11,9 @@ shared/_stats_*.py
 # Office temp/lock files
 ~$*
 *.tmp
+
+# Host kernel headers bind-mounted into the Kathara nodes (shared/ is the mount).
+# ~114 MB / 17.5k generated files, pinned to one exact kernel version: a build
+# dependency of the host, not project source. Regenerate with:
+#     bash shared/fetch_host_headers.sh
+shared/host_headers/
