@@ -100,23 +100,41 @@ TEST_RUN_MAX_CHUNK = 200
 BENCH_TTL          = 255
 
 
-def prog_test_run_bench(prog_fd: int, make_frame, total_repeat: int):
-    """Time `total_repeat` runs of a packet-mutating program, in chunks.
+# Chunks per measurement. The point of a large `repeat` is to amortise the
+# syscall cost over many in-kernel runs; 200 runs already does that, and the
+# reported figure is the MINIMUM per-run average across chunks, which stops
+# improving long before 250 chunks. Capping here keeps the suite fast: without
+# it a repeat=50000 request became 250 syscalls per trial (1750 per pipeline,
+# 7000 for the suite) for no gain in the statistic actually reported.
+TEST_RUN_MAX_CHUNKS = 25
 
-    `make_frame` is called once per chunk to get a pristine frame. The kernel
-    reports the AVERAGE ns/run for each chunk; the minimum across chunks is
-    returned, the same one-sided-noise reasoning the suite uses for its
-    min-of-N trials. Returns (retval_of_last_chunk, min_ns_per_run).
+
+def prog_test_run_bench(prog_fd: int, make_frame, total_repeat: int,
+                        max_chunks: int = TEST_RUN_MAX_CHUNKS):
+    """Time a packet-mutating program in TTL-safe chunks.
+
+    `make_frame` is called once per chunk to get a pristine frame -- required
+    because the kernel never restores the packet buffer between repetitions and
+    the datapath decrements the TTL (see TEST_RUN_MAX_CHUNK).
+
+    The kernel reports the AVERAGE ns/run for each chunk; the minimum across
+    chunks is returned, the same one-sided-noise reasoning the suite uses for
+    its min-of-N trials. `total_repeat` is a target: it is capped at
+    max_chunks * TEST_RUN_MAX_CHUNK runs, because the minimum-of-averages does
+    not keep improving past that and the extra syscalls are pure wall time.
+
+    Returns (retval_of_last_chunk, min_ns_per_run).
     """
+    chunks = max(1, min(max_chunks,
+                        (max(1, total_repeat) + TEST_RUN_MAX_CHUNK - 1)
+                        // TEST_RUN_MAX_CHUNK))
     best = None
     last_retval = None
-    remaining = max(1, total_repeat)
-    while remaining > 0:
-        n = min(TEST_RUN_MAX_CHUNK, remaining)
-        last_retval, dur = prog_test_run(prog_fd, make_frame(), repeat=n)
+    for _ in range(chunks):
+        last_retval, dur = prog_test_run(prog_fd, make_frame(),
+                                         repeat=TEST_RUN_MAX_CHUNK)
         if dur and (best is None or dur < best):
             best = dur
-        remaining -= n
     return last_retval, (best if best is not None else 0)
 
 
@@ -882,7 +900,7 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
     }
 
 
-def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, repeat: int = 2000) -> float:
+def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, repeat: int = None) -> float:
     """
     Real per-packet map-lookup count for `method`, measured via a dedicated
     instrumented build (every `.lookup()` call wrapped with CTR_INC(), see
@@ -905,6 +923,7 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
         print(f"[count_lookups] {method}: instrumenting {total} lookup sites "
               f"({detail})")
 
+    ttl, repeat = _count_lookups_defaults(ttl, repeat)
     weights, scale = load_weights(model_path)
 
     if method == "baseline":
@@ -967,6 +986,21 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = 5, rep
     prog_test_run(disp_fn.fd, frame, repeat=repeat)
     total = sum(int(v) for v in ctr[ct.c_int(0)])
     return total / float(repeat)
+
+
+def _count_lookups_defaults(ttl, repeat):
+    """TTL and repetition count for a lookup measurement.
+
+    Both default to values that keep every run on the FORWARDING path. The old
+    defaults (ttl=5, repeat=2000) were written when the datapath did not modify
+    the packet. Now it decrements the TTL and BPF_PROG_TEST_RUN never restores
+    the buffer between repetitions, so the TTL hit 1 after four runs and the
+    remaining 1996 took the expiry short-circuit -- which does one lookup fewer
+    (no cls_stats on a non-forward). The reported figure was therefore the
+    EXPIRY path's lookup count, off by one on every pipeline.
+    """
+    return (BENCH_TTL if ttl is None else ttl,
+            TEST_RUN_MAX_CHUNK if repeat is None else repeat)
 
 
 def _read_u64(table, key_val):

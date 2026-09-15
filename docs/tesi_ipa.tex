@@ -170,7 +170,9 @@ Gli esperimenti sono stati condotti su \emph{Kathara}, uno strumento di emulazio
 
 La topologia scelta è \emph{Germany50}, importata da SNDlib, un repository di topologie reali usato in letteratura. Comprende una dorsale di cinquanta nodi, a cui si aggiungono due host virtuali come sorgente e destinazione. Il grado massimo di un nodo è sei: il modello deve quindi poter scegliere tra sei interfacce di uscita, a cui si aggiunge la classe di scarto nell'argmax finale. Il traffico di prova usa UDP sulla porta 9999, riservata al protocollo IPA.
 
-Durante la validazione è emerso un limite pratico dell'ambiente: il traffico UDP sulla porta 9999 non viene consegnato end-to-end in tutte le condizioni. Un pacchetto diretto al loopback di un nodo distante più di un salto non arriva, mentre viene consegnato se la destinazione è l'indirizzo IP dell'interfaccia direttamente connessa di un vicino. Per questo la verifica sistematica di correttezza usa \texttt{BPF\_PROG\_TEST\_RUN} anziché traffico reale. La primitiva esegue un programma XDP già caricato su un pacchetto sintetico direttamente nel kernel e restituisce il verdetto e una misura della durata, senza attraversare la scheda di rete.
+Il traffico UDP sulla porta 9999 attraversa regolarmente la rete emulata. Nelle prove effettuate, un invio da \texttt{darmstadt} al loopback di \texttt{aachen}, a tre salti di distanza, è stato consegnato integralmente. Prima di avviare i test occorre però attendere la convergenza di OSPF. Nella dorsale di cinquanta nodi e ottantotto link, il protocollo impiega circa un minuto e mezzo a popolare le tabelle di instradamento; fino ad allora sono raggiungibili soltanto le sottoreti direttamente connesse. I test avviati subito dopo l'accensione del laboratorio falliscono quindi per questo motivo, non per un limite dell'emulatore.
+
+La verifica sistematica di correttezza usa comunque \texttt{BPF\_PROG\_TEST\_RUN}, perché permette di eseguire prove controllate e ripetibili. La primitiva esegue un programma XDP già caricato su un pacchetto sintetico direttamente nel kernel e restituisce il verdetto e una misura della durata, senza attraversare la scheda di rete. Si possono così controllare TTL, stato dei link e \texttt{model\_id}, isolando il test dal traffico della rete emulata. Con pacchetti reali, ogni caso richiederebbe invece di predisporre lo stato dell'intera topologia. Il limite è che, in questa modalità, il redirect non viene realmente eseguito.
 
 % ============================================================
 \chapter{Il design space: tre pipeline per l'inferenza neurale nel datapath}
@@ -190,7 +192,7 @@ L'input vector contiene 65 componenti, ottenute concatenando quattro tipi di fea
 
 La feature \texttt{link\_state} ha richiesto un intervento specifico. Nella prima versione era sempre a 1, come se tutti i link fossero attivi: il modello non riceveva quindi alcuna informazione sui guasti reali e non poteva reagire. È stato aggiunto il thread in user space \texttt{link\_state\_monitor.py}, che legge periodicamente il file \texttt{carrier} dell'interfaccia \texttt{eth$X$} in sysfs e aggiorna la mappa BPF condivisa \texttt{link\_state[0..5]}.
 
-I programmi eBPF leggono la mappa a ogni pacchetto, senza essere ricaricati. Quando un'interfaccia cade, la feature passa a 0 al polling successivo, eseguito ogni mezzo secondo. L'argmax può così scegliere un'altra uscita: è il meccanismo indicato nella documentazione come \emph{fast-reroute}. All'avvio la mappa viene inizializzata assumendo tutti i link attivi.
+I programmi eBPF leggono la mappa a ogni pacchetto, senza essere ricaricati. Quando un'interfaccia cade, la feature passa a 0 al polling successivo, eseguito ogni mezzo secondo. L'argmax può così scegliere un'altra uscita: è il meccanismo indicato nella documentazione come \emph{fast-reroute}. All'avvio vengono impostati a 1 soltanto gli slot associati a un'interfaccia realmente presente sul nodo; quelli senza interfaccia partono da 0 e restano a 0. Nei log, il monitor distingue un'uscita strutturalmente assente da un link realmente caduto.
 
 Lo schema di elaborazione comune a tutte e tre le pipeline è riassunto nella Figura~\ref{fig:common}: cambia soltanto il blocco centrale, cioè \emph{come} l'inferenza viene eseguita, non il parsing a monte né l'azione a valle.
 
@@ -388,7 +390,7 @@ Nel caso studiato, i modelli sono noti in anticipo e cambiano di rado. Conta dun
 \section{Risultati sperimentali comparativi}
 \label{sec:results}
 
-La misura delle tre pipeline usa \texttt{BPF\_PROG\_TEST\_RUN} per le ragioni discusse nella Sezione~\ref{sec:lab}. Il confronto include una quarta configurazione, la \emph{baseline}: un programma con lo stesso parsing del dispatcher e lo stesso redirect finale, ma senza tail call né inferenza. Questo riferimento permette di distinguere il costo del modello neurale da quello del solo framework XDP.
+La misura delle tre pipeline usa \texttt{BPF\_PROG\_TEST\_RUN} per le ragioni discusse nella Sezione~\ref{sec:lab}. Il confronto include una quarta configurazione, la \emph{baseline}: un programma con lo stesso parsing del dispatcher e lo stesso redirect finale, ma senza tail call né inferenza. Sul percorso di successo esegue tre lookup per pacchetto, su \texttt{mac\_table}, \texttt{pkt\_stats} e \texttt{cls\_stats}: sono il costo di framework comune alle pipeline, non operazioni di inferenza. Questo riferimento permette di distinguere il costo del modello neurale da quello del solo framework XDP.
 
 La suite controlla la correttezza preinstallando nella mappa di forwarding le azioni attese. Dopo l'esecuzione verifica che il verdetto sia coerente con un redirect o un drop e che il contatore della classe scelta sia stato incrementato. La classe restituita dal kernel viene sempre confrontata con quella di un riferimento Python indipendente, che replica la stessa aritmetica intera.
 
@@ -422,7 +424,7 @@ Codice jited (byte), run A & 600 & 4\,751 & 48\,640 & 40\,635 \\
 Codice jited (byte), run B e C & 600 & 4\,751 & 50\,306 & 40\,544 \\
 Tail call / pacchetto & 0 & 1 & 1 & 3 \\
 Letture mappa / pacchetto (reali) & 0 & 4.0 & 8.0 & 26.0 \\
-Memoria mappe (byte) & 280 & 308 & 3\,960 & 8\,188 \\
+Memoria mappe (byte) & 280 & 2\,356 & 9\,356 & 18\,704 \\
 \midrule
 Latenza minima (ns/pacchetto), run A (7 trial) & 28.0 & 47.0 & 224.0 & 387.0 \\
 Latenza minima (ns/pacchetto), run B (7 trial) & 14.0 & 48.0 & 165.0 & 392.0 \\
@@ -476,13 +478,13 @@ La stessa ottimizzazione si applica allo scratch delle attivazioni intermedie di
 Letture mappa / pacchetto & 147.0 & 8.0 & 160.0 & 26.0 \\
 Istruzioni eBPF (xlated) & 16\,988 & 9\,962 & 15\,767 & 8\,209 \\
 Codice jited (byte) & 84\,587 & 48\,640 & 76\,376 & 40\,635 \\
-Memoria mappe (byte) & 8\,052 & 3\,960 & 16\,884 & 8\,188 \\
+Memoria mappe (byte) & 13\,448 & 9\,356 & 27\,400 & 18\,704 \\
 Latenza minima (ns/pacchetto) & 349.7 & 224.0 & 590.0 & 387.0 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-I risultati sono nella Tabella~\ref{tab:blocco-pesi}. Le letture di mappa per pacchetto scendono da $147$ a $8$ per P2 e da $160$ a $26$ per P3; le istruzioni e il codice jited si riducono sensibilmente; anche la memoria occupata dalle mappe cala, perché un array con valori da un byte paga comunque un arrotondamento per entry che una singola entry compatta non paga.
+I risultati sono nella Tabella~\ref{tab:blocco-pesi}. Le letture di mappa per pacchetto scendono da $147$ a $8$ per P2 e da $160$ a $26$ per P3; le istruzioni e il codice jited si riducono sensibilmente. Anche la memoria occupata dalle mappe diminuisce, ma di circa un terzo: il 30,4\% per P2 e il 31,7\% per P3. Il layout a blocco concentra i pesi in un'unica entry, anziché distribuirli in migliaia di entry separate.
 
 Le latenze ``prima'' e ``dopo'' della Tabella~\ref{tab:blocco-pesi} sono state raccolte nella \emph{stessa sessione, sulla stessa macchina}, modificando soltanto il contenitore dei pesi. I valori assoluti sono quindi direttamente confrontabili, senza normalizzazione: P2 passa da $349.7$ a $224.0$ nanosecondi per pacchetto e P3 da $590.0$ a $387.0$, con un guadagno di circa un terzo per entrambe. Tra tabelle raccolte su macchine diverse, invece, il confronto deve limitarsi alle metriche deterministiche, come istruzioni, letture di mappa e memoria, per le ragioni già discusse sull'instabilità del baseline.
 

@@ -1313,7 +1313,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
             # TTL-expired path and leave the counters dirty.
             V.prog_test_run_bench(disp_fd,
                                   lambda: V.build_frame(0, V.BENCH_TTL, setup["scale"]),
-                                  1000)
+                                  1000, max_chunks=2)
         except OSError as e:
             fail(f"{name}: BPF_PROG_TEST_RUN failed ({e})")
             all_ok = False
@@ -1365,6 +1365,15 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         samples.sort()
         lat_min, lat_p50, lat_max = samples[0], samples[trials // 2], samples[-1]
         lat_ns  = float(lat_min) if lat_min else (wall * 1e9 / (repeat * trials))
+        # NOT a measured throughput. This is 1/latency: the rate a single core
+        # would reach IF packets were processed strictly back-to-back with no
+        # I/O, no queueing and no loss -- and, under BPF_PROG_TEST_RUN, without
+        # bpf_redirect ever executing, which is the most expensive part of the
+        # real forwarding path. It is an upper bound derived from the latency
+        # column, useful for comparing the three pipelines against each other,
+        # and NOT comparable with the zero-loss throughput figures reported in
+        # the literature (RFC 2544), which are measured with real traffic.
+        # See docs/metodologia_test.pdf.
         mpps    = (1000.0 / lat_ns) if lat_ns > 0 else 0.0
         # Sum the kernel's own view of every map this pipeline declares. A name
         # this pipeline does not have raises and is skipped -- that is expected,
@@ -1419,7 +1428,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     # which is not: the cheaper the program, the wider its spread, and the
     # baseline is consistently the worst of the four.
     line("  ...spread (max-min)/min %", "spread", lambda v: f"{v:.0f}%")
-    line("Throughput (Mpps, from min)", "mpps", lambda v: f"{v:.3f}")
+    line("Inference rate (Mpps, 1/latency)", "mpps", lambda v: f"{v:.3f}")
     print("  " + "-" * (32 + 16 * len(rows)))
     print()
     print("  NOTE: 'eBPF instructions' is the STATIC size of the loaded program, not the")
