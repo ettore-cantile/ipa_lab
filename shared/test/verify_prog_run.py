@@ -88,6 +88,38 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1, ingress_ifindex: 
     return a.retval, a.duration
 
 
+# Max BPF_PROG_TEST_RUN repetitions per syscall when the program MUTATES the
+# packet. The kernel copies data_in into a page once and then re-runs the
+# program on THAT page `repeat` times, never restoring it in between. The
+# datapath decrements the TTL, so one large `repeat` walks the TTL down to 1
+# after a couple of hundred runs and every run after that measures the
+# TTL-expired short-circuit instead of the inference path. Chunking with a fresh
+# frame keeps every measured run on the real path. 200 < 255-1, so a frame built
+# with BENCH_TTL survives a whole chunk.
+TEST_RUN_MAX_CHUNK = 200
+BENCH_TTL          = 255
+
+
+def prog_test_run_bench(prog_fd: int, make_frame, total_repeat: int):
+    """Time `total_repeat` runs of a packet-mutating program, in chunks.
+
+    `make_frame` is called once per chunk to get a pristine frame. The kernel
+    reports the AVERAGE ns/run for each chunk; the minimum across chunks is
+    returned, the same one-sided-noise reasoning the suite uses for its
+    min-of-N trials. Returns (retval_of_last_chunk, min_ns_per_run).
+    """
+    best = None
+    last_retval = None
+    remaining = max(1, total_repeat)
+    while remaining > 0:
+        n = min(TEST_RUN_MAX_CHUNK, remaining)
+        last_retval, dur = prog_test_run(prog_fd, make_frame(), repeat=n)
+        if dur and (best is None or dur < best):
+            best = dur
+        remaining -= n
+    return last_retval, (best if best is not None else 0)
+
+
 def prog_test_run_data(prog_fd: int, frame: bytes):
     """Like prog_test_run(), but also returns the packet the program produced.
 
@@ -220,9 +252,28 @@ def load_weights(model_path=MODEL_PT):
             scale = int(json.load(f).get("scale_factor", 128))
     return weights, scale
 
+def _ip_csum(hdr20: bytes) -> int:
+    """Standard IPv4 header checksum over a 20-byte header whose checksum field
+    is zero.
+
+    The synthetic frames used to ship with checksum 0 -- an invalid header. That
+    was harmless while the datapath never touched the IP header, but the TTL
+    decrement now updates the checksum INCREMENTALLY, and an incremental update
+    only preserves correctness if the input was already correct. So the frames
+    have to carry a real checksum, or the output checksum is unverifiable.
+    """
+    total = 0
+    for i in range(0, 20, 2):
+        total += (hdr20[i] << 8) | hdr20[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
 def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
     ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, ttl, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
+    ip  = ip[:10] + struct.pack('!H', _ip_csum(ip)) + ip[12:]
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
     # exactly 20 format letters (3 B + 1 H + 16 B) = 21 bytes, matching
     # sizeof(struct ipa_hdr) in the eBPF C source.
@@ -280,6 +331,7 @@ def build_frame_sparse(model_id: int, ttl: int, scale: int, n_in: int, n_out: in
     one-hot from model_id, ingress_iface from ctx->ingress_ifindex)."""
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
     ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, ttl, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
+    ip  = ip[:10] + struct.pack('!H', _ip_csum(ip)) + ip[12:]
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
     ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBB', model_id, 0, 0, scale, n_in, n_out, 2, 4,
                       0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, n_out)
@@ -1100,14 +1152,19 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=ref_ifindex)
         frame = build_frame(model_id, ttl, scale)
         _reset_stats(setup)
-        retval, dur_ns = prog_test_run(disp.fd, frame, repeat=repeat, ingress_ifindex=0)
+        # repeat=1: the program mutates the packet (TTL decrement) and
+        # BPF_PROG_TEST_RUN does not restore the buffer between repetitions, so
+        # re-running would walk the TTL down and end up testing the expiry path
+        # instead of the decision under test. One run is all a class check needs;
+        # latency for the tables is measured by prog_test_run_bench().
+        retval, dur_ns = prog_test_run(disp.fd, frame, repeat=1, ingress_ifindex=0)
         cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
         ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
         detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"
         if retval == XDP_PASS:
             ok = False
             detail += "  <-- XDP_PASS: inference did not complete / no mac_table entry"
-        lat_us = dur_ns / 1000 / max(1, repeat)
+        lat_us = dur_ns / 1000
         status = "PASS" if ok else "FAIL"
         if ok:
             passed += 1
@@ -1160,7 +1217,12 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
             map_values, ifindex=TEST_RUN_DEFAULT_INGRESS_IFINDEX, ifindex_table=ifindex_table)
         frame = build_frame_sparse(model_id, ttl, scale, n_in, n_out)
         _reset_stats(setup, n_classes=n_out)
-        retval, dur_ns = prog_test_run(disp.fd, frame, repeat=repeat)
+        # repeat=1: the program mutates the packet (TTL decrement) and
+        # BPF_PROG_TEST_RUN does not restore the buffer between repetitions, so
+        # re-running would walk the TTL down and end up testing the expiry path
+        # instead of the decision under test. One run is all a class check needs;
+        # latency for the tables is measured by prog_test_run_bench().
+        retval, dur_ns = prog_test_run(disp.fd, frame, repeat=1)
         if ref_cls < n_out - 1:
             cls_count = _read_u64(cs, ref_cls)
             ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
@@ -1169,7 +1231,7 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
             cls_count = _read_u64(ps, 2)
             ok = (retval == 1) and (cls_count > 0)
             detail = f"retval={retval} pkt_stats[DROP]={cls_count}"
-        lat_us = dur_ns / 1000 / max(1, repeat)
+        lat_us = dur_ns / 1000
         status = "PASS" if ok else "FAIL"
         if ok:
             passed += 1

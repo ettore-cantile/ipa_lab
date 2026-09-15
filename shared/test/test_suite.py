@@ -1307,9 +1307,13 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
                 jit_total += (jb or 0)
                 per_prog.append((pname, ic))
         disp_fd = setup["disp"].fd
-        frame = V.build_frame(0, ttl_max, setup["scale"])
         try:
-            V.prog_test_run(disp_fd, frame, repeat=1000)
+            # Warm-up, chunked for the same reason as the measurement below:
+            # the packet is mutated, so one long repeat would just exercise the
+            # TTL-expired path and leave the counters dirty.
+            V.prog_test_run_bench(disp_fd,
+                                  lambda: V.build_frame(0, V.BENCH_TTL, setup["scale"]),
+                                  1000)
         except OSError as e:
             fail(f"{name}: BPF_PROG_TEST_RUN failed ({e})")
             all_ok = False
@@ -1345,10 +1349,17 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         # 47% for the same pipeline), i.e. it reported system interference, not
         # a property of the pipeline. Per-pipeline CPU cost is already captured
         # by the latency and instruction columns.
+        # Chunked: the datapath mutates the packet (TTL decrement) and
+        # BPF_PROG_TEST_RUN does NOT restore the buffer between repetitions, so
+        # a single repeat=50000 would spend ~99.5% of its runs on the
+        # TTL-expired short-circuit and report that as the pipeline's latency.
+        # prog_test_run_bench() re-supplies a pristine TTL=255 frame every 200
+        # runs, keeping every measured run on the real inference path.
         samples = []
         w0  = time.perf_counter()
+        _mk = lambda: V.build_frame(0, V.BENCH_TTL, setup["scale"])
         for _ in range(trials):
-            retval, dur_ns = V.prog_test_run(disp_fd, frame, repeat=repeat)
+            retval, dur_ns = V.prog_test_run_bench(disp_fd, _mk, repeat)
             samples.append(dur_ns)
         wall = time.perf_counter() - w0
         samples.sort()
