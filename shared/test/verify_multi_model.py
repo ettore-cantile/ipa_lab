@@ -78,6 +78,17 @@ def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int, if
         layer_offsets.append(offset)
         offset += n_in * n_out + n_out
 
+    # Per-column divisors for the FIRST layer only: it is the one that consumes
+    # raw features. The `ttl` column (12) carries the training normalisation --
+    # the model was trained on ttl/initial_ttl, not on the raw hop count, and the
+    # datapath divides the product accordingly. Without this the reference
+    # disagrees with every pipeline and the multi-model check fails while the
+    # programs are actually correct. See model_meta.DEFAULT_TTL_SCALE.
+    from model_meta import feature_scale
+    from verify_prog_run import _trunc_div
+    col_scale = [1] * 65
+    col_scale[12] = feature_scale("ttl")
+
     acts = x
     # best_val starts undefined rather than at a finite sentinel: the logits are
     # unbounded int64-scale accumulations, so an all-below-sentinel output row
@@ -88,11 +99,13 @@ def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int, if
         woff = layer_offsets[li]
         bias_off = n_in * n_out
         is_last = (li == len(layer_dims) - 1)
+        scales = col_scale if li == 0 else [1] * n_in
         out = []
         for j in range(n_out):
             acc = s8(weights[woff + bias_off + j])
             for i in range(n_in):
-                acc += acts[i] * s8(weights[woff + j * n_in + i])
+                acc += _trunc_div(acts[i] * s8(weights[woff + j * n_in + i]),
+                                  scales[i])
             if is_last and (best_val is None or acc > best_val):
                 best_val, best_cls = acc, j
             out.append(acc if is_last else max(0, acc))
