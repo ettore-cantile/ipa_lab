@@ -163,6 +163,29 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
+/* ---- TTL handling for a forwarding hop -----------------------------------
+ * A node that redirects a packet IS a router hop and must decrement the TTL,
+ * or a forwarding loop never dies. Until this existed the datapath read
+ * ip->ttl as a model feature and never wrote it: a redirected packet kept its
+ * TTL forever, which on this topology produced a permanent loop between two
+ * adjacent nodes instead of the packet eventually expiring.
+ *
+ * Incremental checksum fix per RFC 1624, in the canonical form used by the
+ * kernel's own samples/bpf/xdp_fwd_kern.c. TTL is the high byte of the
+ * {ttl,protocol} 16-bit word, so decrementing it subtracts 0x0100 from that
+ * word; the one's-complement checksum is corrected by adding htons(0x0100)
+ * and folding the carry back in.
+ *
+ * Called ONLY on the forwarding path, AFTER inference: the model must see the
+ * TTL as received, which is what the Python reference replicates. */
+static inline __attribute__((always_inline))
+void ipa_ttl_dec(struct iphdr *iph) {
+    __u32 _c = (__u32)iph->check;
+    _c += (__u32)bpf_htons(0x0100);
+    iph->check = (__u16)(_c + (_c >= 0xFFFF));
+    iph->ttl--;
+}
+
 /* Scratch maps: PERCPU to avoid contention.
  *
  * scratch_acts holds the WHOLE activation vector in ONE struct-valued per-CPU
@@ -302,9 +325,24 @@ int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end, int best_c
         return XDP_DROP;
     }
 
+    /* Re-parse the IP header: this epilogue is reached through the tail-call
+     * chain, so it does not inherit the dispatcher's pointers. Needed only for
+     * the TTL decrement below -- the packet was already validated by the
+     * dispatcher, but the verifier requires the bounds check again anyway. */
+    struct iphdr *ip = (struct iphdr *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return XDP_PASS;
+
     __u32 cls = (__u32)best_cls;
     struct fwd_action *action = mac_table_t3.lookup(&cls);
     if (action != NULL && action->ifindex != 0) {
+        /* A hop must not forward a packet whose TTL would reach 0. See the
+         * ipa_ttl_dec() comment: counted as MISS and passed to the kernel. */
+        if (ip->ttl <= 1) {
+            int ti = 1; __u64 *tv = pkt_stats_t3.lookup(&ti);
+            if (tv) __sync_fetch_and_add(tv, 1);
+            return XDP_PASS;
+        }
+        ipa_ttl_dec(ip);
         int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         __u64 *cv = cls_stats_t3.lookup(&cls);

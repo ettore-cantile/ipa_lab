@@ -17,6 +17,17 @@ struct ipa_hdr {
 } __attribute__((packed));
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
+/* TTL decrement for a forwarding hop, with the RFC 1624 incremental
+ * checksum fix -- same helper as the BCC pipelines (see ebpf_program.py).
+ * A redirecting node is a router hop: without this a forwarding loop
+ * never expires. */
+static __always_inline void ipa_ttl_dec(struct iphdr *iph) {
+    __u32 _c = (__u32)iph->check;
+    _c += (__u32)bpf_htons(0x0100);
+    iph->check = (__u16)(_c + (_c >= 0xFFFF));
+    iph->ttl--;
+}
+
 struct link_state_vec { __u32 v[6]; };
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
          __type(key, __u32); __type(value, struct link_state_vec); } link_state SEC(".maps");
@@ -24,7 +35,7 @@ struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 3);
          __type(key, __u32); __type(value, __u64); } pkt_stats SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 7);
          __type(key, __u32); __type(value, __u64); } cls_stats SEC(".maps");
-struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16);
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 16);
          __type(key, __u32); __type(value, struct fwd_action); } mac_table SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_PROG_ARRAY); __uint(max_entries, 256);
          __type(key, __u32); __type(value, __u32); } model_progs SEC(".maps");
@@ -180,7 +191,16 @@ int xdp_model(struct xdp_md *ctx) {
     }
     __u32 _cls = (__u32)best_cls;
     struct fwd_action *act = bpf_map_lookup_elem(&mac_table, &_cls);
-    if (act) {
+    if (act && act->ifindex != 0) {   /* ARRAY: never NULL; ifindex==0 => unprovisioned */
+        /* A hop must not forward a packet whose TTL would reach 0.
+         * Counted as MISS and handed to the kernel, which emits the
+         * ICMP Time Exceeded. Mirrors the BCC pipelines exactly. */
+        if (ip->ttl <= 1) {
+            __u32 ti = 1; __u64 *tv = bpf_map_lookup_elem(&pkt_stats, &ti);
+            if (tv) __sync_fetch_and_add(tv, 1);
+            return XDP_PASS;
+        }
+        ipa_ttl_dec(ip);
         __u32 hi = 0; __u64 *hv = bpf_map_lookup_elem(&pkt_stats, &hi);
         if (hv) __sync_fetch_and_add(hv, 1);
         __u64 *cv = bpf_map_lookup_elem(&cls_stats, &_cls);

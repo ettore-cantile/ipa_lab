@@ -87,6 +87,44 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1, ingress_ifindex: 
         raise OSError(e, os.strerror(e))
     return a.retval, a.duration
 
+
+def prog_test_run_data(prog_fd: int, frame: bytes):
+    """Like prog_test_run(), but also returns the packet the program produced.
+
+    BPF_PROG_TEST_RUN writes the (possibly modified) packet back into data_out,
+    which is how the TTL decrement and the recomputed IP checksum can be checked
+    for real instead of being taken on trust. Separate from prog_test_run() so
+    the latency path keeps its exact shape.
+    """
+    out = (ct.c_uint8 * 2048)()
+    buf = ct.create_string_buffer(frame, len(frame))
+    a = _BpfAttrTest(
+        prog_fd       = prog_fd,
+        data_size_in  = len(frame),
+        data_size_out = ct.sizeof(out),
+        data_in       = ct.cast(buf, ct.c_void_p).value,
+        data_out      = ct.cast(out, ct.c_void_p).value,
+        repeat        = 1,
+    )
+    r = _libc.syscall(321, BPF_PROG_TEST_RUN, ct.byref(a), ct.sizeof(a))
+    if r != 0:
+        e = ct.get_errno()
+        raise OSError(e, os.strerror(e))
+    return a.retval, a.duration, bytes(bytearray(out)[:a.data_size_out])
+
+
+def ip_checksum_ok(hdr: bytes) -> bool:
+    """True if the 20-byte IPv4 header checksums correctly. A valid header sums
+    (in one's complement, 16-bit words, checksum field included) to 0xFFFF."""
+    if len(hdr) < 20:
+        return False
+    total = 0
+    for i in range(0, 20, 2):
+        total += (hdr[i] << 8) | hdr[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total == 0xFFFF
+
 _BPF_OBJ_GET_INFO_BY_FD = 15
 
 class _BpfProgInfo(ct.Structure):
@@ -381,6 +419,29 @@ struct ipa_hdr {
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
+/* ---- TTL handling for a forwarding hop -----------------------------------
+ * A node that redirects a packet IS a router hop and must decrement the TTL,
+ * or a forwarding loop never dies. Until this existed the datapath read
+ * ip->ttl as a model feature and never wrote it: a redirected packet kept its
+ * TTL forever, which on this topology produced a permanent loop between two
+ * adjacent nodes instead of the packet eventually expiring.
+ *
+ * Incremental checksum fix per RFC 1624, in the canonical form used by the
+ * kernel's own samples/bpf/xdp_fwd_kern.c. TTL is the high byte of the
+ * {ttl,protocol} 16-bit word, so decrementing it subtracts 0x0100 from that
+ * word; the one's-complement checksum is corrected by adding htons(0x0100)
+ * and folding the carry back in.
+ *
+ * Called ONLY on the forwarding path, AFTER inference: the model must see the
+ * TTL as received, which is what the Python reference replicates. */
+static inline __attribute__((always_inline))
+void ipa_ttl_dec(struct iphdr *iph) {
+    __u32 _c = (__u32)iph->check;
+    _c += (__u32)bpf_htons(0x0100);
+    iph->check = (__u16)(_c + (_c >= 0xFFFF));
+    iph->ttl--;
+}
+
 BPF_ARRAY(mac_table, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats, __u64, 3);
 BPF_ARRAY(cls_stats, __u64, 7);
@@ -438,6 +499,16 @@ int xdp_baseline(struct xdp_md *ctx) {
     __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
     struct fwd_action *action = mac_table.lookup(&cls);
     if (action && action->ifindex != 0) {
+        /* The baseline is the reference floor the pipelines are compared
+         * against, so it must do the SAME framework work they do -- TTL
+         * decrement included. Leaving it out would push the cost of the TTL
+         * update into the "cost of the neural network" subtraction. */
+        if (ip->ttl <= 1) {
+            int ti = 1; __u64 *tv = pkt_stats.lookup(&ti);
+            if (tv) __sync_fetch_and_add(tv, 1);
+            return XDP_PASS;
+        }
+        ipa_ttl_dec(ip);
         int si = 0; __u64 *v = pkt_stats.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         __u64 *cv = cls_stats.lookup(&cls);
@@ -489,6 +560,29 @@ struct ipa_hdr {
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
+/* ---- TTL handling for a forwarding hop -----------------------------------
+ * A node that redirects a packet IS a router hop and must decrement the TTL,
+ * or a forwarding loop never dies. Until this existed the datapath read
+ * ip->ttl as a model feature and never wrote it: a redirected packet kept its
+ * TTL forever, which on this topology produced a permanent loop between two
+ * adjacent nodes instead of the packet eventually expiring.
+ *
+ * Incremental checksum fix per RFC 1624, in the canonical form used by the
+ * kernel's own samples/bpf/xdp_fwd_kern.c. TTL is the high byte of the
+ * {ttl,protocol} 16-bit word, so decrementing it subtracts 0x0100 from that
+ * word; the one's-complement checksum is corrected by adding htons(0x0100)
+ * and folding the carry back in.
+ *
+ * Called ONLY on the forwarding path, AFTER inference: the model must see the
+ * TTL as received, which is what the Python reference replicates. */
+static inline __attribute__((always_inline))
+void ipa_ttl_dec(struct iphdr *iph) {
+    __u32 _c = (__u32)iph->check;
+    _c += (__u32)bpf_htons(0x0100);
+    iph->check = (__u16)(_c + (_c >= 0xFFFF));
+    iph->ttl--;
+}
+
 BPF_ARRAY(mac_table, struct fwd_action, 8);
 BPF_ARRAY(pkt_stats, __u64, 3);
 BPF_ARRAY(cls_stats, __u64, 7);
@@ -527,10 +621,26 @@ int xdp_baseline_action(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
+    /* Re-parse the IP header: this leaf is reached through a tail call, so it
+     * does not inherit the dispatcher's pointers. Needed only for the TTL
+     * decrement -- the packet was already validated upstream, but the verifier
+     * requires the bounds check again regardless. */
+    struct iphdr *ip = (struct iphdr *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return XDP_PASS;
 
     __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
     struct fwd_action *action = mac_table.lookup(&cls);
     if (action && action->ifindex != 0) {
+        /* The baseline is the reference floor the pipelines are compared
+         * against, so it must do the SAME framework work they do -- TTL
+         * decrement included. Leaving it out would push the cost of the TTL
+         * update into the "cost of the neural network" subtraction. */
+        if (ip->ttl <= 1) {
+            int ti = 1; __u64 *tv = pkt_stats.lookup(&ti);
+            if (tv) __sync_fetch_and_add(tv, 1);
+            return XDP_PASS;
+        }
+        ipa_ttl_dec(ip);
         int si = 0; __u64 *v = pkt_stats.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
         __u64 *cv = cls_stats.lookup(&cls);
@@ -844,7 +954,75 @@ def _fired_cls_p1(setup) -> int:
     return -1
 
 
-def probe_link_down(model_path, model_id: int = 0, ttl_min: int = 1, ttl_max: int = 5):
+# TTL sweeps start at 2, not 1: a forwarding hop now decrements the TTL and
+# refuses to forward a packet whose TTL would reach 0 (see ipa_ttl_dec in the
+# eBPF sources). TTL=1 is therefore a legitimate NON-forward, and including it
+# in a sweep that asserts 'the packet was redirected' would fail by design.
+# TTL=1 is covered separately by the dedicated expiry test.
+def verify_ttl_handling(method: str, model_id: int, model_path: str):
+    """Prove the forwarding hop behaves like a router with respect to the TTL.
+
+    Two properties, both checked against the packet the program actually
+    produced (BPF_PROG_TEST_RUN writes it back to data_out), not against the
+    source code:
+
+      forwarded  -- a packet with a healthy TTL is redirected AND comes out
+                    with TTL decremented by exactly 1 AND with a valid IP
+                    header checksum. Without the incremental checksum fix the
+                    TTL would change and the checksum would not, producing a
+                    packet every downstream router silently discards -- a
+                    failure that is invisible in a return-code-only test.
+      expired    -- a packet with TTL=1 is NOT forwarded. A hop must not emit a
+                    packet with TTL 0; before this existed the datapath never
+                    wrote the TTL at all, so a redirected packet looped forever.
+
+    Returns (n_pass, n_fail, details).
+    """
+    setup_fn = {"hardcoded": setup_hardcoded,
+                "template":  setup_template,
+                "modular":   setup_modular}[method]
+    setup = setup_fn(model_id, model_path)
+    b, disp = setup["b"], setup["disp"]          # noqa: F841 (b keeps maps alive)
+    scale = setup["scale"]
+    ps = setup["pkt_stats"]
+
+    npass, nfail, details = 0, 0, []
+
+    # --- forwarded: TTL 5 must come out as TTL 4 with a valid checksum ---
+    _reset_stats(setup)
+    frame = build_frame(model_id, 5, scale)
+    retval, _, out = prog_test_run_data(disp.fd, frame)
+    if len(out) >= 34:
+        ttl_out = out[14 + 8]                    # eth(14) + offset of TTL in IP hdr
+        csum_ok = ip_checksum_ok(out[14:34])
+    else:
+        ttl_out, csum_ok = None, False
+    forwarded = retval in (0, 4)
+    if forwarded and ttl_out == 4 and csum_ok:
+        npass += 1
+        details.append(f"{method}: TTL 5 -> forwarded, out TTL={ttl_out}, checksum OK")
+    else:
+        nfail += 1
+        details.append(f"{method}: TTL 5 -> retval={retval} out_ttl={ttl_out} "
+                       f"csum_ok={csum_ok} (atteso retval in (0,4), ttl 4, csum OK)")
+
+    # --- expired: TTL 1 must NOT be forwarded ---
+    _reset_stats(setup)
+    frame = build_frame(model_id, 1, scale)
+    retval, _, out = prog_test_run_data(disp.fd, frame)
+    hits = _read_u64(ps, 0)
+    if retval not in (0, 4) and hits == 0:
+        npass += 1
+        details.append(f"{method}: TTL 1 -> not forwarded (retval={retval}, hits=0)")
+    else:
+        nfail += 1
+        details.append(f"{method}: TTL 1 -> retval={retval} hits={hits} "
+                       f"(atteso NON inoltrato)")
+
+    return npass, nfail, details
+
+
+def probe_link_down(model_path, model_id: int = 0, ttl_min: int = 2, ttl_max: int = 6):
     """Prove that link_state is a live routing input: for each TTL and each
     egress k, run Pipeline 1 with all links up, then with link k down
     (link_state[k]=0), and record the cases where the argmax egress class
@@ -1012,7 +1190,7 @@ def main():
     p.add_argument("--model", default=MODEL_PT)
     p.add_argument("--model-dir", default=os.path.join(SHARED_DIR, "test", "fixtures", "sparse_hetero_11"),
                    help="sparse-hetero: directory with model_meta.json (+ weights.json)")
-    p.add_argument("--ttl-min", type=int, default=1)
+    p.add_argument("--ttl-min", type=int, default=2)   # 1 = expired, never forwarded
     p.add_argument("--ttl-max", type=int, default=10)
     p.add_argument("--repeat", type=int, default=1000, help="BPF_PROG_TEST_RUN repeat count for latency measurement")
     args = p.parse_args()

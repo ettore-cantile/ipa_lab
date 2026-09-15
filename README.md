@@ -216,6 +216,42 @@ the historical `65-4-4-7` shape.
 
 ---
 
+## TTL: the hop behaves like a router
+
+All three pipelines decrement `ip->ttl` before `bpf_redirect`, and fix the IP
+header checksum incrementally (RFC 1624, the same `ipa_ttl_dec()` helper the
+kernel's own `samples/bpf/xdp_fwd_kern.c` uses). A packet whose TTL would reach
+zero is **not** forwarded: it is counted as MISS and returned with `XDP_PASS`,
+so the kernel is the one that drops it and emits ICMP Time Exceeded.
+
+This was missing. The datapath read `ip->ttl` as a model feature and never wrote
+it, so a redirected packet kept its TTL forever and a forwarding loop could never
+expire. On this topology that was not hypothetical: with `link_state` all-up the
+model selects class 0 for every TTL from 2 upward, so every node forwarded out
+`eth0` and a packet entered a permanent two-node loop between `duesseldorf` and
+`essen`.
+
+The decrement happens **after** inference, so the model still sees the TTL as
+received — which is what the Python reference replicates, keeping the
+equivalence check valid.
+
+`test_suite.py --only kernel` verifies this against the packet the program
+actually emitted (`BPF_PROG_TEST_RUN` writes it back), not against the source:
+TTL 5 must come out as TTL 4 with a valid checksum, and TTL 1 must not be
+forwarded at all. A missing checksum fix would otherwise pass every
+return-code-only test while producing packets that each downstream router
+silently discards.
+
+> **This makes looping safe, not correct.** The datapath never reads the
+> destination IP — the model's features are `[link_state, ingress_iface, ttl,
+> node]`, with no destination among them — so the egress class does not depend
+> on where the packet is addressed. The TTL now bounds the damage to at most 64
+> hops instead of forever, which is exactly what TTL is for, but destination-
+> based forwarding needs a model trained with a destination feature. See the
+> known limitations above.
+
+---
+
 ## IPA header (21 bytes, on UDP port 9999)
 
 ```

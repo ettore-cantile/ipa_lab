@@ -1147,7 +1147,12 @@ _PIPELINE_MAP_NAMES = [
 ]
 
 
-def verify_alt_architectures(ttl_min=1, ttl_max=5):
+# TTL sweeps start at 2, not 1: a forwarding hop now decrements the TTL and
+# refuses to forward a packet whose TTL would reach 0 (see ipa_ttl_dec in the
+# eBPF sources). TTL=1 is therefore a legitimate NON-forward, and including it
+# in a sweep that asserts 'the packet was redirected' would fail by design.
+# TTL=1 is covered separately by the dedicated expiry test.
+def verify_alt_architectures(ttl_min=2, ttl_max=6):
     """
     Everything above this point in suite_kernel() exercises exactly ONE
     architecture (the checked-in 65-4-4-7 model) across the 3 pipelines --
@@ -1252,7 +1257,12 @@ def verify_alt_architectures(ttl_min=1, ttl_max=5):
     return all_ok
 
 
-def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=True, trials=7):
+# TTL sweeps start at 2, not 1: a forwarding hop now decrements the TTL and
+# refuses to forward a packet whose TTL would reach 0 (see ipa_ttl_dec in the
+# eBPF sources). TTL=1 is therefore a legitimate NON-forward, and including it
+# in a sweep that asserts 'the packet was redirected' would fail by design.
+# TTL=1 is covered separately by the dedicated expiry test.
+def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=True, trials=7):
     print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
     if not sys.platform.startswith("linux"):
         info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
@@ -1424,6 +1434,27 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=1, ttl_max=5, verify=Tru
                     all_ok = False
             except Exception as e:
                 fail(f"dispatch {name}: error ({e})")
+                all_ok = False
+
+        # A forwarding hop must behave like a router towards the TTL: decrement
+        # it, fix the IP checksum, and refuse to forward a packet whose TTL
+        # would reach 0. Checked against the packet the program really produced,
+        # so a missing checksum fix cannot pass unnoticed.
+        print()
+        for name, _, _ in methods:
+            if name == "baseline":
+                continue
+            try:
+                np_, nf_, det = V.verify_ttl_handling(name, 0, mp)
+                for line in det:
+                    info(f"  {line}")
+                if nf_ == 0:
+                    ok(f"TTL handling {name}: {np_}/{np_} (decrement + checksum + expiry)")
+                else:
+                    fail(f"TTL handling {name}: {nf_} check(s) failed")
+                    all_ok = False
+            except Exception as e:
+                fail(f"TTL handling {name}: error ({e})")
                 all_ok = False
 
         # link_state is a live routing input: a link going down must be able to
