@@ -298,6 +298,30 @@ def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
     ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBB', model_id, 0, 0, scale, 65, 7, 2, 4, 3, 0, 65, 0, 0, 0, 0, 0, 0, 1, 0, 7)
     return eth + ip + udp + ipa
 
+def _trunc_div(a: int, b: int) -> int:
+    """Integer division truncating toward ZERO, like C.
+
+    Python's // floors, so -7 // 30 == -1 while C gives 0. The eBPF datapath
+    divides the scaled feature terms with C semantics, and this reference has to
+    agree bit for bit or the equivalence test fails on negative weights.
+    """
+    if b == 1:
+        return a
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+
+def _feature_scales(features) -> list:
+    """Per-COLUMN divisor for a resolved descriptor: each feature's training
+    scale repeated over the columns it occupies. See model_meta.feature_scale
+    and DEFAULT_TTL_SCALE."""
+    import model_meta as _mm
+    out = []
+    for f in features:
+        out += [_mm.feature_scale(f["type"])] * int(f["size"])
+    return out
+
+
 def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
     def s8(v):
         return ct.c_int8(int(v) & 0xFF).value
@@ -317,11 +341,17 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
         x[5 + ifindex] = 1
     if 0 <= model_id <= 51:
         x[13 + model_id] = 1
+    # Per-column divisors: only the ttl column (12) is scaled, by the
+    # checkpoint's initial_ttl. See model_meta.DEFAULT_TTL_SCALE.
+    import model_meta as _mm
+    col_scale = [1] * N_IN
+    col_scale[12] = _mm.feature_scale("ttl")
+
     h1 = []
     for j in range(N_H1):
         acc = s8(weights[off_fc1_b + j])
         for i in range(N_IN):
-            acc += x[i] * s8(weights[j * N_IN + i])
+            acc += _trunc_div(x[i] * s8(weights[j * N_IN + i]), col_scale[i])
         h1.append(max(0, acc))
     h2 = []
     for j in range(N_H2):
@@ -409,10 +439,15 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
         off = b_off + n_cur
         is_out = (li == len(layer_sizes) - 1)
         nxt = []
+        # Only the FIRST layer consumes raw features, so only it applies the
+        # per-feature scales; later layers consume activations, which are
+        # already in the model's own units.
+        scales = _feature_scales(features) if li == 1 else [1] * n_prev
         for j in range(n_cur):
             acc = s8(weights[b_off + j])
             for i in range(n_prev):
-                acc += acts[i] * s8(weights[w_off + j * n_prev + i])
+                acc += _trunc_div(acts[i] * s8(weights[w_off + j * n_prev + i]),
+                                  scales[i])
             nxt.append(acc if is_out else max(0, acc))
         acts = nxt
 

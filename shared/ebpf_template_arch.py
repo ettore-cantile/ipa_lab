@@ -386,6 +386,8 @@ EBPF_ARCH_GENERIC_2LAYER = r"""
 #define T2_MAX_H1    8
 #define T2_MAX_H2    8
 #define T2_N_QUEUES  4
+/* Must match model_meta.DEFAULT_TTL_SCALE (the checkpoint's initial_ttl). */
+#define T2_TTL_SCALE 30
 #define MAX_N_IN     128
 #define MAX_FEAT     4
 #define FEAT_LINK_STATE  0x01
@@ -600,7 +602,11 @@ int arch_generic_2layer(struct xdp_md *ctx) {
                 __u32 sz   = desc->feats[f].size;
                 __u32 base = woff + fc1_w_off + j * n_in + desc->feats[f].col_off;
                 if (code == FEAT_TTL) {
-                    acc += (long long)_ttl * AW_W(AW, base);
+                    /* Divided by the training scale: the model was trained on
+                     * ttl/initial_ttl in (0,1], not on the raw hop count. See
+                     * model_meta.DEFAULT_TTL_SCALE. The PRODUCT is divided --
+                     * dividing _ttl itself would collapse it to 0 or 1. */
+                    acc += ((long long)_ttl * AW_W(AW, base)) / T2_TTL_SCALE;
                 } else if (code == FEAT_LINK_STATE) {
                     #pragma unroll
                     for (int i = 0; i < 6; i++) {

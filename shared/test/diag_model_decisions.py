@@ -33,6 +33,8 @@ SHARED_DIR = os.path.dirname(_TEST_DIR)
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 
+from model_meta import DEFAULT_TTL_SCALE as TTL_SCALE
+
 
 def infer(w, ttl, link_state, node, ifindex=None,
           n_in=65, h=4, n_out=7):
@@ -57,7 +59,11 @@ def infer(w, ttl, link_state, node, ifindex=None,
                 acc += link_state[i] * w[base + i]
         if ifindex is not None and 0 <= ifindex < 6:
             acc += w[base + 6 + ifindex]
-        acc += ttl * w[base + 12]
+        # Same scaling the datapath applies: the model was trained on
+        # ttl/initial_ttl, not on the raw hop count. Truncating toward zero,
+        # like C. See model_meta.DEFAULT_TTL_SCALE.
+        _p = ttl * w[base + 12]
+        acc += (abs(_p) // TTL_SCALE) * (1 if _p >= 0 else -1)
         acc += w[base + 13 + node]
         h1.append(acc if acc > 0 else 0)
 
@@ -100,17 +106,15 @@ def main():
 
     # ---------------------------------------------------------------
     print("=" * 66)
-    print(" 1. TTL sweep   (all links up, node 0, ingress inert)")
+    print(f" 1. TTL sweep 1..{TTL_SCALE}   (all links up, node 0, ingress inert)")
     print("=" * 66)
-    pairs = [(t, infer(w, t, all_up, 0)) for t in range(1, 65)]
+    pairs = [(t, infer(w, t, all_up, 0)) for t in range(1, TTL_SCALE + 1)]
     for a, b, c in _runs(pairs):
         rng = f"TTL {a}" if a == b else f"TTL {a}-{b}"
         tag = "DROP" if c == 6 else f"egress eth{c}"
         print(f"  {rng:<14} -> class {c}  ({tag})")
     seen |= {c for _, c in pairs}
-    print(f"\n  classi distinte su tutto il range TTL: {sorted({c for _, c in pairs})}")
-    print(f"  range usato dai sender (30-64)         : "
-          f"{sorted({infer(w, t, all_up, 0) for t in range(30, 65)})}")
+    print(f"\n  classi distinte sul range addestrato: {sorted({c for _, c in pairs})}")
 
     # ---------------------------------------------------------------
     print("\n" + "=" * 66)
@@ -118,7 +122,7 @@ def main():
     print("=" * 66)
     changed = 0
     tested = 0
-    for t in (2, 5, 16, 32, 64):
+    for t in (5, 10, 15, 20, 25, 30):
         base = infer(w, t, all_up, 0)
         row = []
         for k in range(6):
@@ -136,11 +140,11 @@ def main():
 
     # ---------------------------------------------------------------
     print("\n" + "=" * 66)
-    print(" 3. Node one-hot   (TTL 32, all links up)")
+    print(f" 3. Node one-hot   (TTL {TTL_SCALE}, all links up)")
     print("=" * 66)
     by_node = {}
     for n in range(args.n_nodes):
-        c = infer(w, 32, all_up, n)
+        c = infer(w, TTL_SCALE, all_up, n)
         by_node.setdefault(c, []).append(n)
         seen.add(c)
     for c in sorted(by_node):
@@ -158,16 +162,27 @@ def main():
     print("=" * 66)
     print(f"  classi raggiunte in TUTTE le prove sopra: {sorted(seen)}  "
           f"({len(seen)} su {7})")
-    live = sorted({infer(w, t, all_up, 0) for t in range(30, 65)})
-    print(f"  classi raggiunte nelle condizioni del lab "
-          f"(TTL 30-64, link tutti up, un solo model_id): {live}")
-    if len(live) == 1:
-        print()
-        print("  => In esercizio il modello emette UNA SOLA classe. L'uscita non")
-        print("     dipende dalla destinazione (non e' una feature) ne' dal nodo")
-        print("     (indicizzato da model_id). Il forwarding IPA non puo' quindi")
-        print("     consegnare a una destinazione arbitraria: serve un modello")
-        print("     addestrato con una feature di destinazione.")
+    live = sorted({infer(w, t, all_up, 0) for t in range(1, TTL_SCALE + 1)})
+    print(f"  classi a node fisso (come oggi, node=model_id): {live}")
+    per_node = sorted({infer(w, TTL_SCALE, all_up, n) for n in range(args.n_nodes)})
+    print(f"  classi variando il nodo (se la feature fosse cablata): {per_node}")
+
+    dead = react = tot = 0
+    for n in range(args.n_nodes):
+        for t in range(1, TTL_SCALE + 1):
+            base = infer(w, t, all_up, n)
+            for k in range(6):
+                ls = [0 if i == k else 1 for i in range(6)]
+                c = infer(w, t, ls, n)
+                tot += 1
+                if c != base:
+                    react += 1
+                if c == k:
+                    dead += 1
+    print()
+    print(f"  reagisce a un guasto  : {react}/{tot} ({100*react/tot:.1f}%)")
+    print(f"  redirect su link MORTO: {dead}/{tot} ({100*dead/tot:.1f}%)"
+          "   <- deve stare vicino a zero")
     print()
 
 

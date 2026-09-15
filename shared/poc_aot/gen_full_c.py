@@ -63,10 +63,19 @@ _SCALAR_SOURCE = {
 
 
 def _feat_scalar(feat, offset, n_in, fc1_w, n_h1):
+    """Scalar feature term, divided by the feature's training scale.
+
+    Mirrors ebpf_program._gen_feature_scalar exactly -- the AOT object must
+    compute the same thing as the BCC build or the two Pipeline 1 backends
+    disagree. The division applies to the PRODUCT (dividing the TTL itself
+    would collapse 10..30 onto 0 or 1); see model_meta.DEFAULT_TTL_SCALE.
+    """
     var, expr = _SCALAR_SOURCE[feat["type"]]
+    scale = _model_meta.feature_scale(feat["type"])
     pre = [f"    __u32 {var} = {expr};   /* feature '{feat['type']}' (scalar) */"]
     def term(j):
-        return f"(__s64){var} * {_lit(fc1_w[j * n_in + offset])}LL"
+        prod = f"(__s64){var} * {_lit(fc1_w[j * n_in + offset])}LL"
+        return prod if scale == 1 else f"(({prod}) / {scale}LL)"
     return pre, term
 
 

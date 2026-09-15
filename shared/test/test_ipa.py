@@ -43,6 +43,9 @@ from scapy.fields import ByteField, ShortField
 FEAT_LINK_STATE = 0x01
 FEAT_INGRESS_IF = 0x02
 FEAT_TTL        = 0x03
+
+# Initial IP TTL range, capped at the checkpoint's initial_ttl (30).
+TTL_MIN, TTL_MAX = 20, 30
 FEAT_NODE_ID    = 0x04
 # Output codes live in their OWN namespace (they describe what the model
 # predicts, not what it reads), so this 0x01 does not clash with
@@ -118,7 +121,9 @@ print()
 
 t_start = time.perf_counter()
 for i in range(N):
-    ttl = random.randint(30, 64)
+    # Trained range: the ttl feature is ttl_value/30 in (0, 1], so a TTL above
+    # 30 is outside anything the model saw. See model_meta.DEFAULT_TTL_SCALE.
+    ttl = random.randint(TTL_MIN, TTL_MAX)
     mid = MODEL_IDS[i % len(MODEL_IDS)]
     ipa_hdr = IPA_HDR(model_id=mid, scale_factor=SCALE_FACTOR)
     # Explicit sport: scapy's UDP.sport defaults to 53, and scapy binds DNS to

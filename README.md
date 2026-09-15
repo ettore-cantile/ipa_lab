@@ -216,6 +216,36 @@ the historical `65-4-4-7` shape.
 
 ---
 
+## TTL: normalised, exactly as the model was trained
+
+The `ttl` feature is **not** the raw hop count. The training pipeline builds the
+column as `ttl_value / initial_ttl` with `initial_ttl = 30`
+(`IPA_dataset_gen.py`), so the model was trained on a value in `(0, 1]` that
+starts at 1.0 and decreases with every hop: the *fraction of the journey
+remaining*. The dataset confirms it — the `ttl` column of
+`dataset_germany50_5.csv` ranges over `[0.3333, 1.0]` in steps of 1/30.
+
+The datapath used to feed the raw TTL (30-64). Since `link_state` enters the dot
+product as 0 or 1, that gave the TTL term 30-64x more leverage per unit of
+weight and buried the failure signal. Measured over the trained range:
+
+| | raw TTL | normalised |
+|---|---|---|
+| reacts to a link failure | **0.0%** | **35.2%** |
+| redirects onto the DEAD link | **16.7%** | **0.7%** |
+| egress classes ever used | 1 of 7 | 5 of 7 |
+
+The model was never the problem — it was being fed the feature at the wrong
+scale. `model_meta.DEFAULT_TTL_SCALE` holds the divisor; all three pipelines and
+the AOT generator divide the TTL **product** by it (dividing the TTL itself would
+collapse the 10..30 range onto 0 or 1 and throw the resolution away), and the
+Python reference uses `_trunc_div` so it matches C's truncate-toward-zero on
+negative weights. `send_ipa.py` sends with `INITIAL_TTL = 30` for the same
+reason: a higher TTL normalises above 1.0, outside anything the model saw.
+
+Run `shared/test/diag_model_decisions.py` to see the numbers for the current
+weights — no root, no BCC, no kernel needed.
+
 ## TTL: the hop behaves like a router
 
 All three pipelines decrement `ip->ttl` before `bpf_redirect`, and fix the IP

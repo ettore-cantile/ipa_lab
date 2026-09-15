@@ -391,10 +391,21 @@ _DENSEVEC_SOURCE = {
 
 
 def _gen_feature_scalar(feat, offset, n_in, fc1_w, n_h1):
+    """Scalar feature term, divided by the feature's training scale.
+
+    The division is applied to the PRODUCT, not to the feature: `ttl / 30` in
+    integer arithmetic collapses the whole 10..30 range onto 0 or 1. Signed
+    integer division in C truncates toward zero, and the Python reference must
+    use int(a/b) (not //) to match on negative weights.
+    See model_meta.DEFAULT_TTL_SCALE for why `ttl` is scaled at all.
+    """
+    from model_meta import feature_scale
     var, expr = _SCALAR_SOURCE[feat["type"]]
+    scale = feature_scale(feat["type"])
     preamble = [f"    __u32 {var} = {expr};   /* feature '{feat['type']}' (scalar) */"]
     def term(j):
-        return f"(__s64){var} * {_lit(fc1_w[j * n_in + offset])}LL"
+        prod = f"(__s64){var} * {_lit(fc1_w[j * n_in + offset])}LL"
+        return prod if scale == 1 else f"(({prod}) / {scale}LL)"
     return preamble, term
 
 

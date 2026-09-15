@@ -417,6 +417,8 @@ EBPF_LAYER_FIRST = EBPF_MODULAR_COMMON_HEADER + r"""
 #define PROTO_N_IN  65
 #define ML1_MAX_H1   8
 #define ML_N_QUEUES  4
+/* Must match model_meta.DEFAULT_TTL_SCALE (the checkpoint's initial_ttl). */
+#define ML_TTL_SCALE 30
 #define ML_MAX_N_IN  128
 #define FEAT_LINK_STATE  0x01
 #define FEAT_INGRESS_IF  0x02
@@ -526,7 +528,9 @@ int layer_first(struct xdp_md *ctx) {
                 __u32 sz   = desc->feats[f].size;
                 __u32 base = woff + j * n_in + desc->feats[f].col_off;
                 if (code == FEAT_TTL) {
-                    acc += (long long)_ttl * LW_W(LW, base);
+                    /* Divided by the training scale -- see T2_TTL_SCALE in
+                     * ebpf_template_arch.py and model_meta.DEFAULT_TTL_SCALE. */
+                    acc += ((long long)_ttl * LW_W(LW, base)) / ML_TTL_SCALE;
                 } else if (code == FEAT_LINK_STATE) {
                     #pragma unroll
                     for (int i = 0; i < 6; i++) {

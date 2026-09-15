@@ -56,6 +56,13 @@ import time
 IPA_HEADER_SIZE = 21
 N_WEIGHTS       = 319
 
+# Initial IP TTL. NOT an arbitrary default: the model's ttl feature was trained
+# as ttl_value / initial_ttl with initial_ttl = 30 (IPA_dataset_gen.py), i.e. the
+# fraction of the journey remaining, in (0, 1]. Sending with a higher TTL feeds
+# the datapath a normalised value above 1.0, outside the range the model ever
+# saw. Keep this equal to model_meta.DEFAULT_TTL_SCALE.
+INITIAL_TTL     = 30
+
 
 def build_ipa_header(
     model_id: int,
@@ -214,7 +221,8 @@ def main():
         dst        = sys.argv[1]
         model_id   = int(sys.argv[2])   if len(sys.argv) > 2 else 0
         weights    = sys.argv[3]        if len(sys.argv) > 3 else None
-        send_packets(dst, 1, model_id, weights, 9999, 0.0, 64, 64)
+        send_packets(dst, 1, model_id, weights, 9999, 0.0,
+                     INITIAL_TTL, INITIAL_TTL)
         return
 
     parser = argparse.ArgumentParser(
@@ -232,10 +240,10 @@ def main():
                         help="UDP destination port (default: 9999)")
     parser.add_argument("--interval", type=float, default=0.01,
                         help="Delay between packets in seconds (default: 0.01)")
-    parser.add_argument("--ttl-min",  type=int,   default=64,
-                        help="Minimum IP TTL (default: 64)")
-    parser.add_argument("--ttl-max",  type=int,   default=64,
-                        help="Maximum IP TTL (default: 64)")
+    parser.add_argument("--ttl-min",  type=int,   default=INITIAL_TTL,
+                        help=f"Minimum IP TTL (default: {INITIAL_TTL})")
+    parser.add_argument("--ttl-max",  type=int,   default=INITIAL_TTL,
+                        help=f"Maximum IP TTL (default: {INITIAL_TTL})")
     args = parser.parse_args()
 
     if args.ttl_min > args.ttl_max:

@@ -154,13 +154,13 @@ int xdp_model(struct xdp_md *ctx) {
         case 51: w_node_0 = 2LL; w_node_1 = 12LL; w_node_2 = -6LL; w_node_3 = -7LL; break;
         default: break;
     }
-    long long a1_0 = ls0 * 8LL + ls1 * 7LL + ls2 * 33LL + ls3 * -11LL + ls4 * 38LL + ls5 * 1LL + w_iface_0 + (__s64)_ttl * 11LL + w_node_0 + -36LL;
+    long long a1_0 = ls0 * 8LL + ls1 * 7LL + ls2 * 33LL + ls3 * -11LL + ls4 * 38LL + ls5 * 1LL + w_iface_0 + (((__s64)_ttl * 11LL) / 30LL) + w_node_0 + -36LL;
     long long h1_0 = a1_0 > 0 ? a1_0 : 0;
-    long long a1_1 = ls0 * 3LL + ls1 * 1LL + ls2 * 1LL + ls3 * 20LL + ls4 * 2LL + ls5 * 16LL + w_iface_1 + (__s64)_ttl * 9LL + w_node_1 + -15LL;
+    long long a1_1 = ls0 * 3LL + ls1 * 1LL + ls2 * 1LL + ls3 * 20LL + ls4 * 2LL + ls5 * 16LL + w_iface_1 + (((__s64)_ttl * 9LL) / 30LL) + w_node_1 + -15LL;
     long long h1_1 = a1_1 > 0 ? a1_1 : 0;
-    long long a1_2 = ls0 * -16LL + ls1 * -1LL + ls2 * 28LL + ls3 * 15LL + ls4 * 3LL + ls5 * 1LL + w_iface_2 + (__s64)_ttl * -5LL + w_node_2 + 1LL;
+    long long a1_2 = ls0 * -16LL + ls1 * -1LL + ls2 * 28LL + ls3 * 15LL + ls4 * 3LL + ls5 * 1LL + w_iface_2 + (((__s64)_ttl * -5LL) / 30LL) + w_node_2 + 1LL;
     long long h1_2 = a1_2 > 0 ? a1_2 : 0;
-    long long a1_3 = ls0 * -9LL + ls1 * 31LL + ls2 * 6LL + ls3 * -10LL + ls4 * -10LL + ls5 * 0LL + w_iface_3 + (__s64)_ttl * 2LL + w_node_3 + 12LL;
+    long long a1_3 = ls0 * -9LL + ls1 * 31LL + ls2 * 6LL + ls3 * -10LL + ls4 * -10LL + ls5 * 0LL + w_iface_3 + (((__s64)_ttl * 2LL) / 30LL) + w_node_3 + 12LL;
     long long h1_3 = a1_3 > 0 ? a1_3 : 0;
     long long a2_0 = h1_0 * 51LL + h1_1 * 32LL + h1_2 * 8LL + h1_3 * -70LL + 6LL;
     long long h2_0 = a2_0 > 0 ? a2_0 : 0;

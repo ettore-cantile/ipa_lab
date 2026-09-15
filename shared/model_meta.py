@@ -98,8 +98,35 @@ MAX_N_OUT = 32
 # Adding a new feature type = one entry here + its _gen_feature_* fragment
 # (+ a userspace seeder for map-backed ones).
 # ---------------------------------------------------------------------------
+# Normalisation divisor for the `ttl` feature.
+#
+# The training pipeline does NOT feed the raw TTL. IPA_dataset_gen.py builds the
+# column as
+#     ttl = ttl_value / initial_ttl        with initial_ttl = 30
+# so the model was trained on a value in (0, 1] that starts at 1.0 and decreases
+# with each hop -- the FRACTION OF THE JOURNEY REMAINING, not a hop count. The
+# dataset confirms it: the `ttl` column of dataset_germany50_5.csv ranges over
+# [0.3333, 1.0] in steps of 1/30.
+#
+# The datapath used to pass the raw TTL (30-64). Since link_state enters the
+# dot product as 0 or 1, that gave the TTL term 30-64x more leverage per unit of
+# weight and buried the failure signal: measured over the trained TTL range, the
+# model reacted to a link failure in 0% of cases and redirected onto the DEAD
+# link in 16.7%. Dividing the TTL term by this scale restores the trained
+# behaviour (reroute on ~48% of failures, dead-link redirects to 0%).
+#
+# Divide the PRODUCT, never the TTL: `ttl / 30` in integer arithmetic collapses
+# the whole 10..30 range onto 0 or 1 and throws the resolution away.
+#
+# This is a property of the CHECKPOINT (its initial_ttl), not of the topology.
+# A model trained with a different initial_ttl needs a different value here; if
+# that ever happens it belongs in model_meta.json / the per-model descriptor
+# rather than in this constant.
+DEFAULT_TTL_SCALE = 30
+
 FEATURE_CATALOG = {
-    "ttl":             {"kind": "scalar",           "dim": 1},
+    "ttl":             {"kind": "scalar",           "dim": 1,
+                        "scale": DEFAULT_TTL_SCALE},
     "link_state":      {"kind": "dense_vector_map", "map": "link_state", "dim_key": "n_interfaces"},
     "queue_occupancy": {"kind": "dense_vector_map", "map": "queue_state", "dim_key": "n_queues"},
     "ingress_iface":   {"kind": "onehot",           "dim_key": "n_interfaces"},
@@ -230,6 +257,13 @@ def topology_config_for(meta: dict) -> dict:
             cfg[k] = meta[k]
     cfg.update(meta.get("topology_config", {}))
     return cfg
+
+
+def feature_scale(feature_type: str) -> int:
+    """Divisor applied to a scalar feature's contribution, so the datapath feeds
+    the model the same magnitude the training pipeline did. 1 = no scaling.
+    See DEFAULT_TTL_SCALE for why `ttl` needs one."""
+    return int(FEATURE_CATALOG[feature_type].get("scale", 1))
 
 
 def feature_size(feature_type: str, topology_config: dict) -> int:

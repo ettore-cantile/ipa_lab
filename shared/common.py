@@ -362,7 +362,19 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
 
 
 def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
-    """Attach `fn` to `iface` in XDP native/driver mode (flags=2).
+    """Attach `fn` to `iface` in XDP GENERIC (SKB) mode.
+
+    flags=2 is XDP_FLAGS_SKB_MODE, not driver mode (that is 4,
+    XDP_FLAGS_DRV_MODE). Generic XDP runs inside netif_receive_skb, i.e. AFTER
+    the kernel has allocated the sk_buff -- later and slower than native XDP,
+    which runs in the driver before the skb exists. It is chosen here because it
+    works on every device regardless of driver support, which matters for the
+    veth-based interfaces inside Kathara containers; native mode can refuse to
+    attach depending on how the container's interfaces are set up.
+
+    This affects only the LIVE deployment path. Every number in the design-space
+    tables is measured with BPF_PROG_TEST_RUN, which does not attach the program
+    at all, so the attach mode does not enter those measurements.
 
     Raises on failure instead of printing and returning: a swallowed
     exception let every caller print "Pipeline running" over an interface
