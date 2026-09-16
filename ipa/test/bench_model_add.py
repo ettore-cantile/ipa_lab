@@ -17,7 +17,7 @@ Needs Linux + BCC + root (loads real XDP programs, never attaches them).
 Usage:
     sudo python3 ipa/test/bench_model_add.py
     sudo python3 ipa/test/bench_model_add.py --n-models 3 --model /shared/<checkpoint>.pt
-    kathara exec frankfurt -- python3 /shared/test/bench_model_add.py
+    sudo python3 ipa/test/bench_model_add.py
 """
 import os
 import sys
@@ -168,8 +168,8 @@ def main():
     args = parser.parse_args()
 
     if not sys.platform.startswith("linux"):
-        print("[bench] Needs Linux + BCC + root. Run inside Kathara, e.g.:")
-        print("  kathara exec frankfurt -- python3 /shared/bench_model_add.py")
+        print("[bench] Needs Linux + BCC + root, e.g.:")
+        print("  sudo python3 ipa/test/bench_model_add.py")
         sys.exit(1)
 
     from verify_prog_run import load_weights

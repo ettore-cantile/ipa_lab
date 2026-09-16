@@ -19,7 +19,7 @@ BPF_PROG_TEST_RUN sample is not trustworthy (one-sided system noise only
 ever slows a trial down), so MIN across TRIALS independent measurements is
 reported, with median/max for context.
 
-Run on Linux (Kathara or bare VM) with bcc installed:
+Run on Linux with bcc installed:
     sudo python3 ipa/test/bench_tailcall_overhead.py
     sudo python3 ipa/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
 """

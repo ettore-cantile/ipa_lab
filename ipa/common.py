@@ -350,39 +350,120 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
     return t
 
 
-def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE):
-    """Attach `fn` to `iface` in XDP GENERIC (SKB) mode.
+# XDP attach flags, from include/uapi/linux/if_link.h.
+XDP_FLAGS_SKB_MODE = 2      # generic: runs in netif_receive_skb, AFTER the skb
+XDP_FLAGS_DRV_MODE = 4      # native:  runs in the driver, BEFORE the skb exists
+XDP_FLAGS_HW_MODE = 8       # offloaded onto the NIC
 
-    flags=2 is XDP_FLAGS_SKB_MODE, not driver mode (that is 4,
-    XDP_FLAGS_DRV_MODE). Generic XDP runs inside netif_receive_skb, i.e. AFTER
-    the kernel has allocated the sk_buff -- later and slower than native XDP,
-    which runs in the driver before the skb exists. It is chosen here because it
-    works on every device regardless of driver support, which matters for the
-    veth-based interfaces inside Kathara containers; native mode can refuse to
-    attach depending on how the container's interfaces are set up.
+_MODE_FLAGS = {"native": XDP_FLAGS_DRV_MODE,
+               "generic": XDP_FLAGS_SKB_MODE,
+               "auto": 0}
 
-    This affects only the LIVE deployment path. Every number in the design-space
-    tables is measured with BPF_PROG_TEST_RUN, which does not attach the program
-    at all, so the attach mode does not enter those measurements.
+# Default attach mode, overridable per call or by $IPA_XDP_MODE.
+#
+# This used to be hardcoded to generic (flags=2), and the reason was written
+# into the docstring: generic "works on every device regardless of driver
+# support, which matters for the veth-based interfaces inside Kathara
+# containers". That justification came from the emulator, not from the design.
+# Generic XDP runs inside netif_receive_skb -- after the kernel has already
+# allocated the sk_buff -- which is later and slower than native XDP and is NOT
+# the path a real deployment takes. Native is the default now; a box that
+# cannot do native has to say so out loud.
+DEFAULT_XDP_MODE = os.environ.get("IPA_XDP_MODE", "native")
 
-    Raises on failure instead of printing and returning: a swallowed
-    exception let every caller print "Pipeline running" over an interface
-    with nothing attached, leaving the HIT/MISS/DROP counters frozen at 0
-    with no indication of why. Callers that want to survive a failed attach
-    must catch it explicitly.
+
+def xdp_mode_in_effect(iface: str):
+    """Which XDP mode is actually attached to `iface` right now.
+
+    Returns "native", "generic", "offload", or None if nothing is attached.
+
+    Asking the kernel rather than trusting the flags we passed is the whole
+    point: with flags=0 the kernel picks the mode itself and silently falls
+    back to generic, which is exactly how a measurement ends up describing a
+    path nobody deploys. Reads `ip -details link show`, which prints the mode
+    as `xdpgeneric` / `xdpdrv` / `xdpoffload`.
     """
-    print(f"[xdp] Attaching XDP to {iface}...")
     try:
-        b.attach_xdp(iface, fn, flags=2)
+        import subprocess
+        out = subprocess.run(["ip", "-details", "link", "show", "dev", iface],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    if "xdpoffload" in out:
+        return "offload"
+    if "xdpdrv" in out:
+        return "native"
+    if "xdpgeneric" in out:
+        return "generic"
+    return "native" if "prog/xdp" in out or " xdp " in out else None
+
+
+def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE, mode: str = None):
+    """Attach `fn` to `iface`, defaulting to NATIVE XDP.
+
+    `mode` is "native" (driver mode, the real datapath), "generic" (SKB mode,
+    after the skb is allocated), or "auto" (flags=0: let the kernel choose,
+    which means it may quietly give you generic). Defaults to
+    $IPA_XDP_MODE, else native.
+
+    A native attach that fails does NOT silently become a generic one. Falling
+    back by itself is what makes a number unattributable: the program runs, the
+    counters move, and nothing in the output says the packet took a different
+    path than the one being measured. Ask for "auto" or "generic" explicitly if
+    that is what you want.
+
+    Whatever was requested, the mode actually in effect is read back from the
+    kernel and printed, and a mismatch is reported loudly.
+
+    Raises on failure instead of printing and returning: a swallowed exception
+    let every caller print "Pipeline running" over an interface with nothing
+    attached, leaving the HIT/MISS/DROP counters frozen at 0 with no indication
+    of why. Callers that want to survive a failed attach must catch it.
+    """
+    mode = (mode or DEFAULT_XDP_MODE).lower()
+    if mode not in _MODE_FLAGS:
+        raise ValueError(
+            f"unknown XDP mode {mode!r}: expected one of "
+            f"{', '.join(sorted(_MODE_FLAGS))} (via the mode= argument or "
+            f"$IPA_XDP_MODE)")
+    flags = _MODE_FLAGS[mode]
+
+    print(f"[xdp] Attaching XDP to {iface} in {mode} mode (flags={flags})...")
+    try:
+        b.attach_xdp(iface, fn, flags=flags)
     except Exception as e:
+        hint = ""
+        if mode == "native":
+            hint = (" This interface's driver may not support native XDP "
+                    "(emulated NICs such as e1000 do not; veth, virtio_net "
+                    "and most physical drivers do). To measure on the generic "
+                    "path instead, say so explicitly: "
+                    "IPA_XDP_MODE=generic, or mode='generic'.")
         raise RuntimeError(
-            f"XDP attach to {iface!r} failed: {e}. "
+            f"XDP attach to {iface!r} in {mode} mode failed: {e}. "
             f"Check the interface exists, is up, and has no stale program "
-            f"(ip link set dev {iface} xdp off)."
+            f"(ip link set dev {iface} xdp off).{hint}"
         ) from e
-    print(f"[xdp] XDP attached to {iface}")
+
+    actual = xdp_mode_in_effect(iface)
+    if actual is None:
+        print(f"[xdp] attached to {iface}, but the kernel reports no XDP "
+              f"program on it -- cannot confirm the mode")
+    elif mode == "auto":
+        print(f"[xdp] XDP attached to {iface}: kernel chose {actual} mode")
+    elif actual != mode:
+        print(f"[xdp] WARNING: asked for {mode} mode, kernel reports {actual}. "
+              f"Every measurement from this run describes the {actual} path.")
+    else:
+        print(f"[xdp] XDP attached to {iface} in {actual} mode")
+    return actual
 
 
-def detach_xdp(b: BPF, iface: str = INGRESS_IFACE):
-    b.remove_xdp(iface, flags=2)
+def detach_xdp(b: BPF, iface: str = INGRESS_IFACE, mode: str = None):
+    """Detach, using the same flags the attach used.
+
+    The flags must match: removing a native program with SKB flags fails.
+    """
+    mode = (mode or DEFAULT_XDP_MODE).lower()
+    b.remove_xdp(iface, flags=_MODE_FLAGS.get(mode, 0))
     print(f"[xdp] XDP removed from {iface}")

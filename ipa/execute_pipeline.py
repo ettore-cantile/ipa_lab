@@ -90,6 +90,15 @@ For the full metric comparison across pipelines:
         help="Path to .pt checkpoint (default: model_meta.default_checkpoint())"
     )
     parser.add_argument(
+        "--xdp-mode",
+        choices=["native", "generic", "auto"],
+        default=None,
+        help="XDP attach mode. native (default) runs in the driver, before the "
+             "sk_buff exists -- the path a real deployment takes. generic runs "
+             "in netif_receive_skb, after it. auto lets the kernel pick, which "
+             "means it may silently give you generic. Overrides $IPA_XDP_MODE."
+    )
+    parser.add_argument(
         "--verify-only",
         action="store_true",
         help="Load and verify eBPF program without attaching XDP (safe for testing)"
@@ -170,6 +179,7 @@ For the full metric comparison across pipelines:
             # what actually runs on the datapath node.
             # Same reason as above: pass the already-resolved absolute path.
             sys.argv = ["method4_hardcoded_aot.py", "--iface", args.iface,
+                        "--xdp-mode", args.xdp_mode or "native",
                         "--model", model_path]
             runpy.run_path(
                 os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py"),
@@ -179,12 +189,14 @@ For the full metric comparison across pipelines:
     elif args.method == "template":
         # Pipeline 2 — architectural template, weights in BPF_ARRAY
         from methods.method5_template import run
-        run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids)
+        run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids,
+            xdp_mode=args.xdp_mode)
 
     else:
         # Pipeline 3 — modular layers, scratch map, N tail calls
         from methods.method6_modular import run
-        run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids)
+        run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids,
+            xdp_mode=args.xdp_mode)
 
 
 if __name__ == "__main__":

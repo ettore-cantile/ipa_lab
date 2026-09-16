@@ -57,7 +57,7 @@ _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def run(model_id: int = 42, iface: str = None, model_ids: list = None,
-        hidden_dims: list = None):
+        hidden_dims: list = None, xdp_mode: str = None):
     ingress_iface = iface if iface else INGRESS_IFACE
     ingress_iface, _ = resolve_ifindex(ingress_iface)
     ids = list(model_ids) if model_ids else [model_id]
@@ -153,7 +153,7 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
     # interface. Previously only KeyboardInterrupt detached, so any other
     # exception left a live XDP program on the node with no way to notice.
     try:
-        attach_xdp(b, fn_dispatcher, iface=ingress_iface)
+        attach_xdp(b, fn_dispatcher, iface=ingress_iface, mode=xdp_mode)
     except Exception:
         stop_monitor.set()
         raise
@@ -178,5 +178,5 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         pass
     finally:
         stop_monitor.set()
-        detach_xdp(b, iface=ingress_iface)
+        detach_xdp(b, iface=ingress_iface, mode=xdp_mode)
         print("\n\nXDP removed. Exiting.")

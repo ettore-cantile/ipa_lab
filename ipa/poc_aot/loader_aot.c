@@ -20,7 +20,8 @@
 //
 // Build: cc -O2 loader_aot.c -o loader_aot -lbpf
 // Run  : sudo ./loader_aot <literal.o>                 (bench: TEST_RUN)
-//        sudo ./loader_aot <literal.o> --attach <ifidx> (LIVE deploy: attach
+//        sudo ./loader_aot <literal.o> --attach <ifidx> [--xdp-mode native|generic|auto]
+//              (LIVE deploy: attach
 //              xdp_dispatch to the interface, stay resident until Ctrl-C, then
 //              detach -- the AOT alternative to method4_hardcoded's BCC attach)
 
@@ -30,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
@@ -119,8 +121,25 @@ int main(int argc, char **argv) {
     //                   datapath alternative to BCC's method4_hardcoded attach.
     const char *lit = "nn_aot_arch.o";
     int attach_ifindex = -1;
+    // XDP attach mode. This used to be a bare 0, which means "kernel decides"
+    // -- and the kernel decides by trying native and SILENTLY falling back to
+    // generic. A deploy that lands on the generic path (inside
+    // netif_receive_skb, after the sk_buff is allocated) is not the path being
+    // measured, and nothing in the output said so. Native is the default now,
+    // the mode actually in effect is read back from the kernel, and a failed
+    // native attach is an error rather than a quiet downgrade.
+    __u32 xdp_flags = XDP_FLAGS_DRV_MODE;
+    const char *mode_name = "native";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--attach") && i + 1 < argc) attach_ifindex = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--xdp-mode") && i + 1 < argc) {
+            mode_name = argv[++i];
+            if (!strcmp(mode_name, "native"))       xdp_flags = XDP_FLAGS_DRV_MODE;
+            else if (!strcmp(mode_name, "generic")) xdp_flags = XDP_FLAGS_SKB_MODE;
+            else if (!strcmp(mode_name, "auto"))    xdp_flags = 0;
+            else { fprintf(stderr, "--xdp-mode: expected native|generic|auto, got %s\n",
+                           mode_name); return 2; }
+        }
         else lit = argv[i];
     }
 
@@ -150,9 +169,36 @@ int main(int argc, char **argv) {
     // resident (the AOT alternative to BCC's method4_hardcoded live attach).
     // Requires libbpf >= 0.7 for bpf_xdp_attach/detach. ---
     if (attach_ifindex >= 0) {
-        if (bpf_xdp_attach(attach_ifindex, disp_fd, 0, NULL)) {
-            fprintf(stderr, "bpf_xdp_attach(ifindex=%d) failed\n", attach_ifindex);
+        if (bpf_xdp_attach(attach_ifindex, disp_fd, xdp_flags, NULL)) {
+            fprintf(stderr, "bpf_xdp_attach(ifindex=%d, mode=%s) failed: %s\n",
+                    attach_ifindex, mode_name, strerror(errno));
+            if (xdp_flags == XDP_FLAGS_DRV_MODE)
+                fprintf(stderr,
+                        "  This interface's driver may not support native XDP "
+                        "(emulated NICs such as e1000 do not; veth, virtio_net "
+                        "and most physical drivers do).\n"
+                        "  To deploy on the generic path instead, say so "
+                        "explicitly: --xdp-mode generic\n");
             goto err;
+        }
+        /* Trust the kernel, not the flags we passed: with --xdp-mode auto the
+         * kernel chooses, and every number from this run describes whichever
+         * path it actually chose. */
+        {
+            LIBBPF_OPTS(bpf_xdp_query_opts, q);
+            const char *actual = "unknown";
+            if (!bpf_xdp_query(attach_ifindex, xdp_flags, &q)) {
+                if      (q.attach_mode == XDP_ATTACHED_DRV)   actual = "native";
+                else if (q.attach_mode == XDP_ATTACHED_SKB)   actual = "generic";
+                else if (q.attach_mode == XDP_ATTACHED_HW)    actual = "offload";
+                else if (q.attach_mode == XDP_ATTACHED_MULTI) actual = "multi";
+            }
+            if (strcmp(actual, mode_name) && strcmp(mode_name, "auto"))
+                printf("[deploy] WARNING: asked for %s mode, kernel reports %s. "
+                       "Every measurement from this run describes the %s path.\n",
+                       mode_name, actual, actual);
+            else
+                printf("[deploy] XDP attach mode in effect: %s\n", actual);
         }
         signal(SIGINT,  on_signal);
         signal(SIGTERM, on_signal);
@@ -170,7 +216,7 @@ int main(int argc, char **argv) {
          * pause(), making a working, attached deploy look like a hang. */
         fflush(stdout);
         while (!g_stop) pause();
-        bpf_xdp_detach(attach_ifindex, 0, NULL);
+        bpf_xdp_detach(attach_ifindex, xdp_flags, NULL);
         printf("\n[deploy] detached from ifindex %d.\n", attach_ifindex);
         bpf_object__close(obj);
         return 0;

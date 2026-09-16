@@ -27,7 +27,7 @@ not the leaf-only shortcut verify_prog_run.py uses for per-packet
 correctness checks) -- this is the actual "multi-model concurrent" claim
 made in the design-space docs, tested end to end.
 
-Needs Linux + BCC + root. In Kathara:
+Needs Linux + BCC + root:
     sudo python3 ipa/test/verify_multi_model.py
 """
 import os
@@ -299,7 +299,7 @@ def main():
     print(" IPA/eBPF multi-model concurrent registration -- design-space proof")
     print("=" * 70)
     if not sys.platform.startswith("linux"):
-        print("Needs Linux + BCC + root. Run in Kathara.")
+        print("Needs Linux + BCC + root.")
         sys.exit(1)
 
     results = {

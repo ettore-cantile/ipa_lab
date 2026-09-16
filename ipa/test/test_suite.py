@@ -28,7 +28,7 @@ Usage:
   python3 ipa/test/test_suite.py --only core --verbose
   python3 ipa/test/test_suite.py --only quant --samples 200
   sudo python3 ipa/test/test_suite.py --only kernel    # kernel metrics (root)
-  kathara exec frankfurt -- python3 /shared/test/test_suite.py --only kernel
+  sudo python3 ipa/test/test_suite.py --only kernel     # any Linux host + BCC
 """
 
 import argparse
@@ -1537,13 +1537,13 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
     if not sys.platform.startswith("linux"):
         info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
-        info("Run in Kathara / a Linux host: sudo python3 ipa/test_suite.py --only kernel")
+        info("Run on a Linux host: sudo python3 ipa/test/test_suite.py --only kernel")
         return True
     try:
         import verify_prog_run as V
     except Exception as e:
         info(f"kernel suite skipped: BCC/verify_prog_run not importable ({e}).")
-        info("Needs Linux + BCC + root. In Kathara: kathara exec frankfurt -- python3 /shared/test_suite.py --only kernel")
+        info("Needs Linux + BCC + root: sudo python3 ipa/test/test_suite.py --only kernel")
         return True
     mp = model_path or V.MODEL_PT
     methods = [

@@ -134,6 +134,12 @@ def main():
         help="LIVE DEPLOY: attach the prebuilt .o to this interface (real XDP "
              "attach, stays resident until Ctrl-C) instead of the TEST_RUN bench. "
              "This is the AOT alternative to method4_hardcoded's BCC live attach.")
+    ap.add_argument(
+        "--xdp-mode", choices=["native", "generic", "auto"], default="native",
+        help="XDP attach mode for --iface. native (default) runs in the driver, "
+             "before the sk_buff exists -- the path a real deployment takes. "
+             "generic runs in netif_receive_skb, after it. auto lets the kernel "
+             "pick, which means it may silently give you generic.")
     args = ap.parse_args()
     args.model = _resolve_cli_path(args.model)
 
@@ -300,7 +306,8 @@ def main():
             sys.exit(f"[AOT] interface {args.iface!r} not found")
         print(f"[AOT] LIVE deploy: attaching prebuilt .o to {args.iface} "
               f"(ifindex={ifindex}); no clang on this node. Ctrl-C to detach.\n")
-        rc = subprocess.run([loader_bin, o_path, "--attach", str(ifindex)],
+        rc = subprocess.run([loader_bin, o_path, "--attach", str(ifindex),
+                             "--xdp-mode", args.xdp_mode],
                             cwd=POC_DIR).returncode
         if rc != 0:
             sys.exit(f"[AOT] loader_aot live attach failed (rc={rc})")
