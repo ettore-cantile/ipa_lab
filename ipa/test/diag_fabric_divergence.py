@@ -111,7 +111,7 @@ def main():
 
         # Reference: class plus both hidden layers.
         ref_cls, ref_val, ref_h1, ref_h2 = V.ref_infer(
-            weights, scale, ttl, 0, ifindex=0, link_state=ls)
+            weights, scale, ttl, 0, ingress_port=0, link_state=ls)
 
         # Datapath: same input, through the real program.
         cls_before = [int(setup["cls_stats"][ct.c_int(i)].value

@@ -93,19 +93,14 @@ def run(args=None):
     # ------------------------------------------------------------------
     from ebpf_program import load_and_generate
 
-    # ifindex_table maps each kernel ingress ifindex -> logical port for the
-    # ingress_iface one-hot. Size it to that feature (0 if the model doesn't
-    # use it); the default [2, 2+size) convention matches ebpf_program's
-    # generator and the kernel tests (verify_prog_run). None -> generator
-    # applies the same default.
-    iface_size = next(
-        (f["size"] for f in shape["features"] if f["type"] == "ingress_iface"), 0)
-    ifindex_table = list(range(2, 2 + max(iface_size, 1)))
+    # The kernel ifindex -> logical port mapping is no longer compiled in:
+    # it is the `ingress_port` map, filled at attach time from this node's own
+    # interfaces (see common.install_ingress_port_table). What used to sit here
+    # was list(range(2, 2 + iface_size)) -- the assumption eth0 == ifindex 2.
 
     ebpf_src, weights_int8, scale = load_and_generate(
         model_path=model_path,
         model_id=args.model_id,
-        ifindex_table=ifindex_table,
         meta=meta,
         topology_config=topo_cfg,
     )
@@ -120,14 +115,13 @@ def run(args=None):
         print("[method4] NOTE: hardcoded live deploy is AOT-only "
               "(method4_hardcoded_aot.py / execute_pipeline.py --method hardcoded). "
               "Running the BCC verifier check instead of attaching.")
-    _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table)
+    _verify_only(shape, ebpf_src, weights_int8, scale)
 
 
-def _verify_only(shape, ebpf_src, weights_int8, scale, ifindex_table):
+def _verify_only(shape, ebpf_src, weights_int8, scale):
     """Run the BPF verifier without attaching to any interface."""
     from bcc import BPF
     print(f"[verify-only] shape={shape}")
-    print(f"[verify-only] ifindex_table={ifindex_table}")
     print(f"DIM INPUT: {shape['n_in']}")
     print(f"[verify-only] scale={scale}, weights={len(weights_int8)}, "
           f"source_chars={len(ebpf_src)}")

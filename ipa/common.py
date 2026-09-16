@@ -275,6 +275,48 @@ def install_mac_per_port(b, table_name: str, node_cfg, logical_ports: list = Non
 # it, and keeping a deprecated shim around only invites the assumption back.
 # Use install_mac_per_port(b, table, node_cfg, logical_ports).
 
+
+def install_ingress_port_table(b, map_name: str, node_cfg,
+                               logical_ports: list = None) -> dict:
+    """Fill `map_name` with kernel ifindex -> LOGICAL PORT, 1-based.
+
+    The mirror of install_mac_per_port. That one answers "the model chose class
+    k, which interface do I send out of"; this one answers "the packet arrived
+    on interface X, which of my ports is that" -- the question the trained
+    ingress_iface one-hot asks.
+
+    It used to be answered by a compile-time table, [2, 3, 4, ...], i.e. the
+    assumption eth0 == ifindex 2. Kernel ifindexes are assigned by the kernel:
+    2 and 3 on a freshly booted container, 207 and 209 on a box that has
+    created a few veths. When they do not match, no bit is set and a trained
+    feature contributes nothing -- silently, with every test still green
+    because nothing checked that it contributed anything.
+
+    Values are 1-based because the datapath's guard is `>= 1 && <= size`, so a
+    missing entry (0) reads as "not one of my ports". Returns what was written.
+    """
+    ports = list(logical_ports) if logical_ports is not None \
+        else sorted(node_cfg.port_to_iface)
+    written = {}
+    for logical_idx, port in enumerate(sorted(ports), start=1):
+        ifx = node_cfg.ifindex_of(port)
+        if ifx is None:
+            continue
+        b[map_name][ctypes.c_uint32(int(ifx))] = ctypes.c_uint32(logical_idx)
+        written[int(ifx)] = logical_idx
+
+    if not written:
+        print(f"[ingress] WARNING: {map_name} is empty -- no logical port "
+              f"resolved to an interface on this node, so the ingress_iface "
+              f"feature contributes nothing to any decision")
+    else:
+        for ifx, li in sorted(written.items()):
+            name = next((n for p2, n in node_cfg.port_to_iface.items()
+                         if node_cfg.ifindex_of(p2) == ifx), "?")
+            print(f"[ingress] {map_name}: ifindex {ifx} ({name}) -> "
+                  f"one-hot slot {li}")
+    return written
+
 def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
                              interval: float = 5.0):
     """Start a daemon thread that periodically re-reads /proc/net/arp and

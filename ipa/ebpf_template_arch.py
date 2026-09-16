@@ -430,6 +430,23 @@ BPF_PROG_ARRAY(arch_progs, 8);
  * decision here, no output validation -- just resolve the physical action. */
 /* mac_table_t2 is keyed by LOGICAL PORT, not by class. */
 BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
+/* Kernel ingress ifindex -> LOGICAL PORT (1-based; absent means "not one of
+ * this node's ports", which contributes nothing).
+ *
+ * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
+ * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
+ * kernel and are arbitrary -- 2 and 3 on a container, 207 and 209 on a box
+ * that has created a few veths -- so on real hardware the guard
+ * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
+ * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at
+ * compile time as [2, 3, 4, ...], which is the same assumption spelled
+ * differently.
+ *
+ * Which interface realises which logical port is a NODE fact, discovered at
+ * runtime, exactly like mac_table. This is that map, on the ingress side.
+ */
+BPF_HASH(ingress_port_t2, __u32, __u32, 64);
+
 BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);   /* per-class redirect counter */
@@ -619,6 +636,23 @@ BPF_HASH(model_desc, __u8, struct model_desc, 256);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 /* mac_table_t2 is keyed by LOGICAL PORT, not by class. */
 BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
+/* Kernel ingress ifindex -> LOGICAL PORT (1-based; absent means "not one of
+ * this node's ports", which contributes nothing).
+ *
+ * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
+ * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
+ * kernel and are arbitrary -- 2 and 3 on a container, 207 and 209 on a box
+ * that has created a few veths -- so on real hardware the guard
+ * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
+ * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at
+ * compile time as [2, 3, 4, ...], which is the same assumption spelled
+ * differently.
+ *
+ * Which interface realises which logical port is a NODE fact, discovered at
+ * runtime, exactly like mac_table. This is that map, on the ingress side.
+ */
+BPF_HASH(ingress_port_t2, __u32, __u32, 64);
+
 BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
 BPF_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);
@@ -718,7 +752,14 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     if (!AW) return XDP_PASS;
 
     __u32 _ttl       = ((__u32)ip->ttl) & 0xff;
-    __u32 _raw_iface = ctx->ingress_ifindex;
+    /* Kernel ifindex -> logical port, 1-based. Not the raw ifindex: see
+     * the ingress_port_t2 declaration. 0 when this node has no logical port
+     * on the interface the packet arrived on, which the feature guard below
+     * reads as "no ingress-port bit set". */
+    __u32 _raw_iface = 0;
+    { __u32 _kif = ctx->ingress_ifindex;
+      __u32 *_lp = ingress_port_t2.lookup(&_kif);
+      if (_lp) _raw_iface = *_lp; }
     __u32 _node      = (__u32)ipa->model_id;
 
     /* dense feature vectors, each read once with a SINGLE lookup, reused across

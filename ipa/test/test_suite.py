@@ -1437,8 +1437,6 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
     # --- P1 hardcoded: variable depth, same descriptor -------------------
     shape = mm.derive_shape({"n_interfaces": 6, "n_nodes": 52})
     features, n_out, n_in = shape["features"], shape["n_out"], shape["n_in"]
-    iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
-    ifindex_table = list(range(2, 2 + max(iface_size, 1)))
 
     # link_state width from the resolved descriptor, not a literal 6.
     _ls_size = next((f["size"] for f in features if f["type"] == "link_state"), 0)
@@ -1456,7 +1454,7 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
         # about a convention the datapath does not implement.
         alt_sem = suite_semantics(n_out)
         src = build_combined_hardcoded_source(
-            models=[(0, weights, scale, ifindex_table)],
+            models=[(0, weights, scale)],
             features=features, n_out=n_out, hidden_dims=dims,
             semantics=alt_sem)
         try:
@@ -1478,8 +1476,12 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
             ref_cls, ref_val = V.ref_infer_sparse(
                 weights, features, dims, n_out, ttl, model_id=0,
                 map_values={"link_state": [1] * _ls_size},
-                ifindex=V.TEST_RUN_DEFAULT_INGRESS_IFINDEX,
-                ifindex_table=ifindex_table, scale=scale)
+                # No ingress_port entry is installed for these alt-arch
+                # programs, so the datapath resolves no logical port and the
+                # ingress_iface one-hot stays empty. The reference must say the
+                # same thing, or the two disagree about a feature neither is
+                # exercising.
+                ingress_port=0, scale=scale)
             frame = V.build_frame_sparse(model_id=0, ttl=ttl, scale=scale, n_in=n_in, n_out=n_out)
             for i in range(3):
                 ps[ct.c_int(i)] = ct.c_ulonglong(0)

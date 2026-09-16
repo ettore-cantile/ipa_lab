@@ -295,6 +295,23 @@ BPF_PROG_ARRAY(layer_chain, 16);
  * The NN decides the port; this only resolves the L2 next-hop. */
 /* mac_table_t3 is keyed by LOGICAL PORT, not by class. */
 BPF_ARRAY(mac_table_t3, struct fwd_action, MAX_N_OUT);
+/* Kernel ingress ifindex -> LOGICAL PORT (1-based; absent means "not one of
+ * this node's ports", which contributes nothing).
+ *
+ * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
+ * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
+ * kernel and are arbitrary -- 2 and 3 on a container, 207 and 209 on a box
+ * that has created a few veths -- so on real hardware the guard
+ * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
+ * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at
+ * compile time as [2, 3, 4, ...], which is the same assumption spelled
+ * differently.
+ *
+ * Which interface realises which logical port is a NODE fact, discovered at
+ * runtime, exactly like mac_table. This is that map, on the ingress side.
+ */
+BPF_HASH(ingress_port_t3, __u32, __u32, 64);
+
 BPF_ARRAY(class_action_t3, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t3, __u64, MAX_N_OUT);   /* per-class redirect counter */
@@ -472,7 +489,14 @@ int modular_dispatcher(struct xdp_md *ctx) {
     idx = META_MODEL_ID;   { long long v = model_id;               scratch_meta.update(&idx, &v); }
     idx = META_SCALE;      { long long v = lentry->scale_factor;   scratch_meta.update(&idx, &v); }
     idx = META_LAYER_IDX;  { long long v = 0LL;                    scratch_meta.update(&idx, &v); }
-    idx = META_INGRESS_IF; { long long v = ctx->ingress_ifindex;   scratch_meta.update(&idx, &v); }
+    /* The LOGICAL PORT, not the kernel ifindex -- resolved here, at the
+     * dispatcher, so every tail-called layer reads a node-independent value
+     * from scratch_meta. See the ingress_port_t3 declaration. */
+    idx = META_INGRESS_IF;
+    { __u32 _kif = ctx->ingress_ifindex;
+      __u32 *_lp = ingress_port_t3.lookup(&_kif);
+      long long v = _lp ? (long long)(*_lp) : 0LL;
+      scratch_meta.update(&idx, &v); }
     idx = META_TTL;        { long long v = ip->ttl;                scratch_meta.update(&idx, &v); }
 
     /* Tail call to layer_chain[0] = layer_first. It reads model_id/scale/

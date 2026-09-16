@@ -100,7 +100,8 @@ def _is_probe_frame(data: bytes) -> bool:
     return int.from_bytes(data[36:38], "big") == 9999      # the IPA port
 
 
-def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30):
+def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30,
+                            ingress_port=0):
     """One (link_state, ttl) per output class the model can actually reach.
 
     Sweeping TTL alone is not a test: for the checked-in checkpoint every TTL
@@ -122,7 +123,8 @@ def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30):
         # whatever class the model picks.
         for ttl in range(2, max_ttl + 1):
             cls = V.ref_infer(weights, scale, ttl, model_id,
-                              ifindex=0, link_state=list(bits))[0]
+                              ingress_port=ingress_port,
+                              link_state=list(bits))[0]
             if cls not in found:
                 found[cls] = (list(bits), ttl)
             if len(found) == n_out:
@@ -149,6 +151,14 @@ def _delta(before, after):
             if after[i] != before[i]}
 
 _MAC_NAME = {1: "mac_table", 2: "mac_table_t2", 3: "mac_table_t3"}
+_INGRESS_NAME = {1: "ingress_port", 2: "ingress_port_t2", 3: "ingress_port_t3"}
+
+# The one-hot slot the fabric's ingress interface occupies. On a real node the
+# ingress is one of the node's own ports; the fabric keeps it on a separate
+# interface so a redirect back to port 0 stays observable, and then declares it
+# as this slot so the ingress_iface feature is actually exercised rather than
+# left contributing nothing.
+FABRIC_INGRESS_SLOT = 1
 _SETUP = {"hardcoded": "setup_hardcoded",
           "template": "setup_template",
           "modular": "setup_modular"}
@@ -186,17 +196,27 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
         if verbose:
             info(f"mac_table: {installed}")
 
-        ingress_ifx = fab.ingress_ifindex
-        if not 1 <= ingress_ifx <= 6:
-            info(f"ingress ifindex is {ingress_ifx}, outside the [1,6] the "
-                 f"ingress_iface one-hot covers: that feature contributes "
-                 f"nothing here. Real kernel ifindexes are arbitrary -- see "
-                 f"the note at the end.")
+        # Kernel ifindex -> logical port, the ingress-side mirror of mac_table.
+        # Without it the ingress_iface one-hot is empty on any real box, because
+        # the kernel ifindex (205, 217, ...) never falls inside [1, n_interfaces].
+        ing_name = _INGRESS_NAME[setup["pipeline"]]
+        ingress_port = FABRIC_INGRESS_SLOT
+        try:
+            b[ing_name][ct.c_uint32(fab.ingress_ifindex)] = \
+                ct.c_uint32(ingress_port)
+            if verbose:
+                info(f"{ing_name}: ifindex {fab.ingress_ifindex} "
+                     f"({fab.ingress}) -> one-hot slot {ingress_port}")
+        except Exception as e:
+            ingress_port = 0
+            info(f"{ing_name} unavailable ({e}); the ingress_iface feature "
+                 f"contributes nothing in this run")
 
         # --ttl-max now bounds the SEARCH for per-class inputs, not a blind
         # sweep: the sweep was what made 7/7 mean one class seven times.
         cases = _cases_covering_classes(V, weights, scale, 0, n_out,
-                                        max_ttl=max(ttl_range))
+                                        max_ttl=max(ttl_range),
+                                        ingress_port=ingress_port)
         missing = [c for c in range(n_out) if c not in cases]
         info(f"classes reachable by varying link_state and ttl: "
              f"{sorted(cases)}" + (f"; unreachable: {missing}" if missing else ""))
@@ -211,11 +231,11 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
                 # they are answering different questions.
                 write_vector_map(b, "link_state", ls)
                 got_cls = V.ref_infer(weights, scale, ttl, 0,
-                                      ifindex=ingress_ifx, link_state=ls)[0]
-                if got_cls != exp_cls:
-                    info(f"ingress ifindex {ingress_ifx} moved the reference "
-                         f"from class {exp_cls} to {got_cls}; using {got_cls}")
-                    exp_cls = got_cls
+                                      ingress_port=ingress_port, link_state=ls)[0]
+                assert got_cls == exp_cls, (
+                    f"the case search and the per-case reference disagree "
+                    f"({exp_cls} vs {got_cls}) on the same input -- they are "
+                    f"not being given the same ingress_port")
                 action = sem.action_of(exp_cls)
                 exp_port = sem.port_of(exp_cls) if action == "FORWARD" else None
                 lsd = "".join(map(str, ls))
@@ -342,12 +362,14 @@ def main():
         print(f"{GREEN} {_results['pass']}/{total} checks passed{NC}")
     print(f"{YELLOW}{'=' * 64}{NC}")
 
-    print("\nNote on the ingress_iface feature: the datapath reads "
-          "ctx->ingress_ifindex, a KERNEL ifindex, and uses it directly as the "
-          "one-hot index. On a real box those are arbitrary (15, 17, 19...), "
-          "so the feature is dead unless the ifindex is translated into a "
-          "logical port first -- the mirror of the egress mapping that already "
-          "exists. Pipeline 1 does translate; Pipelines 2 and 3 do not.")
+    print("\nThe ingress_iface one-hot is fed from the `ingress_port` map: "
+          "kernel ifindex -> logical port, installed above from the fabric's "
+          "own interfaces. It used to be indexed by the raw "
+          "ctx->ingress_ifindex (P2/P3) or by a switch over a compile-time "
+          "[2, 3, ...] table (P1), both of which resolve to nothing on a box "
+          "whose ifindexes are 205 and 217 -- a trained feature contributing "
+          "zero, with every test still green because none checked that it "
+          "contributed anything.")
 
     return 1 if _results["fail"] else 0
 

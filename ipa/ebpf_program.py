@@ -277,6 +277,17 @@ BPF_ARRAY(cls_stats,        __u64, {n_out});   /* per-class redirect counter */
  * detected by ifindex==0 (never a valid egress ifindex) instead of NULL. */
 BPF_ARRAY(mac_table, struct fwd_action, {mac_capacity});
 
+/* Kernel ingress ifindex -> LOGICAL PORT (1-based; absent contributes nothing).
+ *
+ * This replaces a compile-time `ifindex_table`, baked into the generated
+ * switch as `case 2: _iface = 1; case 3: _iface = 2; ...`. That table encoded
+ * the assumption eth0 == ifindex 2, which holds in a freshly booted container
+ * and nowhere else: on a box that has created a few veths the ingress arrives
+ * with ifindex 207, no case matches, and the trained ingress_iface feature
+ * silently contributes nothing. Which interface realises which logical port is
+ * a NODE fact, resolved at runtime -- the same reason mac_table is a map. */
+BPF_HASH(ingress_port, __u32, __u32, 64);
+
 /* model_progs: dispatcher -> model_<id>, indexed directly by ipa->model_id.
  * A single tail call, matching the design-space spec's hardcoded pipeline
  * ("packet -> dispatcher -> tail call -> model_<id> -> action"). */
@@ -523,23 +534,21 @@ def _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
+def _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1):
     """ingress-iface one-hot: exactly one active logical port (1..size), the
     weight switch selects fc1_w[j, offset + (port-1)]. One switch total (not
-    per neuron) -- verifier-safe (see module docstring / prof_Notes.md #8)."""
+    per neuron) -- verifier-safe (see module docstring / prof_Notes.md #8).
+
+    The logical port comes from the ingress_port map, not from a switch over
+    hardcoded kernel ifindexes: see that map's declaration for why. The WEIGHT
+    switch below stays literal -- that is what Pipeline 1 is."""
     size = feat["size"]
-    lines = ["    /* feature 'ingress_iface' (one-hot): raw ifindex -> logical 1..size */",
+    lines = ["    /* feature 'ingress_iface' (one-hot): kernel ifindex -> logical 1..size,",
+             "     * resolved through the ingress_port map (a node fact, not a model fact) */",
              "    __u32 _iface = 0U;",
-             "    switch (ctx->ingress_ifindex) {"]
-    seen = set()
-    for logical_idx, kern in enumerate(ifindex_table[:size], start=1):
-        ki = int(kern)
-        if ki in seen:
-            continue
-        seen.add(ki)
-        lines.append(f"        case {ki}U: _iface = {logical_idx}U; break;")
-    lines.append("        default: break;")
-    lines.append("    }")
+             "    { __u32 _kif = ctx->ingress_ifindex;",
+             "      __u32 *_lp = ingress_port.lookup(&_kif);",
+             "      if (_lp && *_lp >= 1U && *_lp <= " + str(size) + "U) _iface = *_lp; }"]
     for j in range(n_h1):
         lines.append(f"    long long w_iface_{j} = 0LL;")
     lines.append("    switch (_iface) {")
@@ -574,7 +583,7 @@ def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
+def _gen_feature(feat, offset, n_in, fc1_w, n_h1):
     """Dispatch to the right per-kind generator for one descriptor entry."""
     t = feat["type"]
     kind = _model_meta.FEATURE_CATALOG[t]["kind"]
@@ -584,7 +593,7 @@ def _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
         return _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1)
     if kind == "onehot":
         if t == "ingress_iface":
-            return _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1, ifindex_table)
+            return _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1)
         if t == "node":
             return _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1)
     raise ValueError(f"no C generator for feature type {t!r} (kind {kind!r})")
@@ -598,7 +607,6 @@ def generate_ebpf_hardcoded(
     weights_int8: list,
     scale: int,
     model_id: int = 0,
-    ifindex_table: list = None,
     include_header: bool = True,
     n_interfaces: int = None,
     n_nodes: int = None,
@@ -642,9 +650,11 @@ def generate_ebpf_hardcoded(
       - inference always runs (pure hardcoded, no cache gate)
       - mac_table itself is populated by the CALLER (method4_hardcoded.py)
 
-    ifindex_table: kernel ifindex -> logical port mapping for the
-                   ingress_iface one-hot feature (if present in the
-                   descriptor). Defaults to [2, 3, ...].
+    The ingress_iface one-hot no longer takes an `ifindex_table` argument.
+    It used to default to [2, 3, ...] and be compiled into a switch, which
+    encoded "eth0 is ifindex 2" into the program. The mapping is now the
+    ingress_port map, filled by the control plane from the node's own
+    interfaces -- see common.install_ingress_port_table.
     """
     dims = [int(d) for d in hidden_dims]
 
@@ -681,15 +691,6 @@ def generate_ebpf_hardcoded(
             f"Expected {n_weights} weights for shape "
             f"{'-'.join(map(str, layer_sizes))}, got {len(weights_int8)}")
 
-    # ifindex_table sized to the ingress_iface feature (if any); default
-    # [2,3,...]. For a descriptor without ingress_iface it is unused.
-    iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
-    if ifindex_table is None:
-        ifindex_table = list(range(2, 2 + max(iface_size, 1)))
-    ifindex_table = list(ifindex_table[:max(iface_size, 1)])
-    while len(ifindex_table) < iface_size:
-        ifindex_table.append(2)
-
     w = weights_int8
     layers = []            # [(W, B)] one entry per layer, input -> output
     off = 0
@@ -712,7 +713,7 @@ def generate_ebpf_hardcoded(
     term_fns  = []
     offset = 0
     for feat in features:
-        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table)
+        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1)
         fc1_lines.extend(pre)
         term_fns.append(term)
         offset += feat["size"]
@@ -807,7 +808,7 @@ def build_combined_hardcoded_source(
     semantics=None,
 ) -> str:
     """
-    models: list of (model_id, weights_int8, scale, ifindex_table) tuples,
+    models: list of (model_id, weights_int8, scale) tuples,
     all sharing the same feature descriptor / n_out / hidden_dims (the map
     sizes and cls range are shared by the whole compiled object; register
     differently-shaped models via separate method4_hardcoded.py runs).
@@ -848,9 +849,25 @@ def build_combined_hardcoded_source(
         semantics = descriptor_semantics_or_reference(n_out, "Pipeline1")
     src = (_build_header(dvmaps, n_out, semantics=semantics) + "\n"
            + EBPF_HARDCODED_DISPATCHER)
-    for model_id, weights_int8, scale, ifindex_table in models:
+    for entry in models:
+        # (model_id, weights, scale), or the old 4-tuple whose last element was
+        # a compile-time ifindex_table. A None there is the shape every caller
+        # already used and is simply dropped; anything else is refused rather
+        # than ignored, because ignoring it would silently discard a mapping
+        # the caller believed was in effect.
+        if len(entry) == 4:
+            model_id, weights_int8, scale, _stale = entry
+            if _stale is not None:
+                raise ValueError(
+                    "build_combined_hardcoded_source no longer takes a "
+                    "compile-time ifindex_table: the kernel ifindex -> logical "
+                    "port mapping is the runtime `ingress_port` map, filled by "
+                    "common.install_ingress_port_table() from the node's own "
+                    "interfaces. Pass (model_id, weights, scale).")
+        else:
+            model_id, weights_int8, scale = entry
         src += "\n" + generate_ebpf_hardcoded(
-            weights_int8, scale, model_id, ifindex_table, include_header=False,
+            weights_int8, scale, model_id, include_header=False,
             hidden_dims=hidden_dims, features=features, n_out=n_out,
             semantics=semantics)
     return src
@@ -863,7 +880,6 @@ def build_combined_hardcoded_source(
 def load_and_generate(
     model_path: str = None,
     model_id: int = 0,
-    ifindex_table: list = None,
     meta: dict = None,
     topology_config: dict = None,
 ) -> tuple:
@@ -942,7 +958,7 @@ def load_and_generate(
         )
 
     ebpf_src = build_combined_hardcoded_source(
-        [(model_id, weights_int8, scale, ifindex_table)],
+        [(model_id, weights_int8, scale)],
         features=shape["features"], n_out=shape["n_out"],
         hidden_dims=tuple(shape["hidden_dims"]))
     return ebpf_src, weights_int8, scale

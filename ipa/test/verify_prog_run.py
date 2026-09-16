@@ -323,7 +323,7 @@ def _feature_scales(features) -> list:
     return out
 
 
-def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0,
+def ref_infer(weights, scale: int, ttl: int, model_id: int, ingress_port: int = 0,
               link_state=None):
     """Integer reference for the checked-in 65-4-4-7 model.
 
@@ -350,8 +350,11 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0,
     for i in range(6):
         x[i] = int(ls[i]) if i < len(ls) else 0
     x[12] = ttl
-    if 1 <= ifindex <= 6:
-        x[5 + ifindex] = 1
+    # The LOGICAL PORT (1-based), not a kernel ifindex: the datapath resolves
+    # ctx->ingress_ifindex through the `ingress_port` map before it reaches the
+    # feature. Passing a raw ifindex here would set a bit the datapath does not.
+    if 1 <= ingress_port <= 6:
+        x[5 + ingress_port] = 1
     if 0 <= model_id <= 51:
         x[13 + model_id] = 1
     # Per-column divisors: only the ttl column (12) is scaled, by the
@@ -412,7 +415,7 @@ def build_frame_sparse(model_id: int, ttl: int, scale: int, n_in: int, n_out: in
 
 
 def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
-                     map_values, ifindex, ifindex_table, scale: int = 1):
+                     map_values, ingress_port=0, scale: int = 1):
     """Python reference for the heterogeneous sparse route: builds the input
     vector feature by feature from the descriptor (mirroring the per-kind C
     generators in ebpf_program.py), then runs the MLP + argmax. Returns
@@ -422,9 +425,14 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
     trained model does not follow.
 
     map_values: {map_name: [values]} the caller seeded into the dense_vector
-    maps (link_state, queue_state). ifindex/ifindex_table: the raw
-    ctx->ingress_ifindex and the kernel-ifindex->logical mapping used by the
-    ingress_iface one-hot (mirrors generate_ebpf_hardcoded's default table)."""
+    maps (link_state, queue_state).
+
+    ingress_port: the LOGICAL PORT the packet arrived on, 1-based, 0 for none.
+    This used to be a raw ctx->ingress_ifindex plus an `ifindex_table` to
+    translate it, mirroring a table the generator compiled in. The datapath
+    now resolves the kernel ifindex through the `ingress_port` map before the
+    feature is built, so the reference is handed the resolved value -- which is
+    also the only value that means anything without knowing the node."""
     import model_meta as mm
     def s8(v):
         return ct.c_int8(int(v) & 0xFF).value
@@ -442,11 +450,7 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
             for i in range(size):
                 x[o + i] = vals[i]
         elif kind == "onehot" and t == "ingress_iface":
-            logical = 0
-            for li, ki in enumerate(ifindex_table[:size], start=1):
-                if ki == ifindex:
-                    logical = li
-                    break
+            logical = int(ingress_port)
             if 1 <= logical <= size:
                 x[o + (logical - 1)] = 1
         elif kind == "onehot" and t == "node":
@@ -1354,7 +1358,6 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
     # descriptor has an ingress_iface feature); TEST_RUN default ingress
     # ifindex is 1, which this table does not map -> no iface contribution.
     iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
-    ifindex_table = list(range(2, 2 + max(iface_size, 1)))
 
     feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in features)
     print(f"[setup] scale={scale}  weights={len(weights)}  n_in={n_in}  n_out={n_out}")
@@ -1375,8 +1378,11 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
     for ttl in range(ttl_min, ttl_max + 1):
         ref_cls, ref_val = ref_infer_sparse(
             weights, features, hidden_dims, n_out, ttl, model_id,
-            map_values, ifindex=TEST_RUN_DEFAULT_INGRESS_IFINDEX,
-            ifindex_table=ifindex_table, scale=scale)
+            # This runner installs no ingress_port entry, so the datapath
+            # resolves no logical port and the ingress_iface one-hot stays
+            # empty. The reference has to agree, or the two disagree about a
+            # feature neither of them is exercising.
+            map_values, ingress_port=0, scale=scale)
         frame = build_frame_sparse(model_id, ttl, scale, n_in, n_out)
         _reset_stats(setup, n_classes=n_out)
         # repeat=1: the program mutates the packet (TTL decrement) and
