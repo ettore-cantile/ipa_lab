@@ -383,9 +383,15 @@ int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end,
     if (ca->action == ACT_DROP) {
         int di = 2; __u64 *dv = pkt_stats_t3.lookup(&di);
         if (dv) __sync_fetch_and_add(dv, 1);
+        /* Same reason as Pipeline 2: the decision happened, so it is recorded
+         * whatever is then done with the packet. */
+        __u64 *dcv = cls_stats_t3.lookup(&_ci);
+        if (dcv) __sync_fetch_and_add(dcv, 1);
         return XDP_DROP;
     }
     if (ca->action != ACT_FORWARD) {           /* ACT_UNUSED */
+        __u64 *ucv = cls_stats_t3.lookup(&_ci);
+        if (ucv) __sync_fetch_and_add(ucv, 1);
         int mi = 1; __u64 *mv = pkt_stats_t3.lookup(&mi);
         if (mv) __sync_fetch_and_add(mv, 1);
         return XDP_PASS;

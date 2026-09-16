@@ -242,10 +242,11 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
                     fail(f"link_state={lsd} ttl={ttl}: reference says class "
                          f"{exp_cls}, datapath chose class {chosen} ({why})")
                     continue
-                if chosen is None and action == "FORWARD":
+                if chosen is None:
                     fail(f"link_state={lsd} ttl={ttl}: expected class "
                          f"{exp_cls}, but the datapath recorded no class at "
-                         f"all ({why}) -- the program did not reach argmax")
+                         f"all ({why}) -- the program did not reach argmax, or "
+                         f"took a path that does not record one")
                     continue
 
                 if action != "FORWARD":

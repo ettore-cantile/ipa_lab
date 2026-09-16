@@ -855,9 +855,16 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     if (ca->action == ACT_DROP) {
         int di = 2; __u64 *dv = pkt_stats_t2.lookup(&di);
         if (dv) __sync_fetch_and_add(dv, 1);
+        /* The class was decided; record it. Without this a DROP is visible
+         * only as a pkt_stats counter, and "the model chose the DROP class"
+         * cannot be told apart from "the program never reached argmax". */
+        __u64 *dcv = cls_stats_t2.lookup(&_ci);
+        if (dcv) __sync_fetch_and_add(dcv, 1);
         return XDP_DROP;
     }
     if (ca->action != ACT_FORWARD) {           /* ACT_UNUSED */
+        __u64 *ucv = cls_stats_t2.lookup(&_ci);
+        if (ucv) __sync_fetch_and_add(ucv, 1);
         int mi = 1; __u64 *mv = pkt_stats_t2.lookup(&mi);
         if (mv) __sync_fetch_and_add(mv, 1);
         return XDP_PASS;

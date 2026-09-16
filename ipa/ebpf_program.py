@@ -357,6 +357,11 @@ def _gen_class_dispatch(semantics) -> str:
                          f"   /* DROP (declared, not inferred) */")
             lines.append("        int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);")
             lines.append("        if (_dv) __sync_fetch_and_add(_dv, 1);")
+            # The class was decided; record it, so a DROP is distinguishable
+            # from a program that never reached argmax.
+            lines.append(f"        __u32 _dc = {cid}U;")
+            lines.append("        __u64 *_dcv = cls_stats.lookup(&_dc);")
+            lines.append("        if (_dcv) __sync_fetch_and_add(_dcv, 1);")
             lines.append("        return XDP_DROP;")
             lines.append("    }")
         else:
@@ -364,6 +369,9 @@ def _gen_class_dispatch(semantics) -> str:
                          f"   /* UNUSED: countable, never forwarded */")
             lines.append("        int _ui = 1; __u64 *_uv = pkt_stats.lookup(&_ui);")
             lines.append("        if (_uv) __sync_fetch_and_add(_uv, 1);")
+            lines.append(f"        __u32 _uc = {cid}U;")
+            lines.append("        __u64 *_ucv = cls_stats.lookup(&_uc);")
+            lines.append("        if (_ucv) __sync_fetch_and_add(_ucv, 1);")
             lines.append("        return XDP_PASS;")
             lines.append("    }")
     lines += [
