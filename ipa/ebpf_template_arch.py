@@ -177,7 +177,21 @@ N_WEIGHTS_T2 = _LazyWeightCount()
 # Raw bpf(2) syscall helpers
 # ---------------------------------------------------------------------------
 
-_libc = ct.CDLL("libc.so.6", use_errno=True)
+# Binding libc at import time made this module Linux-only to IMPORT, not just
+# to run -- and the biggest thing it exports is C source text, which is
+# generated offline precisely so the node needs no toolchain. The AOT
+# translator (poc_aot/bcc_to_libbpf.py) has to read these strings on whatever
+# machine does the build. Bound lazily: _bpf_syscall() raises if it is actually
+# needed and unavailable, which is the point where a caller genuinely needs a
+# kernel.
+_libc = None
+
+
+def _get_libc():
+    global _libc
+    if _libc is None:
+        _libc = ct.CDLL("libc.so.6", use_errno=True)
+    return _libc
 _BPF_SYSCALL_NR          = 321   # x86_64
 _BPF_MAP_UPDATE_ELEM     = 2
 _BPF_MAP_LOOKUP_ELEM     = 1
@@ -225,7 +239,7 @@ def _get_map_value_size(map_fd: int) -> int:
         info_len = ct.sizeof(info),
         info     = ct.cast(ct.byref(info), ct.c_void_p).value,
     )
-    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_OBJ_GET_INFO_BY_FD,
+    ret = _get_libc().syscall(_BPF_SYSCALL_NR, _BPF_OBJ_GET_INFO_BY_FD,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
         print(f"[Pipeline2] BPF_OBJ_GET_INFO_BY_FD errno={ct.get_errno()}, fallback value_size=8")
@@ -245,7 +259,7 @@ def _bpf_map_read_blk(map_fd: int, value_size: int, index: int = 0) -> bytearray
         value  = ct.cast(val_buf, ct.c_void_p).value,
         flags  = 0,
     )
-    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_LOOKUP_ELEM,
+    ret = _get_libc().syscall(_BPF_SYSCALL_NR, _BPF_MAP_LOOKUP_ELEM,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
         return bytearray(value_size)
@@ -264,7 +278,7 @@ def _bpf_map_write_blk(map_fd: int, blk: bytearray, index: int = 0) -> None:
         value  = ct.cast(val_buf, ct.c_void_p).value,
         flags  = _BPF_ANY,
     )
-    ret = _libc.syscall(_BPF_SYSCALL_NR, _BPF_MAP_UPDATE_ELEM,
+    ret = _get_libc().syscall(_BPF_SYSCALL_NR, _BPF_MAP_UPDATE_ELEM,
                         ct.byref(attr), ct.sizeof(attr))
     if ret != 0:
         e = ct.get_errno()

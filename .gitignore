@@ -27,3 +27,12 @@ experiments/kathara_germany50/lab/shared/
 # Generated AOT artefacts (gen_full_c.py writes both).
 ipa/poc_aot/nn_aot_arch.o
 ipa/poc_aot/loader_aot
+
+# The libbpf build of P2/P3: bcc_to_libbpf.py translates the .bpf.c from the
+# BCC sources, clang compiles it, and vmlinux.h comes from the running kernel's
+# BTF. All three are build output of one machine, not project source.
+ipa/poc_aot/ipa_template.bpf.c
+ipa/poc_aot/ipa_modular.bpf.c
+ipa/poc_aot/ipa_template.o
+ipa/poc_aot/ipa_modular.o
+ipa/poc_aot/vmlinux.h
