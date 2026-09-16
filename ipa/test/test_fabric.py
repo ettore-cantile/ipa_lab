@@ -117,7 +117,10 @@ def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30):
     import itertools
     found = {}
     for bits in itertools.product([0, 1], repeat=6):
-        for ttl in range(1, max_ttl + 1):
+        # From 2: ttl<=1 is never forwarded (a hop must not send a packet
+        # whose TTL would reach 0), so those inputs cannot be delivered
+        # whatever class the model picks.
+        for ttl in range(2, max_ttl + 1):
             cls = V.ref_infer(weights, scale, ttl, model_id,
                               ifindex=0, link_state=list(bits))[0]
             if cls not in found:
@@ -125,6 +128,25 @@ def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30):
             if len(found) == n_out:
                 return found
     return found
+
+def _counter_snapshot(m, n):
+    """Current values of a BPF_ARRAY, as a plain list."""
+    out = []
+    for i in range(n):
+        try:
+            v = m[ct.c_int(i)]
+        except Exception:
+            out.append(0)
+            continue
+        out.append(int(getattr(v, "value", v)))
+    return out
+
+
+def _delta(before, after):
+    """Indices whose counter moved, with how much."""
+    return {i: after[i] - before[i]
+            for i in range(min(len(before), len(after)))
+            if after[i] != before[i]}
 
 _MAC_NAME = {1: "mac_table", 2: "mac_table_t2", 3: "mac_table_t3"}
 _SETUP = {"hardcoded": "setup_hardcoded",
@@ -198,23 +220,56 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
                 exp_port = sem.port_of(exp_cls) if action == "FORWARD" else None
                 lsd = "".join(map(str, ls))
 
+                cls_before = _counter_snapshot(setup["cls_stats"], n_out)
+                pkt_before = _counter_snapshot(setup["pkt_stats"], 3)
+
                 frame = V.build_frame(0, ttl, scale)
                 got_port, data = fab.send_and_capture(frame, timeout=timeout,
                                                       match=_is_probe_frame)
 
+                cls_d = _delta(cls_before,
+                               _counter_snapshot(setup["cls_stats"], n_out))
+                pkt_d = _delta(pkt_before,
+                               _counter_snapshot(setup["pkt_stats"], 3))
+                chosen = max(cls_d, key=cls_d.get) if cls_d else None
+                pkt_names = {0: "HIT", 1: "MISS", 2: "DROP"}
+                why = ", ".join(f"{pkt_names.get(i, i)}+{v}"
+                                for i, v in sorted(pkt_d.items())) or "no counter moved"
+
+                # Question one, and the only one the class semantics answer:
+                # did the datapath DECIDE what the reference decided?
+                if chosen is not None and chosen != exp_cls:
+                    fail(f"link_state={lsd} ttl={ttl}: reference says class "
+                         f"{exp_cls}, datapath chose class {chosen} ({why})")
+                    continue
+                if chosen is None and action == "FORWARD":
+                    fail(f"link_state={lsd} ttl={ttl}: expected class "
+                         f"{exp_cls}, but the datapath recorded no class at "
+                         f"all ({why}) -- the program did not reach argmax")
+                    continue
+
                 if action != "FORWARD":
-                    if got_port is None:
-                        ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} is {action}"
-                           f" -- nothing left the node, as it should not")
+                    # "nothing arrived" is NOT evidence of a DROP: a lost
+                    # redirect, a filtered frame and a program that never ran
+                    # all look identical from out here. The counter is.
+                    if got_port is not None:
+                        fail(f"link_state={lsd} ttl={ttl}: class {exp_cls} is "
+                             f"{action} but a packet came out of port {got_port}")
+                    elif chosen == exp_cls:
+                        ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} "
+                           f"{action} recorded ({why}), nothing left the node")
                     else:
-                        fail(f"link_state={lsd} ttl={ttl}: class {exp_cls} is {action}"
-                             f" but a packet came out of port {got_port}")
+                        fail(f"link_state={lsd} ttl={ttl}: expected class "
+                             f"{exp_cls} ({action}), nothing left the node but "
+                             f"the datapath recorded {chosen} ({why})")
                     continue
 
                 if got_port is None:
-                    fail(f"link_state={lsd} ttl={ttl}: expected class {exp_cls} -> "
-                         f"port {exp_port} (ifindex {fab.ifindex_of[exp_port]}), "
-                         f"but nothing arrived within {timeout}s")
+                    fail(f"link_state={lsd} ttl={ttl}: datapath chose class "
+                         f"{exp_cls} -> port {exp_port} (ifindex "
+                         f"{fab.ifindex_of[exp_port]}) and counted {why}, but "
+                         f"nothing arrived within {timeout}s -- decided "
+                         f"correctly, did not deliver")
                 elif got_port != exp_port:
                     fail(f"link_state={lsd} ttl={ttl}: expected class {exp_cls} -> "
                          f"port {exp_port}, packet left by port {got_port}")
@@ -223,7 +278,7 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
                     dst = data[0:6].hex(":") if data else "?"
                     ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} -> port "
                        f"{exp_port} (ifindex {fab.ifindex_of[exp_port]}), "
-                       f"dst_mac={dst}")
+                       f"dst_mac={dst}, {why}")
 
             if delivered:
                 info(f"{delivered} packet(s) redirected and captured on a real "
@@ -261,7 +316,7 @@ def main():
     from model_meta import default_checkpoint
     model_path = a.model or default_checkpoint()
     methods = list(_SETUP) if a.method == "all" else [a.method]
-    ttl_range = range(1, a.ttl_max + 1)
+    ttl_range = range(2, a.ttl_max + 1)
 
     print(f"{YELLOW}{'=' * 64}{NC}")
     print(f"{YELLOW} fabric test -- real attach, real redirect, real capture{NC}")
