@@ -1294,19 +1294,20 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print("      dispatcher -> ... -> action) -- no leaf-priming shortcut.")
     print("      argmax -> mac_table[class] -> bpf_redirect.")
     print("      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.")
-    # Reference ingress_ifindex: under BPF_PROG_TEST_RUN, the sandbox's real
-    # default ctx->ingress_ifindex is 1 (empirically confirmed -- see
-    # TEST_RUN_DEFAULT_INGRESS_IFINDEX above and the multi-model diagnostics
-    # in verify_multi_model.py). P1 translates it through its OWN
-    # ifindex_table (default [2..7]), which does NOT map 1 -> _iface stays 0.
-    # P2/P3 clamp the raw value directly (1<=x<=6), so 1 DOES contribute an
-    # iface feature there. This only ever flips a close/tied argmax; the
-    # real trained 65-4-4-7 model isn't sensitive to it (class 0 dominates),
-    # which is why ifindex=0 "worked" here for years without anyone noticing.
-    ref_ifindex = 0 if pipeline == 1 else 1
+    # Reference ingress port. This used to read
+    #     ref_ifindex = 0 if pipeline == 1 else 1
+    # because the three pipelines disagreed: P1 translated the kernel ifindex
+    # through a compile-time table that did not map the sandbox's value, while
+    # P2/P3 used the raw ifindex directly and did. That asymmetry is gone --
+    # all three now resolve the kernel ifindex through the `ingress_port` map,
+    # and this runner installs no entry in it, so no logical port resolves and
+    # the ingress_iface one-hot is empty for every pipeline. The reference has
+    # to say the same, or the two disagree about a feature neither is using.
+    ref_ingress_port = 0
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
-        ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id, ifindex=ref_ifindex)
+        ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id,
+                                             ingress_port=ref_ingress_port)
         frame = build_frame(model_id, ttl, scale)
         _reset_stats(setup)
         # repeat=1: the program mutates the packet (TTL decrement) and
