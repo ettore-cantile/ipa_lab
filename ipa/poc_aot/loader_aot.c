@@ -28,6 +28,7 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <linux/bpf.h>
+#include <linux/if_link.h>   // XDP_FLAGS_* / XDP_ATTACHED_*
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

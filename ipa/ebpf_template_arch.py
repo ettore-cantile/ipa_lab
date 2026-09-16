@@ -948,6 +948,22 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     elif n_in is None:
         n_in = sum(f["size"] for f in features)
 
+    # Class semantics. Required, not derived: inferring DROP as n_out-1 is the
+    # assumption this parameter exists to remove. With no argument the shared
+    # resolver reads the descriptor and announces any fallback.
+    if semantics is None:
+        from model_meta import descriptor_semantics_or_reference
+        semantics = descriptor_semantics_or_reference(reference_widths()[1],
+                                                     "Pipeline2")
+    semantics.validate()
+
+
+    if semantics.n_out != reference_widths()[1]:
+        raise ValueError(
+            f"class semantics declare n_out={semantics.n_out} but the "
+            f"descriptor's output width is {reference_widths()[1]}. Descriptor "
+            f"and model must agree before either reaches the datapath.")
+
     n_weights = arch_weight_count(n_h1, n_h2, n_in, semantics.n_out)
     arch_id   = 0
     map_fd    = bpf_obj["arch_weights"].map_fd
@@ -985,15 +1001,6 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     expected = ct.c_int8(int(weights_int8[0])).value
     ok       = "OK" if v0 == expected else f"MISMATCH got={v0} expected={expected}"
     print(f"[Pipeline2] arch_weights[{weight_offset}] verify: {ok}")
-
-    # Class semantics. Required, not derived: inferring DROP as n_out-1 is the
-    # assumption this parameter exists to remove. With no argument the shared
-    # resolver reads the descriptor and announces any fallback.
-    if semantics is None:
-        from model_meta import descriptor_semantics_or_reference
-        semantics = descriptor_semantics_or_reference(reference_widths()[1],
-                                                     "Pipeline2")
-    semantics.validate()
 
     class ArchEntry(Structure):
         _pack_ = 1
