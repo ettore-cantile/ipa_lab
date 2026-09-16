@@ -71,5 +71,6 @@
     "max_failures": 10,
     "initial_ttl": 30
   },
-  "provenance": "class semantics declared from the training label mapping; n_out=7 keeps the checkpoint's output width, class 6 is declared UNUSED rather than repurposed as DROP"
+  "provenance": "class semantics declared from the training label mapping; n_out=7 keeps the checkpoint's output width, class 6 is declared UNUSED rather than repurposed as DROP",
+  "checkpoint": "frr_germany50_5_model_4x2.pt"
 }

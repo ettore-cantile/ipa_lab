@@ -14,10 +14,10 @@
 #   - /shared mounted on both nodes
 #
 # Usage:
-#   bash shared/test/test_kathara_send_recv.sh [N_PKTS] [METHOD] [MODEL_ID]
-#   bash shared/test/test_kathara_send_recv.sh 20 hardcoded 42
-#   bash shared/test/test_kathara_send_recv.sh 50 template  42
-#   bash shared/test/test_kathara_send_recv.sh 50 modular   42
+#   bash ipa/test/test_kathara_send_recv.sh [N_PKTS] [METHOD] [MODEL_ID]
+#   bash ipa/test/test_kathara_send_recv.sh 20 hardcoded 42
+#   bash ipa/test/test_kathara_send_recv.sh 50 template  42
+#   bash ipa/test/test_kathara_send_recv.sh 50 modular   42
 #
 # Default: 20 packets, hardcoded method, model_id=42
 # =============================================================================
@@ -98,7 +98,7 @@ echo ""
 # Step 4: send packets from darmstadt
 # ---------------------------------------------------------------------------
 echo "[Step 4] Sending ${N_PKTS} IPA packets from darmstadt..."
-kathara exec darmstadt -- python3 /shared/test/test_ipa.py \
+kathara exec darmstadt -- python3 /shared/test_ipa.py \
     --dest frankfurt \
     --count "${N_PKTS}" \
     --model-id "${MODEL_ID}" \

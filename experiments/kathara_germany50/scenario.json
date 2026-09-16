@@ -1,0 +1,33 @@
+{
+  "_comment": "Everything about THIS experiment that the core engine must not know. Read by genera_lab.py and by the traffic scripts; never imported by ipa/.",
+  "name": "kathara_germany50",
+  "backend": "kathara",
+
+  "topology": {
+    "source": "germany50.xml",
+    "format": "sndlib",
+    "url": "http://sndlib.zib.de/",
+    "routers": 50,
+    "links": 88
+  },
+
+  "hosts": {
+    "h_src": "karlsruhe",
+    "h_dst": "flensburg",
+    "_note": "Attaching h_src to karlsruhe makes it the unique degree-6 node, which is what fixes n_interfaces at 6. Change these and topology_config.json's n_interfaces may change with them."
+  },
+
+  "image": "kathara/frr_ebpf",
+  "routing": "frr-ospf",
+  "convergence_seconds": 90,
+
+  "traffic": {
+    "udp_port": 9999,
+    "default_sender": "darmstadt",
+    "default_receiver": "frankfurt",
+    "_note": "Defaults for the send/recv scripts only. No engine code reads these; they were hardcoded in recv_ipa.py's banner and in test_kathara_send_recv.sh."
+  },
+
+  "initial_ttl": 30,
+  "_initial_ttl_note": "The TTL the senders start from. It must equal the checkpoint's training initial_ttl (ipa/model_meta.json -> inputs.ttl.normalize_by), or the normalised TTL feature is fed a value outside the trained range."
+}

@@ -28,8 +28,9 @@ Two separate concerns:
     for the same feature type.
 
     Read from topology_config.json at runtime via load_topology_config().
-    Falls back to DEFAULT_TOPOLOGY_CONFIG (historical 6-interface / 52-node
-    topology) when the file is absent.
+    Resolved by load_topology_config(): $IPA_TOPOLOGY_CONFIG, then
+    /etc/ipa/topology_config.json, then the model descriptor's `trained_on`
+    block. There is deliberately no built-in default.
 
     Any n_interfaces / n_nodes / n_queues keys present in a model's
     model_meta.json are IGNORED when a topology_config is supplied — they
@@ -63,15 +64,31 @@ _SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 # Per-topology / per-network defaults.
 # Overridden at runtime by topology_config.json (see load_topology_config()).
 # ---------------------------------------------------------------------------
-DEFAULT_TOPOLOGY_CONFIG = {
-    "n_interfaces": 6,
-    "n_nodes": 52,
-    "n_queues": 4,
-}
+# NO built-in topology numbers.
+#
+# This used to be `DEFAULT_TOPOLOGY_CONFIG = {"n_interfaces": 6, "n_nodes": 52,
+# "n_queues": 4}` -- the Germany50 lab, written into the engine, silently used
+# by every caller that did not supply a config. Feature widths are a property
+# of the network a model was TRAINED on, so the engine cannot have a default
+# for them: any number it picks is a claim about someone else's network.
+#
+# Resolution order is now explicit, and exhausting it is an error, not a
+# fallback. See resolve_topology_config().
+# Every topology dimension the feature catalog can ask for. A config needs an
+# entry only for the dimensions its model's features actually use: the checked-in
+# model has no queue_occupancy feature, so demanding n_queues from it would be
+# demanding a number about a network property it never observes. A feature that
+# needs a missing key raises at the point of use, naming the key -- see
+# feature_size().
+TOPOLOGY_KEYS = ("n_interfaces", "n_nodes", "n_queues")
+TOPOLOGY_KEYS_REQUIRED = ("n_interfaces", "n_nodes")
+
+
+class ScenarioError(Exception):
+    """No usable topology configuration, or one that contradicts the model."""
+
 
 DEFAULT_META = {
-    "n_interfaces": 6,   # kept for backward compat with callers reading it directly
-    "n_nodes": 52,
     "hidden_dims": [4, 4],
     # Declared, not left to derive_shape's n_interfaces+1 fallback. The value
     # is the checked-in checkpoint's output width; 6 interfaces is the topology
@@ -83,6 +100,24 @@ DEFAULT_META = {
 # needs a bound; generous relative to a 65-input baseline).
 MAX_N_IN  = 128
 MAX_N_OUT = 32
+# Compiled ceilings for the dense per-slot features, mirroring IPA_MAX_IFACES /
+# IPA_MAX_QUEUES in the P2/P3 C templates. A scenario larger than these needs
+# both raised and the programs recompiled; check_topology_fits() says so rather
+# than letting the datapath read past the vector.
+MAX_N_IFACES = 8
+MAX_N_QUEUES = 8
+
+
+def check_topology_fits(topology_config: dict) -> None:
+    """Raise if the scenario exceeds what the datapath was compiled for."""
+    for key, ceiling, cdefine in (("n_interfaces", MAX_N_IFACES, "IPA_MAX_IFACES"),
+                                  ("n_queues", MAX_N_QUEUES, "IPA_MAX_QUEUES")):
+        if key in topology_config and int(topology_config[key]) > ceiling:
+            raise ScenarioError(
+                f"scenario has {key}={topology_config[key]}, above the compiled "
+                f"ceiling {ceiling}. Raise {cdefine} in ebpf_template_arch.py "
+                f"and ebpf_modular.py (and MAX_N_{key[2:].upper()} here), then "
+                f"recompile. The datapath vectors are sized by that define.")
 
 # ---------------------------------------------------------------------------
 # Feature catalog: the feature *types* the switch knows how to build locally.
@@ -197,23 +232,89 @@ def load_topology_config(path: str = "/etc/ipa/topology_config.json") -> dict:
     a link_state vector of size n_interfaces — unused slots are zero and
     their weights are folded away at compile time.
 
-    If the file does not exist the function returns DEFAULT_TOPOLOGY_CONFIG
-    (historical 6-interface / 52-node topology) so existing setups that
-    have no topology_config.json keep working unchanged.
+    Resolution order, highest first:
+
+      1. $IPA_TOPOLOGY_CONFIG           -- an explicit scenario file
+      2. `path` (default /etc/ipa/topology_config.json)  -- per-deployment
+      3. the model descriptor's `trained_on` block       -- see below
+      4. ScenarioError
+
+    A config states the dimensions its model's features need. `n_interfaces`
+    and `n_nodes` are required; `n_queues` only when a queue_occupancy feature
+    is present, and feature_size() raises if it is asked for and absent.
+
+    Step 3 matters and is not a fallback in disguise. The feature widths are
+    fixed by the TRAINING run: a model trained with a 6-slot link_state reads
+    6 columns of fc1 whatever network it is later deployed on. So the
+    descriptor is a legitimate source for them, and it is the source the
+    checked-in model uses (model_meta.json's `trained_on`).
+
+    What is gone is step 0: a `DEFAULT_TOPOLOGY_CONFIG` of {6, 52, 4} baked
+    into this module, applied silently whenever nothing else was supplied.
+    That made every caller that forgot a config quietly correct for Germany50
+    and quietly wrong everywhere else.
     """
+    env = os.environ.get("IPA_TOPOLOGY_CONFIG")
+    if env:
+        with open(env) as f:
+            cfg = json.load(f)
+        print(f"[topology_config] loaded from $IPA_TOPOLOGY_CONFIG={env}: {cfg}")
+        return _validated_topology(cfg, f"$IPA_TOPOLOGY_CONFIG={env}")
     if os.path.exists(path):
         with open(path) as f:
             cfg = json.load(f)
         print(f"[topology_config] loaded from {path}: {cfg}")
-        merged = dict(DEFAULT_TOPOLOGY_CONFIG)
-        merged.update(cfg)
-        return merged
-    else:
-        print(
-            f"[topology_config] {path} not found — "
-            f"using DEFAULT_TOPOLOGY_CONFIG: {DEFAULT_TOPOLOGY_CONFIG}"
-        )
-        return dict(DEFAULT_TOPOLOGY_CONFIG)
+        return _validated_topology(cfg, path)
+    cfg = _topology_from_descriptor()
+    if cfg is not None:
+        return cfg
+    raise ScenarioError(
+        "no topology configuration. The engine has no built-in one on "
+        "purpose -- feature widths belong to the network a model was trained "
+        "on. Supply one of:\n"
+        "  $IPA_TOPOLOGY_CONFIG=/path/to/topology_config.json\n"
+        f"  {path}\n"
+        "  a `trained_on` block in model_meta.json with "
+        f"{list(TOPOLOGY_KEYS)}")
+
+
+def _validated_topology(cfg: dict, origin: str) -> dict:
+    missing = [k for k in TOPOLOGY_KEYS_REQUIRED if k not in cfg]
+    if missing:
+        raise ScenarioError(
+            f"{origin}: topology config is missing {missing}. Each of "
+            f"{list(TOPOLOGY_KEYS_REQUIRED)} must be stated -- a missing one "
+            f"used to be filled from the Germany50 defaults.")
+    out = {k: int(cfg[k]) for k in TOPOLOGY_KEYS if k in cfg}
+    out["_origin"] = origin
+    for k, v in out.items():
+        if k != "_origin" and int(v) < 1:
+            raise ScenarioError(f"{origin}: {k}={v} must be >= 1")
+    return out
+
+
+def _topology_from_descriptor():
+    """Topology dimensions recorded in the model descriptor's `trained_on`."""
+    meta_path = os.path.join(_SHARED_DIR, "model_meta.json")
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+    except Exception as e:
+        print(f"[topology_config] {meta_path} unreadable ({e})")
+        return None
+    t = meta.get("trained_on") or {}
+    if not all(k in t for k in TOPOLOGY_KEYS_REQUIRED):
+        present = [k for k in TOPOLOGY_KEYS if k in t]
+        if present:
+            print(f"[topology_config] model_meta.json `trained_on` has only "
+                  f"{present}; {list(TOPOLOGY_KEYS_REQUIRED)} are required")
+        return None
+    cfg = _validated_topology(t, f"{meta_path} `trained_on`")
+    print(f"[topology_config] from the model descriptor's `trained_on` "
+          f"({meta.get('trained_on', {}).get('topology', 'unnamed')}): {cfg}")
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -254,15 +355,19 @@ def topology_config_for(meta: dict) -> dict:
     to derive_shape(meta, topology_config=...) directly.
 
     Priority (lowest to highest):
-      DEFAULT_TOPOLOGY_CONFIG
+      load_topology_config()  -- env / deployment file / descriptor
       <- top-level n_interfaces / n_nodes / n_queues keys in meta
       <- meta["topology_config"] sub-dict
+
+    The base used to be the module's Germany50 constants; it is now whatever
+    the scenario resolution finds, so a meta dict that overrides nothing gets
+    the scenario's numbers rather than someone else's network's.
     """
-    cfg = dict(DEFAULT_TOPOLOGY_CONFIG)
-    for k in ("n_interfaces", "n_nodes", "n_queues"):
+    cfg = dict(load_topology_config())
+    for k in TOPOLOGY_KEYS:
         if k in meta:
-            cfg[k] = meta[k]
-    cfg.update(meta.get("topology_config", {}))
+            cfg[k] = int(meta[k])
+    cfg.update({k: int(v) for k, v in meta.get("topology_config", {}).items()})
     return cfg
 
 
@@ -279,7 +384,14 @@ def feature_size(feature_type: str, topology_config: dict) -> int:
     entry = FEATURE_CATALOG[feature_type]
     if "dim" in entry:
         return int(entry["dim"])
-    return int(topology_config[entry["dim_key"]])
+    key = entry["dim_key"]
+    if key not in topology_config:
+        raise ScenarioError(
+            f"feature {feature_type!r} needs topology dimension {key!r}, which "
+            f"the scenario ({topology_config.get('_origin', 'unknown source')}) "
+            f"does not declare. Add it there -- it used to be silently filled "
+            f"from the Germany50 defaults.")
+    return int(topology_config[key])
 
 
 def _validate_feature_types(types: list) -> None:
@@ -534,3 +646,30 @@ def descriptor_semantics_or_reference(n_out: int, who: str):
           f"`semantics=`.")
     return ClassSemantics.forward_then_drop(n_out - 1, drop_class=n_out - 1,
                                             n_out=n_out)
+
+
+def default_checkpoint() -> str:
+    """Path of the .pt this repo is configured for.
+
+    $IPA_CHECKPOINT, then model_meta.json's `checkpoint` key, then the single
+    .pt next to the descriptor. The filename used to be the literal
+    'frr_germany50_5_model_4x2.pt', repeated in nine places -- a model name is
+    data, and one scenario's data at that.
+    """
+    env = os.environ.get("IPA_CHECKPOINT")
+    if env:
+        return env
+    try:
+        with open(os.path.join(_SHARED_DIR, "model_meta.json")) as f:
+            ck = json.load(f).get("checkpoint")
+        if ck:
+            return ck if os.path.isabs(ck) else os.path.join(_SHARED_DIR, ck)
+    except Exception:
+        pass
+    import glob
+    pts = sorted(glob.glob(os.path.join(_SHARED_DIR, "*.pt")))
+    if len(pts) == 1:
+        return pts[0]
+    raise ScenarioError(
+        f"cannot pick a checkpoint: {len(pts)} .pt files in {_SHARED_DIR}. "
+        f"Set $IPA_CHECKPOINT or add a `checkpoint` key to model_meta.json.")

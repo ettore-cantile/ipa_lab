@@ -45,8 +45,21 @@ LINK_STATE_MAP = "link_state"
 # The vector width must stay at the trained value or the fc1 column offsets
 # desync from the weights; see model_meta.derive_shape /
 # verify_shape_vs_checkpoint.
-N_EGRESS = 6
-DEFAULT_IFACES = [f"eth{i}" for i in range(N_EGRESS)]
+def n_egress() -> int:
+    """Number of link_state slots: the MODEL's feature width.
+
+    Was `N_EGRESS = 6`, a module constant -- the Germany50 lab's largest node
+    degree, frozen at import time and then used as the loop bound, the CLI
+    default and the map width. Resolved from the scenario now; the value is
+    still the network's maximum interface count, not this node's degree, since
+    it has to match the columns fc1 was trained with.
+    """
+    import model_meta as _mm
+    return int(_mm.load_topology_config()["n_interfaces"])
+
+
+def default_ifaces() -> list:
+    return [f"eth{i}" for i in range(n_egress())]
 
 
 def iface_exists(iface: str) -> bool:
@@ -93,10 +106,11 @@ def _write_vector(bpf_obj, values) -> None:
 
 
 def _slot_names(ifaces=None) -> list:
-    """Resolve the slot -> interface-name mapping, padded to N_EGRESS with the
+    """Resolve the slot -> interface-name mapping, padded to n_egress() with the
     eth<i> convention so a caller passing FEWER names cannot IndexError."""
-    ifaces = list(ifaces or DEFAULT_IFACES)
-    return [ifaces[i] if i < len(ifaces) else f"eth{i}" for i in range(N_EGRESS)]
+    n = n_egress()
+    ifaces = list(ifaces or default_ifaces())
+    return [ifaces[i] if i < len(ifaces) else f"eth{i}" for i in range(n)]
 
 
 def init_link_state_up(bpf_obj, ifaces=None) -> list:
@@ -120,7 +134,7 @@ def init_link_state_up(bpf_obj, ifaces=None) -> list:
 
 def update_link_state(bpf_obj, ifaces=None, verbose: bool = False) -> list:
     """Read the carrier of each egress iface and write it into the map.
-    Returns the list of N_EGRESS states written (for logging/inspection)."""
+    Returns the list of n_egress() states written (for logging/inspection)."""
     names = _slot_names(ifaces)
     states = []
     for i, name in enumerate(names):
@@ -144,7 +158,7 @@ def monitor_loop(bpf_obj, ifaces=None, interval: float = 0.5,
     absent = [n for n, p in zip(names, present) if not p]
     if absent:
         # Say this once, up front, instead of listing these slots as "down"
-        # every poll. The checkpoint reserves N_EGRESS=6 link_state columns
+        # every poll. The checkpoint reserves n_egress() link_state columns
         # because the network's largest node has degree 6; this node has fewer
         # interfaces than that, so the extra slots have nothing behind them.
         # They are not links that failed.
@@ -186,11 +200,12 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(
         description="Dry-run: print egress carrier states (no BPF map write)")
-    p.add_argument("--ifaces", nargs="+", default=DEFAULT_IFACES,
-                   help=f"egress interfaces, slot 0..{N_EGRESS - 1} "
-                        f"(default eth0..eth{N_EGRESS - 1})")
+    _n = n_egress()
+    p.add_argument("--ifaces", nargs="+", default=default_ifaces(),
+                   help=f"egress interfaces, slot 0..{_n - 1} "
+                        f"(default eth0..eth{_n - 1})")
     args = p.parse_args()
-    print(f"Egress link carrier state over {N_EGRESS} model slots "
+    print(f"Egress link carrier state over {n_egress()} model slots "
           f"(1=up, 0=down/absent):")
     for i, name in enumerate(_slot_names(args.ifaces)):
         note = "" if iface_exists(name) else "   <- no such interface on this node"

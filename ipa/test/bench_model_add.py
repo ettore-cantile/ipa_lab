@@ -15,8 +15,8 @@ covered by verify_prog_run.py / test_suite.py --only kernel:
 Needs Linux + BCC + root (loads real XDP programs, never attaches them).
 
 Usage:
-    sudo python3 shared/test/bench_model_add.py
-    sudo python3 shared/test/bench_model_add.py --n-models 3 --model /shared/frr_germany50_5_model_4x2.pt
+    sudo python3 ipa/test/bench_model_add.py
+    sudo python3 ipa/test/bench_model_add.py --n-models 3 --model /shared/<checkpoint>.pt
     kathara exec frankfurt -- python3 /shared/test/bench_model_add.py
 """
 import os
@@ -26,7 +26,7 @@ import argparse
 import statistics
 import ctypes as ct
 
-# Lives in shared/test/; pipeline modules (ebpf_program, ebpf_template_arch,
+# Lives in ipa/test/; pipeline modules (ebpf_program, ebpf_template_arch,
 # ebpf_modular, verify_prog_run) and the .pt data file live one level up
 # in shared/, so both directories are added to sys.path.
 _TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +36,8 @@ for _dir in (SHARED_DIR, _TEST_DIR):
         sys.path.insert(0, _dir)
 os.chdir(SHARED_DIR)
 
-MODEL_PT = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
+from model_meta import default_checkpoint
+MODEL_PT = default_checkpoint()
 
 
 def _stats(times):

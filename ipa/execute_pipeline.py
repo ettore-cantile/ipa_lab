@@ -17,13 +17,14 @@ Single entry point for all three design-space pipelines:
                         maximum runtime flexibility)
 
 Usage:
-    sudo python3 shared/execute_pipeline.py --method hardcoded [--iface eth0] [--model-id 0]
-    sudo python3 shared/execute_pipeline.py --method template  [--iface eth0] [--model-id 0]
-    sudo python3 shared/execute_pipeline.py --method modular   [--iface eth0] [--model-id 0]
+    sudo python3 ipa/execute_pipeline.py --method hardcoded [--iface eth0] [--model-id 0]
+    sudo python3 ipa/execute_pipeline.py --method template  [--iface eth0] [--model-id 0]
+    sudo python3 ipa/execute_pipeline.py --method modular   [--iface eth0] [--model-id 0]
 
 Notes:
     - Requires root (XDP attach).
-    - The .pt model must be at shared/frr_germany50_5_model_4x2.pt
+    - The .pt model is resolved by model_meta.default_checkpoint()
+      ($IPA_CHECKPOINT, then model_meta.json's `checkpoint` key)
     - extract_weights.py requires torch; it is skipped if weights.json exists.
 """
 
@@ -54,7 +55,7 @@ Pipeline trade-off summary:
   modular   : lower performance   | maximum flexibility | PERCPU_ARRAY + N tail calls
 
 For the full metric comparison across pipelines:
-  sudo python3 shared/test/test_suite.py --only kernel
+  sudo python3 ipa/test/test_suite.py --only kernel
         """
     )
     parser.add_argument(
@@ -86,7 +87,7 @@ For the full metric comparison across pipelines:
     parser.add_argument(
         "--model",
         default=None,
-        help="Path to .pt checkpoint (default: shared/frr_germany50_5_model_4x2.pt)"
+        help="Path to .pt checkpoint (default: model_meta.default_checkpoint())"
     )
     parser.add_argument(
         "--verify-only",
@@ -95,9 +96,8 @@ For the full metric comparison across pipelines:
     )
     args = parser.parse_args()
 
-    model_path = args.model or os.path.join(
-        SHARED_DIR, "frr_germany50_5_model_4x2.pt"
-    )
+    from model_meta import default_checkpoint
+    model_path = args.model or default_checkpoint()
 
     # ------------------------------------------------------------------
     # Step 1: extract weights (produces weights.json + weights_float.json)

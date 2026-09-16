@@ -5,8 +5,12 @@ Tre pipeline (P1 hardcoded, P2 template, P3 modular) verificate su due piani:
 - **userspace** (numerico, PyTorch/NumPy) — accuratezza, quantizzazione, robustezza, struttura;
 - **kernel** (`BPF_PROG_TEST_RUN` sui programmi XDP reali) — istruzioni eBPF, latenza (min/p50/max/spread), throughput, memoria mappe + dispatch reale.
 
-Tutto è raccolto in un unico script: `shared/test/test_suite.py`. Tutti gli script di test
-(compreso `bench_model_add.py`, vedi §6) vivono ora sotto `shared/test/`.
+Tutto è raccolto in un unico script: `ipa/test/test_suite.py`. Tutti gli script di test
+(compreso `bench_model_add.py`, vedi §6) vivono sotto `ipa/test/`.
+
+**Nota sul layout.** Il motore sta in `ipa/`; lo scenario Kathara/Germany50 sta in
+`experiments/kathara_germany50/`. I comandi `kathara exec ... /shared/...` restano validi perché
+`make_lab.py` copia `ipa/` dentro `lab/shared/`, che è ciò che Kathara monta su `/shared`.
 
 ---
 
@@ -16,18 +20,18 @@ Richiede solo `torch` + `numpy`. Girano ovunque (anche fuori da Kathara).
 
 ```bash
 # Tutte le suite (la suite kernel viene saltata se non c'è BCC/root)
-python3 shared/test/test_suite.py
+python3 ipa/test/test_suite.py
 
 # Una singola suite
-python3 shared/test/test_suite.py --only core       # struttura design-space + update latency
-python3 shared/test/test_suite.py --only quant       # accuratezza argmax vs scale_factor
-python3 shared/test/test_suite.py --only pktstats    # HIT/FAKE/MISS per pipeline
-python3 shared/test/test_suite.py --only extract     # coerenza pesi / weights.json / dequant
-python3 shared/test/test_suite.py --only robust      # input anomali, nessun crash
+python3 ipa/test/test_suite.py --only core       # struttura design-space + update latency
+python3 ipa/test/test_suite.py --only quant       # accuratezza argmax vs scale_factor
+python3 ipa/test/test_suite.py --only pktstats    # HIT/FAKE/MISS per pipeline
+python3 ipa/test/test_suite.py --only extract     # coerenza pesi / weights.json / dequant
+python3 ipa/test/test_suite.py --only robust      # input anomali, nessun crash
 
 # Opzioni
-python3 shared/test/test_suite.py --only quant --samples 500
-python3 shared/test/test_suite.py --model shared/frr_germany50_5_model_4x2.pt --verbose
+python3 ipa/test/test_suite.py --only quant --samples 500
+python3 ipa/test/test_suite.py --model ipa/frr_germany50_5_model_4x2.pt --verbose
 ```
 
 ---
@@ -41,19 +45,19 @@ riferimento — utile per capire quanto costa davvero l'inferenza rispetto al so
 
 ```bash
 # Su host Linux con BCC installato
-sudo python3 shared/test/test_suite.py --only kernel
+sudo python3 ipa/test/test_suite.py --only kernel
 
 # Dentro Kathara (nodo frankfurt)
 kathara exec frankfurt -- python3 /shared/test/test_suite.py --only kernel
 
 # Solo metriche, senza il gate di dispatch
-sudo python3 shared/test/test_suite.py --only kernel --no-verify
+sudo python3 ipa/test/test_suite.py --only kernel --no-verify
 
 # Più ripetizioni per una latenza più stabile (per-trial repeat)
-sudo python3 shared/test/test_suite.py --only kernel --kernel-repeat 200000
+sudo python3 ipa/test/test_suite.py --only kernel --kernel-repeat 200000
 
 # Più trial indipendenti (default 7) se il risultato è ancora volatile
-sudo python3 shared/test/test_suite.py --only kernel --kernel-trials 15
+sudo python3 ipa/test/test_suite.py --only kernel --kernel-trials 15
 ```
 
 **Volatilità corretta**: la tabella misurava latenza/throughput con un **singolo** campione
@@ -112,13 +116,19 @@ kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method modul
 ## 3. Avvio del lab Kathara
 
 ```bash
-# dalla root del repo
+cd experiments/kathara_germany50
+python3 genera_lab.py          # genera lab/lab.conf + lab/<node>.startup
+python3 make_lab.py            # assembla lab/shared/ copiandolo da ../../ipa
+cd lab
 kathara lstart                 # avvia tutti i nodi (germany50)
 kathara linfo                  # stato dei nodi
 kathara lclean                 # ferma e pulisce il lab
 ```
 
-Ogni nodo esegue `shared/fix_bpf.sh` al boot (monta debugfs, abilita ip_forward, FRR/OSPF).
+Il lab non è più committato nella root: `lab/` è output rigenerabile. Modifica il
+motore in `ipa/`, mai in `lab/shared/` — il `make_lab.py` successivo lo sovrascrive.
+
+Ogni nodo esegue `/shared/fix_bpf.sh` al boot (copiato da `experiments/kathara_germany50/host_setup/` da `make_lab.py`) (monta debugfs, abilita ip_forward, FRR/OSPF).
 
 ---
 
@@ -159,7 +169,7 @@ sul nodo datapath, che non ha bisogno di clang/cc/libbpf.
 
 ```bash
 # bench (deploy-cost + perf, via BPF_PROG_TEST_RUN) -- richiede root sull'host
-sudo python3 shared/methods/method4_hardcoded_aot.py
+sudo python3 ipa/methods/method4_hardcoded_aot.py
 # deploy LIVE su Kathara (via execute_pipeline, backend AOT di default):
 kathara exec frankfurt -- ip link set dev eth1 xdp off
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
@@ -182,10 +192,10 @@ build non richiede root; solo l'attach XDP finale lo richiede):
 ```bash
 # dev-lib per il link statico (una volta):
 sudo apt-get install -y libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
-python3 shared/methods/method4_hardcoded_aot.py   # sull'host, non via kathara exec
+python3 ipa/methods/method4_hardcoded_aot.py   # sull'host, non via kathara exec
 ```
 Il binario è linkato **staticamente** (niente `libbpf.so` richiesto a runtime) e vive in
-`shared/poc_aot/loader_aot` — poiché `shared/` è montato via bind mount in ogni nodo
+`ipa/poc_aot/loader_aot` — poiché `lab/shared/` è montato via bind mount in ogni nodo
 Kathara, una volta costruito sull'host è **immediatamente visibile** su tutti i nodi,
 nessuna copia manuale.
 
@@ -195,7 +205,7 @@ Note pratiche emerse costruendolo davvero:
   anche `libzstd` e `liblzma`. Lo script prova prima la riga a 3 librerie, poi quella a 5
   (con `zstd`/`lzma`); su Ubuntu recente serve la seconda. Se fallisce stampa l'errore
   `ld` completo per capire quale `.a` manca.
-- I file generati sotto `shared/poc_aot/` (`nn_aot_arch.bpf.c`, `.o`, `loader_aot`) prendono
+- I file generati sotto `ipa/poc_aot/` (`nn_aot_arch.bpf.c`, `.o`, `loader_aot`) prendono
   il proprietario dell'utente che li crea: se un run precedente è stato fatto con `sudo`/
   `kathara exec` (root), un run successivo come utente normale fallisce con
   `PermissionError`. Rimedio: `sudo chown -R $USER:$USER ~/percorso/ipa_lab`.
@@ -229,10 +239,10 @@ kathara exec frankfurt -- python3 /shared/recv_ipa.py --timeout 30 --port 9999
 
 # sender da darmstadt
 kathara exec darmstadt -- python3 /shared/send_ipa.py
-kathara exec darmstadt -- python3 /shared/test/test_ipa.py --dest frankfurt --count 100 --model-id 0
+kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 100 --model-id 0
 
 # traffico multi-modello (round-robin), per esercitare il dispatch multi-model_id di P2/P3
-kathara exec darmstadt -- python3 /shared/test/test_ipa.py --dest frankfurt --count 90 --model-ids 42 43 44
+kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 90 --model-ids 42 43 44
 ```
 
 ---
@@ -244,7 +254,7 @@ nuovo `model_id` a runtime in ciascuna pipeline — sfrutta il multi-model conco
 (più `model_id` nella stessa run, blocchi di pesi non sovrapposti in `arch_weights`/`layer_weights`).
 
 ```bash
-sudo python3 shared/test/bench_model_add.py --n-models 3
+sudo python3 ipa/test/bench_model_add.py --n-models 3
 kathara exec frankfurt -- python3 /shared/test/bench_model_add.py --n-models 3
 ```
 
@@ -262,9 +272,9 @@ fisso a 2). Domanda del relatore: a parità di budget-pesi, conviene allargare u
 aggiungerne uno nuovo? Script dedicato:
 
 ```bash
-sudo python3 shared/test/bench_depth_vs_width.py                      # tutti e 4 i descrittori
-sudo python3 shared/test/bench_depth_vs_width.py --descriptor no_onehot
-sudo python3 shared/test/bench_depth_vs_width.py --repeat 5000        # più stabile, più lento
+sudo python3 ipa/test/bench_depth_vs_width.py                      # tutti e 4 i descrittori
+sudo python3 ipa/test/bench_depth_vs_width.py --descriptor no_onehot
+sudo python3 ipa/test/bench_depth_vs_width.py --repeat 5000        # più stabile, più lento
 ```
 
 **Metodologia** (vedi il file per il codice completo):
@@ -318,8 +328,8 @@ in sez. 7-8 sotto) elenca il tail-call come una delle tre componenti di costo
 separabili — mancava una misura dedicata.
 
 ```bash
-sudo python3 shared/test/bench_tailcall_overhead.py
-sudo python3 shared/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
+sudo python3 ipa/test/bench_tailcall_overhead.py
+sudo python3 ipa/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
 ```
 
 Confronta due varianti minime, **stesso parse, stessa azione di redirect**,
@@ -347,7 +357,7 @@ larghezza arbitrarie". Ora `suite_kernel()` chiama anche `verify_alt_architectur
 
 Nessun comando nuovo — è già dentro:
 ```bash
-sudo python3 shared/test/test_suite.py --only kernel
+sudo python3 ipa/test/test_suite.py --only kernel
 ```
 
 ---

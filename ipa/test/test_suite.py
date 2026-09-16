@@ -24,10 +24,10 @@ Available suites (--only):
   all      : every suite (default)
 
 Usage:
-  python3 shared/test/test_suite.py                       # every suite (kernel skipped without BCC)
-  python3 shared/test/test_suite.py --only core --verbose
-  python3 shared/test/test_suite.py --only quant --samples 200
-  sudo python3 shared/test/test_suite.py --only kernel    # kernel metrics (root)
+  python3 ipa/test/test_suite.py                       # every suite (kernel skipped without BCC)
+  python3 ipa/test/test_suite.py --only core --verbose
+  python3 ipa/test/test_suite.py --only quant --samples 200
+  sudo python3 ipa/test/test_suite.py --only kernel    # kernel metrics (root)
   kathara exec frankfurt -- python3 /shared/test/test_suite.py --only kernel
 """
 
@@ -36,7 +36,7 @@ import time
 import sys
 import os
 
-# Lives in shared/test/; pipeline modules (ebpf_program, extract_weights, ...)
+# Lives in ipa/test/; pipeline modules (ebpf_program, extract_weights, ...)
 # and the .pt/.json data files live one level up in shared/.
 _TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
 SHARED_DIR = os.path.dirname(_TEST_DIR)
@@ -1440,6 +1440,9 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
     iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
     ifindex_table = list(range(2, 2 + max(iface_size, 1)))
 
+    # link_state width from the resolved descriptor, not a literal 6.
+    _ls_size = next((f["size"] for f in features if f["type"] == "link_state"), 0)
+
     def n_weights(dims):
         sizes = [n_in] + list(dims) + [n_out]
         return sum(sizes[i - 1] * sizes[i] + sizes[i] for i in range(1, len(sizes)))
@@ -1465,7 +1468,7 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
             all_ok = False
             continue
         b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
-        write_vector_map(b, "link_state", [1] * 6)
+        write_vector_map(b, "link_state", [1] * _ls_size)
         V._install_mac_table(b, "mac_table", semantics=alt_sem)
         ps, cs = b["pkt_stats"], b["cls_stats"]
 
@@ -1474,7 +1477,7 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
         for ttl in range(ttl_min, ttl_max + 1):
             ref_cls, ref_val = V.ref_infer_sparse(
                 weights, features, dims, n_out, ttl, model_id=0,
-                map_values={"link_state": [1] * 6},
+                map_values={"link_state": [1] * _ls_size},
                 ifindex=V.TEST_RUN_DEFAULT_INGRESS_IFINDEX,
                 ifindex_table=ifindex_table, scale=scale)
             frame = V.build_frame_sparse(model_id=0, ttl=ttl, scale=scale, n_in=n_in, n_out=n_out)
@@ -1534,7 +1537,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
     if not sys.platform.startswith("linux"):
         info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
-        info("Run in Kathara / a Linux host: sudo python3 shared/test_suite.py --only kernel")
+        info("Run in Kathara / a Linux host: sudo python3 ipa/test_suite.py --only kernel")
         return True
     try:
         import verify_prog_run as V
@@ -1778,26 +1781,9 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
 
 
 def default_checkpoint() -> str:
-    """Path of the checkpoint the suites run, from the config, not a literal.
-
-    IPA_CHECKPOINT overrides it; otherwise model_meta.json's `checkpoint` key;
-    otherwise the single .pt next to the descriptor. The filename used to be
-    the literal 'frr_germany50_5_model_4x2.pt' in five places.
-    """
-    env = os.environ.get("IPA_CHECKPOINT")
-    if env:
-        return env
-    try:
-        import model_meta as _mm
-        meta = _mm.load_model_meta(os.path.join(SHARED_DIR, "weights.json"))
-        if meta.get("checkpoint"):
-            cand = meta["checkpoint"]
-            return cand if os.path.isabs(cand) else os.path.join(SHARED_DIR, cand)
-    except Exception:
-        pass
-    import glob as _glob
-    pts = sorted(_glob.glob(os.path.join(SHARED_DIR, "*.pt")))
-    return pts[0] if pts else os.path.join(SHARED_DIR, "model.pt")
+    """The checkpoint the suites run, resolved by model_meta."""
+    import model_meta as _mm
+    return _mm.default_checkpoint()
 
 
 def _load_default_model(model_arg):

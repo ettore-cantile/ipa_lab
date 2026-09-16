@@ -2,12 +2,12 @@
 """
 make_scenario.py -- generate a synthetic scenario's artefacts.
 
-    python3 shared/synth/make_scenario.py --preset ipa_like
-    python3 shared/synth/make_scenario.py --preset all -n 1000
-    python3 shared/synth/make_scenario.py --n-in-features 6,6,1,52 --n-out 7 \
+    python3 ipa/synth/make_scenario.py --preset ipa_like
+    python3 ipa/synth/make_scenario.py --preset all -n 1000
+    python3 ipa/synth/make_scenario.py --n-in-features 6,6,1,52 --n-out 7 \
                                           --hidden 4,4 --seed 42
 
-Writes into shared/synth/scenarios/<name>/ by default, reusing the repo's
+Writes into ipa/synth/scenarios/<name>/ by default, reusing the repo's
 existing artefact names so every loader in the tree consumes them unchanged.
 """
 

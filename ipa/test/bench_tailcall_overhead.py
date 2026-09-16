@@ -20,8 +20,8 @@ ever slows a trial down), so MIN across TRIALS independent measurements is
 reported, with median/max for context.
 
 Run on Linux (Kathara or bare VM) with bcc installed:
-    sudo python3 shared/test/bench_tailcall_overhead.py
-    sudo python3 shared/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
+    sudo python3 ipa/test/bench_tailcall_overhead.py
+    sudo python3 ipa/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
 """
 import os
 import sys
@@ -54,7 +54,8 @@ def main():
     ap = argparse.ArgumentParser(description="Isolate pure bpf_tail_call overhead")
     ap.add_argument("--repeat", type=int, default=2000)
     ap.add_argument("--trials", type=int, default=7)
-    ap.add_argument("--model", default=os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt"))
+    from model_meta import default_checkpoint
+    ap.add_argument("--model", default=default_checkpoint())
     ap.add_argument("--model-id", type=int, default=0)
     ap.add_argument("--ttl", type=int, default=42)
     ap.add_argument("--scale", type=int, default=128)

@@ -12,12 +12,12 @@ suite — only to compile-and-verify the generated C offline.
 Topology dimensions (n_interfaces, n_nodes, n_queues) are read from
 topology_config.json — a file that describes the NETWORK TOPOLOGY shared
 by all nodes in the same deployment, not a per-node property. If the file
-does not exist the code falls back to DEFAULT_TOPOLOGY_CONFIG (historical
-6/52 defaults).
+does not exist the code falls back to the model descriptor's `trained_on`
+block; there is no built-in topology).
 
 Usage:
-    sudo python3 shared/methods/method4_hardcoded.py --verify-only \\
-        --model shared/frr_germany50_5_model_4x2.pt \\
+    sudo python3 ipa/methods/method4_hardcoded.py --verify-only \\
+        --model ipa/<checkpoint>.pt \\
         --topology-config /etc/ipa/topology_config.json
 """
 
@@ -43,7 +43,7 @@ def _build_parser():
     ap = argparse.ArgumentParser(
         description="Pipeline 1 — Hardcoded Model (BCC literal path)"
     )
-    ap.add_argument("--model", default="shared/frr_germany50_5_model_4x2.pt",
+    ap.add_argument("--model", default=None,
                     help="Path to the .pt checkpoint")
     ap.add_argument(
         "--topology-config",

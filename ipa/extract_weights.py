@@ -22,10 +22,18 @@ Fallback (no torch):
 import json
 import os
 
-# Architecture constants matching frr_germany50_5_model_4x2.pt
-N_INTERFACES = 6
-N_NODES      = 52
+# Architecture of the checkpoint being extracted.
+#
+# N_INTERFACES and N_NODES were literals 6 and 52 here -- the Germany50 lab's
+# dimensions, restated in a third place. They are scenario properties, so they
+# are read from the scenario; only HIDDEN_DIM stays, because the hidden width
+# is a property of the trained model and nothing else knows it.
 HIDDEN_DIM   = 4
+
+
+def _topology():
+    import model_meta as _mm
+    return _mm.load_topology_config()
 # fc1(65*4+4=264) + fc2(4*4+4=20) + out(4*7+7=35) = 319 weights
 
 SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +55,7 @@ def _load_from_json(json_path: str) -> list:
 
 
 def extract_weights_int8(
-    model_path: str = "frr_germany50_5_model_4x2.pt",
+    model_path: str = None,
     n_interfaces: int = None,
     n_nodes: int = None,
     hidden_dim: int = None,
@@ -56,7 +64,7 @@ def extract_weights_int8(
     Return a flat list of int8 weights for the FRR model.
 
     n_interfaces/n_nodes/hidden_dim override the module defaults
-    (N_INTERFACES/N_NODES/HIDDEN_DIM) -- pass a model's resolved shape
+    (the scenario's n_interfaces/n_nodes + HIDDEN_DIM) -- pass a resolved shape
     (see shared/model_meta.py derive_shape()) to extract weights for a
     topology other than the one checked-in 6/52/4 checkpoint. None means
     "use the module default", so existing callers are unaffected.
@@ -70,10 +78,16 @@ def extract_weights_int8(
         list of int in [-128, 127], length depends on shape (319 for the
         default 65-4-4-7 topology)
     """
-    n_interfaces = N_INTERFACES if n_interfaces is None else n_interfaces
-    n_nodes      = N_NODES if n_nodes is None else n_nodes
+    _t = _topology() if (n_interfaces is None or n_nodes is None) else {}
+    n_interfaces = _t["n_interfaces"] if n_interfaces is None else n_interfaces
+    n_nodes      = _t["n_nodes"]      if n_nodes      is None else n_nodes
     hidden_dim   = HIDDEN_DIM if hidden_dim is None else hidden_dim
 
+    # model_path=None means "the configured checkpoint" (was the literal
+    # frr_germany50_5_model_4x2.pt as a default argument).
+    if model_path is None:
+        import model_meta as _mm
+        model_path = _mm.default_checkpoint()
     # Resolve model path relative to this file if not absolute
     if not os.path.isabs(model_path):
         candidate = os.path.join(SHARED_DIR, model_path)
@@ -156,12 +170,35 @@ if __name__ == "__main__":
         print("Run this script on the host (not inside Kathara) where torch is installed.")
         raise SystemExit(1)
 
-    MODEL_PATH = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
-    print("Extracting weights from PyTorch model...")
+    # Checkpoint path: $IPA_CHECKPOINT, then the descriptor's `checkpoint` key,
+    # then the single .pt next to this file. Was the literal filename.
+    _env = os.environ.get("IPA_CHECKPOINT")
+    if _env:
+        MODEL_PATH = _env
+    else:
+        import glob as _glob
+        try:
+            import model_meta as _mm
+            _ck = _mm.load_model_meta(os.path.join(SHARED_DIR, "weights.json")).get("checkpoint")
+        except Exception:
+            _ck = None
+        if _ck:
+            MODEL_PATH = _ck if os.path.isabs(_ck) else os.path.join(SHARED_DIR, _ck)
+        else:
+            _pts = sorted(_glob.glob(os.path.join(SHARED_DIR, "*.pt")))
+            if len(_pts) != 1:
+                raise SystemExit(
+                    f"cannot pick a checkpoint: {len(_pts)} .pt files in "
+                    f"{SHARED_DIR}. Set $IPA_CHECKPOINT or add a `checkpoint` "
+                    f"key to model_meta.json.")
+            MODEL_PATH = _pts[0]
+    _TOPO = _topology()
+    print(f"Extracting weights from {MODEL_PATH} ...")
+    print(f"  topology: n_interfaces={_TOPO['n_interfaces']} n_nodes={_TOPO['n_nodes']}")
 
     model = FastRerouteMLP(
-        n_interfaces=N_INTERFACES,
-        n_nodes=N_NODES,
+        n_interfaces=_TOPO["n_interfaces"],
+        n_nodes=_TOPO["n_nodes"],
         hidden_dim=HIDDEN_DIM
     )
     model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
@@ -206,8 +243,8 @@ if __name__ == "__main__":
         with open(_meta_path) as f:
             model_meta = json.load(f)
     model_meta.update({
-        "n_interfaces": N_INTERFACES,
-        "n_nodes": N_NODES,
+        "n_interfaces": _TOPO["n_interfaces"],
+        "n_nodes": _TOPO["n_nodes"],
         "hidden_dims": [HIDDEN_DIM, HIDDEN_DIM],
         "n_out": int(model.out.out_features),
     })

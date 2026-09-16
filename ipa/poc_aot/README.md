@@ -31,14 +31,14 @@ apples-to-apples with `test_suite --kernel` hardcoded.
 | `loader_aot.c` | libbpf loader: times the runtime open+load (deploy cost), populates `model_progs`, seeds `link_state`/`mac_table`, and `BPF_PROG_TEST_RUN`s the dispatcher (perf) |
 | `Makefile` | compiles the `.bpf.c` **once** and builds the loader |
 
-Usually you don't run these by hand — `shared/methods/method4_hardcoded_aot.py`
+Usually you don't run these by hand — `ipa/methods/method4_hardcoded_aot.py`
 orchestrates generate → clang → loader and prints the comparison vs BCC.
 
 ## Run (on the Linux host / Kathara — needs root)
 
 ```sh
 sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)   # once
-sudo python3 shared/methods/method4_hardcoded_aot.py
+sudo python3 ipa/methods/method4_hardcoded_aot.py
 ```
 
 or manually:

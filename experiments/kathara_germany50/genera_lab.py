@@ -2,6 +2,12 @@
 node) from the SNDlib Germany50 topology.
 
 Run it from anywhere:  python3 genera_lab.py [--xml PATH] [--out DIR]
+Then:                  python3 make_lab.py      (populates <out>/shared)
+                       cd <out> && kathara lstart
+
+This script and everything beside it are the EXPERIMENT. The engine lives in
+<repo>/ipa/ and imports nothing from here; make_lab.py copies the core into the
+lab's shared/ mount, so the dependency only ever points experiment -> core.
 
 It rewrites lab.conf and every <node>.startup in the output directory, so it
 is guarded behind __main__ and an explicit CLI: importing this module used to
@@ -162,6 +168,9 @@ def generate(xml_path: str, out_dir: str, hosts: dict = None) -> None:
     for host in host_names:
         startup_files[host].append(f"ip route add default via {host_gw[host]}")
 
+    # lab/ is generated output and is not tracked: it may not exist yet.
+    os.makedirs(out_dir, exist_ok=True)
+
     # Save lab.conf
     with open(os.path.join(out_dir, "lab.conf"), "w") as f:
         f.write(lab_conf)
@@ -194,9 +203,11 @@ def main():
         description="Generate the Kathara lab from an SNDlib topology XML")
     p.add_argument("--xml", default=os.path.join(here, "germany50.xml"),
                    help="SNDlib topology XML (default: germany50.xml next to this script)")
-    p.add_argument("--out", default=here,
+    p.add_argument("--out", default=os.path.join(here, "lab"),
                    help="directory to write lab.conf and <node>.startup into "
-                        "(default: the repo root next to this script)")
+                        "(default: ./lab next to this script). That directory is "
+                        "the Kathara lab root; run make_lab.py afterwards to "
+                        "populate its shared/ mount from the core.")
     p.add_argument("--host", action="append", metavar="NAME=ROUTER", default=None,
                    help="end host to attach, e.g. --host h_src=karlsruhe. Repeatable. "
                         f"Default: {', '.join(f'{h}={r}' for h, r in DEFAULT_HOSTS.items())} "

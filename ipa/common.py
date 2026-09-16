@@ -1,12 +1,21 @@
 """
-common.py - Shared helpers used by all methods.
+common.py - Shared runtime helpers, scenario-independent.
 
-Interface mapping (from lab.conf + darmstadt.startup):
-  darmstadt[0]="l59" <-> frankfurt[1]="l59"
-    eth0 = 10.0.0.233/30  -> INGRESS: IPA packets arrive from frankfurt here
-  darmstadt[1]="l62" <-> mannheim[0]="l62"
-    eth1 = 10.0.0.246/30  -> EGRESS:  forwarded packets leave toward mannheim
+This docstring used to be the wiring table of ONE node of ONE lab:
 
+    darmstadt[0]="l59" <-> frankfurt[1]="l59"
+      eth0 = 10.0.0.233/30  -> INGRESS
+    darmstadt[1]="l62" <-> mannheim[0]="l62"
+      eth1 = 10.0.0.246/30  -> EGRESS
+
+and the module exported INGRESS_IFACE = "eth0" / EGRESS_IFACE = "eth1" /
+N_WEIGHTS = 319 to match it. Those are properties of a deployment and of a
+checkpoint; this module is neither. Which interface a node ingresses on is a
+NODE fact (node_config.py), and the weight count is a MODEL fact
+(model_meta.derive_shape).
+
+What is left here is genuinely shared and scenario-free: BPF map helpers, MAC
+and ifindex resolution, and XDP attach/detach.
 """
 import json
 import os
@@ -17,12 +26,14 @@ import threading
 import time
 from bcc import BPF
 
-INGRESS_IFACE = "eth0"   # darmstadt[0]=l59, link to frankfurt (10.0.0.233/30)
-EGRESS_IFACE  = "eth1"   # darmstadt[1]=l62, link to mannheim  (10.0.0.246/30)
-DST_MAC       = [0x62, 0x45, 0x3d, 0xec, 0xc9, 0x80]  # resolve_egress_mac() fallback
+# Default ingress interface, overridable by $IPA_IFACE. Not a lab constant:
+# every entry point also takes --iface, and this only names the interface a
+# bare `run()` attaches to when nothing else says.
+INGRESS_IFACE = os.environ.get("IPA_IFACE", "eth0")
 
-# Total number of weights: fc1(260+4) + fc2(16+4) + out(28+7) = 319
-N_WEIGHTS = 319
+# Fallback destination MAC, used only until ARP resolves the real neighbour
+# (see start_mac_refresh_thread). Was a specific lab neighbour's address.
+DST_MAC = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
 
 
 def load_weights(path: str) -> list:
@@ -257,96 +268,12 @@ def install_mac_per_port(b, table_name: str, node_cfg, logical_ports: list = Non
     return {"installed": installed, "pending": pending, "absent": absent}
 
 
-def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = None):
-    """[DEPRECATED] Class-keyed mac_table.
-
-    Kept so existing call sites keep working, but it encodes the two
-    assumptions this refactor removes: that a class index IS a logical port,
-    and that logical port k IS `eth{k}`. New code should resolve a NodeConfig
-    and call install_mac_per_port().
-    """
-    print("[mac] NOTE: install_mac_per_class() assumes class == logical port == "
-          "eth{index}. Use install_mac_per_port() with a NodeConfig instead.")
-    """Populate `table_name` (BPF_HASH class -> fwd_action) with a DISTINCT
-    next-hop PER egress class: class i -> egress_ifaces[i], src = that iface's own
-    MAC, dst = the ARP-resolved MAC of its neighbour (fallback until ARP resolves).
-
-    This makes the NN's argmax class actually select the physical egress port,
-    instead of every class redirecting out the same interface (the old behaviour:
-    one iface resolved, the same action written to all classes).
-
-    egress_ifaces: class -> interface name. Default ['eth0','eth1',...], i.e. the
-    argmax class index == egress port index (same order as the link_state slots).
-    Classes whose interface is absent on this node are left UNMAPPED -> that class
-    resolves to MISS at runtime. Pass an explicit list to match a different
-    class->port convention.
-
-    Returns {"installed": [(cls, iface, ifindex)],
-             "pending":   [(cls, iface)],
-             "absent":    [(cls, iface)]}
-    where `absent` lists the classes whose egress interface does not exist on
-    this node at all -- structural on any node below the network's maximum
-    degree, and reported separately from a real provisioning failure -- and
-    `pending` lists exactly the classes whose dst_mac is still the
-    fallback because ARP hasn't resolved yet. Callers feed `pending` straight
-    into start_mac_refresh_thread() -- they must NOT re-derive it by calling
-    neighbor_mac() again: a second /proc/net/arp read can disagree with the one
-    used here (ARP may resolve in between), which would either leave a fallback
-    MAC unwatched or spawn a refresh thread for an already-correct entry.
-    """
-    if egress_ifaces is None:
-        egress_ifaces = [f"eth{i}" for i in range(n_fwd)]
-    mac = b.get_table(table_name)
-    installed, pending, absent = [], [], []
-    for cls in range(n_fwd):
-        name = egress_ifaces[cls] if cls < len(egress_ifaces) else None
-        if not name:
-            continue
-        if not os.path.isdir(f"/sys/class/net/{name}"):
-            # No such interface on this node. Expected and structural: the model
-            # has one egress class per interface of the LARGEST node in the
-            # network (6 for the checked-in checkpoint), so every node of lower
-            # degree has classes it can never forward through. Collected and
-            # reported once below rather than logged as a per-class failure --
-            # it is model padding, not a provisioning error.
-            absent.append((cls, name))
-            continue
-        try:
-            iface_r, ifindex = resolve_ifindex(name)
-            src_mac = local_mac(iface_r)
-            dst_mac = neighbor_mac(iface_r)
-        except Exception as e:
-            print(f"[mac] class {cls}: egress '{name}' present but unusable "
-                  f"({e}) -> unmapped (MISS)")
-            continue
-        if dst_mac is None:
-            # No ARP entry yet (idle link). Install a fallback so the class is
-            # not a hard MISS, and hand this class to the refresh thread.
-            dst_mac = DST_MAC
-            pending.append((cls, iface_r))
-        action = mac.Leaf()
-        action.ifindex = ifindex
-        for i in range(6):
-            action.src_mac[i] = src_mac[i]
-            action.dst_mac[i] = dst_mac[i]
-        mac[ctypes.c_uint32(cls)] = action
-        installed.append((cls, iface_r, ifindex))
-    pending_cls = {c for c, _ in pending}
-    for cls, ifc, idx in installed:
-        state = "ARP pending -> fallback dst_mac" if cls in pending_cls else "ARP resolved"
-        print(f"[mac] {table_name}: class {cls} -> {ifc} (ifindex={idx}) [{state}]")
-    if absent:
-        names = ", ".join(f"class {c} ({n})" for c, n in absent)
-        print(f"[mac] {table_name}: {len(absent)} of {n_fwd} egress classes have no "
-              f"interface on this node -> permanent MISS: {names}")
-        print("[mac]   Structural, not a failure: the model reserves one egress "
-              "class per interface of the network's LARGEST node, and this node "
-              f"has degree {len(installed)}. Only a maximum-degree node uses "
-              f"every class.")
-    if not installed:
-        print(f"[mac] WARNING: {table_name} -- no egress interface resolved; every class -> MISS")
-    return {"installed": installed, "pending": pending, "absent": absent}
-
+# install_mac_per_class() lived here: it keyed mac_table by CLASS, assuming
+# class k == logical port k == eth{k}. All three equalities are false for the
+# checked-in model (DROP is class 5, class 6 is untrained, ports are a separate
+# index space), it had no callers left after install_mac_per_port() replaced
+# it, and keeping a deprecated shim around only invites the assumption back.
+# Use install_mac_per_port(b, table, node_cfg, logical_ports).
 
 def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
                              interval: float = 5.0):

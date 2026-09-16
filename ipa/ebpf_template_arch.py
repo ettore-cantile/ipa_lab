@@ -10,10 +10,10 @@ Design space position:
 
 Architecture family supported here: fc1 -> ReLU -> fc2 -> ReLU -> out,
 input/output sizes fixed by the IPA packet format, hidden widths dynamic:
-  fc1  : T2_N_IN=65 inputs -> n_h1 hidden   (n_h1 <= T2_MAX_H1)
+  fc1  : n_in inputs -> n_h1 hidden         (n_h1 <= T2_MAX_H1)
   fc2  : n_h1 hidden       -> n_h2 hidden   (n_h2 <= T2_MAX_H2)
   out  : n_h2 hidden       -> n_out outputs   (n_out <= MAX_N_OUT)
-T2_N_IN=65 is fixed by the IPA header/feature encoding; n_out is NOT
+n_in comes from the feature descriptor, not from this file; n_out is NOT
 (6 link_state + 6 iface one-hot + 1 ttl + 52 node one-hot = 65 in;
 6 egress classes + drop = 7 out) -- they are protocol constants, not model
 hyperparameters, so they stay compile-time. n_h1/n_h2 are read at runtime
@@ -69,7 +69,26 @@ import os
 # Protocol-fixed constants: input/output size are dictated by the IPA
 # feature encoding (65 in) and the number of egress classes + drop (7 out),
 # not by the model. Hidden widths are the actual per-model hyperparameters.
-T2_N_IN   = 65
+# The reference model's widths, RESOLVED FROM THE DESCRIPTOR, not written here.
+#
+# These were `T2_N_IN = 65` and `T2_N_OUT = 7`, described as "fixed by the IPA
+# header/feature encoding". 65 is not a protocol constant: it is
+# 6 link_state + 6 ingress_iface + 1 ttl + 52 node, i.e. the Germany50 lab's
+# dimensions summed. Neither value appears in the compiled C at all -- the
+# program reads the feature layout from model_desc and n_out from
+# arch_registry -- so they only ever served as Python defaults, and as defaults
+# they silently assumed that topology.
+#
+# Resolved lazily: importing this module must not require a scenario to be
+# configured (the codegen is importable on any host).
+def reference_widths():
+    """(n_in, n_out) of the model this repo is configured for."""
+    import model_meta as _mm
+    sh = _mm.derive_shape(_mm.load_model_meta(
+                              os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "weights.json")),
+                          topology_config=_mm.load_topology_config())
+    return sh["n_in"], sh["n_out"]
 # Output width of the CHECKED-IN model, used only as a default for
 # arch_weight_count(). NOT a constraint: the datapath reads n_out from
 # arch_registry, and the compile-time ceiling is MAX_N_OUT (class_semantics.py).
@@ -93,20 +112,66 @@ T2_MAX_H2 = 8
 MAX_WEIGHT_ENTRIES = 1024
 
 
-def arch_weight_count(n_h1: int, n_h2: int, n_in: int = T2_N_IN,
-                      n_out: int = T2_N_OUT) -> int:
+def arch_weight_count(n_h1: int, n_h2: int, n_in: int = None,
+                      n_out: int = None) -> int:
     """Flat int8 weight count for an n_in -> n_h1 -> n_h2 -> T2_N_OUT MLP
     (fc1 weights+bias, fc2 weights+bias, out weights+bias), matching the
-    flat layout load_arch_weights() writes and the eBPF program reads. n_in
-    defaults to the protocol-standard 65 (the default descriptor); a custom
-    descriptor with a different N_IN passes its own n_in so the weight block
-    size stays consistent with the runtime IV width read from model_desc."""
+    flat layout load_arch_weights() writes and the eBPF program reads.
+
+    n_in/n_out default to the CONFIGURED model's widths, resolved from the
+    descriptor. They used to default to the literals 65 and 7, so a caller that
+    omitted them got the Germany50 model's block size for whatever model it was
+    actually registering."""
+    if n_in is None or n_out is None:
+        _in, _out = reference_widths()
+        n_in = _in if n_in is None else n_in
+        n_out = _out if n_out is None else n_out
     return (n_in * n_h1 + n_h1) + (n_h1 * n_h2 + n_h2) + (n_h2 * n_out + n_out)
 
 
-# Weight count for the one model currently in the repo (65-4-4-7 = 319),
-# kept for callers/tests that assumed the old fixed shape.
-N_WEIGHTS_T2 = arch_weight_count(4, 4)
+class _LazyWeightCount:
+    """`N_WEIGHTS_T2` as a lazily-evaluated int.
+
+    It was `arch_weight_count(4, 4)` evaluated at import time against the
+    literal 65/7. Resolving it eagerly now would make importing this module
+    require a configured scenario, which would break `--only kernel` on a host
+    with no descriptor. It resolves on first use instead.
+    """
+
+    def __int__(self):
+        return arch_weight_count(4, 4)
+
+    def __index__(self):
+        return int(self)
+
+    def __repr__(self):
+        return str(int(self))
+
+    def __str__(self):
+        return str(int(self))
+
+    def __eq__(self, other):
+        return int(self) == other
+
+    def __hash__(self):
+        return hash(int(self))
+
+    def __rfloordiv__(self, other):
+        return other // int(self)
+
+    def __floordiv__(self, other):
+        return int(self) // other
+
+    def __mul__(self, other):
+        return int(self) * other
+
+    __rmul__ = __mul__
+
+    def __format__(self, spec):
+        return format(int(self), spec)
+
+
+N_WEIGHTS_T2 = _LazyWeightCount()
 
 # ---------------------------------------------------------------------------
 # Raw bpf(2) syscall helpers
@@ -325,13 +390,27 @@ BPF_ARRAY(arch_weights, struct aw_blk, 1);
 /* link_state: 6 egress up/down slots (feature [0..5]), held in ONE struct-valued
  * entry (key 0) so the leaf reads the whole vector with a SINGLE lookup instead
  * of 6. Written by the userspace carrier monitor. 1=up, 0=down. */
-struct ls_vec { __u32 v[6]; };
+/* COMPILED CEILINGS for the dense per-slot features, not deployment values.
+ *
+ * These were the literals 6 and 4 -- the Germany50 lab's interface count and
+ * its queue count -- written into the struct sizes AND into every loop bound,
+ * so the compiled datapath only fit that one network. The consumption loops
+ * are already gated by the descriptor's per-feature `sz`, so widening the
+ * compiled bound costs a few unrolled iterations and changes no result: slots
+ * past the model's real size are skipped, never summed.
+ *
+ * A deployment whose n_interfaces / n_queues exceeds these must raise the
+ * ceiling and recompile -- the control plane checks and says so, instead of
+ * silently reading past the vector. See model_meta.MAX_N_IFACES/MAX_N_QUEUES. */
+#define IPA_MAX_IFACES  8
+#define IPA_MAX_QUEUES  8
+struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 
 /* queue_occupancy feature: n_queues occupancy slots in one struct-valued entry
  * (key 0), seeded by queue_state_monitor.py. Present so a descriptor can use the
  * queue_occupancy feature type; unused if the model's descriptor omits it. */
-struct qs_vec { __u32 v[4]; };
+struct qs_vec { __u32 v[IPA_MAX_QUEUES]; };
 BPF_ARRAY(queue_state, struct qs_vec, 1);
 
 /* Per-model feature descriptor (model_desc registry): which feature types the
@@ -410,13 +489,14 @@ int ipa_switch_template(struct xdp_md *ctx) {
 """
 
 EBPF_ARCH_GENERIC_2LAYER = r"""
-#define T2_N_IN     65
-/* Reference model's output width, kept for the docstring's example only.
- * The program reads n_out from arch_registry; the ceiling is MAX_N_OUT. */
-#define T2_N_OUT     7
+/* No T2_N_IN / T2_N_OUT here any more. They were 65 and 7 -- the Germany50
+ * feature sum and the reference model's class count -- and neither was read by
+ * a single line of this program: the input layout comes from model_desc and
+ * n_out from arch_registry, both per-model at runtime. A #define nobody reads
+ * is still a claim, and this one claimed the datapath only ever runs one
+ * topology's model. The real bounds are the ceilings below. */
 #define T2_MAX_H1    8
 #define T2_MAX_H2    8
-#define T2_N_QUEUES  4
 /* Must match model_meta.DEFAULT_TTL_SCALE (the checkpoint's initial_ttl). */
 #define T2_TTL_SCALE 30
 #define MAX_N_IN     128
@@ -515,9 +595,23 @@ void ipa_ttl_dec(struct iphdr *iph) {
 struct aw_blk { __u8 w[MAX_WEIGHT_ENTRIES]; };
 BPF_ARRAY(arch_weights, struct aw_blk, 1);
 #define AW_W(blk, i) ((long long)(__s8)((blk)->w[(__u32)(i) & (MAX_WEIGHT_ENTRIES - 1)]))
-struct ls_vec { __u32 v[6]; };
+/* COMPILED CEILINGS for the dense per-slot features, not deployment values.
+ *
+ * These were the literals 6 and 4 -- the Germany50 lab's interface count and
+ * its queue count -- written into the struct sizes AND into every loop bound,
+ * so the compiled datapath only fit that one network. The consumption loops
+ * are already gated by the descriptor's per-feature `sz`, so widening the
+ * compiled bound costs a few unrolled iterations and changes no result: slots
+ * past the model's real size are skipped, never summed.
+ *
+ * A deployment whose n_interfaces / n_queues exceeds these must raise the
+ * ceiling and recompile -- the control plane checks and says so, instead of
+ * silently reading past the vector. See model_meta.MAX_N_IFACES/MAX_N_QUEUES. */
+#define IPA_MAX_IFACES  8
+#define IPA_MAX_QUEUES  8
+struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
-struct qs_vec { __u32 v[4]; };
+struct qs_vec { __u32 v[IPA_MAX_QUEUES]; };
 BPF_ARRAY(queue_state, struct qs_vec, 1);
 struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
@@ -628,18 +722,20 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     __u32 _node      = (__u32)ipa->model_id;
 
     /* dense feature vectors, each read once with a SINGLE lookup, reused across
-     * neurons. Sized to the topology (link_state=6, queue=T2_N_QUEUES); the
+     * neurons. Sized to the COMPILED CEILINGS, gated per-feature by the
+     * descriptor's size below; the
      * descriptor's per-feature size gates how many slots actually contribute. */
-    long long ls[6];
+    long long ls[IPA_MAX_IFACES];
     { int lsz = 0; struct ls_vec *lsp = link_state.lookup(&lsz);
       #pragma unroll
-      for (int i = 0; i < 6; i++) ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
+      for (int i = 0; i < IPA_MAX_IFACES; i++)
+          ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
     /* queue_state is only read if the model's descriptor actually declares the
      * queue_occupancy feature. The default descriptor does not, so this saves
      * an unconditional lookup on the common path. */
-    long long qs[T2_N_QUEUES];
+    long long qs[IPA_MAX_QUEUES];
     #pragma unroll
-    for (int i = 0; i < T2_N_QUEUES; i++) qs[i] = 0LL;
+    for (int i = 0; i < IPA_MAX_QUEUES; i++) qs[i] = 0LL;
     __u8 _need_qs = 0;
     #pragma unroll
     for (int f = 0; f < MAX_FEAT; f++)
@@ -648,7 +744,7 @@ int arch_generic_2layer(struct xdp_md *ctx) {
       int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
       if (qsp) {
         #pragma unroll
-        for (int i = 0; i < T2_N_QUEUES; i++) qs[i] = (long long)(qsp->v[i]);
+        for (int i = 0; i < IPA_MAX_QUEUES; i++) qs[i] = (long long)(qsp->v[i]);
       }
     }
 
@@ -678,13 +774,13 @@ int arch_generic_2layer(struct xdp_md *ctx) {
                     acc += ((long long)_ttl * AW_W(AW, base)) / T2_TTL_SCALE;
                 } else if (code == FEAT_LINK_STATE) {
                     #pragma unroll
-                    for (int i = 0; i < 6; i++) {
+                    for (int i = 0; i < IPA_MAX_IFACES; i++) {
                         if ((__u32)i < sz && ls[i])
                             acc += ls[i] * AW_W(AW, base + i);
                     }
                 } else if (code == FEAT_QUEUE_OCC) {
                     #pragma unroll
-                    for (int i = 0; i < T2_N_QUEUES; i++) {
+                    for (int i = 0; i < IPA_MAX_QUEUES; i++) {
                         if ((__u32)i < sz && qs[i])
                             acc += qs[i] * AW_W(AW, base + i);
                     }
@@ -809,7 +905,8 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     """
     Populate arch_weights and arch_registry for Pipeline 2.
 
-    n_h1/n_h2 are THIS model's hidden widths (input=T2_N_IN=65 and
+    n_h1/n_h2 are THIS model's hidden widths (input width from the
+    descriptor and
     output width n_out is read from the descriptor). They must
     fit under the compiled ceilings T2_MAX_H1/T2_MAX_H2 -- raises ValueError
     otherwise rather than silently truncating. Any model with hidden widths
@@ -844,8 +941,8 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     # one is passed). n_in drives both the flat weight-block size here and the
     # runtime IV width read from model_desc -> they stay consistent.
     if features is None:
-        from model_meta import derive_shape, DEFAULT_META, DEFAULT_TOPOLOGY_CONFIG
-        _sh = derive_shape(dict(DEFAULT_META), topology_config=dict(DEFAULT_TOPOLOGY_CONFIG))
+        from model_meta import derive_shape, DEFAULT_META, load_topology_config
+        _sh = derive_shape(dict(DEFAULT_META), topology_config=load_topology_config())
         features = _sh["features"]
         n_in = _sh["n_in"]
     elif n_in is None:
@@ -894,7 +991,8 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     # resolver reads the descriptor and announces any fallback.
     if semantics is None:
         from model_meta import descriptor_semantics_or_reference
-        semantics = descriptor_semantics_or_reference(T2_N_OUT, "Pipeline2")
+        semantics = descriptor_semantics_or_reference(reference_widths()[1],
+                                                     "Pipeline2")
     semantics.validate()
 
     class ArchEntry(Structure):

@@ -422,7 +422,7 @@ def _resolve_shape(model_path=None, meta=None, topology_config=None):
         if model_path:
             meta = _model_meta.load_model_meta(model_path)
     if topology_config is None:
-        topology_config = dict(_model_meta.DEFAULT_TOPOLOGY_CONFIG)
+        topology_config = _model_meta.load_topology_config()
     shape = _model_meta.derive_shape(meta, topology_config=topology_config)
 
     iface_size = next((f["size"] for f in shape["features"] if f["type"] == "ingress_iface"), 0)

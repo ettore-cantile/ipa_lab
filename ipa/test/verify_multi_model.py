@@ -28,7 +28,7 @@ correctness checks) -- this is the actual "multi-model concurrent" claim
 made in the design-space docs, tested end to end.
 
 Needs Linux + BCC + root. In Kathara:
-    sudo python3 shared/test/verify_multi_model.py
+    sudo python3 ipa/test/verify_multi_model.py
 """
 import os
 import sys

@@ -84,58 +84,130 @@ it rather than letting it look like a fault:
   unusable* ones, and prints the node's degree alongside.
 - `n_fwd` comes from the model's `n_out - 1`, not a literal 6.
 
-The topology lives in `germany50.xml` (SNDlib format). `genera_lab.py` parses it and emits the Kathara lab: `lab.conf` (collision domains and interface assignment) plus one `<node>.startup` per node (IP addressing, loopbacks, `/etc/hosts`, FRR/OSPF configuration). `importSNDLib.py` is a separate analysis helper that loads the same XML into a NetworkX graph for topology statistics and plotting.
+All of this lives in [`experiments/kathara_germany50/`](experiments/kathara_germany50/), not in the engine. `germany50.xml` is the SNDlib topology; `genera_lab.py` parses it and emits the Kathara lab into `lab/` (`lab.conf` with collision domains and interface assignment, plus one `<node>.startup` per node: IP addressing, loopbacks, `/etc/hosts`, FRR/OSPF). `make_lab.py` then populates `lab/shared/` from `ipa/`. `importSNDLib.py` is a separate analysis helper that loads the same XML into a NetworkX graph for topology statistics and plotting.
+
+The dimensions those files imply — `n_interfaces=6`, `n_nodes=52` — are written once, in `experiments/kathara_germany50/topology_config.json`, and read by the engine through `$IPA_TOPOLOGY_CONFIG` or `/etc/ipa/topology_config.json`. They are no longer constants inside `model_meta.py`.
 
 ---
 
 ## Repository Structure
 
+Three layers, and the dependency only ever points downward.
+
 ```
 ipa_lab/
-├── genera_lab.py                    # Generates lab.conf + <node>.startup from germany50.xml
-├── importSNDLib.py                  # SNDlib XML -> NetworkX topology (analysis helper)
-├── germany50.xml                    # SNDlib Germany50 topology
-├── lab.conf, <node>.startup         # Generated Kathara lab (52 nodes, 90 links)
-├── Dockerfile                       # kathara/frr_ebpf image (FRR + BCC + eBPF headers)
-├── docs/
-│   ├── testing.md                   # Test guide + measured results
-│   └── tesi_ipa.tex                 # Thesis text
-└── shared/                          # Bind-mounted into every Kathara node as /shared
-    ├── execute_pipeline.py          # SINGLE ENTRY POINT: --method hardcoded|template|modular
-    ├── model_meta.py                # Feature catalog, topology_config, shape derivation
-    ├── ebpf_program.py              # Pipeline 1 codegen (weights as C literals, BCC dialect)
-    ├── ebpf_template_arch.py        # Pipeline 2 eBPF source + arch_weights control plane
-    ├── ebpf_modular.py              # Pipeline 3 eBPF source + layer_weights control plane
-    ├── common.py                    # mac_table install, ARP refresh, XDP attach/detach
-    ├── fix_bpf.sh                   # (per node, at boot) symlinks host_headers for BCC
-    ├── fetch_host_headers.sh        # (on the host, once) populates host_headers/
-    ├── link_state_monitor.py        # Seeds link_state[] from real carrier state
-    ├── queue_state_monitor.py       # Seeds queue_state[] (synthetic, demo feature)
-    ├── extract_weights.py           # .pt -> weights.json / weights_float.json
-    ├── FRR_model.py                 # PyTorch MLP definition (training-side)
-    ├── frr_germany50_5_model_4x2.pt # Trained checkpoint (65-4-4-7)
-    ├── weights.json                 # int8 weights (319 values, scale=24)
-    ├── weights_float.json           # float weights + scale_factor
-    ├── send_ipa.py                  # Single/N-packet IPA sender (struct.pack)
-    ├── recv_ipa.py                  # IPA listener (use only with XDP detached)
-    ├── methods/
-    │   ├── method4_hardcoded.py     # P1 compile-and-verify (BCC, no attach)
-    │   ├── method4_hardcoded_aot.py # P1 deploy: AOT-literal .o + libbpf loader
-    │   ├── method5_template.py      # P2 deploy
-    │   └── method6_modular.py       # P3 deploy
-    ├── poc_aot/
-    │   ├── gen_full_c.py            # Descriptor-driven libbpf-dialect literal generator
-    │   ├── loader_aot.c             # Static libbpf loader (bench + live attach)
-    │   └── nn_aot_arch.o            # Prebuilt object, deployed to nodes without clang
-    └── test/
-        ├── test_suite.py            # All suites: core/pktstats/extract/quant/robust/kernel
-        ├── verify_prog_run.py       # Per-pipeline kernel verifier (BPF_PROG_TEST_RUN)
-        ├── verify_multi_model.py    # Concurrent multi-model registration proof
-        ├── bench_model_add.py       # Real cost of registering a new model_id
-        ├── bench_depth_vs_width.py  # Width-vs-depth trade-off sweep (P1)
-        ├── bench_tailcall_overhead.py # Isolated bpf_tail_call cost
-        └── test_ipa.py              # Scapy multi-packet sender
+├── ipa/                             # 1. CORE ENGINE — no topology, no emulator
+│   ├── execute_pipeline.py          #    SINGLE ENTRY POINT: --method hardcoded|template|modular
+│   ├── ebpf_program.py              #    P1 codegen (weights as C literals, BCC dialect)
+│   ├── ebpf_template_arch.py        #    P2 eBPF source + arch_weights control plane
+│   ├── ebpf_modular.py              #    P3 eBPF source + layer_weights control plane
+│   ├── class_semantics.py           #    class -> action -> logical port (declared, never inferred)
+│   ├── node_config.py               #    logical port -> ifindex / MAC (per node)
+│   ├── label_mapping.py             #    dataset label -> class, declared and verified
+│   ├── model_meta.py                #    2. CONFIG LAYER: feature catalog, scenario resolution,
+│   │                                #       shape derivation, checkpoint resolution
+│   ├── common.py                    #    map helpers, MAC/ifindex resolution, XDP attach/detach
+│   ├── link_state_monitor.py        #    seeds link_state[] from real carrier state
+│   ├── queue_state_monitor.py       #    seeds queue_state[] (demo feature)
+│   ├── extract_weights.py           #    .pt -> weights.json / weights_float.json
+│   ├── FRR_model.py                 #    PyTorch MLP definition (training-side)
+│   ├── model_meta.json              #    THE MODEL DESCRIPTOR: n_out, class_semantics,
+│   │                                #       label_mapping, trained_on, checkpoint
+│   ├── weights.json / weights_float.json
+│   ├── methods/                     #    per-pipeline deploy entry points
+│   ├── poc_aot/                     #    AOT-literal generator + static libbpf loader
+│   ├── synth/                       #    synthetic model generator (scenarios/ is
+│   │                                #       generated output, not tracked)
+│   └── test/                        #    engine tests, topology-agnostic
+│       ├── test_suite.py            #      core/pktstats/extract/quant/robust/kernel
+│       ├── test_class_semantics.py  #      53 checks, five class layouts, none Germany50
+│       ├── test_synth.py            #      36 checks on generated models
+│       ├── verify_prog_run.py       #      per-pipeline kernel verifier (BPF_PROG_TEST_RUN)
+│       ├── verify_multi_model.py    #      concurrent multi-model registration
+│       └── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost
+│
+├── experiments/                     # 3. BACKEND / SCENARIO — one directory per environment
+│   └── kathara_germany50/           #    the environment this work was evaluated on
+│       ├── topology_config.json     #      n_interfaces=6, n_nodes=52, n_queues=4
+│       ├── scenario.json            #      hosts, image, traffic defaults, initial TTL
+│       ├── germany50.xml            #      SNDlib topology
+│       ├── genera_lab.py            #      XML -> lab/lab.conf + lab/<node>.startup
+│       ├── importSNDLib.py          #      XML -> NetworkX (analysis helper)
+│       ├── make_lab.py              #      assembles lab/shared/ from ../../ipa
+│       ├── Dockerfile               #      kathara/frr_ebpf image
+│       ├── host_setup/              #      fix_bpf.sh, fetch_host_headers.sh
+│       ├── traffic/                 #      send_ipa.py, recv_ipa.py, test_ipa.py, send/recv test
+│       └── lab/                     #      GENERATED, untracked: lab.conf, <node>.startup, shared/
+│
+└── docs/
+    ├── testing.md                   # Test guide + measured results
+    ├── metodologia_test.tex/.pdf    # How this class of model is tested in the literature
+    └── tesi_ipa.tex                 # Thesis text
 ```
+
+### What "the core does not depend on the scenario" means, concretely
+
+`ipa/` contains no topology numbers, no hostnames, no `germany50.xml`, and no
+Kathara paths. Where `n_interfaces` and `n_nodes` are needed they are resolved,
+in order, from:
+
+1. `$IPA_TOPOLOGY_CONFIG`
+2. `/etc/ipa/topology_config.json`
+3. the model descriptor's `trained_on` block
+
+and exhausting that raises `ScenarioError` naming all three. There is
+deliberately **no built-in default**: `DEFAULT_TOPOLOGY_CONFIG = {6, 52, 4}` used
+to sit in `model_meta.py` and silently apply to any caller that supplied
+nothing, which made every such caller quietly correct for Germany50 and quietly
+wrong everywhere else.
+
+The same holds for the model: `n_out`, which class is DROP, which classes
+forward and onto which logical port all come from `ipa/model_meta.json`. None of
+it is derived from `n_interfaces + 1`, `n_out - 1` or `max(label) + 1`.
+
+You can check both claims:
+
+```bash
+# no code-level dependency on the experiment
+grep -rnE "import (genera_lab|importSNDLib)|germany50\.xml|lab\.conf|\.startup" ipa/ --include=*.py
+
+# generate a full P1 pipeline for a topology that is not Germany50
+cat > /tmp/tiny.json <<'JSON'
+{"topology":"tiny-ring","n_interfaces":3,"n_nodes":8,"n_queues":2}
+JSON
+IPA_TOPOLOGY_CONFIG=/tmp/tiny.json python3 - <<'PY'
+import sys; sys.path.insert(0, "ipa")
+import model_meta as m, ebpf_program as E
+from class_semantics import ClassSemantics
+cfg = m.load_topology_config()
+sh = m.derive_shape({"features": ["link_state","ingress_iface","ttl","node"],
+                     "n_out": 4, "hidden_dims": [3,3]}, topology_config=cfg)
+print("n_in =", sh["n_in"], " n_out =", sh["n_out"])      # 15, 4
+sem = ClassSemantics.forward_then_drop(3, drop_class=3, n_out=4)
+src = E.build_combined_hardcoded_source(
+    models=[(0, [1]*sum(a*b+b for a,b in zip([sh["n_in"],3,3],[3,3,4])), 24, [2,3,4])],
+    features=sh["features"], n_out=4, hidden_dims=(3,3), semantics=sem)
+print("link_state width:", "v[3]" in src)                  # True
+PY
+```
+
+### Running the Kathara/Germany50 experiment
+
+Kathara mounts a directory named `shared/` in the lab root at `/shared` inside
+every machine. That convention is why the engine used to live at
+`<repo>/shared/`. It now lives in `ipa/`, and the experiment copies what a node
+needs into its own mount:
+
+```bash
+cd experiments/kathara_germany50
+python3 genera_lab.py      # lab/lab.conf + lab/<node>.startup
+python3 make_lab.py        # lab/shared/  <- copied from ../../ipa
+cd lab && kathara lstart
+```
+
+Full instructions in [experiments/kathara_germany50/README.md](experiments/kathara_germany50/README.md).
+
+---
 
 > **Historical note.** The preliminary phase of this project was organised around
 > `switch_core.py` and four *methods* (PTQ / QAT / OpenFlow-like / IPA-demo)
@@ -206,7 +278,10 @@ the historical `65-4-4-7` shape.
 
 > **Known limitation — `ingress_iface` is inert on this lab.** P1 maps the kernel
 > ifindex to a logical port through an `ifindex_table` defaulting to `[2..7]`;
-> P2/P3 use the raw ifindex clamped to `[1, n_interfaces]`. Real Kathara nodes get
+> P2/P3 resolve the argmax class through `class_action_t2`/`class_action_t3`
+> (class -> action + logical port) and then `mac_table_t*[logical port]`. The
+> earlier text here described a raw ifindex clamped to `[1, n_interfaces]`,
+> which the datapath no longer does. Real Kathara nodes get
 > ifindexes like 201/209/217/223, which match neither — so this feature contributes
 > zero on all three pipelines in the live lab. Under `BPF_PROG_TEST_RUN` the
 > sandbox ifindex is 1, which P2/P3 *do* accept and P1 does not, so the two
@@ -243,7 +318,7 @@ Python reference uses `_trunc_div` so it matches C's truncate-toward-zero on
 negative weights. `send_ipa.py` sends with `INITIAL_TTL = 30` for the same
 reason: a higher TTL normalises above 1.0, outside anything the model saw.
 
-Run `shared/test/diag_model_decisions.py` to see the numbers for the current
+Run `ipa/test/diag_model_decisions.py` to see the numbers for the current
 weights — no root, no BCC, no kernel needed.
 
 ## TTL: the hop behaves like a router
@@ -305,12 +380,13 @@ travel in-band (a true IPA cache-miss path) is future work; see the discussion i
 ### First run after cloning
 
 The Kathara nodes compile eBPF with BCC against the **host's** kernel headers,
-bind-mounted through `shared/`. Those headers are ~114 MB of generated files
+placed into the lab's `shared/` mount by `make_lab.py --link-headers`. Those
+headers are ~114 MB of generated files
 pinned to one exact kernel version, so they are **not tracked in git**. Populate
 them once per machine (and again after a kernel upgrade):
 
 ```bash
-bash shared/fetch_host_headers.sh     # copies /usr/src/linux-headers-$(uname -r)
+bash experiments/kathara_germany50/host_setup/fetch_host_headers.sh     # copies /usr/src/linux-headers-$(uname -r)
 ```
 
 Without this, every pipeline fails at BPF compilation and `fix_bpf.sh` prints
@@ -319,7 +395,8 @@ the command to run.
 ### Start the lab
 
 ```bash
-kathara lstart      # 52 nodes (50 routers + h_src/h_dst), germany50 topology
+cd experiments/kathara_germany50 && python3 genera_lab.py && python3 make_lab.py
+cd lab && kathara lstart   # 52 nodes (50 routers + h_src/h_dst), germany50 topology
 kathara linfo
 kathara lclean      # tear down
 ```
@@ -332,7 +409,7 @@ kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method modular  
 kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
 
 # load + verifier check only, no attach
-sudo python3 shared/execute_pipeline.py --method hardcoded --verify-only
+sudo python3 ipa/execute_pipeline.py --method hardcoded --verify-only
 
 # detach a stale program
 kathara exec frankfurt -- ip link set dev eth1 xdp off
@@ -365,11 +442,11 @@ changes the map-memory figures reported by `test_suite.py --only kernel`.
 **Pipeline 1 deploys via AOT only.** The BCC live-attach path was removed; the
 `.o` is built offline on a box with clang and the statically linked `loader_aot`
 attaches it on nodes that have neither clang nor `libbpf.so`. Build both once on
-the host — `shared/` is bind-mounted, so they appear on every node:
+the host, then re-run `experiments/kathara_germany50/make_lab.py` so they reach every node:
 
 ```bash
 sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
-python3 shared/methods/method4_hardcoded_aot.py     # builds .o + loader, then benches
+python3 ipa/methods/method4_hardcoded_aot.py     # builds .o + loader, then benches
 ```
 
 ### Send traffic
@@ -380,7 +457,7 @@ kathara exec h_src -- python3 /shared/send_ipa.py --dst h_dst --count 100
 
 # or router-to-router, to exercise a specific hop
 kathara exec darmstadt -- python3 /shared/send_ipa.py --dst frankfurt --count 100
-kathara exec darmstadt -- python3 /shared/test/test_ipa.py --dest frankfurt --count 100 --model-id 0
+kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 100 --model-id 0
 ```
 
 `recv_ipa.py` is only meaningful with **XDP detached**: a TRUE HIT means the
@@ -395,16 +472,16 @@ Full guide with expected output in [`docs/testing.md`](docs/testing.md).
 
 ```bash
 # userspace suites (torch + numpy, no root)
-python3 shared/test/test_suite.py --only core
+python3 ipa/test/test_suite.py --only core
 
 # in-kernel metrics + dispatch correctness (Linux + BCC + root)
-sudo python3 shared/test/test_suite.py --only kernel
+sudo python3 ipa/test/test_suite.py --only kernel
 
 # per-pipeline verifier
-sudo python3 shared/test/verify_prog_run.py --method hardcoded|template|modular|sparse-hetero
+sudo python3 ipa/test/verify_prog_run.py --method hardcoded|template|modular|sparse-hetero
 
 # concurrent multi-model registration
-sudo python3 shared/test/verify_multi_model.py
+sudo python3 ipa/test/verify_multi_model.py
 ```
 
 Correctness criterion, identical across pipelines: pre-install `mac_table`, run

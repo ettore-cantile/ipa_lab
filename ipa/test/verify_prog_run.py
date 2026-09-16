@@ -2,7 +2,7 @@
 """
 verify_prog_run.py  --  BPF_PROG_TEST_RUN verifier for the 3 IPA pipelines.
 
-Lives in shared/test/; the pipeline modules it imports (ebpf_program,
+Lives in ipa/test/; the pipeline modules it imports (ebpf_program,
 ebpf_template_arch, ebpf_modular, extract_weights) live one level up in
 shared/, so SHARED_DIR is added to sys.path below.
 """
@@ -237,7 +237,8 @@ def map_bytes(map_fd: int, nr_cpus: int = 1) -> int:
     per_cpu = nr_cpus if map_type in _PERCPU_MAP_TYPES else 1
     return (ksz + vsz * per_cpu) * ment
 
-MODEL_PT     = os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
+from model_meta import default_checkpoint
+MODEL_PT     = default_checkpoint()
 WEIGHTS_JSON = os.path.join(SHARED_DIR, "weights_float.json")
 
 def _nr_cpus() -> int:
@@ -554,7 +555,12 @@ def _seed_link_state(b, val: int = 1):
     ref_infer's x[0..5]=1."""
     try:
         from common import write_vector_map
-        write_vector_map(b, "link_state", [int(val)] * 6)
+        # Width from the scenario, not a literal 6: write_vector_map pads
+        # and truncates to the map, but a short list left the high slots at
+        # whatever the previous test wrote.
+        import model_meta as _mm
+        _n = int(_mm.load_topology_config()["n_interfaces"])
+        write_vector_map(b, "link_state", [int(val)] * _n)
     except Exception:
         pass
 
@@ -1215,7 +1221,12 @@ def probe_link_down(model_path, model_id: int = 0, ttl_min: int = 2, ttl_max: in
         prog_test_run(fn.fd, frame, repeat=1)
         cls_up = _fired_cls_p1(setup)
         from common import set_vector_slot
-        for k in range(6):
+        # Was `range(6)`: the Germany50 interface count, so on any other
+        # scenario the probe flipped the wrong slots and silently reported
+        # "0 link-down cases changed the egress".
+        import model_meta as _mm
+        _n_if = int(_mm.load_topology_config()["n_interfaces"])
+        for k in range(_n_if):
             _seed_link_state(b, 1)
             set_vector_slot(b, "link_state", k, 0)
             _reset_stats(setup)

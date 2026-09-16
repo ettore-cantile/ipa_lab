@@ -12,8 +12,18 @@ shared/_stats_*.py
 ~$*
 *.tmp
 
-# Host kernel headers bind-mounted into the Kathara nodes (shared/ is the mount).
-# ~114 MB / 17.5k generated files, pinned to one exact kernel version: a build
-# dependency of the host, not project source. Regenerate with:
-#     bash shared/fetch_host_headers.sh
+# Host kernel headers for BCC on the Kathara nodes. ~114 MB / 17.5k generated
+# files pinned to one exact kernel version: a build dependency of the host, not
+# project source. Regenerate with:
+#     bash experiments/kathara_germany50/host_setup/fetch_host_headers.sh
 shared/host_headers/
+experiments/kathara_germany50/lab/shared/host_headers/
+
+# Generated Kathara lab. `genera_lab.py` writes lab.conf + <node>.startup and
+# `make_lab.py` assembles shared/ from ipa/ -- all reproducible output, and the
+# 52 .startup files used to be committed at the repo root.
+experiments/kathara_germany50/lab/shared/
+
+# Generated AOT artefacts (gen_full_c.py writes both).
+ipa/poc_aot/nn_aot_arch.o
+ipa/poc_aot/loader_aot

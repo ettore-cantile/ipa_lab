@@ -38,7 +38,7 @@ Compile-time ceilings (verifier needs a compile-time trip count; wider/
 deeper models need these raised and the program reloaded once -- raising
 them grows layer_first/layer_hidden's own instruction count, watch the
 4096-instruction cap on kernels that still enforce it):
-  PROTO_N_IN   = 65  (fixed: the IPA feature vector is always this wide;
+  n_in         from the feature descriptor (was a fixed 65;
                        not a ceiling, the exact, protocol-mandated width)
   ML1_MAX_H1   = 8   (first layer's output width ceiling)
   MLH_MAX_H    = 8   (every later layer's input AND output width ceiling,
@@ -102,6 +102,7 @@ Weight storage:
   before arithmetic, and load_modular_weights() stores each int8 as
   v & 0xFF (identical two's-complement bits) inside the struct-valued block.
 """
+import os
 
 # Scratch map layout constants
 SCRATCH_ACT_SIZE   = 128   # max activations at any layer boundary
@@ -115,7 +116,17 @@ META_INGRESS_IF   = 3
 META_TTL          = 4
 
 # Compile-time layer-shape ceilings (see module docstring)
-PROTO_N_IN   = 65   # protocol-fixed IPA feature vector width, not a ceiling
+# Was `PROTO_N_IN = 65   # protocol-fixed IPA feature vector width`. It is not
+# protocol-fixed: 65 = 6 link_state + 6 ingress_iface + 1 ttl + 52 node, the
+# Germany50 lab summed up. Resolved from the descriptor instead; the compiled
+# ceiling is ML1_MAX_N_IN below.
+def reference_n_in():
+    """Input width of the model this repo is configured for."""
+    import model_meta as _mm
+    return _mm.derive_shape(
+        _mm.load_model_meta(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "weights.json")),
+        topology_config=_mm.load_topology_config())["n_in"]
 ML1_MAX_H1   = 8    # first layer's output width ceiling
 MLH_MAX_H    = 8    # later layers' input/output width ceiling
 LAYER_CHAIN_SIZE = 16
@@ -238,13 +249,27 @@ BPF_ARRAY(layer_weights, struct lw_blk, 1);
 /* link_state: 6 egress up/down slots (feature [0..5]), held in ONE struct-valued
  * entry (key 0) so layer_first reads the whole vector with a SINGLE lookup
  * instead of 6. Written by the userspace carrier monitor. 1=up, 0=down. */
-struct ls_vec { __u32 v[6]; };
+/* COMPILED CEILINGS for the dense per-slot features, not deployment values.
+ *
+ * These were the literals 6 and 4 -- the Germany50 lab's interface count and
+ * its queue count -- written into the struct sizes AND into every loop bound,
+ * so the compiled datapath only fit that one network. The consumption loops
+ * are already gated by the descriptor's per-feature `sz`, so widening the
+ * compiled bound costs a few unrolled iterations and changes no result: slots
+ * past the model's real size are skipped, never summed.
+ *
+ * A deployment whose n_interfaces / n_queues exceeds these must raise the
+ * ceiling and recompile -- the control plane checks and says so, instead of
+ * silently reading past the vector. See model_meta.MAX_N_IFACES/MAX_N_QUEUES. */
+#define IPA_MAX_IFACES  8
+#define IPA_MAX_QUEUES  8
+struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 
 /* queue_occupancy feature: n_queues occupancy slots in one struct-valued entry
  * (key 0), seeded by queue_state_monitor.py. Present so a descriptor can use the
  * queue_occupancy feature type; unused if the model's descriptor omits it. */
-struct qs_vec { __u32 v[4]; };
+struct qs_vec { __u32 v[IPA_MAX_QUEUES]; };
 BPF_ARRAY(queue_state, struct qs_vec, 1);
 
 /* Per-model feature descriptor (model_desc registry): which feature types the
@@ -315,8 +340,8 @@ BPF_HASH(layer_registry, __u8, struct layer_model_entry, 256);
  * where its weights start in the flat layer_weights array. This is what
  * makes the layer chain architecture-agnostic -- it never assumes a fixed
  * width or depth, it just looks up what THIS model's THIS layer needs.
- * (layer 0's n_in is always PROTO_N_IN=65 by protocol, so only its n_out
- * is actually consulted -- see layer_first.) */
+ * (layer 0's n_in is fixed by the feature descriptor, so only its n_out is
+ * actually consulted -- see layer_first.) */
 struct layer_shape_key {
     __u8 model_id;
     __u8 layer_idx;
@@ -459,9 +484,13 @@ int modular_dispatcher(struct xdp_md *ctx) {
 # (a 1-layer model), otherwise ReLU + write scratch_acts + chain to hop 1.
 # -----------------------------------------------------------------
 EBPF_LAYER_FIRST = EBPF_MODULAR_COMMON_HEADER + r"""
-#define PROTO_N_IN  65
+/* PROTO_N_IN is gone: it was 65, the Germany50 feature sum, and layer_first
+ * reads its input sparsely through model_desc, never through that width. */
 #define ML1_MAX_H1   8
-#define ML_N_QUEUES  4
+/* Compiled CEILING on the queue_occupancy feature, not the deployment's queue
+ * count. Was `ML_N_QUEUES 4` -- the lab's value, read as if it were a law.
+ * The ceiling now lives in IPA_MAX_QUEUES, shared with Pipeline 2. */
+
 /* Must match model_meta.DEFAULT_TTL_SCALE (the checkpoint's initial_ttl). */
 #define ML_TTL_SCALE 30
 #define ML_MAX_N_IN  128
@@ -522,15 +551,16 @@ int layer_first(struct xdp_md *ctx) {
 
     /* dense feature vectors, each read once (single lookup), reused per neuron.
      * Sized to the topology; the descriptor's per-feature size gates the slots. */
-    long long ls[6];
+    long long ls[IPA_MAX_IFACES];
     { int lsz = 0; struct ls_vec *lsp = link_state.lookup(&lsz);
       #pragma unroll
-      for (int i = 0; i < 6; i++) ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
+      for (int i = 0; i < IPA_MAX_IFACES; i++)
+          ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
     /* queue_state is only read if this model's descriptor declares the
      * queue_occupancy feature -- the default descriptor does not. */
-    long long qs[ML_N_QUEUES];
+    long long qs[IPA_MAX_QUEUES];
     #pragma unroll
-    for (int i = 0; i < ML_N_QUEUES; i++) qs[i] = 0LL;
+    for (int i = 0; i < IPA_MAX_QUEUES; i++) qs[i] = 0LL;
     __u8 _need_qs = 0;
     #pragma unroll
     for (int f = 0; f < ML_MAX_FEAT; f++)
@@ -539,7 +569,7 @@ int layer_first(struct xdp_md *ctx) {
       int qsz = 0; struct qs_vec *qsp = queue_state.lookup(&qsz);
       if (qsp) {
         #pragma unroll
-        for (int i = 0; i < ML_N_QUEUES; i++) qs[i] = (long long)(qsp->v[i]);
+        for (int i = 0; i < IPA_MAX_QUEUES; i++) qs[i] = (long long)(qsp->v[i]);
       }
     }
 
@@ -582,13 +612,13 @@ int layer_first(struct xdp_md *ctx) {
                     acc += ((long long)_ttl * LW_W(LW, base)) / ML_TTL_SCALE;
                 } else if (code == FEAT_LINK_STATE) {
                     #pragma unroll
-                    for (int i = 0; i < 6; i++) {
+                    for (int i = 0; i < IPA_MAX_IFACES; i++) {
                         if ((__u32)i < sz)
                             acc += ls[i] * LW_W(LW, base + i);
                     }
                 } else if (code == FEAT_QUEUE_OCC) {
                     #pragma unroll
-                    for (int i = 0; i < ML_N_QUEUES; i++) {
+                    for (int i = 0; i < IPA_MAX_QUEUES; i++) {
                         if ((__u32)i < sz)
                             acc += qs[i] * LW_W(LW, base + i);
                     }
@@ -758,8 +788,8 @@ def load_modular_weights(
       used when layer_dims is None -- backward compatible with the one
       trained model checked into the repo). Any depth/width combination
       works as long as:
-        - the first layer's n_in is exactly PROTO_N_IN=65 (protocol
-          feature vector -- layer_first reads it sparsely, not generically)
+        - the first layer's n_in matches the feature descriptor
+          (layer_first reads the vector sparsely, not generically)
           and its n_out is <= ML1_MAX_H1
         - every later layer's n_in and n_out are both <= MLH_MAX_H
       This is what makes Pipeline 3 genuinely architecture-agnostic: no
@@ -892,9 +922,9 @@ def load_modular_weights(
     # here so every existing caller (methods + test harnesses) registers
     # model_desc without a separate call. n_in must equal the first layer's n_in.
     if features is None:
-        from model_meta import derive_shape, DEFAULT_META, DEFAULT_TOPOLOGY_CONFIG
+        from model_meta import derive_shape, DEFAULT_META, load_topology_config
         features = derive_shape(dict(DEFAULT_META),
-                                topology_config=dict(DEFAULT_TOPOLOGY_CONFIG))["features"]
+                                topology_config=load_topology_config())["features"]
     load_model_desc(bpf_obj, features, n_in=layer_dims[0][0], model_id=model_id)
     return total_weights
 

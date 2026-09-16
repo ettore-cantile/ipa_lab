@@ -94,6 +94,7 @@ Verifier constraints (why the sparse route's codegen is shaped this way):
      stored in _iface before the existing switch(_iface).
 """
 
+import os
 import model_meta as _model_meta
 
 # Historical/default shape constants -- kept as documented fallback
@@ -101,11 +102,23 @@ import model_meta as _model_meta
 # every existing call site (tests, verify_prog_run.py, bench scripts)
 # keeps producing byte-identical output to before this module was
 # generalized. See model_meta.py for how a model's real shape is derived.
-N_IN   = 65
-N_H1   =  4
-N_H2   =  4
-N_OUT  =  7
-N_WEIGHTS = N_IN*N_H1 + N_H1 + N_H1*N_H2 + N_H2 + N_H2*N_OUT + N_OUT  # 319
+# Were N_IN=65 / N_H1=4 / N_H2=4 / N_OUT=7 / N_WEIGHTS=319 -- the Germany50
+# checkpoint's shape, written here as if it were the module's shape. Nothing in
+# the generator reads them any more (every entry point takes `features`,
+# `n_out` and `hidden_dims`), so they are resolved lazily and only for the one
+# caller that wants "the configured model's shape".
+def reference_shape():
+    """{n_in, n_out, hidden_dims, n_weights} of the configured model."""
+    import model_meta as _mm
+    sh = _mm.derive_shape(
+        _mm.load_model_meta(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "weights.json")),
+        topology_config=_mm.load_topology_config())
+    dims = list(sh["hidden_dims"])
+    sizes = [sh["n_in"]] + dims + [sh["n_out"]]
+    n_w = sum(sizes[i] * sizes[i + 1] + sizes[i + 1] for i in range(len(sizes) - 1))
+    return {"n_in": sh["n_in"], "n_out": sh["n_out"],
+            "hidden_dims": dims, "n_weights": n_w}
 
 _COMMON_STRUCTS = r"""
 #include <uapi/linux/if_ether.h>
@@ -579,8 +592,8 @@ def generate_ebpf_hardcoded(
     model_id: int = 0,
     ifindex_table: list = None,
     include_header: bool = True,
-    n_interfaces: int = 6,
-    n_nodes: int = 52,
+    n_interfaces: int = None,
+    n_nodes: int = None,
     hidden_dims: tuple = (4, 4),
     features: list = None,
     n_out: int = None,
@@ -628,7 +641,17 @@ def generate_ebpf_hardcoded(
     dims = [int(d) for d in hidden_dims]
 
     if features is None:
-        _shape = _model_meta.derive_shape({"n_interfaces": n_interfaces, "n_nodes": n_nodes})
+        # n_interfaces/n_nodes default to the SCENARIO, not to 6/52. Those
+        # literals in the signature meant a caller who passed neither got
+        # the Germany50 widths for whatever model it was generating.
+        _meta = dict(_model_meta.load_model_meta(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.json")))
+        if n_interfaces is not None:
+            _meta["n_interfaces"] = n_interfaces
+        if n_nodes is not None:
+            _meta["n_nodes"] = n_nodes
+        _shape = _model_meta.derive_shape(
+            _meta, topology_config=_model_meta.topology_config_for(_meta))
         features = _shape["features"]
         n_out = _shape["n_out"]
     if n_out is None:
@@ -768,8 +791,8 @@ def _dense_vector_maps_for(features: list) -> dict:
 
 def build_combined_hardcoded_source(
     models: list,
-    n_interfaces: int = 6,
-    n_nodes: int = 52,
+    n_interfaces: int = None,
+    n_nodes: int = None,
     hidden_dims: tuple = (4, 4),
     features: list = None,
     n_out: int = None,
@@ -783,15 +806,25 @@ def build_combined_hardcoded_source(
 
     Feature descriptor: pass `features` (+ `n_out`) for a heterogeneous
     feature set, or leave them None to build the historical default
-    descriptor from n_interfaces/n_nodes (n_out from the descriptor) -- keeps
-    every existing caller (tests, benches) working unchanged.
+    descriptor from the scenario's n_interfaces/n_nodes (n_out from the model
+    descriptor). Pass n_interfaces/n_nodes only to override the scenario.
 
     Returns one compilation unit: header (incl. the dense_vector maps the
     descriptor needs + model_progs) + dispatcher + one model_<id> function
     per entry in `models`.
     """
     if features is None:
-        _shape = _model_meta.derive_shape({"n_interfaces": n_interfaces, "n_nodes": n_nodes})
+        # n_interfaces/n_nodes default to the SCENARIO, not to 6/52. Those
+        # literals in the signature meant a caller who passed neither got
+        # the Germany50 widths for whatever model it was generating.
+        _meta = dict(_model_meta.load_model_meta(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.json")))
+        if n_interfaces is not None:
+            _meta["n_interfaces"] = n_interfaces
+        if n_nodes is not None:
+            _meta["n_nodes"] = n_nodes
+        _shape = _model_meta.derive_shape(
+            _meta, topology_config=_model_meta.topology_config_for(_meta))
         features = _shape["features"]
         n_out = _shape["n_out"]
     if n_out is None:
@@ -820,7 +853,7 @@ def build_combined_hardcoded_source(
 # the combined hardcoded source.
 # ---------------------------------------------------------------------------
 def load_and_generate(
-    model_path: str = "shared/frr_germany50_5_model_4x2.pt",
+    model_path: str = None,
     model_id: int = 0,
     ifindex_table: list = None,
     meta: dict = None,
@@ -917,12 +950,14 @@ def __getattr__(name):
     it on first attribute access keeps the name working for any external
     caller while costing importers nothing."""
     if name == "EBPF_PROGRAM":
-        return build_combined_hardcoded_source([(0, [0] * N_WEIGHTS, 128, None)])
+        return build_combined_hardcoded_source(
+            [(0, [0] * reference_shape()["n_weights"], 128, None)])
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":
     import sys
-    model_path = sys.argv[1] if len(sys.argv) > 1 else "shared/frr_germany50_5_model_4x2.pt"
+    model_path = (sys.argv[1] if len(sys.argv) > 1
+                  else _model_meta.default_checkpoint())
     src, w, s = load_and_generate(model_path)
     print(src)

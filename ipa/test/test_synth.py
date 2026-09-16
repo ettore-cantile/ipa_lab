@@ -23,8 +23,8 @@ What is actually checked
   determinism     same seed -> byte-identical artefacts; different seed ->
                   different weights.
 
-    python3 shared/test/test_synth.py
-    sudo python3 shared/test/test_synth.py --kernel
+    python3 ipa/test/test_synth.py
+    sudo python3 ipa/test/test_synth.py --kernel
 """
 
 import argparse

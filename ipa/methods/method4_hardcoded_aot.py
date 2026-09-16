@@ -23,8 +23,8 @@ every (re)load, while keeping the literal-weights performance.
 
 Topology dimensions (n_interfaces, n_nodes, n_queues) come from
 topology_config.json — a file that describes the NETWORK TOPOLOGY shared
-by all nodes in the same deployment. If absent, DEFAULT_TOPOLOGY_CONFIG
-(historical 6/52) is used.
+by all nodes in the same deployment. If absent, the descriptor's `trained_on`
+block is used; the engine has no built-in topology.
 
 The problem (measured, method4 BCC path -- the "[M1 update timing]" line printed
 by verify_prog_run.py / test_suite.py --only kernel):
@@ -72,10 +72,10 @@ Requires (on the VM/build box): clang, llvm, libbpf-dev, linux headers.
     sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)
 
 Run:
-    sudo python3 shared/methods/method4_hardcoded_aot.py
-    sudo python3 shared/methods/method4_hardcoded_aot.py \\
-        --model shared/frr_germany50_5_model_4x2.pt
-    sudo python3 shared/methods/method4_hardcoded_aot.py \\
+    sudo python3 ipa/methods/method4_hardcoded_aot.py
+    sudo python3 ipa/methods/method4_hardcoded_aot.py \\
+        --model ipa/<checkpoint>.pt
+    sudo python3 ipa/methods/method4_hardcoded_aot.py \\
         --topology-config /etc/ipa/topology_config.json
 """
 
@@ -137,7 +137,8 @@ def main():
     args = ap.parse_args()
     args.model = _resolve_cli_path(args.model)
 
-    model_path = args.model or os.path.join(SHARED_DIR, "frr_germany50_5_model_4x2.pt")
+    from model_meta import default_checkpoint
+    model_path = args.model or default_checkpoint()
 
     # ------------------------------------------------------------------
     # Step 0: load topology_config (authoritative network dimensions) and
@@ -194,7 +195,7 @@ def main():
             f"{os.path.relpath(o_path, _ORIGINAL_CWD)}.\n"
             f"      AOT-literal is the only hardcoded deploy backend now (BCC live-attach\n"
             f"      was removed at the professor's request). Build the .o OFFLINE on a\n"
-            f"      box with clang (python3 shared/methods/method4_hardcoded_aot.py),\n"
+            f"      box with clang (python3 ipa/methods/method4_hardcoded_aot.py),\n"
             f"      then copy nn_aot_arch.o onto this node.")
 
     loader_c   = os.path.join(POC_DIR, "loader_aot.c")
@@ -215,7 +216,7 @@ def main():
             f"{os.path.relpath(loader_bin, _ORIGINAL_CWD)}.\n"
             f"      Build it ONCE on a box with a C compiler + libbpf-dev/libelf-dev/"
             f"zlib1g-dev\n      (e.g. the host, not inside kathara exec):\n"
-            f"          python3 shared/methods/method4_hardcoded_aot.py\n"
+            f"          python3 ipa/methods/method4_hardcoded_aot.py\n"
             f"      The binary is statically linked (no runtime libbpf.so needed), and "
             f"since\n      shared/ is bind-mounted into every Kathara node, building it once "
             f"on the\n      host makes it immediately available on every node -- no copy step.")

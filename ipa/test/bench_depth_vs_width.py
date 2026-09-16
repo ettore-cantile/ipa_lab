@@ -46,9 +46,9 @@ XDP_DROP -- the map lookup cost is the same either way, so it does not bias
 the timing.
 
 Run on Linux (Kathara or bare VM) with bcc installed:
-    sudo python3 shared/test/bench_depth_vs_width.py
-    sudo python3 shared/test/bench_depth_vs_width.py --repeat 5000
-    sudo python3 shared/test/bench_depth_vs_width.py --descriptor no_onehot
+    sudo python3 ipa/test/bench_depth_vs_width.py
+    sudo python3 ipa/test/bench_depth_vs_width.py --repeat 5000
+    sudo python3 ipa/test/bench_depth_vs_width.py --descriptor no_onehot
 """
 import os
 import sys

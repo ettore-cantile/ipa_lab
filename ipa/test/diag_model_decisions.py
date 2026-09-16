@@ -19,8 +19,8 @@ If the answer is one, the datapath is a very fast way of computing a constant,
 and no amount of pipeline engineering changes that.
 
 Usage:
-    python3 shared/test/diag_model_decisions.py
-    python3 shared/test/diag_model_decisions.py --weights /shared/weights.json
+    python3 ipa/test/diag_model_decisions.py
+    python3 ipa/test/diag_model_decisions.py --weights /shared/weights.json
 """
 
 import argparse

@@ -1,0 +1,10 @@
+{
+  "_comment": "Scenario dimensions for the Germany50 SNDlib topology as emitted by genera_lab.py. Deploy this to /etc/ipa/topology_config.json on each node, or point $IPA_TOPOLOGY_CONFIG at it. The engine has no built-in values: these numbers used to live as DEFAULT_TOPOLOGY_CONFIG inside model_meta.py.",
+  "topology": "germany50",
+  "n_interfaces": 6,
+  "n_nodes": 52,
+  "n_queues": 4,
+  "_n_interfaces_note": "Largest node degree in the network, NOT this node's degree. karlsruhe reaches 6 once h_src is attached; the rest range from 2 to 6 and pad the unused link_state slots with zeros.",
+  "_n_nodes_note": "50 SNDlib routers + h_src + h_dst.",
+  "_n_queues_note": "Declared for completeness. The checked-in model's feature descriptor has no queue_occupancy feature, so nothing reads this."
+}

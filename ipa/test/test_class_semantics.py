@@ -17,8 +17,8 @@ Case B is the checked-in model's REAL semantics: its trained DROP class is 5
 (dataset.py maps label -1 to max(label)+1 = 5) while the datapath used to
 hardcode 6. Case B therefore doubles as a regression test for that bug.
 
-    python3 shared/test/test_class_semantics.py
-    sudo python3 shared/test/test_class_semantics.py --kernel
+    python3 ipa/test/test_class_semantics.py
+    sudo python3 ipa/test/test_class_semantics.py --kernel
 """
 
 import argparse
