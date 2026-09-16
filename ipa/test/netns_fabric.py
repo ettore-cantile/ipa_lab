@@ -12,11 +12,17 @@ let alone that it leaves on the port the model chose.
 
 This module builds the missing half on a plain Linux box:
 
-    ipa0  <--veth-->  ipa0p        port 0, the ingress (XDP attaches here)
-    ipa1  <--veth-->  ipa1p        port 1
-    ...                            one pair per logical port
+    ipain <--veth-->  ipainp       the ingress (XDP attaches here)
+    ipa0  <--veth-->  ipa0p         logical port 0
+    ipa1  <--veth-->  ipa1p         logical port 1
+    ...                             one pair per logical port
 
-Inject a frame on ipa0p, and it arrives at ipa0 as ingress traffic. The XDP
+The ingress is DEDICATED, not one of the logical ports. When it was port 0, a
+class forwarding on port 0 redirected the frame back out the interface it
+arrived on, where the capture cannot tell it from the frame just injected --
+so a correct decision on port 0 was unobservable by construction.
+
+Inject a frame on ipainp, and it arrives at ipain as ingress traffic. The XDP
 program runs for real, in native mode, and bpf_redirect() moves the frame to
 ipaK, which delivers it out ipaKp -- where a raw socket is waiting. What comes
 back is the answer to the question TEST_RUN cannot ask: did the packet come out
@@ -131,21 +137,19 @@ class NetnsFabric:
     Attributes after __enter__:
       port_to_iface   {logical_port: iface}    -> NodeConfig.resolve(...)
       peer_of         {logical_port: iface}    the far side of each pair
-      ingress         the interface a pipeline attaches XDP to (port 0)
+      ingress         the dedicated interface a pipeline attaches XDP to
+      ingress_peer    where frames are injected to arrive on `ingress`
+      ingress_ifindex kernel ifindex of `ingress`
       ifindex_of      {logical_port: ifindex}
       pass_attached   ports whose peer carries the XDP_PASS stub
     """
 
     def __init__(self, n_ports: int = 5, prefix: str = DEFAULT_PREFIX,
-                 ingress_port: int = 0, enable_redirect: bool = True,
-                 verbose: bool = True):
+                 enable_redirect: bool = True, verbose: bool = True):
         if n_ports < 1:
             raise ValueError("n_ports must be >= 1")
-        if not 0 <= ingress_port < n_ports:
-            raise ValueError(f"ingress_port {ingress_port} outside [0, {n_ports})")
         self.n_ports = n_ports
         self.prefix = prefix
-        self.ingress_port = ingress_port
         self.enable_redirect = enable_redirect
         self.verbose = verbose
 
@@ -153,6 +157,9 @@ class NetnsFabric:
         self.peer_of = {}
         self.ifindex_of = {}
         self.pass_attached = []
+        self.ingress = None             # dedicated, never a logical port
+        self.ingress_peer = None
+        self.ingress_ifindex = None
         self._bpf = None
         self._socks = {}
         self._built = False
@@ -164,9 +171,8 @@ class NetnsFabric:
     def _peer(self, port):
         return f"{self.prefix}{port}p"
 
-    @property
-    def ingress(self):
-        return self.port_to_iface[self.ingress_port]
+    def _ingress_names(self):
+        return f"{self.prefix}in", f"{self.prefix}inp"
 
     # -- lifecycle ---------------------------------------------------------
     def build(self):
@@ -187,8 +193,12 @@ class NetnsFabric:
             cleanup(self.prefix, verbose=False)
 
         import socket as _socket
-        for port in range(self.n_ports):
-            a, b = self._name(port), self._peer(port)
+
+        # The dedicated ingress first, then one pair per logical port.
+        pairs = [(None, *self._ingress_names())]
+        pairs += [(port, self._name(port), self._peer(port))
+                  for port in range(self.n_ports)]
+        for port, a, b in pairs:
             _run(["ip", "link", "add", a, "type", "veth", "peer", "name", b])
             # No IPv6 on a fabric interface: the kernel would send MLD and
             # router solicitations on every fresh veth, and that traffic lands
@@ -198,14 +208,18 @@ class NetnsFabric:
                       f"net.ipv6.conf.{end}.disable_ipv6=1"], check=False)
             _run(["ip", "link", "set", a, "up"])
             _run(["ip", "link", "set", b, "up"])
-            self.port_to_iface[port] = a
-            self.peer_of[port] = b
-            self.ifindex_of[port] = _socket.if_nametoindex(a)
+            if port is None:
+                self.ingress, self.ingress_peer = a, b
+                self.ingress_ifindex = _socket.if_nametoindex(a)
+            else:
+                self.port_to_iface[port] = a
+                self.peer_of[port] = b
+                self.ifindex_of[port] = _socket.if_nametoindex(a)
 
         self._built = True
         if self.verbose:
-            print(f"[fabric] {self.n_ports} veth pair(s), ingress={self.ingress}"
-                  f" (ifindex={self.ifindex_of[self.ingress_port]})")
+            print(f"[fabric] {self.n_ports} port pair(s) + a dedicated ingress "
+                  f"{self.ingress} (ifindex={self.ingress_ifindex})")
 
         if self.enable_redirect:
             self._attach_pass_stubs()
@@ -297,10 +311,14 @@ class NetnsFabric:
         return self
 
     def send(self, frame: bytes, port: int = None):
-        """Inject `frame` on a port's PEER, so it arrives as ingress traffic."""
-        port = self.ingress_port if port is None else port
-        s = self._sock(self.peer_of[port])
-        s.send(frame)
+        """Inject `frame` so it arrives on the ingress interface.
+
+        With no `port` the frame goes to the dedicated ingress peer, which is
+        not one of the logical ports -- so every port, port 0 included, stays
+        observable as a destination.
+        """
+        iface = self.ingress_peer if port is None else self.peer_of[port]
+        self._sock(iface).send(frame)
 
     def capture(self, timeout: float = 0.5, ports=None, match=None):
         """Read one frame from whichever peer produces one first.
@@ -320,8 +338,6 @@ class NetnsFabric:
         ports = list(range(self.n_ports)) if ports is None else list(ports)
         watch = {}
         for p in ports:
-            if p == self.ingress_port:
-                continue            # the frame we injected is not a result
             watch[self._sock(self.peer_of[p]).fileno()] = p
 
         deadline = time.time() + timeout
@@ -382,6 +398,8 @@ def main():
 
     try:
         with NetnsFabric(n_ports=a.n_ports, prefix=a.prefix) as fab:
+            print(f"[fabric] ingress    : {fab.ingress} "
+                  f"(ifindex {fab.ingress_ifindex}), peer {fab.ingress_peer}")
             print(f"[fabric] ports      : {fab.port_to_iface}")
             print(f"[fabric] peers      : {fab.peer_of}")
             print(f"[fabric] ifindexes  : {fab.ifindex_of}")

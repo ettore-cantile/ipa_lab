@@ -186,7 +186,7 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
         if verbose:
             info(f"mac_table: {installed}")
 
-        ingress_ifx = fab.ifindex_of[fab.ingress_port]
+        ingress_ifx = fab.ingress_ifindex
         if not 1 <= ingress_ifx <= 6:
             info(f"ingress ifindex is {ingress_ifx}, outside the [1,6] the "
                  f"ingress_iface one-hot covers: that feature contributes "
