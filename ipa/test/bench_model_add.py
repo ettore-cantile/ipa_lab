@@ -16,7 +16,7 @@ Needs Linux + BCC + root (loads real XDP programs, never attaches them).
 
 Usage:
     sudo python3 ipa/test/bench_model_add.py
-    sudo python3 ipa/test/bench_model_add.py --n-models 3 --model /shared/<checkpoint>.pt
+    sudo python3 ipa/test/bench_model_add.py --n-models 3 --model ipa/<checkpoint>.pt
     sudo python3 ipa/test/bench_model_add.py
 """
 import os

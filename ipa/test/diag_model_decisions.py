@@ -20,7 +20,7 @@ and no amount of pipeline engineering changes that.
 
 Usage:
     python3 ipa/test/diag_model_decisions.py
-    python3 ipa/test/diag_model_decisions.py --weights /shared/weights.json
+    python3 ipa/test/diag_model_decisions.py --weights ipa/weights.json
 """
 
 import argparse
@@ -63,7 +63,7 @@ def infer(w, ttl, link_state, node, ifindex=None,
     Feature layout of the default descriptor (see model_meta): link_state at
     columns 0..5, ingress_iface one-hot at 6..11, ttl at 12, node one-hot at
     13..64. `ifindex=None` means the ingress_iface feature contributes nothing,
-    which is what happens on a real Kathara node (the kernel ifindex is far
+    which is what happens on a real node (the kernel ifindex is far
     outside the one-hot range) -- see the known limitation in the README.
     """
     fc1_w, fc1_b = 0, n_in * h

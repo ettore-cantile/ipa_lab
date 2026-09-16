@@ -28,7 +28,7 @@ Compatibility notes with the existing codebase:
   - All three programs (dispatcher + layer_first + layer_hidden) compiled
     from EBPF_MODULAR_FULL so BCC sees them as a single compilation unit
 
-Files used (paths resolved relative to this file, not hardcoded /shared/):
+Files used (paths resolved relative to this file, not hardcoded absolute paths):
   ../weights.json       : int8 weights (319 values)
   ../weights_float.json : float weights + scale_factor
 """

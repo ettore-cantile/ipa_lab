@@ -111,7 +111,7 @@ For the full metric comparison across pipelines:
     # ------------------------------------------------------------------
     # Step 1: extract weights (produces weights.json + weights_float.json)
     # Skip if both files already exist — extract_weights.py requires torch
-    # which is NOT available inside Kathara containers.  The pre-built JSON
+    # which is NOT available inside a stripped container image.  The pre-built JSON
     # files checked into the repo are sufficient for all three pipelines.
     # ------------------------------------------------------------------
     weights_path = os.path.join(SHARED_DIR, "weights.json")
@@ -159,7 +159,7 @@ For the full metric comparison across pipelines:
             # Forward the RESOLVED model_path, not args.model: this process has
             # already os.chdir'd into SHARED_DIR, so method4_hardcoded.py's own
             # default ("shared/frr_...pt", relative) would resolve to
-            # shared/shared/frr_...pt and fail to load.
+            # ipa/ipa/frr_...pt and fail to load.
             sys.argv = ["method4_hardcoded.py", "--verify-only",
                         "--iface", args.iface,
                         "--model-id", str(args.model_id),

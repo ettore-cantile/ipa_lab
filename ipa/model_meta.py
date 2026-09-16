@@ -529,7 +529,7 @@ def verify_shape_vs_checkpoint(shape: dict, model_path: str) -> None:
     try:
         import torch
     except ImportError:
-        # Deployment nodes (e.g. Kathara containers) run from the prebuilt
+        # Deployment nodes without torch run from the prebuilt
         # weights.json and have no torch/.pt. The checkpoint N_IN cross-check is
         # a dev-machine safety net, not a runtime requirement -- skip it here
         # instead of hard-failing the whole pipeline.

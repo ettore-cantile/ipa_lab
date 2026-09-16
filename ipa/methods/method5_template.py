@@ -23,7 +23,7 @@ Compatibility notes with the existing codebase:
   - pkt_stats_t2 map is used instead of pkt_stats
   - mac_table_t2 (class -> ifindex + MACs) resolves the L2 next-hop after argmax
 
-Files used (paths resolved relative to this file, not hardcoded /shared/):
+Files used (paths resolved relative to this file, not hardcoded absolute paths):
   ../weights.json       : int8 weights (319 values)
   ../weights_float.json : float weights + scale_factor
 """

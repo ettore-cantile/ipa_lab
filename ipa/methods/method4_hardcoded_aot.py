@@ -12,7 +12,7 @@ never runs on the datapath node in production, so it is a separate concern
 from what this script does.
 
 loader_aot (built below) is statically linked against libbpf (+ libelf,
-zlib): the Kathara node images used in this lab have neither clang nor
+zlib): stripped node images typically have neither clang nor
 libbpf installed, so a dynamically-linked loader copied there would fail to
 even start ("cannot open shared object file") -- the whole point of
 building it elsewhere is defeated if it still needs libbpf.so present on
@@ -209,27 +209,27 @@ def main():
     needs_build = (not os.path.exists(loader_bin)
                   or os.path.getmtime(loader_bin) < os.path.getmtime(loader_c))
     if needs_build and not shutil.which(args.cc):
-        # Same fallback pattern as the model .o above: Kathara node images
+        # Same fallback pattern as the model .o above: stripped node images
         # have no C compiler at all (no clang, no cc/gcc), so the loader --
         # like the model .o -- must be built ONCE on a box that has one
         # (with libbpf-dev/libelf-dev/zlib1g-dev for the static link below),
         # then the resulting binary just needs to exist at this same path
         # (shared/poc_aot/loader_aot) -- e.g. built directly on the host,
-        # which shares this directory with every Kathara node via the bind
+        # which is shared with every node via the bind
         # mount, so no manual copy step is needed once it is built there.
         sys.exit(
             f"[AOT] '{args.cc}' not found on this node and no prebuilt "
             f"{os.path.relpath(loader_bin, _ORIGINAL_CWD)}.\n"
             f"      Build it ONCE on a box with a C compiler + libbpf-dev/libelf-dev/"
-            f"zlib1g-dev\n      (e.g. the host, not inside kathara exec):\n"
+            f"zlib1g-dev\n      (e.g. a build host):\n"
             f"          python3 ipa/methods/method4_hardcoded_aot.py\n"
             f"      The binary is statically linked (no runtime libbpf.so needed), and "
-            f"since\n      shared/ is bind-mounted into every Kathara node, building it once "
+            f"since\n      the directory is shared with every node, building it once "
             f"on the\n      host makes it immediately available on every node -- no copy step.")
     if needs_build:
         # Statically link libbpf so the resulting binary has NO runtime
         # dependency on libbpf.so being installed on the datapath node --
-        # Kathara node images may lack libbpf, so a dynamically-linked
+        # stripped node images may lack libbpf, so a dynamically-linked
         # loader_aot copied there would fail to even start ("cannot open
         # shared object file"). Only libc stays dynamic.
         #
@@ -243,7 +243,7 @@ def main():
         # binary still links glibc DYNAMICALLY, and a glibc binary is not
         # backward compatible -- built on a newer glibc (e.g. the host's
         # Ubuntu) it fails on an older one ("GLIBC_2.38 not found") on the
-        # Kathara node. The fix is a FULLY static binary (-static, glibc
+        # deployment node. The fix is a FULLY static binary (-static, glibc
         # included): loader_aot only makes bpf syscalls + file I/O, no
         # hostname resolution / dlopen, so fully-static is safe here. So the
         # preferred attempts pass -static; the non-static ones are kept only
@@ -273,7 +273,7 @@ def main():
         if built and not won_fully_static:
             # Linked, but glibc is dynamic: this binary runs only where the
             # node's glibc is >= the build host's. On this lab that produced
-            # "GLIBC_2.38 not found" on the Kathara node. Warn loudly instead
+            # "GLIBC_2.38 not found" on the deployment node. Warn loudly instead
             # of pretending the build is deployable everywhere.
             print("[AOT] WARNING: the fully-static (-static) link did not succeed, so this")
             print("      loader links glibc DYNAMICALLY and may fail on a node with an OLDER")
@@ -284,11 +284,11 @@ def main():
         if not built:
             print("[AOT] static link failed on all attempts. Full ld error:")
             print("      " + "\n      ".join(last_err.strip().splitlines()[-8:]))
-            print("[AOT] To fix the STATIC link (needed for Kathara nodes without libbpf.so):")
+            print("[AOT] To fix the STATIC link (needed on nodes without libbpf.so):")
             print("      sudo apt-get install libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev")
             print("[AOT] Falling back to DYNAMIC -lbpf. WARNING: this binary needs libbpf.so at")
             print("      runtime -- it will NOT run on a node that lacks it (check with:")
-            print("      kathara exec <node> -- ldconfig -p | grep bpf).")
+            print("      ldconfig -p | grep bpf on the node).")
             rc, out, err = _run([args.cc, "-O2", loader_c, "-o", loader_bin, "-lbpf"], cwd=POC_DIR)
             if rc != 0:
                 sys.exit(f"[AOT] loader build failed even dynamically (rc={rc}):\n{err}\n"
@@ -340,7 +340,7 @@ def main():
         # Only the generated .c is disposable. The .o must SURVIVE: it is the
         # prebuilt artifact the no-clang deploy path reuses (see the
         # "reusing prebuilt" branch above, and the --iface live deploy), and
-        # shared/ is bind-mounted into every Kathara node -- deleting it here
+        # the build directory may be shared with the nodes -- deleting it here
         # meant a single bench run on the host wiped the object the datapath
         # nodes load.
         try:

@@ -179,11 +179,10 @@ N_WEIGHTS_T2 = _LazyWeightCount()
 
 # Binding libc at import time made this module Linux-only to IMPORT, not just
 # to run -- and the biggest thing it exports is C source text, which is
-# generated offline precisely so the node needs no toolchain. The AOT
-# translator (poc_aot/bcc_to_libbpf.py) has to read these strings on whatever
-# machine does the build. Bound lazily: _bpf_syscall() raises if it is actually
-# needed and unavailable, which is the point where a caller genuinely needs a
-# kernel.
+# generated offline precisely so the node needs no toolchain, and read by
+# tooling that may run anywhere. Bound lazily: the syscall helpers raise if
+# libc is actually needed and unavailable, which is the point where a caller
+# genuinely needs a kernel.
 _libc = None
 
 
@@ -292,7 +291,7 @@ EBPF_TEMPLATE_ARCH_DISPATCHER = r"""
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
 
-/* Same fallback ebpf_program.py carries: some Kathara/minimal-header setups do
+/* Same fallback ebpf_program.py carries: some minimal-header setups do
  * not get IPPROTO_UDP from the includes above. RFC 791 value. */
 #ifndef IPPROTO_UDP
 #define IPPROTO_UDP 17
@@ -495,7 +494,7 @@ int ipa_switch_template(struct xdp_md *ctx) {
     /* Same FIX(#4) Pipeline 1 already applies (see ebpf_program.py): read the
      * protocol at its absolute RFC 791 offset (byte 9) instead of ip->protocol,
      * because struct iphdr's ihl:4/version:4 bitfield can be packed differently
-     * by clang against the minimal headers in the Kathara images, making every
+     * by clang against minimal container headers, making every
      * UDP packet fail the check; and derive the UDP header from the real ihl*4
      * instead of sizeof(struct iphdr), which is wrong when IP options present. */
     __u8 ip_proto = *((__u8 *)ip + 9);

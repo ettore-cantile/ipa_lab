@@ -8,7 +8,7 @@ Three things were conflated before this file existed:
 None of those equalities holds. `install_mac_per_class` keyed mac_table by
 CLASS and assumed class k lived on `eth{k}`; the Pipeline 1 codegen assumed
 kernel ifindexes ran 2..7; P2/P3 used the raw ifindex clamped into the one-hot
-range. On a real Kathara node the ifindexes are 201/209/217..., so all three
+range. On a real node the ifindexes are 201/209/217..., so all three
 assumptions were wrong in different ways.
 
 Here the chain is explicit and each arrow is a separate lookup:

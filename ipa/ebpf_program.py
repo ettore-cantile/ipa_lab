@@ -72,9 +72,10 @@ Verifier constraints (why the sparse route's codegen is shaped this way):
      static const array) because it goes through the normal map helper,
      not a relocated global symbol.
 
-  4) ip->protocol bitfield ambiguity on BCC/Kathara (DBG_NOT_UDP=100%):
+  4) ip->protocol bitfield ambiguity on BCC with minimal headers
+     (DBG_NOT_UDP=100%):
      struct iphdr declares ihl:4,version:4 as a bitfield at byte 0.
-     On BCC with minimal kernel headers inside Kathara containers,
+     On BCC with minimal kernel headers inside a stripped container image,
      Clang's packing of this bitfield can cause ip->protocol (byte 9)
      to be read at the wrong offset, making ALL UDP packets fail the
      IPPROTO_UDP check even though tcpdump confirms proto=17.
@@ -126,7 +127,7 @@ _COMMON_STRUCTS = r"""
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
 
-/* Fallback: in some Kathara/minimal-header environments IPPROTO_UDP may
+/* Fallback: in some minimal-header environments IPPROTO_UDP may
  * not be defined via the includes above. Hardcode the RFC 791 value. */
 #ifndef IPPROTO_UDP
 #define IPPROTO_UDP 17
@@ -934,7 +935,7 @@ def load_and_generate(
             with open(weights_float_path) as f:
                 scale = int(json.load(f)["scale_factor"])
         else:
-            # Deriving scale from the .pt needs torch; deployment nodes (Kathara)
+            # Deriving scale from the .pt needs torch; deployment nodes
             # have no torch and run from the prebuilt json instead. Fall back to
             # the json/meta scale rather than hard-failing.
             try:

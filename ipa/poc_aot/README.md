@@ -34,7 +34,7 @@ apples-to-apples with `test_suite --kernel` hardcoded.
 Usually you don't run these by hand — `ipa/methods/method4_hardcoded_aot.py`
 orchestrates generate → clang → loader and prints the comparison vs BCC.
 
-## Run (on the Linux host / Kathara — needs root)
+## Run (Linux + root)
 
 ```sh
 sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)   # once

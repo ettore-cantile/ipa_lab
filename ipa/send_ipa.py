@@ -5,8 +5,8 @@ send_ipa.py - Send IPA packet(s) with paper-compliant header.
 Usage (originale, single packet):
   python3 send_ipa.py <dst> [model_id] [weights_json]
 
-Usage (Kathara test, multi-packet with variable TTL):
-  python3 send_ipa.py --dst frankfurt --count 100 --model-id 0 --weights /shared/weights.json
+Usage (multi-packet with variable TTL):
+  python3 send_ipa.py --dst frankfurt --count 100 --model-id 0 --weights ipa/weights.json
   python3 send_ipa.py --dst frankfurt --count 100 --ttl-min 30 --ttl-max 64
   python3 send_ipa.py --dst frankfurt --count 500 --interval 0.002
 

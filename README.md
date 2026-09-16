@@ -1,6 +1,6 @@
 # IPA Lab — Intelligent PAckets with eBPF
 
-This repository contains the lab implementation of **Intelligent PAckets (IPA)** with an eBPF-accelerated data plane, developed on top of the [Kathara](https://github.com/KatharaFramework/Kathara) network emulator. The goal is to embed compact machine learning models directly inside packet headers and execute per-hop inference to achieve adaptive, mission-driven forwarding decisions — without any control-plane signaling.
+This repository contains the lab implementation of **Intelligent PAckets (IPA)** with an eBPF-accelerated data plane, verified on a real Linux kernel datapath. The goal is to embed compact machine learning models directly inside packet headers and execute per-hop inference to achieve adaptive, mission-driven forwarding decisions — without any control-plane signaling.
 
 The work extends the original proof-of-concept by Polverini, Cianfrani, and Listanti (Sapienza University of Rome / University of Molise) with a kernel-space eBPF/XDP forwarding engine that performs MLP inference at line rate.
 
@@ -53,12 +53,10 @@ The experimental setup uses the **Germany50** topology from the [SNDlib reposito
 > is `50 + 2`. The model and the environment agree exactly — there is no padding
 > and no mismatch to explain away.
 >
-> `genera_lab.py` previously emitted only the 50 routers, giving a lab of 50
-> nodes with max degree 5. That made the checkpoint's 6/52 look like dimensions
-> invented for no reason, with `link_state[5]` permanently 0 and egress class 5
-> a permanent MISS on every node. The generator now emits the hosts, so the lab
-> is the topology the model was trained for. Run `genera_lab.py` and it reports
-> the check explicitly:
+> These two numbers are recorded in `topologies/germany50/topology_config.json`
+> and in the checkpoint's own `trained_on` block, and the engine reads them from
+> there. They are properties of the network the model was trained on, not
+> constants of the engine.
 >
 > ```
 > Max node degree: 6 (karlsruhe, interfaces eth0..eth5)
@@ -84,9 +82,9 @@ it rather than letting it look like a fault:
   unusable* ones, and prints the node's degree alongside.
 - `n_fwd` comes from the model's `n_out - 1`, not a literal 6.
 
-All of this lives in [`experiments/kathara_germany50/`](experiments/kathara_germany50/), not in the engine. `germany50.xml` is the SNDlib topology; `genera_lab.py` parses it and emits the Kathara lab into `lab/` (`lab.conf` with collision domains and interface assignment, plus one `<node>.startup` per node: IP addressing, loopbacks, `/etc/hosts`, FRR/OSPF). `make_lab.py` then populates `lab/shared/` from `ipa/`. `importSNDLib.py` is a separate analysis helper that loads the same XML into a NetworkX graph for topology statistics and plotting.
+All of this lives in [`topologies/germany50/`](topologies/germany50/), not in the engine. `germany50.xml` is the SNDlib topology the checked-in checkpoint was trained on, kept because it is the provenance of that model: delete it and `n_nodes=52` / `n_interfaces=6` become numbers with no origin. `importSNDLib.py` loads it into a NetworkX graph, for topology statistics and as the way to feed a real topology to the test fabric.
 
-The dimensions those files imply — `n_interfaces=6`, `n_nodes=52` — are written once, in `experiments/kathara_germany50/topology_config.json`, and read by the engine through `$IPA_TOPOLOGY_CONFIG` or `/etc/ipa/topology_config.json`. They are no longer constants inside `model_meta.py`.
+The dimensions those files imply — `n_interfaces=6`, `n_nodes=52` — are written once, in `topologies/germany50/topology_config.json`, and read by the engine through `$IPA_TOPOLOGY_CONFIG` or `/etc/ipa/topology_config.json`. They are no longer constants inside `model_meta.py`.
 
 ---
 
@@ -126,18 +124,11 @@ ipa_lab/
 │       ├── verify_multi_model.py    #      concurrent multi-model registration
 │       └── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost
 │
-├── experiments/                     # 3. BACKEND / SCENARIO — one directory per environment
-│   └── kathara_germany50/           #    the environment this work was evaluated on
+├── topologies/                      # 3. SCENARIO DATA — one directory per network
+│   └── germany50/                   #    the network the checked-in model was trained on
+│       ├── germany50.xml            #      SNDlib topology, 50 routers / 88 links
 │       ├── topology_config.json     #      n_interfaces=6, n_nodes=52, n_queues=4
-│       ├── scenario.json            #      hosts, image, traffic defaults, initial TTL
-│       ├── germany50.xml            #      SNDlib topology
-│       ├── genera_lab.py            #      XML -> lab/lab.conf + lab/<node>.startup
-│       ├── importSNDLib.py          #      XML -> NetworkX (analysis helper)
-│       ├── make_lab.py              #      assembles lab/shared/ from ../../ipa
-│       ├── Dockerfile               #      kathara/frr_ebpf image
-│       ├── host_setup/              #      fix_bpf.sh, fetch_host_headers.sh
-│       ├── traffic/                 #      send_ipa.py, recv_ipa.py, test_ipa.py, send/recv test
-│       └── lab/                     #      GENERATED, untracked: lab.conf, <node>.startup, shared/
+│       └── importSNDLib.py          #      XML -> NetworkX
 │
 └── docs/
     ├── testing.md                   # Test guide + measured results
@@ -148,7 +139,7 @@ ipa_lab/
 ### What "the core does not depend on the scenario" means, concretely
 
 `ipa/` contains no topology numbers, no hostnames, no `germany50.xml`, and no
-Kathara paths. Where `n_interfaces` and `n_nodes` are needed they are resolved,
+emulator paths. Where `n_interfaces` and `n_nodes` are needed they are resolved,
 in order, from:
 
 1. `$IPA_TOPOLOGY_CONFIG`
@@ -169,7 +160,7 @@ You can check both claims:
 
 ```bash
 # no code-level dependency on the experiment
-grep -rnE "import (genera_lab|importSNDLib)|germany50\.xml|lab\.conf|\.startup" ipa/ --include=*.py
+grep -rniE "import importSNDLib|germany50|kathara|topologies/" ipa/ --include=*.py
 
 # generate a full P1 pipeline for a topology that is not Germany50
 cat > /tmp/tiny.json <<'JSON'
@@ -191,21 +182,21 @@ print("link_state width:", "v[3]" in src)                  # True
 PY
 ```
 
-### Running the Kathara/Germany50 experiment
+### Running against a real datapath
 
-Kathara mounts a directory named `shared/` in the lab root at `/shared` inside
-every machine. That convention is why the engine used to live at
-`<repo>/shared/`. It now lives in `ipa/`, and the experiment copies what a node
-needs into its own mount:
+There is no emulator. The tests build their own network out of `veth` pairs on
+the host, attach XDP in **native** mode, inject a frame and read which
+interface it came out of:
 
 ```bash
-cd experiments/kathara_germany50
-python3 genera_lab.py      # lab/lab.conf + lab/<node>.startup
-python3 make_lab.py        # lab/shared/  <- copied from ../../ipa
-cd lab && kathara lstart
+sudo python3 ipa/test/test_fabric.py          # P1/P2/P3, real attach + redirect
+sudo python3 ipa/test/netns_fabric.py --hold  # just the fabric, to deploy onto
+sudo bash ipa/test/probe_env.sh               # what this machine can support
 ```
 
-Full instructions in [experiments/kathara_germany50/README.md](experiments/kathara_germany50/README.md).
+`veth` supports native XDP, so the attach mode is the deployment mode rather
+than a stand-in for it. What is not covered: a physical NIC's driver and DMA,
+and multi-hop forwarding across several nodes.
 
 ---
 
@@ -273,21 +264,20 @@ the historical `65-4-4-7` shape.
 > default) the one-hot therefore fires slot 0 on **every** node, so the feature
 > contributes the same constant everywhere and carries no topological
 > information. Making it a real node feature means seeding a per-node id at
-> startup (each node knows its own name from the Kathara lab) and reading that
+> startup (from the node's own hostname or configuration) and reading that
 > instead of `model_id`.
 
-> **Known limitation — `ingress_iface` is inert on this lab.** P1 maps the kernel
-> ifindex to a logical port through an `ifindex_table` defaulting to `[2..7]`;
-> P2/P3 resolve the argmax class through `class_action_t2`/`class_action_t3`
-> (class -> action + logical port) and then `mac_table_t*[logical port]`. The
-> earlier text here described a raw ifindex clamped to `[1, n_interfaces]`,
-> which the datapath no longer does. Real Kathara nodes get
-> ifindexes like 201/209/217/223, which match neither — so this feature contributes
-> zero on all three pipelines in the live lab. Under `BPF_PROG_TEST_RUN` the
-> sandbox ifindex is 1, which P2/P3 *do* accept and P1 does not, so the two
-> semantics also disagree there (`verify_prog_run.py` models this explicitly with
-> `ref_ifindex = 0 if pipeline == 1 else 1`). Fixing it means resolving real
-> ifindexes at startup and giving P2/P3 an ifindex→port map.
+> **`ingress_iface` used to be inert, and now is not.** The one-hot was indexed
+> by `ctx->ingress_ifindex` directly (P2/P3) or by a switch over a compile-time
+> `[2, 3, ...]` table (P1). Kernel ifindexes are assigned by the kernel and are
+> arbitrary — 205, 217, 229 on a box that has created a few veths — so neither
+> resolved to anything and a trained feature contributed **zero**, with every
+> test still green because none of them checked that it contributed anything.
+> All three pipelines now resolve the kernel ifindex through a runtime
+> `ingress_port` map, filled by the control plane from the node's own
+> interfaces: the mirror of `mac_table` on the ingress side. `test_fabric.py`
+> installs it and the per-class inputs it finds changed accordingly, which is
+> the evidence the feature is live.
 
 ---
 
@@ -379,92 +369,59 @@ travel in-band (a true IPA cache-miss path) is future work; see the discussion i
 
 ### First run after cloning
 
-The Kathara nodes compile eBPF with BCC against the **host's** kernel headers,
-placed into the lab's `shared/` mount by `make_lab.py --link-headers`. Those
-headers are ~114 MB of generated files
-pinned to one exact kernel version, so they are **not tracked in git**. Populate
-them once per machine (and again after a kernel upgrade):
+Nothing to fetch. The engine compiles eBPF with BCC against the host's own
+kernel headers, so a box with `bcc`, `clang` and `linux-headers-$(uname -r)`
+installed is ready. Check what the machine supports:
 
 ```bash
-bash experiments/kathara_germany50/host_setup/fetch_host_headers.sh     # copies /usr/src/linux-headers-$(uname -r)
+sudo bash ipa/test/probe_env.sh
 ```
 
-Without this, every pipeline fails at BPF compilation and `fix_bpf.sh` prints
-the command to run.
+It reports virtualisation, the kernel options that matter (`VETH`, `NET_PKTGEN`,
+BTF), the toolchain, and — the decisive one — whether **native** XDP attaches to
+a `veth`.
 
-### Start the lab
+### Build a network to attach to
 
 ```bash
-cd experiments/kathara_germany50 && python3 genera_lab.py && python3 make_lab.py
-cd lab && kathara lstart   # 52 nodes (50 routers + h_src/h_dst), germany50 topology
-kathara linfo
-kathara lclean      # tear down
+sudo python3 ipa/test/netns_fabric.py --n-ports 5 --hold
 ```
+
+One `veth` pair per logical port plus a dedicated ingress, each peer carrying an
+`XDP_PASS` stub so `bpf_redirect` into a veth works. Ctrl-C tears it all down;
+`--cleanup` removes what a killed run left behind.
 
 ### Attach a pipeline (XDP, on the ingress interface)
 
 ```bash
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method template  --iface eth1 --model-id 0
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method modular   --iface eth1 --model-id 0
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
-
-# load + verifier check only, no attach
-sudo python3 ipa/execute_pipeline.py --method hardcoded --verify-only
-
-# detach a stale program
-kathara exec frankfurt -- ip link set dev eth1 xdp off
+sudo IPA_XDP_MODE=native IPA_IFACE_PATTERN='ipa{i}' \
+  python3 ipa/execute_pipeline.py --method template --iface ipain
 ```
 
-All three populate `mac_table` and `link_state` themselves at startup and print
-live `HIT | MISS | DROP` counters. XDP only sees **ingress** traffic, so attach on
-the interface the traffic arrives on (check with `tcpdump -i any -n udp port 9999`).
+`--method` is `hardcoded` | `template` | `modular`. `--xdp-mode` picks the attach
+mode: `native` (the default; runs in the driver, before the `sk_buff` exists),
+`generic` (runs in `netif_receive_skb`, after it), or `auto` (the kernel decides,
+which means it may quietly give you generic). The mode actually in effect is
+read back from the kernel and printed — a native attach that fails is an error,
+not a silent downgrade, because a silent one makes every measurement
+unattributable.
 
-A failed XDP attach raises — it does not print a warning and carry on — so if a
-pipeline prints `running`, the program really is on the wire. All three detach
-the program and stop the carrier monitor on **any** exit path, not only Ctrl-C.
-
-**Concurrent models are capped by the shared weight block.** `--model-ids` packs
-every registered model into one BPF map entry, so the cap is
-`MAX_WEIGHT_ENTRIES / weights-per-model`:
-
-| | block size | per model (65-4-4-7) | max concurrent models |
-|---|---|---|---|
-| P2 template | `MAX_WEIGHT_ENTRIES` = 1024 | 319 | **3** |
-| P3 modular | `MAX_LAYER_WEIGHT_ENTRIES` = 2048 | 319 | **6** |
-
-Both are checked before the eBPF program is compiled, so asking for more fails
-immediately with the numbers rather than part-way through registration. Raising
-a cap means changing the Python constant **and** the matching `#define` in the
-eBPF source together (keep it a power of two — the datapath masks its weight
-index with `size - 1` to keep a runtime-variable index verifier-safe), and it
-changes the map-memory figures reported by `test_suite.py --only kernel`.
-
-**Pipeline 1 deploys via AOT only.** The BCC live-attach path was removed; the
-`.o` is built offline on a box with clang and the statically linked `loader_aot`
-attaches it on nodes that have neither clang nor `libbpf.so`. Build both once on
-the host, then re-run `experiments/kathara_germany50/make_lab.py` so they reach every node:
+Which interface realises which logical port is a node fact, not a model fact:
 
 ```bash
-sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
-python3 ipa/methods/method4_hardcoded_aot.py     # builds .o + loader, then benches
+IPA_PORT_MAP="0=ipa0,1=ipa1,4=enp0s3"   # exact, per port
+IPA_IFACE_PATTERN="ipa{i}"              # a naming convention
 ```
+
+If a stale program is left on an interface: `sudo ip link set dev ipain xdp off`.
 
 ### Send traffic
 
 ```bash
-# end-to-end, the way the topology is meant to be driven
-kathara exec h_src -- python3 /shared/send_ipa.py --dst h_dst --count 100
-
-# or router-to-router, to exercise a specific hop
-kathara exec darmstadt -- python3 /shared/send_ipa.py --dst frankfurt --count 100
-kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 100 --model-id 0
+sudo python3 ipa/send_ipa.py --dst <host> --count 100 --model-id 0
+sudo python3 ipa/recv_ipa.py
+sudo python3 ipa/test/test_ipa.py --dest <host> --count 100 --model-id 0
 ```
-
-`recv_ipa.py` is only meaningful with **XDP detached**: a TRUE HIT means the
-packet was redirected and never reaches the local IP stack, so the listener
-correctly sees nothing while a pipeline is attached.
-
----
 
 ## Testing
 
@@ -495,28 +452,6 @@ Latency is reported as the **minimum of N independent trials**, not the mean:
 system noise here is one-sided (scheduling and interrupts can only slow a sample
 down, never speed it below its true cost), the same reasoning behind `hyperfine`
 and Google Benchmark.
-
----
-
-## Regenerating the lab
-
-```bash
-python3 genera_lab.py                      # rewrites lab.conf + every <node>.startup
-python3 genera_lab.py --xml other.xml --out /tmp/lab   # different topology / output dir
-python3 genera_lab.py --host h_src=berlin              # attach a host elsewhere
-python3 genera_lab.py --no-hosts                       # bare 50-router backbone
-```
-
-`--host` and `--no-hosts` change the topology the lab presents to the model.
-The defaults (`h_src=karlsruhe`, `h_dst=flensburg`) are the attachment points the
-checked-in checkpoint was trained on; anything else changes `n_nodes` or the max
-degree and the checkpoint no longer matches. The generator prints the resulting
-`N_IN` so the mismatch is visible immediately.
-
-Runs from any working directory and only writes when invoked as a script
-(importing it has no side effects). It prints the node count, link count and max
-node degree it produced — a quick check that the lab matches what the model and
-the docs assume.
 
 ---
 

@@ -97,7 +97,7 @@ Feature encoding (protocol-fixed, independent of hidden depth/width):
 
 Weight storage:
   layer_weights uses an unsigned-byte leaf (__u8). The libbcc build in the
-  Kathara container cannot resolve a signed-byte leaf type, so signedness is
+  container image cannot resolve a signed-byte leaf type, so signedness is
   handled explicitly: the eBPF C code casts each byte to __s8 via LW_W()
   before arithmetic, and load_modular_weights() stores each int8 as
   v & 0xFF (identical two's-complement bits) inside the struct-valued block.
@@ -147,7 +147,7 @@ EBPF_MODULAR_COMMON_HEADER = r"""
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
 
-/* Same fallback ebpf_program.py carries: some Kathara/minimal-header setups do
+/* Same fallback ebpf_program.py carries: some minimal-header setups do
  * not get IPPROTO_UDP from the includes above. RFC 791 value. */
 #ifndef IPPROTO_UDP
 #define IPPROTO_UDP 17
@@ -232,7 +232,7 @@ BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
  * of one helper call per weight byte. Measured before this change: the large
  * majority of P3's 160 map lookups per packet were single-byte weight reads.
  *
- * __u8 storage (not __s8): BCC's str2ctype on the libbcc in the Kathara
+ * __u8 storage (not __s8): BCC's str2ctype on an older libbcc such as the one in a stripped
  * container has no 'signed char', only 'unsigned char'. Sign semantics are
  * preserved -- the eBPF code re-casts each byte to (__s8) via LW_W(). */
 #define MAX_LAYER_WEIGHT_ENTRIES 2048

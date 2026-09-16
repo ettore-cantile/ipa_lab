@@ -21,15 +21,15 @@ realistically sized first packet is still useful, and because an in-band
 cache-miss path would reuse exactly this framing.
 
 Usage:
-  python3 traffic/test_ipa.py [--dest HOST] [--count N] [--delay SEC]
+  python3 ipa/test/test_ipa.py [--dest HOST] [--count N] [--delay SEC]
                       [--model-id ID] [--model-ids ID1 ID2 ...] [--weights-file PATH]
                       [--scale-factor N]
 Examples:
-  python3 traffic/test_ipa.py --dest frankfurt --count 100
-  python3 traffic/test_ipa.py --dest frankfurt --count 50 --model-id 42
-  python3 traffic/test_ipa.py --dest frankfurt --count 50 --model-ids 42 43 44
-  python3 traffic/test_ipa.py --dest frankfurt --count 50 --model-id 42 \
-                      --weights-file /shared/weights.json
+  python3 ipa/test/test_ipa.py --dest frankfurt --count 100
+  python3 ipa/test/test_ipa.py --dest frankfurt --count 50 --model-id 42
+  python3 ipa/test/test_ipa.py --dest frankfurt --count 50 --model-ids 42 43 44
+  python3 ipa/test/test_ipa.py --dest frankfurt --count 50 --model-id 42 \
+                      --weights-file ipa/weights.json
 """
 import argparse
 import time

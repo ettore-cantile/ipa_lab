@@ -405,7 +405,7 @@ _MODE_FLAGS = {"native": XDP_FLAGS_DRV_MODE,
 #
 # This used to be hardcoded to generic (flags=2), and the reason was written
 # into the docstring: generic "works on every device regardless of driver
-# support, which matters for the veth-based interfaces inside Kathara
+# support, which mattered for veth interfaces inside the stripped
 # containers". That justification came from the emulator, not from the design.
 # Generic XDP runs inside netif_receive_skb -- after the kernel has already
 # allocated the sk_buff -- which is later and slower than native XDP and is NOT

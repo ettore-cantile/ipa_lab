@@ -1,38 +1,18 @@
 # Python bytecode caches (were tracked by mistake; root-owned copies from
-# sudo/kathara runs blocked `git pull`). Never track these.
+# sudo runs blocked `git pull`). Never track these.
 __pycache__/
 *.pyc
 *.pyo
-
-# Ephemeral test scaffolding written by test_kathara.sh / krun()
-shared/_krun_*.sh
-shared/_stats_*.py
 
 # Office temp/lock files
 ~$*
 *.tmp
 
-# Host kernel headers for BCC on the Kathara nodes. ~114 MB / 17.5k generated
-# files pinned to one exact kernel version: a build dependency of the host, not
-# project source. Regenerate with:
-#     bash experiments/kathara_germany50/host_setup/fetch_host_headers.sh
-shared/host_headers/
-experiments/kathara_germany50/lab/shared/host_headers/
-
-# Generated Kathara lab. `genera_lab.py` writes lab.conf + <node>.startup and
-# `make_lab.py` assembles shared/ from ipa/ -- all reproducible output, and the
-# 52 .startup files used to be committed at the repo root.
-experiments/kathara_germany50/lab/shared/
-
 # Generated AOT artefacts (gen_full_c.py writes both).
 ipa/poc_aot/nn_aot_arch.o
 ipa/poc_aot/loader_aot
 
-# The libbpf build of P2/P3: bcc_to_libbpf.py translates the .bpf.c from the
-# BCC sources, clang compiles it, and vmlinux.h comes from the running kernel's
-# BTF. All three are build output of one machine, not project source.
-ipa/poc_aot/ipa_template.bpf.c
-ipa/poc_aot/ipa_modular.bpf.c
-ipa/poc_aot/ipa_template.o
-ipa/poc_aot/ipa_modular.o
-ipa/poc_aot/vmlinux.h
+# Generated synthetic scenarios. `make_scenario.py --preset all` rewrites every
+# one of these byte-identically (seed 20260916); test_synth.py generates its own
+# into temp dirs and never reads this tree. 42 files / 4.4 MB of pure output.
+ipa/synth/scenarios/

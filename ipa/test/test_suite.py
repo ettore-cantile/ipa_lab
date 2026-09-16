@@ -45,7 +45,7 @@ if SHARED_DIR not in sys.path:
 
 # torch is optional at import time: `--only kernel` never touches a torch
 # model (it drives verify_prog_run.py / BCC directly), so it must keep working
-# inside Kathara containers that don't have torch installed. main() hard-fails
+# on nodes that don't have torch installed. main() hard-fails
 # with a clear error only if a suite that actually needs torch is requested.
 try:
     import torch

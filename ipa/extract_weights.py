@@ -15,7 +15,7 @@ Architecture fixed to the germany50/5 checkpoint:
 Quantization: PTQ with SCALE_FACTOR = floor(127 / max|w|)
 
 Fallback (no torch):
-  If torch is not installed (e.g. inside Kathara containers), and a
+  If torch is not installed (e.g. inside a stripped container image), and a
   precomputed weights.json exists in the same directory, extract_weights_int8()
   returns its contents directly without loading the .pt file.
 """
@@ -159,7 +159,7 @@ def extract_weights_int8(
 
 # ---------------------------------------------------------------------------
 # __main__: produce weights.json and weights_float.json
-# Requires torch — intended to run on the host, not inside Kathara.
+# Requires torch — intended to run on a host with torch, not on a forwarding node.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
@@ -167,7 +167,7 @@ if __name__ == "__main__":
         from FRR_model import FastRerouteMLP
     except ImportError as e:
         print(f"ERROR: {e}")
-        print("Run this script on the host (not inside Kathara) where torch is installed.")
+        print("Run this script on a host where torch is installed.")
         raise SystemExit(1)
 
     # Checkpoint path: $IPA_CHECKPOINT, then the descriptor's `checkpoint` key,

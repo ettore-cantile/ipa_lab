@@ -8,15 +8,15 @@ Tre pipeline (P1 hardcoded, P2 template, P3 modular) verificate su due piani:
 Tutto è raccolto in un unico script: `ipa/test/test_suite.py`. Tutti gli script di test
 (compreso `bench_model_add.py`, vedi §6) vivono sotto `ipa/test/`.
 
-**Nota sul layout.** Il motore sta in `ipa/`; lo scenario Kathara/Germany50 sta in
-`experiments/kathara_germany50/`. I comandi `kathara exec ... /shared/...` restano validi perché
-`make_lab.py` copia `ipa/` dentro `lab/shared/`, che è ciò che Kathara monta su `/shared`.
+**Nota sul layout.** Il motore sta in `ipa/`; i dati della topologia su cui il
+checkpoint depositato è stato addestrato stanno in `topologies/germany50/`. Tutti i
+comandi qui sotto si eseguono dalla radice del repository.
 
 ---
 
 ## 1. Test locali (userspace) — nessun root, nessun kernel eBPF
 
-Richiede solo `torch` + `numpy`. Girano ovunque (anche fuori da Kathara).
+Richiede solo `torch` + `numpy`. Girano ovunque: nessun kernel, nessun root.
 
 ```bash
 # Tutte le suite (la suite kernel viene saltata se non c'è BCC/root)
@@ -46,9 +46,6 @@ riferimento — utile per capire quanto costa davvero l'inferenza rispetto al so
 ```bash
 # Su host Linux con BCC installato
 sudo python3 ipa/test/test_suite.py --only kernel
-
-# Dentro Kathara (nodo frankfurt)
-kathara exec frankfurt -- python3 /shared/test/test_suite.py --only kernel
 
 # Solo metriche, senza il gate di dispatch
 sudo python3 ipa/test/test_suite.py --only kernel --no-verify
@@ -92,7 +89,7 @@ Cosa verifica in più oltre al dispatch:
 >   per questo che i `ref_val` stampati per P1 differiscono da quelli di P2/P3 pur
 >   restando la stessa classe. **Non è un bug della suite** — è la suite che documenta
 >   una divergenza reale fra le pipeline.
-> - Su un nodo Kathara vero gli ifindex sono 201/209/217/223: non stanno né in `[2..7]`
+> - Su un nodo vero gli ifindex sono 201/209/217/223: non stanno né in `[2..7]`
 >   né in `[1,6]`, quindi **tutte e tre** azzerano la feature. 6 dei 65 input sono
 >   costantemente nulli e il modello non sa mai da quale porta è entrato il pacchetto.
 >
@@ -105,30 +102,38 @@ Cosa verifica in più oltre al dispatch:
 ### Verifier standalone (equivalente al gate di dispatch)
 
 ```bash
-kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method hardcoded
-kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method template
-kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method modular
-kathara exec frankfurt -- python3 /shared/test/verify_prog_run.py --method modular --model-id 3
+sudo python3 ipa/test/verify_prog_run.py --method hardcoded
+sudo python3 ipa/test/verify_prog_run.py --method template
+sudo python3 ipa/test/verify_prog_run.py --method modular
+sudo python3 ipa/test/verify_prog_run.py --method modular --model-id 3
 ```
 
 ---
 
-## 3. Avvio del lab Kathara
+## 3. Costruire un datapath reale (`netns_fabric.py`)
+
+Non c'è più un emulatore. Il banco si costruisce con `veth` sull'host: una coppia
+per porta logica più un ingresso dedicato, ognuna col peer che porta uno stub
+`XDP_PASS`.
 
 ```bash
-cd experiments/kathara_germany50
-python3 genera_lab.py          # genera lab/lab.conf + lab/<node>.startup
-python3 make_lab.py            # assembla lab/shared/ copiandolo da ../../ipa
-cd lab
-kathara lstart                 # avvia tutti i nodi (germany50)
-kathara linfo                  # stato dei nodi
-kathara lclean                 # ferma e pulisce il lab
+sudo python3 ipa/test/netns_fabric.py --n-ports 5          # costruisci, mostra, smonta
+sudo python3 ipa/test/netns_fabric.py --n-ports 5 --hold   # resta su, per deployarci sopra
+sudo python3 ipa/test/netns_fabric.py --cleanup            # resti di un run ucciso
 ```
 
-Il lab non è più committato nella root: `lab/` è output rigenerabile. Modifica il
-motore in `ipa/`, mai in `lab/shared/` — il `make_lab.py` successivo lo sovrascrive.
+`veth` supporta XDP **native**, quindi la modalità di attach è quella di
+deployment, non un surrogato. Lo stub sui peer non è decorazione: redirigere
+*verso* una veth passa da `veth_xdp_xmit()`, e il kernel alloca le code che quel
+percorso richiede solo se il lato ricevente ha un programma XDP. Senza, il
+redirect fallisce in silenzio e il pacchetto sparisce — identico a un modello che
+decide di droppare tutto.
 
-Ogni nodo esegue `/shared/fix_bpf.sh` al boot (copiato da `experiments/kathara_germany50/host_setup/` da `make_lab.py`) (monta debugfs, abilita ip_forward, FRR/OSPF).
+L'ingresso è **dedicato**, non una porta logica: quando era la porta 0, una classe
+che inoltra su quella porta rimandava il frame fuori dall'interfaccia da cui era
+entrato, dove la cattura non lo distingue da quello appena iniettato.
+
+Cosa la macchina regge lo dice `sudo bash ipa/test/probe_env.sh`.
 
 ---
 
@@ -136,25 +141,25 @@ Ogni nodo esegue `/shared/fix_bpf.sh` al boot (copiato da `experiments/kathara_g
 
 Attacca sull'interfaccia dove **entra** il traffico (XDP conta solo l'ingresso). In questo
 lab il traffico per `frankfurt` (IP loopback `10.255.255.17`) entra su **eth1** — verifica con
-`kathara exec frankfurt -- tcpdump -i any -n udp port 9999`.
+`sudo tcpdump -i any -n udp port 9999`.
 
 ```bash
 # sul nodo che fa da switch (es. frankfurt), su eth1
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method template  --iface eth1 --model-id 0
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method modular   --iface eth1 --model-id 0
+sudo python3 ipa/execute_pipeline.py --method template  --iface eth1 --model-id 0
+sudo python3 ipa/execute_pipeline.py --method modular   --iface eth1 --model-id 0
 
 # hardcoded: AOT-literal è l'UNICO backend di deploy (BCC live-attach rimosso su
 # richiesta esplicita del relatore). Serve un .o prebuilt (build offline su host
 # con clang) + loader_aot linkato staticamente contro libbpf (nessuna dipendenza
-# runtime su libbpf.so sul nodo Kathara). BCC resta solo internamente ai test
+# runtime su libbpf.so sul nodo). BCC resta solo internamente ai test
 # (verify_prog_run.py ecc.), mai per il deploy.
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
+sudo python3 ipa/execute_pipeline.py --method hardcoded --iface eth1
 
 # solo verifica del caricamento, senza restare in ascolto
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --verify-only
+sudo python3 ipa/execute_pipeline.py --method hardcoded --verify-only
 
 # se un XDP resta appeso da un run precedente ("File exists"): staccalo
-kathara exec frankfurt -- ip link set dev eth1 xdp off
+sudo ip link set dev eth1 xdp off
 ```
 
 Tutte e tre stampano `HIT | MISS | DROP` dal vivo. Popolano `mac_table` (classe → ifindex +
@@ -170,12 +175,12 @@ sul nodo datapath, che non ha bisogno di clang/cc/libbpf.
 ```bash
 # bench (deploy-cost + perf, via BPF_PROG_TEST_RUN) -- richiede root sull'host
 sudo python3 ipa/methods/method4_hardcoded_aot.py
-# deploy LIVE su Kathara (via execute_pipeline, backend AOT di default):
-kathara exec frankfurt -- ip link set dev eth1 xdp off
-kathara exec frankfurt -- python3 /shared/execute_pipeline.py --method hardcoded --iface eth1
+# deploy LIVE su un'interfaccia (via execute_pipeline, backend AOT di default):
+sudo ip link set dev eth1 xdp off
+sudo python3 ipa/execute_pipeline.py --method hardcoded --iface eth1
 ```
 
-**Verificato end-to-end** su nodo Kathara `frankfurt` (che NON ha clang, cc né `libbpf.so`
+**Verificato end-to-end** su nodo `frankfurt` (che NON ha clang, cc né `libbpf.so`
 usabile per il link): il loader fully-static carica il `.o` prebuilt e attacca il programma
 XDP; `ip link show dev eth1` mostra `prog/xdp id ... name xdp_dispatch ... jited`, cioè il
 dispatcher AOT agganciato e JIT-compilato. Il comando di deploy resta resident (loop
@@ -185,19 +190,17 @@ dell'inferenza è coperta separatamente da `test_suite --only kernel` (5/5 PASS 
 Il modello AOT è **build offline** (macchina con clang) → deploy del `.o` prebuilt sul nodo
 (nessun clang). Su un nodo senza clang, se `nn_aot_arch.o` è già presente viene riusato.
 
-**`loader_aot` va costruito allo stesso modo, una volta sola, fuori da Kathara**: anche
-`cc`/gcc manca nei nodi Kathara (oltre a clang), quindi non si può compilare il loader
-dentro `kathara exec`. Costruiscilo **sull'host** (come utente normale, non `sudo` — il
-build non richiede root; solo l'attach XDP finale lo richiede):
+**`loader_aot` va costruito una volta sola su una macchina di build**, non sul nodo
+che inoltra: un nodo stripped non ha né `clang` né `cc`. Costruiscilo come utente
+normale, non con `sudo` — il build non richiede root, solo l'attach XDP finale lo
+richiede:
 ```bash
 # dev-lib per il link statico (una volta):
 sudo apt-get install -y libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
-python3 ipa/methods/method4_hardcoded_aot.py   # sull'host, non via kathara exec
+python3 ipa/methods/method4_hardcoded_aot.py   # sulla macchina di build
 ```
 Il binario è linkato **staticamente** (niente `libbpf.so` richiesto a runtime) e vive in
-`ipa/poc_aot/loader_aot` — poiché `lab/shared/` è montato via bind mount in ogni nodo
-Kathara, una volta costruito sull'host è **immediatamente visibile** su tutti i nodi,
-nessuna copia manuale.
+`ipa/poc_aot/loader_aot`: è il file da copiare sul nodo, da solo, insieme al `.o`.
 
 Note pratiche emerse costruendolo davvero:
 - Il link statico di libbpf tira dentro dipendenze transitive che devono anch'esse essere
@@ -206,15 +209,15 @@ Note pratiche emerse costruendolo davvero:
   (con `zstd`/`lzma`); su Ubuntu recente serve la seconda. Se fallisce stampa l'errore
   `ld` completo per capire quale `.a` manca.
 - I file generati sotto `ipa/poc_aot/` (`nn_aot_arch.bpf.c`, `.o`, `loader_aot`) prendono
-  il proprietario dell'utente che li crea: se un run precedente è stato fatto con `sudo`/
-  `kathara exec` (root), un run successivo come utente normale fallisce con
+  il proprietario dell'utente che li crea: se un run precedente è stato fatto con `sudo`
+  (root), un run successivo come utente normale fallisce con
   `PermissionError`. Rimedio: `sudo chown -R $USER:$USER ~/percorso/ipa_lab`.
-- Sui nodi Kathara di questo lab `libbpf.so.1` **è presente** (tirato dentro da BCC), quindi
+- Su un nodo dove BCC è installato `libbpf.so.1` è presente (tirato dentro da BCC), quindi
   anche un loader linkato dinamicamente (`-lbpf`) funzionerebbe lì; il link statico resta
   comunque la scelta preferita perché non dipende da questo dettaglio dell'immagine.
 - Il bench sull'host (`method4_hardcoded_aot.py` senza `--iface`) carica un programma BPF e
   quindi richiede root: eseguito come utente normale fallisce con `RLIMIT_MEMLOCK -EPERM`.
-  Non è un problema del deploy — il caricamento reale avviene sul nodo Kathara, che gira
+  Non è un problema del deploy — il caricamento reale avviene sul nodo, che gira
   come root.
 
 Le pipeline avviano automaticamente il monitor `link_state` (thread di polling che tiene
@@ -223,26 +226,24 @@ carrier senza caricare eBPF:
 
 ```bash
 # stampa lo stato up/down di eth0..eth5 che verrebbe scritto nella map
-kathara exec frankfurt -- python3 /shared/link_state_monitor.py --ifaces eth0 eth1 eth2 eth3 eth4 eth5
+sudo python3 ipa/link_state_monitor.py --ifaces eth0 eth1 eth2 eth3 eth4 eth5
 ```
 
 ---
 
 ## 5. Invio pacchetti IPA di prova
 
-Il fabric Kathara non consegna UDP:9999 end-to-end, quindi la verifica di correttezza
-si fa con `BPF_PROG_TEST_RUN` (sopra). Per un test di invio live:
+La verifica di correttezza end-to-end è `test_fabric.py` (sezione 4): inietta,
+cattura, e confronta sia la decisione (`cls_stats`) sia la porta d'uscita. Questi
+script servono per traffico manuale su un fabric già attivo:
 
 ```bash
-# listener su frankfurt
-kathara exec frankfurt -- python3 /shared/recv_ipa.py --timeout 30 --port 9999
+sudo python3 ipa/recv_ipa.py --timeout 30 --port 9999
+sudo python3 ipa/send_ipa.py --dst <host> --count 100
+sudo python3 ipa/test/test_ipa.py --dest <host> --count 100 --model-id 0
 
-# sender da darmstadt
-kathara exec darmstadt -- python3 /shared/send_ipa.py
-kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 100 --model-id 0
-
-# traffico multi-modello (round-robin), per esercitare il dispatch multi-model_id di P2/P3
-kathara exec darmstadt -- python3 /shared/test_ipa.py --dest frankfurt --count 90 --model-ids 42 43 44
+# traffico multi-modello (round-robin), per esercitare il dispatch di P2/P3
+sudo python3 ipa/test/test_ipa.py --dest <host> --count 90 --model-ids 42 43 44
 ```
 
 ---
@@ -255,7 +256,7 @@ nuovo `model_id` a runtime in ciascuna pipeline — sfrutta il multi-model conco
 
 ```bash
 sudo python3 ipa/test/bench_model_add.py --n-models 3
-kathara exec frankfurt -- python3 /shared/test/bench_model_add.py --n-models 3
+sudo python3 ipa/test/bench_model_add.py --n-models 3
 ```
 
 Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (max 3 modelli con questa architettura),
@@ -582,19 +583,50 @@ P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
   colonna 1 per lo stesso pacchetto. Non è ancora stato uniformato — su questo modello sposta
   solo argmax quasi pari (la classe 0 domina), ma va allineato prima di trarre conclusioni
   sull'equivalenza delle tre pipeline. Vedi il commento in `verify_prog_run.py` (`ref_ifindex`).
-- **P2/P3 non caricano dentro Kathara**: il nodo applica il cap storico di 4096 istruzioni per
+- **P2/P3 non caricano in un container minimale**: il nodo applica il cap storico di 4096 istruzioni per
   programma, e `arch_generic_2layer` ne conta 9 318 compilato nel container (`bpf: Program too
   large`). Le misure di questa tabella vengono da `BPF_PROG_TEST_RUN` **sull'host**, dove il
   cap non si applica. È un limite preesistente e non una regressione — prima del blocco pesi
-  strutturato lo stesso programma era circa il doppio — ma va detto: **P2 e P3 non hanno mai
-  girato end-to-end sul fabric**, solo P1. Servirebbe un altro ~2.3× di riduzione istruzioni.
+  strutturato lo stesso programma era circa il doppio. Riguarda l'immagine container minimale, non il
+  kernel dell'host: vedi la voce seguente.
+- **P1, P2 e P3 girano end-to-end su un datapath reale** (`ipa/test/test_fabric.py`, 18/18):
+  XDP in modalità **native** su `veth`, `bpf_redirect` vero, pacchetto catturato sulla porta
+  d'uscita, DROP verificato dal contatore `cls_stats` e non dal silenzio. Questa riga diceva
+  il contrario fino a poco fa — era vera quando l'unico banco era un emulatore.
+
+### Il soffitto compilato ha un costo di verifica, e ha un limite
+
+`T2_MAX_H1`, `T2_MAX_H2` e `MAX_N_IN` sono **soffitti a compile-time**: i cicli interni sono
+`#pragma unroll`ati a quelli, non alle larghezze reali del modello, così un programma compilato
+serve qualunque modello che stia sotto. È il livello L1 del modello a tre livelli, ed è la
+ragione per cui P2 non ricompila quando cambia modello.
+
+Il conto però lo paga il **verificatore**, che percorre ogni cammino del corpo srotolato. Con i
+soffitti larghi (`8 × 4 × 128`) il kernel si arrende:
+
+```
+processed 1000001 insns (limit 1000000) ... total_states 13864 peak_states 1010
+```
+
+Due limiti distinti, da non confondere: il programma è ~14 900 istruzioni, ampiamente **dentro**
+il cap sulla dimensione. Quello che finisce è la **complessità di verifica**, e cresce col
+prodotto dei soffitti.
+
+È la misura concreta di quanto un programma "generico" possa essere generico: la genericità di
+P2 non è gratis, si paga in stati del verificatore, e il tetto è raggiungibile con numeri
+ragionevoli (8 neuroni, 128 feature). Il modello depositato usa 4-4-65, cioè circa metà di ogni
+soffitto — abbassarli a quelle misure riduce il corpo srotolato di circa 4×.
+
+Emerso provando a caricare lo stesso datapath con `libbpf` invece di BCC. Quel percorso non è
+stato portato avanti — BCC resta il backend di deploy per P2/P3 — ma il limite che ha messo in
+luce non dipende dal backend: è il verificatore del kernel, lo stesso per entrambi.
 - Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`
   (fino a 20× su un singolo campione, rumore a senso unico — vedi sez. 7): tutti gli script
   di benchmark aggiunti in questa sessione (7, 8) usano minimo su N trial indipendenti, mai
   un campione singolo.
 - **Limiti dell'ambiente (onestà, cfr. Heiser "Benchmarking Crimes", arXiv:1801.02381)**:
   nessun CPU pinning/isolamento core, nessuna frequenza CPU fissata, nessun C-state
-  disabilitato, VM/Kathara — i numeri assoluti (ns/pacchetto, Mpps) non sono comparabili con
+  disabilitato, VM — i numeri assoluti (ns/pacchetto, Mpps) non sono comparabili con
   paper su bare-metal. Il confronto **relativo** fra le pipeline sullo stesso nodo, stesse
   condizioni, è l'unica misura difendibile con questo setup — è quello su cui si basano
   tutte le conclusioni di questo documento (ordine P1/P2/P3, larghezza-vs-profondità).

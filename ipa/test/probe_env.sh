@@ -138,7 +138,7 @@ C
         else
             no "native XDP refused on veth: $(tr -d '\n' < /tmp/ipaprobe.drv.log | tail -c 160)"
             if ip link set dev "$V0" xdpgeneric obj /tmp/ipaprobe.bpf.o sec xdp 2>/dev/null; then
-                warn "generic XDP works -- same mode the repo uses today, no gain over Kathara"
+                warn "generic XDP works, native does not -- measurements here describe the post-skb path"
                 ip link set dev "$V0" xdpgeneric off 2>/dev/null
             else
                 no "generic XDP also refused -- no XDP on veth at all here"

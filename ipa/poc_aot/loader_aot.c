@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
                t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d. Ctrl-C to detach.\n",
                attach_ifindex);
-        /* Flush now: when stdout is a pipe (e.g. under `kathara exec`, not a
+        /* Flush now: when stdout is a pipe rather than a
          * TTY) C stdio is fully buffered, so without this the messages above
          * would sit in the buffer -- invisible -- while the loader blocks in
          * pause(), making a working, attached deploy look like a hang. */

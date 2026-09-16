@@ -6,7 +6,7 @@ Run on frankfurt BEFORE sending from darmstadt.
 Listens on UDP port 9999, decodes the IPA header and prints statistics.
 
 Usage:
-  python3 /shared/recv_ipa.py [--timeout 30] [--port 9999]
+  python3 ipa/recv_ipa.py [--timeout 30] [--port 9999]
 
 Esempio output:
   [recv_ipa] Listening on UDP :9999 (timeout=30s)
