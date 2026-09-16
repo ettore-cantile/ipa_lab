@@ -54,6 +54,42 @@ class PortBinding:
                 f"(ifindex={self.ifindex}, link {state})")
 
 
+def port_map_from_env():
+    """Logical port -> interface name, taken from the environment.
+
+    Two knobs, explicit first:
+
+      IPA_PORT_MAP="0=ipav0,1=ipav1,4=enp0s3"   exact, per port
+      IPA_IFACE_PATTERN="ipav{i}"               a naming convention
+
+    Returns (port_to_iface_or_None, pattern). The default pattern stays
+    "eth{i}", which is a convention of one lab and not a property of the
+    datapath: a node whose interfaces are named anything else had no way to
+    say so, and every FORWARD class came out unforwardable with five "no such
+    interface" notes and no hint of what to set.
+    """
+    raw = os.environ.get("IPA_PORT_MAP", "").strip()
+    pattern = os.environ.get("IPA_IFACE_PATTERN", "eth{i}")
+    if not raw:
+        return None, pattern
+    mapping = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise NodeConfigError(
+                f"IPA_PORT_MAP: expected comma-separated PORT=IFACE pairs "
+                f"(e.g. '0=ipav0,1=ipav1'), got {item!r}")
+        port, iface = item.split("=", 1)
+        try:
+            mapping[int(port.strip())] = iface.strip()
+        except ValueError:
+            raise NodeConfigError(
+                f"IPA_PORT_MAP: {port.strip()!r} is not a logical port number")
+    return mapping, pattern
+
+
 @dataclass
 class NodeConfig:
     """Resolved per-node state: which logical ports this node can actually use.
@@ -83,16 +119,27 @@ class NodeConfig:
         does not need to provide interfaces for ports no class selects.
         """
         host = hostname or socket.gethostname()
-        p2i = dict(port_to_iface) if port_to_iface else {
-            p: iface_pattern.format(i=p) for p in logical_ports}
+        if port_to_iface:
+            p2i = dict(port_to_iface)
+        else:
+            env_map, env_pattern = port_map_from_env()
+            # An explicit argument beats the environment; the environment beats
+            # the built-in convention. iface_pattern is only overridden when the
+            # caller left it at the default, so an explicit argument still wins.
+            if iface_pattern == "eth{i}":
+                iface_pattern = env_pattern
+            p2i = {p: iface_pattern.format(i=p) for p in logical_ports}
+            if env_map:
+                p2i.update({p: n for p, n in env_map.items() if p in logical_ports})
         cfg = NodeConfig(hostname=host, node_index=node_index, port_to_iface=p2i)
         for p in sorted(logical_ports):
             name = p2i.get(p)
             if name is None:
                 raise NodeConfigError(
                     f"{host}: the model selects logical port {p} but the node "
-                    f"configuration has no interface for it. Either add the "
-                    f"mapping or use a model that does not select that port.")
+                    f"configuration has no interface for it. Add the mapping "
+                    f"(IPA_PORT_MAP='{p}=<iface>', or IPA_IFACE_PATTERN) or "
+                    f"use a model that does not select that port.")
             cfg.bindings[p] = _bind(p, name)
         return cfg
 

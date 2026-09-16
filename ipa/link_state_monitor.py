@@ -59,7 +59,25 @@ def n_egress() -> int:
 
 
 def default_ifaces() -> list:
-    return [f"eth{i}" for i in range(n_egress())]
+    """The interfaces whose carrier fills link_state[0..n_egress-1].
+
+    Honours the same knobs as node_config.NodeConfig.resolve, so the link_state
+    slots and the forwarding ports describe the same interfaces:
+
+        IPA_PORT_MAP="0=ipav0,1=ipav1"    exact, per slot
+        IPA_IFACE_PATTERN="ipav{i}"       a naming convention
+
+    "eth{i}" remains the fallback, but it is a convention of one lab, not a
+    property of the datapath.
+    """
+    from node_config import port_map_from_env
+    env_map, pattern = port_map_from_env()
+    names = [pattern.format(i=i) for i in range(n_egress())]
+    if env_map:
+        for slot, iface in env_map.items():
+            if 0 <= slot < len(names):
+                names[slot] = iface
+    return names
 
 
 def iface_exists(iface: str) -> bool:

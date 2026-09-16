@@ -212,6 +212,27 @@ def resolve_descriptor(features: list) -> list:
 # topology_config loading  (Problema 1)
 # ---------------------------------------------------------------------------
 
+# Origins already announced, so a resident process says where its topology came
+# from once instead of on every resolution. Deliberately not a cache of the
+# config itself -- see load_topology_config.
+_ANNOUNCED = set()
+
+
+def _announce_once(msg: str) -> None:
+    if msg not in _ANNOUNCED:
+        _ANNOUNCED.add(msg)
+        print(msg)
+
+
+def reset_topology_announcements() -> None:
+    """Forget what has been announced, so the next resolution prints again.
+
+    For tests that walk several scenarios in one process and want each one
+    reported.
+    """
+    _ANNOUNCED.clear()
+
+
 def load_topology_config(path: str = "/etc/ipa/topology_config.json") -> dict:
     """
     Load the per-network topology configuration from *path*.
@@ -258,12 +279,12 @@ def load_topology_config(path: str = "/etc/ipa/topology_config.json") -> dict:
     if env:
         with open(env) as f:
             cfg = json.load(f)
-        print(f"[topology_config] loaded from $IPA_TOPOLOGY_CONFIG={env}: {cfg}")
+        _announce_once(f"[topology_config] loaded from $IPA_TOPOLOGY_CONFIG={env}: {cfg}")
         return _validated_topology(cfg, f"$IPA_TOPOLOGY_CONFIG={env}")
     if os.path.exists(path):
         with open(path) as f:
             cfg = json.load(f)
-        print(f"[topology_config] loaded from {path}: {cfg}")
+        _announce_once(f"[topology_config] loaded from {path}: {cfg}")
         return _validated_topology(cfg, path)
     cfg = _topology_from_descriptor()
     if cfg is not None:
@@ -302,17 +323,17 @@ def _topology_from_descriptor():
         with open(meta_path) as f:
             meta = json.load(f)
     except Exception as e:
-        print(f"[topology_config] {meta_path} unreadable ({e})")
+        _announce_once(f"[topology_config] {meta_path} unreadable ({e})")
         return None
     t = meta.get("trained_on") or {}
     if not all(k in t for k in TOPOLOGY_KEYS_REQUIRED):
         present = [k for k in TOPOLOGY_KEYS if k in t]
         if present:
-            print(f"[topology_config] model_meta.json `trained_on` has only "
+            _announce_once(f"[topology_config] model_meta.json `trained_on` has only "
                   f"{present}; {list(TOPOLOGY_KEYS_REQUIRED)} are required")
         return None
     cfg = _validated_topology(t, f"{meta_path} `trained_on`")
-    print(f"[topology_config] from the model descriptor's `trained_on` "
+    _announce_once(f"[topology_config] from the model descriptor's `trained_on` "
           f"({meta.get('trained_on', {}).get('topology', 'unnamed')}): {cfg}")
     return cfg
 
