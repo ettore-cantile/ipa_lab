@@ -114,10 +114,19 @@ def extract_weights_int8(
         # cannot -- so a caller asking for a different topology would silently get
         # the default-shape weights and generate a program whose literals do not
         # match its declared shape. Fail loudly instead.
+        # n_out from the descriptor. It used to read `n_interfaces + 1` here
+        # too, so a descriptor declaring a different output width would have
+        # been checked against a width nobody declared.
+        import model_meta as _mm
+        n_out = _mm.derive_shape(
+            _mm.load_model_meta(json_path),
+            topology_config={"n_interfaces": n_interfaces,
+                             "n_nodes": n_nodes,
+                             "n_queues": 4})["n_out"]
         n_in = n_interfaces + n_interfaces + 1 + n_nodes
         expected = (n_in * hidden_dim + hidden_dim
                     + hidden_dim * hidden_dim + hidden_dim
-                    + hidden_dim * (n_interfaces + 1) + (n_interfaces + 1))
+                    + hidden_dim * n_out + n_out)
         if len(w) != expected:
             raise ValueError(
                 f"{json_path} holds {len(w)} weights but the requested shape "
@@ -183,18 +192,34 @@ if __name__ == "__main__":
     with open(os.path.join(SHARED_DIR, "weights_float.json"), "w") as f:
         json.dump({"scale_factor": SCALE_FACTOR, "weights": all_floats}, f)
 
-    # model_meta.json: per-node feature dimensions so codegen can derive
-    # N_IN/N_OUT instead of assuming the fixed 65/7 constants. No explicit
-    # "features" list -> the default descriptor [link_state, ingress_iface,
-    # ttl, node] with n_out = n_interfaces+1 (see model_meta.derive_shape),
-    # i.e. exactly the historical 65-4-4-7 model.
-    model_meta = {
+    # model_meta.json: the descriptor codegen and the datapath both read.
+    #
+    # This used to write only {n_interfaces, n_nodes, hidden_dims} and let
+    # derive_shape compute n_out = n_interfaces + 1, leaving class MEANINGS
+    # recorded nowhere -- which is how the datapath came to drop class 6 while
+    # the model was trained to drop class 5. n_out and class_semantics are now
+    # written explicitly, and an existing descriptor's semantics are PRESERVED
+    # rather than overwritten by a rebuild of the weights.
+    _meta_path = os.path.join(SHARED_DIR, "model_meta.json")
+    model_meta = {}
+    if os.path.exists(_meta_path):
+        with open(_meta_path) as f:
+            model_meta = json.load(f)
+    model_meta.update({
         "n_interfaces": N_INTERFACES,
         "n_nodes": N_NODES,
         "hidden_dims": [HIDDEN_DIM, HIDDEN_DIM],
-    }
-    with open(os.path.join(SHARED_DIR, "model_meta.json"), "w") as f:
-        json.dump(model_meta, f)
+        "n_out": int(model.out.out_features),
+    })
+    if not model_meta.get("class_semantics"):
+        print("[extract_weights] WARNING: model_meta.json has no "
+              "class_semantics. The datapath cannot know which class means "
+              "DROP and will fall back to an ANNOUNCED guess "
+              f"(DROP = {int(model.out.out_features) - 1}). Declare it with "
+              "label_mapping.write_descriptor() using the mapping this model "
+              "was trained with.")
+    with open(_meta_path, "w") as f:
+        json.dump(model_meta, f, indent=2)
 
     print(f"Saved {len(integer_weights)} int8 weights -> weights.json")
     print(f"int8 range: min={min(integer_weights)}  max={max(integer_weights)}")

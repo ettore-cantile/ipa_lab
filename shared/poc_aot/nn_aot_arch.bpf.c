@@ -162,21 +162,21 @@ int xdp_model(struct xdp_md *ctx) {
     long long h1_2 = a1_2 > 0 ? a1_2 : 0;
     long long a1_3 = ls0 * -9LL + ls1 * 31LL + ls2 * 6LL + ls3 * -10LL + ls4 * -10LL + ls5 * 0LL + w_iface_3 + (((__s64)_ttl * 2LL) / 30LL) + w_node_3 + 12LL;
     long long h1_3 = a1_3 > 0 ? a1_3 : 0;
-    long long a2_0 = h1_0 * 51LL + h1_1 * 32LL + h1_2 * 8LL + h1_3 * -70LL + 6LL;
+    long long a2_0 = h1_0 * 51LL + h1_1 * 32LL + h1_2 * 8LL + h1_3 * -70LL + 144LL;
     long long h2_0 = a2_0 > 0 ? a2_0 : 0;
-    long long a2_1 = h1_0 * 122LL + h1_1 * -82LL + h1_2 * 21LL + h1_3 * 9LL + -2LL;
+    long long a2_1 = h1_0 * 122LL + h1_1 * -82LL + h1_2 * 21LL + h1_3 * 9LL + -48LL;
     long long h2_1 = a2_1 > 0 ? a2_1 : 0;
-    long long a2_2 = h1_0 * 49LL + h1_1 * 46LL + h1_2 * -30LL + h1_3 * 61LL + -20LL;
+    long long a2_2 = h1_0 * 49LL + h1_1 * 46LL + h1_2 * -30LL + h1_3 * 61LL + -480LL;
     long long h2_2 = a2_2 > 0 ? a2_2 : 0;
-    long long a2_3 = h1_0 * -27LL + h1_1 * 9LL + h1_2 * 96LL + h1_3 * 40LL + 12LL;
+    long long a2_3 = h1_0 * -27LL + h1_1 * 9LL + h1_2 * 96LL + h1_3 * 40LL + 288LL;
     long long h2_3 = a2_3 > 0 ? a2_3 : 0;
-    long long o_0 = h2_0 * 37LL + h2_1 * -6LL + h2_2 * 54LL + h2_3 * -82LL + -22LL;
-    long long o_1 = h2_0 * -70LL + h2_1 * 16LL + h2_2 * 45LL + h2_3 * 3LL + -12LL;
-    long long o_2 = h2_0 * 10LL + h2_1 * 51LL + h2_2 * -49LL + h2_3 * 37LL + -57LL;
-    long long o_3 = h2_0 * 45LL + h2_1 * -121LL + h2_2 * -6LL + h2_3 * 43LL + 18LL;
-    long long o_4 = h2_0 * -22LL + h2_1 * 65LL + h2_2 * -47LL + h2_3 * -33LL + 75LL;
-    long long o_5 = h2_0 * 9LL + h2_1 * -8LL + h2_2 * 8LL + h2_3 * 27LL + 18LL;
-    long long o_6 = h2_0 * -5LL + h2_1 * -5LL + h2_2 * -4LL + h2_3 * -13LL + -18LL;
+    long long o_0 = h2_0 * 37LL + h2_1 * -6LL + h2_2 * 54LL + h2_3 * -82LL + -12672LL;
+    long long o_1 = h2_0 * -70LL + h2_1 * 16LL + h2_2 * 45LL + h2_3 * 3LL + -6912LL;
+    long long o_2 = h2_0 * 10LL + h2_1 * 51LL + h2_2 * -49LL + h2_3 * 37LL + -32832LL;
+    long long o_3 = h2_0 * 45LL + h2_1 * -121LL + h2_2 * -6LL + h2_3 * 43LL + 10368LL;
+    long long o_4 = h2_0 * -22LL + h2_1 * 65LL + h2_2 * -47LL + h2_3 * -33LL + 43200LL;
+    long long o_5 = h2_0 * 9LL + h2_1 * -8LL + h2_2 * 8LL + h2_3 * 27LL + 10368LL;
+    long long o_6 = h2_0 * -5LL + h2_1 * -5LL + h2_2 * -4LL + h2_3 * -13LL + -10368LL;
     long long best_val = o_0; int best_cls = 0;
     if (o_1 > best_val) { best_val = o_1; best_cls = 1; }
     if (o_2 > best_val) { best_val = o_2; best_cls = 2; }
@@ -184,13 +184,38 @@ int xdp_model(struct xdp_md *ctx) {
     if (o_4 > best_val) { best_val = o_4; best_cls = 4; }
     if (o_5 > best_val) { best_val = o_5; best_cls = 5; }
     if (o_6 > best_val) { best_val = o_6; best_cls = 6; }
-    if (best_cls >= 6) {
+    /* class -> action -> logical port (from the model descriptor) */
+    __u32 _port = 0xffffffffU;
+    switch (best_cls) {
+    case 0: _port = 0U; break;   /* FORWARD -> logical port 0 */
+    case 1: _port = 1U; break;   /* FORWARD -> logical port 1 */
+    case 2: _port = 2U; break;   /* FORWARD -> logical port 2 */
+    case 3: _port = 3U; break;   /* FORWARD -> logical port 3 */
+    case 4: _port = 4U; break;   /* FORWARD -> logical port 4 */
+    case 5: {   /* DROP (declared) */
         __u32 di = 2; __u64 *dv = bpf_map_lookup_elem(&pkt_stats, &di);
         if (dv) __sync_fetch_and_add(dv, 1);
         return XDP_DROP;
     }
-    __u32 _cls = (__u32)best_cls;
-    struct fwd_action *act = bpf_map_lookup_elem(&mac_table, &_cls);
+    case 6: {   /* UNUSED */
+        __u32 ui = 1; __u64 *uv = bpf_map_lookup_elem(&pkt_stats, &ui);
+        if (uv) __sync_fetch_and_add(uv, 1);
+        return XDP_PASS;
+    }
+    default: {   /* argmax outside [0, n_out) */
+        __u32 xi = 1; __u64 *xv = bpf_map_lookup_elem(&pkt_stats, &xi);
+        if (xv) __sync_fetch_and_add(xv, 1);
+        return XDP_PASS;
+    }
+    }
+    if (_port == 0xffffffffU) {
+        __u32 xi = 1; __u64 *xv = bpf_map_lookup_elem(&pkt_stats, &xi);
+        if (xv) __sync_fetch_and_add(xv, 1);
+        return XDP_PASS;
+    }
+    /* mac_table is keyed by LOGICAL PORT, not by class. */
+    /* mac_table is keyed by LOGICAL PORT, cls_stats by CLASS. */
+    struct fwd_action *act = bpf_map_lookup_elem(&mac_table, &_port);
     if (act && act->ifindex != 0) {   /* ARRAY: never NULL; ifindex==0 => unprovisioned */
         /* A hop must not forward a packet whose TTL would reach 0.
          * Counted as MISS and handed to the kernel, which emits the
@@ -203,7 +228,8 @@ int xdp_model(struct xdp_md *ctx) {
         ipa_ttl_dec(ip);
         __u32 hi = 0; __u64 *hv = bpf_map_lookup_elem(&pkt_stats, &hi);
         if (hv) __sync_fetch_and_add(hv, 1);
-        __u64 *cv = bpf_map_lookup_elem(&cls_stats, &_cls);
+        __u32 _cs_key = (__u32)best_cls;
+        __u64 *cv = bpf_map_lookup_elem(&cls_stats, &_cs_key);
         if (cv) __sync_fetch_and_add(cv, 1);
         __builtin_memcpy(eth->h_source, act->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   act->dst_mac, 6);

@@ -6,9 +6,11 @@ Design space position:
   - Each model -> a dedicated eBPF program
   - Weights hardcoded as literals in the C source
   - A single tail call, NO map lookup for the weights (pure hardcoded).
-  - Action: best_cls -> mac_table[best_cls] -> MAC rewrite -> bpf_redirect
-    (cls 0..n_interfaces-1 = redirect on the resolved iface with real
-    src/dst MAC, cls n_interfaces = XDP_DROP). Same mac_table pattern as
+  - Action: best_cls -> (class semantics) -> logical port ->
+    mac_table[port] -> MAC rewrite -> bpf_redirect
+    (the class semantics say which classes forward, on which logical port,
+    and which one drops -- no class index implies an action). Same mac_table
+    pattern as
     P2/P3 -- the NN decides the port, mac_table only resolves the L2
     next-hop -- so the packet's Ethernet header is rewritten before
     leaving, not just its egress iface.
@@ -215,7 +217,8 @@ int ipa_switch_hardcoded(struct xdp_md *ctx) {
 """
 
 
-def _build_header(dense_vector_maps: dict, n_out: int) -> str:
+def _build_header(dense_vector_maps: dict, n_out: int,
+                  semantics=None) -> str:
     """
     Build the map/struct declarations for a combined hardcoded source.
 
@@ -225,8 +228,11 @@ def _build_header(dense_vector_maps: dict, n_out: int) -> str:
     BPF_ARRAY the control plane seeds. A model that uses no map-backed
     features passes {} (its whole input vector comes from the packet TTL
     and one-hot indices).
-    n_out sizes cls_stats and the mac_table capacity -- generalizes what
-    used to be fixed at 7/8 respectively.
+    n_out sizes cls_stats (one counter per CLASS). mac_table is sized by the
+    LOGICAL PORT space instead, from `semantics`: the two are different index
+    spaces and `max(8, n_out)` only covered the port space because the
+    reference model happens to number its ports 0..n_out-2. Without semantics
+    the old bound is kept, and that is safe only because it is >= n_out.
     """
     map_decls = ""
     for map_name, size in sorted(dense_vector_maps.items()):
@@ -238,16 +244,21 @@ def _build_header(dense_vector_maps: dict, n_out: int) -> str:
             f"struct {map_name}_vec {{ __u32 v[{size}]; }};\n"
             f"BPF_ARRAY({map_name}, struct {map_name}_vec, 1);\n"
         )
-    mac_capacity = max(8, n_out)
+    if semantics is not None:
+        _ports = semantics.logical_ports
+        mac_capacity = max(8, (max(_ports) + 1) if _ports else 0)
+    else:
+        mac_capacity = max(8, n_out)
     return _COMMON_STRUCTS + f"""
 {map_decls}BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(no mac_table entry) [2]=drop */
 BPF_ARRAY(cls_stats,        __u64, {n_out});   /* per-class redirect counter */
 
-/* mac_table: egress class (the argmax output) -> {{ifindex, src/dst MAC}}.
+/* mac_table: LOGICAL PORT (what the class semantics map the argmax output
+ * onto) -> {{ifindex, src/dst MAC}}.
  * Same struct/role as P2/P3's mac_table_t2/t3 -- the NN decides the port,
  * this only resolves the L2 next-hop and rewrites the Ethernet header
  * before bpf_redirect(). A BPF_ARRAY (not a hash): the key is the dense
- * class index 0..n_out-1, so a direct O(1) array index is both correct and
+ * logical port index, so a direct O(1) array index is both correct and
  * cheaper than hashing. Unlike a hash, an ARRAY lookup NEVER returns NULL
  * (every slot exists, zero-initialised), so "class not provisioned" is
  * detected by ifindex==0 (never a valid egress ifindex) instead of NULL. */
@@ -265,7 +276,7 @@ def _lit(v) -> str:
 
 
 def _gen_dense_layer(prev_terms: list, n_cur: int, w: list, b: list,
-                     out_prefix: str, relu: bool) -> list:
+                     out_prefix: str, relu: bool, bias_mul: int = 1) -> list:
     """
     Emit `n_cur` neurons of a fully-connected layer as single-expression C
     statements: out_prefix_j = RELU_LL(sum_i(prev_terms[i] * w[j,i]) + b[j]).
@@ -279,7 +290,15 @@ def _gen_dense_layer(prev_terms: list, n_cur: int, w: list, b: list,
         terms = " + ".join(
             f"{prev_terms[i]} * {_lit(w[j * n_prev + i])}LL" for i in range(n_prev)
         )
-        bias = _lit(b[j])
+        # Bias scaled into the accumulator's units. The weights are stored as
+        # round(w_float * scale), so after L layers of products the accumulator
+        # carries scale**L while a bias stored the same way carries only
+        # scale**1. Multiplying by scale**(L-1) puts the two in the same scale.
+        # Computed here in Python, so P1 pays nothing at runtime and cannot
+        # overflow: the literal is exact. See _gen_dense_layer's callers for
+        # where bias_mul comes from, and docs for the measured effect
+        # (float/int8 argmax agreement 72% -> 96%).
+        bias = _lit(int(b[j]) * bias_mul)
         expr = f"{terms} + {bias}LL"
         if relu:
             lines.append(f"    long long {out_prefix}_{j} = RELU_LL({expr});")
@@ -297,22 +316,76 @@ def _gen_argmax(n_out: int, out_prefix: str = "out") -> list:
     return lines
 
 
-def _gen_action_epilogue(drop_cls_expr: str) -> str:
+def _gen_class_dispatch(semantics) -> str:
+    """Emit the class -> action -> logical port dispatch for Pipeline 1.
+
+    P1 is code generation, so the semantics are resolved HERE and become a
+    switch over literal class indices: no map lookup and no index arithmetic at
+    runtime. The switch is generated FROM THE DESCRIPTOR, so a model with a
+    different DROP class or non-consecutive ports produces different code
+    rather than being silently misinterpreted.
+
+    The previous version emitted `if (best_cls >= n_out - 1) return XDP_DROP;`
+    -- which hardcoded both that DROP is the last class and that every other
+    class maps onto a port of the same index. Neither holds: the checked-in
+    model's trained DROP class is 5, not 6.
     """
-    Shared post-argmax epilogue: class -> mac_table[class] -> MAC rewrite
-    -> bpf_redirect (or DROP if best_cls indicates the drop class). Never
-    assumes anything about the feature encoding, only about `best_cls`.
+    lines = ["    /* --- class -> action -> logical port (generated from the",
+             "     *     model descriptor; see class_semantics.py) --- */",
+             "    __u32 _port = 0xffffffffU;   /* sentinel: no port selected */",
+             "    switch (best_cls) {"]
+    for cid in range(semantics.n_out):
+        spec = semantics.classes[cid]
+        if spec.action == "FORWARD":
+            lines.append(f"    case {cid}: _port = {spec.port}U; break;"
+                         f"   /* FORWARD -> logical port {spec.port} */")
+        elif spec.action == "DROP":
+            lines.append(f"    case {cid}: {{"
+                         f"   /* DROP (declared, not inferred) */")
+            lines.append("        int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);")
+            lines.append("        if (_dv) __sync_fetch_and_add(_dv, 1);")
+            lines.append("        return XDP_DROP;")
+            lines.append("    }")
+        else:
+            lines.append(f"    case {cid}: {{"
+                         f"   /* UNUSED: countable, never forwarded */")
+            lines.append("        int _ui = 1; __u64 *_uv = pkt_stats.lookup(&_ui);")
+            lines.append("        if (_uv) __sync_fetch_and_add(_uv, 1);")
+            lines.append("        return XDP_PASS;")
+            lines.append("    }")
+    lines += [
+        "    default: {   /* argmax outside [0, n_out): must not happen */",
+        "        int _xi = 1; __u64 *_xv = pkt_stats.lookup(&_xi);",
+        "        if (_xv) __sync_fetch_and_add(_xv, 1);",
+        "        return XDP_PASS;",
+        "    }",
+        "    }",
+        "    if (_port == 0xffffffffU) {",
+        "        int _xi = 1; __u64 *_xv = pkt_stats.lookup(&_xi);",
+        "        if (_xv) __sync_fetch_and_add(_xv, 1);",
+        "        return XDP_PASS;",
+        "    }",
+    ]
+    return "\n".join(lines)
+
+
+def _gen_action_epilogue(semantics) -> str:
+    """
+    Post-argmax epilogue: class -> action -> logical port -> mac_table[port]
+    -> MAC rewrite -> bpf_redirect. mac_table is keyed by LOGICAL PORT, so the
+    node decides which interface realises the port the model selected.
     """
     return f"""
-    /* --- Action: class -> mac_table[class] -> MAC rewrite -> bpf_redirect --- */
-    if ({drop_cls_expr}) {{
-        int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);
-        if (_dv) __sync_fetch_and_add(_dv, 1);
-        return XDP_DROP;
-    }}
+{_gen_class_dispatch(semantics)}
 
-    __u32 _cls = (__u32)best_cls;
-    struct fwd_action *_action = mac_table.lookup(&_cls);
+    /* Two different keys, and they must not be conflated:
+     *   mac_table  is keyed by LOGICAL PORT (what the node provisioned)
+     *   cls_stats  is keyed by CLASS       (what the model emitted)
+     * They used to share one `_cls = _port` variable. For the reference model
+     * class k forwards on port k, so the two agreed by accident; a model whose
+     * forwarding classes sit on non-consecutive ports would have had its
+     * per-class counter written at a port index. */
+    struct fwd_action *_action = mac_table.lookup(&_port);
     if (_action != NULL && _action->ifindex != 0) {{
         /* A hop must not forward a packet whose TTL would reach 0. Counted as
          * MISS -- the existing "we did not forward this" bucket, which already
@@ -326,13 +399,15 @@ def _gen_action_epilogue(drop_cls_expr: str) -> str:
         ipa_ttl_dec(ip);
         int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
         if (_hv) __sync_fetch_and_add(_hv, 1);
-        __u64 *_cv = cls_stats.lookup(&_cls);
+        __u32 _cs_key = (__u32)best_cls;
+        __u64 *_cv = cls_stats.lookup(&_cs_key);
         if (_cv) __sync_fetch_and_add(_cv, 1);
         __builtin_memcpy(eth->h_source, _action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   _action->dst_mac, 6);
         return bpf_redirect(_action->ifindex, 0);
     }}
-    /* no mac_table entry for that class (not provisioned) */
+    /* no mac_table entry for that logical port (the node did not provision
+     * it, or its link is down) */
     int _mi = 1; __u64 *_mv = pkt_stats.lookup(&_mi);
     if (_mv) __sync_fetch_and_add(_mv, 1);
     return XDP_PASS;
@@ -509,6 +584,7 @@ def generate_ebpf_hardcoded(
     hidden_dims: tuple = (4, 4),
     features: list = None,
     n_out: int = None,
+    semantics=None,
 ) -> str:
     """
     Generate an eBPF XDP program, function name `model_<model_id>`, for
@@ -526,16 +602,22 @@ def generate_ebpf_hardcoded(
 
     Backward compatibility: if `features` is None, a default descriptor is
     built from n_interfaces/n_nodes in the historical order
-    [link_state, ingress_iface, ttl, node] with n_out = n_interfaces+1, so
+    [link_state, ingress_iface, ttl, node], with n_out from the descriptor, so
     the checked-in 65-4-4-7 model still generates a functionally identical
     program. (`n_out` is required when `features` is given explicitly.)
 
     After argmax the program:
       - resolves the action via mac_table[best_cls] -> {ifindex, src_mac, dst_mac}
-      - cls < n_out-1: rewrites eth->h_source/h_dest, bpf_redirect(ifindex, 0)
+      - class whose declared action is FORWARD: rewrites eth->h_source/h_dest
+        and bpf_redirect(ifindex, 0) on the interface bound to its logical port
                  -> pkt_stats[0]++, cls_stats[cls]++
-      - cls < n_out-1 but mac_table has no entry: pkt_stats[1]++, XDP_PASS
-      - cls == n_out-1:  XDP_DROP    -> pkt_stats[2]++
+      - FORWARD but mac_table has no entry for that port: pkt_stats[1]++,
+        XDP_PASS
+      - class whose declared action is DROP:   XDP_DROP -> pkt_stats[2]++
+      - class declared UNUSED: cls_stats[cls]++, XDP_PASS (countable, never
+        forwarded -- the model was not trained to emit it)
+    Which class is which comes from the ClassSemantics passed in, never from
+    the index.
       - inference always runs (pure hardcoded, no cache gate)
       - mac_table itself is populated by the CALLER (method4_hardcoded.py)
 
@@ -619,8 +701,12 @@ def generate_ebpf_hardcoded(
         n_cur = layer_sizes[li + 1]
         is_out = (li == len(layers) - 1)
         prefix = "out" if is_out else f"h{li + 1}"
+        # Layer li (0-based) needs its bias multiplied by scale**li: layer 0
+        # is already consistent (both bias and products carry scale**1), every
+        # later layer accumulates one more factor of scale in its products.
         rest_lines.extend(_gen_dense_layer(prev_names, n_cur, W, B, prefix,
-                                           relu=not is_out))
+                                           relu=not is_out,
+                                           bias_mul=scale ** li))
         prev_names = [f"{prefix}_{j}" for j in range(n_cur)]
 
     argmax_lines = _gen_argmax(n_out)
@@ -628,7 +714,18 @@ def generate_ebpf_hardcoded(
     fc1_src    = "\n".join(fc1_lines)
     rest_src   = "\n".join(rest_lines)
     argmax_src = "\n".join(argmax_lines)
-    epilogue   = _gen_action_epilogue(f"best_cls >= {n_out - 1}")
+    # Class semantics come from the descriptor. Never inferred here: when the
+    # caller passes none, one shared helper resolves it (model_meta.json first,
+    # an announced reference layout second) so every pipeline reports the same
+    # thing the same way.
+    if semantics is None:
+        from model_meta import descriptor_semantics_or_reference
+        semantics = descriptor_semantics_or_reference(n_out, "Pipeline1")
+    semantics.validate()
+    if semantics.n_out != n_out:
+        raise ValueError(f"class semantics declare n_out={semantics.n_out} "
+                         f"but the model outputs {n_out}")
+    epilogue   = _gen_action_epilogue(semantics)
 
     shape_str = ("-".join(str(f["size"]) for f in features)
                  + " -> " + "-".join(str(s) for s in layer_sizes))
@@ -676,6 +773,7 @@ def build_combined_hardcoded_source(
     hidden_dims: tuple = (4, 4),
     features: list = None,
     n_out: int = None,
+    semantics=None,
 ) -> str:
     """
     models: list of (model_id, weights_int8, scale, ifindex_table) tuples,
@@ -685,7 +783,7 @@ def build_combined_hardcoded_source(
 
     Feature descriptor: pass `features` (+ `n_out`) for a heterogeneous
     feature set, or leave them None to build the historical default
-    descriptor from n_interfaces/n_nodes (n_out = n_interfaces+1) -- keeps
+    descriptor from n_interfaces/n_nodes (n_out from the descriptor) -- keeps
     every existing caller (tests, benches) working unchanged.
 
     Returns one compilation unit: header (incl. the dense_vector maps the
@@ -700,11 +798,20 @@ def build_combined_hardcoded_source(
         raise ValueError("build_combined_hardcoded_source: n_out required when 'features' is given")
 
     dvmaps = _dense_vector_maps_for(features)
-    src = _build_header(dvmaps, n_out) + "\n" + EBPF_HARDCODED_DISPATCHER
+    # Resolve the semantics ONCE here, so the header's mac_table capacity and
+    # every model_<id> dispatch switch come from the same object. Left to the
+    # per-model default, the header would size mac_table from one resolution
+    # while the switch used another.
+    if semantics is None:
+        from model_meta import descriptor_semantics_or_reference
+        semantics = descriptor_semantics_or_reference(n_out, "Pipeline1")
+    src = (_build_header(dvmaps, n_out, semantics=semantics) + "\n"
+           + EBPF_HARDCODED_DISPATCHER)
     for model_id, weights_int8, scale, ifindex_table in models:
         src += "\n" + generate_ebpf_hardcoded(
             weights_int8, scale, model_id, ifindex_table, include_header=False,
-            hidden_dims=hidden_dims, features=features, n_out=n_out)
+            hidden_dims=hidden_dims, features=features, n_out=n_out,
+            semantics=semantics)
     return src
 
 

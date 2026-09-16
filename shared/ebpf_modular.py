@@ -77,18 +77,21 @@ Maps:
   layer_chain       : BPF_PROG_ARRAY  0 -> layer_first.fd, 1..15 -> layer_hidden.fd
   layer_registry    : model_id -> {scale_factor, n_layers}
   layer_shapes      : {model_id, layer_idx} -> {n_in, n_out, weight_offset}
-  mac_table_t3      : u32 class (argmax output) -> fwd_action {ifindex, src/dst MAC}
+  class_action_t3   : u32 class (argmax output) -> {action, logical port}
+  mac_table_t3      : u32 LOGICAL PORT -> fwd_action {ifindex, src/dst MAC}
   cls_stats_t3      : per-class redirect counter
   pkt_stats_t3      : [0]=HIT [1]=MISS [2]=DROP
 
-Action: the last layer runs argmax -> class, then a single mac_table_t3[class]
+Action: the last layer runs argmax -> class, then class_action_t3[class] gives
+the action + logical port, and a single mac_table_t3[port]
 lookup resolves the L2 next-hop and bpf_redirect()s (cls 6 = DROP). No output
 key, no per-TTL validation -- the NN decides, the table only maps class->port.
 
 Feature encoding (protocol-fixed, independent of hidden depth/width):
   link_state[0..5] + ingress-iface one-hot [6..11] + ttl [12] + node one-hot
   [13..64] -- always the first layer's n_in=65 input; the last layer's
-  n_out is always 7 (6 egress classes + drop), matching the mac_table/argmax
+  n_out comes from the model descriptor (7 for the checked-in checkpoint, of
+  which 5 forward, class 5 drops and class 6 is unused), matching the argmax
   action above. layer_first reads these straight from scratch_meta/link_state
   (no dense 65-slot scratch_acts array is ever built for it).
 
@@ -162,6 +165,16 @@ struct fwd_action {
     __u8  src_mac[6];
     __u8  dst_mac[6];
 } __attribute__((packed));
+
+/* ---- class semantics: class -> action -> logical port --------------------
+ * Same contract as P2 (see ebpf_template_arch.py). The datapath never infers
+ * an action from a class index. */
+#define ACT_INVALID 0
+#define ACT_FORWARD 1
+#define ACT_DROP    2
+#define ACT_UNUSED  3
+#define MAX_N_OUT   32
+struct class_act { __u8 action; __u8 port; __u8 _p0; __u8 _p1; };
 
 /* ---- TTL handling for a forwarding hop -----------------------------------
  * A node that redirects a packet IS a router hop and must decrement the TTL,
@@ -240,6 +253,10 @@ BPF_ARRAY(queue_state, struct qs_vec, 1);
  * at runtime by layer_first to build the IV generically instead of the old
  * hardcoded 65-feature layout. */
 #define ML_MAX_FEAT 4
+/* Trip-count ceiling for the bias-multiplier loop below. MUST equal
+ * LAYER_CHAIN_SIZE (the BPF_PROG_ARRAY size): a model cannot have more layers
+ * than the chain has slots, so the loop always covers every reachable depth. */
+#define ML_MAX_DEPTH 16
 struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[ML_MAX_FEAT]; };
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
@@ -249,11 +266,13 @@ BPF_HASH(model_desc, __u8, struct model_desc, 256);
  * across concurrently-registered models of different depths. */
 BPF_PROG_ARRAY(layer_chain, 16);
 
-/* mac_table: egress class (0..5, the argmax output) -> {ifindex, src/dst MAC}.
+/* mac_table_t3: LOGICAL PORT (from class_action_t3) -> {ifindex, src/dst MAC}.
  * The NN decides the port; this only resolves the L2 next-hop. */
-BPF_ARRAY(mac_table_t3, struct fwd_action, 8);
+/* mac_table_t3 is keyed by LOGICAL PORT, not by class. */
+BPF_ARRAY(mac_table_t3, struct fwd_action, MAX_N_OUT);
+BPF_ARRAY(class_action_t3, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
-BPF_ARRAY(cls_stats_t3, __u64, 7);   /* per-class redirect counter */
+BPF_ARRAY(cls_stats_t3, __u64, MAX_N_OUT);   /* per-class redirect counter */
 
 /* CTR_INC(): real per-packet map-lookup counter, active only when
  * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
@@ -315,14 +334,36 @@ BPF_HASH(layer_shapes, struct layer_shape_key, struct layer_shape_entry, 512);
  * the logic without the macro-argument foot-guns of the previous 3-block
  * design (see git history: struct padding bugs from more implicit magic). */
 static inline __attribute__((always_inline))
-int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end, int best_cls) {
+int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end,
+                      int best_cls, __u32 n_out) {
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
 
-    if (best_cls >= 6) {
+    /* Class -> action -> logical port, from the descriptor-filled map. The
+     * previous `best_cls >= 6` hardcoded both the DROP class and the
+     * class==port assumption; neither holds for this model (trained DROP is
+     * class 5) nor for any other output width. */
+    if (best_cls < 0 || (__u32)best_cls >= n_out) {
+        int mi = 1; __u64 *mv = pkt_stats_t3.lookup(&mi);
+        if (mv) __sync_fetch_and_add(mv, 1);
+        return XDP_PASS;
+    }
+    __u32 _ci = (__u32)best_cls;
+    struct class_act *ca = class_action_t3.lookup(&_ci);
+    if (!ca || ca->action == ACT_INVALID) {
+        int mi = 1; __u64 *mv = pkt_stats_t3.lookup(&mi);
+        if (mv) __sync_fetch_and_add(mv, 1);
+        return XDP_PASS;
+    }
+    if (ca->action == ACT_DROP) {
         int di = 2; __u64 *dv = pkt_stats_t3.lookup(&di);
         if (dv) __sync_fetch_and_add(dv, 1);
         return XDP_DROP;
+    }
+    if (ca->action != ACT_FORWARD) {           /* ACT_UNUSED */
+        int mi = 1; __u64 *mv = pkt_stats_t3.lookup(&mi);
+        if (mv) __sync_fetch_and_add(mv, 1);
+        return XDP_PASS;
     }
 
     /* Re-parse the IP header: this epilogue is reached through the tail-call
@@ -332,8 +373,12 @@ int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end, int best_c
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
 
-    __u32 cls = (__u32)best_cls;
-    struct fwd_action *action = mac_table_t3.lookup(&cls);
+    /* mac_table_t3 is keyed by LOGICAL PORT, cls_stats_t3 by CLASS. Keeping
+     * them in one variable named `cls` (holding the port) wrote the per-class
+     * counter at a port index; it agreed only because the reference model
+     * numbers its ports the same as its forwarding classes. */
+    __u32 port = (__u32)ca->port;
+    struct fwd_action *action = mac_table_t3.lookup(&port);
     if (action != NULL && action->ifindex != 0) {
         /* A hop must not forward a packet whose TTL would reach 0. See the
          * ipa_ttl_dec() comment: counted as MISS and passed to the kernel. */
@@ -345,13 +390,13 @@ int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end, int best_c
         ipa_ttl_dec(ip);
         int si = 0; __u64 *v = pkt_stats_t3.lookup(&si);
         if (v) __sync_fetch_and_add(v, 1);
-        __u64 *cv = cls_stats_t3.lookup(&cls);
+        __u64 *cv = cls_stats_t3.lookup(&_ci);   /* keyed by CLASS */
         if (cv) __sync_fetch_and_add(cv, 1);
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     }
-    /* no mac_table entry for that class (e.g. link down / not provisioned) */
+    /* no mac_table entry for that LOGICAL PORT (link down / not provisioned) */
     int si = 1; __u64 *v = pkt_stats_t3.lookup(&si);
     if (v) __sync_fetch_and_add(v, 1);
     return XDP_PASS;
@@ -503,6 +548,10 @@ int layer_first(struct xdp_md *ctx) {
     struct lw_blk *LW = layer_weights.lookup(&_lwz);
     if (!LW) return XDP_PASS;
 
+    /* layer_first is always layer 0, where bias and products both carry
+     * scale**1: no bias multiplier is needed here. layer_hidden computes one
+     * because its products carry scale**(layer_idx+1). See ebpf_program.py's
+     * _gen_dense_layer for the derivation. */
     long long out[ML1_MAX_H1];
     /* LLONG_MIN, not -1e7: the logits of a 1-layer model are unbounded int64
      * accumulations (ttl up to 255 x int8 weights), so an all-negative output
@@ -575,7 +624,7 @@ int layer_first(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    return ml_argmax_forward(ctx, data, data_end, best_cls);
+    return ml_argmax_forward(ctx, data, data_end, best_cls, n_out);
 }
 """
 
@@ -616,6 +665,23 @@ int layer_hidden(struct xdp_md *ctx) {
     __u32 n_out = shape->n_out;
     __u32 woff  = shape->weight_offset;
     if (n_in == 0 || n_in > MLH_MAX_H || n_out == 0 || n_out > MLH_MAX_H) return XDP_PASS;
+    /* Bias multiplier: the weights are stored as round(w_float * scale), so
+     * this layer's products carry scale**(layer_idx+1) while a bias stored the
+     * same way carries only scale**1. Multiplying the bias by scale**layer_idx
+     * puts the two in the same units. Without it the biases are progressively
+     * under-weighted with depth and the datapath disagrees with the trained
+     * model on 28% of decisions (measured: argmax agreement 72% -> 96%).
+     *
+     * Unrolled to ML_MAX_DEPTH because the verifier needs a constant trip
+     * count; layer_idx < n_layers <= LAYER_CHAIN_SIZE, so every reachable
+     * depth is covered. A model deep enough for scale**layer_idx to overflow
+     * int64 would already have overflowed its accumulators. */
+    long long bias_mul = 1LL;
+    #pragma unroll
+    for (int _bp = 0; _bp < ML_MAX_DEPTH; _bp++) {
+        if (_bp < layer_idx) bias_mul *= (long long)lentry->scale_factor;
+    }
+
     __u32 bias_off = n_in * n_out;
 
     /* Weight block and this CPU's activation vector, each read ONCE for the
@@ -637,7 +703,7 @@ int layer_hidden(struct xdp_md *ctx) {
     #pragma unroll
     for (int j = 0; j < MLH_MAX_H; j++) {
         if (j >= n_out) { out[j] = 0LL; continue; }
-        long long acc = LW_W(LW, woff + bias_off + j);
+        long long acc = LW_W(LW, woff + bias_off + j) * bias_mul;
         #pragma unroll
         for (int i = 0; i < MLH_MAX_H; i++) {
             if (i >= n_in) continue;
@@ -662,7 +728,7 @@ int layer_hidden(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    return ml_argmax_forward(ctx, data, data_end, best_cls);
+    return ml_argmax_forward(ctx, data, data_end, best_cls, n_out);
 }
 """
 
@@ -682,6 +748,7 @@ def load_modular_weights(
     layer_dims: list = None,
     base_offset: int = 0,
     features: list = None,
+    semantics=None,
 ) -> int:
     """
     Populate layer_registry, layer_shapes and layer_weights for Pipeline 3.
@@ -724,6 +791,19 @@ def load_modular_weights(
 
     if layer_dims is None:
         layer_dims = [(65, 4), (4, 4), (4, 7)]
+
+    # Class semantics: required, not derived from n_out. With no argument the
+    # shared resolver reads the descriptor and announces any fallback.
+    if semantics is None:
+        from model_meta import descriptor_semantics_or_reference
+        semantics = descriptor_semantics_or_reference(layer_dims[-1][1],
+                                                      "Pipeline3")
+    semantics.validate()
+    if semantics.n_out != layer_dims[-1][1]:
+        raise ValueError(
+            f"class semantics declare n_out={semantics.n_out} but the last "
+            f"layer outputs {layer_dims[-1][1]}. Descriptor and model must "
+            f"agree before either reaches the datapath.")
 
     n_layers = len(layer_dims)
     if n_layers == 0 or n_layers > LAYER_CHAIN_SIZE:
@@ -791,6 +871,9 @@ def load_modular_weights(
     for layer_idx, ((n_in, n_out), woff) in enumerate(zip(layer_dims, layer_offsets)):
         shapes_table[LayerShapeKey(model_id=model_id, layer_idx=layer_idx)] = \
             LayerShapeEntry(n_in=n_in, n_out=n_out, weight_offset=woff)
+
+    from ebpf_template_arch import load_class_action
+    load_class_action(bpf_obj, "class_action_t3", semantics)
 
     class LayerModelEntry(Structure):
         _pack_ = 1

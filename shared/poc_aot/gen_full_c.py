@@ -203,7 +203,7 @@ _PARSE = """    void *data = (void *)(long)ctx->data;
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;"""
 
 
-def _emit_model_body(shape, w, ifindex_table) -> list:
+def _emit_model_body(shape, w, ifindex_table, scale: int = 1, semantics=None) -> list:
     """IV + MLP + argmax + action body of the tail-called model program (weights
     as literals). ctx/data/eth/ip/udp/ipa are already parsed by the caller-emitted
     _PARSE block (the SECOND parse the dispatcher+tail-call architecture forces)."""
@@ -245,23 +245,63 @@ def _emit_model_body(shape, w, ifindex_table) -> list:
         for j in range(n_cur):
             terms = " + ".join(f"{prev[i]} * {_lit(W[j*n_prev+i])}LL"
                                for i in range(n_prev))
+            # Bias scaled into the accumulator's units: the weights are
+            # round(w_float * scale), so this layer's products carry
+            # scale**(li+1) while a bias stored the same way carries scale**1.
+            # Multiplying by scale**li puts them in the same scale. Computed
+            # here, so the object pays nothing at runtime. Mirrors
+            # ebpf_program._gen_dense_layer -- the two Pipeline 1 backends must
+            # compute the same thing.
+            bmul = scale ** li
             if is_out:
-                A(f"    long long {pfx}_{j} = {terms} + {_lit(B[j])}LL;")
+                A(f"    long long {pfx}_{j} = {terms} + {_lit(int(B[j]) * bmul)}LL;")
             else:
-                A(f"    long long a{li+1}_{j} = {terms} + {_lit(B[j])}LL;")
+                A(f"    long long a{li+1}_{j} = {terms} + {_lit(int(B[j]) * bmul)}LL;")
                 A(f"    long long {pfx}_{j} = a{li+1}_{j} > 0 ? a{li+1}_{j} : 0;")
         prev = [f"{pfx}_{j}" for j in range(n_cur)]
 
     A("    long long best_val = o_0; int best_cls = 0;")
     for k in range(1, n_out):
         A(f"    if (o_{k} > best_val) {{ best_val = o_{k}; best_cls = {k}; }}")
-    A(f"    if (best_cls >= {n_out - 1}) {{")
-    A("        __u32 di = 2; __u64 *dv = bpf_map_lookup_elem(&pkt_stats, &di);")
-    A("        if (dv) __sync_fetch_and_add(dv, 1);")
-    A("        return XDP_DROP;")
+    # class -> action -> logical port, GENERATED from the descriptor. Mirrors
+    # ebpf_program._gen_class_dispatch: the two Pipeline 1 backends must emit
+    # the same semantics, or the AOT object and the BCC build disagree.
+    # The previous `best_cls >= n_out - 1` hardcoded both that DROP is the last
+    # class and that a class index is a port index. Neither holds.
+    A("    /* class -> action -> logical port (from the model descriptor) */")
+    A("    __u32 _port = 0xffffffffU;")
+    A("    switch (best_cls) {")
+    for cid in range(n_out):
+        spec = semantics.classes[cid]
+        if spec.action == "FORWARD":
+            A(f"    case {cid}: _port = {spec.port}U; break;"
+              f"   /* FORWARD -> logical port {spec.port} */")
+        elif spec.action == "DROP":
+            A(f"    case {cid}: {{   /* DROP (declared) */")
+            A("        __u32 di = 2; __u64 *dv = bpf_map_lookup_elem(&pkt_stats, &di);")
+            A("        if (dv) __sync_fetch_and_add(dv, 1);")
+            A("        return XDP_DROP;")
+            A("    }")
+        else:
+            A(f"    case {cid}: {{   /* UNUSED */")
+            A("        __u32 ui = 1; __u64 *uv = bpf_map_lookup_elem(&pkt_stats, &ui);")
+            A("        if (uv) __sync_fetch_and_add(uv, 1);")
+            A("        return XDP_PASS;")
+            A("    }")
+    A("    default: {   /* argmax outside [0, n_out) */")
+    A("        __u32 xi = 1; __u64 *xv = bpf_map_lookup_elem(&pkt_stats, &xi);")
+    A("        if (xv) __sync_fetch_and_add(xv, 1);")
+    A("        return XDP_PASS;")
     A("    }")
-    A("    __u32 _cls = (__u32)best_cls;")
-    A("    struct fwd_action *act = bpf_map_lookup_elem(&mac_table, &_cls);")
+    A("    }")
+    A("    if (_port == 0xffffffffU) {")
+    A("        __u32 xi = 1; __u64 *xv = bpf_map_lookup_elem(&pkt_stats, &xi);")
+    A("        if (xv) __sync_fetch_and_add(xv, 1);")
+    A("        return XDP_PASS;")
+    A("    }")
+    A("    /* mac_table is keyed by LOGICAL PORT, not by class. */")
+    A("    /* mac_table is keyed by LOGICAL PORT, cls_stats by CLASS. */")
+    A("    struct fwd_action *act = bpf_map_lookup_elem(&mac_table, &_port);")
     A("    if (act && act->ifindex != 0) {   /* ARRAY: never NULL; ifindex==0 => unprovisioned */")
     A("        /* A hop must not forward a packet whose TTL would reach 0.")
     A("         * Counted as MISS and handed to the kernel, which emits the")
@@ -274,7 +314,8 @@ def _emit_model_body(shape, w, ifindex_table) -> list:
     A("        ipa_ttl_dec(ip);")
     A("        __u32 hi = 0; __u64 *hv = bpf_map_lookup_elem(&pkt_stats, &hi);")
     A("        if (hv) __sync_fetch_and_add(hv, 1);")
-    A("        __u64 *cv = bpf_map_lookup_elem(&cls_stats, &_cls);")
+    A("        __u32 _cs_key = (__u32)best_cls;")
+    A("        __u64 *cv = bpf_map_lookup_elem(&cls_stats, &_cs_key);")
     A("        if (cv) __sync_fetch_and_add(cv, 1);")
     A("        __builtin_memcpy(eth->h_source, act->src_mac, 6);")
     A("        __builtin_memcpy(eth->h_dest,   act->dst_mac, 6);")
@@ -311,7 +352,7 @@ def _emit_maps(shape) -> list:
     return L
 
 
-def _emit_arch(shape, w, ifindex_table) -> str:
+def _emit_arch(shape, w, ifindex_table, scale: int = 1, semantics=None) -> str:
     """FULL-PATH, ARCHITECTURE-FAITHFUL literal program: dispatcher +
     PROG_ARRAY tail-call + model that RE-parses (double parse) -- same topology
     as the BCC hardcoded path, so BPF_PROG_TEST_RUN on the dispatcher measures
@@ -355,7 +396,7 @@ def _emit_arch(shape, w, ifindex_table) -> str:
     A("SEC(\"xdp\")")
     A("int xdp_model(struct xdp_md *ctx) {")
     A(_PARSE)
-    L.extend(_emit_model_body(shape, w, ifindex_table))
+    L.extend(_emit_model_body(shape, w, ifindex_table, scale, semantics))
     A("}")
     A("")
     # --- dispatcher (entry): parses, tail-calls model_progs[model_id] ---
@@ -374,7 +415,7 @@ def _emit_arch(shape, w, ifindex_table) -> str:
 def _resolve_shape(model_path=None, meta=None, topology_config=None):
     """Resolve (shape, ifindex_table) from a model descriptor + topology, using
     the SAME model_meta logic as the BCC path. With no meta the default
-    descriptor [link_state, ingress_iface, ttl, node] / n_out=n_interfaces+1 is
+    descriptor [link_state, ingress_iface, ttl, node], n_out from it, is
     used -> the historical 65-4-4-7 shape."""
     if meta is None:
         meta = dict(_model_meta.DEFAULT_META)
@@ -392,7 +433,7 @@ def _resolve_shape(model_path=None, meta=None, topology_config=None):
 
 
 def generate_arch_literal_c(model_path: str = None, meta: dict = None,
-                            topology_config: dict = None) -> str:
+                            topology_config: dict = None, semantics=None) -> str:
     """Importable: the ARCHITECTURE-FAITHFUL literal program (dispatcher +
     tail-call + double-parse), descriptor-driven. Real int8 weights from
     model_path; the descriptor is resolved from `meta`/`topology_config`
@@ -416,14 +457,71 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
     if len(w) != n_weights:
         raise SystemExit(f"expected {n_weights} weights for "
                          f"{'-'.join(map(str, sizes))}, got {len(w)}")
-    return _emit_arch(shape, w, ifindex_table)
+    # The int8 scale is needed to put each layer's bias in the accumulator's
+    # units (see below). Read from weights_float.json, the same source
+    # load_arch_weights uses, so the AOT object and the BCC build agree.
+    scale = 1
+    try:
+        import json as _json
+        _wf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "weights_float.json")
+        with open(_wf) as _f:
+            scale = int(_json.load(_f).get("scale_factor", 1))
+    except Exception as _e:
+        print(f"[gen_full_c] WARNING: scale_factor unavailable ({_e}); "
+              f"biases will not be rescaled, which makes this object disagree "
+              f"with the BCC build. Regenerate weights_float.json.")
+    # Class semantics: declared, not inferred. With no argument the shared
+    # resolver reads the descriptor and announces any fallback, so the AOT
+    # object and the BCC build resolve it identically.
+    if semantics is None:
+        from model_meta import descriptor_semantics_or_reference
+        semantics = descriptor_semantics_or_reference(sizes[-1], "AOT")
+    semantics.validate()
+    if semantics.n_out != sizes[-1]:
+        raise SystemExit(f"class semantics declare n_out={semantics.n_out} but "
+                         f"the model outputs {sizes[-1]}")
+    return _emit_arch(shape, w, ifindex_table, scale, semantics)
+
+
+def generate_meta_header(semantics=None) -> str:
+    """Emit nn_aot_meta.h: the class semantics the loader must seed against.
+
+    loader_aot.c is C with no JSON parser, so it used to seed mac_table for
+    classes 0..n_out-2 -- re-deriving "DROP is the last class" and "class k is
+    a forwarding class" in a third language. It now seeds exactly the LOGICAL
+    PORTS this model can select, generated from the same ClassSemantics object
+    the datapath switch is generated from.
+    """
+    if semantics is None:
+        shape, _ = _resolve_shape()
+        from model_meta import descriptor_semantics_or_reference
+        semantics = descriptor_semantics_or_reference(_layer_sizes(shape)[-1],
+                                                      "AOT/meta")
+    ports = semantics.logical_ports
+    L = ["/* GENERATED by gen_full_c.py -- do not edit. */",
+         "#ifndef NN_AOT_META_H",
+         "#define NN_AOT_META_H",
+         "",
+         f"#define AOT_N_OUT      {semantics.n_out}",
+         f"#define AOT_N_PORTS    {len(ports)}",
+         ("#define AOT_LOGICAL_PORTS { "
+          + ", ".join(str(p) for p in ports) + " }") if ports else
+         "#define AOT_LOGICAL_PORTS { 0 }   /* no forwarding class */",
+         ""]
+    for cid in range(semantics.n_out):
+        L.append(f"/* class {cid}: {semantics.classes[cid].describe()} */")
+    L += ["", "#endif", ""]
+    return "\n".join(L)
 
 
 def main():
     with open(os.path.join(_HERE, "nn_aot_arch.bpf.c"), "w") as f:
         f.write(generate_arch_literal_c())
+    with open(os.path.join(_HERE, "nn_aot_meta.h"), "w") as f:
+        f.write(generate_meta_header())
     shape, _ = _resolve_shape()
-    print(f"wrote nn_aot_arch.bpf.c (arch-faithful literal, "
+    print(f"wrote nn_aot_arch.bpf.c + nn_aot_meta.h (arch-faithful literal, "
           f"{'-'.join(map(str, _layer_sizes(shape)))}) in {_HERE}")
 
 

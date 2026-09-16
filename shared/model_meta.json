@@ -1,0 +1,75 @@
+{
+  "n_out": 7,
+  "drop_class": 5,
+  "class_semantics": {
+    "0": {
+      "action": "FORWARD",
+      "port": 0
+    },
+    "1": {
+      "action": "FORWARD",
+      "port": 1
+    },
+    "2": {
+      "action": "FORWARD",
+      "port": 2
+    },
+    "3": {
+      "action": "FORWARD",
+      "port": 3
+    },
+    "4": {
+      "action": "FORWARD",
+      "port": 4
+    },
+    "5": {
+      "action": "DROP"
+    },
+    "6": {
+      "action": "UNUSED"
+    }
+  },
+  "label_mapping": {
+    "n_out": 7,
+    "drop_label": -1,
+    "port_labels": {
+      "0": 0,
+      "1": 1,
+      "2": 2,
+      "3": 3,
+      "4": 4
+    },
+    "label_to_class": {
+      "-1": 5,
+      "0": 0,
+      "1": 1,
+      "2": 2,
+      "3": 3,
+      "4": 4
+    },
+    "provenance": "declared explicitly; NOT derived from max(label)+1"
+  },
+  "features": [
+    "link_state",
+    "ingress_iface",
+    "ttl",
+    "node"
+  ],
+  "hidden_dims": [
+    4,
+    4
+  ],
+  "inputs": {
+    "ttl": {
+      "normalize_by": 30
+    }
+  },
+  "trained_on": {
+    "topology": "germany50",
+    "n_nodes": 52,
+    "n_interfaces": 6,
+    "max_failures": 10,
+    "initial_ttl": 30
+  },
+  "provenance": "class semantics declared from the training label mapping; n_out=7 keeps the checkpoint's output width, class 6 is declared UNUSED rather than repurposed as DROP"
+}

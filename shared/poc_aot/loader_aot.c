@@ -33,6 +33,7 @@
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
+#include "nn_aot_meta.h"   // GENERATED: class semantics (see gen_full_c.py)
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
@@ -82,23 +83,31 @@ static void seed_vec_map(struct bpf_object *obj, const char *name, __u32 fill) {
     bpf_map_update_elem(bpf_map__fd(m), &z, buf, BPF_ANY);
 }
 
-// Descriptor-agnostic seeding: dense-feature maps are seeded only when present,
-// mac_table forward classes are 0..n_out-2 (n_out read from cls_stats), the last
-// class being DROP (no entry).
+// Descriptor-driven seeding: dense-feature maps are seeded only when present,
+// and mac_table is seeded for the LOGICAL PORTS the generated switch can
+// select -- AOT_LOGICAL_PORTS in nn_aot_meta.h, emitted by gen_full_c.py from
+// the same ClassSemantics object the datapath switch is generated from.
+//
+// It used to seed classes 0..n_out-2, with n_out taken from cls_stats' size:
+// "the last class is DROP" and "class k is a forwarding class" re-derived here,
+// in a third language. For the checked-in model both are wrong -- DROP is
+// class 5 and class 6 is untrained -- so the loop installed a next-hop for the
+// DROP class, and it keyed mac_table by class where the datapath keys it by
+// logical port.
 static int seed_maps(struct bpf_object *obj) {
     struct bpf_map *mt = bpf_object__find_map_by_name(obj, "mac_table");
-    struct bpf_map *cs = bpf_object__find_map_by_name(obj, "cls_stats");
     if (!mt) { fprintf(stderr, "missing mac_table\n"); return -1; }
     seed_vec_map(obj, "link_state",  1);    // all-up baseline (matches test_suite ref)
     seed_vec_map(obj, "queue_state", 1);    // nonzero occupancy baseline
-    __u32 n_out = cs ? bpf_map__max_entries(cs) : 7;
-    __u32 n_fwd = n_out > 0 ? n_out - 1 : 0;
+    const __u32 ports[AOT_N_PORTS] = AOT_LOGICAL_PORTS;
     int mtfd = bpf_map__fd(mt);
-    for (__u32 c = 0; c < n_fwd; c++) {      // mac_table forward classes 0..n_out-2
+    for (int i = 0; i < AOT_N_PORTS; i++) {
         struct fwd_action a; memset(&a, 0, sizeof(a));
         a.ifindex = 1;
-        bpf_map_update_elem(mtfd, &c, &a, BPF_ANY);
+        bpf_map_update_elem(mtfd, &ports[i], &a, BPF_ANY);
     }
+    fprintf(stderr, "seeded mac_table for %d logical port(s) of %d class(es)\n",
+            AOT_N_PORTS, AOT_N_OUT);
     return 0;
 }
 

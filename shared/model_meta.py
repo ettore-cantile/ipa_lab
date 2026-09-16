@@ -48,13 +48,16 @@ A model_meta.json therefore looks like:
 N_IN = sum of the (topology-derived) sizes of those feature types.
 
 Absence of a "features" list falls back to the historical fixed encoding
-[link_state, ingress_iface, ttl, node] with n_out = n_interfaces+1, so a model
+[link_state, ingress_iface, ttl, node]; n_out comes from the descriptor, so a model
 with no descriptor (the checked-in 65-4-4-7 model, topology config 6/52)
 reproduces the original N_IN=65/N_OUT=7 program.
 """
 
 import json
 import os
+
+# This module's own directory: where weights.json / model_meta.json live.
+_SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
 # Per-topology / per-network defaults.
@@ -70,6 +73,10 @@ DEFAULT_META = {
     "n_interfaces": 6,   # kept for backward compat with callers reading it directly
     "n_nodes": 52,
     "hidden_dims": [4, 4],
+    # Declared, not left to derive_shape's n_interfaces+1 fallback. The value
+    # is the checked-in checkpoint's output width; 6 interfaces is the topology
+    # and has nothing to do with it (only 5 of them are ever a label).
+    "n_out": 7,
 }
 
 # Compile-time ceiling for the generated first-layer dot product (verifier
@@ -325,7 +332,24 @@ def derive_shape(meta: dict, topology_config: dict = None,
         n_out = int(meta["n_out"])
     else:
         types = list(_DEFAULT_FEATURE_TYPES)
-        n_out = cfg["n_interfaces"] + 1
+        # n_out is a property of the TRAINED MODEL, not of the topology. The
+        # line here used to be `n_out = cfg["n_interfaces"] + 1`, which asserts
+        # one class per interface plus exactly one extra, and (everywhere
+        # downstream) that the extra one is DROP. The checked-in checkpoint has
+        # n_interfaces=6 and n_out=7 -- so the formula happens to give the right
+        # WIDTH while being wrong about every class meaning: only 5 classes
+        # forward, class 5 drops, class 6 is untrained.
+        #
+        # Declared n_out wins. The formula survives only as an announced
+        # fallback for descriptors written before it was recorded.
+        if "n_out" in meta:
+            n_out = int(meta["n_out"])
+        else:
+            n_out = cfg["n_interfaces"] + 1
+            print(f"[model_meta] NOTE: descriptor declares no n_out; ASSUMING "
+                  f"n_interfaces + 1 = {n_out}. That formula says nothing about "
+                  f"what the classes mean -- add \"n_out\" and "
+                  f"\"class_semantics\" to model_meta.json.")
 
     features = [{"type": t, "size": feature_size(t, cfg)} for t in types]
     n_in = sum(f["size"] for f in features)
@@ -440,3 +464,73 @@ def feature_maps(features: list) -> dict:
         if entry["kind"] == "dense_vector_map":
             out[f["type"]] = entry["map"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Class semantics (see class_semantics.py)
+# ---------------------------------------------------------------------------
+
+def load_class_semantics(model_path: str, n_out: int = None):
+    """Class semantics for the model whose artefacts sit next to `model_path`.
+
+    Read from model_meta.json's `class_semantics` block. If the descriptor has
+    none, a reference layout (FORWARD 0..n_out-2, DROP n_out-1) is built and
+    the assumption is PRINTED -- the previous behaviour was the same guess made
+    silently, which is how the datapath ended up dropping class 6 while the
+    model was trained to drop class 5.
+    """
+    from class_semantics import ClassSemantics
+    meta = load_model_meta(model_path)
+    if meta.get("class_semantics"):
+        sem = ClassSemantics.from_json(meta)
+        if n_out is not None and sem.n_out != n_out:
+            raise ValueError(
+                f"model_meta.json declares n_out={sem.n_out} but the resolved "
+                f"shape has n_out={n_out}. Fix the descriptor rather than "
+                f"letting the datapath pick one of the two.")
+        return sem
+    if n_out is None:
+        raise ValueError("no class_semantics in the descriptor and no n_out given")
+    print(f"[model_meta] WARNING: no class_semantics in the descriptor; "
+          f"assuming FORWARD 0..{n_out - 2} and DROP {n_out - 1}. This is a "
+          f"GUESS -- declare class_semantics in model_meta.json. The checked-in "
+          f"model's trained DROP class is 5, not {n_out - 1}.")
+    return ClassSemantics.forward_then_drop(n_out - 1, drop_class=n_out - 1,
+                                            n_out=n_out)
+
+
+def descriptor_semantics_or_reference(n_out: int, who: str):
+    """Semantics for an n_out-wide model: descriptor first, reference second.
+
+    The single fallback used by all three pipelines and the AOT generator, so
+    there is one place where "no semantics were supplied" is resolved and one
+    wording for it. Order matters:
+
+      1. shared/model_meta.json's class_semantics, if its n_out matches. This
+         is a DECLARATION and is used as-is.
+      2. FORWARD 0..n_out-2 / DROP n_out-1, printed as an assumption.
+
+    Step 2 is still a guess, and for the checked-in model it is the WRONG one
+    (trained DROP is 5, class 6 is untrained). It exists so that a caller who
+    forgot to pass semantics gets a loud line in its output rather than a
+    silently mis-dropping datapath.
+    """
+    from class_semantics import ClassSemantics
+    try:
+        meta = load_model_meta(os.path.join(_SHARED_DIR, "weights.json"))
+        if meta.get("class_semantics"):
+            sem = ClassSemantics.from_json(meta)
+            if sem.n_out == n_out:
+                print(f"[{who}] class semantics from model_meta.json "
+                      f"(n_out={sem.n_out}, drop_class={sem.drop_class})")
+                return sem
+            print(f"[{who}] NOTE: model_meta.json declares n_out={sem.n_out}, "
+                  f"this model has n_out={n_out}: descriptor not applicable")
+    except Exception as e:
+        print(f"[{who}] NOTE: model_meta.json unusable ({e})")
+    print(f"[{who}] NOTE: no class semantics supplied; ASSUMING the reference "
+          f"layout FORWARD 0..{n_out - 2}, DROP {n_out - 1}. This is a guess, "
+          f"not a rule -- declare class_semantics in model_meta.json or pass "
+          f"`semantics=`.")
+    return ClassSemantics.forward_then_drop(n_out - 1, drop_class=n_out - 1,
+                                            n_out=n_out)

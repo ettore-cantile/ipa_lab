@@ -34,6 +34,26 @@ if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 
 from model_meta import DEFAULT_TTL_SCALE as TTL_SCALE
+from model_meta import descriptor_semantics_or_reference
+from class_semantics import format_decision
+
+# N_OUT and the class meanings both come from the model descriptor. This
+# diagnostic used to label class 6 DROP and every other class "egress ethN",
+# which is the convention the datapath implemented and the model was NOT
+# trained with.
+SEM = descriptor_semantics_or_reference(7, "diag")
+
+# int8 weight scale, read from the same file the control planes use. Needed to
+# put each layer's bias in the accumulator's units -- see infer() below.
+def _load_qscale(default=24):
+    try:
+        with open(os.path.join(SHARED_DIR, "weights_float.json")) as f:
+            return int(json.load(f).get("scale_factor", default))
+    except Exception:
+        return default
+
+
+QSCALE = _load_qscale()
 
 
 def infer(w, ttl, link_state, node, ifindex=None,
@@ -67,12 +87,18 @@ def infer(w, ttl, link_state, node, ifindex=None,
         acc += w[base + 13 + node]
         h1.append(acc if acc > 0 else 0)
 
+    # Biases scaled into the accumulator's units: layer li's products carry
+    # scale**(li+1) while a stored bias carries scale**1, so the bias is
+    # multiplied by scale**li. Same correction as the datapath. Without it the
+    # decisions differ from the trained model on 28% of inputs.
     h2 = []
     for j in range(h):
-        acc = w[fc2_b + j] + sum(h1[i] * w[fc2_w + j * h + i] for i in range(h))
+        acc = (w[fc2_b + j] * QSCALE
+               + sum(h1[i] * w[fc2_w + j * h + i] for i in range(h)))
         h2.append(acc if acc > 0 else 0)
 
-    logits = [w[out_b + k] + sum(h2[i] * w[out_w + k * h + i] for i in range(h))
+    logits = [w[out_b + k] * QSCALE * QSCALE
+              + sum(h2[i] * w[out_w + k * h + i] for i in range(h))
               for k in range(n_out)]
     return max(range(n_out), key=lambda k: logits[k])
 
@@ -103,6 +129,12 @@ def main():
 
     all_up = [1] * 6
     seen = set()
+    # What each class MEANS comes from the model descriptor, printed up front so
+    # the sweep below can be read without guessing.
+    print("class semantics:")
+    for _l in SEM.summary().splitlines():
+        print(_l)
+    print()
 
     # ---------------------------------------------------------------
     print("=" * 66)
@@ -111,8 +143,10 @@ def main():
     pairs = [(t, infer(w, t, all_up, 0)) for t in range(1, TTL_SCALE + 1)]
     for a, b, c in _runs(pairs):
         rng = f"TTL {a}" if a == b else f"TTL {a}-{b}"
-        tag = "DROP" if c == 6 else f"egress eth{c}"
-        print(f"  {rng:<14} -> class {c}  ({tag})")
+        # `"DROP" if c == 6` labelled the model's untrained class as DROP and
+        # its real DROP class (5) as an egress interface -- this diagnostic was
+        # one of the places the wrong convention was read off as fact.
+        print(f"  {rng:<14} -> {format_decision(c, SEM)}")
     seen |= {c for _, c in pairs}
     print(f"\n  classi distinte sul range addestrato: {sorted({c for _, c in pairs})}")
 
@@ -150,7 +184,7 @@ def main():
     for c in sorted(by_node):
         nodes = by_node[c]
         shown = ", ".join(map(str, nodes[:12])) + (" ..." if len(nodes) > 12 else "")
-        print(f"  class {c}: {len(nodes):>2}/{args.n_nodes} nodi  [{shown}]")
+        print(f"  {format_decision(c, SEM)}: {len(nodes):>2}/{args.n_nodes} nodi  [{shown}]")
     print("\n  NOTA: nel datapath questo indice viene da ipa->model_id, non")
     print("  dall'identita' del nodo. Con un solo model_id registrato tutti i")
     print("  nodi usano la stessa colonna, quindi questa riga mostra cosa")

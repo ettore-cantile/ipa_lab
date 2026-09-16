@@ -9,10 +9,27 @@ class FastRerouteMLP(nn.Module):
     through extract_weights.py with SCALE_FACTOR=128.
     """
 
-    def __init__(self, n_interfaces=6, n_nodes=22, hidden_dim=32):
+    def __init__(self, n_interfaces=6, n_nodes=22, hidden_dim=32,
+                 n_classes=7):
+        """`n_classes` is the model's OUTPUT WIDTH and nothing more.
+
+        It used to be computed as `n_interfaces + 1  # +1 for DROP class`. That
+        one line asserted three things the training data does not support:
+        that every interface owns exactly one class, that there is exactly one
+        non-forwarding class, and that it is DROP. On the germany50 dataset only
+        5 of the 6 interfaces ever appear as a label (nothing routes out of
+        karlsruhe's link to h_src), DROP is class 5, and class 6 is never
+        emitted at all.
+
+        Which class means what belongs in the model descriptor
+        (model_meta.json's `class_semantics`), built from the training label
+        mapping -- see label_mapping.py. This constructor only needs the width,
+        so the width is what it takes. The default 7 keeps the checked-in
+        checkpoint loadable; it is not derived from n_interfaces.
+        """
         super(FastRerouteMLP, self).__init__()
         self.n_interfaces = n_interfaces
-        self.n_classes = n_interfaces + 1  # +1 for DROP class
+        self.n_classes = int(n_classes)
 
         input_dim = (
             n_interfaces       # output interface states

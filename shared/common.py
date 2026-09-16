@@ -204,7 +204,69 @@ def resolve_egress_mac(iface: str, fallback_dst: list = None):
     return src, dst
 
 
+def install_mac_per_port(b, table_name: str, node_cfg, logical_ports: list = None):
+    """Populate `table_name` keyed by LOGICAL PORT, from a resolved NodeConfig.
+
+    mac_table used to be keyed by CLASS, with class k assumed to live on
+    `eth{k}`. Both halves were wrong: a class is not a port (the model states
+    which port each class selects, see class_semantics.py) and a port is not an
+    interface name (the node states that, see node_config.py). This function
+    consumes the node's resolution and writes only ports the node can realise;
+    a port the model may select but the node lacks is left unmapped, so the
+    datapath treats it as unforwardable instead of redirecting somewhere
+    arbitrary.
+
+    Returns {"installed": [(port, iface, ifindex)], "pending": [(port, iface)],
+             "absent": [(port, iface)]}.
+    """
+    ports = sorted(node_cfg.bindings) if logical_ports is None else sorted(logical_ports)
+    mac = b.get_table(table_name)
+    installed, pending, absent = [], [], []
+    for port in ports:
+        bind = node_cfg.bindings.get(port)
+        if bind is None or not bind.present or bind.ifindex is None:
+            absent.append((port, bind.iface if bind else "?"))
+            continue
+        src = bind.src_mac
+        dst = bind.dst_mac
+        if src is None:
+            absent.append((port, bind.iface))
+            continue
+        if dst is None:
+            dst = DST_MAC
+            pending.append((port, bind.iface))
+        action = mac.Leaf()
+        action.ifindex = bind.ifindex
+        for i in range(6):
+            action.src_mac[i] = src[i]
+            action.dst_mac[i] = dst[i]
+        mac[ctypes.c_uint32(port)] = action
+        installed.append((port, bind.iface, bind.ifindex))
+    pend = {p for p, _ in pending}
+    for port, ifc, idx in installed:
+        st = "ARP pending -> fallback dst_mac" if port in pend else "ARP resolved"
+        print(f"[mac] {table_name}: logical_port {port} -> {ifc} "
+              f"(ifindex={idx}) [{st}]")
+    if absent:
+        names = ", ".join(f"port {p} ({n})" for p, n in absent)
+        print(f"[mac] {table_name}: {len(absent)} of {len(ports)} logical ports "
+              f"have no usable interface on this node -> unforwardable: {names}")
+    if not installed:
+        print(f"[mac] WARNING: {table_name} -- no logical port resolved; "
+              f"every FORWARD class is unforwardable")
+    return {"installed": installed, "pending": pending, "absent": absent}
+
+
 def install_mac_per_class(b, table_name: str, n_fwd: int, egress_ifaces: list = None):
+    """[DEPRECATED] Class-keyed mac_table.
+
+    Kept so existing call sites keep working, but it encodes the two
+    assumptions this refactor removes: that a class index IS a logical port,
+    and that logical port k IS `eth{k}`. New code should resolve a NodeConfig
+    and call install_mac_per_port().
+    """
+    print("[mac] NOTE: install_mac_per_class() assumes class == logical port == "
+          "eth{index}. Use install_mac_per_port() with a NodeConfig instead.")
     """Populate `table_name` (BPF_HASH class -> fwd_action) with a DISTINCT
     next-hop PER egress class: class i -> egress_ifaces[i], src = that iface's own
     MAC, dst = the ARP-resolved MAC of its neighbour (fallback until ARP resolves).

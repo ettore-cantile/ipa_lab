@@ -5,7 +5,9 @@
 # (BCC already pulls clang/llvm; libbpf-dev is the only likely-missing one.)
 #
 # Usage:
-#   python3 gen_full_c.py       # generate nn_aot_arch.bpf.c (once per model)
+#   python3 gen_full_c.py       # generate nn_aot_arch.bpf.c + nn_aot_meta.h
+#                               # (once per model; nn_aot_meta.h carries the
+#                               #  class semantics the loader seeds against)
 #   make                        # clang -> nn_aot_arch.o ; cc -> loader_aot
 #   sudo ./loader_aot nn_aot_arch.o
 #
@@ -24,11 +26,11 @@ all: nn_aot_arch.o loader_aot
 nn_aot_arch.o: nn_aot_arch.bpf.c
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
-loader_aot: loader_aot.c
+loader_aot: loader_aot.c nn_aot_meta.h
 	$(CC) -O2 loader_aot.c -o loader_aot -lbpf
 
 run: all
 	sudo ./loader_aot nn_aot_arch.o
 
 clean:
-	rm -f nn_aot_arch.o loader_aot nn_aot_arch.bpf.c
+	rm -f nn_aot_arch.o loader_aot nn_aot_arch.bpf.c nn_aot_meta.h

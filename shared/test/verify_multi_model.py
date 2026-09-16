@@ -51,7 +51,8 @@ from verify_prog_run import (
 PASS_RETVALS = frozenset({0, 4})
 
 
-def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int, ifindex: int = 0):
+def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int,
+                    ifindex: int = 0, scale: int = 1):
     """
     Generalized reference forward for an MLP of arbitrary depth/width,
     layer_dims = [(n_in0,n_out0), (n_in1,n_out1), ...] with n_in0 == 65
@@ -102,7 +103,13 @@ def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int, if
         scales = col_scale if li == 0 else [1] * n_in
         out = []
         for j in range(n_out):
-            acc = s8(weights[woff + bias_off + j])
+        # Bias scaled into the accumulator's units. The weights are stored as
+        # round(w_float * scale), so after L layers of products the accumulator
+        # carries scale**L while a bias stored the same way carries scale**1.
+        # Multiplying by scale**(layer index) puts the two in the same scale;
+        # without it the datapath disagrees with the trained model on 28% of
+        # decisions (measured: float/int8 argmax agreement 72% -> 96%).
+            acc = s8(weights[woff + bias_off + j]) * (scale ** li)
             for i in range(n_in):
                 acc += _trunc_div(acts[i] * s8(weights[woff + j * n_in + i]),
                                   scales[i])
@@ -139,7 +146,8 @@ def _reset(ps, cs, n_cls=7):
             pass
 
 
-def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3, ifindex=0):
+def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3,
+           ifindex=0, scale=24):
     """
     ifindex: the reference's assumed ctx->ingress_ifindex under
     BPF_PROG_TEST_RUN. P1 (hardcoded) translates the kernel's default value
@@ -152,23 +160,48 @@ def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3, ifin
     trained-model weights never being sensitive to it -- see the multi-model
     test's synthetic-weight diagnostics for the discrepancy this exposed).
     """
-    ref_cls, ref_val = ref_infer_shape(weights, ref_layer_dims, ttl, model_id, ifindex=ifindex)
-    frame = build_frame(model_id, ttl, 24)
+    ref_cls, ref_val = ref_infer_shape(weights, ref_layer_dims, ttl, model_id,
+                                       ifindex=ifindex, scale=scale)
+    frame = build_frame(model_id, ttl, scale)
     _reset(ps, cs)
     retval, _ = prog_test_run(disp_fd, frame, repeat=1)
-    if ref_cls < 6:
+    # Expectation from the DECLARED action. `ref_cls < 6` asserted that class 6
+    # is DROP and that 0..5 all forward -- wrong on both counts for the
+    # checked-in model, whose DROP class is 5 and whose class 6 is untrained.
+    sem = _semantics_for(ref_layer_dims[-1][1])
+    act = sem.action_of(ref_cls)
+    if act == "FORWARD":
         got = _read_u64(cs, ref_cls)
         ok = (retval in PASS_RETVALS) and got > 0
-    else:
-        # ref picked the DROP class (6): the correct kernel behavior is
-        # XDP_DROP (retval=1), not a redirect.
+    elif act == "DROP":
         got = _read_u64(ps, 2)
         ok = (retval == 1) and got > 0
+    else:
+        # UNUSED: the generated epilogue counts it and returns XDP_PASS.
+        got = _read_u64(cs, ref_cls)
+        ok = (retval == 2) and got > 0
     tag = "PASS" if ok else "FAIL"
     shape = "-".join(str(d[0]) for d in ref_layer_dims) + f"-{ref_layer_dims[-1][1]}"
     print(f"  [{tag}] {name:10s} model_id={model_id} shape={shape:14s} "
           f"ref_cls={ref_cls} ref_val={ref_val:>8} retval={retval} hit={got>0}")
     return ok
+
+
+_SEM_CACHE = {}
+
+
+def _semantics_for(n_out: int):
+    """Class semantics for an n_out-wide model, resolved once per width.
+
+    Routed through the single shared resolver (model_meta.json first, an
+    announced reference layout second) so this file cannot hold a different
+    opinion about class meanings than the datapath it is verifying.
+    """
+    if n_out not in _SEM_CACHE:
+        import model_meta as mm
+        _SEM_CACHE[n_out] = mm.descriptor_semantics_or_reference(
+            n_out, "verify_multi_model")
+    return _SEM_CACHE[n_out]
 
 
 def test_hardcoded():

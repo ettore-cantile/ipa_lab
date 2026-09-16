@@ -349,13 +349,19 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
 
     h1 = []
     for j in range(N_H1):
-        acc = s8(weights[off_fc1_b + j])
+        # Bias scaled into the accumulator's units. The weights are stored as
+        # round(w_float * scale), so after L layers of products the accumulator
+        # carries scale**L while a bias stored the same way carries scale**1.
+        # Multiplying by scale**(layer index) puts the two in the same scale;
+        # without it the datapath disagrees with the trained model on 28% of
+        # decisions (measured: float/int8 argmax agreement 72% -> 96%).
+        acc = s8(weights[off_fc1_b + j])            # layer 0: scale**0 == 1
         for i in range(N_IN):
             acc += _trunc_div(x[i] * s8(weights[j * N_IN + i]), col_scale[i])
         h1.append(max(0, acc))
     h2 = []
     for j in range(N_H2):
-        acc = s8(weights[off_fc2_b + j])
+        acc = s8(weights[off_fc2_b + j]) * scale        # layer 1: scale**1
         for i in range(N_H1):
             acc += h1[i] * s8(weights[off_fc2_w + j * N_H1 + i])
         h2.append(max(0, acc))
@@ -387,11 +393,14 @@ def build_frame_sparse(model_id: int, ttl: int, scale: int, n_in: int, n_out: in
 
 
 def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
-                     map_values, ifindex, ifindex_table):
+                     map_values, ifindex, ifindex_table, scale: int = 1):
     """Python reference for the heterogeneous sparse route: builds the input
     vector feature by feature from the descriptor (mirroring the per-kind C
     generators in ebpf_program.py), then runs the MLP + argmax. Returns
-    (best_cls, best_val); best_cls == n_out-1 means DROP.
+    (best_cls, best_val). What best_cls MEANS is not this function's business:
+    ask the ClassSemantics. It deliberately does not say "n_out-1 means DROP"
+    any more -- that sentence was the only documentation of a convention the
+    trained model does not follow.
 
     map_values: {map_name: [values]} the caller seeded into the dense_vector
     maps (link_state, queue_state). ifindex/ifindex_table: the raw
@@ -444,7 +453,13 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
         # already in the model's own units.
         scales = _feature_scales(features) if li == 1 else [1] * n_prev
         for j in range(n_cur):
-            acc = s8(weights[b_off + j])
+        # Bias scaled into the accumulator's units. The weights are stored as
+        # round(w_float * scale), so after L layers of products the accumulator
+        # carries scale**L while a bias stored the same way carries scale**1.
+        # Multiplying by scale**(layer index) puts the two in the same scale;
+        # without it the datapath disagrees with the trained model on 28% of
+        # decisions (measured: float/int8 argmax agreement 72% -> 96%).
+            acc = s8(weights[b_off + j]) * (scale ** (li - 1))
             for i in range(n_prev):
                 acc += _trunc_div(acts[i] * s8(weights[w_off + j * n_prev + i]),
                                   scales[i])
@@ -462,18 +477,53 @@ class _FwdAction(ct.Structure):
     _pack_ = 1
     _fields_ = [("ifindex",  ct.c_uint32), ("src_mac",  ct.c_uint8 * 6), ("dst_mac",  ct.c_uint8 * 6)]
 
-def _install_mac_table(b, name, ifindex=2, n_classes=6):
-    """Pre-install the class->action map for classes 0..n_classes-1 (the
-    argmax output). The NN picks the class; this dictionary resolves it to
-    {ifindex, MACs}. n_classes defaults to 6 (the historical egress count);
-    pass n_out-1 for a model with a different number of egress classes."""
+def _install_mac_table(b, name, ifindex=2, semantics=None, ports=None):
+    """Pre-install the logical-port -> action map the datapath reads after
+    argmax. The NN picks a class, the class semantics say which LOGICAL PORT
+    that class forwards on, and this dictionary resolves that port to
+    {ifindex, MACs}.
+
+    The signature used to be `n_classes=6`, filling keys 0..5 and defaulting to
+    "the historical egress count". That baked in three things at once: that the
+    map is keyed by class, that class k is a forwarding class for every k below
+    the count, and that the count is n_out-1. For the checked-in model all
+    three are wrong (DROP is class 5, class 6 is untrained), so the table both
+    installed a next-hop for the DROP class and left the real port space only
+    accidentally correct.
+
+    Pass `semantics` and the declared logical ports are used. `ports` overrides
+    with an explicit list, for tests that want a deliberately partial table.
+    """
+    if ports is None:
+        if semantics is None:
+            semantics = _default_semantics_for(b, name)
+        ports = semantics.logical_ports
     action = _FwdAction(
         ifindex=ifindex,
         src_mac=(ct.c_uint8 * 6)(0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF),
         dst_mac=(ct.c_uint8 * 6)(0x11, 0x22, 0x33, 0x44, 0x55, 0x66),
     )
-    for cls in range(n_classes):
-        b[name][ct.c_uint32(cls)] = action
+    for port in ports:
+        b[name][ct.c_uint32(port)] = action
+    return list(ports)
+
+
+def _default_semantics_for(b, name):
+    """Semantics for a setup that did not pass any: descriptor, then reference.
+
+    Routed through the one shared resolver so the verifier cannot disagree with
+    the datapath about what class 5 means.
+    """
+    import model_meta as mm
+    n_out = None
+    try:
+        n_out = b["cls_stats"].max_entries if "cls_stats" in dir(b) else None
+    except Exception:
+        n_out = None
+    if n_out is None:
+        n_out = mm.derive_shape(mm.load_model_meta(
+            os.path.join(SHARED_DIR, "weights.json")))["n_out"]
+    return mm.descriptor_semantics_or_reference(n_out, f"verify:{name}")
 
 def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, layer_idx: int, ingress_ifindex: int = 0, ttl: int = 0):
     """Seed scratch_acts/scratch_meta so that calling layer_hidden directly
@@ -914,7 +964,11 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
     b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
 
     n_out = shape["n_out"]
-    _install_mac_table(b, "mac_table", n_classes=n_out - 1)
+    # The generator was handed these same semantics (load_and_generate ->
+    # generate_ebpf_hardcoded), so the seeded port space matches the switch the
+    # datapath actually runs.
+    semantics = mm.descriptor_semantics_or_reference(n_out, "verify:sparse")
+    _install_mac_table(b, "mac_table", semantics=semantics)
 
     # Seed each dense_vector map with known values (deterministic, arbitrary).
     # Each map holds all its slots in one struct-valued entry (single lookup).
@@ -931,6 +985,7 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
         "weights": weights, "scale": scale, "shape": shape,
         "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
         "pipeline": 1, "map_values": map_values,
+        "semantics": semantics,
         "progs": {"ipa_switch_hardcoded": fn.fd, f"model_{model_id}": model_fn.fd},
     }
 
@@ -1276,14 +1331,23 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
     print(f"[setup] scale={scale}  weights={len(weights)}  n_in={n_in}  n_out={n_out}")
     print(f"      features: {feats_str}")
     print(f"      seeded maps: {map_values}")
-    print(f"      IV built locally (maps + TTL + node one-hot). PASS = redirect on ref_cls "
-          f"(or DROP for ref_cls == {n_out - 1}).")
+    # PASS/FAIL comes from the DECLARED action of the reference class. The old
+    # rule was `ref_cls < n_out - 1 -> expect redirect, else expect DROP`, so a
+    # model whose DROP class is not the last one was scored against the wrong
+    # expectation on every single TTL -- and an UNUSED class had no expectation
+    # at all.
+    semantics = setup["semantics"]
+    for _l in semantics.summary().splitlines():
+        print(f"      {_l}")
+    print("      IV built locally (maps + TTL + node one-hot). PASS = the "
+          "action the semantics declare for ref_cls.")
 
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
         ref_cls, ref_val = ref_infer_sparse(
             weights, features, hidden_dims, n_out, ttl, model_id,
-            map_values, ifindex=TEST_RUN_DEFAULT_INGRESS_IFINDEX, ifindex_table=ifindex_table)
+            map_values, ifindex=TEST_RUN_DEFAULT_INGRESS_IFINDEX,
+            ifindex_table=ifindex_table, scale=scale)
         frame = build_frame_sparse(model_id, ttl, scale, n_in, n_out)
         _reset_stats(setup, n_classes=n_out)
         # repeat=1: the program mutates the packet (TTL decrement) and
@@ -1292,14 +1356,25 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
         # instead of the decision under test. One run is all a class check needs;
         # latency for the tables is measured by prog_test_run_bench().
         retval, dur_ns = prog_test_run(disp.fd, frame, repeat=1)
-        if ref_cls < n_out - 1:
+        action = semantics.action_of(ref_cls)
+        if action == "FORWARD":
             cls_count = _read_u64(cs, ref_cls)
             ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
-            detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"
-        else:
+            detail = (f"FORWARD(port {semantics.port_of(ref_cls)}) "
+                      f"retval={retval} cls_stats[{ref_cls}]={cls_count}")
+        elif action == "DROP":
             cls_count = _read_u64(ps, 2)
             ok = (retval == 1) and (cls_count > 0)
-            detail = f"retval={retval} pkt_stats[DROP]={cls_count}"
+            detail = f"DROP retval={retval} pkt_stats[DROP]={cls_count}"
+        else:
+            # UNUSED: countable, never forwarded, never dropped. The generated
+            # epilogue returns XDP_PASS and bumps cls_stats, so that a class the
+            # model was never trained to emit is visible instead of silently
+            # taking the DROP path.
+            cls_count = _read_u64(cs, ref_cls)
+            ok = (retval == 2) and (cls_count > 0)
+            detail = (f"UNUSED retval={retval} (expect XDP_PASS=2) "
+                      f"cls_stats[{ref_cls}]={cls_count}")
         lat_us = dur_ns / 1000
         status = "PASS" if ok else "FAIL"
         if ok:

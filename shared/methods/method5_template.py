@@ -44,10 +44,13 @@ from ebpf_template_arch import (
 )
 from common import (
     load_weights, attach_xdp, detach_xdp, INGRESS_IFACE, resolve_ifindex,
-    install_mac_per_class, start_mac_refresh_thread,
+    install_mac_per_port, start_mac_refresh_thread,
 )
 from link_state_monitor import init_link_state_up, start_monitor_thread
-from model_meta import derive_shape, load_model_meta, load_topology_config
+from model_meta import (derive_shape, load_model_meta, load_topology_config,
+                        load_class_semantics)
+from node_config import NodeConfig
+from ebpf_template_arch import load_class_action
 
 # Resolve the shared/ directory relative to this file regardless of cwd.
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -121,15 +124,21 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
 
     fn_dispatcher = b.load_func("ipa_switch_template", BPF.XDP)
 
-    # n_fwd = egress classes = n_out - 1 (the last class is DROP), derived from
-    # the model shape instead of a literal 6. The literal silently assumed the
-    # checked-in 65-4-4-7 checkpoint; a model with a different output width
-    # would have had its top classes left unmapped with no warning.
+    # class -> action -> logical port comes from the MODEL descriptor; logical
+    # port -> ifindex/MAC from the NODE. Neither is derived from the other, and
+    # neither assumes DROP is the last class or that class k lives on eth{k}.
     _shape = derive_shape(load_model_meta(weights_path),
                           topology_config=load_topology_config())
-    n_fwd = _shape["n_out"] - 1
-    print(f"  Egress classes: {n_fwd} (n_out={_shape['n_out']}, last class = DROP)")
-    mac_info = install_mac_per_class(b, "mac_table_t2", n_fwd=n_fwd)
+    semantics = load_class_semantics(weights_path, _shape["n_out"])
+    print("[Method 5] class semantics:")
+    print(semantics.summary())
+    node_cfg = NodeConfig.resolve(semantics.logical_ports)
+    print(node_cfg.summary())
+    for _p in node_cfg.validate(semantics.logical_ports, strict=False):
+        print(f"[Method 5] NOTE: {_p}")
+    mac_info = install_mac_per_port(b, "mac_table_t2", node_cfg,
+                                    semantics.logical_ports)
+    load_class_action(b, "class_action_t2", semantics)
     if mac_info["pending"]:
         start_mac_refresh_thread(b, "mac_table_t2", mac_info["pending"], interval=5.0)
 
