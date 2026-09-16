@@ -40,6 +40,10 @@
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
+/* The interface being attached to, or -1 in bench mode. seed_maps() needs it
+ * to fill ingress_port, and it is parsed before seed_maps() runs. */
+static int g_attach_ifindex = -1;
+
 /* Set by SIGINT/SIGTERM so the live-attach deploy mode can detach cleanly. */
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -111,6 +115,33 @@ static int seed_maps(struct bpf_object *obj) {
     }
     fprintf(stderr, "seeded mac_table for %d logical port(s) of %d class(es)\n",
             AOT_N_PORTS, AOT_N_OUT);
+
+    /* Kernel ingress ifindex -> LOGICAL PORT. The program no longer carries a
+     * compiled-in [2, 3, ...] table: an AOT object is built on a build machine,
+     * possibly long before the node it runs on exists, so it cannot know what
+     * ifindexes that node will hand out. Without an entry here the
+     * ingress_iface one-hot stays empty and a trained feature contributes
+     * nothing -- silently, which is how it went unnoticed for so long.
+     *
+     * In --attach mode the ingress is known: it is the interface being attached
+     * to, and it is logical port 1 unless the deployment says otherwise. In
+     * bench mode there is no interface at all, so nothing is seeded and the
+     * feature is empty -- which is what the reference is told too. */
+    struct bpf_map *ip_map = bpf_object__find_map_by_name(obj, "ingress_port");
+    if (ip_map && g_attach_ifindex >= 0) {
+        __u32 kif = (__u32)g_attach_ifindex, port = 1;
+        if (bpf_map_update_elem(bpf_map__fd(ip_map), &kif, &port, BPF_ANY)) {
+            fprintf(stderr, "WARNING: could not seed ingress_port for ifindex "
+                            "%d (%s); the ingress_iface feature will contribute "
+                            "nothing\n", g_attach_ifindex, strerror(errno));
+        } else {
+            fprintf(stderr, "seeded ingress_port: ifindex %d -> one-hot slot %u\n",
+                    g_attach_ifindex, port);
+        }
+    } else if (ip_map) {
+        fprintf(stderr, "ingress_port left empty (bench mode: no interface), so "
+                        "the ingress_iface one-hot contributes nothing\n");
+    }
     return 0;
 }
 
@@ -121,7 +152,6 @@ int main(int argc, char **argv) {
     //                   resident until Ctrl-C, then detach). This is the LIVE
     //                   datapath alternative to BCC's method4_hardcoded attach.
     const char *lit = "nn_aot_arch.o";
-    int attach_ifindex = -1;
     // XDP attach mode. This used to be a bare 0, which means "kernel decides"
     // -- and the kernel decides by trying native and SILENTLY falling back to
     // generic. A deploy that lands on the generic path (inside
@@ -132,7 +162,7 @@ int main(int argc, char **argv) {
     __u32 xdp_flags = XDP_FLAGS_DRV_MODE;
     const char *mode_name = "native";
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--attach") && i + 1 < argc) attach_ifindex = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--attach") && i + 1 < argc) g_attach_ifindex = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--xdp-mode") && i + 1 < argc) {
             mode_name = argv[++i];
             if (!strcmp(mode_name, "native"))       xdp_flags = XDP_FLAGS_DRV_MODE;
@@ -169,10 +199,10 @@ int main(int argc, char **argv) {
     // --- LIVE DEPLOY mode: attach xdp_dispatch to a real interface and stay
     // resident (the AOT alternative to BCC's method4_hardcoded live attach).
     // Requires libbpf >= 0.7 for bpf_xdp_attach/detach. ---
-    if (attach_ifindex >= 0) {
-        if (bpf_xdp_attach(attach_ifindex, disp_fd, xdp_flags, NULL)) {
+    if (g_attach_ifindex >= 0) {
+        if (bpf_xdp_attach(g_attach_ifindex, disp_fd, xdp_flags, NULL)) {
             fprintf(stderr, "bpf_xdp_attach(ifindex=%d, mode=%s) failed: %s\n",
-                    attach_ifindex, mode_name, strerror(errno));
+                    g_attach_ifindex, mode_name, strerror(errno));
             if (xdp_flags == XDP_FLAGS_DRV_MODE)
                 fprintf(stderr,
                         "  This interface's driver may not support native XDP "
@@ -188,7 +218,7 @@ int main(int argc, char **argv) {
         {
             LIBBPF_OPTS(bpf_xdp_query_opts, q);
             const char *actual = "unknown";
-            if (!bpf_xdp_query(attach_ifindex, xdp_flags, &q)) {
+            if (!bpf_xdp_query(g_attach_ifindex, xdp_flags, &q)) {
                 if      (q.attach_mode == XDP_ATTACHED_DRV)   actual = "native";
                 else if (q.attach_mode == XDP_ATTACHED_SKB)   actual = "generic";
                 else if (q.attach_mode == XDP_ATTACHED_HW)    actual = "offload";
@@ -210,15 +240,15 @@ int main(int argc, char **argv) {
                "(BCC recompile of the same model: ~1.3 s, reference not measured here)\n",
                t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d. Ctrl-C to detach.\n",
-               attach_ifindex);
+               g_g_attach_ifindex);
         /* Flush now: when stdout is a pipe rather than a
          * TTY) C stdio is fully buffered, so without this the messages above
          * would sit in the buffer -- invisible -- while the loader blocks in
          * pause(), making a working, attached deploy look like a hang. */
         fflush(stdout);
         while (!g_stop) pause();
-        bpf_xdp_detach(attach_ifindex, xdp_flags, NULL);
-        printf("\n[deploy] detached from ifindex %d.\n", attach_ifindex);
+        bpf_xdp_detach(g_attach_ifindex, xdp_flags, NULL);
+        printf("\n[deploy] detached from ifindex %d.\n", g_attach_ifindex);
         bpf_object__close(obj);
         return 0;
     }

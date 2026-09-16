@@ -52,12 +52,13 @@ Implementation notes:
     the datapath pays a SINGLE bpf_map_lookup_elem for all the weights instead
     of one helper call per weight byte (~139 of P2's former 147 lookups per
     packet). Same "N lookups -> 1" transformation as the dense feature vectors.
-  - ingress_ifindex is clamped to [0,6]; under BPF_PROG_TEST_RUN it is a
-    sandbox value outside that range and is treated as "no ingress iface".
-    NOTE: unlike Pipeline 1, this does NOT translate the kernel ifindex into a
-    logical port through an ifindex_table -- the raw ifindex is used as the
-    one-hot index. On a real node (eth0 = ifindex 2) the two pipelines
-    therefore select DIFFERENT columns for the same packet.
+  - the ingress one-hot is indexed by LOGICAL PORT, resolved from
+    ctx->ingress_ifindex through the `ingress_port` map. An ifindex with no
+    entry yields 0, i.e. "not one of this node's ports", and contributes
+    nothing -- which is also what happens under BPF_PROG_TEST_RUN, where no
+    entry is installed. All three pipelines resolve it the same way: the
+    earlier asymmetry, where P1 used a compiled-in table and P2/P3 used the raw
+    ifindex and so selected DIFFERENT columns for the same packet, is gone.
   - The weight block is written through the raw bpf(2) syscall (libbcc does not
     export a stable bpf_update_elem); the real map value size is detected via
     BPF_OBJ_GET_INFO_BY_FD before writing.

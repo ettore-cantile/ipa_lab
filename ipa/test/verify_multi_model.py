@@ -149,11 +149,12 @@ def _reset(ps, cs, n_cls=7):
 def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3,
            ifindex=0, scale=24):
     """
-    ifindex: the reference's assumed ctx->ingress_ifindex under
-    BPF_PROG_TEST_RUN. P1 (hardcoded) translates the kernel's default value
-    through its OWN ifindex_table (which doesn't map it to anything, so it
-    resolves to "no iface feature" == ifindex=0 for the reference too). P2
-    (template) and P3 (modular) clamp the RAW ctx->ingress_ifindex directly
+    ifindex: the reference's assumed LOGICAL PORT. All three pipelines now
+    resolve ctx->ingress_ifindex through the `ingress_port` map, and this test
+    installs no entry, so no port resolves and the one-hot is empty everywhere
+    -- 0 for the reference too. This parameter used to carry a real asymmetry:
+    P1 translated through a compiled-in table that mapped nothing, while P2/P3
+    clamped the RAW ctx->ingress_ifindex directly
     (1 <= x <= 6), and the empirically observed default under TEST_RUN is 1
     -- so their reference must assume ifindex=1, not 0, or a close/tied
     class can flip (this was silently masked by verify_prog_run.py's real
@@ -222,8 +223,9 @@ def test_hardcoded():
 
     ps, cs = b["pkt_stats"], b["cls_stats"]
     ok = True
-    # ifindex=0: P1's ifindex_table (default [2..7]) never maps the kernel's
-    # TEST_RUN ingress_ifindex to a logical port, so _iface stays 0.
+    # ifindex=0: no ingress_port entry is installed here, so the kernel's
+    # TEST_RUN ingress_ifindex resolves to no logical port and _iface stays 0
+    # -- the same for all three pipelines.
     ok &= _check("hardcoded", 0, disp_fn.fd, ps, cs, dims, weights0, ifindex=0)
     ok &= _check("hardcoded", 1, disp_fn.fd, ps, cs, dims, weights0, ifindex=0)
     return ok

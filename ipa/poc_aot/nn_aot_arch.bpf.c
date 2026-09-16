@@ -39,6 +39,12 @@ struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 16);
          __type(key, __u32); __type(value, struct fwd_action); } mac_table SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_PROG_ARRAY); __uint(max_entries, 256);
          __type(key, __u32); __type(value, __u32); } model_progs SEC(".maps");
+/* kernel ingress ifindex -> LOGICAL PORT (1-based; absent contributes
+ * nothing). The ingress-side mirror of mac_table: which interface
+ * realises which port is a node fact, and an AOT program is compiled
+ * before the node exists. */
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64);
+         __type(key, __u32); __type(value, __u32); } ingress_port SEC(".maps");
 
 SEC("xdp")
 int xdp_model(struct xdp_md *ctx) {
@@ -68,17 +74,14 @@ int xdp_model(struct xdp_md *ctx) {
         ls4=(long long)_p->v[4];
         ls5=(long long)_p->v[5];
       } }
-    /* feature 'ingress_iface' (one-hot): raw ifindex -> logical 1..size */
+    /* feature 'ingress_iface' (one-hot): kernel ifindex -> logical
+     * 1..size through the ingress_port map -- a node fact, resolved at
+     * load time, not a constant compiled into the program. The WEIGHT
+     * switch below stays literal: that is what this generator is for. */
     __u32 _iface = 0U;
-    switch (ctx->ingress_ifindex) {
-        case 2U: _iface = 1U; break;
-        case 3U: _iface = 2U; break;
-        case 4U: _iface = 3U; break;
-        case 5U: _iface = 4U; break;
-        case 6U: _iface = 5U; break;
-        case 7U: _iface = 6U; break;
-        default: break;
-    }
+    { __u32 _kif = ctx->ingress_ifindex;
+      __u32 *_lp = bpf_map_lookup_elem(&ingress_port, &_kif);
+      if (_lp && *_lp >= 1U && *_lp <= 6U) _iface = *_lp; }
     long long w_iface_0 = 0LL;
     long long w_iface_1 = 0LL;
     long long w_iface_2 = 0LL;

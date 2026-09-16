@@ -42,8 +42,17 @@ if SHARED_DIR not in sys.path:
 
 import model_meta as _model_meta
 
-# kernel ifindex -> logical port 1..n_interfaces (loader sets ctx->ingress_ifindex = 2)
-DEFAULT_IFINDEX_TABLE = [2, 3, 4, 5, 6, 7]
+# The kernel ifindex -> logical port mapping is NOT compiled in. It used to be
+# DEFAULT_IFINDEX_TABLE = [2, 3, 4, 5, 6, 7], baked into the generated program
+# as a switch, which encodes the assumption eth0 == ifindex 2. Kernel ifindexes
+# are assigned by the kernel and are arbitrary -- 205, 217, 229 on a box that
+# has created a few veths -- so on real hardware no case matched and the
+# trained ingress_iface feature contributed nothing.
+#
+# An AOT program has even less business guessing them than a BCC one: it is
+# compiled on a build machine, possibly months before the node it runs on
+# exists. The mapping is the `ingress_port` map, filled at load time by the
+# loader (or by the Python control plane) from the node's own interfaces.
 
 
 def _lit(v) -> str:
@@ -98,20 +107,16 @@ def _feat_dense_vector(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
+def _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1):
     size = feat["size"]
-    lines = ["    /* feature 'ingress_iface' (one-hot): raw ifindex -> logical 1..size */",
+    lines = ["    /* feature 'ingress_iface' (one-hot): kernel ifindex -> logical",
+             "     * 1..size through the ingress_port map -- a node fact, resolved at",
+             "     * load time, not a constant compiled into the program. The WEIGHT",
+             "     * switch below stays literal: that is what this generator is for. */",
              "    __u32 _iface = 0U;",
-             "    switch (ctx->ingress_ifindex) {"]
-    seen = set()
-    for logical_idx, kern in enumerate(ifindex_table[:size], start=1):
-        ki = int(kern)
-        if ki in seen:
-            continue
-        seen.add(ki)
-        lines.append(f"        case {ki}U: _iface = {logical_idx}U; break;")
-    lines.append("        default: break;")
-    lines.append("    }")
+             "    { __u32 _kif = ctx->ingress_ifindex;",
+             "      __u32 *_lp = bpf_map_lookup_elem(&ingress_port, &_kif);",
+             f"      if (_lp && *_lp >= 1U && *_lp <= {size}U) _iface = *_lp; }}"]
     for j in range(n_h1):
         lines.append(f"    long long w_iface_{j} = 0LL;")
     lines.append("    switch (_iface) {")
@@ -144,7 +149,7 @@ def _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
+def _gen_feature(feat, offset, n_in, fc1_w, n_h1):
     t = feat["type"]
     kind = _model_meta.FEATURE_CATALOG[t]["kind"]
     if kind == "scalar":
@@ -153,7 +158,7 @@ def _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table):
         return _feat_dense_vector(feat, offset, n_in, fc1_w, n_h1)
     if kind == "onehot":
         if t == "ingress_iface":
-            return _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1, ifindex_table)
+            return _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1)
         if t == "node":
             return _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1)
     raise ValueError(f"no C generator for feature type {t!r} (kind {kind!r})")
@@ -203,7 +208,7 @@ _PARSE = """    void *data = (void *)(long)ctx->data;
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;"""
 
 
-def _emit_model_body(shape, w, ifindex_table, scale: int = 1, semantics=None) -> list:
+def _emit_model_body(shape, w, scale: int = 1, semantics=None) -> list:
     """IV + MLP + argmax + action body of the tail-called model program (weights
     as literals). ctx/data/eth/ip/udp/ipa are already parsed by the caller-emitted
     _PARSE block (the SECOND parse the dispatcher+tail-call architecture forces)."""
@@ -222,7 +227,7 @@ def _emit_model_body(shape, w, ifindex_table, scale: int = 1, semantics=None) ->
     term_fns = []
     offset = 0
     for feat in features:
-        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1, ifindex_table)
+        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1)
         L.extend(pre)
         term_fns.append(term)
         offset += feat["size"]
@@ -349,10 +354,16 @@ def _emit_maps(shape) -> list:
     A("         __type(key, __u32); __type(value, struct fwd_action); } mac_table SEC(\".maps\");")
     A("struct { __uint(type, BPF_MAP_TYPE_PROG_ARRAY); __uint(max_entries, 256);")
     A("         __type(key, __u32); __type(value, __u32); } model_progs SEC(\".maps\");")
+    A("/* kernel ingress ifindex -> LOGICAL PORT (1-based; absent contributes")
+    A(" * nothing). The ingress-side mirror of mac_table: which interface")
+    A(" * realises which port is a node fact, and an AOT program is compiled")
+    A(" * before the node exists. */")
+    A("struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64);")
+    A("         __type(key, __u32); __type(value, __u32); } ingress_port SEC(\".maps\");")
     return L
 
 
-def _emit_arch(shape, w, ifindex_table, scale: int = 1, semantics=None) -> str:
+def _emit_arch(shape, w, scale: int = 1, semantics=None) -> str:
     """FULL-PATH, ARCHITECTURE-FAITHFUL literal program: dispatcher +
     PROG_ARRAY tail-call + model that RE-parses (double parse) -- same topology
     as the BCC hardcoded path, so BPF_PROG_TEST_RUN on the dispatcher measures
@@ -396,7 +407,7 @@ def _emit_arch(shape, w, ifindex_table, scale: int = 1, semantics=None) -> str:
     A("SEC(\"xdp\")")
     A("int xdp_model(struct xdp_md *ctx) {")
     A(_PARSE)
-    L.extend(_emit_model_body(shape, w, ifindex_table, scale, semantics))
+    L.extend(_emit_model_body(shape, w, scale, semantics))
     A("}")
     A("")
     # --- dispatcher (entry): parses, tail-calls model_progs[model_id] ---
@@ -413,7 +424,7 @@ def _emit_arch(shape, w, ifindex_table, scale: int = 1, semantics=None) -> str:
 
 
 def _resolve_shape(model_path=None, meta=None, topology_config=None):
-    """Resolve (shape, ifindex_table) from a model descriptor + topology, using
+    """Resolve the shape from a model descriptor + topology, using
     the SAME model_meta logic as the BCC path. With no meta the default
     descriptor [link_state, ingress_iface, ttl, node], n_out from it, is
     used -> the historical 65-4-4-7 shape."""
@@ -425,11 +436,7 @@ def _resolve_shape(model_path=None, meta=None, topology_config=None):
         topology_config = _model_meta.load_topology_config()
     shape = _model_meta.derive_shape(meta, topology_config=topology_config)
 
-    iface_size = next((f["size"] for f in shape["features"] if f["type"] == "ingress_iface"), 0)
-    ifindex_table = list(DEFAULT_IFINDEX_TABLE[:max(iface_size, 1)])
-    while len(ifindex_table) < iface_size:
-        ifindex_table.append(2)
-    return shape, ifindex_table
+    return shape
 
 
 def generate_arch_literal_c(model_path: str = None, meta: dict = None,
@@ -439,7 +446,7 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
     model_path; the descriptor is resolved from `meta`/`topology_config`
     (defaults reproduce the 65-4-4-7 program byte-for-byte)."""
     from extract_weights import extract_weights_int8
-    shape, ifindex_table = _resolve_shape(model_path, meta, topology_config)
+    shape = _resolve_shape(model_path, meta, topology_config)
     sizes = _layer_sizes(shape)
     n_weights = _weight_count(sizes)
     # Pass the RESOLVED topology through, exactly like the BCC path
@@ -481,7 +488,7 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
     if semantics.n_out != sizes[-1]:
         raise SystemExit(f"class semantics declare n_out={semantics.n_out} but "
                          f"the model outputs {sizes[-1]}")
-    return _emit_arch(shape, w, ifindex_table, scale, semantics)
+    return _emit_arch(shape, w, scale, semantics)
 
 
 def generate_meta_header(semantics=None) -> str:
@@ -494,7 +501,7 @@ def generate_meta_header(semantics=None) -> str:
     the datapath switch is generated from.
     """
     if semantics is None:
-        shape, _ = _resolve_shape()
+        shape = _resolve_shape()
         from model_meta import descriptor_semantics_or_reference
         semantics = descriptor_semantics_or_reference(_layer_sizes(shape)[-1],
                                                       "AOT/meta")
@@ -520,7 +527,7 @@ def main():
         f.write(generate_arch_literal_c())
     with open(os.path.join(_HERE, "nn_aot_meta.h"), "w") as f:
         f.write(generate_meta_header())
-    shape, _ = _resolve_shape()
+    shape = _resolve_shape()
     print(f"wrote nn_aot_arch.bpf.c + nn_aot_meta.h (arch-faithful literal, "
           f"{'-'.join(map(str, _layer_sizes(shape)))}) in {_HERE}")
 

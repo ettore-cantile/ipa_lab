@@ -88,10 +88,12 @@ Verifier constraints (why the sparse route's codegen is shaped this way):
   5) Feature vector iface one-hot always zero (chosen_port=DROP, 100%):
      _iface = ctx->ingress_ifindex & 0x7 produced e.g. 655 & 7 = 7,
      which never matched any switch(_iface) case, so w_iface_j = 0 for
-     all neurons. Fix: emit a preliminary switch(ctx->ingress_ifindex)
-     that maps each hardcoded kernel ifindex (from ifindex_table,
-     resolved at pipeline startup via socket.if_nametoindex) to the
-     logical index 1..n_interfaces used by the training feature encoding,
+     all neurons. The fix went through two stages: first a switch over
+     kernel ifindexes compiled in from a table, which only moved the
+     assumption (it hardcoded eth0 == ifindex 2 and matched nothing on a
+     real box); then the `ingress_port` map, read at runtime, which maps
+     the kernel ifindex to the logical index 1..n_interfaces the training
+     feature encoding uses,
      stored in _iface before the existing switch(_iface).
 """
 

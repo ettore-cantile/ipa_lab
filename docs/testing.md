@@ -363,38 +363,129 @@ sudo python3 ipa/test/test_suite.py --only kernel
 
 ---
 
-## Risultati (kernel, `test_suite.py --only kernel`, 4 CPU, modello 65→4→4→7, scale=24)
+## Risultati (kernel, `test_suite.py --only kernel`, 4 vCPU, modello 65→4→4→7, scale=24)
 
-Aggiornati dopo: IV **descrittore-driven** in P2/P3 (registry `model_desc`), AOT-literal
-universale in P1, riga **baseline** (parse + redirect, **nessuna inferenza**) come pavimento.
+Rimisurati dopo tre correzioni che invalidavano la tabella precedente:
 
-Metodologia: minimo su N trial indipendenti (sez. 2), con p50/max e spread relativo
-riportati per trasparenza. Sono riportate **tre esecuzioni indipendenti**, perche' il
-confronto fra loro e' esso stesso un risultato metodologico (vedi la nota sotto).
+1. **bias dell'ultimo strato nel riferimento** (`ref_infer` moltiplicava per `scale⁰`
+   invece che per `scale²`): ogni confronto float/int8 misurava la cosa sbagliata;
+2. **mappa `ingress_port`**: la feature `ingress_iface` passava da contribuire **zero**
+   su hardware vero a contribuire davvero — il modello girava di fatto su 3 input su 4;
+3. **`cls_stats`** ora scritto anche su DROP e UNUSED, non solo sul FORWARD riuscito.
+
+> ⚠️ **La tabella precedente mescolava run di versioni diverse del codice.** Le righe
+> erano etichettate A/B/C come se fossero esecuzioni ripetute dello stesso build, ma
+> P2 vi compariva con 9 916 istruzioni mentre le note dello stesso documento
+> registravano già `~2 618→16 988` per un cambiamento successivo. Non erano numeri da
+> correggere: era la tabella da rifare. Qui c'è **un solo stato del codice**.
+
+Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo. Sono
+riportate **due esecuzioni consecutive dello stesso identico binario**, perché la
+distanza fra loro è il dato metodologico più importante della sezione.
 
 | Metrica | run | baseline | P1 hardcoded | P2 template | P3 modular |
 |---|---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | A | 129 | 997 | 9 962 | 8 209 |
-| Istruzioni eBPF (xlated) | B, C | 129 | 997 | 9 916 | 8 201 |
-| Codice jited (byte) | A | 600 | 4 751 | 48 640 | 40 635 |
-| Codice jited (byte) | B, C | 600 | 4 751 | 50 306 | 40 544 |
+| Istruzioni eBPF (xlated) | 1 e 2 | 155 | 971 | 16 185 | 11 826 |
+| Codice jited (byte) | 1 e 2 | 709 | 4 764 | 79 051 | 57 831 |
 | Tail call / pacchetto | — | 0 | 1 | 1 | 3 |
-| Map lookup / pacchetto (reali) | — | 0 | 4.0 | 8.0 | 26.0 |
-| Memoria mappe (byte) | — | 280 | 308 | 3 960 | 8 188 |
-| **Latenza min (ns/pkt)** | **A** (7 trial) | **28.0** | **47.0** | **224.0** | **387.0** |
-| **Latenza min (ns/pkt)** | **B** (7 trial) | **14.0** | **48.0** | **165.0** | **392.0** |
-| **Latenza min (ns/pkt)** | **C** (15 trial) | **25.0** | **51.0** | **234.0** | **391.0** |
-| ...p50 | C | 33.0 | 52.0 | 244.0 | 419.0 |
-| ...max | C | 53.0 | 67.0 | 323.0 | 529.0 |
-| ...spread (max−min)/min | C | **112%** | 31% | 38% | 35% |
-| Throughput (Mpps, da min) | C | 40.000 | 19.608 | 4.274 | 2.558 |
+| Map lookup / pacchetto (reali) | — | 3.0 | 5.0 | n.d. | 28.0 |
+| Memoria mappe (byte) | — | 280 | 2 356 | 10 416 | 19 508 |
+| **Latenza min (ns/pkt)** | **1** | **35.0** | **62.0** | **243.0** | **478.0** |
+| **Latenza min (ns/pkt)** | **2** | **28.0** | **67.0** | **247.0** | **422.0** |
+| ...p50 | 2 | 30.0 | 73.0 | 261.0 | 445.0 |
+| ...max | 2 | 38.0 | 80.0 | 278.0 | 455.0 |
+| ...spread (max−min)/min | 2 | 36% | 19% | 13% | 8% |
+| Throughput teorico (Mpps, da min) | 2 | 35.714 | 14.925 | 4.049 | 2.370 |
 
-| Dispatch (correttezza) | — | 5/5 PASS | 5/5 PASS | 5/5 PASS |
-| link_state reroute | PASS (5/30 casi cambiano uscita) |||
+Suddivisione per programma (identica nei due run):
+
+| | dispatcher | leaf |
+|---|---|---|
+| baseline | — | `xdp_baseline` 155 |
+| P1 hardcoded | `ipa_switch_hardcoded` 29 | `model_0` 942 |
+| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 16 144 |
+| P3 modular | `modular_dispatcher` 116 | `layer_first` 9 994 + `layer_hidden` 1 716 |
+
+Correttezza, run 2:
+
+| | |
+|---|---|
+| Dispatch (TTL 2-6) | 5/5 PASS su tutte e tre |
+| Gestione TTL (decremento + checksum + scadenza) | 2/2 PASS su tutte e tre |
+| `link_state` reroute | PASS, **11/30** casi di link-down cambiano uscita |
+| Architetture alternative (65-8-7, 65-4-4-4-7) | 5/5 PASS |
+| Multi-modello concorrente (P2 65-6-5-7, P3 65-5-6-4-7) | PASS |
+| Aggiornamento modello P1 (ricompila + ricarica) | 1 476 ms |
+
+### Il risultato principale: la dimensione non predice la velocità
+
+**P3 ha il 27% di istruzioni in meno di P2 ed è quasi il doppio più lento** (11 826 contro
+16 185 istruzioni; 422 contro 247 ns). Il motivo è nelle due righe centrali: 3 tail call
+contro 1, e 28 letture di mappa per pacchetto.
+
+Il conteggio `xlated` misura quanto è grande il programma caricato, non quanto lavoro
+fa per pacchetto. A dominare in questo regime sono **lookup e salti**, non l'aritmetica —
+ed è visibile solo perché le quattro righe vengono dallo stesso run, sulla stessa
+macchina, nello stesso minuto.
+
+`n.d.` sui lookup di P2: contarli richiede di strumentare il programma, e la versione
+strumentata sfora il tetto (`Program too large (16497 insns), at most 4096`). È lo stesso
+limite del verificatore discusso nelle note oneste, raggiunto da un'altra direzione.
+
+> ⚠️ **Le istruzioni sono un conteggio STATICO, non il percorso eseguito.** Dividere
+> 971 istruzioni per 67 ns darebbe ~4.8 istruzioni per ciclo a 3 GHz, sopra il massimo
+> pratico su x86 (3-4). Non è una contraddizione: `xlated` misura la dimensione del
+> programma caricato, non quante istruzioni girano per pacchetto. In P1 lo switch della
+> one-hot `node` ha 52 casi ma ne esegue **uno solo**; inoltre, con i pesi come letterali,
+> clang applica strength reduction (i pesi a zero spariscono, quelli potenza di due
+> diventano shift). Il percorso dinamico è quindi una frazione delle 971 — ed è
+> precisamente il vantaggio strutturale che la hardcoded ha sulle altre due. Vale la pena
+> saperlo perché è la prima obiezione naturale davanti a questa tabella.
+>
+> (La versione precedente di questa nota citava anche uno switch a 6 casi per
+> `ingress_iface`. Non c'è più: quella traduzione è una lettura della mappa
+> `ingress_port`, perché una tabella compilata di ifindex non corrisponde a nulla su una
+> macchina reale.)
+
+### Un lookup in più per pacchetto, misurato
+
+P1 passa da 4.0 a 5.0 letture di mappa per pacchetto e P3 da 26.0 a 28.0: è la mappa
+`ingress_port`, che traduce l'ifindex del kernel in porta logica. È il prezzo di rendere
+viva una feature che prima non contribuiva nulla, ed è esattamente un lookup.
+
+Nello stesso cambiamento P1 perde 26 istruzioni (997→971): la mappa ha sostituito uno
+`switch` a 6 casi letterali, e il lookup costa meno del salto.
 
 ### Attendibilita' dei numeri di latenza
 
-**Le latenze assolute delle pipeline riproducono bene.** Su tre esecuzioni indipendenti
+**Due esecuzioni dello stesso binario, a minuti di distanza:**
+
+| | baseline | P1 | P2 | P3 |
+|---|---:|---:|---:|---:|
+| run 1 | 35.0 | 62.0 | 243.0 | 478.0 |
+| run 2 | 28.0 | 67.0 | 247.0 | 422.0 |
+| scarto | −20% | +8% | +2% | −12% |
+
+Le **istruzioni sono identiche** nei due run: sono deterministiche. Le latenze no.
+
+Quindi: su questa VM a 4 vCPU una differenza di latenza sotto il ~20% fra due misure
+prese in momenti diversi **non significa nulla**. Vale il confronto *dentro* un run, dove
+tutte le righe vedono la stessa macchina nello stesso secondo. Ogni cifra assoluta qui va
+letta come "ordine di grandezza su questa VM", mai come prestazione del sistema.
+
+Va aggiunto un limite di metodo più profondo: `BPF_PROG_TEST_RUN` esegue il programma in
+un ciclo sullo stesso buffer. Niente NIC, niente driver, niente allocazione di `sk_buff`,
+nessuna pressione di cache da traffico vero. Il `Mpps` in tabella è `1/latenza`, cioè un
+**picco teorico**, non throughput retto. Per quello serve traffico vero.
+
+---
+
+### Nota storica: perché la sezione è stata rifatta
+
+**La versione precedente sosteneva che le latenze assolute riproducessero bene**, e su
+quella base costruiva un modello di costo in cicli. Conservata qui perché la conclusione
+opposta — misurata sopra su due run dello stesso binario — è essa stessa il risultato.
+Il testo di allora diceva: su tre esecuzioni indipendenti
 P1 misura 47 / 48 / 51 ns e P3 misura 387 / 392 / 391 ns: variazione sotto il 10% su P1 e
 sotto l'1.5% su P3. Anche l'ordine di grandezza e' quello atteso in letteratura per XDP
 sotto `BPF_PROG_TEST_RUN` (un programma minimale sta sui 10-20 ns, un redirect sui 25-50):
@@ -405,17 +496,6 @@ Il modello di costo torna. A circa 3 GHz, 25 ns sono ~75 cicli (parse + redirect
 cicli per P3 — di cui la maggior parte spiegabile con le sole 26 letture di mappa e le 3
 tail call. E' esattamente la tesi che il capitolo sostiene: in questo regime dominano
 lookup e salti, non l'aritmetica.
-
-> ⚠️ **Le istruzioni sono un conteggio STATICO, non il percorso eseguito.** Dividere
-> 997 istruzioni per 51 ns darebbe ~6.5 istruzioni per ciclo, impossibile su x86 (il
-> massimo pratico e' 3-4). Non e' una contraddizione: `xlated` misura la dimensione del
-> programma caricato, non quante istruzioni girano per pacchetto. In P1 lo switch della
-> one-hot `node` ha 52 casi ma ne esegue **uno solo**, e quello di `ingress_iface` ne ha
-> 6 ed esegue uno; inoltre, con i pesi come letterali, clang applica strength reduction
-> (i pesi a zero spariscono, quelli potenza di due diventano shift). Il percorso dinamico
-> e' quindi una frazione dei 997 — ed e' precisamente il vantaggio strutturale che la
-> hardcoded ha sulle altre due. Vale la pena saperlo perche' e' la prima obiezione
-> naturale davanti a questa tabella.
 
 ### Perche' la riga "latenza normalizzata sul baseline" e' stata rimossa
 

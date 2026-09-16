@@ -311,6 +311,174 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
                 info(f"detach: {e}")
 
 
+# --------------------------------------------------------------------------
+# N topologies x N models
+# --------------------------------------------------------------------------
+# The single-scenario run above uses the checked-in 65-4-4-7 model on the
+# topology it was trained for. That proves the datapath is right for ONE
+# network. The point of making the engine scenario-independent was to be able
+# to ask the same question of any network, so this asks it.
+#
+# Each case is a (topology, model) pair with nothing in common with the
+# checkpoint: a different number of interfaces (so a different number of
+# logical ports, and a fabric of a different width), a different number of
+# nodes (so a different input width), and different hidden dimensions. The
+# weights are random -- what is under test is the datapath, not the model's
+# accuracy, and a random model exercises the argmax just as well.
+#
+# Pipeline 1 is used because it generates code per model, so any shape compiles.
+# P2 and P3 run under fixed compiled ceilings (T2_MAX_H1 and friends) and a
+# shape outside them is refused by design, which is a different property and is
+# already checked by the alt-arch section of test_suite.py.
+
+SWEEP_CASES = [
+    # (n_interfaces, n_nodes, hidden_dims, seed)
+    (3, 8, (4, 4), 101),        # a small ring
+    (4, 16, (6,), 202),         # one hidden layer, wider
+    (5, 24, (4, 4, 4), 303),    # three layers
+    (2, 6, (3, 3), 404),        # the narrowest fabric that still forwards
+    (6, 52, (4, 4), 505),       # the checkpoint's own dimensions, random weights
+]
+
+
+def _weight_count(n_in, dims, n_out):
+    sizes = [n_in] + list(dims) + [n_out]
+    return sum(sizes[i - 1] * sizes[i] + sizes[i] for i in range(1, len(sizes)))
+
+
+def run_sweep(timeout, xdp_mode, verbose):
+    """One (topology, model) pair per case, each on its own fabric."""
+    import json
+    import random as _random
+    import tempfile
+    import model_meta as mm
+    import verify_prog_run as V
+    from bcc import BPF
+    from class_semantics import ClassSemantics
+    from ebpf_program import build_combined_hardcoded_source
+    from common import write_vector_map, attach_xdp, detach_xdp
+    from netns_fabric import NetnsFabric
+
+    saved_env = os.environ.get("IPA_TOPOLOGY_CONFIG")
+    tmpdir = tempfile.mkdtemp(prefix="ipa-sweep-")
+
+    for n_if, n_nodes, dims, seed in SWEEP_CASES:
+        name = f"{n_if}if/{n_nodes}n/{'-'.join(map(str, dims))}"
+        print(f"\n{YELLOW}=== topology {name} ==={NC}")
+
+        # The scenario is a file the engine reads, exactly as a real deployment
+        # would supply one -- not a parameter threaded through the call.
+        cfg_path = os.path.join(tmpdir, f"topo_{n_if}_{n_nodes}.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"topology": f"sweep-{n_if}x{n_nodes}",
+                       "n_interfaces": n_if, "n_nodes": n_nodes}, f)
+        os.environ["IPA_TOPOLOGY_CONFIG"] = cfg_path
+        mm.reset_topology_announcements()
+
+        # n_out is DECLARED, not derived from the interface count: one class per
+        # forwarding port plus a DROP class. The engine must be told, never left
+        # to infer it.
+        n_out = n_if + 1
+        shape = mm.derive_shape({"n_out": n_out, "hidden_dims": list(dims)},
+                                topology_config=mm.load_topology_config())
+        n_in = shape["n_in"]
+        features = shape["features"]
+        sem = ClassSemantics.forward_then_drop(n_if, drop_class=n_if,
+                                               n_out=n_out)
+        ports = sem.logical_ports
+        ls_size = next((f["size"] for f in features
+                        if f["type"] == "link_state"), 0)
+
+        rng = _random.Random(seed)
+        weights = [rng.randint(-30, 30)
+                   for _ in range(_weight_count(n_in, dims, n_out))]
+        scale = 24
+
+        if verbose:
+            info(f"n_in={n_in} n_out={n_out} ports={ports} "
+                 f"weights={len(weights)}")
+
+        try:
+            src = build_combined_hardcoded_source(
+                models=[(0, weights, scale)], features=features, n_out=n_out,
+                hidden_dims=dims, semantics=sem)
+            b = BPF(text=src)
+            model_fn = b.load_func("model_0", BPF.XDP)
+            disp_fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+        except Exception as e:
+            fail(f"{name}: compile/verifier failed ({e})")
+            continue
+        b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+
+        with NetnsFabric(n_ports=len(ports), verbose=False) as fab:
+            for port in ports:
+                ifx = fab.ifindex_of.get(port)
+                if ifx is None:
+                    continue
+                b["mac_table"][ct.c_uint32(port)] = V._FwdAction(
+                    ifindex=ifx,
+                    src_mac=(ct.c_uint8 * 6)(0x02, 0, 0, 0, 0, 0x01),
+                    dst_mac=(ct.c_uint8 * 6)(0x02, 0, 0, 0, 0, 0x02))
+            try:
+                b["ingress_port"][ct.c_uint32(fab.ingress_ifindex)] = \
+                    ct.c_uint32(FABRIC_INGRESS_SLOT)
+                ingress_port = FABRIC_INGRESS_SLOT
+            except Exception:
+                ingress_port = 0
+
+            # Find an input per class the same way the single-scenario run
+            # does, but through the sparse reference, which handles any shape.
+            ls_all_up = [1] * ls_size
+            write_vector_map(b, "link_state", ls_all_up)
+
+            attach_xdp(b, disp_fn, iface=fab.ingress, mode=xdp_mode)
+            try:
+                seen = {}
+                for ttl in range(2, 31):
+                    cls, _ = V.ref_infer_sparse(
+                        weights, features, dims, n_out, ttl, model_id=0,
+                        map_values={"link_state": ls_all_up},
+                        ingress_port=ingress_port, scale=scale)
+                    seen.setdefault(cls, ttl)
+                info(f"classes reachable by ttl alone: {sorted(seen)}")
+
+                for cls in sorted(seen):
+                    ttl = seen[cls]
+                    action = sem.action_of(cls)
+                    exp_port = sem.port_of(cls) if action == "FORWARD" else None
+                    frame = V.build_frame_sparse(0, ttl, scale, n_in, n_out)
+                    got_port, data = fab.send_and_capture(
+                        frame, timeout=timeout, match=_is_probe_frame)
+
+                    if action != "FORWARD":
+                        if got_port is None:
+                            ok(f"{name} ttl={ttl}: class {cls} {action}, "
+                               f"nothing left the node")
+                        else:
+                            fail(f"{name} ttl={ttl}: class {cls} is {action} "
+                                 f"but a packet left by port {got_port}")
+                    elif got_port == exp_port:
+                        ok(f"{name} ttl={ttl}: class {cls} -> port {exp_port} "
+                           f"(ifindex {fab.ifindex_of[exp_port]})")
+                    elif got_port is None:
+                        fail(f"{name} ttl={ttl}: class {cls} -> port "
+                             f"{exp_port}, nothing arrived in {timeout}s")
+                    else:
+                        fail(f"{name} ttl={ttl}: class {cls} -> port "
+                             f"{exp_port}, packet left by port {got_port}")
+            finally:
+                try:
+                    detach_xdp(b, iface=fab.ingress, mode=xdp_mode)
+                except Exception:
+                    pass
+
+    if saved_env is None:
+        os.environ.pop("IPA_TOPOLOGY_CONFIG", None)
+    else:
+        os.environ["IPA_TOPOLOGY_CONFIG"] = saved_env
+    mm.reset_topology_announcements()
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("Usage")[0].strip(),
@@ -326,6 +494,13 @@ def main():
                         "two can be compared on the same fabric")
     p.add_argument("--timeout", type=float, default=0.5,
                    help="how long to wait for a redirected frame (default 0.5s)")
+    p.add_argument("--sweep", action="store_true",
+                   help="also run N topologies x N models: each case is a "
+                        "different interface count, node count and hidden "
+                        "shape, on its own fabric, with nothing in common with "
+                        "the checked-in checkpoint")
+    p.add_argument("--only-sweep", action="store_true",
+                   help="run only the sweep")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args()
 
@@ -346,12 +521,19 @@ def main():
     print(f"  ttl     : search 1..{a.ttl_max}")
     print(f"  xdp     : {a.xdp_mode}")
 
-    for m in methods:
+    if not a.only_sweep:
+        for m in methods:
+            try:
+                run_one(m, model_path, ttl_range, a.xdp_mode, a.timeout,
+                        verbose=not a.quiet)
+            except Exception as e:
+                fail(f"{m}: {type(e).__name__}: {e}")
+
+    if a.sweep or a.only_sweep:
         try:
-            run_one(m, model_path, ttl_range, a.xdp_mode, a.timeout,
-                    verbose=not a.quiet)
+            run_sweep(a.timeout, a.xdp_mode, verbose=not a.quiet)
         except Exception as e:
-            fail(f"{m}: {type(e).__name__}: {e}")
+            fail(f"sweep: {type(e).__name__}: {e}")
 
     total = _results["pass"] + _results["fail"]
     print(f"\n{YELLOW}{'=' * 64}{NC}")
