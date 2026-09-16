@@ -24,7 +24,7 @@ Usage
 -----
     sudo python3 ipa/test/test_fabric.py                  # all three pipelines
     sudo python3 ipa/test/test_fabric.py --method template
-    sudo python3 ipa/test/test_fabric.py --ttl-min 2 --ttl-max 12
+    sudo python3 ipa/test/test_fabric.py --ttl-max 60      # widen the search
     sudo python3 ipa/test/test_fabric.py --xdp-mode generic   # compare paths
 
 Needs Linux + BCC + root.
@@ -85,6 +85,47 @@ def _install_fabric_mac_table(b, name, fab, ports):
     return installed
 
 
+def _is_probe_frame(data: bytes) -> bool:
+    """Is this the frame the test injected, or the kernel talking to itself?
+
+    The datapath rewrites the MACs but leaves L3/L4 alone, so the injected
+    frame is still IPv4/UDP to port 9999 when it comes out the other side.
+    """
+    if len(data) < 38:
+        return False
+    if int.from_bytes(data[12:14], "big") != 0x0800:      # IPv4
+        return False
+    if data[23] != 17:                                     # UDP
+        return False
+    return int.from_bytes(data[36:38], "big") == 9999      # the IPA port
+
+
+def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30):
+    """One (link_state, ttl) per output class the model can actually reach.
+
+    Sweeping TTL alone is not a test: for the checked-in checkpoint every TTL
+    from 2 to 30 returns class 2, so a seven-TTL run exercises one class seven
+    times and reports 7/7. link_state is the feature that moves this argmax, so
+    the cases are searched rather than listed -- which also keeps this working
+    for a different model, where the reachable set will differ.
+
+    Classes with no input that reaches them (an untrained one, typically) are
+    simply absent, and the caller reports them as not covered rather than
+    failing: unreachable is a property of the model, not a defect of the
+    datapath.
+    """
+    import itertools
+    found = {}
+    for bits in itertools.product([0, 1], repeat=6):
+        for ttl in range(1, max_ttl + 1):
+            cls = V.ref_infer(weights, scale, ttl, model_id,
+                              ifindex=0, link_state=list(bits))[0]
+            if cls not in found:
+                found[cls] = (list(bits), ttl)
+            if len(found) == n_out:
+                return found
+    return found
+
 _MAC_NAME = {1: "mac_table", 2: "mac_table_t2", 3: "mac_table_t3"}
 _SETUP = {"hardcoded": "setup_hardcoded",
           "template": "setup_template",
@@ -101,6 +142,7 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
         os.path.join(SHARED_DIR, "weights.json")),
         topology_config=mm.load_topology_config())["n_out"]
     sem = mm.load_class_semantics(os.path.join(SHARED_DIR, "weights.json"), n_out)
+    _ = n_out
     ports = sem.logical_ports
 
     print(f"\n{YELLOW}=== {method} on a real datapath "
@@ -129,40 +171,59 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
                  f"nothing here. Real kernel ifindexes are arbitrary -- see "
                  f"the note at the end.")
 
+        # --ttl-max now bounds the SEARCH for per-class inputs, not a blind
+        # sweep: the sweep was what made 7/7 mean one class seven times.
+        cases = _cases_covering_classes(V, weights, scale, 0, n_out,
+                                        max_ttl=max(ttl_range))
+        missing = [c for c in range(n_out) if c not in cases]
+        info(f"classes reachable by varying link_state and ttl: "
+             f"{sorted(cases)}" + (f"; unreachable: {missing}" if missing else ""))
+
+        from common import write_vector_map
         attach_xdp(b, setup["disp"], iface=fab.ingress, mode=xdp_mode)
         try:
             delivered = 0
-            for ttl in ttl_range:
-                exp_cls = V.ref_infer(weights, scale, ttl, 0, ifindex=ingress_ifx)
-                if isinstance(exp_cls, tuple):
-                    exp_cls = exp_cls[0]
+            for exp_cls in sorted(cases):
+                ls, ttl = cases[exp_cls]
+                # The map and the reference must be told the same thing, or
+                # they are answering different questions.
+                write_vector_map(b, "link_state", ls)
+                got_cls = V.ref_infer(weights, scale, ttl, 0,
+                                      ifindex=ingress_ifx, link_state=ls)[0]
+                if got_cls != exp_cls:
+                    info(f"ingress ifindex {ingress_ifx} moved the reference "
+                         f"from class {exp_cls} to {got_cls}; using {got_cls}")
+                    exp_cls = got_cls
                 action = sem.action_of(exp_cls)
                 exp_port = sem.port_of(exp_cls) if action == "FORWARD" else None
+                lsd = "".join(map(str, ls))
 
                 frame = V.build_frame(0, ttl, scale)
-                got_port, data = fab.send_and_capture(frame, timeout=timeout)
+                got_port, data = fab.send_and_capture(frame, timeout=timeout,
+                                                      match=_is_probe_frame)
 
                 if action != "FORWARD":
                     if got_port is None:
-                        ok(f"ttl={ttl}: class {exp_cls} is {action} -- nothing "
-                           f"left the node, as it should not")
+                        ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} is {action}"
+                           f" -- nothing left the node, as it should not")
                     else:
-                        fail(f"ttl={ttl}: class {exp_cls} is {action} but a "
-                             f"packet came out of port {got_port}")
+                        fail(f"link_state={lsd} ttl={ttl}: class {exp_cls} is {action}"
+                             f" but a packet came out of port {got_port}")
                     continue
 
                 if got_port is None:
-                    fail(f"ttl={ttl}: expected class {exp_cls} -> port "
-                         f"{exp_port} (ifindex {fab.ifindex_of[exp_port]}), "
+                    fail(f"link_state={lsd} ttl={ttl}: expected class {exp_cls} -> "
+                         f"port {exp_port} (ifindex {fab.ifindex_of[exp_port]}), "
                          f"but nothing arrived within {timeout}s")
                 elif got_port != exp_port:
-                    fail(f"ttl={ttl}: expected class {exp_cls} -> port "
-                         f"{exp_port}, packet left by port {got_port}")
+                    fail(f"link_state={lsd} ttl={ttl}: expected class {exp_cls} -> "
+                         f"port {exp_port}, packet left by port {got_port}")
                 else:
                     delivered += 1
                     dst = data[0:6].hex(":") if data else "?"
-                    ok(f"ttl={ttl}: class {exp_cls} -> port {exp_port} "
-                       f"(ifindex {fab.ifindex_of[exp_port]}), dst_mac={dst}")
+                    ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} -> port "
+                       f"{exp_port} (ifindex {fab.ifindex_of[exp_port]}), "
+                       f"dst_mac={dst}")
 
             if delivered:
                 info(f"{delivered} packet(s) redirected and captured on a real "
@@ -181,8 +242,8 @@ def main():
     p.add_argument("--method", choices=list(_SETUP) + ["all"], default="all")
     p.add_argument("--model", default=None,
                    help="checkpoint (default: model_meta.default_checkpoint())")
-    p.add_argument("--ttl-min", type=int, default=2)
-    p.add_argument("--ttl-max", type=int, default=8)
+    p.add_argument("--ttl-max", type=int, default=30,
+                   help="upper bound of the TTL search for per-class inputs")
     p.add_argument("--xdp-mode", choices=["native", "generic", "auto"],
                    default="native",
                    help="native is the deployment path; generic is here so the "
@@ -200,13 +261,13 @@ def main():
     from model_meta import default_checkpoint
     model_path = a.model or default_checkpoint()
     methods = list(_SETUP) if a.method == "all" else [a.method]
-    ttl_range = range(a.ttl_min, a.ttl_max + 1)
+    ttl_range = range(1, a.ttl_max + 1)
 
     print(f"{YELLOW}{'=' * 64}{NC}")
     print(f"{YELLOW} fabric test -- real attach, real redirect, real capture{NC}")
     print(f"{YELLOW}{'=' * 64}{NC}")
     print(f"  model   : {model_path}")
-    print(f"  ttl     : {a.ttl_min}..{a.ttl_max}")
+    print(f"  ttl     : search 1..{a.ttl_max}")
     print(f"  xdp     : {a.xdp_mode}")
 
     for m in methods:

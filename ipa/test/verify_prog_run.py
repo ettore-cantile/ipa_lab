@@ -323,7 +323,17 @@ def _feature_scales(features) -> list:
     return out
 
 
-def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
+def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0,
+              link_state=None):
+    """Integer reference for the checked-in 65-4-4-7 model.
+
+    `link_state` is the egress up/down vector as seeded into the map. It
+    defaults to all-up, which is the baseline every TEST_RUN check uses. It is
+    a parameter because TTL alone does not move this model's argmax: sweeping
+    ttl 2..8 returns the same class every time, so a test that varies only TTL
+    exercises exactly one output class however many times it runs. link_state
+    is the feature that actually changes the decision.
+    """
     def s8(v):
         return ct.c_int8(int(v) & 0xFF).value
     N_IN, N_H1, N_H2, N_OUT = 65, 4, 4, 7
@@ -333,10 +343,12 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0):
     off_out_w = off_fc2_b + N_H2
     off_out_b = off_out_w + N_H2 * N_OUT
     x = [0] * N_IN
-    # link_state features [0..5] = 1 (all egress links up) -- matches the
-    # verify baseline where the link_state map is seeded to all-up.
+    # link_state features [0..5]: all up unless the caller says otherwise.
+    # Must match whatever was written into the link_state map, or the reference
+    # and the datapath are answering different questions.
+    ls = [1] * 6 if link_state is None else list(link_state)[:6]
     for i in range(6):
-        x[i] = 1
+        x[i] = int(ls[i]) if i < len(ls) else 0
     x[12] = ttl
     if 1 <= ifindex <= 6:
         x[5 + ifindex] = 1

@@ -190,6 +190,12 @@ class NetnsFabric:
         for port in range(self.n_ports):
             a, b = self._name(port), self._peer(port)
             _run(["ip", "link", "add", a, "type", "veth", "peer", "name", b])
+            # No IPv6 on a fabric interface: the kernel would send MLD and
+            # router solicitations on every fresh veth, and that traffic lands
+            # in the same captures the test reads its answer from.
+            for end in (a, b):
+                _run(["sysctl", "-qw",
+                      f"net.ipv6.conf.{end}.disable_ipv6=1"], check=False)
             _run(["ip", "link", "set", a, "up"])
             _run(["ip", "link", "set", b, "up"])
             self.port_to_iface[port] = a
@@ -296,12 +302,19 @@ class NetnsFabric:
         s = self._sock(self.peer_of[port])
         s.send(frame)
 
-    def capture(self, timeout: float = 0.5, ports=None):
+    def capture(self, timeout: float = 0.5, ports=None, match=None):
         """Read one frame from whichever peer produces one first.
 
-        Returns (port, frame), or (None, None) if nothing arrived before the
-        timeout -- which is what a DROP looks like from out here, and is a
-        result, not an error.
+        `match` is a predicate on the raw bytes. Frames it rejects are skipped
+        and the wait continues, which matters because a freshly created veth
+        carries the kernel's own traffic -- IPv6 MLD and router solicitations,
+        dst_mac 33:33:... -- and the first frame to arrive is not necessarily
+        the one that was injected. Without a filter that noise is reported as
+        the pipeline's answer.
+
+        Returns (port, frame), or (None, None) if nothing matching arrived
+        before the timeout -- which is what a DROP looks like from out here,
+        and is a result, not an error.
         """
         import select
         ports = list(range(self.n_ports)) if ports is None else list(ports)
@@ -325,14 +338,16 @@ class NetnsFabric:
                     continue
                 except OSError:
                     continue
+                if match is not None and not match(data):
+                    continue            # kernel chatter, keep waiting
                 return port, data
         return None, None
 
-    def send_and_capture(self, frame: bytes, timeout: float = 0.5):
+    def send_and_capture(self, frame: bytes, timeout: float = 0.5, match=None):
         """Inject, then report which port the packet left by (None = dropped)."""
         self.open_captures()
         self.send(frame)
-        return self.capture(timeout=timeout)
+        return self.capture(timeout=timeout, match=match)
 
 
 def build_probe_frame(payload: bytes = b"", ethertype: int = DEFAULT_ETHERTYPE,
