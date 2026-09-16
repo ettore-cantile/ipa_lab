@@ -381,8 +381,14 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ifindex: int = 0,
     # No numeric sentinel: the logits are unbounded int64-scale accumulations, so
     # any finite starting value can be above ALL of them and pin best_cls to 0.
     best_val, best_cls = None, 0
+    # Output layer: scale**2, matching bias_mul_3 in the eBPF sources. This
+    # read s8(weights[off_out_b + k]) alone -- scale**0 -- while layer 0 used
+    # scale**0 correctly and layer 1 used scale**1. Only the last layer was
+    # missed, and only sparse link_state inputs are sensitive enough to it to
+    # show the difference.
+    out_bias_mul = scale * scale
     for k in range(N_OUT):
-        acc = s8(weights[off_out_b + k])
+        acc = s8(weights[off_out_b + k]) * out_bias_mul
         for i in range(N_H2):
             acc += h2[i] * s8(weights[off_out_w + k * N_H2 + i])
         if best_val is None or acc > best_val:
