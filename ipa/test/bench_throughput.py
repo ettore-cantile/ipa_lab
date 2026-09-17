@@ -1711,6 +1711,14 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     finiva dentro la deviazione standard delle ripetizioni."""
     if warmup and gen is not None:
         gen.warmup(frame, delay)
+    # Il filtro sulla durata vale SOLO per le finestre di misura. La sonda
+    # manda un pacchetto per istanza: dura zero per costruzione, e filtrarla
+    # faceva scartare l'unica ripetizione e fallire ogni run con "la sonda non
+    # ha trasmesso nulla" -- cioe' incolpare pktgen di una regola di questo
+    # file. La finestra e' di misura quando il `count` chiesto e' abbastanza
+    # grande da doverci arrivare.
+    n_inst = gen.n_inst if gen is not None else max(1, len(tg_devs or [None]))
+    check_window = count * n_inst >= MIN_WINDOW_PKTS
     runs = []
     if diag is not None:
         diag.start()
@@ -1726,7 +1734,7 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         # della strumentazione, e tenerlo faceva comparire righe con
         # TX == HIT == RX == 200000 marcate 100.00%, perche' la perdita
         # PEGGIORE delle tre ripetizioni veniva da una misura rotta.
-        if r["rx"] == 0 and r["tx"] > 0:
+        if check_window and r["rx"] == 0 and r["tx"] > 0:
             # Prima il filtro era `hit > 0 and rx == 0`, e lasciava passare il
             # caso peggiore: una finestra in cui il programma non ha visto
             # nulla (hit = 0) ma pktgen ha trasmesso. Quella finestra usciva
@@ -1736,7 +1744,7 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
             warn(f"misura scartata: {r['tx']} trasmessi, {r['hit']} elaborati "
                  f"e 0 contati in uscita -- strumentazione, non perdita")
             continue
-        if r["secs"] < WINDOW_SHORT_FRACTION * (
+        if check_window and r["secs"] < WINDOW_SHORT_FRACTION * (
                 gen.window_s if gen is not None else WINDOW_S) * 0.5:
             # Una finestra molto piu' corta del bersaglio e' dominata
             # dall'avvio dei thread, e i suoi pps sono quelli dell'avvio.
@@ -1769,11 +1777,13 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     med["unreliable"] = bool(med["spread_pct"] is not None
                              and med["spread_pct"] > MAX_SPREAD_PCT)
     # Due avvisi che riguardano la MISURA e non il datapath: se scattano, la
-    # riga resta ma va letta sapendo che la finestra non era pulita.
-    if med.get("gen_skew_pct", 0) > 20.0:
+    # riga resta ma va letta sapendo che la finestra non era pulita. Solo sulle
+    # finestre di misura: su una sonda da due pacchetti questi rapporti non
+    # vogliono dire niente e sarebbero solo rumore a schermo.
+    if check_window and med.get("gen_skew_pct", 0) > 20.0:
         warn(f"thread del generatore sfasati del {med['gen_skew_pct']}%: non "
              f"hanno lavorato nella stessa finestra")
-    if med.get("gen_rate_mismatch_pct", 0) > 25.0:
+    if check_window and med.get("gen_rate_mismatch_pct", 0) > 25.0:
         warn(f"TX/durata e somma dei pps per istanza differiscono del "
              f"{med['gen_rate_mismatch_pct']}%: uso TX diviso la durata "
              f"globale, che e' la lettura che non gonfia")
