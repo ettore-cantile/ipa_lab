@@ -17,47 +17,56 @@ IL BANCO, E CHE COSA MISURA DAVVERO
     ipa_in_peer  --veth-->  ipa_in                --veth-->  ipa<N>p
         TX              XDP: inferenza + redirect        XDP_DROP + contatore
 
-TG, DUT e RX stanno sulla STESSA macchina e condividono le stesse CPU, perche'
-e' la macchina che c'e'. Va detto prima dei numeri:
+TG, DUT e RX stanno sulla STESSA macchina: e' la macchina che c'e', e non se ne
+aggiunge una seconda. Cio' che si puo' fare -- ed e' quello che questa versione
+fa -- e' smettere di farli condividere le CPU:
 
-    questo NON misura "il throughput di P2". Misura il throughput del percorso
-    veth di QUESTA macchina con P2 in mezzo, mentre pktgen le ruba CPU.
+    CPU del GENERATORE   i thread kpktgend_<cpu> di pktgen, scelti a mano
+    CPU del DUT          i kernel thread napi/<dev>-<id> che eseguono XDP
+    CPU 0                esclusa per default da entrambi (timer, RCU, IRQ)
 
-Resta un esperimento che vale: da' perdita di pacchetti vera invece di
-1/latenza, e il confronto RELATIVO fra pipeline regge perche' il generatore e'
-identico per tutte. Se il collo di bottiglia e' il generatore la cosa si vede
-nei dati (tutte le pipeline allo stesso rate, perdita zero) e va riportata.
+Fatta la separazione, la frase "questo non misura il throughput della pipeline"
+resta vera solo per meta': il costo del veth e della copia di headroom e'
+ancora dentro la cifra, ma il generatore non ruba piu' il core al programma
+sotto test, e la pipeline puo' finalmente SATURARE. Quando satura, il numero
+che esce e' un limite della pipeline e non del generatore -- ed e' esattamente
+la distinzione che questo script deve saper fare.
 
 --------------------------------------------------------------------------
-CHI E' IL COLLO DI BOTTIGLIA
+PERCHE' PRIMA IL GENERATORE SATURAVA SEMPRE PER PRIMO
 --------------------------------------------------------------------------
-Misurato: a `delay 0` e frame da 64 byte questa macchina fa circa 780 kpps con
-la pipeline hardcoded e ZERO perdita. Il picco teorico di quella pipeline e'
-~14 Mpps, quindi a saturare non e' lei: e' il generatore.
+Tre ragioni, tutte strutturali, tutte affrontate qui:
 
-E c'e' una ragione strutturale, non solo di potenza. Su veth la RICEZIONE del
-peer avviene nel softirq della STESSA CPU che trasmette: TG e DUT non sono solo
-sulla stessa macchina, sono sullo stesso core, per costruzione. Aggiungere
-thread al generatore non li separa.
+1. IN SOFTIRQ LA RX DEL PEER GIRA SULLA CPU CHE HA TRASMESSO. Un core faceva
+   {genera + inferisce + redirige}: t_gen + t_pipeline sullo stesso core.
+   RIMEDIO: /sys/class/net/<dev>/threaded sposta il poll NAPI in un kernel
+   thread, che si pinna sulle CPU che pktgen non usa.
 
-Questo non rende la misura inutile, ma cambia la grandezza che misura:
+2. UN THREAD GENERATORE PER OGNI CORE DEL DUT. La versione precedente creava un
+   veth -- quindi una NAPI, quindi un core DUT -- per OGNI thread pktgen: gen e
+   DUT scalavano insieme e il rapporto fra i due non cambiava mai.
+   RIMEDIO: topologia `shared`. Un solo veth d'ingresso, N istanze pktgen sullo
+   STESSO device (sintassi ufficiale `dev@N`, quella dei sample del kernel) con
+   `queue_map` distinta per non contendersi lo stesso txq. Il lato DUT ha le sue
+   code RX e i suoi thread NAPI, in numero deciso separatamente. Cosi' si puo'
+   chiedere 3 core di generatore contro 1 core di DUT, che e' la condizione in
+   cui la pipeline satura.
 
-    a delay 0 un core fa {genera + inferisce + redirige}. Il tempo per
-    pacchetto e' t_gen + t_pipeline, e t_gen e' IDENTICO per tutte e tre le
-    pipeline. La differenza fra le loro cifre e' quindi attribuibile alla
-    pipeline, anche se il valore assoluto no.
+3. CLONE_SKB E BURST NON ESISTONO SU VETH. Non e' una scelta di questo script:
+   il kernel rifiuta entrambi quando il device non annuncia IFF_TX_SKB_SHARING
+   (veth lo azzera, perche' consegna l'skb alla RX del peer dove XDP lo
+   riscrive), e rifiuta clone_skb anche in xmit_mode netif_receive.
+   RIMEDIO: nessuno -- si PROVA una volta, si riporta l'esito, e se il device li
+   accetta si verifica che aumentino davvero il rate invece di darlo per
+   scontato. L'unica manopola che su veth funziona sempre e' il numero di
+   thread.
 
-Conseguenza da riportare e non nascondere: finche' il generatore satura per
-primo, "throughput massimo" e "throughput a perdita nulla" coincidono, perche'
-la perdita non compare mai. Sono due numeri diversi solo quando a saturare e'
-il sistema sotto test.
-
-`--clone-skb N` fa riusare a pktgen lo stesso buffer N volte invece di
-allocarne uno per pacchetto, e alza parecchio il rate offerto. Va usato
-sapendo che cambia cosa si misura: sparisce il costo di allocazione dal lato
-generatore, e il datapath puo' dover prendere una copia privata del buffer
-prima di riscrivere il TTL. Il default e' 0, cioe' un buffer per pacchetto,
-che e' la condizione piu' vicina al traffico vero.
+Cio' che NON si puo' togliere, e che va detto accanto ai numeri: XDP su veth
+pretende XDP_PACKET_HEADROOM (256 byte) davanti al pacchetto, gli skb di pktgen
+hanno NET_SKB_PAD (64), e pktgen riserva NET_SKB_PAD a mano invece di
+`dev->needed_headroom`. Quindi veth_xdp_rcv_skb fa una COPIA per ogni pacchetto
+prima di eseguire il programma. E' il costo di "XDP su veth alimentato da un
+mittente non XDP" e nessun parametro di pktgen lo elimina.
 
 --------------------------------------------------------------------------
 TRE PUNTI DI CONTEGGIO, PERCHE' "PERSI" NON BASTA
@@ -69,7 +78,8 @@ TRE PUNTI DI CONTEGGIO, PERCHE' "PERSI" NON BASTA
 TX - HIT e' quello che non e' nemmeno arrivato al programma (coda del veth,
 softirq). HIT - RX e' quello che il programma ha elaborato ma non e' uscito
 (redirect fallito, oppure la classe scelta era DROP). Un solo numero di
-"perdita" confonderebbe cose diverse.
+"perdita" confonderebbe cose diverse -- e con esse confonderebbe il collo di
+bottiglia, che e' cio' che questo banco deve identificare.
 
 --------------------------------------------------------------------------
 IL BYTE CHE FA FALLIRE TUTTO IN SILENZIO
@@ -85,26 +95,52 @@ pacchetto verifica HIT prima di misurare qualunque cosa. Se la sonda fallisce
 lo script si ferma invece di produrre numeri privi di senso.
 
 --------------------------------------------------------------------------
+LE DUE MODALITA'
+--------------------------------------------------------------------------
+Sono esperimenti diversi e rispondono a domande diverse. Tenerle separate e'
+cio' che impedisce di confrontare pipeline misurate a rate diversi.
+
+  --mode compare    CONFRONTO. Rate offerto IDENTICO per tutte le pipeline,
+                    stessi parametri di pktgen, stessa durata, stesso frame.
+                    Nessuna ricerca e nessun adattamento fra una pipeline e
+                    l'altra. Risponde a: "a parita' di carico, chi perde?"
+                    Il rate si sceglie con --offered-pps; senza, lo decide una
+                    calibrazione fatta UNA volta e poi congelata per tutti.
+
+  --mode saturate   SATURAZIONE. Rate offerto crescente su una scala
+                    geometrica, ogni gradino confermato da piu' ripetizioni.
+                    Risponde a: "dove comincia a perdere, e per colpa di chi?"
+                    Niente bisezione: la perdita su questo banco non e'
+                    monotona nel rate, e bisecare su un fenomeno non monotono
+                    converge su qualunque punto sia uscito pulito per caso.
+
+--------------------------------------------------------------------------
 USO
 --------------------------------------------------------------------------
-    sudo python3 ipa/test/bench_throughput.py                  # tutte
-    sudo python3 ipa/test/bench_throughput.py --method modular
-    sudo python3 ipa/test/bench_throughput.py --frames 64,512,1514
-    sudo python3 ipa/test/bench_throughput.py --out result/
+    # confronto equo fra tutte le pipeline, stesso carico per tutte
+    sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --out result/
+
+    # dove satura ciascuna pipeline, e chi e' il collo di bottiglia
+    sudo python3 ipa/test/bench_throughput.py --mode saturate --diag --out result/
+
+    # CPU separate esplicite: generatore su 1-2, DUT su 3, CPU 0 fuori
+    sudo python3 ipa/test/bench_throughput.py --gen-cpus 1,2 --dut-cpus 3 --mode saturate
+
+    # percorso storico: latenza arrivo->ripartenza + throughput, a giri
+    sudo python3 ipa/test/bench_throughput.py --latency --rounds 3 --out result/
+
     sudo python3 ipa/test/bench_throughput.py --cleanup        # se resta sporco
 
-Confronto equo (questo e' quello da citare in tesi): un solo fabric, tutte le
-pipeline compilate PRIMA di misurare, e misura a giri con la mediana fra i giri.
-Riporta il tempo arrivo-partenza, non solo la portata.
+Per ogni pipeline il percorso --latency riporta TRE righe, che rispondono a tre
+domande diverse:
 
-    sudo python3 ipa/test/bench_throughput.py --latency --rounds 5 --out result/
-    sudo python3 ipa/test/bench_throughput.py --latency --frames 64,512,1514 \
-        --rounds 5 --out result/
-
-Scrive due file: latency.csv (mediana fra i giri) e latency_raw.csv (ogni giro).
-Il secondo serve a leggere la dispersione, che e' cio' che dice se la mediana
-significa qualcosa: su questa VM la latenza varia di pochi ns fra i giri, la
-portata a pieno rate anche del 137%.
+    pieno         quanto passa spingendo al massimo. E' un sistema in
+                  sovraccarico: la cifra dipende da quanto si e' spinto.
+    zero-perdite  il rate piu' alto a cui non si perde NEMMENO UN pacchetto.
+                  E' il throughput nel senso della RFC 2544, ed e' la riga da
+                  citare.
+    scarico       a 50 kpps, senza coda davanti: e' dove la latenza si misura,
+                  perche' li' si confrontano programmi e non lunghezze di coda.
 
 Serve Linux, root, BCC e il modulo pktgen (`sudo modprobe pktgen`).
 """
@@ -116,6 +152,7 @@ import csv
 import time
 import argparse
 import subprocess
+import statistics
 import ctypes as ct
 
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -127,6 +164,7 @@ for _p in (SHARED_DIR, _TEST_DIR):
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
+
 class PktgenEmptyRun(RuntimeError):
     """Un run che non ha trasmesso nulla. Segnalato al chiamante, non fatale."""
 
@@ -134,49 +172,17 @@ class PktgenEmptyRun(RuntimeError):
 PKTGEN_DIR = "/proc/net/pktgen"
 PKTGEN_MAGIC_MODEL_ID = 0xBE      # vedi la docstring
 
-# Quante volte riusare lo stesso buffer quando il generatore satura per primo e
-# bisogna spingere piu' forte. 100000 e' abbastanza da togliere di mezzo il
-# costo di allocazione senza che il conteggio dei pacchetti ne risenta.
+# Quante volte riusare lo stesso buffer quando il device lo consente. Su veth
+# non lo consente (vedi GenCaps), quindi in pratica questa costante serve solo
+# sui device che annunciano IFF_TX_SKB_SHARING.
 ESCALATE_CLONE = 100000
 
-# --------------------------------------------------------------------------
-# DOVE VA IL TEMPO PER PACCHETTO, E LE TRE MANOPOLE CHE LO TOCCANO
-# --------------------------------------------------------------------------
-# A ~550 kpps per core il costo per pacchetto e' ~1800 ns, e l'inferenza ne
-# spiega 60 (P1). Il resto e' il banco, e si divide in tre pezzi che si possono
-# aggredire separatamente.
-#
-# 1. LA COPIA PER HEADROOM. XDP su veth pretende XDP_PACKET_HEADROOM (256 byte)
-#    davanti al pacchetto; gli skb di pktgen ne hanno NET_SKB_PAD (64). Quindi
-#    veth_xdp_rcv_skb ne fa una copia PER OGNI PACCHETTO prima di eseguire il
-#    programma. E' il costo noto di "XDP su veth alimentato da un mittente non
-#    XDP" e non si toglie con una manopola di pktgen: si toglie cambiando modo
-#    di iniezione (punto 3).
-#
-# 2. IL SECONDO SALTO VETH. Ogni pacchetto rediretto attraversa un ALTRO veth e
-#    ci trova un ALTRO programma XDP (il contatore). Sono due traversate e due
-#    invocazioni XDP per pacchetto, mentre su un nodo vero il redirect va su una
-#    NIC. Il contatore serve -- e' cio' che ha mostrato che la perdita e' in
-#    uscita -- ma va saputo che sta dentro la cifra.
-#
-# 3. IL MODO DI INIEZIONE. `xmit_mode netif_receive` fa iniettare a pktgen i
-#    pacchetti direttamente nel percorso RX del device, saltando veth_xmit, la
-#    NAPI del peer e la conversione skb->xdp. E' il modo documentato per
-#    misurare l'elaborazione in ricezione. ATTENZIONE: si entra a
-#    netif_receive_skb, quindi XDP gira in modo GENERIC, non native -- i numeri
-#    non sono confrontabili con quelli in modo native, e la colonna xmit_mode
-#    del CSV serve a non mescolarli.
-#
-# `burst N` chiede a pktgen di consegnare N pacchetti per chiamata (xmit_more).
-# Come clone_skb puo' essere rifiutato da veth; come clone_skb, il rifiuto e' un
-# esperimento in meno e non un run perso.
 XMIT_MODES = ("start_xmit", "netif_receive", "queue_xmit")
-_BURST_SUPPORTED = True
 
-# veth non espone IFF_TX_SKB_SHARING -- consegna l'skb alla RX del peer, dove
-# XDP lo riscrive -- quindi pktgen rifiuta clone_skb. Una volta saputo, non si
-# riprova: altrimenti ogni punto di misura stampa lo stesso avviso per ogni
-# device, e a tre thread sono sei righe di rumore per misura.
+# Retrocompatibilita': il vecchio codice consultava questi due globali per
+# sapere se valeva la pena riprovare. La verita' adesso sta in GenCaps, che e'
+# PER DEVICE, ma questi restano allineati perche' find_knee li legge ancora.
+_BURST_SUPPORTED = True
 _CLONE_SUPPORTED = True
 
 # Frame sizes. 64 e' il minimo Ethernet; 1514 il massimo senza jumbo. Il frame
@@ -197,6 +203,41 @@ DEFAULT_REPEAT = 3
 # mediana. Serve a togliere l'ordine dei metodi dalla misura -- vedi run_fair.
 DEFAULT_ROUNDS = 3
 
+# Durata BERSAGLIO di una finestra di misura, in secondi.
+#
+# pktgen conta PACCHETTI, non secondi: non esiste un parametro "dura T". La
+# durata si ottiene quindi calibrando il `count` sul rate misurato, e si
+# RILEGGE dai contatori di pktgen (campo `Result: OK: <usec>`), che e' la durata
+# vera e non quella sperata. Una finestra uscita corta viene ricalibrata una
+# volta sola: vedi Generator.window_count.
+#
+# Uno schema alternativo -- `count 0` e `stop` scritto da un thread dopo T
+# secondi -- darebbe la durata esatta, ma se lo stop fallisce pktgen trasmette
+# per sempre e il run si pianta. Scartato per quello.
+WINDOW_S = 0.30
+
+# Warm-up: una finestra buttata via PRIMA della misura. La prima raffica paga
+# cache fredde, la prima allocazione delle code e l'avvio dei thread, e non
+# descrive il regime. Separarla e' la ragione per cui i primi campioni non
+# sporcano piu' la deviazione standard.
+DEFAULT_WARMUP_S = 0.10
+
+# Sotto questo numero di pacchetti la finestra e' troppo corta perche' i
+# percentili vogliano dire qualcosa, anche se il tempo sarebbe sufficiente.
+MIN_WINDOW_PKTS = 20000
+
+# ... e sopra questo numero un punto a rate alto durerebbe molto piu' della
+# finestra bersaglio senza aggiungere informazione. Tiene prevedibile il run.
+MAX_WINDOW_PKTS = 4_000_000
+
+# Una finestra uscita sotto questa frazione della durata bersaglio viene
+# ricalibrata una volta: vuol dire che la stima del rate era troppo bassa.
+WINDOW_SHORT_FRACTION = 0.5
+
+# Passi di bisezione nella ricerca del ginocchio nel percorso storico
+# (--latency). La modalita' saturate non biseca: vedi find_saturation.
+KNEE_STEPS = 5
+
 # Oltre questa dispersione fra le ripetizioni il punto non e' utilizzabile.
 # Misurato: hardcoded ha dato +-75% fra tre misure della stessa cosa, e la
 # baseline e' uscita il 26% PIU' LENTA di una pipeline che fa strettamente piu'
@@ -207,10 +248,22 @@ MAX_SPREAD_PCT = 25.0
 # banco, e un'inversione non e' un difetto del run. Vedi check_validity.
 VALID_TOL = 0.10
 
-# Ritardi fissi, usati solo se il chiamante li chiede con --delays. Il default
-# e' la ricerca del ginocchio (find_knee), che costa meno punti e centra la
-# risposta invece di avvicinarla.
+# Ritardi fissi, usati solo se il chiamante li chiede con --delays.
 DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
+
+# Scala dei rate per --mode saturate: frazioni del rate CONSEGNATO a delay 0,
+# crescenti. Si parte sotto la capacita' stimata e si sale, e ogni gradino e'
+# confermato da piu' ripetizioni. Non e' una bisezione, ed e' voluto.
+SATURATE_LADDER = (0.50, 0.65, 0.80, 0.90, 0.97, 1.03, 1.10, 1.25)
+
+# Quanto deve salire il rate offerto perche' clone_skb/burst valgano la perdita
+# di rappresentativita'. Sotto questa soglia il parametro e' accettato dal
+# device ma inutile, e si torna alla condizione di riferimento.
+GEN_KNOB_MIN_GAIN = 0.10
+
+# Sopra questa occupazione una CPU si considera satura. Serve SOLO alla
+# diagnostica, e solo per etichettare: non entra in nessun calcolo di rate.
+CPU_BUSY_PCT = 90.0
 
 # Cinque gradini, e i due estremi servono a leggere i tre in mezzo.
 #
@@ -218,8 +271,6 @@ DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
 #              Nessuna inferenza. E' il TETTO DEL BANCO: se satura anche lei a
 #              X pacchetti/s, allora X e' il limite del veth e delle CPU, non
 #              della pipeline, e ogni cifra sotto va letta rispetto a quello.
-#              Senza questa colonna non si sa se si sta misurando il datapath o
-#              la macchina.
 #   p1_static  pesi E indice del nodo compilati dentro: un binario per nodo.
 #   hardcoded  pesi compilati, nodo da mappa (la "P1.5").
 #   template   solo i soffitti compilati.
@@ -256,8 +307,229 @@ def warn(m):
     print(f"  {RED}[WARN]{NC} {m}")
 
 
+def note(m):
+    print(f"  {GREY}{m}{NC}")
+
+
 # ==========================================================================
-# pktgen
+# CPU: CHI GENERA E CHI ELABORA -- LA MODIFICA PRINCIPALE
+# ==========================================================================
+# pktgen crea un kernel thread PER CPU, chiamato kpktgend_<cpu> e legato a
+# quella CPU con kthread_bind. Scrivere `add_device X` dentro
+# /proc/net/pktgen/kpktgend_3 vuol dire quindi, letteralmente, "genera questo
+# traffico sulla CPU 3". L'affinita' del generatore non e' una cosa da chiedere
+# a taskset: e' gia' nel nome del file.
+#
+# La versione precedente usava kpktgend_0..threads-1, cioe' partiva SEMPRE da
+# CPU 0 -- che e' la CPU su cui il kernel mette per default i timer, il lavoro
+# di RCU e buona parte degli IRQ. Il generatore ci perdeva cicli e il DUT pure.
+#
+# Qui le due liste sono esplicite e verificate:
+#
+#   --gen-cpus 1,2   i thread pktgen: uno per CPU elencata
+#   --dut-cpus 3     dove vanno pinnati i kernel thread napi/<dev>-<id>
+#   CPU 0            fuori da entrambe se non la si chiede con --allow-cpu0
+#
+# Nulla e' assunto sul numero di core: le liste si intersecano con le CPU
+# davvero online e con i thread pktgen davvero esistenti, e cio' che avanza
+# viene detto invece che ignorato.
+
+
+def parse_cpu_list(spec):
+    """"1,3-5" -> [1, 3, 4, 5]. None o stringa vuota -> None (cioe' 'decidi tu').
+
+    Stesso formato che il kernel usa in /sys/devices/system/cpu/online, cosi'
+    la lista che l'utente scrive e quella che il kernel stampa si leggono allo
+    stesso modo."""
+    if spec is None:
+        return None
+    spec = str(spec).strip()
+    if not spec or spec.lower() == "auto":
+        return None
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                raise ValueError(f"intervallo di CPU non valido: {part!r}")
+            if hi < lo:
+                raise ValueError(f"intervallo rovesciato: {part!r}")
+            out.extend(range(lo, hi + 1))
+        else:
+            try:
+                out.append(int(part))
+            except ValueError:
+                raise ValueError(f"CPU non valida: {part!r}")
+    # Ordinate e senza ripetizioni: due volte la stessa CPU vorrebbe dire due
+    # thread pktgen sullo stesso core, che pktgen non permette comunque.
+    return sorted(set(out))
+
+
+def online_cpus():
+    """Le CPU davvero online, dal kernel. Non os.cpu_count(), che conta quelle
+    presenti: una CPU offline ha il suo kpktgend_<n> assente e va esclusa."""
+    try:
+        with open("/sys/devices/system/cpu/online") as f:
+            cpus = parse_cpu_list(f.read().strip())
+        if cpus:
+            return cpus
+    except OSError:
+        pass
+    return list(range(os.cpu_count() or 1))
+
+
+def pg_thread_path(cpu):
+    return f"{PKTGEN_DIR}/kpktgend_{cpu}"
+
+
+def pg_thread_exists(cpu):
+    """C'e' un thread pktgen su questa CPU? Se il modulo e' stato caricato con
+    la CPU offline, o la CPU e' isolata, il file non esiste e chiederne uno
+    fallirebbe a meta' configurazione."""
+    return os.path.exists(pg_thread_path(cpu))
+
+
+class CpuPlan:
+    """Chi genera, chi elabora, e cosa e' stato scartato per arrivarci."""
+
+    def __init__(self, gen, dut, online, notes, shared=False):
+        self.gen = list(gen)
+        self.dut = list(dut)
+        self.online = list(online)
+        self.notes = list(notes)
+        # True quando non e' stato possibile separare: generatore e DUT sulle
+        # stesse CPU. Non e' un errore fatale -- e' il vecchio comportamento --
+        # ma da quel momento la cifra assoluta misura la SOMMA dei due.
+        self.shared = shared
+
+    @property
+    def threads(self):
+        return len(self.gen)
+
+    @property
+    def excluded(self):
+        return [c for c in self.online
+                if c not in self.gen and c not in self.dut]
+
+    def describe(self):
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Piano CPU: generatore e DUT su questa macchina{NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        fmt = lambda xs: ",".join(str(x) for x in xs) if xs else "(nessuna)"
+        info(f"CPU online .............. {fmt(self.online)}")
+        info(f"CPU generatore (pktgen) . {fmt(self.gen)}  "
+             f"-> {self.threads} thread kpktgend")
+        info(f"CPU DUT (XDP/NAPI) ...... {fmt(self.dut)}")
+        info(f"CPU lasciate al sistema . {fmt(self.excluded)}")
+        for n in self.notes:
+            warn(n)
+        if self.shared:
+            warn("generatore e DUT condividono le CPU: la cifra assoluta "
+                 "misura la somma dei due, non la pipeline.")
+        else:
+            note("generatore e DUT su core disgiunti: la perdita che si vede "
+                 "e' della pipeline, non del generatore che le ruba il core.")
+
+
+def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
+              check_pktgen=True):
+    """Decide le due liste di CPU, verificandole contro la macchina vera.
+
+    Regole, in ordine:
+      1. si parte dalle CPU ONLINE;
+      2. la CPU 0 esce, se non la si e' chiesta: e' dove finiscono timer, RCU
+         e IRQ, e un thread pktgen li' genera a rate variabile;
+      3. cio' che l'utente ha chiesto vince, ma intersecato con (1);
+      4. quello che resta e' del DUT;
+      5. se non resta niente, si dichiara la condivisione invece di fingere
+         una separazione che non c'e'.
+
+    Senza --threads il numero di thread generatore si sceglie da solo con una
+    regola sola: PIU' core al generatore che al DUT. E' la condizione in cui la
+    pipeline satura, che e' cio' che si vuole misurare; il caso opposto -- un
+    core per parte -- e' quello in cui il generatore satura per primo e il
+    banco non dice niente sulla pipeline."""
+    notes = []
+    online = online_cpus()
+    pool = [c for c in online if allow_cpu0 or c != 0]
+    if not pool:
+        notes.append("una sola CPU online e CPU 0 esclusa: la riammetto, "
+                     "non c'e' altro su cui girare.")
+        pool = list(online)
+
+    want_gen = parse_cpu_list(gen_spec)
+    want_dut = parse_cpu_list(dut_spec)
+
+    if want_gen is not None:
+        gen = [c for c in want_gen if c in online]
+        dropped = [c for c in want_gen if c not in online]
+        if dropped:
+            notes.append(f"CPU {dropped} chieste per il generatore ma non "
+                         f"online: scartate.")
+        # Una lista esplicita vince anche sull'esclusione della CPU 0: se
+        # l'utente la scrive, la vuole, e --allow-cpu0 serve solo al caso
+        # automatico.
+        if 0 in gen and not allow_cpu0:
+            notes.append("CPU 0 chiesta esplicitamente per il generatore: la "
+                         "uso, ma li' girano timer, RCU e IRQ e il rate "
+                         "offerto e' meno stabile.")
+    else:
+        n = len(pool)
+        if threads and threads > 0:
+            gen_n = min(threads, n)
+            if threads > n:
+                notes.append(f"chiesti {threads} thread generatore ma solo {n} "
+                             f"CPU utilizzabili: ne uso {gen_n}. Due thread "
+                             f"pktgen sulla stessa CPU non esistono -- il "
+                             f"thread E' la CPU.")
+        else:
+            # Un terzo al DUT, il resto al generatore, minimo uno per parte.
+            dut_n = max(1, n // 3)
+            gen_n = max(1, n - dut_n)
+        gen = pool[:gen_n]
+
+    if want_dut is not None:
+        dut = [c for c in want_dut if c in online]
+        dropped = [c for c in want_dut if c not in online]
+        if dropped:
+            notes.append(f"CPU {dropped} chieste per il DUT ma non online: "
+                         f"scartate.")
+    else:
+        dut = [c for c in pool if c not in gen]
+
+    if check_pktgen and os.path.isdir(PKTGEN_DIR):
+        missing = [c for c in gen if not pg_thread_exists(c)]
+        if missing:
+            notes.append(f"nessun thread pktgen su CPU {missing} "
+                         f"(kpktgend_<cpu> assente): scartate dal generatore.")
+            gen = [c for c in gen if c not in missing]
+
+    if not gen:
+        gen = pool[:1] or online[:1]
+        notes.append(f"nessuna CPU utilizzabile per il generatore: ripiego "
+                     f"su {gen}.")
+
+    shared = False
+    overlap = sorted(set(gen) & set(dut))
+    if overlap:
+        notes.append(f"CPU {overlap} chieste sia per il generatore sia per il "
+                     f"DUT: su quei core i due si contendono il tempo.")
+        shared = True
+    if not dut:
+        dut = list(gen)
+        shared = True
+        notes.append("nessuna CPU libera per il DUT: la NAPI restera' sui "
+                     "core del generatore (comportamento storico).")
+    return CpuPlan(gen, dut, online, notes, shared=shared)
+
+
+# ==========================================================================
+# pktgen: il livello basso
 # ==========================================================================
 def pg_write(path, cmd):
     """Write one pktgen command, and say which one if it fails.
@@ -306,6 +578,23 @@ def pg_reset():
     pg_write(f"{PKTGEN_DIR}/pgctrl", "reset")
 
 
+def pg_stop():
+    """Ferma i thread in corso. Usato solo in pulizia: il percorso normale
+    aspetta che `start` ritorni, perche' start blocca fino all'ultimo thread."""
+    try:
+        pg_write(f"{PKTGEN_DIR}/pgctrl", "stop")
+    except RuntimeError:
+        pass
+
+
+def pg_dev_path(name):
+    """Il file di controllo di UN'ISTANZA. Il nome puo' contenere '@': pktgen
+    toglie il suffisso per cercare il netdev (pktgen_dev_get_by_name si ferma
+    alla '@') ma tiene il nome intero per il file, ed e' cosi' che lo stesso
+    device sta su piu' thread -- vedi Generator."""
+    return f"{PKTGEN_DIR}/{name}"
+
+
 def probe_clone_support(dev):
     """Chiedi UNA volta se questo device accetta clone_skb, prima di misurare.
 
@@ -313,13 +602,16 @@ def probe_clone_support(dev):
     stato da cui `start` non parte -- pktgen riporta `pkts-sofar: 0` e
     `started: 0us` -- e quella misura andava a zero pacchetti in mezzo allo
     sweep. Scoprirlo prima, su un device gia' configurato per essere buttato,
-    toglie il problema alla radice invece di gestirne le conseguenze."""
+    toglie il problema alla radice invece di gestirne le conseguenze.
+
+    Il kernel rifiuta clone_skb quando il device non annuncia
+    IFF_TX_SKB_SHARING (veth lo azzera) e in xmit_mode netif_receive."""
     global _CLONE_SUPPORTED
-    if not os.path.exists(f"{PKTGEN_DIR}/{dev}"):
+    if not os.path.exists(pg_dev_path(dev)):
         return _CLONE_SUPPORTED
     try:
-        pg_write(f"{PKTGEN_DIR}/{dev}", "clone_skb 1")
-        pg_write(f"{PKTGEN_DIR}/{dev}", "clone_skb 0")
+        pg_write(pg_dev_path(dev), "clone_skb 1")
+        pg_write(pg_dev_path(dev), "clone_skb 0")
     except RuntimeError:
         _CLONE_SUPPORTED = False
         info("clone_skb non supportato su questo device (veth consegna l'skb "
@@ -327,97 +619,182 @@ def probe_clone_support(dev):
     return _CLONE_SUPPORTED
 
 
-def pg_clear_threads(n):
-    """Detach every device from the first `n` generator threads."""
-    for i in range(n):
+def probe_burst_support(dev):
+    """Come sopra per `burst`. Il kernel lo rifiuta esattamente negli stessi
+    casi di clone_skb piu' xmit_mode queue_xmit: entrambi riusano lo stesso
+    skb, ed e' proprio cio' che veth non puo' fare.
+
+    Provarlo PRIMA e' la differenza fra "un esperimento in meno" e "un punto
+    di misura a zero pacchetti in mezzo allo sweep"."""
+    global _BURST_SUPPORTED
+    if not os.path.exists(pg_dev_path(dev)):
+        return _BURST_SUPPORTED
+    try:
+        pg_write(pg_dev_path(dev), "burst 2")
+        pg_write(pg_dev_path(dev), "burst 0")
+    except RuntimeError:
+        _BURST_SUPPORTED = False
+        info("burst non supportato su questo device: come clone_skb, "
+             "richiede un skb condivisibile")
+    return _BURST_SUPPORTED
+
+
+class GenCaps:
+    """Cosa accetta DAVVERO questo device in questo xmit_mode.
+
+    Per device e per modalita', perche' sono condizioni diverse: clone_skb e'
+    rifiutato in netif_receive anche su un device che altrove lo accetta. Il
+    risultato e' in cache: senza, ogni punto di misura ristampa lo stesso
+    avviso per ogni istanza, e a tre thread sono sei righe di rumore per
+    misura."""
+
+    _cache = {}
+
+    def __init__(self, clone=False, burst=False, probed=False):
+        self.clone = clone
+        self.burst = burst
+        self.probed = probed
+
+    @classmethod
+    def probe(cls, name, xmit_mode="start_xmit", quiet=False):
+        dev = name.split("@")[0]
+        key = (dev, xmit_mode)
+        if key in cls._cache:
+            return cls._cache[key]
+        caps = cls()
+        path = pg_dev_path(name)
+        if not os.path.exists(path):
+            return caps                 # niente device: niente da dichiarare
+        for attr, cmd_on, cmd_off in (("clone", "clone_skb 1", "clone_skb 0"),
+                                      ("burst", "burst 2", "burst 0")):
+            try:
+                pg_write(path, cmd_on)
+                pg_write(path, cmd_off)
+                setattr(caps, attr, True)
+            except RuntimeError:
+                setattr(caps, attr, False)
+        caps.probed = True
+        cls._cache[key] = caps
+        global _CLONE_SUPPORTED, _BURST_SUPPORTED
+        _CLONE_SUPPORTED, _BURST_SUPPORTED = caps.clone, caps.burst
+        if not quiet:
+            yn = lambda v: "si" if v else "no"
+            info(f"{dev} ({xmit_mode}): clone_skb={yn(caps.clone)} "
+                 f"burst={yn(caps.burst)}")
+            if not caps.clone and not caps.burst:
+                note("nessuna delle due: e' il caso normale su veth, che non "
+                     "annuncia IFF_TX_SKB_SHARING. L'unica manopola che resta "
+                     "per alzare il carico offerto e' il numero di thread.")
+        return caps
+
+    @classmethod
+    def forget(cls):
+        cls._cache.clear()
+
+
+def pg_clear_threads(threads):
+    """Stacca ogni device dai thread indicati.
+
+    `threads` puo' essere un numero (i primi N thread, come faceva la versione
+    precedente) o una lista di CPU. La seconda forma e' quella giusta adesso
+    che le CPU del generatore non sono piu' 0..N-1."""
+    cpus = range(threads) if isinstance(threads, int) else list(threads)
+    for cpu in cpus:
         try:
-            pg_write(f"{PKTGEN_DIR}/kpktgend_{i}", "rem_device_all")
+            pg_write(pg_thread_path(cpu), "rem_device_all")
         except RuntimeError:
-            break                   # fewer threads than CPUs: nothing to clear
+            continue        # meno thread che CPU, o CPU offline: niente da fare
 
 
 def pg_ensure_device(dev, thread=0):
     """Attacca `dev` se pktgen non lo conosce (piu'). Idempotente."""
-    if os.path.exists(f"{PKTGEN_DIR}/{dev}"):
-        return f"{PKTGEN_DIR}/{dev}"
+    if os.path.exists(pg_dev_path(dev)):
+        return pg_dev_path(dev)
     return pg_add_device(dev, thread)
 
 
 def pg_add_device(dev, thread=0):
-    """Attacca `dev` al thread generatore `thread` e verifica che ci sia."""
-    pg_write(f"{PKTGEN_DIR}/kpktgend_{thread}", f"add_device {dev}")
-    d = f"{PKTGEN_DIR}/{dev}"
+    """Attacca `dev` al thread generatore `thread` (= CPU) e verifica che ci sia.
+
+    `dev` puo' essere "ipa0p" oppure "ipa0p@2": la seconda forma e' la sintassi
+    ufficiale di pktgen per mettere lo STESSO netdev su piu' thread, ed e'
+    quella che i sample del kernel usano per generare da piu' core."""
+    pg_write(pg_thread_path(thread), f"add_device {dev}")
+    d = pg_dev_path(dev)
     if not os.path.exists(d):
         raise RuntimeError(
-            f"pktgen: {d} non esiste dopo `add_device {dev}`. "
-            f"L'interfaccia esiste ed e' UP? `ip link show {dev}`")
+            f"pktgen: {d} non esiste dopo `add_device {dev}` sul thread "
+            f"{thread}. L'interfaccia esiste ed e' UP? `ip link show "
+            f"{dev.split('@')[0]}`")
     return d
 
 
 def pg_set_params(dev, pkt_size, count, delay, dst_ip="10.0.0.2",
-                  dst_mac="02:00:00:00:00:02"):
+                  dst_mac="02:00:00:00:00:02", queue_map=None):
     """Cambia i parametri di un device GIA' attaccato, senza staccarlo.
 
     Separato da pg_configure perche' rimuovere e riaggiungere il device a ogni
     punto di misura faceva fallire `add_device` con EBUSY -- la rimozione non e'
     sincrona e il thread lo teneva ancora. Cambiare i parametri e' quello che
-    serviva fin dall'inizio."""
-    d = f"{PKTGEN_DIR}/{dev}"
-    for cmd in (f"count {count}", f"pkt_size {pkt_size}", f"delay {delay}",
-                f"dst {dst_ip}", f"dst_mac {dst_mac}",
-                "udp_src_min 1234", "udp_src_max 1234",
-                "udp_dst_min 9999", "udp_dst_max 9999"):
+    serviva fin dall'inizio.
+
+    `queue_map` fissa la coda di trasmissione usata da questa istanza. Con piu'
+    istanze sullo stesso device e' cio' che impedisce loro di contendersi lo
+    stesso txq lock: e' la manopola che rende utile il secondo thread."""
+    d = pg_dev_path(dev)
+    cmds = [f"count {count}", f"pkt_size {pkt_size}", f"delay {delay}",
+            f"dst {dst_ip}", f"dst_mac {dst_mac}",
+            "udp_src_min 1234", "udp_src_max 1234",
+            "udp_dst_min 9999", "udp_dst_max 9999"]
+    if queue_map is not None:
+        cmds += [f"queue_map_min {queue_map}", f"queue_map_max {queue_map}"]
+    for cmd in cmds:
         pg_write(d, cmd)
 
 
 def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0,
-                 thread=0, burst=0, xmit_mode="start_xmit"):
+                 thread=0, burst=0, xmit_mode="start_xmit", queue_map=None):
     """Put one device on one generator thread and configure it.
 
-    One thread per device, one device per thread. pktgen threads are pinned to
-    a CPU each, so N devices on N threads is N generator cores -- which is the
-    only way to raise the offered load on this bench, clone_skb being refused
-    by veth (it modifies the skb, so it cannot advertise IFF_TX_SKB_SHARING)."""
-    pg_write(f"{PKTGEN_DIR}/kpktgend_{thread}", f"add_device {dev}")
-    d = f"{PKTGEN_DIR}/{dev}"
+    One instance per thread. pktgen threads are pinned to a CPU each, so N
+    instances on N threads is N generator cores -- which is the only way to
+    raise the offered load on this bench when clone_skb is refused by veth (it
+    modifies the skb, so it cannot advertise IFF_TX_SKB_SHARING)."""
+    pg_write(pg_thread_path(thread), f"add_device {dev}")
+    d = pg_dev_path(dev)
     # add_device creates this entry, and a failed add leaves it missing. Saying
     # so here beats an ENOENT from the first pgset, which points at the wrong
     # step.
     if not os.path.exists(d):
         raise RuntimeError(
             f"pktgen: {d} non esiste dopo `add_device {dev}`. "
-            f"L'interfaccia esiste ed e' UP? `ip link show {dev}`")
-    global _CLONE_SUPPORTED, _BURST_SUPPORTED
+            f"L'interfaccia esiste ed e' UP? `ip link show "
+            f"{dev.split('@')[0]}`")
     if xmit_mode != "start_xmit":
         # Set before anything else: it changes which path the packets take, and
         # some settings are only meaningful on one of them.
         pg_write(d, f"xmit_mode {xmit_mode}")
-    if burst and _BURST_SUPPORTED:
-        try:
-            pg_write(d, f"burst {burst}")
-        except RuntimeError:
-            _BURST_SUPPORTED = False
-            warn("burst rifiutato da questo device, proseguo senza.")
-    if clone and _CLONE_SUPPORTED:
-        # Optional by design: clone_skb is the escalation knob, not part of the
-        # reference condition. A kernel that refuses it costs one experiment,
-        # not the whole run -- so it is tried separately, reported ONCE, and
-        # never attempted again.
-        try:
-            pg_write(d, f"clone_skb {clone}")
-        except RuntimeError:
-            _CLONE_SUPPORTED = False
-            warn("clone_skb rifiutato da questo device: veth consegna l'skb "
-                 "alla RX del peer e non puo' condividerlo. Proseguo senza, "
-                 "e non ci riprovo.")
-    for cmd in (f"count {count}",
-                f"pkt_size {pkt_size}",
-                f"delay {delay}",
-                f"dst {dst_ip}",
-                f"dst_mac {dst_mac}",
-                "udp_src_min 1234", "udp_src_max 1234",
-                "udp_dst_min 9999", "udp_dst_max 9999"):
-        pg_write(d, cmd)
+    caps = GenCaps.probe(dev, xmit_mode, quiet=True)
+    if burst:
+        if caps.burst:
+            try:
+                pg_write(d, f"burst {burst}")
+            except RuntimeError:
+                warn("burst rifiutato da questo device, proseguo senza.")
+        else:
+            # Gia' saputo dalla sonda: non si riprova e non si ristampa.
+            pass
+    if clone:
+        if caps.clone:
+            try:
+                pg_write(d, f"clone_skb {clone}")
+            except RuntimeError:
+                warn("clone_skb rifiutato da questo device: veth consegna "
+                     "l'skb alla RX del peer e non puo' condividerlo.")
+        else:
+            pass
+    pg_set_params(dev, pkt_size, count, delay, dst_ip, dst_mac,
+                  queue_map=queue_map)
 
 
 # pktgen's device file after a run looks like:
@@ -435,27 +812,69 @@ def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0,
 _SOFAR_RE = re.compile(r"pkts-sofar:\s*(\d+)")
 _USEC_RE = re.compile(r"Result: OK:\s*(\d+)\(")
 _PPS_RE = re.compile(r"(\d+)pps")
+_ERR_RE = re.compile(r"errors:\s*(\d+)")
+
+
+class GenRun(tuple):
+    """L'esito di UNA finestra del generatore.
+
+    E' una tupla di tre elementi (tx, pps, secs) perche' tutto il codice
+    esistente fa `tx, pps, secs = pg_run_and_read(...)` e quella forma deve
+    continuare a funzionare. Gli attributi in piu' servono alla diagnostica:
+    per-istanza, skew fra i thread, errori riportati dal generatore.
+
+    La DURATA aggregata e' il MASSIMO fra le istanze, non il minimo e non la
+    media. `pgctrl start` blocca finche' l'ultimo thread ha finito, quindi la
+    finestra vera e' lunga quanto il thread piu' lento; dividere il totale per
+    una durata piu' corta gonfierebbe ogni pps della tabella."""
+
+    def __new__(cls, tx, pps, secs, per_dev=None, wall=0.0, errors=0):
+        self = super().__new__(cls, (tx, pps, secs))
+        self.tx = tx
+        self.pps = pps
+        self.secs = secs
+        self.per_dev = per_dev or []
+        self.wall = wall
+        self.errors = errors
+        durs = [d["secs"] for d in self.per_dev if d.get("secs")]
+        # Skew: quanto sono durate diversamente le istanze. Sopra il 20% i
+        # thread non hanno lavorato nella stessa finestra e il rate aggregato
+        # e' una media su periodi diversi -- va detto, non corretto in
+        # silenzio.
+        self.skew_pct = (round(100.0 * (max(durs) - min(durs)) / max(durs), 1)
+                         if len(durs) > 1 and max(durs) > 0 else 0.0)
+        # Coerenza: il totale trasmesso diviso la durata globale deve
+        # assomigliare alla somma dei pps che pktgen riporta per istanza. Se non
+        # ci assomiglia, uno dei due non descrive questa finestra.
+        agg = (tx / secs) if secs else 0.0
+        self.rate_mismatch_pct = (round(100.0 * abs(agg - pps) / pps, 1)
+                                  if pps else 0.0)
+        return self
+
+    @property
+    def tx_pps_aggregate(self):
+        """TX totale diviso la durata GLOBALE. E' la cifra onesta da usare:
+        sommare i pps per-istanza li somma su finestre che non coincidono."""
+        return int(self.tx / self.secs) if self.secs else 0
 
 
 def pg_run_and_read(devs):
     """Start every configured thread, wait, and sum what they sent.
 
     `pgctrl start` runs ALL threads at once and blocks until the last one
-    finishes, so one call drives the whole generator. TX is the sum over
-    devices; the duration is the LONGEST of them, because the offered rate is
-    what the slowest thread finished in -- taking the shortest would inflate
-    every pps in the table."""
+    finishes, so one call drives the whole generator."""
     if isinstance(devs, str):
         devs = [devs]
     wall0 = time.time()
     pg_write(f"{PKTGEN_DIR}/pgctrl", "start")     # blocks until all are done
     wall = time.time() - wall0
 
-    sent = pps = 0
+    sent = pps = errors = 0
     secs = 0.0
+    per_dev = []
     for dev in devs:
         try:
-            with open(f"{PKTGEN_DIR}/{dev}") as f:
+            with open(pg_dev_path(dev)) as f:
                 text = f.read()
         except FileNotFoundError:
             # pktgen ha smesso di conoscere questo device fra la
@@ -467,24 +886,669 @@ def pg_run_and_read(devs):
             raise PktgenEmptyRun(
                 f"pktgen non conosce piu' {dev} (fabric ricostruito?)")
         m = _SOFAR_RE.search(text)
-        sent += int(m.group(1)) if m else 0
+        d_tx = int(m.group(1)) if m else 0
         m = _USEC_RE.search(text)
-        if m:
-            secs = max(secs, int(m.group(1)) / 1e6)
+        d_secs = int(m.group(1)) / 1e6 if m else 0.0
         m = _PPS_RE.search(text)
-        pps += int(m.group(1)) if m else 0
+        d_pps = int(m.group(1)) if m else 0
+        # `errors:` compare due volte (nel Result e in Current): la seconda e'
+        # il contatore corrente del device, ed e' quella che interessa.
+        errs = _ERR_RE.findall(text)
+        d_err = int(errs[-1]) if errs else 0
+        sent += d_tx
+        pps += d_pps
+        errors += d_err
+        secs = max(secs, d_secs)
+        per_dev.append(dict(dev=dev, tx=d_tx, pps=d_pps, secs=round(d_secs, 4),
+                            errors=d_err))
     secs = secs or wall
     pps = pps or (int(sent / secs) if secs else 0)
     if sent == 0:
         # Non fatale: un punto che non si misura e' un punto che non si
         # misura, non la fine dell'esperimento. Alzare qui buttava via anche
         # le misure gia' riuscite dello stesso run.
-        # Nothing parsed usually means the device was never added, or pktgen
-        # refused the config. Hand the raw text over rather than reporting a
-        # silent zero that looks like 100% loss.
         raise PktgenEmptyRun(
             f"pktgen non riporta pacchetti per {devs}")
-    return sent, pps, secs
+    return GenRun(sent, pps, secs, per_dev=per_dev, wall=wall, errors=errors)
+
+
+# ==========================================================================
+# IL GENERATORE COME OGGETTO: configurato una volta, riusato per ogni punto
+# ==========================================================================
+# Prima la configurazione di pktgen era sparsa fra measure_point, _fair_sweep e
+# run_latency, ognuno con la sua idea di quanti thread usare (uno) e su quale
+# CPU (la 0). Metterla in un oggetto solo serve a tre cose concrete:
+#
+#   1. i thread e le CPU si decidono UNA volta, dal CpuPlan, e valgono per
+#      tutte le pipeline -- che e' il requisito del confronto equo;
+#   2. le capacita' del device (clone_skb, burst) si sondano una volta e si
+#      riportano una volta;
+#   3. la durata della finestra diventa una proprieta' del generatore e non del
+#      chiamante, quindi warm-up e misura usano lo stesso codice con due durate
+#      diverse invece di due implementazioni che divergono.
+
+
+def _num_queues(dev, kind="tx"):
+    """Quante code ha davvero questo device. Serve a non chiedere una
+    queue_map che non esiste: pktgen la accetterebbe e il kernel poi userebbe
+    la coda 0, cioe' tutti i thread di nuovo sulla stessa."""
+    path = f"/sys/class/net/{dev}/queues"
+    try:
+        n = len([x for x in os.listdir(path) if x.startswith(kind + "-")])
+    except OSError:
+        return 1
+    return max(1, n)
+
+
+class Generator:
+    """pktgen su N CPU scelte, verso uno o piu' device.
+
+    topology="shared": UN device, N istanze `dev@i`, una per CPU del
+        generatore, ognuna sulla propria coda TX. E' il modo per avere piu'
+        core di generatore che core di DUT -- la condizione in cui la pipeline
+        satura. Il suffisso `@i` e' la sintassi di pktgen per lo stesso netdev
+        su piu' thread: pktgen_dev_get_by_name si ferma alla '@' per cercare il
+        device, e tiene il nome intero per il file di controllo.
+
+    topology="links": un device per CPU (comportamento storico). Ogni device
+        ha la sua NAPI e quindi il suo core DUT: gen e DUT scalano insieme.
+    """
+
+    def __init__(self, devs, plan, xmit_mode="start_xmit", topology="shared",
+                 clone=0, burst=0, dst_ip="10.0.0.2",
+                 dst_mac="02:00:00:00:00:02", window_s=WINDOW_S,
+                 warmup_s=DEFAULT_WARMUP_S):
+        self.devs = [devs] if isinstance(devs, str) else list(devs)
+        self.plan = plan
+        self.xmit_mode = xmit_mode
+        self.topology = topology
+        self.clone = clone
+        self.burst = burst
+        self.dst_ip = dst_ip
+        self.dst_mac = dst_mac
+        self.window_s = window_s
+        self.warmup_s = warmup_s
+        self.caps = GenCaps()
+        self.rate_estimate = 0          # pps aggregati a delay 0, da calibrate
+        self.last_run = None            # l'ultima finestra, per la diagnostica
+        self.instances = []             # [{name, dev, cpu, queue_map}]
+        self._build_instances()
+
+    # -- costruzione ------------------------------------------------------
+    def _build_instances(self):
+        cpus = list(self.plan.gen) or [0]
+        self.instances = []
+        if self.topology == "links":
+            # Un device per CPU; se i device sono meno delle CPU, si usano
+            # tante CPU quanti sono i device: due thread sullo stesso device
+            # senza il suffisso '@' pktgen li rifiuta (EBUSY).
+            for i, dev in enumerate(self.devs[:len(cpus)]):
+                self.instances.append(dict(name=dev, dev=dev, cpu=cpus[i],
+                                           queue_map=None))
+            return
+        dev = self.devs[0]
+        ntx = _num_queues(dev, "tx")
+        for i, cpu in enumerate(cpus):
+            name = dev if len(cpus) == 1 else f"{dev}@{i}"
+            # Una coda per istanza finche' ce ne sono; oltre, si riparte da
+            # capo e due istanze condividono il txq lock. Non e' un errore: e'
+            # il motivo per cui il device d'ingresso viene creato con almeno
+            # tante code TX quanti sono i thread generatore.
+            qmap = None if ntx <= 1 else (i % ntx)
+            self.instances.append(dict(name=name, dev=dev, cpu=cpu,
+                                       queue_map=qmap))
+
+    @property
+    def names(self):
+        return [i["name"] for i in self.instances]
+
+    @property
+    def n_inst(self):
+        return len(self.instances)
+
+    # -- ciclo di vita ----------------------------------------------------
+    def attach(self, verbose=True):
+        """Aggancia ogni istanza al suo thread e applica la configurazione
+        fissa (xmit_mode, queue_map, clone, burst)."""
+        pg_clear_threads(self.plan.gen)
+        for inst in self.instances:
+            pg_add_device(inst["name"], inst["cpu"])
+            self._configure(inst)
+        self.caps = GenCaps.probe(self.instances[0]["name"], self.xmit_mode,
+                                  quiet=not verbose)
+        # La sonda lascia clone_skb/burst a zero: riapplicare le manopole dopo
+        # e' cio' che evita che la sonda cancelli la configurazione.
+        for inst in self.instances:
+            self._apply_knobs(inst)
+        if verbose:
+            self.describe()
+        return self
+
+    def _configure(self, inst):
+        d = pg_dev_path(inst["name"])
+        if self.xmit_mode != "start_xmit":
+            pg_write(d, f"xmit_mode {self.xmit_mode}")
+        if inst["queue_map"] is not None:
+            pg_write(d, f"queue_map_min {inst['queue_map']}")
+            pg_write(d, f"queue_map_max {inst['queue_map']}")
+
+    def _apply_knobs(self, inst):
+        """clone_skb e burst, ma SOLO se il device li ha accettati in sonda.
+
+        Insistere su un parametro rifiutato non e' gratis: il device resta in
+        uno stato da cui `start` non parte, e la misura successiva esce a zero
+        pacchetti."""
+        d = pg_dev_path(inst["name"])
+        if self.clone and self.caps.clone:
+            try:
+                pg_write(d, f"clone_skb {self.clone}")
+            except RuntimeError:
+                pass
+        if self.burst and self.caps.burst:
+            try:
+                pg_write(d, f"burst {self.burst}")
+            except RuntimeError:
+                pass
+
+    def ensure(self):
+        """Riaggancia cio' che e' sparito. Costa una `stat` per istanza e
+        toglie un'intera classe di fallimenti: il fabric ricostruito fra due
+        metodi lascia device con lo stesso nome ma un altro ifindex, e pktgen
+        non li conosce piu'."""
+        for inst in self.instances:
+            if not os.path.exists(pg_dev_path(inst["name"])):
+                pg_add_device(inst["name"], inst["cpu"])
+                self._configure(inst)
+                self._apply_knobs(inst)
+
+    def detach(self):
+        pg_clear_threads(self.plan.gen)
+
+    def describe(self):
+        where = ", ".join(f"cpu{i['cpu']}:{i['name']}"
+                          + (f"(q{i['queue_map']})"
+                             if i["queue_map"] is not None else "")
+                          for i in self.instances)
+        info(f"generatore: {self.n_inst} thread -- {where}")
+        info(f"xmit_mode {self.xmit_mode}, clone_skb "
+             f"{self.clone if self.caps.clone else 0}, burst "
+             f"{self.burst if self.caps.burst else 0}")
+        if self.xmit_mode == "netif_receive":
+            warn("netif_receive inietta nel percorso RX del device: XDP gira "
+                 "in modo GENERIC e sulla CPU DEL GENERATORE. In questa "
+                 "modalita' la separazione gen/DUT non esiste, e i numeri non "
+                 "sono confrontabili con quelli in modo native.")
+
+    # -- rate, conteggi, finestre -----------------------------------------
+    def delay_for(self, total_pps):
+        """Il `delay` (ns fra un pacchetto e il successivo, PER ISTANZA) che
+        offre `total_pps` in aggregato. Il ritardo lo impone pktgen, cioe' il
+        kernel: una pausa in Python non e' un rate, e' la granularita' dello
+        scheduler -- misurato, chiedendo 200 kpps ne uscivano 11 k."""
+        if total_pps <= 0:
+            return 0
+        per_inst = max(1.0, float(total_pps) / self.n_inst)
+        return max(1, int(1e9 / per_inst))
+
+    def window_count(self, total_pps, seconds=None):
+        """Quanti pacchetti PER ISTANZA per una finestra di `seconds`.
+
+        pktgen conta pacchetti, non secondi: la durata si ottiene cosi'. I due
+        estremi sono a durata fissa per una ragione misurata: a NUMERO fisso
+        (200 000) un punto a 11 kpps durava 17 secondi da solo."""
+        seconds = self.window_s if seconds is None else seconds
+        total = max(MIN_WINDOW_PKTS,
+                    min(MAX_WINDOW_PKTS, int(max(0.0, total_pps) * seconds)))
+        return max(1000, total // self.n_inst)
+
+    def run(self, frame, count, delay):
+        """Una finestra grezza. `count` e' PER ISTANZA, quindi il carico
+        offerto scala con i thread e la durata per thread resta paragonabile."""
+        self.ensure()
+        for inst in self.instances:
+            pg_set_params(inst["name"], frame, count, delay,
+                          dst_ip=self.dst_ip, dst_mac=self.dst_mac,
+                          queue_map=inst["queue_map"])
+        # L'ultima finestra resta a disposizione della diagnostica: i pps per
+        # ISTANZA si leggono solo da qui, e sono cio' che dice se un thread
+        # generatore sta indietro rispetto agli altri.
+        self.last_run = pg_run_and_read(self.names)
+        return self.last_run
+
+    def warmup(self, frame, delay=0, seconds=None):
+        """Una finestra buttata via prima della misura. Il risultato si ignora
+        di proposito: serve solo a scaldare cache e code."""
+        seconds = self.warmup_s if seconds is None else seconds
+        if seconds <= 0:
+            return None
+        rate = self.rate_estimate or 1_000_000
+        try:
+            return self.run(frame, self.window_count(rate, seconds), delay)
+        except (PktgenEmptyRun, RuntimeError):
+            return None
+
+    def timed_run(self, frame, delay, seconds=None, expect_pps=None):
+        """Una finestra che punta a durare `seconds`, e lo verifica.
+
+        Se la finestra esce molto piu' corta del bersaglio vuol dire che la
+        stima del rate era bassa: si ricalibra UNA volta sul rate appena
+        misurato e si rifa'. Una volta sola, perche' due ricalibrazioni di
+        fila vogliono dire che il rate non e' stabile, e allora il problema non
+        e' il conteggio."""
+        seconds = self.window_s if seconds is None else seconds
+        rate = expect_pps or self.rate_estimate or 1_000_000
+        r = self.run(frame, self.window_count(rate, seconds), delay)
+        if r.secs < seconds * WINDOW_SHORT_FRACTION and r.secs > 0:
+            better = r.tx / r.secs
+            r2 = self.run(frame, self.window_count(better, seconds), delay)
+            return r2
+        return r
+
+    def calibrate(self, frame=64, seconds=None):
+        """Quanto offre questo generatore a delay 0, misurato e non assunto.
+
+        E' il numero da cui partono sia la ricerca del ginocchio sia la scala
+        della modalita' saturate: sapere il tetto del GENERATORE e' la
+        premessa per dire se il tetto che si osserva e' suo o della pipeline.
+        """
+        seconds = self.window_s if seconds is None else seconds
+        self.warmup(frame, 0, min(self.warmup_s, seconds))
+        r = self.timed_run(frame, 0, seconds)
+        self.rate_estimate = r.tx_pps_aggregate
+        return r
+
+    # -- ricerca automatica della configurazione del generatore ------------
+    def tune(self, frame=64, seconds=None, verbose=True):
+        """Prova le manopole che questo device accetta e TIENE solo quelle che
+        alzano davvero il rate offerto.
+
+        Non e' "metti tutto al massimo": clone_skb toglie di mezzo
+        l'allocazione per pacchetto, quindi cambia cosa si misura, e burst
+        consegna piu' pacchetti per chiamata, quindi cambia la forma del
+        traffico. Pagarlo ha senso solo se in cambio il carico offerto sale di
+        qualcosa che si vede -- sotto GEN_KNOB_MIN_GAIN si torna alla
+        condizione di riferimento, che e' un buffer per pacchetto.
+
+        Su veth nessuna delle due e' accettata, e questa funzione lo dice e
+        non fa altro: e' il caso normale di questo banco."""
+        seconds = self.window_s if seconds is None else seconds
+        base = self.calibrate(frame, seconds)
+        best = base.tx_pps_aggregate
+        chosen = dict(clone=0, burst=0)
+        if verbose:
+            info(f"generatore a delay 0, condizione di riferimento: "
+                 f"{best} pps offerti")
+        if not (self.caps.clone or self.caps.burst):
+            if verbose:
+                note("nessuna manopola disponibile su questo device: il carico "
+                     "offerto si alza solo con i thread (ne ho "
+                     f"{self.n_inst}).")
+            self.rate_estimate = best
+            return chosen
+        trials = []
+        if self.caps.clone:
+            trials.append(("clone", ESCALATE_CLONE))
+        if self.caps.burst:
+            trials.append(("burst", max(2, self.burst or 8)))
+        for knob, value in trials:
+            old = getattr(self, knob)
+            setattr(self, knob, value)
+            for inst in self.instances:
+                self._apply_knobs(inst)
+            try:
+                r = self.timed_run(frame, 0, seconds)
+            except (PktgenEmptyRun, RuntimeError) as e:
+                warn(f"{knob}={value} ha rotto la generazione ({e}): scartato")
+                setattr(self, knob, old)
+                continue
+            got = r.tx_pps_aggregate
+            gain = (got - best) / best if best else 0.0
+            if gain >= GEN_KNOB_MIN_GAIN:
+                chosen[knob] = value
+                best = got
+                if verbose:
+                    info(f"{knob}={value}: {got} pps ({gain:+.0%}) -- tenuto")
+            else:
+                setattr(self, knob, old)
+                if verbose:
+                    note(f"{knob}={value}: {got} pps ({gain:+.0%}), sotto la "
+                         f"soglia del {GEN_KNOB_MIN_GAIN:.0%}: scartato, la "
+                         f"condizione di riferimento e' piu' rappresentativa.")
+        # Riapplica la configurazione scelta (il ciclo puo' averla cambiata).
+        for inst in self.instances:
+            self._apply_knobs(inst)
+        self.rate_estimate = best
+        return chosen
+
+
+def _window_count(rate_pps):
+    """Quanti pacchetti per una finestra di WINDOW_S a questo rate.
+
+    Resta come funzione di modulo perche' il percorso storico (--latency) la
+    usa con un solo thread; con piu' thread si passa da Generator.window_count,
+    che divide per il numero di istanze."""
+    return max(MIN_WINDOW_PKTS, min(MAX_WINDOW_PKTS, int(rate_pps * WINDOW_S)))
+
+
+# ==========================================================================
+# DIAGNOSTICA: chi e' il collo di bottiglia, con i numeri e non a occhio
+# ==========================================================================
+# Regola di questa sezione: si legge solo cio' che il kernel espone davvero, e
+# se una metrica non c'e' si dice che non c'e'. Nessuna stima inventata -- una
+# percentuale di CPU "dedotta" dal rate sarebbe il rate travestito, e verrebbe
+# usata per spiegare il rate.
+#
+# Cosa si legge, e da dove:
+#   /proc/stat                        tempo per CPU -> occupazione per core
+#   /sys/class/net/<dev>/statistics   pacchetti, drop ed errori del device
+#   /proc/net/softnet_stat            drop del backlog e time_squeeze per CPU
+#   ethtool -S <dev>                  contatori XDP di veth, SE ethtool c'e'
+#
+# La raccolta e' agganciata FUORI dalla finestra di misura: si legge prima e
+# dopo, mai durante. E si attiva solo con --diag, perche' leggere procfs fra
+# un punto e l'altro costa tempo e quel tempo cade fra due finestre.
+
+
+def _read_proc_stat():
+    """{cpu: (busy_jiffies, total_jiffies)}. Solo le righe 'cpuN'."""
+    out = {}
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if not line.startswith("cpu") or line.startswith("cpu "):
+                    continue
+                parts = line.split()
+                try:
+                    cpu = int(parts[0][3:])
+                except ValueError:
+                    continue
+                vals = [int(v) for v in parts[1:]]
+                total = sum(vals)
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                out[cpu] = (total - idle, total)
+    except OSError:
+        return {}
+    return out
+
+
+def cpu_util(before, after):
+    """Occupazione per core fra due letture, in percento. Vuoto se /proc/stat
+    non e' leggibile -- e in quel caso il chiamante lo dice, non lo stima."""
+    out = {}
+    for cpu, (busy1, tot1) in after.items():
+        busy0, tot0 = before.get(cpu, (0, 0))
+        dt = tot1 - tot0
+        if dt > 0:
+            out[cpu] = round(100.0 * (busy1 - busy0) / dt, 1)
+    return out
+
+
+_DEV_FIELDS = ("rx_packets", "tx_packets", "rx_dropped", "tx_dropped",
+               "rx_errors", "tx_errors")
+
+
+def _dev_counters(dev):
+    """I contatori standard del device. Sono quelli che `ip -s link` stampa,
+    letti direttamente per non dover parsare l'output di un comando."""
+    base = f"/sys/class/net/{dev}/statistics"
+    out = {}
+    for f in _DEV_FIELDS:
+        try:
+            with open(os.path.join(base, f)) as fh:
+                out[f] = int(fh.read().strip())
+        except OSError:
+            pass
+    return out
+
+
+def _softnet():
+    """[(cpu, processed, dropped, time_squeeze)] da /proc/net/softnet_stat.
+
+    `dropped` e' il backlog che ha traboccato (netdev_max_backlog), e conta
+    soprattutto sul percorso netif_receive; `time_squeeze` e' quante volte il
+    softirq ha esaurito il budget NAPI, che e' il sintomo di una RX che non sta
+    dietro. Nessuno dei due e' attribuibile a un device: sono per CPU."""
+    rows = []
+    try:
+        with open("/proc/net/softnet_stat") as f:
+            for i, line in enumerate(f):
+                c = line.split()
+                if len(c) < 3:
+                    continue
+                rows.append((i, int(c[0], 16), int(c[1], 16), int(c[2], 16)))
+    except OSError:
+        return []
+    return rows
+
+
+def ethtool_stats(dev):
+    """I contatori di ethtool, o None se ethtool non c'e'.
+
+    veth espone qui i suoi contatori XDP (xdp_packets, xdp_drops,
+    xdp_redirect, rx_drops per coda). Non sono garantiti: su un kernel vecchio
+    o un device diverso la lista e' un'altra, quindi si restituisce quello che
+    c'e' e si lascia al chiamante il compito di cercare le chiavi che gli
+    servono, senza pretendere che esistano."""
+    try:
+        p = subprocess.run(["ethtool", "-S", dev], capture_output=True,
+                           text=True, check=False)
+    except OSError:
+        return None             # ethtool non installato: si dichiara, non si stima
+    if p.returncode != 0:
+        return None
+    out = {}
+    for line in p.stdout.splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        v = v.strip()
+        if v.isdigit():
+            out[k.strip()] = int(v)
+    return out or None
+
+
+class Diag:
+    """Uno scatto prima e uno dopo. Niente campionamento durante la misura.
+
+    `enabled=False` rende ogni metodo un no-op, cosi' il percorso di misura
+    principale non paga nulla e non serve un `if` a ogni chiamata."""
+
+    def __init__(self, devs=(), plan=None, enabled=False):
+        self.devs = list(devs)
+        self.plan = plan
+        self.enabled = enabled
+        self._t0 = None
+        self._cpu0 = {}
+        self._dev0 = {}
+        self._eth0 = {}
+        self._soft0 = []
+
+    def start(self):
+        if not self.enabled:
+            return self
+        self._t0 = time.time()
+        self._cpu0 = _read_proc_stat()
+        self._dev0 = {d: _dev_counters(d) for d in self.devs}
+        self._eth0 = {d: (ethtool_stats(d) or {}) for d in self.devs}
+        self._soft0 = _softnet()
+        return self
+
+    def stop(self):
+        """{cpu_pct, dev, softnet_dropped, softnet_squeeze, secs} oppure {}."""
+        if not self.enabled or self._t0 is None:
+            return {}
+        secs = time.time() - self._t0
+        cpu = cpu_util(self._cpu0, _read_proc_stat())
+        dev = {}
+        for d in self.devs:
+            now, before = _dev_counters(d), self._dev0.get(d, {})
+            dev[d] = {k: now.get(k, 0) - before.get(k, 0) for k in now}
+        # ethtool: su veth ci sono i contatori XDP (xdp_packets, xdp_drops,
+        # xdp_redirect, rx_drops per coda). Non sono garantiti su ogni kernel,
+        # quindi si riporta la differenza delle chiavi che ci sono e basta.
+        eth = {}
+        for d in self.devs:
+            now = ethtool_stats(d)
+            if now is None:
+                continue
+            before = self._eth0.get(d) or {}
+            delta = {k: v - before.get(k, 0) for k, v in now.items()
+                     if (v - before.get(k, 0)) != 0
+                     and ("xdp" in k or "drop" in k or "err" in k)}
+            if delta:
+                eth[d] = delta
+        soft_now = _softnet()
+        drop = sum(r[2] for r in soft_now) - sum(r[2] for r in self._soft0)
+        squeeze = sum(r[3] for r in soft_now) - sum(r[3] for r in self._soft0)
+        return dict(secs=round(secs, 3), cpu_pct=cpu, dev=dev, ethtool=eth,
+                    ethtool_available=bool(self._eth0 and
+                                           any(self._eth0.values())),
+                    softnet_dropped=drop, softnet_squeeze=squeeze)
+
+    # -- lettura ----------------------------------------------------------
+    def report(self, d, rate=None):
+        if not d:
+            return
+        print(f"\n{YELLOW}  -- diagnostica ({d['secs']} s di finestra) "
+              f"--{NC}")
+        cpu = d.get("cpu_pct") or {}
+        if not cpu:
+            warn("occupazione per core non leggibile (/proc/stat): non la "
+                 "stimo da altri numeri, semplicemente non c'e'.")
+        else:
+            gen = set(self.plan.gen) if self.plan else set()
+            dut = set(self.plan.dut) if self.plan else set()
+            for c in sorted(cpu):
+                tag = ("gen" if c in gen else
+                       "DUT" if c in dut else "sistema")
+                bar = "#" * int(cpu[c] / 5)
+                col = RED if cpu[c] >= CPU_BUSY_PCT else GREY
+                print(f"    cpu{c:<3d} {tag:8s} {col}{cpu[c]:5.1f}%{NC} {bar}")
+        for dev, ctr in (d.get("dev") or {}).items():
+            if not ctr:
+                continue
+            bits = " ".join(f"{k}={v}" for k, v in sorted(ctr.items()) if v)
+            print(f"    {dev:12s} {bits or 'nessun contatore mosso'}")
+        if d.get("ethtool"):
+            for dev, delta in d["ethtool"].items():
+                bits = " ".join(f"{k}={v}" for k, v in sorted(delta.items()))
+                print(f"    {dev:12s} [ethtool] {bits}")
+        elif not d.get("ethtool_available"):
+            note("ethtool non disponibile o senza contatori su questi device: "
+                 "i contatori XDP di veth non sono leggibili qui, e non li "
+                 "sostituisco con una stima.")
+        print(f"    softnet     dropped={d.get('softnet_dropped', 0)} "
+              f"time_squeeze={d.get('softnet_squeeze', 0)}")
+        note("softnet dropped/time_squeeze sono PER CPU e non per device: "
+             "dicono che una CPU non sta dietro, non quale device la riempie.")
+
+
+def gen_cpu_load(diag_data, plan):
+    """(carico medio delle CPU generatore, carico medio delle CPU DUT).
+
+    None dove il dato non c'e'. Serve al verdetto sul collo di bottiglia, che
+    senza queste due cifre resta comunque possibile ma piu' debole."""
+    if not diag_data or not plan:
+        return None, None
+    cpu = diag_data.get("cpu_pct") or {}
+    g = [cpu[c] for c in plan.gen if c in cpu]
+    d = [cpu[c] for c in plan.dut if c in cpu]
+    return (round(sum(g) / len(g), 1) if g else None,
+            round(sum(d) / len(d), 1) if d else None)
+
+
+# Etichette del verdetto. Sono anche i valori della colonna `bottleneck` nel
+# CSV, quindi non si cambiano alla leggera.
+BN_GEN = "generatore"
+BN_IN = "pipeline-ingresso"
+BN_OUT = "pipeline-uscita"
+BN_PIPE = "pipeline"
+BN_NOISE = "macchina"
+BN_UNKNOWN = "indeterminato"
+
+
+def classify_bottleneck(row, threshold=DEFAULT_LOSS_THRESHOLD, plan=None,
+                        diag_data=None, noisy=False):
+    """(etichetta, spiegazione) per UN punto di misura.
+
+    L'inferenza principale non ha bisogno della diagnostica e vale sempre:
+
+      perdita ~ 0  ->  il DUT NON e' saturo, quindi il limite osservato e' il
+                       rate che il generatore e' riuscito a offrire. Questa
+                       riga NON e' il throughput massimo della pipeline, e
+                       chiamarlo cosi' sarebbe l'errore che tutto questo file
+                       esiste per evitare.
+      perdita > 0  ->  qualcosa satura, e i tre contatori dicono DOVE:
+                       TX-HIT sono pacchetti mai arrivati al programma
+                       (ingresso del DUT), HIT-RX sono pacchetti elaborati e
+                       non usciti (uscita).
+
+    La diagnostica, quando c'e', conferma o contraddice: CPU del generatore al
+    100% con quelle del DUT scariche vuol dire generatore; il contrario vuol
+    dire pipeline."""
+    loss = row.get("loss_worst", row.get("loss_pct", 0.0)) or 0.0
+    before = row.get("lost_before")
+    after = row.get("lost_after")
+    g_load, d_load = gen_cpu_load(diag_data, plan)
+    tail = ""
+    if g_load is not None and d_load is not None:
+        tail = f" (cpu gen {g_load}%, cpu DUT {d_load}%)"
+
+    if noisy:
+        return BN_NOISE, ("la perdita non cresce col rate: e' rumore della "
+                          "macchina, non saturazione" + tail)
+    if loss <= threshold:
+        if g_load is not None and g_load >= CPU_BUSY_PCT and (
+                d_load is None or d_load < CPU_BUSY_PCT):
+            return BN_GEN, ("le CPU del generatore sono sature e quelle del "
+                            "DUT no: il tetto e' il generatore" + tail)
+        return BN_GEN, ("nessuna perdita: il DUT non e' saturo, quindi questo "
+                        "e' il rate che il generatore ha saputo offrire, non "
+                        "il massimo della pipeline" + tail)
+    if before is None or after is None:
+        return BN_PIPE, ("si perde, ma questa riga non ha i contatori HIT: "
+                         "non posso dire se all'ingresso o all'uscita" + tail)
+    if after > before:
+        return BN_OUT, (f"{after} pacchetti elaborati e non usciti contro "
+                        f"{before} mai arrivati: satura l'uscita (il secondo "
+                        f"veth e il contatore), non l'inferenza" + tail)
+    if before > after:
+        return BN_IN, (f"{before} pacchetti mai arrivati al programma contro "
+                       f"{after} elaborati e non usciti: satura l'ingresso "
+                       f"del DUT" + tail)
+    return BN_UNKNOWN, "perdita presente ma non attribuibile" + tail
+
+
+def report_generator(gen):
+    """Che cosa ha fatto ogni THREAD del generatore nell'ultima finestra.
+
+    E' la meta' mancante della diagnostica: l'occupazione per core dice se una
+    CPU e' satura, questa dice se il thread che ci gira sopra sta consegnando
+    quanto gli altri. Un'istanza molto sotto le altre vuol dire una coda TX
+    contesa o una CPU che fa anche altro, e in entrambi i casi il rate
+    aggregato non e' il massimo che il banco puo' offrire."""
+    r = getattr(gen, "last_run", None)
+    if r is None or not r.per_dev:
+        note("nessuna finestra recente del generatore da riportare")
+        return
+    print("")
+    print(f"{YELLOW}  -- generatore, ultima finestra --{NC}")
+    cpu_of = {i["name"]: i["cpu"] for i in gen.instances}
+    for d in r.per_dev:
+        print(f"    {d['dev']:16s} cpu{cpu_of.get(d['dev'], '?'):<3} "
+              f"tx={d['tx']:>9d} {d['pps']:>9d} pps  {d['secs']:>6.3f} s  "
+              f"errori={d['errors']}")
+    print(f"    {'AGGREGATO':16s}     tx={r.tx:>9d} "
+          f"{r.tx_pps_aggregate:>9d} pps  {r.secs:>6.3f} s")
+    if r.skew_pct > 20.0:
+        warn(f"le istanze non hanno lavorato nella stessa finestra "
+             f"(scarto {r.skew_pct}% fra la piu' lunga e la piu' corta): il "
+             f"rate aggregato e' una media su periodi diversi.")
+    if r.rate_mismatch_pct > 25.0:
+        warn(f"TX/durata globale e somma dei pps per istanza differiscono del "
+             f"{r.rate_mismatch_pct}%: uno dei due non descrive questa "
+             f"finestra. La cifra usata e' sempre TX diviso la durata "
+             f"GLOBALE, che e' quella che non puo' gonfiare il risultato.")
 
 
 # ==========================================================================
@@ -496,7 +1560,7 @@ def _percpu_sum(table, key=0):
 
 
 # ==========================================================================
-# one measurement point
+# un punto di misura
 # ==========================================================================
 def _read_u64(table, key):
     try:
@@ -516,11 +1580,30 @@ def _zero_counters(setup, rx_tab, n_out):
     rx_tab.clear()
 
 
+def _agg(values):
+    """media, minimo, massimo, deviazione standard e coefficiente di
+    variazione di una lista di misure.
+
+    La deviazione standard su 3 campioni non e' una statistica seria, e non
+    viene usata per decidere niente: e' riportata perche' e' cio' che permette
+    di leggere una mediana sapendo quanto ballava. Il coefficiente di
+    variazione (std/media) e' la forma confrontabile fra rate diversi."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return dict(mean=0, min=0, max=0, std=0.0, cv_pct=0.0)
+    mean = sum(vals) / len(vals)
+    std = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    return dict(mean=int(mean), min=min(vals), max=max(vals),
+                std=round(std, 1),
+                cv_pct=round(100.0 * std / mean, 1) if mean else 0.0)
+
+
 def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                   tg_devs=None, repeat=DEFAULT_REPEAT, burst=0,
-                  xmit_mode="start_xmit"):
-    """`repeat` runs of the same point; returns the median by rx_pps, carrying
-    the WORST loss seen across them.
+                  xmit_mode="start_xmit", gen=None, warmup=True,
+                  threshold=DEFAULT_LOSS_THRESHOLD, plan=None, diag=None):
+    """`repeat` finestre dello stesso punto; ritorna la mediana per rx_pps,
+    portandosi dietro la perdita PEGGIORE e la dispersione fra le finestre.
 
     Single samples are not usable here. Measured on this bench, three runs of
     one identical configuration -- same pipeline, same rate, same frame,
@@ -531,12 +1614,20 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     Median for the RATE, because a slow outlier is a busy machine and not the
     datapath. Worst for the LOSS, because a rate that drops packets on one run
     out of three is not a rate this datapath sustains, and calling it clean
-    would be the optimistic lie this whole script exists to avoid."""
+    would be the optimistic lie this whole script exists to avoid.
+
+    Il WARM-UP e' una finestra in piu', fatta una volta per punto e scartata:
+    la prima raffica paga cache fredde e la prima allocazione delle code, e
+    finiva dentro la deviazione standard delle ripetizioni."""
+    if warmup and gen is not None:
+        gen.warmup(frame, delay)
     runs = []
+    if diag is not None:
+        diag.start()
     for _ in range(max(1, repeat)):
         try:
             r = _measure_once(setup, rx_tab, fab, frame, delay, count,
-                              n_out, clone, tg_devs, burst, xmit_mode)
+                              n_out, clone, tg_devs, burst, xmit_mode, gen)
         except PktgenEmptyRun as e:
             warn(f"misura scartata: {e}")
             continue
@@ -550,6 +1641,7 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                  f"uscita -- contatore RX non aggiornato, non perdita")
             continue
         runs.append(r)
+    diag_data = diag.stop() if diag is not None else {}
     if not runs:
         return None
     runs.sort(key=lambda r: r["rx_pps"])
@@ -561,6 +1653,11 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     med["rx_pps_max"] = runs[-1]["rx_pps"]
     med["burst"] = burst
     med["xmit_mode"] = xmit_mode
+    a = _agg([r["rx_pps"] for r in runs])
+    med["rx_pps_mean"] = a["mean"]
+    med["rx_pps_std"] = a["std"]
+    med["rx_pps_cv_pct"] = a["cv_pct"]
+    med["secs_mean"] = round(sum(r["secs"] for r in runs) / len(runs), 3)
     lo, hi = med["rx_pps_min"], med["rx_pps_max"]
     med["spread_pct"] = round(100.0 * (hi - lo) / lo, 1) if lo else None
     # Una mediana su misure che oscillano del 75% non e' una misura: e' il
@@ -568,31 +1665,75 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     # onesta da farne.
     med["unreliable"] = bool(med["spread_pct"] is not None
                              and med["spread_pct"] > MAX_SPREAD_PCT)
+    # Due avvisi che riguardano la MISURA e non il datapath: se scattano, la
+    # riga resta ma va letta sapendo che la finestra non era pulita.
+    if med.get("gen_skew_pct", 0) > 20.0:
+        warn(f"thread del generatore sfasati del {med['gen_skew_pct']}%: non "
+             f"hanno lavorato nella stessa finestra")
+    if med.get("gen_rate_mismatch_pct", 0) > 25.0:
+        warn(f"TX/durata e somma dei pps per istanza differiscono del "
+             f"{med['gen_rate_mismatch_pct']}%: uso TX diviso la durata "
+             f"globale, che e' la lettura che non gonfia")
+    tag, why = classify_bottleneck(med, threshold=threshold, plan=plan,
+                                   diag_data=diag_data)
+    med["bottleneck"] = tag
+    med["bottleneck_why"] = why
+    if diag_data:
+        g, d = gen_cpu_load(diag_data, plan)
+        med["cpu_gen_pct"] = g
+        med["cpu_dut_pct"] = d
+        med["softnet_dropped"] = diag_data.get("softnet_dropped")
+        med["_diag"] = diag_data
     return med
 
 
 def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
-                  tg_devs=None, burst=0, xmit_mode="start_xmit"):
+                  tg_devs=None, burst=0, xmit_mode="start_xmit", gen=None):
     """One (frame size, offered rate) point. Returns a dict of counters.
 
-    `count` is per generator thread, so the offered load scales with the number
-    of threads and the per-thread duration stays comparable."""
-    devs = tg_devs or [fab.ingress_peer]
+    `count` is per generator instance, so the offered load scales with the
+    number of instances and the per-instance duration stays comparable.
+
+    Con un `gen` (Generator) la configurazione del generatore e' gia' in piedi
+    e si cambiano solo i parametri del punto. Senza, si ricade sul percorso
+    storico -- aggiungi, configura, misura -- che serve ai chiamanti che non
+    hanno un Generator."""
     _zero_counters(setup, rx_tab, n_out)
-    pg_clear_threads(len(devs))
-    for i, dev in enumerate(devs):
-        pg_configure(dev, frame, count, delay,
-                     dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02",
-                     clone=clone, thread=i, burst=burst,
-                     xmit_mode=xmit_mode)
-    tx, tx_pps, elapsed = pg_run_and_read(devs)
+    if gen is not None:
+        run = gen.run(frame, count, delay)
+        devs = gen.names
+    else:
+        devs = tg_devs or [fab.ingress_peer]
+        pg_clear_threads(len(devs))
+        for i, dev in enumerate(devs):
+            pg_configure(dev, frame, count, delay,
+                         dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02",
+                         clone=clone, thread=i, burst=burst,
+                         xmit_mode=xmit_mode)
+        run = pg_run_and_read(devs)
+    tx, tx_pps, elapsed = run
     hit = _read_u64(setup["pkt_stats"], 0)
     miss = _read_u64(setup["pkt_stats"], 1)
     drop = _read_u64(setup["pkt_stats"], 2)
     rx = _percpu_sum(rx_tab)
     secs = elapsed if elapsed > 0 else 1e-9
+    # Il rate OFFERTO e' quello che pktgen ha chiesto al kernel; quello
+    # AGGREGATO e' il totale diviso la durata globale. Il secondo e' la cifra
+    # da usare: sommare i pps per-istanza li somma su finestre che non
+    # coincidono, e a thread sfasati gonfia il numero.
+    offered = int(1e9 / delay) * len(devs) if delay else None
     return dict(frame=frame, delay=delay, secs=round(secs, 3),
-                tx=tx, tx_pps=tx_pps or int(tx / secs),
+                tx=tx, tx_pps=run.tx_pps_aggregate or int(tx / secs),
+                tx_pps_sum=tx_pps, offered_pps=offered,
+                gen_threads=len(devs),
+                gen_skew_pct=getattr(run, "skew_pct", 0.0),
+                # Coerenza fra le due letture del rate offerto. Vedi GenRun:
+                # se TX/durata-globale e la somma dei pps per istanza non si
+                # assomigliano, una delle due non descrive questa finestra, e
+                # quella usata ovunque qui e' la prima -- che e' quella che non
+                # puo' gonfiare il risultato.
+                gen_rate_mismatch_pct=getattr(run, "rate_mismatch_pct", 0.0),
+                gen_errors=getattr(run, "errors", 0),
                 hit=hit, miss=miss, drop=drop, rx=rx,
                 rx_pps=int(rx / secs),
                 # Throughput on the wire counts the frame, not the payload.
@@ -600,8 +1741,6 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 lost_before=max(0, tx - hit),
                 lost_after=max(0, hit - rx),
                 loss_pct=round(100.0 * (tx - rx) / tx, 3) if tx else 0.0)
-
-
 
 
 # ==========================================================================
@@ -681,8 +1820,6 @@ int xdp_lat_count(struct xdp_md *ctx) {
 LAT_STAMP = ("\n    { int _lz = 0; __u64 _lt = bpf_ktime_get_ns();\n"
              "      ts_in.update(&_lz, &_lt); }\n")
 
-# Nome della funzione d'ingresso XDP per ciascun metodo: e' quella in cui
-# infilare il timestamp, ed e' quella che si attacca all'interfaccia.
 # Istogramma LOGARITMICO, 40 celle: la cella i raccoglie [2^i, 2^(i+1)) ns,
 # quindi si copre da 1 ns a ~18 minuti.
 #
@@ -697,6 +1834,8 @@ LAT_STAMP = ("\n    { int _lz = 0; __u64 _lt = bpf_ktime_get_ns();\n"
 # la risoluzione logaritmica (1-2 us, 2-4 us, ...) e' quella giusta.
 LAT_BUCKETS = 40
 
+# Nome della funzione d'ingresso XDP per ciascun metodo: e' quella in cui
+# infilare il timestamp, ed e' quella che si attacca all'interfaccia.
 LAT_ENTRY = {
     "baseline": "xdp_baseline",
     "p1_static": "ipa_switch_hardcoded",
@@ -740,7 +1879,7 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
 
 
 def _load_instrumented(method, model_path, fab, sem, node=STATIC_NODE):
-    """Compila tutto insieme, carica, e caba la pipeline su questo fabric."""
+    """Compila tutto insieme, carica, e cabla la pipeline su questo fabric."""
     from bcc import BPF
     import verify_prog_run as V
     import test_fabric as TF
@@ -800,6 +1939,23 @@ def _load_instrumented(method, model_path, fab, sem, node=STATIC_NODE):
     return setup, lat_fn
 
 
+def _map_extra_ingress(setup, ifindexes):
+    """Fai riconoscere al programma anche gli ingressi aggiuntivi.
+
+    Gli ingressi extra sono altri core di generatore che alimentano LO STESSO
+    nodo, non altre porte del nodo: prendono percio' lo stesso slot logico
+    dell'ingresso del fabric. Senza questa riga il pacchetto arriva, il
+    programma gira, e la feature 'porta d'ingresso' vale zero -- cioe' si
+    misura una decisione presa su un input diverso da quello dichiarato."""
+    import test_fabric as TF
+    pl = setup["pipeline"]
+    if pl == 0:
+        return          # la baseline non legge la porta d'ingresso
+    ing = setup["b"][TF._INGRESS_NAME[pl]]
+    for idx in ifindexes:
+        ing[ct.c_uint32(idx)] = ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
+
+
 def _read_lat(b):
     """Statistiche di latenza, sommando le celle per-CPU.
 
@@ -845,8 +2001,12 @@ def _read_lat(b):
 
 
 def run_latency(method, model_path, frames, delays, count, threads,
-                threaded_napi=True):
-    """Latenza arrivo -> ripartenza, a piu' dimensioni di frame e piu' rate."""
+                threaded_napi=True, plan=None, xmit_mode="start_xmit"):
+    """Latenza arrivo -> ripartenza, a piu' dimensioni di frame e piu' rate.
+
+    Percorso storico, tenuto perche' e' quello citato nel quaderno. La
+    differenza rispetto a prima e' che il generatore passa dal CpuPlan: anche
+    qui i thread pktgen stanno sulle CPU dichiarate e non piu' sulla 0."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -855,6 +2015,7 @@ def run_latency(method, model_path, frames, delays, count, threads,
           f"(build strumentata){NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
 
+    plan = plan or plan_cpus(threads=threads)
     sem, n_out = class_semantics()
     rows = []
     with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
@@ -871,17 +2032,17 @@ def run_latency(method, model_path, frames, delays, count, threads,
         napi_devs = []
         if threaded_napi:
             napi_devs = [fab.ingress]
-            if enable_threaded_napi(napi_devs, threads, os.cpu_count() or 1):
+            if enable_threaded_napi(napi_devs, plan):
                 info("NAPI in thread: generatore e DUT su core separati")
+
+        gen = Generator([fab.ingress_peer], plan, xmit_mode=xmit_mode,
+                        topology="shared").attach()
 
         # Throughput E latenza nella stessa riga, perche' vengono dallo
         # STESSO pacchetto: il programma d'uscita conta e cronometra insieme,
         # quindi `campioni` e' esattamente RX. Riportarli separati avrebbe
         # significato due run e due stati della macchina per due numeri che
         # descrivono lo stesso evento.
-        # Aggiunto una volta per tutto il run: vedi pg_set_params.
-        pg_clear_threads(1)
-        pg_add_device(fab.ingress_peer, thread=0)
         hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>8s} {'RX':>8s} "
                f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
                f"{'min':>6s} {'p50':>6s} {'p90':>6s} {'p99':>7s}")
@@ -889,19 +2050,11 @@ def run_latency(method, model_path, frames, delays, count, threads,
         print("  " + "-" * (len(hdr) - 2))
         for frame in frames:
             for delay in delays:
+                gen.warmup(frame, delay)
                 b["lat_acc"].clear()
                 b["lat_hist"].clear()
-                # Il device si aggiunge UNA volta (sopra) e poi si cambiano
-                # solo i parametri. Rimuoverlo e riaggiungerlo a ogni punto
-                # faceva fallire `add_device` con EBUSY: la rimozione non e'
-                # istantanea e il thread lo teneva ancora.
-                # Idempotente: se il device e' ancora agganciato non fa
-                # nulla, se e' sparito lo riaggancia. Costa una `stat` per
-                # punto e toglie un'intera classe di fallimenti.
-                pg_ensure_device(fab.ingress_peer, thread=0)
-                pg_set_params(fab.ingress_peer, frame, count, delay)
                 try:
-                    tx, tx_pps, secs = pg_run_and_read([fab.ingress_peer])
+                    tx, tx_pps, secs = gen.run(frame, count, delay)
                 except PktgenEmptyRun as e:
                     warn(f"punto scartato: {e}")
                     continue
@@ -935,12 +2088,14 @@ def run_latency(method, model_path, frames, delays, count, threads,
                 rows.append(dict(method=method, frame=frame, delay=delay,
                                  tx=tx, rx=rx, tx_pps=tx_pps, rx_pps=rx_pps,
                                  rx_mbps=mbps, loss_pct=loss,
-                                 excess_rx=excess, samples=rx, **{
+                                 excess_rx=excess, samples=rx,
+                                 gen_threads=gen.n_inst, **{
                                      k: st[k] for k in
                                      ("lat_min_ns", "lat_p50_ns",
                                       "lat_p90_ns", "lat_p99_ns",
                                       "lat_avg_ns", "lat_max_ns")},
                                  over_4us=st["over"]))
+        gen.detach()
         pg_reset()
         if napi_devs:
             disable_threaded_napi(napi_devs)
@@ -956,7 +2111,6 @@ def run_latency(method, model_path, frames, delays, count, threads,
           f"INFERIORE di quello di produzione, non lo stesso numero. Per il "
           f"throughput da citare usa il run senza --latency.{NC}")
     return rows
-
 
 
 # ==========================================================================
@@ -982,8 +2136,10 @@ def run_latency(method, model_path, frames, delays, count, threads,
 #    i giri. Una deriva colpisce allora tutti allo stesso modo invece di
 #    premiare chi capita per primo.
 #
-# Resta quello che non si puo' togliere: TG e DUT sulla stessa macchina. Ma
-# adesso e' l'unica differenza rimasta fra le colonne, non una delle quattro.
+# A queste tre si aggiunge adesso la quarta, che e' la ragione di questa
+# revisione: il generatore e' lo STESSO OGGETTO per tutte le pipeline, sulle
+# stesse CPU, con le stesse manopole gia' sondate. Prima ogni percorso si
+# configurava pktgen per conto suo, sempre su un thread solo, sempre su CPU 0.
 
 
 class _quiet:
@@ -1007,12 +2163,29 @@ def _detach(iface):
                    check=False, capture_output=True)
 
 
+def _noop():
+    class _N:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    return _N()
+
+
+def _fmt_ns(v):
+    return f"{v:5d}n" if v is not None else "  n/d"
+
+
 def run_fair(methods, model_path, frames, delays, count, threads,
-             threaded_napi=True, repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS):
+             threaded_napi=True, repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS,
+             tol=0.0, plan=None, xmit_mode="start_xmit", diag=None,
+             window_s=WINDOW_S, warmup_s=DEFAULT_WARMUP_S):
     """Tutte le pipeline sullo stesso fabric, compilate prima, misurate a giri."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
+    plan = plan or plan_cpus(threads=threads)
     sem, n_out = class_semantics()
     raw = []
 
@@ -1035,8 +2208,9 @@ def run_fair(methods, model_path, frames, delays, count, threads,
             warn("nessuna pipeline caricata")
             return []
 
-        pg_clear_threads(1)
-        pg_add_device(fab.ingress_peer, thread=0)
+        gen = Generator([fab.ingress_peer], plan, xmit_mode=xmit_mode,
+                        topology="shared", window_s=window_s,
+                        warmup_s=warmup_s).attach()
         napi_devs = []
 
         # --- fase 2: misura a giri, tutti i metodi in ogni giro
@@ -1044,7 +2218,8 @@ def run_fair(methods, model_path, frames, delays, count, threads,
         print(f"{YELLOW} Fase 2: {rounds} giri x {len(loaded)} pipeline, "
               f"stesso fabric, nessuna compilazione{NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
-        hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} {'delay':>6s} "
+        hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} "
+               f"{'fase':12s} "
                f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
                f"{'min':>6s} {'p50':>6s} {'p99':>7s}")
         print(hdr)
@@ -1074,8 +2249,7 @@ def run_fair(methods, model_path, frames, delays, count, threads,
                     # nulla da mettere in thread.
                     if threaded_napi:
                         napi_devs = [fab.ingress]
-                        if enable_threaded_napi(napi_devs, threads,
-                                                os.cpu_count() or 1):
+                        if enable_threaded_napi(napi_devs, plan):
                             info("NAPI in thread: generatore e DUT su core "
                                  "separati")
                         else:
@@ -1083,26 +2257,23 @@ def run_fair(methods, model_path, frames, delays, count, threads,
                     first = False
                 # Scaldata scartata: la prima raffica paga cache fredde e la
                 # prima allocazione, e non descrive il regime.
-                try:
-                    pg_ensure_device(fab.ingress_peer, thread=0)
-                    pg_set_params(fab.ingress_peer, 64, 2000, 0)
-                    pg_run_and_read([fab.ingress_peer])
-                except PktgenEmptyRun:
-                    pass
+                gen.warmup(64, 0)
                 for frame in frames:
-                    for delay in delays:
-                        r = _one_fair_point(b, fab, frame, delay, count)
-                        if r is None:
-                            continue
-                        r.update(method=m, round=rnd, threads=threads)
+                    for r in _fair_sweep(b, fab, frame, tol, gen=gen,
+                                         plan=plan, diag=diag):
+                        r.update(method=m, round=rnd, threads=gen.n_inst)
                         raw.append(r)
-                        print(f"  {rnd:4d} {m:10s} {frame:5d} {delay:6d} "
+                        if r["phase"] == "ricerca":
+                            continue        # i passi intermedi restano nel CSV
+                        print(f"  {rnd:4d} {m:10s} {frame:5d} "
+                              f"{r['phase']:12s} "
                               f"{r['rx_pps']:9d} {r['rx_mbps']:7.1f} "
                               f"{r['loss_pct']:7.2f}% "
                               f"{_fmt_ns(r['lat_min_ns'])} "
                               f"{_fmt_ns(r['lat_p50_ns'])} "
                               f"{_fmt_ns(r['lat_p99_ns'])}")
 
+        gen.detach()
         pg_reset()
         if napi_devs:
             disable_threaded_napi(napi_devs)
@@ -1112,28 +2283,147 @@ def run_fair(methods, model_path, frames, delays, count, threads,
     return raw
 
 
-def _noop():
-    class _N:
-        def __enter__(self):
-            return self
+# ==========================================================================
+# IL RATE MASSIMO SENZA PERDITE (RFC 2544)
+# ==========================================================================
+# "Throughput" in senso di rete non e' quanti pacchetti passano quando si spinge
+# al massimo: e' il rate PIU' ALTO a cui non se ne perde nessuno. Sono due numeri
+# diversi e il secondo e' quello citabile, perche' il primo descrive un sistema
+# in sovraccarico -- dove la cifra dipende da quanto si e' spinto, non da cosa
+# regge il sistema.
+#
+# Il ritardo lo impone PKTGEN, cioe' il kernel, non un time.sleep() in Python.
+# E' la ragione per cui questa ricerca e' accurata e un generatore frenato da
+# Python non lo era: misurato, chiedendo 200 kpps con una pausa in Python ne
+# uscivano 11 kpps, e il punto a 50 kpps ne dava 13 -- piu' del punto piu'
+# veloce. Quei numeri erano la granularita' dello scheduler, non un rate.
 
-        def __exit__(self, *a):
-            return False
-    return _N()
+
+def _fair_sweep(b, fab, frame, tol, steps=KNEE_STEPS, gen=None, plan=None,
+                diag=None):
+    """Tre punti per pipeline: a fondo, al limite senza perdite, e a vuoto.
+
+    Ritorna righe gia' etichettate con `phase`, che e' cio' su cui il riepilogo
+    raggruppa. Non si raggruppa piu' su `delay` perche' con la ricerca il
+    ritardo e' diverso per ogni pipeline: e' il RISULTATO della ricerca, non
+    una condizione dell'esperimento.
+    """
+    rows = []
+    wc = (gen.window_count if gen is not None
+          else (lambda r, s=None: _window_count(r)))
+
+    # --- 1. a fondo: quanto offre il generatore e quanto ne sopravvive.
+    #     Serve come estremo superiore della ricerca, e come cifra di
+    #     sovraccarico da riportare accanto a quella pulita.
+    full = _one_fair_point(b, fab, frame, 0, wc(3_000_000), gen=gen)
+    if full is None:
+        return rows
+    full["phase"] = "pieno"
+    rows.append(full)
+
+    if full["loss_pct"] <= tol:
+        # Niente si perde gia' alla massima spinta: il generatore ha saturato
+        # prima della pipeline. Non c'e' un ginocchio da cercare, e dirlo e' il
+        # risultato -- cercarlo comunque restituirebbe un numero piu' basso di
+        # quello gia' misurato.
+        clean = dict(full)
+        clean["phase"] = "zero-perdite"
+        clean["gen_bound"] = 1
+        rows.append(clean)
+    else:
+        # --- 2. la ricerca del limite, attorno a una stima che gia' abbiamo.
+        #
+        #     Il rate CONSEGNATO in sovraccarico e' quasi esattamente la
+        #     capacita': se se ne offrono 2,4 M e ne passano 1,4 M, la pipeline
+        #     ne regge circa 1,4 M. Quindi non serve bisecare [0, offerto]: si
+        #     parte poco sotto la stima e si sale finche' si perde.
+        #
+        #     Una bisezione cieca su quell'intervallo trovava una pipeline da
+        #     300 kpps a 225 k (-25%): cinque dimezzamenti di un intervallo che
+        #     arriva a 2,4 M non hanno risoluzione in basso.
+        #
+        #     E anche partendo dalla stima, bisecare sbagliava del 6%, per un
+        #     motivo che vale la pena ricordare: `int(1e9 / rate)` arrotonda il
+        #     ritardo PER DIFETTO, quindi il primo tentativo offre un filo piu'
+        #     della capacita', perde un pacchetto, e con lo zero stretto viene
+        #     bocciato -- mandando la bisezione a ripartire da zero. Partire
+        #     sotto la stima toglie il problema alla radice.
+        SU = (0.98, 1.02, 1.05, 1.09, 1.14, 1.20)    # pulito: si prova a salire
+        GIU = (0.92, 0.85, 0.75, 0.60, 0.40, 0.25)   # sporco: si scende
+        est = float(full["rx_pps"])
+        best = None
+        rate = est * SU[0]
+        i_su, i_giu = 1, 0
+        for _ in range(steps):
+            if rate < 1000:
+                break
+            r = _one_fair_point(b, fab, frame, _delay_for(rate, gen),
+                                wc(rate), gen=gen)
+            if r is None:
+                break
+            r["phase"] = "ricerca"
+            rows.append(r)
+            if r["loss_pct"] <= tol:
+                best = r
+                if i_su >= len(SU):
+                    break
+                rate, i_su = est * SU[i_su], i_su + 1
+            else:
+                if best is not None:
+                    # Pulito al gradino prima, sporco a questo: il limite sta
+                    # in mezzo e lo si e' gia' misurato. Continuare vorrebbe
+                    # dire raffinare oltre il rumore del banco.
+                    break
+                if i_giu >= len(GIU):
+                    break
+                rate, i_giu = est * GIU[i_giu], i_giu + 1
+        if best is not None:
+            clean = dict(best)
+            clean["phase"] = "zero-perdite"
+            clean["gen_bound"] = 0
+            rows.append(clean)
+
+    # --- 3. a vuoto: la latenza senza coda davanti. E' il numero che separa le
+    #     pipeline fra loro, e va preso dove nessuna e' in sovraccarico --
+    #     altrimenti si confrontano lunghezze di coda invece che programmi.
+    idle_rate = 50_000
+    idle = _one_fair_point(b, fab, frame, _delay_for(idle_rate, gen),
+                           wc(idle_rate), gen=gen)
+    if idle is not None:
+        idle["phase"] = "scarico"
+        rows.append(idle)
+    for r in rows:
+        r.setdefault("gen_bound", 0)
+        tag, why = classify_bottleneck(r, threshold=max(tol, 0.0), plan=plan)
+        r["bottleneck"] = tag
+        r["bottleneck_why"] = why
+    return rows
 
 
-def _fmt_ns(v):
-    return f"{v:5d}n" if v is not None else "  n/d"
+def _delay_for(rate, gen=None):
+    """Il ritardo per offrire `rate` in aggregato, tenendo conto che con N
+    istanze ognuna trasmette a rate/N."""
+    if gen is not None:
+        return gen.delay_for(rate)
+    return int(1e9 / rate) if rate > 0 else 0
 
 
-def _one_fair_point(b, fab, frame, delay, count):
+def _one_fair_point(b, fab, frame, delay, count, gen=None):
     """Un punto: throughput e latenza dallo stesso pacchetto."""
     b["lat_acc"].clear()
     b["lat_hist"].clear()
     try:
-        pg_ensure_device(fab.ingress_peer, thread=0)
-        pg_set_params(fab.ingress_peer, frame, count, delay)
-        tx, tx_pps, secs = pg_run_and_read([fab.ingress_peer])
+        if gen is not None:
+            run = gen.run(frame, count, delay)
+            tx, tx_pps, secs = run
+            threads = gen.n_inst
+            skew = run.skew_pct
+        else:
+            pg_ensure_device(fab.ingress_peer, thread=0)
+            pg_set_params(fab.ingress_peer, frame, count, delay)
+            run = pg_run_and_read([fab.ingress_peer])
+            tx, tx_pps, secs = run
+            threads, skew = 1, getattr(run, "skew_pct", 0.0)
     except PktgenEmptyRun as e:
         warn(f"punto scartato: {e}")
         return None
@@ -1142,7 +2432,11 @@ def _one_fair_point(b, fab, frame, delay, count):
         return None
     rx, secs = st["n"], (secs or 1e-9)
     return dict(frame=frame, delay=delay, tx=tx, rx=rx, tx_pps=tx_pps,
-                rx_pps=int(rx / secs), rx_mbps=round(rx * frame * 8 / secs / 1e6, 1),
+                rx_pps=int(rx / secs),
+                rx_mbps=round(rx * frame * 8 / secs / 1e6, 1),
+                secs=round(secs, 3), gen_threads=threads,
+                gen_skew_pct=skew,
+                offered_pps=(int(1e9 / delay) * threads if delay else None),
                 loss_pct=round(100.0 * max(0, tx - rx) / tx, 3) if tx else 0.0,
                 excess_rx=max(0, rx - tx),
                 **{k: st[k] for k in ("lat_min_ns", "lat_p50_ns", "lat_p90_ns",
@@ -1179,7 +2473,11 @@ def _latency_verdict(rows):
     varia del 137% fra i giri, la sua latenza minima di meno dell'1%. Sono due
     misure con due affidabilita' diverse e vanno riportate come tali, invece di
     lasciare che il lettore prenda la tabella per buona tutta insieme."""
-    lat = [r for r in rows if r.get("lat_spread_pct") is not None]
+    lat = [r for r in rows
+           if r.get("lat_spread_pct") is not None and r.get("phase") == "scarico"]
+    if not lat:
+        # Nessuna riga a vuoto: si ripiega su tutte, dicendolo.
+        lat = [r for r in rows if r.get("lat_spread_pct") is not None]
     if not lat:
         return
     worst = max(lat, key=lambda r: r["lat_spread_pct"])
@@ -1204,19 +2502,30 @@ def summarise_fair(raw, methods):
     import statistics as stats
     if not raw:
         return []
-    keys = sorted({(r["method"], r["frame"], r["delay"]) for r in raw})
+    raw = [r for r in raw if r.get("phase") != "ricerca"]
+    # Ordine LOGICO, non alfabetico. In ordine alfabetico le fasi escono
+    # "pieno, scarico, zero-perdite" e le pipeline "baseline, hardcoded,
+    # modular, p1_static, template": la riga che conta finisce in fondo e
+    # l'ordine delle pipeline non e' piu' quello del costo crescente, che e'
+    # il modo in cui questa tabella si legge.
+    ordine_fase = {"pieno": 0, "zero-perdite": 1, "scarico": 2}
+    ordine_met = {m: i for i, m in enumerate(METHODS)}
+    keys = sorted({(r["method"], r["frame"], r["phase"]) for r in raw},
+                  key=lambda k: (ordine_met.get(k[0], 99), k[1],
+                                 ordine_fase.get(k[2], 99)))
     out = []
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} Riepilogo: mediana fra i giri{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
-    hdr = (f"  {'pipeline':10s} {'frame':>5s} {'delay':>6s} {'giri':>4s} "
+    hdr = (f"  {'pipeline':10s} {'frame':>5s} {'fase':12s} {'giri':>4s} "
            f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
-           f"{'min':>6s} {'p50':>6s} {'p99':>7s}")
+           f"{'min':>6s} {'p50':>6s} {'p99':>7s} {'collo':>18s}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
-    for m, frame, delay in keys:
-        pts = [r for r in raw if (r["method"], r["frame"], r["delay"])
-               == (m, frame, delay)]
+    for m, frame, phase in keys:
+        pts = [r for r in raw if (r["method"], r["frame"], r["phase"])
+               == (m, frame, phase)]
+        delay = int(stats.median([r["delay"] for r in pts]))
         med = {k: stats.median([r[k] for r in pts if r[k] is not None] or [0])
                for k in ("rx_pps", "rx_mbps", "loss_pct", "lat_min_ns",
                          "lat_p50_ns", "lat_p99_ns")}
@@ -1227,21 +2536,36 @@ def summarise_fair(raw, methods):
         # misure cosi' non e' un risultato, ed e' il numero che va marcato.
         pps = [r["rx_pps"] for r in pts if r["rx_pps"]]
         spread = (100.0 * (max(pps) - min(pps)) / min(pps)) if pps else 0.0
+        stat = _agg(pps)
         # La latenza ha la sua dispersione, e nei fatti e' un altro mondo:
         # pochi ns su tre giri contro decine di punti percentuali.
         lats = [r["lat_min_ns"] for r in pts if r["lat_min_ns"]]
         lat_spread = (100.0 * (max(lats) - min(lats)) / min(lats)) if lats else 0.0
         bad = spread > MAX_SPREAD_PCT
-        row = dict(method=m, frame=frame, delay=delay, rounds=len(pts),
+        # Il collo di bottiglia della maggioranza dei giri: se i giri non sono
+        # d'accordo si riporta il piu' frequente, che e' cio' che una mediana
+        # e' per una grandezza non numerica.
+        tags = [r.get("bottleneck") for r in pts if r.get("bottleneck")]
+        tag = max(set(tags), key=tags.count) if tags else BN_UNKNOWN
+        row = dict(method=m, frame=frame, phase=phase, delay=delay,
+                   rounds=len(pts),
                    pps_spread_pct=round(spread, 1),
+                   rx_pps_mean=stat["mean"], rx_pps_min=stat["min"],
+                   rx_pps_max=stat["max"], rx_pps_std=stat["std"],
+                   rx_pps_cv_pct=stat["cv_pct"],
+                   secs=round(stats.median([r.get("secs", 0) for r in pts]), 3),
+                   bottleneck=tag,
                    lat_spread_pct=round(lat_spread, 1), unreliable=bad, **med)
         out.append(row)
         flag = f" {RED}pps +-{spread:.0f}%{NC}" if bad else ""
-        print(f"  {m:10s} {frame:5d} {delay:6d} {len(pts):4d} "
+        # La riga senza perdite e' quella citabile: si vede.
+        col = GREEN if phase == "zero-perdite" else ""
+        end = NC if col else ""
+        print(f"  {col}{m:10s} {frame:5d} {phase:12s}{end} {len(pts):4d} "
               f"{int(med['rx_pps']):9d} {med['rx_mbps']:7.1f} "
               f"{med['loss_pct']:7.2f}% "
               f"{int(med['lat_min_ns']):5d}n {int(med['lat_p50_ns']):5d}n "
-              f"{int(med['lat_p99_ns']):6d}n{flag}")
+              f"{int(med['lat_p99_ns']):6d}n {tag:>18s}{flag}")
     return out
 
 
@@ -1259,11 +2583,11 @@ def summarise_fair(raw, methods):
 #
 # Dal kernel 5.12 /sys/class/net/<dev>/threaded sposta il poll NAPI in un
 # KERNEL THREAD dedicato (`napi/<dev>-<id>`), che lo scheduler puo' mettere
-# altrove e che si puo' pinnare a mano. Pinnando i thread NAPI sulle CPU che
-# pktgen NON usa, generatore e DUT stanno davvero su core diversi:
+# altrove e che si puo' pinnare a mano. Pinnando i thread NAPI sulle CPU del
+# DUT, generatore e pipeline stanno davvero su core diversi:
 #
-#     CPU 0..T-1   pktgen genera
-#     CPU T..N-1   napi/<dev>-*  esegue XDP, cioe' l'inferenza
+#     CPU del generatore   pktgen genera (kpktgend_<cpu>)
+#     CPU del DUT          napi/<dev>-*  esegue XDP, cioe' l'inferenza
 #
 # Da quel momento la domanda "a che rate la pipeline comincia a perdere" ha una
 # risposta, perche' il generatore non le ruba piu' il core.
@@ -1274,33 +2598,72 @@ def summarise_fair(raw, methods):
 
 
 def _napi_threads(dev):
-    """I PID dei kernel thread NAPI di `dev`. Vuoto se non e' in modo thread."""
-    out = subprocess.run(["ps", "-eo", "pid,comm"], capture_output=True,
-                         text=True, check=False).stdout
-    pids = []
+    """I PID dei kernel thread NAPI di `dev`, in ordine di napi id.
+
+    L'ordine e' quello di creazione, che e' l'ordine delle code, ma il kernel
+    NON garantisce la corrispondenza id->coda e questo codice non la pretende:
+    quello che serve e' distribuire N thread su M CPU, non sapere quale coda
+    serve quale thread. Dichiararlo qui evita che qualcuno legga il pinning
+    come una mappa coda->CPU che non e'."""
+    try:
+        out = subprocess.run(["ps", "-eo", "pid,comm"], capture_output=True,
+                             text=True, check=False).stdout
+    except OSError:
+        # Niente `ps` (container minimale): i thread esistono lo stesso, ma
+        # non si possono pinnare. Dirlo invece di far esplodere il run.
+        warn("`ps` non disponibile: non posso trovare i thread NAPI, quindi "
+             "non posso pinnarli. Restano dove li mette lo scheduler.")
+        return []
+    found = []
     for line in out.splitlines():
         parts = line.split(None, 1)
-        if len(parts) == 2 and parts[1].strip().startswith(f"napi/{dev}-"):
-            pids.append(parts[0].strip())
-    return pids
+        if len(parts) != 2:
+            continue
+        comm = parts[1].strip()
+        if not comm.startswith(f"napi/{dev}-"):
+            continue
+        try:
+            nid = int(comm.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            nid = 0
+        found.append((nid, parts[0].strip()))
+    return [pid for _, pid in sorted(found)]
 
 
-def enable_threaded_napi(devs, first_cpu, ncpu):
-    """Metti in modo thread la NAPI di `devs` e pinna i thread da `first_cpu`.
+def enable_threaded_napi(devs, plan_or_first_cpu=None, ncpu=None):
+    """Metti in modo thread la NAPI di `devs` e pinna i thread sulle CPU DUT.
 
-    Restituisce [(dev, pid, cpu), ...] per quello che e' andato a posto. Un
-    device che non supporta `threaded` non e' un errore: si riporta e si
-    proseguec in softirq, perche' meglio una misura dichiarata su un core solo
-    che nessuna misura."""
+    Il secondo argomento e' un CpuPlan (forma nuova) oppure la prima CPU da
+    usare piu' il numero totale di CPU (forma storica, tenuta perche' un paio
+    di chiamanti la usano ancora).
+
+    COME SI DISTRIBUISCE. Un device con una sola coda ha un solo thread NAPI e
+    va su una CPU sola: e' il caso del fabric. Un device con piu' code ne ha
+    uno per coda, e allora si spalmano sulle CPU del DUT -- ed e' cio' che
+    permette di avere piu' core di generatore che di DUT senza che i core del
+    DUT restino inutilizzati.
+
+    Va ricordato il modo in cui questo e' andato storto una volta: con DUE
+    device d'ingresso, CINQUE contatori d'uscita e dieci thread schiacciati su
+    due CPU, il generatore offriva 4,17 Mpps e il datapath ne consegnava 118 k.
+    Non era saturazione, era un crollo da oversubscription. La regola che ne
+    e' uscita, e che qui resta: si mettono in thread SOLO gli ingressi, e i
+    contatori d'uscita restano in softirq.
+
+    Restituisce [(dev, n_thread, [cpu, ...])] per quello che e' andato a
+    posto."""
+    if isinstance(plan_or_first_cpu, CpuPlan):
+        dut = list(plan_or_first_cpu.dut)
+    else:
+        first = plan_or_first_cpu if isinstance(plan_or_first_cpu, int) else 0
+        total = ncpu or (os.cpu_count() or 1)
+        dut = [c for c in range(first, total)] or [first]
+    if not dut:
+        dut = [0]
+
     placed = []
-    cpu = first_cpu
+    next_cpu = 0
     for dev in devs:
-        # ONE CPU per device, not one per NAPI thread. A multi-queue veth has a
-        # NAPI thread per queue, so pinning them round-robin scattered one
-        # device's work over every DUT core and, with two ingress devices and
-        # five egress counters, put ten threads on two CPUs -- measured: the
-        # generator offered 4.17 Mpps and the datapath delivered 118 k, a
-        # collapse rather than saturation. A device is one DUT core.
         path = f"/sys/class/net/{dev}/threaded"
         if not os.path.exists(path):
             warn(f"{dev}: /sys/.../threaded non c'e', resto in softirq "
@@ -1312,15 +2675,29 @@ def enable_threaded_napi(devs, first_cpu, ncpu):
         except OSError as e:
             warn(f"{dev}: threaded rifiutato ({e.strerror}), resto in softirq")
             continue
-        if cpu >= ncpu:
-            cpu = first_cpu              # piu' device che CPU libere: gira
         pids = _napi_threads(dev)
+        used = []
         for pid in pids:
-            subprocess.run(["taskset", "-pc", str(cpu), pid],
-                           capture_output=True, check=False)
+            cpu = dut[next_cpu % len(dut)]
+            next_cpu += 1
+            try:
+                r = subprocess.run(["taskset", "-pc", str(cpu), pid],
+                                   capture_output=True, check=False)
+            except OSError:
+                warn("`taskset` non disponibile (util-linux): i thread NAPI "
+                     "sono in modo thread ma non pinnati, quindi la "
+                     "separazione fra le CPU la decide lo scheduler.")
+                break
+            if r.returncode == 0:
+                used.append(cpu)
+            else:
+                warn(f"{dev}: taskset su cpu{cpu} fallito per il pid {pid} "
+                     f"({r.stderr.decode().strip() or 'motivo non riportato'})")
         if pids:
-            placed.append((dev, len(pids), cpu))
-        cpu += 1
+            placed.append((dev, len(pids), sorted(set(used))))
+        else:
+            warn(f"{dev}: modo thread attivo ma nessun thread napi/{dev}-* "
+                 f"trovato: il poll potrebbe essere ancora in softirq")
     return placed
 
 
@@ -1336,7 +2713,7 @@ def disable_threaded_napi(devs):
 
 
 # ==========================================================================
-# extra ingress links: one generator core each
+# LINK D'INGRESSO DEDICATI: uno o piu', dimensionati sulle CPU
 # ==========================================================================
 TG_PREFIX = "ipatg"
 
@@ -1346,47 +2723,71 @@ def _ip(*args, check=True):
                           check=check)
 
 
-def make_tg_links(n):
-    """`n` extra veth pairs, each the ingress of one more generator thread.
+def _make_pair(rx, tx, rx_queues, tx_queues):
+    """Una coppia veth dimensionata: `rx` e' il lato DUT (XDP), `tx` quello su
+    cui trasmette pktgen.
 
-    Why this exists: clone_skb is refused by veth, so a single pktgen thread
-    cannot be made faster. What CAN be added is threads -- pktgen pins one per
-    CPU -- and each needs its own device. All of them feed the SAME XDP
-    program, so the offered load scales with cores while the thing under test
-    stays one program with one set of maps.
+    IL VINCOLO CHE DECIDE I NUMERI. veth_xdp_set rifiuta l'attach con
+    "XDP expects number of rx queues not less than peer tx queues": il lato che
+    porta XDP deve avere ALMENO tante code RX quante sono le code TX del peer.
+    Quindi le code TX del generatore fissano un minimo per le code RX del DUT,
+    e il numero di CPU del DUT puo' solo alzarlo, mai abbassarlo. Sbagliarlo
+    non da' un errore a runtime: da' un attach fallito, cioe' nessun programma
+    e nessun HIT."""
+    _ip("link", "del", rx, check=False)          # leftovers from a crash
+    rxq = max(rx_queues, tx_queues)
+    _ip("link", "add", rx, "numrxqueues", str(rxq), "numtxqueues", str(rxq),
+        "type", "veth", "peer", tx,
+        "numrxqueues", str(tx_queues), "numtxqueues", str(tx_queues))
+    for dev in (rx, tx):
+        _ip("link", "set", dev, "up")
+        # IPv6 autoconf would put router solicitations on the same wire and
+        # they would be counted as traffic that nobody generated.
+        subprocess.run(["sysctl", "-qw",
+                        f"net.ipv6.conf.{dev}.disable_ipv6=1"],
+                       capture_output=True, check=False)
+    idx = int(_ip("-o", "link", "show", rx).stdout.split(":")[0])
+    return rx, tx, idx
 
-    That is also what makes the result interesting rather than just bigger:
-    pkt_stats and cls_stats are shared BPF_ARRAYs incremented with
-    __sync_fetch_and_add, so several cores hammering them contend on the same
-    cache line. Whether that shows up is the question this can answer and the
-    single-core measurement cannot.
+
+def make_tg_links(n, gen_queues=1, dut_queues=1):
+    """`n` coppie veth, ognuna ingresso di un thread generatore in piu'.
+
+    Topologia "links", quella storica: ogni coppia ha la sua NAPI e quindi il
+    suo core DUT, per cui generatore e DUT scalano insieme. Utile per
+    riprodurre le misure vecchie e per vedere come si comporta la stessa
+    pipeline su piu' code d'ingresso indipendenti.
+
+    Tutte alimentano lo STESSO programma XDP, quindi il carico offerto scala
+    con i core mentre la cosa sotto test resta un programma con le sue mappe --
+    ed e' anche cio' che rende la misura interessante e non solo piu' grande:
+    pkt_stats e cls_stats sono BPF_ARRAY condivisi incrementati con
+    __sync_fetch_and_add, quindi piu' core che li martellano si contendono la
+    stessa cache line.
 
     Returns [(rx_dev, tx_dev, rx_ifindex), ...]."""
     made = []
     for i in range(n):
         rx, tx = f"{TG_PREFIX}{i}", f"{TG_PREFIX}{i}p"
-        _ip("link", "del", rx, check=False)          # leftovers from a crash
-        # One queue per CPU on both sides: with a single queue every
-        # generator thread funnels through one NAPI instance, which caps the
-        # aggregate before any pipeline does.
-        ncpu = str(os.cpu_count() or 1)
-        _ip("link", "add", rx, "numrxqueues", ncpu, "numtxqueues", ncpu,
-            "type", "veth", "peer", tx,
-            "numrxqueues", ncpu, "numtxqueues", ncpu)
-        for dev in (rx, tx):
-            _ip("link", "set", dev, "up")
-            # IPv6 autoconf would put router solicitations on the same wire and
-            # they would be counted as traffic that nobody generated.
-            subprocess.run(["sysctl", "-qw",
-                            f"net.ipv6.conf.{dev}.disable_ipv6=1"],
-                           capture_output=True, check=False)
-        idx = int(_ip("-o", "link", "show", rx).stdout.split(":")[0])
-        made.append((rx, tx, idx))
+        made.append(_make_pair(rx, tx, dut_queues, gen_queues))
     return made
 
 
+def make_shared_tg_link(gen_threads, dut_queues, index=0):
+    """UNA coppia veth per la topologia "shared": tutti i thread generatore
+    trasmettono qui, su code TX distinte, e il lato DUT ha le sue code RX.
+
+    E' la modifica che permette di chiedere N core di generatore contro M core
+    di DUT con N > M, cioe' l'unica configurazione in cui su una macchina sola
+    la pipeline arriva a saturare.
+
+    Returns (rx_dev, tx_dev, rx_ifindex)."""
+    rx, tx = f"{TG_PREFIX}{index}", f"{TG_PREFIX}{index}p"
+    return _make_pair(rx, tx, max(1, dut_queues), max(1, gen_threads))
+
+
 def del_tg_links(n):
-    for i in range(n):
+    for i in range(max(1, n)):
         _ip("link", "del", f"{TG_PREFIX}{i}", check=False)
 
 
@@ -1515,103 +2916,160 @@ def attach_rx_counter(fab):
     return b, b["rx_count"], attached
 
 
+class Ingress:
+    """Dove entra il traffico: quale device porta XDP, quale usa pktgen.
+
+    Esiste perche' la risposta dipende da tre cose che prima erano decise in
+    posti diversi dello stesso file: la topologia (un device condiviso o uno
+    per thread), il numero di CPU per parte, e l'xmit_mode (netif_receive
+    inietta NEL device che riceve, non nel suo peer).
+
+    Campi:
+      dut_devs   i device su cui si attacca il programma e su cui si mette la
+                 NAPI in thread
+      gen_devs   i device che pktgen usa per trasmettere
+      ifindexes  gli ifindex da mappare sullo slot logico d'ingresso
+      created    i link creati qui, da rimuovere alla fine
+    """
+
+    def __init__(self, dut_devs, gen_devs, ifindexes, created=0,
+                 topology="shared"):
+        self.dut_devs = list(dut_devs)
+        self.gen_devs = list(gen_devs)
+        self.ifindexes = list(ifindexes)
+        self.created = created
+        self.topology = topology
+
+    def cleanup(self):
+        if self.created:
+            del_tg_links(self.created)
+
+
+def build_ingress(fab, plan, topology="shared", rx_side=False):
+    """Costruisce la parte d'ingresso del banco secondo il piano CPU.
+
+    shared, piu' di un thread generatore: una coppia veth nuova, dimensionata
+        cosi' -- code TX sul lato generatore = numero di thread pktgen; code RX
+        sul lato DUT = almeno tante quante quelle (vincolo di veth_xdp_set) e
+        comunque non meno delle CPU del DUT. Ne esce un solo ifindex
+        d'ingresso, N code di generazione e M thread NAPI da pinnare: gen e DUT
+        scalano SEPARATAMENTE, che e' il punto di tutta questa revisione.
+
+    links: il comportamento storico, una coppia per thread.
+
+    un thread solo: si usa l'ingresso del fabric, senza creare niente.
+
+    `rx_side` (xmit_mode netif_receive) cambia il device che pktgen usa: si
+    inietta nel percorso RX del device che riceve, non nel peer."""
+    n_gen, n_dut = len(plan.gen), len(plan.dut)
+    if n_gen <= 1 and topology == "shared":
+        dut, gen_dev = fab.ingress, fab.ingress_peer
+        return Ingress([dut], [dut if rx_side else gen_dev], [], 0, "shared")
+    if topology == "links":
+        made = make_tg_links(n_gen - 1, gen_queues=1, dut_queues=1)
+        dut_devs = [fab.ingress] + [m[0] for m in made]
+        gen_devs = ([fab.ingress] + [m[0] for m in made]) if rx_side else \
+                   ([fab.ingress_peer] + [m[1] for m in made])
+        return Ingress(dut_devs, gen_devs, [m[2] for m in made],
+                       max(0, n_gen - 1), "links")
+    rx, tx, idx = make_shared_tg_link(n_gen, max(n_dut, n_gen))
+    info(f"ingresso condiviso {rx}: {n_gen} code TX per il generatore, "
+         f"{max(n_dut, n_gen)} code RX sul DUT "
+         f"(veth pretende rx(DUT) >= tx(peer))")
+    return Ingress([rx], [rx if rx_side else tx], [idx], 1, "shared")
+
+
+# ==========================================================================
+# UN METODO ALLA VOLTA: sonda, misura, riassumi
 # ==========================================================================
 def run_method(method, model_path, frames, delays, count, out_rows,
                clone=0, threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
                repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit",
-               threaded_napi=True):
+               threaded_napi=True, plan=None, topology="shared",
+               diag_enabled=False, offered_pps=None, window_s=WINDOW_S,
+               warmup_s=DEFAULT_WARMUP_S, tune=False, search="ladder"):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
+    plan = plan or plan_cpus(threads=threads)
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} {method} -- throughput end-to-end, TG e DUT sulla stessa "
-          f"macchina{NC}")
+          f"macchina ma su core diversi{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
 
     sem, n_out = class_semantics()
+    rc = 0
     with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
         rx_side = (xmit_mode == "netif_receive")
         rx_b, rx_tab, attached = attach_rx_counter(fab)
         info(f"contatore RX su {len(attached)} peer d'uscita (XDP_DROP)")
 
         setup = build_pipeline(method, model_path, fab, sem)
+        ing = build_ingress(fab, plan, topology, rx_side)
         # netif_receive injects at netif_receive_skb, which is PAST the native
         # XDP hook: veth's native program runs in veth_poll, earlier. Attaching
         # native and injecting there means no program runs at all -- neither
         # HIT nor MISS, which is exactly what the probe reported. The generic
         # hook is the one on that path, so that is where the program has to go.
-        xdp_mode = "generic" if xmit_mode == "netif_receive" else None
-        attach_xdp(setup["b"], setup["disp"], fab.ingress, mode=xdp_mode)
-        info(f"pipeline agganciata a {fab.ingress} (ifindex "
-             f"{fab.ingress_ifindex})")
+        xdp_mode = "generic" if rx_side else None
+        for dev in ing.dut_devs:
+            attach_xdp(setup["b"], setup["disp"], dev, mode=xdp_mode)
+        _map_extra_ingress(setup, ing.ifindexes)
+        info(f"pipeline agganciata a {', '.join(ing.dut_devs)}")
 
-        # (rx_side is set above, before the pipeline is attached, because
-        # it decides the XDP mode as well as the device.)
-        # WHICH device pktgen is pointed at depends on the injection mode.
-        #
-        #   start_xmit / queue_xmit : pktgen TRANSMITS, so it takes the PEER of
-        #       the DUT's ingress; the packet crosses the veth and arrives on
-        #       the ingress, where the pipeline's XDP runs.
-        #   netif_receive : pktgen injects straight into a device's RECEIVE
-        #       path, so it takes the INGRESS itself. No veth crossing, no
-        #       peer NAPI, no skb->xdp conversion -- and XDP runs generic.
-        #
-        # Getting this backwards would send every packet somewhere the pipeline
-        # is not, and the probe would catch it, but the message would blame the
-        # model_id byte.
-        tg_devs = [fab.ingress if rx_side else fab.ingress_peer]
-        extra = []
-        if threads > 1:
-            import test_fabric as TF
-            extra = make_tg_links(threads - 1)
-            ing_map = setup["b"][TF._INGRESS_NAME[setup["pipeline"]]]
-            for rx, tx, idx in extra:
-                attach_xdp(setup["b"], setup["disp"], rx, mode=xdp_mode)
-                # Same logical port as the fabric ingress: these are extra
-                # generator cores feeding one node, not extra node ports.
-                ing_map[ct.c_uint32(idx)] = ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
-                tg_devs.append(rx if rx_side else tx)
-            info(f"{threads} core generatori: {', '.join(tg_devs)}")
-        if rx_side:
-            info("xmit_mode netif_receive: XDP gira in modo GENERIC, non "
-                 "native -- non confrontabile con gli altri run")
+        gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
+        gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
+                        topology=ing.topology, clone=clone, burst=burst,
+                        window_s=window_s, warmup_s=warmup_s).attach()
 
         # Separazione vera fra generatore e DUT: i thread NAPI che eseguono
-        # l'inferenza vanno sulle CPU che pktgen non usa.
+        # l'inferenza vanno sulle CPU del DUT.
+        #
+        # SOLO gli ingressi. I peer d'uscita portano il contatore, che e'
+        # strumentazione e non il DUT: lasciarli in softirq li fa girare sul
+        # core che ha elaborato il pacchetto, come farebbe l'uscita di un nodo
+        # vero. Metterli in thread su CPU proprie li ha messi in concorrenza
+        # con l'inferenza sulle stesse CPU.
         napi_devs = []
         if threaded_napi and not rx_side:
-            ncpu = os.cpu_count() or 1
-            # pktgen usa kpktgend_0..threads-1, cioe' le CPU 0..threads-1.
-            # SOLO gli ingressi. I peer d'uscita portano il contatore, che
-            # e' strumentazione e non il DUT: lasciarli in softirq li fa girare
-            # sul core che ha elaborato il pacchetto, come farebbe l'uscita di
-            # un nodo vero. Metterli in thread su CPU proprie li ha messi in
-            # concorrenza con l'inferenza sulle stesse due CPU.
-            napi_devs = [fab.ingress] + [e[0] for e in extra]
-            placed = enable_threaded_napi(napi_devs, threads, ncpu)
+            napi_devs = list(ing.dut_devs)
+            placed = enable_threaded_napi(napi_devs, plan)
             if placed:
-                where = ", ".join(f"{d}({n} code)->cpu{c}"
-                                  for d, n, c in placed)
+                where = ", ".join(
+                    f"{d}({n} thread)->cpu{','.join(str(c) for c in cs)}"
+                    for d, n, cs in placed)
                 info(f"NAPI in thread, pinnata: {where}")
-                info(f"pktgen su cpu 0-{threads - 1}, inferenza sulle altre: "
-                     f"generatore e DUT su core separati")
+                info(f"pktgen su cpu {','.join(str(c) for c in plan.gen)}, "
+                     f"inferenza su cpu {','.join(str(c) for c in plan.dut)}")
             else:
+                napi_devs = []
                 warn("nessun thread NAPI pinnato: generatore e pipeline "
                      "restano sullo stesso core, e le cifre misurano la somma")
+        elif rx_side:
+            warn("xmit_mode netif_receive: XDP gira in modo GENERIC e sulla "
+                 "CPU del generatore -- niente separazione, e numeri non "
+                 "confrontabili con gli altri run")
+
+        diag = Diag(devs=ing.dut_devs + attached[:1], plan=plan,
+                    enabled=diag_enabled)
 
         # -- sonda: un pacchetto solo, per sapere se stiamo misurando
         #    inferenza o XDP_PASS.
         probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
-                              tg_devs, repeat=1, burst=burst,
-                              xmit_mode=xmit_mode)
-        probe_clone_support(tg_devs[0])
+                              repeat=1, burst=burst, xmit_mode=xmit_mode,
+                              gen=gen, warmup=False, threshold=threshold,
+                              plan=plan)
         if probe is None:
             warn("la sonda non ha trasmesso nulla: pktgen non e' partito.")
+            gen.detach()
+            ing.cleanup()
             return 1
         if probe["hit"] == 0 and method == "baseline":
             warn("la baseline non ha prodotto HIT: non legge model_id, quindi "
                  "il problema e' a monte (il pacchetto non arriva o mac_table "
                  "e' vuota). Mi fermo.")
+            gen.detach()
+            ing.cleanup()
             return 1
         if probe["hit"] == 0:
             warn(f"la sonda non ha prodotto nessun HIT "
@@ -1620,89 +3078,257 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                  "model_id sul filo non e' ne' 0 ne' 190.")
             warn("Misurare adesso darebbe il costo di NON fare inferenza. "
                  "Mi fermo.")
+            gen.detach()
+            ing.cleanup()
             return 1
         ok(f"sonda: {probe['hit']} HIT su {probe['tx']} inviato -- si sta "
            f"misurando inferenza vera")
 
-        hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>9s} {'HIT':>9s} "
-               f"{'RX':>9s} {'TX pps':>9s} {'RX pps':>9s} {'Mb/s':>8s} "
-               f"{'perdita':>8s}")
+        # Il TETTO DEL GENERATORE, misurato una volta e stampato: e' la cifra
+        # rispetto a cui va letto tutto il resto. Se un risultato ci arriva
+        # vicino, il limite e' qui e non nella pipeline.
+        if tune:
+            # tune() calibra da sola e lascia sul generatore le manopole che
+            # hanno davvero alzato il rate.
+            gen.tune(frames[0] if frames else 64)
+        else:
+            gen.calibrate(frames[0] if frames else 64)
+        info(f"tetto del generatore su questo banco: {gen.rate_estimate} pps "
+             f"offerti da {gen.n_inst} thread su cpu "
+             f"{','.join(str(c) for c in plan.gen)}")
+
+        hdr = (f"  {'frame':>5s} {'offerto':>9s} {'TX':>9s} {'HIT':>9s} "
+               f"{'RX':>9s} {'RX pps':>9s} {'Mb/s':>8s} {'s':>5s} "
+               f"{'perdita':>8s} {'collo':>18s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
+
         def printer(r):
-            mark = GREEN if r["loss_pct"] == 0 else (
-                RED if r["loss_pct"] > 1 else YELLOW)
+            mark = GREEN if r["loss_worst"] <= threshold else (
+                RED if r["loss_worst"] > 1 else YELLOW)
             spread = ""
             if r.get("spread_pct") is not None:
                 col = RED if r.get("unreliable") else GREY
                 flag = " INAFFIDABILE" if r.get("unreliable") else ""
                 spread = (f" {col}(x{r['repeat']}, +-{r['spread_pct']:.0f}%"
                           f"{flag}){NC}")
-            print(f"  {r['frame']:5d} {r['delay']:6d} {r['tx']:9d} "
-                  f"{r['hit']:9d} {r['rx']:9d} {r['tx_pps']:9d} "
-                  f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
-                  f"{mark}{r['loss_worst']:7.2f}%{NC}{spread}")
+            off = r.get("offered_pps")
+            print(f"  {r['frame']:5d} {(off if off else 0):9d} {r['tx']:9d} "
+                  f"{r['hit']:9d} {r['rx']:9d} "
+                  f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} {r['secs']:5.2f} "
+                  f"{mark}{r['loss_worst']:7.2f}%{NC} "
+                  f"{r.get('bottleneck', ''):>18s}{spread}")
 
         for frame in frames:
             if delays:
-                # Manual sweep: the caller asked for specific rates.
+                # Sweep manuale: il chiamante ha chiesto rate precisi, e qui
+                # vale --count come nella versione precedente. Le altre
+                # modalita' derivano il conteggio dalla durata (--duration),
+                # ma uno sweep esplicito e' anche una riproduzione di misure
+                # vecchie, e quelle erano a numero di pacchetti fisso.
                 for delay in delays:
-                    r = measure_point(setup, rx_tab, fab, frame, delay, count,
-                                      n_out, clone, tg_devs, repeat, burst,
-                                      xmit_mode)
+                    r = measure_point(setup, rx_tab, fab, frame, delay,
+                                      count,
+                                      n_out, clone, repeat=repeat, burst=burst,
+                                      xmit_mode=xmit_mode, gen=gen,
+                                      threshold=threshold, plan=plan,
+                                      diag=diag)
                     if r is None:
                         continue
-                    r["clone_skb"], r["method"] = clone, method
-                    r["threads"] = threads
+                    r["clone_skb"], r["method"] = gen.clone, method
+                    r["threads"] = gen.n_inst
                     out_rows.append(r)
                     printer(r)
-            else:
+            elif offered_pps:
+                # Modalita' confronto: un rate solo, uguale per tutti.
+                r = _point_at_rate(setup, rx_tab, fab, frame, offered_pps,
+                                   n_out, gen, repeat, threshold, plan, diag,
+                                   xmit_mode)
+                if r is not None:
+                    r["method"], r["phase"] = method, "confronto"
+                    out_rows.append(r)
+                    printer(r)
+            elif search == "bisect":
                 find_knee(setup, rx_tab, fab, frame, count, n_out, clone,
-                          out_rows, method, printer, tg_devs=tg_devs,
-                          threads=threads, threshold=threshold,
-                          repeat=repeat, burst=burst, xmit_mode=xmit_mode)
+                          out_rows, method, printer, tg_devs=gen.names,
+                          threads=gen.n_inst, threshold=threshold,
+                          repeat=repeat, burst=burst, xmit_mode=xmit_mode,
+                          gen=gen)
+            else:
+                find_saturation(setup, rx_tab, fab, frame, n_out, gen,
+                                out_rows, method, printer, threshold, repeat,
+                                plan, diag, xmit_mode)
             _summarise(method, frame, out_rows, threshold)
 
+        if diag_enabled:
+            # Una finestra in piu', FUORI dalle misure, solo per fotografare la
+            # macchina: occupazione per core, contatori dei device, softnet, e
+            # cosa ha consegnato ogni thread del generatore.
+            diag.start()
+            gen.timed_run(frames[0] if frames else 64, 0)
+            diag.report(diag.stop())
+            report_generator(gen)
+
+        gen.detach()
         pg_reset()
         if napi_devs:
             disable_threaded_napi(napi_devs)
-        del_tg_links(threads - 1)
+        for dev in ing.dut_devs:
+            _detach(dev)
+        ing.cleanup()
         for peer in attached:
-            subprocess.run(["ip", "link", "set", "dev", peer, "xdp", "off"],
-                           check=False, capture_output=True)
+            _detach(peer)
         del rx_b
-    return 0
+    return rc
+
+
+def _point_at_rate(setup, rx_tab, fab, frame, rate_pps, n_out, gen, repeat,
+                   threshold, plan, diag, xmit_mode="start_xmit"):
+    """Un punto a rate OFFERTO fissato, con la finestra di durata bersaglio.
+
+    E' il mattone della modalita' confronto: il rate lo decide il chiamante e
+    non la pipeline, quindi tutte le pipeline vedono lo stesso carico."""
+    delay = gen.delay_for(rate_pps)
+    count = gen.window_count(rate_pps)
+    r = measure_point(setup, rx_tab, fab, frame, delay, count, n_out,
+                      gen.clone, repeat=repeat, burst=gen.burst,
+                      xmit_mode=xmit_mode, gen=gen, threshold=threshold,
+                      plan=plan, diag=diag)
+    if r is not None:
+        r["offered_pps"] = rate_pps
+        r["threads"] = gen.n_inst
+        r["clone_skb"] = gen.clone
+    return r
+
+
+# ==========================================================================
+# SATURAZIONE: salire per gradini, non bisecare
+# ==========================================================================
+def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
+                    printer, threshold=DEFAULT_LOSS_THRESHOLD,
+                    repeat=DEFAULT_REPEAT, plan=None, diag=None,
+                    xmit_mode="start_xmit", ladder=SATURATE_LADDER):
+    """Il rate piu' alto che questa pipeline regge, e di chi e' il limite.
+
+    IL PROCEDIMENTO
+      1. delay 0, massima spinta. Da' due cose: il rate CONSEGNATO (che e'
+         gia' quasi la capacita': se se ne offrono 2,4 M e ne passano 1,4 M, la
+         pipeline ne regge circa 1,4 M) e la perdita in sovraccarico.
+      2. Se a massima spinta non si perde niente, la pipeline NON e' satura: il
+         limite e' il generatore. Si dichiara e ci si ferma, perche' qualunque
+         numero piu' basso sarebbe solo un rate piu' basso, non un limite.
+      3. Altrimenti si sale sulla scala geometrica dei rate, ogni gradino
+         confermato da `repeat` finestre con la perdita PEGGIORE.
+
+    PERCHE' NON SI BISECA. La bisezione presuppone la monotonia: sotto il
+    ginocchio pulito, sopra sporco. Misurato su questo banco, la sequenza reale
+    e' stata 0.00% a 343 kpps, 0.58% a 356 k, 0.57% a 369 k, 0.20% a 400 k e
+    0.43% a 600 k -- sparsa, gia' con worst-of-three applicato. Su una
+    sequenza cosi' la bisezione converge su qualunque punto sia uscito pulito
+    per caso e lo pubblica come throughput.
+
+    Qui invece si misurano TUTTI i gradini e poi si applica una regola che la
+    non monotonia non rompe: il risultato e' il rate piu' alto che sia pulito
+    E che abbia puliti TUTTI i gradini sotto di se'. Se il gradino piu' basso
+    e' sporco, non c'e' nessun rate a perdita nulla da riportare, e si dice
+    questo invece di scegliere il piu' fortunato."""
+    est_count = gen.window_count(gen.rate_estimate or 3_000_000)
+    full = measure_point(setup, rx_tab, fab, frame, 0, est_count, n_out,
+                         gen.clone, repeat=repeat, burst=gen.burst,
+                         xmit_mode=xmit_mode, gen=gen, threshold=threshold,
+                         plan=plan, diag=diag)
+    if full is None:
+        warn(f"frame {frame}: nessuna misura utilizzabile a pieno rate")
+        return None, None
+    full.update(method=method, phase="pieno", delay=0, clone_skb=gen.clone,
+                threads=gen.n_inst, offered_pps=None)
+    gen.rate_estimate = max(gen.rate_estimate, full["tx_pps"])
+    out_rows.append(full)
+    printer(full)
+
+    if full["loss_worst"] <= threshold:
+        clean = dict(full)
+        clean.update(phase="zero-perdite", gen_bound=1)
+        out_rows.append(clean)
+        print(f"  {GREY}a massima spinta non si perde niente: la pipeline non "
+              f"e' satura e questo NON e' il suo massimo. Il tetto e' il "
+              f"generatore ({full['tx_pps']} pps offerti da "
+              f"{gen.n_inst} thread). Per alzarlo: piu' CPU al generatore "
+              f"(--gen-cpus), o meno al DUT (--dut-cpus).{NC}")
+        return full, clean
+
+    base = float(full["rx_pps"])
+    steps = []
+    for frac in ladder:
+        rate = base * frac
+        if rate < 1000:
+            continue
+        r = measure_point(setup, rx_tab, fab, frame, gen.delay_for(rate),
+                          gen.window_count(rate), n_out, gen.clone,
+                          repeat=repeat, burst=gen.burst, xmit_mode=xmit_mode,
+                          gen=gen, threshold=threshold, plan=plan, diag=diag)
+        if r is None:
+            continue
+        r.update(method=method, phase="ricerca", clone_skb=gen.clone,
+                 threads=gen.n_inst, offered_pps=int(rate))
+        out_rows.append(r)
+        printer(r)
+        steps.append(r)
+        # Due gradini sporchi di fila: si e' oltre il limite e continuare a
+        # salire misura solo quanto si butta.
+        if len(steps) >= 2 and all(s["loss_worst"] > threshold
+                                   for s in steps[-2:]):
+            break
+
+    if not steps:
+        return full, None
+    steps.sort(key=lambda r: r["offered_pps"])
+    best = None
+    for s in steps:
+        if s["loss_worst"] > threshold:
+            break               # il primo sporco chiude la parte monotona
+        best = s
+    if best is None:
+        print(f"  {RED}nessun rate a perdita nulla determinabile{NC}{GREY}: si "
+              f"perde gia' al gradino piu' basso ({steps[0]['offered_pps']} "
+              f"pps offerti, {steps[0]['loss_worst']:.2f}%), cioe' molto sotto "
+              f"la capacita' misurata a pieno rate. La perdita qui non dipende "
+              f"dal rate: e' rumore della macchina.{NC}")
+        noisy = dict(full)
+        noisy.update(phase="rumore", gen_bound=0)
+        tag, why = classify_bottleneck(noisy, threshold=threshold, plan=plan,
+                                       noisy=True)
+        noisy["bottleneck"], noisy["bottleneck_why"] = tag, why
+        out_rows.append(noisy)
+        return full, None
+    clean = dict(best)
+    clean.update(phase="zero-perdite", gen_bound=0)
+    out_rows.append(clean)
+    print(f"  {GREEN}limite senza perdite{NC}{GREY}: {clean['rx_pps']} pps "
+          f"consegnati con {clean['offered_pps']} offerti, perdita "
+          f"{clean['loss_worst']:.2f}% su {clean['repeat']} finestre. Il "
+          f"gradino successivo perde: e' saturazione della pipeline, non del "
+          f"generatore.{NC}")
+    return full, clean
 
 
 def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
               method, printer, max_delay=20000, steps=6, tg_devs=None,
               threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
-              repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit"):
-    """Find the fastest rate this pipeline takes without losing packets.
+              repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit",
+              gen=None):
+    """Ricerca del ginocchio per bisezione sul ritardo (percorso storico).
 
-      1. offer everything the generator has (delay 0);
-      2. if nothing is lost, the GENERATOR saturated first -- there is no knee
-         to find, and saying so is the result;
-      3. otherwise bisect the delay down to the fastest rate that stays under
-         `threshold`.
-
-    `threshold` is not a convenience. Measured on this bench: at three
-    generator cores the loss along one frame size went 0.00, 0.00, 0.10, 0.01,
-    0.12, 0.02, 0.21 percent as the rate ROSE -- tens to hundreds of packets
-    out of 300 000, scattered, not monotone. That is a busy VM losing the odd
-    packet, not a datapath saturating. A bisection that treats any loss > 0 as
-    "too fast" converges on whichever slow point happened to come out clean,
-    and reports it as the no-loss throughput: here it returned 600 kpps while
-    1.2 Mpps had run at 0.02%.
-
-    So the search uses a DECLARED threshold, and the summary reports both the
-    threshold figure and whether any point was strictly lossless. RFC 2544
-    asks for zero, and on hardware that can hold still zero is the right bar;
-    on a shared VM it measures the neighbours.
+    Tenuta perche' e' quella con cui sono state prese le misure precedenti e
+    `--search bisect` deve poterle riprodurre. Il difetto e' noto ed e'
+    documentato in find_saturation: la bisezione presuppone che la perdita
+    cresca col rate, e su questo banco non e' vero. Il controllo `dirty_below`
+    in fondo esiste per accorgersene DOPO; find_saturation se ne accorge prima.
 
     Returns (peak_row, clean_row_or_None)."""
     full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone,
-                         tg_devs, repeat, burst, xmit_mode)
+                         tg_devs, repeat, burst, xmit_mode, gen=gen,
+                         threshold=threshold)
     if full is None:
         warn(f"frame {frame}: nessuna misura utilizzabile a pieno rate")
         return None, None
@@ -1718,13 +3344,11 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         # that dominates it here and can multiply the offered rate.
         #
         # This is an escalation, not the default condition: clone_skb changes
-        # what is measured (no allocation on the generator side, and the
-        # datapath may take a private copy before rewriting the TTL). It is
-        # used only to answer "does this pipeline EVER saturate", and the rows
-        # it produces carry clone_skb != 0 so they stay distinguishable.
+        # what is measured, so the rows it produces carry clone_skb != 0 and
+        # stay distinguishable.
         hard = measure_point(setup, rx_tab, fab, frame, 0, count, n_out,
                              ESCALATE_CLONE, tg_devs, repeat, burst,
-                             xmit_mode)
+                             xmit_mode, gen=gen, threshold=threshold)
         if hard is None:
             return full, full
         hard["method"], hard["clone_skb"], hard["delay"] = \
@@ -1738,7 +3362,7 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
             return find_knee(setup, rx_tab, fab, frame, count, n_out,
                              ESCALATE_CLONE, out_rows, method, printer,
                              max_delay, steps, tg_devs, threads,
-                             threshold, repeat, burst, xmit_mode)
+                             threshold, repeat, burst, xmit_mode, gen)
         print(f"  {GREY}nemmeno con clone_skb={ESCALATE_CLONE}: su questa "
               f"macchina satura il generatore, non la pipeline{NC}")
         return (hard if hard["rx_pps"] > full["rx_pps"] else full), hard
@@ -1753,7 +3377,8 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         if mid in (lo, hi):
             break
         r = measure_point(setup, rx_tab, fab, frame, mid, count, n_out,
-                          clone, tg_devs, repeat, burst, xmit_mode)
+                          clone, tg_devs, repeat, burst, xmit_mode, gen=gen,
+                          threshold=threshold)
         if r is None:
             break
         r["method"], r["clone_skb"], r["threads"] = method, clone, threads
@@ -1766,12 +3391,7 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         else:
             lo = mid                # still losing: slow down
     # Is the loss actually driven by the rate? If a point LOSES at a rate
-    # lower than one that stayed clean, it is not: on this bench the sequence
-    # ran 0.00% at 343 kpps, 0.58% at 356 k, 0.57% at 369 k, 0.20% at 400 k and
-    # 0.43% at 600 k -- scattered, with repeat=3 and worst-of-three already
-    # applied. Reporting the fastest clean point as "the no-loss throughput"
-    # would publish whichever rate happened to come out clean three times in a
-    # row, which is a lottery ticket, not a measurement.
+    # lower than one that stayed clean, it is not.
     if best_clean is not None:
         dirty_below = [r for r in out_rows
                        if r.get("method") == method and r["frame"] == frame
@@ -1789,13 +3409,14 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
 
 
 def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
-    """Three numbers, because two would hide the thing that matters.
+    """Tre numeri, perche' due nasconderebbero cio' che conta.
 
     The peak alone overstates a datapath. The peak plus a "no loss" figure is
     the usual pair -- but on a machine that drops the odd packet for reasons of
     its own, strict zero is a lottery. So: the peak, the fastest rate under the
     declared threshold, and whether ANY point was strictly lossless."""
-    pts = [r for r in rows if r["method"] == method and r["frame"] == frame]
+    pts = [r for r in rows if r.get("method") == method
+           and r["frame"] == frame and r.get("phase") != "rumore"]
     if not pts:
         return
     peak = max(pts, key=lambda r: r["rx_pps"])
@@ -1831,12 +3452,248 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
     if best:
         print(f"  {GREY}  sotto {threshold}% di perdita: {best['rx_pps']} pps "
               f"({best['rx_mbps']} Mb/s, perdita {best['loss_pct']}%)")
+        print(f"  {GREY}  collo di bottiglia: {best.get('bottleneck', 'n/d')} "
+              f"-- {best.get('bottleneck_why', '')}{NC}")
     if strict and best:
         b0 = max(strict, key=lambda r: r["rx_pps"])
         print(f"  {GREY}  a perdita esattamente zero: {b0['rx_pps']} pps "
               f"({b0['rx_mbps']} Mb/s){NC}")
     else:
         print(f"  {GREY}  nessun punto a perdita esattamente zero{NC}")
+
+
+# ==========================================================================
+# MODALITA' CONFRONTO: stesso carico, stesse manopole, stessa durata
+# ==========================================================================
+# La modalita' saturate adatta il rate a ogni pipeline -- e' il suo scopo. Ma
+# proprio per questo le sue righe NON sono un confronto: due pipeline misurate
+# a rate diversi hanno visto due esperimenti diversi.
+#
+# Qui il rate e' UNO, deciso prima e congelato: ogni pipeline vede lo stesso
+# carico offerto, la stessa dimensione di frame, la stessa durata e le stesse
+# manopole del generatore. Cambia solo il programma XDP, che e' esattamente la
+# variabile indipendente che si vuole isolare.
+#
+# Il rate comune, se non lo si passa con --offered-pps, e' il 90% del PIU'
+# BASSO fra i rate consegnati a massima spinta dalle pipeline in gara. Sotto
+# quel valore nessuna e' in sovraccarico per costruzione, quindi le differenze
+# che restano sono di elaborazione e non di lunghezza delle code.
+
+
+def run_compare(methods, model_path, frames, offered_pps=None,
+                threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
+                repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS, plan=None,
+                topology="shared", xmit_mode="start_xmit",
+                threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
+                warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0):
+    """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate."""
+    from netns_fabric import NetnsFabric
+    from common import attach_xdp
+    import statistics as stats
+
+    plan = plan or plan_cpus(threads=threads)
+    sem, n_out = class_semantics()
+    raw = []
+
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+        rx_side = (xmit_mode == "netif_receive")
+        rx_b, rx_tab, attached = attach_rx_counter(fab)
+        info(f"contatore RX su {len(attached)} peer d'uscita (XDP_DROP)")
+
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Fase 1: compilo e carico {len(methods)} pipeline "
+              f"(nessuna misura in corso){NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        loaded = {}
+        for m in methods:
+            try:
+                loaded[m] = build_pipeline(m, model_path, fab, sem)
+                info(f"{m}: caricata")
+            except Exception as e:
+                warn(f"{m}: non caricata, la salto -- {type(e).__name__}: {e}")
+        if not loaded:
+            warn("nessuna pipeline caricata")
+            return [], []
+
+        ing = build_ingress(fab, plan, topology, rx_side)
+        xdp_mode = "generic" if rx_side else None
+        for setup in loaded.values():
+            _map_extra_ingress(setup, ing.ifindexes)
+        gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
+        gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
+                        topology=ing.topology, clone=clone, burst=burst,
+                        window_s=window_s, warmup_s=warmup_s).attach()
+        diag = Diag(devs=ing.dut_devs, plan=plan, enabled=diag_enabled)
+
+        def use(method):
+            """Metti QUESTA pipeline sull'ingresso. attach_xdp sostituisce il
+            programma senza staccare: staccare smonterebbe la NAPI e con lei
+            il modo a thread, cioe' la separazione fra le CPU."""
+            setup = loaded[method]
+            with _quiet():
+                for dev in ing.dut_devs:
+                    attach_xdp(setup["b"], setup["disp"], dev, mode=xdp_mode)
+            return setup
+
+        # Il primo attach crea la NAPI: solo dopo si puo' metterla in thread.
+        use(next(iter(loaded)))
+        napi_devs = []
+        if threaded_napi and not rx_side:
+            napi_devs = list(ing.dut_devs)
+            placed = enable_threaded_napi(napi_devs, plan)
+            if placed:
+                where = ", ".join(
+                    f"{d}({n} thread)->cpu{','.join(str(c) for c in cs)}"
+                    for d, n, cs in placed)
+                info(f"NAPI in thread, pinnata: {where}")
+            else:
+                napi_devs = []
+                warn("nessun thread NAPI pinnato: generatore e pipeline "
+                     "restano sullo stesso core")
+
+        # --- sonda per pipeline: si misura inferenza o XDP_PASS?
+        alive = []
+        for m in list(loaded):
+            setup = use(m)
+            p = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, gen.clone,
+                              repeat=1, burst=gen.burst, xmit_mode=xmit_mode,
+                              gen=gen, warmup=False, threshold=threshold,
+                              plan=plan)
+            if p is None or p["hit"] == 0:
+                warn(f"{m}: la sonda non produce HIT -- la escludo dal "
+                     f"confronto invece di misurarle il costo di non fare "
+                     f"inferenza")
+                continue
+            alive.append(m)
+        if not alive:
+            warn("nessuna pipeline ha superato la sonda")
+            gen.detach()
+            ing.cleanup()
+            return [], []
+
+        # --- il rate comune
+        frame0 = frames[0] if frames else 64
+        if not offered_pps:
+            print(f"\n{YELLOW} Calibrazione del rate comune (una volta, poi "
+                  f"congelato){NC}")
+            delivered = {}
+            for m in alive:
+                setup = use(m)
+                gen.warmup(frame0, 0)
+                r = measure_point(setup, rx_tab, fab, frame0, 0,
+                                  gen.window_count(gen.rate_estimate
+                                                   or 3_000_000),
+                                  n_out, gen.clone, repeat=1,
+                                  burst=gen.burst, xmit_mode=xmit_mode,
+                                  gen=gen, threshold=threshold, plan=plan)
+                if r is not None:
+                    delivered[m] = r["rx_pps"]
+                    info(f"{m}: {r['rx_pps']} pps consegnati a massima spinta "
+                         f"(perdita {r['loss_worst']:.2f}%)")
+            if not delivered:
+                warn("calibrazione fallita: nessun rate consegnato")
+                gen.detach()
+                ing.cleanup()
+                return [], []
+            slowest = min(delivered, key=delivered.get)
+            offered_pps = int(0.9 * delivered[slowest])
+            note(f"rate comune = 90% del piu' lento ({slowest}): "
+                 f"{offered_pps} pps. Sotto questo carico nessuna pipeline e' "
+                 f"in sovraccarico, quindi le differenze non sono lunghezze "
+                 f"di coda.")
+
+        # --- la misura vera: stessi parametri per tutti, a giri
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Fase 2: {rounds} giri x {len(alive)} pipeline a "
+              f"{offered_pps} pps offerti, frame {frames}{NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} "
+               f"{'offerto':>9s} {'TX':>9s} {'RX':>9s} {'persi':>8s} "
+               f"{'RX pps':>9s} {'Mb/s':>8s} {'perdita':>8s} {'collo':>18s}")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        for rnd in range(1, rounds + 1):
+            for m in alive:
+                setup = use(m)
+                for frame in frames:
+                    r = _point_at_rate(setup, rx_tab, fab, frame, offered_pps,
+                                       n_out, gen, repeat, threshold, plan,
+                                       diag, xmit_mode)
+                    if r is None:
+                        continue
+                    r.update(method=m, round=rnd, phase="confronto")
+                    raw.append(r)
+                    mark = GREEN if r["loss_worst"] <= threshold else (
+                        RED if r["loss_worst"] > 1 else YELLOW)
+                    print(f"  {rnd:4d} {m:10s} {frame:5d} {offered_pps:9d} "
+                          f"{r['tx']:9d} {r['rx']:9d} "
+                          f"{max(0, r['tx'] - r['rx']):8d} "
+                          f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
+                          f"{mark}{r['loss_worst']:7.2f}%{NC} "
+                          f"{r.get('bottleneck', ''):>18s}")
+
+        if diag_enabled:
+            diag.start()
+            gen.timed_run(frame0, gen.delay_for(offered_pps))
+            diag.report(diag.stop())
+            report_generator(gen)
+
+        gen.detach()
+        pg_reset()
+        if napi_devs:
+            disable_threaded_napi(napi_devs)
+        for dev in ing.dut_devs:
+            _detach(dev)
+        ing.cleanup()
+        for peer in attached:
+            _detach(peer)
+        del rx_b
+
+    # --- riepilogo: mediana fra i giri
+    summary = []
+    if raw:
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Riepilogo confronto: mediana fra i giri, stesso "
+              f"carico per tutti{NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        hdr = (f"  {'pipeline':10s} {'frame':>5s} {'giri':>4s} "
+               f"{'offerto':>9s} {'RX pps':>9s} {'min':>9s} {'max':>9s} "
+               f"{'std':>8s} {'perdita':>8s} {'collo':>18s}")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        ordine = {m: i for i, m in enumerate(METHODS)}
+        keys = sorted({(r["method"], r["frame"]) for r in raw},
+                      key=lambda k: (ordine.get(k[0], 99), k[1]))
+        for m, frame in keys:
+            pts = [r for r in raw
+                   if r["method"] == m and r["frame"] == frame]
+            pps = [r["rx_pps"] for r in pts]
+            a = _agg(pps)
+            loss = stats.median([r["loss_worst"] for r in pts])
+            tags = [r.get("bottleneck") for r in pts if r.get("bottleneck")]
+            tag = max(set(tags), key=tags.count) if tags else BN_UNKNOWN
+            spread = (100.0 * (a["max"] - a["min"]) / a["min"]) if a["min"] else 0
+            row = dict(method=m, frame=frame, phase="confronto",
+                       rounds=len(pts), offered_pps=offered_pps,
+                       rx_pps=int(stats.median(pps)), rx_pps_mean=a["mean"],
+                       rx_pps_min=a["min"], rx_pps_max=a["max"],
+                       rx_pps_std=a["std"], rx_pps_cv_pct=a["cv_pct"],
+                       loss_pct=round(loss, 3),
+                       rx_mbps=round(stats.median([r["rx_mbps"]
+                                                   for r in pts]), 2),
+                       secs=round(stats.median([r["secs"] for r in pts]), 3),
+                       pps_spread_pct=round(spread, 1),
+                       unreliable=spread > MAX_SPREAD_PCT,
+                       threads=len(plan.gen), bottleneck=tag)
+            summary.append(row)
+            flag = f" {RED}+-{spread:.0f}%{NC}" if row["unreliable"] else ""
+            print(f"  {m:10s} {frame:5d} {len(pts):4d} {offered_pps:9d} "
+                  f"{row['rx_pps']:9d} {a['min']:9d} {a['max']:9d} "
+                  f"{a['std']:8.1f} {row['loss_pct']:7.2f}% "
+                  f"{tag:>18s}{flag}")
+        note("stesso rate offerto, stessa durata, stesse manopole: le "
+             "differenze in questa tabella sono del programma XDP.")
+    return raw, summary
 
 
 # ==========================================================================
@@ -1871,10 +3728,19 @@ def check_validity(rows):
     close = {m: r["rx_pps"] for m, r in best.items()
              if m != "baseline" and base < r["rx_pps"] <= base * (1 + VALID_TOL)}
     noisy = sorted({m for m, r in best.items() if r.get("unreliable")})
+    gen_bound = sorted({m for m, r in best.items()
+                        if r.get("bottleneck") == BN_GEN})
 
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} Controllo di validita'{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
+    if gen_bound:
+        print(f"  {YELLOW}[NOTA]{NC} limitate dal GENERATORE, non da se "
+              f"stesse: {', '.join(gen_bound)}.")
+        print(f"  {GREY}Per queste righe il numero e' il tetto del banco. "
+              f"Alza le CPU del generatore (--gen-cpus) o abbassa quelle del "
+              f"DUT (--dut-cpus) finche' la perdita compare: solo allora il "
+              f"numero e' della pipeline.{NC}")
     if not faster and not noisy:
         print(f"  {GREEN}[PASS]{NC} la baseline ({base} pps) e' la piu' veloce "
               f"entro {VALID_TOL:.0%}, come deve essere: fa strettamente meno "
@@ -1904,8 +3770,8 @@ def check_validity(rows):
               f"giri, e la sua mediana e' finita SOTTO una che fa piu' lavoro. "
               f"Il throughput di queste righe non e' un risultato.{NC}")
         print(f"  {GREY}La latenza delle stesse righe e' un'altra misura con "
-              f"un'altra dispersione -- vedi il verdetto qui sotto. Un "
-              f"throughput inutilizzabile non la invalida.{NC}")
+              f"un'altra dispersione. Un throughput inutilizzabile non la "
+              f"invalida.{NC}")
     print(f"\n  {YELLOW}Che fare{NC}: chiudi tutto il resto, poi rilancia con "
           f"--rounds 7. Se la dispersione resta, questa VM non e' un banco di "
           f"misura per il throughput assoluto, e cio' che resta valido e' la "
@@ -1913,57 +3779,142 @@ def check_validity(rows):
     return 1
 
 
+def _write_csv(path, rows):
+    """Scrive l'unione delle chiavi, non quelle della prima riga.
+
+    Fasi diverse portano campi diversi, e prendere la prima riga come schema
+    faceva fallire la scrittura DOPO che tutto era stato misurato -- il modo
+    peggiore di perdere un run. Le chiavi che cominciano con '_' sono interne
+    (la diagnostica grezza) e non finiscono nel file."""
+    if not rows:
+        return 0
+    cols = []
+    for row in rows:
+        for k in row:
+            if not k.startswith("_") and k not in cols:
+                cols.append(k)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, restval="", extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
+    return len(rows)
+
+
+# ==========================================================================
 def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("USO")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--method", choices=list(METHODS) + ["all"], default="all")
-    p.add_argument("--frames", default=",".join(map(str, DEFAULT_FRAMES)))
+    p.add_argument("--mode", choices=("compare", "saturate"),
+                   default="saturate",
+                   help="compare: stesso rate offerto per tutte le pipeline, "
+                        "e' il confronto. saturate (default): rate crescente "
+                        "per trovare dove ciascuna comincia a perdere.")
+    p.add_argument("--frames", default=None,
+                   help="taglie di frame in byte, separate da virgola. Il "
+                        "confronto ne usa una sola (64) se non si dice altro: "
+                        "sei taglie moltiplicano per sei la durata del run "
+                        "senza cambiare l'ordine fra le pipeline.")
     p.add_argument("--delays", default="",
                    help="ritardi fissi in ns, separati da virgola. Vuoto (il "
-                        "default) cerca il ginocchio invece di spazzolare: "
-                        "meno punti e centra la risposta")
+                        "default) cerca il punto di saturazione invece di "
+                        "spazzolare: meno punti e centra la risposta")
     p.add_argument("--count", type=int, default=200000,
-                   help="pacchetti per punto di misura")
-    p.add_argument("--no-threaded-napi", action="store_true",
+                   help="pacchetti per punto nel percorso --latency. Negli "
+                        "altri il conteggio lo decide la durata (--duration), "
+                        "perche' pktgen conta pacchetti e non secondi.")
+
+    g = p.add_argument_group("CPU: separare generatore e DUT sulla stessa "
+                             "macchina")
+    g.add_argument("--gen-cpus", default=None, metavar="LISTA",
+                   help="CPU del generatore, es. '1,2' o '1-3'. Una CPU = un "
+                        "thread pktgen (kpktgend_<cpu>). Default: automatico, "
+                        "piu' core al generatore che al DUT.")
+    g.add_argument("--dut-cpus", default=None, metavar="LISTA",
+                   help="CPU su cui pinnare i thread NAPI che eseguono XDP. "
+                        "Default: quelle che restano.")
+    g.add_argument("--allow-cpu0", action="store_true",
+                   help="riammetti la CPU 0, esclusa per default perche' "
+                        "porta timer, RCU e IRQ.")
+    g.add_argument("--threads", type=int, default=None, metavar="N",
+                   help="quanti thread generatore, se non si vogliono "
+                        "elencare le CPU. E' l'unico modo di alzare il carico "
+                        "offerto quando veth rifiuta clone_skb e burst.")
+    g.add_argument("--gen-topology", choices=("shared", "links"),
+                   default="shared",
+                   help="shared: UN veth d'ingresso, N istanze pktgen su code "
+                        "TX distinte -- gen e DUT scalano separatamente. "
+                        "links: un veth per thread (comportamento storico), "
+                        "ogni veth porta con se' un core di DUT.")
+    g.add_argument("--no-threaded-napi", action="store_true",
                    help="lascia la RX in softirq sulla CPU che trasmette, "
                         "cioe' generatore e pipeline sullo stesso core. Serve "
                         "per riprodurre le misure vecchie, non per farne di "
                         "nuove.")
-    p.add_argument("--burst", type=int, default=0, metavar="N",
-                   help="consegna N pacchetti per chiamata (xmit_more). Come "
-                        "clone_skb puo' essere rifiutato da veth.")
-    p.add_argument("--xmit-mode", choices=XMIT_MODES, default="start_xmit",
-                   help="netif_receive inietta nel percorso RX saltando la "
-                        "traversata veth, ma XDP gira GENERIC: numeri non "
-                        "confrontabili con gli altri modi.")
-    p.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS, metavar="N",
+
+    m = p.add_argument_group("misura")
+    m.add_argument("--duration", type=float, default=WINDOW_S, metavar="S",
+                   help=f"durata bersaglio di una finestra di misura "
+                        f"(default {WINDOW_S}s). pktgen conta pacchetti: il "
+                        f"count viene calibrato su questa durata e la durata "
+                        f"vera e' poi riletta dai suoi contatori.")
+    m.add_argument("--warmup", type=float, default=DEFAULT_WARMUP_S,
+                   metavar="S",
+                   help=f"finestra di riscaldamento scartata prima di ogni "
+                        f"punto (default {DEFAULT_WARMUP_S}s). 0 la disattiva.")
+    m.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS, metavar="N",
                    help="giri completi: in ogni giro si misurano TUTTE le "
                         "pipeline, poi si tiene la mediana. Toglie l'ordine "
                         "dei metodi dalla misura.")
-    p.add_argument("--repeat", type=int, default=DEFAULT_REPEAT, metavar="R",
-                   help="misure per punto; si tiene la mediana del rate e la "
+    m.add_argument("--repeat", type=int, default=DEFAULT_REPEAT, metavar="R",
+                   help="finestre per punto; si tiene la mediana del rate e la "
                         "PEGGIORE delle perdite")
-    p.add_argument("--loss-threshold", type=float,
-                   default=DEFAULT_LOSS_THRESHOLD, metavar="PCT",
+    m.add_argument("--offered-pps", type=int, default=None, metavar="PPS",
+                   help="rate offerto fisso (modalita' compare). Senza, lo "
+                        "decide una calibrazione: 90%% del piu' lento.")
+    m.add_argument("--loss-threshold", type=float, default=None,
+                   metavar="PCT",
                    help="sotto questa percentuale la perdita e' considerata "
-                        "rumore della macchina, non saturazione. Zero stretto "
-                        "resta riportato a parte.")
-    p.add_argument("--threads", type=int, default=1, metavar="N",
-                   help="core generatori: N veth d'ingresso, N thread pktgen, "
-                        "tutti sullo stesso programma XDP. E' l'unico modo di "
-                        "alzare il carico offerto, visto che veth rifiuta "
-                        "clone_skb.")
-    p.add_argument("--clone-skb", type=int, default=0, metavar="N",
-                   help="riusa lo stesso skb N volte invece di allocarne uno "
-                        "per pacchetto: alza molto il rate offerto. "
-                        "Cambia cosa si misura -- vedi la docstring.")
-    p.add_argument("--out", default=None, help="dove scrivere il CSV")
-    p.add_argument("--latency", action="store_true",
-                   help="misura la latenza arrivo->ripartenza invece del "
-                        "throughput. Usa una build strumentata: vedi "
-                        "run_latency.")
-    p.add_argument("--cleanup", action="store_true",
+                        "rumore della macchina, non saturazione. Il percorso "
+                        "--latency parte da ZERO STRETTO; gli altri da "
+                        f"{DEFAULT_LOSS_THRESHOLD}%%, che e' il pacchetto "
+                        "perso ogni tanto da una VM condivisa.")
+    m.add_argument("--search", choices=("ladder", "bisect"), default="ladder",
+                   help="come cercare il punto di saturazione. ladder "
+                        "(default) sale per gradini e verifica la monotonia; "
+                        "bisect e' la bisezione storica sul ritardo, tenuta "
+                        "per riprodurre le misure vecchie.")
+
+    gk = p.add_argument_group("manopole del generatore")
+    gk.add_argument("--burst", type=int, default=0, metavar="N",
+                    help="consegna N pacchetti per chiamata (xmit_more). Su "
+                         "veth il kernel lo rifiuta: si prova e si riporta.")
+    gk.add_argument("--clone-skb", type=int, default=0, metavar="N",
+                    help="riusa lo stesso skb N volte invece di allocarne uno "
+                         "per pacchetto. Su veth il kernel lo rifiuta "
+                         "(IFF_TX_SKB_SHARING assente).")
+    gk.add_argument("--tune-generator", action="store_true",
+                    help="prova le manopole supportate e tiene solo quelle "
+                         f"che alzano il rate di almeno il "
+                         f"{int(GEN_KNOB_MIN_GAIN * 100)}%%.")
+    gk.add_argument("--xmit-mode", choices=XMIT_MODES, default="start_xmit",
+                    help="netif_receive inietta nel percorso RX saltando la "
+                         "traversata veth, ma XDP gira GENERIC e sulla CPU del "
+                         "generatore: numeri non confrontabili con gli altri "
+                         "modi, e niente separazione gen/DUT.")
+
+    o = p.add_argument_group("uscita")
+    o.add_argument("--diag", action="store_true",
+                   help="raccoglie occupazione per core, contatori dei device "
+                        "e softnet_stat attorno alle misure. Disattivata per "
+                        "default: legge procfs fra un punto e l'altro.")
+    o.add_argument("--out", default=None, help="dove scrivere i CSV")
+    o.add_argument("--latency", action="store_true",
+                   help="percorso storico: latenza arrivo->ripartenza con una "
+                        "build strumentata, a giri, piu' throughput.")
+    o.add_argument("--cleanup", action="store_true",
                    help="rimuovi un fabric rimasto da un run interrotto")
     a = p.parse_args()
 
@@ -1978,6 +3929,7 @@ def main():
         cleanup()
         del_tg_links(16)
         if pg_available():
+            pg_stop()
             pg_reset()
         return 0
 
@@ -1986,10 +3938,28 @@ def main():
                  f"creato: questo kernel non ha il modulo.")
     pg_reset()
 
+    # Il piano CPU si fa PRIMA di qualunque misura e si stampa: e' la
+    # configurazione da cui dipende tutto il resto, e va letta insieme ai
+    # numeri.
+    plan = plan_cpus(a.gen_cpus, a.dut_cpus, a.threads, a.allow_cpu0)
+    plan.describe()
+
     import model_meta as mm
     model_path = mm.default_checkpoint()
-    frames = [int(x) for x in a.frames.split(",") if x.strip()]
+    # I percorsi vogliono default diversi, e un default sbagliato qui costa
+    # minuti di run: dove si cerca il punto di saturazione una taglia di frame
+    # basta; dove si spazzola, spazzolare una taglia sola non dice niente.
+    if a.frames:
+        frames = [int(x) for x in a.frames.split(",") if x.strip()]
+    else:
+        frames = [64] if (a.latency or a.mode == "compare") else \
+            list(DEFAULT_FRAMES)
     delays = [int(x) for x in a.delays.split(",") if x.strip()]
+    if a.loss_threshold is None:
+        # Zero stretto dove il rate lo si cerca col percorso storico; soglia
+        # tollerante altrove, dove la perdita sparsa di una VM condivisa
+        # farebbe scartare punti buoni.
+        a.loss_threshold = 0.0 if a.latency else DEFAULT_LOSS_THRESHOLD
     methods = list(METHODS) if a.method == "all" else [a.method]
 
     rows = []
@@ -1997,10 +3967,19 @@ def main():
     if a.latency:
         lat_delays = delays or [0, 5000, 20000]
         raw = run_fair(methods, model_path, frames, lat_delays, a.count,
-                       a.threads, not a.no_threaded_napi, a.repeat, a.rounds)
+                       plan.threads, not a.no_threaded_napi, a.repeat,
+                       a.rounds, a.loss_threshold, plan=plan,
+                       xmit_mode=a.xmit_mode, window_s=a.duration,
+                       warmup_s=a.warmup)
         rows = summarise_fair(raw, methods)
+        # Il confronto si fa sulle righe SENZA PERDITE, non su quelle a pieno
+        # rate: a pieno rate si confrontano sistemi in sovraccarico, e chi ne
+        # butta di piu' puo' sembrare piu' veloce.
+        clean = [r for r in rows if r["phase"] == "zero-perdite"]
         rc |= check_validity([dict(method=r["method"], rx_pps=r["rx_pps"],
-                                   unreliable=r["unreliable"]) for r in rows])
+                                   unreliable=r["unreliable"],
+                                   bottleneck=r.get("bottleneck"))
+                              for r in (clean or rows)])
         _latency_verdict(rows)
         if a.out and rows:
             os.makedirs(a.out, exist_ok=True)
@@ -2009,51 +3988,69 @@ def main():
             # significa qualcosa.
             for name, data in (("latency.csv", rows),
                                ("latency_raw.csv", raw)):
-                if not data:
-                    continue
-                path = os.path.join(a.out, name)
-                with open(path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=list(data[0].keys()))
-                    w.writeheader()
-                    w.writerows(data)
-                print(f"  {GREEN}scritto{NC} {path}  ({len(data)} righe)")
+                if data:
+                    _write_csv(os.path.join(a.out, name), data)
             _give_back(a.out)
         # Il codice di uscita e' quello del controllo: un run in cui la
         # baseline non e' la piu' veloce, o in cui la dispersione sfonda, non
         # deve uscire 0 solo perche' il CSV e' stato scritto.
         return rc
 
-    for m in methods:
-        rc |= run_method(m, model_path, frames, delays, a.count, rows,
-                         a.clone_skb, a.threads, a.loss_threshold,
-                         a.repeat, a.burst, a.xmit_mode,
-                         not a.no_threaded_napi)
+    if a.mode == "compare":
+        raw, rows = run_compare(
+            methods, model_path, frames, offered_pps=a.offered_pps,
+            threads=plan.threads, threshold=a.loss_threshold,
+            repeat=a.repeat, rounds=a.rounds, plan=plan,
+            topology=a.gen_topology, xmit_mode=a.xmit_mode,
+            threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
+            window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
+            burst=a.burst)
+        rc |= check_validity(rows)
+        if a.out and (rows or raw):
+            os.makedirs(a.out, exist_ok=True)
+            if rows:
+                _write_csv(os.path.join(a.out, "compare.csv"), rows)
+            if raw:
+                _write_csv(os.path.join(a.out, "compare_raw.csv"), raw)
+            _give_back(a.out)
+        _closing_note(plan)
+        return rc
 
-    rc |= check_validity(rows)
+    for meth in methods:
+        rc |= run_method(meth, model_path, frames, delays, a.count, rows,
+                         clone=a.clone_skb, threads=plan.threads,
+                         threshold=a.loss_threshold, repeat=a.repeat,
+                         burst=a.burst, xmit_mode=a.xmit_mode,
+                         threaded_napi=not a.no_threaded_napi, plan=plan,
+                         topology=a.gen_topology, diag_enabled=a.diag,
+                         offered_pps=a.offered_pps, window_s=a.duration,
+                         warmup_s=a.warmup, tune=a.tune_generator,
+                         search=a.search)
+
+    # Il confronto si fa sulle righe a perdita nulla, non su quelle a pieno
+    # rate: a pieno rate si confrontano sistemi in sovraccarico.
+    clean = [r for r in rows if r.get("phase") == "zero-perdite"]
+    rc |= check_validity(clean or rows)
 
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
-        path = os.path.join(a.out, "throughput.csv")
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader()
-            w.writerows(rows)
-        uid = os.environ.get("SUDO_UID")
-        if uid:
-            try:
-                os.chown(a.out, int(uid), int(os.environ.get("SUDO_GID", uid)))
-                os.chown(path, int(uid), int(os.environ.get("SUDO_GID", uid)))
-            except OSError:
-                pass
-        print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
+        _write_csv(os.path.join(a.out, "throughput.csv"), rows)
+        _give_back(a.out)
 
+    _closing_note(plan)
+    return rc
+
+
+def _closing_note(plan):
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(" Da ricordare leggendo questi numeri: TG, DUT e contatore stanno")
-    print(" sulla STESSA macchina e condividono le stesse CPU. E' throughput")
-    print(" del percorso veth di questa VM con la pipeline in mezzo, non della")
-    print(" pipeline. Il confronto fra pipeline regge; le cifre assolute no.")
+    print(" sulla STESSA macchina. Le CPU sono separate -- generatore su")
+    print(f" {','.join(str(c) for c in plan.gen)}, DUT su "
+          f"{','.join(str(c) for c in plan.dut)} -- quindi la perdita e'")
+    print(" attribuibile, ma il costo del veth e della copia di headroom resta")
+    print(" dentro la cifra. Il confronto fra pipeline regge; le cifre")
+    print(" assolute sono di QUESTO percorso veth, non di una NIC.")
     print(f"{YELLOW}{'=' * 78}{NC}")
-    return rc
 
 
 if __name__ == "__main__":
