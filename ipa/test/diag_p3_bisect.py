@@ -176,6 +176,36 @@ def variants(src):
                           from_model[j:])
             out.append(("node=model_id", from_model,
                         "the original node source, everything else kept"))
+
+    # The variants above narrowed it to one thing: _node read from a
+    # scratch_meta value is refused, _node from `model_id` loads. But model_id
+    # is ALSO read from scratch_meta, four lines earlier, and works:
+    #
+    #     __u8 model_id = (__u8)(*mp);          loads
+    #     __u32 _node   = (_ctx >> 16) & 0xffU; refused
+    #
+    # Same range either way. The difference is the cast: a __u8 gives the
+    # verifier a byte-wide register, a mask on a __u32 gives it a 32-bit
+    # register that happens to be bounded. These try the cast.
+    packed = "    __u32 _node      = (_ctx >> 16) & 0xffU;"
+    if packed in src:
+        out.append(("u8 cast", src.replace(
+            packed,
+            "    __u8 _node8 = (__u8)(_ctx >> 16);\n"
+            "    __u32 _node = _node8;"),
+            "same packed slot, read through a __u8 like model_id is"))
+
+        # And the same idea without the packing: its own slot, u8 cast.
+        own = src.replace(
+            packed,
+            "    __u8 _node8 = (__u8)(_ctx >> 16);\n"
+            "    __u32 _node = _node8;")
+        own = own.replace(
+            "    __u32 _raw_iface = _ctx & 0xffffU;",
+            "    __u16 _if16 = (__u16)_ctx;\n"
+            "    __u32 _raw_iface = _if16;")
+        out.append(("u8+u16 casts", own,
+                    "both halves read through a sized type, not a mask"))
     return out
 
 
