@@ -179,6 +179,10 @@ DEFAULT_LOSS_THRESHOLD = 0.1
 # Vedi measure_point.
 DEFAULT_REPEAT = 3
 
+# Giri completi: in ogni giro si misurano TUTTI i metodi, poi si prende la
+# mediana. Serve a togliere l'ordine dei metodi dalla misura -- vedi run_fair.
+DEFAULT_ROUNDS = 3
+
 # Oltre questa dispersione fra le ripetizioni il punto non e' utilizzabile.
 # Misurato: hardcoded ha dato +-75% fra tre misure della stessa cosa, e la
 # baseline e' uscita il 26% PIU' LENTA di una pipeline che fa strettamente piu'
@@ -314,6 +318,13 @@ def pg_clear_threads(n):
             break                   # fewer threads than CPUs: nothing to clear
 
 
+def pg_ensure_device(dev, thread=0):
+    """Attacca `dev` se pktgen non lo conosce (piu'). Idempotente."""
+    if os.path.exists(f"{PKTGEN_DIR}/{dev}"):
+        return f"{PKTGEN_DIR}/{dev}"
+    return pg_add_device(dev, thread)
+
+
 def pg_add_device(dev, thread=0):
     """Attacca `dev` al thread generatore `thread` e verifica che ci sia."""
     pg_write(f"{PKTGEN_DIR}/kpktgend_{thread}", f"add_device {dev}")
@@ -425,8 +436,18 @@ def pg_run_and_read(devs):
     sent = pps = 0
     secs = 0.0
     for dev in devs:
-        with open(f"{PKTGEN_DIR}/{dev}") as f:
-            text = f.read()
+        try:
+            with open(f"{PKTGEN_DIR}/{dev}") as f:
+                text = f.read()
+        except FileNotFoundError:
+            # pktgen ha smesso di conoscere questo device fra la
+            # configurazione e la lettura. Succede quando il fabric viene
+            # ricostruito fra un metodo e l'altro: l'interfaccia ha lo stesso
+            # NOME ma e' un'altra, e lo stato di pktgen non sopravvive al giro.
+            # Costa un punto di misura, non il run: il chiamante lo salta e
+            # riaggancia il device al giro dopo.
+            raise PktgenEmptyRun(
+                f"pktgen non conosce piu' {dev} (fabric ricostruito?)")
         m = _SOFAR_RE.search(text)
         sent += int(m.group(1)) if m else 0
         m = _USEC_RE.search(text)
@@ -856,6 +877,10 @@ def run_latency(method, model_path, frames, delays, count, threads,
                 # solo i parametri. Rimuoverlo e riaggiungerlo a ogni punto
                 # faceva fallire `add_device` con EBUSY: la rimozione non e'
                 # istantanea e il thread lo teneva ancora.
+                # Idempotente: se il device e' ancora agganciato non fa
+                # nulla, se e' sparito lo riaggancia. Costa una `stat` per
+                # punto e toglie un'intera classe di fallimenti.
+                pg_ensure_device(fab.ingress_peer, thread=0)
                 pg_set_params(fab.ingress_peer, frame, count, delay)
                 try:
                     tx, tx_pps, secs = pg_run_and_read([fab.ingress_peer])
@@ -913,6 +938,185 @@ def run_latency(method, model_path, frames, delays, count, threads,
           f"INFERIORE di quello di produzione, non lo stesso numero. Per il "
           f"throughput da citare usa il run senza --latency.{NC}")
     return rows
+
+
+
+# ==========================================================================
+# CONFRONTO EQUO: stesse condizioni per tutte le pipeline
+# ==========================================================================
+# Tre cose differivano fra un metodo e l'altro, e ognuna e' bastata da sola a
+# rovinare un run:
+#
+# 1. OGNI METODO RICOSTRUIVA IL FABRIC. Veth nuove, ifindex nuovi, e lo stato di
+#    pktgen che non sopravvive al giro -- da cui il device che spariva a meta'
+#    sweep. Qui il fabric si costruisce UNA volta e lo usano tutti.
+#
+# 2. OGNI METODO CHIAMAVA CLANG SUBITO PRIMA DI MISURARE. template e modular
+#    bruciano secondi di CPU che baseline non brucia, e la misura partiva su una
+#    macchina in stati diversi. Qui si compila e si carica TUTTO prima, e durante
+#    le misure nessun compilatore gira.
+#
+# 3. I METODI GIRAVANO IN SEQUENZA, una volta ciascuno. Qualunque deriva della
+#    macchina -- pagine, frequenza, un processo che si sveglia -- si mappava
+#    sull'ORDINE dei metodi, ed e' cosi' che la baseline e' uscita il 26% piu'
+#    lenta di una pipeline che fa strettamente piu' lavoro. Qui si misura a
+#    GIRI: in ogni giro tutti i metodi, e di ogni metodo si tiene la mediana fra
+#    i giri. Una deriva colpisce allora tutti allo stesso modo invece di
+#    premiare chi capita per primo.
+#
+# Resta quello che non si puo' togliere: TG e DUT sulla stessa macchina. Ma
+# adesso e' l'unica differenza rimasta fra le colonne, non una delle quattro.
+
+
+def _detach(iface):
+    subprocess.run(["ip", "link", "set", "dev", iface, "xdp", "off"],
+                   check=False, capture_output=True)
+
+
+def run_fair(methods, model_path, frames, delays, count, threads,
+             threaded_napi=True, repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS):
+    """Tutte le pipeline sullo stesso fabric, compilate prima, misurate a giri."""
+    from netns_fabric import NetnsFabric
+    from common import attach_xdp
+
+    sem, n_out = class_semantics()
+    raw = []
+
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+        # --- fase 1: compila e carica tutto. Qui gira clang, una volta sola,
+        #     e nessuna misura e' ancora partita.
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Fase 1: compilo e carico {len(methods)} pipeline "
+              f"(nessuna misura in corso){NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        loaded = {}
+        for m in methods:
+            try:
+                setup, lat_fn = _load_instrumented(m, model_path, fab, sem)
+                loaded[m] = (setup, lat_fn)
+                info(f"{m}: caricata")
+            except Exception as e:
+                warn(f"{m}: non caricata, la salto -- {type(e).__name__}: {e}")
+        if not loaded:
+            warn("nessuna pipeline caricata")
+            return []
+
+        pg_clear_threads(1)
+        pg_add_device(fab.ingress_peer, thread=0)
+        napi_devs = []
+        if threaded_napi:
+            napi_devs = [fab.ingress]
+            if enable_threaded_napi(napi_devs, threads, os.cpu_count() or 1):
+                info("NAPI in thread: generatore e DUT su core separati")
+
+        # --- fase 2: misura a giri, tutti i metodi in ogni giro
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Fase 2: {rounds} giri x {len(loaded)} pipeline, "
+              f"stesso fabric, nessuna compilazione{NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} {'delay':>6s} "
+               f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
+               f"{'min':>6s} {'p50':>6s} {'p99':>7s}")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+
+        for rnd in range(1, rounds + 1):
+            for m, (setup, lat_fn) in loaded.items():
+                b = setup["b"]
+                for peer in fab.peer_of.values():
+                    try:
+                        attach_xdp(b, lat_fn, peer)
+                    except Exception:
+                        pass
+                attach_xdp(b, setup["disp"], fab.ingress)
+                # Scaldata scartata: la prima raffica paga cache fredde e la
+                # prima allocazione, e non descrive il regime.
+                try:
+                    pg_ensure_device(fab.ingress_peer, thread=0)
+                    pg_set_params(fab.ingress_peer, 64, 2000, 0)
+                    pg_run_and_read([fab.ingress_peer])
+                except PktgenEmptyRun:
+                    pass
+                for frame in frames:
+                    for delay in delays:
+                        r = _one_fair_point(b, fab, frame, delay, count)
+                        if r is None:
+                            continue
+                        r.update(method=m, round=rnd, threads=threads)
+                        raw.append(r)
+                        print(f"  {rnd:4d} {m:10s} {frame:5d} {delay:6d} "
+                              f"{r['rx_pps']:9d} {r['rx_mbps']:7.1f} "
+                              f"{r['loss_pct']:7.2f}% "
+                              f"{_fmt_ns(r['lat_min_ns'])} "
+                              f"{_fmt_ns(r['lat_p50_ns'])} "
+                              f"{_fmt_ns(r['lat_p99_ns'])}")
+                _detach(fab.ingress)
+                for peer in fab.peer_of.values():
+                    _detach(peer)
+
+        pg_reset()
+        if napi_devs:
+            disable_threaded_napi(napi_devs)
+    return raw
+
+
+def _fmt_ns(v):
+    return f"{v:5d}n" if v is not None else "  n/d"
+
+
+def _one_fair_point(b, fab, frame, delay, count):
+    """Un punto: throughput e latenza dallo stesso pacchetto."""
+    b["lat_acc"].clear()
+    b["lat_hist"].clear()
+    try:
+        pg_ensure_device(fab.ingress_peer, thread=0)
+        pg_set_params(fab.ingress_peer, frame, count, delay)
+        tx, tx_pps, secs = pg_run_and_read([fab.ingress_peer])
+    except PktgenEmptyRun as e:
+        warn(f"punto scartato: {e}")
+        return None
+    st = _read_lat(b)
+    if st is None:
+        return None
+    rx, secs = st["n"], (secs or 1e-9)
+    return dict(frame=frame, delay=delay, tx=tx, rx=rx, tx_pps=tx_pps,
+                rx_pps=int(rx / secs), rx_mbps=round(rx * frame * 8 / secs / 1e6, 1),
+                loss_pct=round(100.0 * max(0, tx - rx) / tx, 3) if tx else 0.0,
+                excess_rx=max(0, rx - tx),
+                **{k: st[k] for k in ("lat_min_ns", "lat_p50_ns", "lat_p90_ns",
+                                      "lat_p99_ns", "lat_avg_ns",
+                                      "lat_max_ns")})
+
+
+def summarise_fair(raw, methods):
+    """Mediana fra i giri, per metodo e configurazione."""
+    import statistics as stats
+    if not raw:
+        return []
+    keys = sorted({(r["method"], r["frame"], r["delay"]) for r in raw})
+    out = []
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} Riepilogo: mediana fra i giri{NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+    hdr = (f"  {'pipeline':10s} {'frame':>5s} {'delay':>6s} {'giri':>4s} "
+           f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
+           f"{'min':>6s} {'p50':>6s} {'p99':>7s}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for m, frame, delay in keys:
+        pts = [r for r in raw if (r["method"], r["frame"], r["delay"])
+               == (m, frame, delay)]
+        med = {k: stats.median([r[k] for r in pts if r[k] is not None] or [0])
+               for k in ("rx_pps", "rx_mbps", "loss_pct", "lat_min_ns",
+                         "lat_p50_ns", "lat_p99_ns")}
+        row = dict(method=m, frame=frame, delay=delay, rounds=len(pts), **med)
+        out.append(row)
+        print(f"  {m:10s} {frame:5d} {delay:6d} {len(pts):4d} "
+              f"{int(med['rx_pps']):9d} {med['rx_mbps']:7.1f} "
+              f"{med['loss_pct']:7.2f}% "
+              f"{int(med['lat_min_ns']):5d}n {int(med['lat_p50_ns']):5d}n "
+              f"{int(med['lat_p99_ns']):6d}n")
+    return out
 
 
 # ==========================================================================
@@ -1587,6 +1791,10 @@ def main():
                    help="netif_receive inietta nel percorso RX saltando la "
                         "traversata veth, ma XDP gira GENERIC: numeri non "
                         "confrontabili con gli altri modi.")
+    p.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS, metavar="N",
+                   help="giri completi: in ogni giro si misurano TUTTE le "
+                        "pipeline, poi si tiene la mediana. Toglie l'ordine "
+                        "dei metodi dalla misura.")
     p.add_argument("--repeat", type=int, default=DEFAULT_REPEAT, metavar="R",
                    help="misure per punto; si tiene la mediana del rate e la "
                         "PEGGIORE delle perdite")
@@ -1642,9 +1850,11 @@ def main():
     rc = 0
     if a.latency:
         lat_delays = delays or [0, 5000, 20000]
-        for m in methods:
-            rows += run_latency(m, model_path, frames, lat_delays, a.count,
-                                a.threads, not a.no_threaded_napi)
+        raw = run_fair(methods, model_path, frames, lat_delays, a.count,
+                       a.threads, not a.no_threaded_napi, a.repeat, a.rounds)
+        rows = summarise_fair(raw, methods)
+        rc |= check_validity([dict(method=r["method"], rx_pps=r["rx_pps"],
+                                   unreliable=False) for r in rows])
         if a.out and rows:
             os.makedirs(a.out, exist_ok=True)
             path = os.path.join(a.out, "latency.csv")
