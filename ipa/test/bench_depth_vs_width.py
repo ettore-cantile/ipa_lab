@@ -95,10 +95,22 @@ SHAPES = [
 ]
 
 
+# The scenario's own topology, plus the one dimension it does not declare.
+#
+# `no_onehot` uses queue_occupancy, and a descriptor cannot resolve a dimension
+# the topology does not state -- so leaving this to the scenario killed three of
+# the four descriptors with
+#   ScenarioError: feature 'queue_occupancy' needs topology dimension 'n_queues'
+# after the first one had already run, which reads like a bench problem and is
+# really a missing declaration here. 4 is under the compiled ceilings
+# (IPA_MAX_QUEUES is 8 in Pipeline 2 and in Pipeline 3).
+BENCH_TOPOLOGY = {"n_interfaces": 6, "n_nodes": 52, "n_queues": 4}
+
+
 def build_shape(descriptor_name: str, n_out: int = 7) -> dict:
     types = FEATURE_SETS[descriptor_name]
     meta = {"features": types, "n_out": n_out, "hidden_dims": [4, 4]}
-    return mm.derive_shape(meta)
+    return mm.derive_shape(meta, topology_config=BENCH_TOPOLOGY)
 
 
 def weight_count(n_in, dims, n_out):

@@ -204,33 +204,68 @@ il progetto chiamava P1.
 
 ## D. Larga contro profonda
 
-### D1 — A parità di budget-pesi, allargare batte approfondire ⏳
+La risposta **non è la stessa per tutte le pipeline**, e per la hardcoded dipende
+dal budget. Le due schede qui sotto vanno lette insieme: D2 varia la profondità a
+parametri fermi su tutte e quattro le pipeline, D1 spinge il budget più in alto ma
+solo su P1.
+
+### D1 — A parità di budget-pesi, allargare batte approfondire (P1) ✅⏳
 
 | | |
 |---|---|
 | **Ipotesi** | Dato un numero di parametri, spenderli in un layer largo costa meno che in molti stretti. |
-| **Variabile modificata** | La forma, a budget-pesi abbinato: 3 tier (~300, ~1 200, ~4 700 pesi), ciascuno in versione larga (1 layer) e profonda (4 e 8 layer). |
-| **Variabili fisse** | Il budget-pesi (lo scarto è stampato, mai assunto «circa uguale»); ripetuto su **4 descrittori** indipendenti (0, 1 o 2 one-hot; one-hot piccola da 6 e grande da 52) per isolare l'effetto del descrittore. |
-| **Metrica** | Istruzioni eBPF, latenza (min su 15 trial, con p50/p90/max). |
-| **Risultato** | Tier B: larga 1×16 a 103-111 ns, profonda 4×11 a 203-236 ns, profonda 8×9 a 269-301 ns. Overhead fisso stimato 15-40 ns per layer, coerente sui 4 descrittori. Tier C: **crash sempre**, larga o profonda che sia. |
-| **Conclusione** | Allargare batte approfondire, e non è un artefatto delle one-hot del descrittore di default. Oltre ~1 200-1 300 pesi lo stack eBPF da 512 byte va in overflow comunque: non è una scelta larghezza/profondità, è un limite dell'architettura «tutto srotolato in una funzione». |
-| **Stato** | ⏳ **Da rigirare.** Lo script passava ancora la tabella ifindex compilata, quindi dalla sua rimozione ogni cella sollevava `ValueError`: i numeri qui sopra vengono da uno stato del codice precedente. Corretto, mai rieseguito. |
-| **Copertura mancante** | Misura solo istruzioni e latenza, e solo su P1. Niente tail call, costo mappe, tempo di compilazione, throughput. |
+| **Variabile modificata** | La forma, a budget abbinato: 3 tier (~300, ~1 200, ~4 700 pesi), ciascuno in versione larga (1 layer) e profonda (4 e 8 layer). |
+| **Variabili fisse** | Il budget-pesi — lo **scarto è stampato**, non assunto: 6,7% nel tier A, 10,1% nel B, 2,0% nel C. Descrittore, topologia, pipeline (solo P1). |
+| **Metrica** | Istruzioni eBPF, latenza (minimo su 15 trial, con p50/p90/max). |
+| **Risultato** | Tier A (~300 pesi): larga 1×4 **54 ns**, base 2×4 56, profonda 8×3 **69 ns** (+28%). Tier B (~1 200): larga 1×16 **124 ns**, profonda 4×11 **218** (+76%), profonda 8×9 **282** (+127%). Tier C (~4 700): **crash sempre**, larga o profonda che sia. |
+| **Conclusione** | Allargare batte approfondire, **e il divario cresce col budget**: trascurabile a 300 pesi, più che raddoppiato a 1 200. Oltre ~1 300 pesi lo stack eBPF da 512 byte va in overflow comunque: non è una scelta di architettura, è il limite del «tutto srotolato in una funzione». |
+| **Stato** | ✅ sul descrittore `default`, rimisurato sul codice corrente. ⏳ sugli altri tre: morivano con `ScenarioError: feature 'queue_occupancy' needs topology dimension 'n_queues'`, perché lo script non dichiarava quella dimensione. Corretto, da rieseguire — serve per poter dire «non è un artefatto delle one-hot». |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_depth_vs_width.py` |
 
-### D2 — Larga contro profonda, su tutte e quattro le pipeline ⏳
+### D2 — A parametri fermi, la risposta cambia con la pipeline ✅
 
 | | |
 |---|---|
-| **Ipotesi** | La conclusione di D1 vale anche fuori da P1, e con le metriche che D1 non raccoglie. |
-| **Variabile modificata** | Come lo stesso budget di parametri è disposto: 1, 2, 3, 4 o 5 hidden layer. |
-| **Variabili fisse** | **Il numero di parametri: 592 ± 2%** (591, 599, 595, 604, 589). Topologia, descrittore, pesi da pool a prefisso. Famiglia coerente a imbuto (`h1 ≥ h`, hidden successivi uniformi), tutta dentro i soffitti di P2 e P3 così che tutte e quattro le pipeline corrano tutti e cinque i punti. |
-| **Metrica** | Istruzioni, codice nativo, latenza, **throughput**, **tail call**, **costo delle mappe**, **tempo di compilazione**, rifiuti del verificatore. |
-| **Risultato** | — |
-| **Stato** | ⏳ L'asse è implementato, mai eseguito. |
+| **Ipotesi** | La conclusione di D1 vale anche fuori da P1. **Parzialmente falsa.** |
+| **Variabile modificata** | Come lo stesso budget è disposto: 1, 2, 3, 4 o 5 hidden layer. |
+| **Variabili fisse** | **I parametri: 592 ± 2%** (591, 599, 595, 604, 589 — la colonna `pesi` lo stampa a ogni cella). Famiglia coerente a imbuto (`h1 ≥ h`, hidden successivi uniformi), tutta dentro i soffitti di P2 e P3, così che tutte e quattro le pipeline corrano tutti e cinque i punti. |
+| **Metrica** | Istruzioni, latenza, throughput, tail call, costo mappe, tempo di compilazione. |
+
+**Latenza (ns/pacchetto) a parametri fermi:**
+
+| hidden layer | 1 | 2 | 3 | 4 | 5 | |
+|---|---:|---:|---:|---:|---:|---|
+| P1 specializzata | 78 | 80 | 68 | 95 | 81 | nessuna tendenza |
+| P1.5 hardcoded | 91 | 87 | 75 | 102 | 98 | nessuna tendenza |
+| P2 template | 219 | 246 | 308 | 351 | **402** | **+84%** |
+| P3 modular | 414 | 493 | 496 | 643 | **654** | **+58%** |
+
+**Istruzioni eBPF a parametri fermi:**
+
+| hidden layer | 1 | 2 | 3 | 4 | 5 | |
+|---|---:|---:|---:|---:|---:|---|
+| P1 specializzata | 902 | 889 | 840 | 1 029 | 972 | piatta |
+| P1.5 hardcoded | 1 774 | 1 638 | 1 723 | 1 748 | 1 627 | piatta |
+| P2 template | 14 140 | 14 628 | 16 141 | 16 390 | **17 207** | **+22%** |
+| P3 modular | 12 031 | 12 031 | 12 031 | 12 031 | 12 031 | **identica** |
+
+| | |
+|---|---|
+| **Conclusione** | A questo budget le due P1 **non distinguono** larga da profonda: la dispersione lungo l'asse (68-95 ns) è più grande di qualunque tendenza. Per P2 e P3 invece la profondità costa, molto, e **per due ragioni diverse**: P2 deve srotolare ogni layer, quindi cresce in dimensione *e* in tempo; P3 riusa lo stesso layer — la sua riga di istruzioni è identica a tutti e cinque i punti — e paga **una tail call per layer**. |
+| **Il risultato utile** | Chi sceglie l'architettura deve sapere **su quale pipeline girerà**. Su una hardcoded a ~600 pesi la profondità è quasi gratis; su P2 o P3 la stessa scelta costa il 58-84% di latenza a parità di parametri. |
+| **Limite dichiarato** | ⚠️ «Nessuna tendenza» per le due P1 significa **sotto il rumore di questo run**, non «nessun effetto». La dispersione è ±20% e la serie non è monotona (78, 80, 68, 95, 81). D1 mostra che a 1 200 pesi l'effetto su P1 c'è ed è grande: qui il budget è la metà e la profondità arriva a 5 invece che a 8. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis isoparam --out result/` |
 
----
+### D3 — Perché la profondità costa, quando costa ✅
+
+| | |
+|---|---|
+| **Ipotesi** | Il costo di un layer in più non è aritmetico: è un costo fisso di transizione. |
+| **Variabile modificata** | Il numero di layer, su tre assi indipendenti (`depth` a parametri crescenti, `isoparam` a parametri fermi, i tier di D1). |
+| **Metrica** | Latenza per layer aggiunto, e tail call. |
+| **Risultato** | P3: **+71 ns per layer** sull'asse `depth`, e la sua riga di istruzioni non si muove — il costo è interamente nelle tail call, che vanno da 2 a 7. P2: **+36 ns e +780 istruzioni per layer**, cioè srotolamento. P1: 15-40 ns per layer secondo D1, visibile solo sopra un certo budget. |
+| **Conclusione** | Tre meccanismi distinti per lo stesso sintomo. In P3 si vede allo stato puro: **dimensione costante, tempo crescente** è la firma di un costo di transizione e non di calcolo. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis depth --out result/` |
 
 ## E. Che cosa nessun test di questo progetto dimostra
 
