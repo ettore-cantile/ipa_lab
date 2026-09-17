@@ -8,11 +8,12 @@ model, gets bigger? And -- the part that matters for the design-space argument
 
 They do, and the slopes are the whole point of having three of them:
 
-                        P1 hardcoded     P2 template     P3 modular
-  more NODES            grows            flat            flat
-  more LAYERS           grows            impossible      flat
-  more NEURONS/layer    grows            grows           grows
-  changing the model    ~1.2 s of clang  a map write     a map write
+                        P1 hardcoded     P2 template      P3 modular
+  more NODES            grows            flat             flat
+  more LAYERS           grows            needs a rebuild  flat
+  more NEURONS/layer    grows            grows            grows
+  sparser WEIGHTS       shrinks          flat             flat
+  changing the model    ~1.2 s of clang  a map write      a map write
 
 Each cell of that table is a claim this script measures rather than asserts.
 
@@ -29,14 +30,27 @@ be attributed to the variable named on the x axis and nothing else.
          MAX_N_IN / ML_MAX_N_IN is 128 in P2 and P3.
 
   depth  1..6 hidden layers of 4 neurons, n_nodes 52 (n_in 65)
-         P2 compiles EXACTLY two hidden layers (fc1, fc2), so it produces a
-         single point. That is not a hole in the sweep, it is the result:
-         depth is the axis P2 cannot travel at all.
+         Depth is the one dimension P2 does NOT cover at runtime: its widths
+         come from a map, its depth is compiled in. build_arch_leaf(n) emits
+         the extra blocks, so P2 reaches any depth -- by rebuilding. On this
+         axis P2 therefore recompiles at every point and P3 does not, and
+         that difference, not a missing point, is the result.
 
   width  2, 4, 6, 8 neurons per hidden layer, two hidden layers, n_nodes 52
          8 is the compiled ceiling in P2 (T2_MAX_H1/H2) and P3 (ML1_MAX_H1,
          MLH_MAX_H). P1 has no ceiling but is swept over the same values so
          the three curves are comparable.
+
+  descriptor  the four input-vector compositions of bench_depth_vs_width:
+         0, 1 or 2 one-hot features, and a small (6) vs large (52) one. Same
+         model otherwise. Categorical, so it is drawn as bars.
+
+  sparsity  0, 25, 50, 75, 90 percent of the weights exactly zero, same shape
+         throughout. P1 compiles weights in as literals, so clang deletes a
+         multiply by zero: its instruction count should FALL. P2 and P3 read
+         the same bytes from a map and should not move at all. This is where
+         'the weights are in the code' stops being a description and becomes
+         a number.
 
 --------------------------------------------------------------------------
 WHAT IS MEASURED
@@ -50,11 +64,22 @@ WHAT IS MEASURED
              one-sided (an interrupt can only slow a trial down), so the
              smallest sample is the best estimate of the interference-free
              cost. Same reasoning as bench_depth_vs_width.py and hyperfine.
-  build_ms   wall time to compile (BCC/clang) and load the program. This is
-             the axis where P1 differs in KIND, not degree: P2 and P3 compile
-             a source that does not depend on the model at all, so their
-             build cost is flat by construction and a new model is a map
-             write. Measured anyway rather than assumed.
+  update_ms  cost of INSTALLING A NEW MODEL on a node already running. This
+             is the metric where the three pipelines differ in KIND rather
+             than degree, and the two must not be confused:
+               P1  the weights are C literals, so a new model means
+                   generating C and running clang -- order 1.5 s.
+               P2  arch_registry + model_desc + a slice of arch_weights.
+               P3  layer_registry + layer_shapes + model_desc + weights.
+             For P2 and P3 no compiler runs, so this is map writes only.
+  build_ms   cost of compiling and loading the eBPF program ONCE. For P2 and
+             P3 this is paid when the node starts and never again, because
+             the source never mentions the model's shape. For P1 it is the
+             same event as update_ms, by construction -- the program IS the
+             model. Plotting build_ms as if it were the cost of changing a
+             model would make P2 and P3 look MORE expensive than P1, which
+             is backwards: their ~2.5 s compile happens once, P1's ~1.5 s
+             happens on every model.
   map_bytes  total map memory, per-CPU maps counted per CPU.
   tail       tail calls executed per packet (P3's grows with depth).
   nw         number of int8 weights the model has, for reference.
@@ -106,42 +131,96 @@ GREEN, RED, YELLOW, GREY, NC = (
 # Pinned across every sweep: only the axis variable moves.
 N_INTERFACES = 6
 N_OUT = 7
-FEATURES = ["link_state", "ingress_iface", "ttl", "node"]
 SCALE = 128
 PIPELINES = ("hardcoded", "template", "modular")
 
-# The axes. (label, [values], builder(value) -> (n_nodes, hidden_dims))
+# Input-vector compositions. Imported rather than copied: bench_depth_vs_width
+# already curates this set to separate onehot COUNT from onehot SIZE, and two
+# copies would drift.
+from bench_depth_vs_width import FEATURE_SETS      # noqa: E402
+DEFAULT_DESCRIPTOR = "default"
+
+
+def make_weights(nw, sparsity, seed=42):
+    """`nw` int8 weights of which a `sparsity` fraction are exactly zero.
+
+    Sparsity is a real variable here, not padding for the sweep. P1 writes the
+    weights into the C source as literals, so clang deletes a multiply by zero
+    outright and turns a multiply by a power of two into a shift: its
+    instruction count depends on the VALUES. P2 and P3 read the same weights
+    from a map, where a zero is a byte like any other. The sparsity axis is
+    what turns that difference from an argument into a measurement.
+
+    Zeros are placed with a seeded RNG, so a given (nw, sparsity) is always the
+    same vector -- two pipelines at the same x get identical weights."""
+    rng = random.Random(seed)
+    n_zero = int(round(nw * sparsity))
+    vals = [0] * n_zero + [rng.choice([v for v in range(-100, 101) if v != 0])
+                           for _ in range(nw - n_zero)]
+    rng.shuffle(vals)
+    return vals
+
+# One axis = one variable. `cell(v)` returns everything a worker needs, so a
+# new axis is a new entry here and nothing else. `kind` is "num" for an axis
+# whose x is a number (plotted as a curve) or "cat" for one whose values are
+# names (plotted as bars -- a line between two descriptors would imply a
+# gradient that does not exist).
 AXES = {
     "nodes": {
         "xlabel": "nodi della rete (larghezza della one-hot `node`)",
+        "kind": "num",
         "values": [10, 25, 52, 75, 100],
-        "shape": lambda v: (v, (4, 4)),
+        "cell": lambda v: dict(n_nodes=v, dims=(4, 4)),
         "note": "n_in = 13 + n_nodes; il modello resta 4-4, cambia solo l'ingresso",
     },
     "depth": {
         "xlabel": "numero di hidden layer",
+        "kind": "num",
         "values": [1, 2, 3, 4, 5, 6],
-        "shape": lambda v: (52, tuple([4] * v)),
-        "note": "P2 compila esattamente 2 hidden layer: un punto solo, ed e' il risultato",
+        "cell": lambda v: dict(n_nodes=52, dims=tuple([4] * v)),
+        "note": "P2 copre la profondita' RICOMPILANDO (build_arch_leaf), P3 no: "
+                "la ricompilazione E' il confronto",
     },
     "width": {
         "xlabel": "neuroni per hidden layer",
+        "kind": "num",
         "values": [2, 4, 6, 8],
-        "shape": lambda v: (52, (v, v)),
+        "cell": lambda v: dict(n_nodes=52, dims=(v, v)),
         "note": "8 e' il soffitto compilato di P2 (T2_MAX_H1/H2) e P3 (ML1_MAX_H1)",
     },
+    "descriptor": {
+        "xlabel": "composizione del vettore d'ingresso",
+        "kind": "cat",
+        "values": list(FEATURE_SETS),
+        "cell": lambda v: dict(n_nodes=52, dims=(4, 4), descriptor=v),
+        "note": "stesso modello 4-4, IV diverse: 0/1/2 one-hot, piccola (6) o grande (52)",
+    },
+    "sparsity": {
+        "xlabel": "frazione di pesi esattamente zero",
+        "kind": "num",
+        "values": [0.0, 0.25, 0.5, 0.75, 0.9],
+        "cell": lambda v: dict(n_nodes=52, dims=(4, 4), sparsity=v),
+        "note": "stessa forma, pesi diversi: P1 li compila come letterali, P2/P3 li leggono da mappa",
+    },
 }
+
+
+def cell_of(axis, v):
+    """Fill an axis cell out with the defaults the worker expects."""
+    c = dict(n_nodes=52, dims=(4, 4), descriptor=DEFAULT_DESCRIPTOR, sparsity=0.0)
+    c.update(AXES[axis]["cell"](v))
+    return c
 
 
 def topology(n_nodes):
     return {"n_interfaces": N_INTERFACES, "n_nodes": n_nodes}
 
 
-def build_shape(n_nodes, hidden_dims):
+def build_shape(n_nodes, hidden_dims, descriptor=DEFAULT_DESCRIPTOR):
     """Resolve the feature descriptor for this topology. n_out is DECLARED,
     never derived from the interface count -- see class_semantics.py."""
     import model_meta as mm
-    meta = {"features": FEATURES, "n_out": N_OUT,
+    meta = {"features": FEATURE_SETS[descriptor], "n_out": N_OUT,
             "hidden_dims": list(hidden_dims)}
     return mm.derive_shape(meta, topology_config=topology(n_nodes))
 
@@ -210,22 +289,27 @@ def _totals(b, progs):
     return insns, jited, mb, per_prog, counted
 
 
-def _bench_p1(n_nodes, dims, repeat, trials):
+def _bench_p1(cell, repeat, trials):
     from bcc import BPF
     from ebpf_program import build_combined_hardcoded_source
     from verify_prog_run import build_frame_sparse, _seed_link_state
 
-    shape = build_shape(n_nodes, dims)
+    dims = cell["dims"]
+    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    rng = random.Random(42)
-    weights = [rng.randint(-100, 100) for _ in range(nw)]
-
-    src = build_combined_hardcoded_source(
-        models=[(0, weights, SCALE)],
-        features=shape["features"], n_out=n_out, hidden_dims=tuple(dims))
+    weights = make_weights(nw, cell["sparsity"])
 
     def _load():
+        # Codegen is INSIDE the timed region on purpose. For P1 the weights
+        # are C literals, so installing a model is generating C and running
+        # clang over it -- there is no separate "load the weights" step to
+        # measure. build_ms and update_ms below are therefore the same number
+        # for this pipeline, by construction, and that identity is exactly
+        # what distinguishes it from P2 and P3.
+        src = build_combined_hardcoded_source(
+            models=[(0, weights, SCALE)],
+            features=shape["features"], n_out=n_out, hidden_dims=tuple(dims))
         bb = BPF(text=src)
         m = bb.load_func("model_0", BPF.XDP)
         d = bb.load_func("ipa_switch_hardcoded", BPF.XDP)
@@ -233,6 +317,7 @@ def _bench_p1(n_nodes, dims, repeat, trials):
         return bb, m, d
 
     (b, model_fn, disp_fn), build_ms = _timed(_load)
+    update_ms = build_ms          # see _load: for P1 they are the same event
     _seed_link_state(b, 1)
 
     insns, jited, mb, per_prog, maps = _totals(
@@ -241,37 +326,45 @@ def _bench_p1(n_nodes, dims, repeat, trials):
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
-                n_in=n_in, build_ms=build_ms, lat_ns=lo, lat_p50=med,
+                n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
                 lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
 
 
-def _bench_p2(n_nodes, dims, repeat, trials):
+def _bench_p2(cell, repeat, trials):
     # Checked BEFORE the imports on purpose: "P2 cannot do this depth" is a
     # property of P2, not of whether BCC happens to be installed. Behind the
     # imports, a machine without BCC would report this cell as a crash rather
     # than as the structural limit it is.
-    if len(dims) != 2:
+    dims = cell["dims"]
+    if len(dims) < 2:
         raise NotImplementedError(
-            f"P2 compila esattamente 2 hidden layer (fc1, fc2); "
-            f"questa forma ne chiede {len(dims)}")
+            f"P2 ha sempre fc1 e fc2: profondita' minima 2, questa forma "
+            f"ne chiede {len(dims)}")
+    if len(set(dims[1:])) > 1:
+        raise NotImplementedError(
+            f"in P2 i layer oltre il secondo sono larghi n_h2; questa forma "
+            f"chiede larghezze diverse: {dims[1:]}")
+    n_hidden = len(dims)
 
     from bcc import BPF
     from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
-                                    EBPF_ARCH_GENERIC_2LAYER,
+                                    build_arch_leaf,
                                     load_arch_weights)
     from verify_prog_run import build_frame_sparse, _seed_link_state
 
-    shape = build_shape(n_nodes, dims)
+    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    rng = random.Random(42)
-    weights = [rng.randint(-100, 100) for _ in range(nw)]
+    weights = make_weights(nw, cell["sparsity"])
 
-    # NOTE: the source does not mention the shape anywhere -- that is the
-    # whole claim of P2. build_ms is therefore expected to be FLAT across the
-    # sweep, and a rising curve here would be a finding.
+    # The source does not mention the model's WIDTHS anywhere -- that is P2's
+    # claim, and why its instruction count is flat on the nodes and width
+    # axes. DEPTH is different: it is baked in at compile time, so the leaf
+    # is built for this shape's depth. On the depth axis P2 therefore
+    # RECOMPILES at every point while P3 does not, and that is exactly the
+    # comparison being made.
     src = ("#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER
-           + "\n" + EBPF_ARCH_GENERIC_2LAYER)
+           + "\n" + build_arch_leaf(n_hidden))
 
     def _load():
         bb = BPF(text=src)
@@ -281,10 +374,15 @@ def _bench_p2(n_nodes, dims, repeat, trials):
         return bb, d, leaf
 
     (b, disp_fn, leaf_fn), build_ms = _timed(_load)
-    load_arch_weights(b, weights, model_id=0, scale=SCALE,
-                      n_h1=dims[0], n_h2=dims[1],
-                      features=shape["features"], n_in=n_in,
-                      semantics=shape.get("semantics"))
+    # Installing a model in P2 is writing maps -- arch_registry, model_desc
+    # and a slice of arch_weights. No compiler runs. This is the number that
+    # belongs next to P1's build_ms, not P2's own build_ms, which is a
+    # ONE-TIME cost paid when the node starts and never again.
+    _, update_ms = _timed(lambda: load_arch_weights(
+        b, weights, model_id=0, scale=SCALE,
+        n_h1=dims[0], n_h2=dims[1], n_hidden=n_hidden,
+        features=shape["features"], n_in=n_in,
+        semantics=shape.get("semantics")))
     _seed_link_state(b, 1)
 
     insns, jited, mb, per_prog, maps = _totals(
@@ -294,20 +392,20 @@ def _bench_p2(n_nodes, dims, repeat, trials):
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
-                n_in=n_in, build_ms=build_ms, lat_ns=lo, lat_p50=med,
+                n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
                 lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
 
 
-def _bench_p3(n_nodes, dims, repeat, trials):
+def _bench_p3(cell, repeat, trials):
     from bcc import BPF
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
     from verify_prog_run import build_frame_sparse, _seed_link_state
 
-    shape = build_shape(n_nodes, dims)
+    dims = cell["dims"]
+    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    rng = random.Random(42)
-    weights = [rng.randint(-100, 100) for _ in range(nw)]
+    weights = make_weights(nw, cell["sparsity"])
 
     sizes = [n_in] + list(dims) + [n_out]
     layer_dims = [(sizes[i - 1], sizes[i]) for i in range(1, len(sizes))]
@@ -323,10 +421,13 @@ def _bench_p3(n_nodes, dims, repeat, trials):
         return bb, d, first, hidden
 
     (b, disp_fn, first_fn, hidden_fn), build_ms = _timed(_load)
-    load_modular_weights(b, weights, model_id=0, scale=SCALE,
-                         layer_dims=layer_dims,
-                         features=shape["features"],
-                         semantics=shape.get("semantics"))
+    # Same as P2: a model install is a set of map writes -- layer_registry,
+    # layer_shapes, model_desc and a slice of layer_weights. No compiler.
+    _, update_ms = _timed(lambda: load_modular_weights(
+        b, weights, model_id=0, scale=SCALE,
+        layer_dims=layer_dims,
+        features=shape["features"],
+        semantics=shape.get("semantics")))
     _seed_link_state(b, 1)
 
     insns, jited, mb, per_prog, maps = _totals(
@@ -339,20 +440,26 @@ def _bench_p3(n_nodes, dims, repeat, trials):
     # Tail calls actually executed: dispatcher -> layer_first -> layer_hidden
     # x (n_layers - 1). NOT the number of distinct programs, which is always 3.
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=len(layer_dims),
-                nw=nw, n_in=n_in, build_ms=build_ms, lat_ns=lo, lat_p50=med,
+                nw=nw, n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
                 lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
 
 
 _BENCH = {"hardcoded": _bench_p1, "template": _bench_p2, "modular": _bench_p3}
 
 
-def _worker(pipeline, n_nodes, dims_csv, repeat, trials):
+def _worker(pipeline, spec_json):
     """Runs in the subprocess. Prints exactly one JSON line; that is the
-    parent's only contract with it."""
+    parent's only contract with it.
+
+    The cell arrives as JSON rather than as positional arguments: adding an
+    axis then means adding a key, not editing an argv layout in three
+    places."""
     os.chdir(SHARED_DIR)
-    dims = tuple(int(x) for x in dims_csv.split(",") if x)
+    spec = json.loads(spec_json)
+    repeat, trials = spec.pop("repeat"), spec.pop("trials")
+    spec["dims"] = tuple(spec["dims"])
     try:
-        out = _BENCH[pipeline](n_nodes, dims, repeat, trials)
+        out = _BENCH[pipeline](spec, repeat, trials)
         out["ok"] = True
     except NotImplementedError as e:
         out = {"ok": False, "skipped": True, "detail": str(e)}
@@ -364,12 +471,13 @@ def _worker(pipeline, n_nodes, dims_csv, repeat, trials):
     return 0
 
 
-def bench_cell(pipeline, n_nodes, dims, repeat, trials):
+def bench_cell(pipeline, cell, repeat, trials):
     """One cell, isolated. A fatal LLVM abort or a verifier refusal kills only
     the child."""
+    spec = dict(cell, dims=list(cell["dims"]), repeat=repeat, trials=trials)
     proc = subprocess.run(
         [sys.executable, os.path.abspath(__file__), "--_worker", pipeline,
-         str(n_nodes), ",".join(map(str, dims)), str(repeat), str(trials)],
+         json.dumps(spec)],
         capture_output=True, text=True)
     last = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else None
     if last:
@@ -395,28 +503,33 @@ def run_axis(axis, repeat, trials, out_dir):
 
     rows = []
     hdr = (f"  {'x':>5s} {'pipeline':10s} {'forma':>16s} {'pesi':>6s} "
-           f"{'insns':>7s} {'ns':>7s} {'build ms':>9s} {'mappe B':>8s} {'tail':>4s}")
+           f"{'insns':>7s} {'ns':>7s} {'update ms':>10s} {'build ms':>9s} "
+           f"{'mappe B':>8s} {'tail':>4s}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
 
     for v in spec["values"]:
-        n_nodes, dims = spec["shape"](v)
+        cell = cell_of(axis, v)
+        dims = cell["dims"]
         for pipe in PIPELINES:
-            r = bench_cell(pipe, n_nodes, dims, repeat, trials)
-            shape_str = f"{13 + n_nodes}-{'-'.join(map(str, dims))}-{N_OUT}"
+            r = bench_cell(pipe, cell, repeat, trials)
+            n_in = r.get("n_in") or "?"
+            shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{N_OUT}"
             if r.get("ok"):
-                print(f"  {v:5d} {pipe:10s} {shape_str:>16s} {r['nw']:6d} "
-                      f"{r['insns']:7d} {r['lat_ns']:7.1f} {r['build_ms']:9.1f} "
+                print(f"  {str(v):>5s} {pipe:10s} {shape_str:>16s} {r['nw']:6d} "
+                      f"{r['insns']:7d} {r['lat_ns']:7.1f} "
+                      f"{r['update_ms']:10.2f} {r['build_ms']:9.1f} "
                       f"{r['map_bytes']:8d} {r['tail']:4d}")
                 rows.append(dict(axis=axis, x=v, pipeline=pipe,
                                  shape=shape_str, **{
                                      k: r[k] for k in
                                      ("nw", "n_in", "insns", "jited",
-                                      "map_bytes", "tail", "build_ms",
+                                      "map_bytes", "n_maps", "tail",
+                                      "build_ms", "update_ms",
                                       "lat_ns", "lat_p50", "lat_max")}))
             else:
                 mark = f"{GREY}n/d{NC}" if r.get("skipped") else f"{RED}CRASH{NC}"
-                print(f"  {v:5d} {pipe:10s} {shape_str:>16s} {'':6s} "
+                print(f"  {str(v):>5s} {pipe:10s} {shape_str:>16s} {'':6s} "
                       f"{mark} {GREY}{r.get('detail', '')[:90]}{NC}")
 
     if out_dir:
@@ -436,11 +549,18 @@ def run_axis(axis, repeat, trials, out_dir):
 # ==========================================================================
 # PLOTS -- read the CSV, never re-measure. No root, no BCC.
 # ==========================================================================
+# (colonna, etichetta y, nome file, asse y logaritmico)
+#
+# update_ms is log: P1 sits around 1500 ms and P2/P3 around a millisecond, so
+# on a linear axis the two cheap pipelines collapse onto the zero line and the
+# graph shows one curve instead of three. The whole finding is the DISTANCE
+# between them, which is what a log axis is for.
 PLOTS = [
-    ("insns", "istruzioni eBPF (xlated)", "scaling_{axis}_insns"),
-    ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latenza"),
-    ("build_ms", "compilazione + caricamento (ms)", "scaling_{axis}_build"),
-    ("map_bytes", "memoria delle mappe (byte)", "scaling_{axis}_mappe"),
+    ("insns", "istruzioni eBPF (xlated)", "scaling_{axis}_insns", False),
+    ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latenza", False),
+    ("update_ms", "installare un modello nuovo (ms)", "scaling_{axis}_update", True),
+    ("build_ms", "compilare il programma, una volta (ms)", "scaling_{axis}_build", False),
+    ("map_bytes", "memoria delle mappe (byte)", "scaling_{axis}_mappe", False),
 ]
 STYLE = {
     "hardcoded": dict(color="#c0392b", marker="o", label="P1 hardcoded"),
@@ -464,29 +584,59 @@ def plot_axis(axis, in_dir, fmt):
         print(f"  {GREY}salto {axis}: CSV vuoto{NC}")
         return 0
 
+    cat = AXES[axis]["kind"] == "cat"
+    # Categorical x (the descriptor axis) is drawn as grouped bars, not a
+    # curve. A line from "no_onehot" to "big_onehot" would draw a slope
+    # between two names, implying intermediate descriptors that do not exist.
+    order = [str(v) for v in AXES[axis]["values"]]
+
     made = 0
-    for metric, ylabel, stem in PLOTS:
-        fig, ax = plt.subplots(figsize=(5.6, 3.6))
+    for metric, ylabel, stem, logy in PLOTS:
+        fig, ax = plt.subplots(figsize=(6.2 if cat else 5.6, 3.6))
         drawn = False
-        for pipe in PIPELINES:
-            pts = sorted((float(r["x"]), float(r[metric]))
-                         for r in rows if r["pipeline"] == pipe and r[metric])
-            if not pts:
+        if metric not in rows[0]:
+            # A CSV written by an older version of this script: it simply does
+            # not have this column. Say so and move on -- crashing with a
+            # KeyError would make an out-of-date file look like a broken
+            # plotter, and re-measuring is the fix either way.
+            print(f"  {GREY}salto {metric} per {axis}: colonna assente nel CSV "
+                  f"(rimisura per averla){NC}")
+            plt.close(fig)
+            continue
+        for slot, pipe in enumerate(PIPELINES):
+            vals = {r["x"]: r[metric] for r in rows
+                    if r["pipeline"] == pipe and r.get(metric)}
+            if not vals:
                 continue
-            xs, ys = zip(*pts)
-            # A single point cannot show a slope, so it is drawn as a lone
-            # marker: that is P2 on the depth axis, and the gap IS the result.
-            ax.plot(xs, ys, linestyle="-" if len(xs) > 1 else "none",
-                    linewidth=1.6, markersize=6, **STYLE[pipe])
+            if cat:
+                idx = [i for i, k in enumerate(order) if k in vals]
+                ys = [float(vals[order[i]]) for i in idx]
+                w = 0.26
+                ax.bar([i + (slot - 1) * w for i in idx], ys, width=w,
+                       color=STYLE[pipe]["color"], label=STYLE[pipe]["label"])
+            else:
+                pts = sorted((float(k), float(v)) for k, v in vals.items())
+                xs, ys = zip(*pts)
+                # A single point cannot show a slope, so it is drawn as a lone
+                # marker: that is P2 on the depth axis when its compiled layer
+                # ceiling is 2, and the gap IS the result.
+                ax.plot(xs, ys, linestyle="-" if len(xs) > 1 else "none",
+                        linewidth=1.6, markersize=6, **STYLE[pipe])
             drawn = True
         if not drawn:
             plt.close(fig)
             continue
+        if cat:
+            ax.set_xticks(range(len(order)))
+            ax.set_xticklabels(order, fontsize=8)
         ax.set_xlabel(AXES[axis]["xlabel"])
         ax.set_ylabel(ylabel)
         ax.grid(True, linewidth=0.4, alpha=0.4)
         ax.legend(frameon=False, fontsize=8)
-        ax.set_ylim(bottom=0)
+        if logy:
+            ax.set_yscale("log")      # set_ylim(bottom=0) is invalid on a log axis
+        else:
+            ax.set_ylim(bottom=0)
         fig.tight_layout()
         out = os.path.join(in_dir, stem.format(axis=axis) + "." + fmt)
         fig.savefig(out, dpi=160)
@@ -511,12 +661,11 @@ def main():
     p.add_argument("--plot", metavar="DIR", default=None,
                    help="non misurare: genera i grafici dai CSV in DIR")
     p.add_argument("--format", default="pdf", choices=["pdf", "png"])
-    p.add_argument("--_worker", nargs=5, help=argparse.SUPPRESS)
+    p.add_argument("--_worker", nargs=2, help=argparse.SUPPRESS)
     a = p.parse_args()
 
     if a._worker:
-        pipe, n_nodes, dims_csv, repeat, trials = a._worker
-        return _worker(pipe, int(n_nodes), dims_csv, int(repeat), int(trials))
+        return _worker(a._worker[0], a._worker[1])
 
     if a.plot:
         import importlib.util
@@ -531,8 +680,12 @@ def main():
     if os.geteuid() != 0:
         sys.exit("serve root: sudo python3 ipa/test/bench_scaling.py")
 
-    os.chdir(SHARED_DIR)
+    # Resolved BEFORE the chdir: a relative --out is relative to where the
+    # USER ran the command, not to ipa/. Resolving it after the chdir put
+    # `--out results/` inside ipa/results/, which is not where anyone typing
+    # that meant it to go.
     out_dir = os.path.abspath(a.out)
+    os.chdir(SHARED_DIR)
     axes = list(AXES) if a.axis == "all" else [a.axis]
     for ax in axes:
         run_axis(ax, a.repeat, a.trials, out_dir)

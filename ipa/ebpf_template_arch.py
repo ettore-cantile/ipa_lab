@@ -114,7 +114,7 @@ MAX_WEIGHT_ENTRIES = 1024
 
 
 def arch_weight_count(n_h1: int, n_h2: int, n_in: int = None,
-                      n_out: int = None) -> int:
+                      n_out: int = None, n_hidden: int = 2) -> int:
     """Flat int8 weight count for an n_in -> n_h1 -> n_h2 -> T2_N_OUT MLP
     (fc1 weights+bias, fc2 weights+bias, out weights+bias), matching the
     flat layout load_arch_weights() writes and the eBPF program reads.
@@ -127,7 +127,12 @@ def arch_weight_count(n_h1: int, n_h2: int, n_in: int = None,
         _in, _out = reference_widths()
         n_in = _in if n_in is None else n_in
         n_out = _out if n_out is None else n_out
-    return (n_in * n_h1 + n_h1) + (n_h1 * n_h2 + n_h2) + (n_h2 * n_out + n_out)
+    # Layers beyond the second are n_h2 -> n_h2 (see build_arch_leaf), so each
+    # contributes one square weight matrix plus a bias row. n_hidden=2 leaves
+    # the term at zero and the expression is the original one.
+    extra = (n_hidden - 2) * (n_h2 * n_h2 + n_h2)
+    return ((n_in * n_h1 + n_h1) + (n_h1 * n_h2 + n_h2) + extra
+            + (n_h2 * n_out + n_out))
 
 
 class _LazyWeightCount:
@@ -537,7 +542,7 @@ int ipa_switch_template(struct xdp_md *ctx) {
 }
 """
 
-EBPF_ARCH_GENERIC_2LAYER = r"""
+_ARCH_LEAF_TEMPLATE = r"""
 /* No T2_N_IN / T2_N_OUT here any more. They were 65 and 7 -- the Germany50
  * feature sum and the reference model's class count -- and neither was read by
  * a single line of this program: the input layout comes from model_desc and
@@ -760,7 +765,10 @@ int arch_generic_2layer(struct xdp_md *ctx) {
      * long long, not u32: scale**2 with a 16-bit scale would overflow. */
     long long bias_mul_1 = 1LL;
     long long bias_mul_2 = (long long)scale;
-    long long bias_mul_3 = (long long)scale * (long long)scale;
+    /* Layer L's products carry scale**L while a bias stored the same way
+     * carries scale**1, so layer L's bias needs scale**L. The output layer is
+     * layer n_hidden, hence scale to the power of the COMPILED depth. */
+    long long bias_mul_3 = /*@BIAS_OUT@*/(long long)scale * (long long)scale;
 
     __u32 n_h1 = entry->n_h1;
     __u32 n_h2 = entry->n_h2;
@@ -784,7 +792,10 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     __u32 fc1_b_off = n_in * n_h1;
     __u32 fc2_w_off = fc1_b_off + n_h1;
     __u32 fc2_b_off = fc2_w_off + n_h1 * n_h2;
-    __u32 out_w_off = fc2_b_off + n_h2;
+    /* out_w_off skips the EXTRA hidden layers (if this leaf was built with
+     * any): each is n_h2 -> n_h2, so weights + bias = n_h2*n_h2 + n_h2. With
+     * no extra layers the term is zero and this is the original expression. */
+    __u32 out_w_off = fc2_b_off + n_h2 + /*@EXTRA_SPAN@*/0;
     __u32 out_b_off = out_w_off + n_h2 * n_out;
 
     /* ONE bound check for this model's whole weight block, replacing the ~139
@@ -955,6 +966,7 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         h2[j] = RELU(acc);
     }
 
+/*@EXTRA_LAYERS@*/
     /* Same trick: h2[i]==0 for i>=n_h2, so the output loop is always
      * unrolled to T2_MAX_H2 regardless of this model's actual n_h2. */
     /* Sentinel must be LOWER than any reachable logit, otherwise a model whose
@@ -1046,12 +1058,95 @@ int arch_generic_2layer(struct xdp_md *ctx) {
 """
 
 
+# ---------------------------------------------------------------------------
+# Compiled depth: how many hidden layers this leaf can run
+# ---------------------------------------------------------------------------
+# P2's genericity is a set of COMPILE-TIME envelopes -- T2_MAX_H1, T2_MAX_H2,
+# MAX_N_IN, MAX_N_OUT -- inside which any model runs with no recompilation.
+# Depth used to be the one dimension that was not an envelope but a constant:
+# the source wrote fc1 and fc2 and stopped, so a 3-hidden-layer model had
+# nowhere to go.
+#
+# build_arch_leaf(n_hidden) makes depth an envelope like the others. It emits
+# (n_hidden - 2) additional dense blocks after fc2, each n_h2 -> n_h2.
+#
+# Two honest limits, both different from P3's:
+#
+#   1. The extra layers are all n_h2 wide. fc1 and fc2 keep independent widths
+#      (n_h1, n_h2) exactly as before, so every existing model -- including the
+#      65-6-5-7 in verify_multi_model -- is unaffected. A model whose layers
+#      have different widths beyond the second does not fit.
+#   2. A leaf built for n_hidden runs models of EXACTLY that depth. Changing
+#      depth means recompiling, which is precisely what P3 does not need. That
+#      is the trade-off the depth axis of bench_scaling.py measures: P2 buys
+#      depth with a recompile and with instructions paid on every packet,
+#      P3 buys it with a tail call.
+#
+# n_hidden=2 reproduces the previous source exactly: the extra-span term is 0,
+# the bias multiplier is scale**2, and no block is inserted.
+T2_MIN_HIDDEN = 2
+
+
+def build_arch_leaf(n_hidden: int = 2) -> str:
+    """The arch_generic_2layer leaf source, compiled for `n_hidden` hidden
+    layers. See the comment above for what that does and does not buy."""
+    if n_hidden < T2_MIN_HIDDEN:
+        raise ValueError(
+            f"build_arch_leaf: n_hidden={n_hidden}; P2's leaf always has fc1 "
+            f"and fc2, so {T2_MIN_HIDDEN} is the minimum. For a shallower "
+            f"model use Pipeline 1 or 3.")
+    n_extra = n_hidden - 2
+
+    span = ("0" if n_extra == 0
+            else f"{n_extra}U * (n_h2 * n_h2 + n_h2)")
+    bias_out = " * ".join(["(long long)scale"] * n_hidden)
+
+    blocks = []
+    for e in range(n_extra):
+        w_off = f"fc2_b_off + n_h2 + {e}U * (n_h2 * n_h2 + n_h2)"
+        bias_mul = " * ".join(["(long long)scale"] * (2 + e))
+        blocks.append(f"""
+    /* extra hidden layer {e + 1} of {n_extra}: n_h2 -> n_h2, dense.
+     * Computed into a scratch row and copied back into h2, so the output
+     * layer below needs no knowledge of how deep this leaf was built. */
+    {{
+        __u32 xw_off = {w_off};
+        __u32 xb_off = xw_off + n_h2 * n_h2;
+        long long hx[T2_MAX_H2];
+        #pragma unroll
+        for (int j = 0; j < T2_MAX_H2; j++) {{
+            if (j >= n_h2) {{ hx[j] = 0LL; continue; }}
+            long long acc = AW_W(AW, woff + xb_off + j) * ({bias_mul});
+            #pragma unroll
+            for (int i = 0; i < T2_MAX_H2; i++)
+                acc += h2[i] * AW_W(AW, woff + xw_off + j * n_h2 + i);
+            hx[j] = RELU(acc);
+        }}
+        #pragma unroll
+        for (int j = 0; j < T2_MAX_H2; j++) h2[j] = hx[j];
+    }}""")
+
+    src = _ARCH_LEAF_TEMPLATE
+    src = src.replace("/*@EXTRA_SPAN@*/0", span)
+    src = src.replace("/*@BIAS_OUT@*/(long long)scale * (long long)scale",
+                      bias_out)
+    src = src.replace("/*@EXTRA_LAYERS@*/", "".join(blocks))
+    return src
+
+
+# The historical name, kept so every existing caller is untouched. It is the
+# 2-hidden-layer leaf, which is byte-for-byte what the source said before
+# depth became a parameter.
+EBPF_ARCH_GENERIC_2LAYER = build_arch_leaf(2)
+
+
+
 def load_arch_weights(bpf_obj, weights_int8: list,
                       model_id: int = 0, scale: int = 128,
                       weight_offset: int = 0,
                       n_h1: int = 4, n_h2: int = 4,
                       features: list = None, n_in: int = None,
-                      semantics=None) -> None:
+                      semantics=None, n_hidden: int = 2) -> None:
     """
     Populate arch_weights and arch_registry for Pipeline 2.
 
@@ -1114,7 +1209,14 @@ def load_arch_weights(bpf_obj, weights_int8: list,
             f"descriptor's output width is {reference_widths()[1]}. Descriptor "
             f"and model must agree before either reaches the datapath.")
 
-    n_weights = arch_weight_count(n_h1, n_h2, n_in, semantics.n_out)
+    # n_hidden MUST match the depth the leaf was compiled for: the datapath
+    # reads a fixed number of blocks out of this flat vector, so a mismatch
+    # does not fail, it silently reads the wrong bytes as weights. There is no
+    # runtime field to check it against -- arch_entry carries widths, not
+    # depth -- so the caller is responsible for passing the same number it
+    # passed to build_arch_leaf().
+    n_weights = arch_weight_count(n_h1, n_h2, n_in, semantics.n_out,
+                                  n_hidden=n_hidden)
     arch_id   = 0
     map_fd    = bpf_obj["arch_weights"].map_fd
 
