@@ -241,6 +241,41 @@ def variants(src):
             out.append(("zero merges", zero,
                         "the ttl ternary made an early exit too -- NO merged "
                         "value reaches the loop"))
+
+    # What actually distinguishes the one variant that loads:
+    #
+    #     __u8 model_id = (__u8)(*mp);        map read, u8 cast -- and it WORKS
+    #     __u32 _node   = <anything else>;    map read, u8 cast -- refused
+    #
+    # So it is not the provenance and not the cast. `_node = model_id` works
+    # because it is the SAME value the verifier is already tracking: one
+    # scalar, not two. Any independent _node is a second one, and the state
+    # space is the product.
+    #
+    # Which means the fix is to free state somewhere else. layer_first keeps
+    # two ceiling-sized vectors alive across the loop:
+    #
+    #     long long ls[IPA_MAX_IFACES];   /* 8 */
+    #     long long qs[IPA_MAX_QUEUES];   /* 8 */
+    #
+    # The checked-in descriptor declares NO queue feature -- its codes are
+    # 1,2,3,4 and queue_occupancy is 5 -- so those 8 slots are tracked for
+    # nothing. These variants shrink the ceilings and see whether the room
+    # that frees is what the node index needs.
+    for name, val in (("IPA_MAX_QUEUES", 1), ("IPA_MAX_QUEUES", 2),
+                      ("IPA_MAX_IFACES", 6)):
+        old = f"#define {name}  8"
+        if old in src:
+            out.append((f"{name}={val}",
+                        src.replace(old, f"#define {name}  {val}"),
+                        f"as-is with {name} cut from 8 to {val}"))
+
+    # And both at once: queues to 1, ifaces to the 6 the topology declares.
+    both = src.replace("#define IPA_MAX_QUEUES  8", "#define IPA_MAX_QUEUES  1")
+    both = both.replace("#define IPA_MAX_IFACES  8", "#define IPA_MAX_IFACES  6")
+    if both != src:
+        out.append(("both ceilings", both,
+                    "queues 8->1 and ifaces 8->6, as-is otherwise"))
     return out
 
 
