@@ -3683,6 +3683,17 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
     return full, clean
 
 
+def _knee_count(gen, rate_pps, fallback):
+    """Pacchetti per istanza per una finestra della durata bersaglio.
+
+    Senza generatore (o senza una stima del rate) resta il numero fisso che il
+    chiamante ha passato: e' il comportamento storico, e va tenuto perche'
+    `--delays` riproduce misure vecchie prese cosi'."""
+    if gen is None or rate_pps <= 0:
+        return fallback
+    return gen.window_count(rate_pps, gen.window_s)
+
+
 def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
               method, printer, max_delay=20000, steps=6, tg_devs=None,
               threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
@@ -3697,6 +3708,18 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
     in fondo esiste per accorgersene DOPO; find_saturation se ne accorge prima.
 
     Returns (peak_row, clean_row_or_None)."""
+    # `count` in ingresso e' il vecchio numero fisso di pacchetti, e a pieno
+    # rate non descrive niente: 200 000 pacchetti a 4,8 Mpps sono 0,04 s, cioe'
+    # l'avvio dei thread e basta. Misurato: ogni finestra a pieno rate usciva
+    # fra 0,057 e 0,109 s e veniva scartata come "troppo corta", con l'esito
+    # "nessuna misura utilizzabile" su tutte le pipeline, mentre --duration 1.0
+    # era stato chiesto esplicitamente.
+    #
+    # La finestra si dimensiona sul RATE BERSAGLIO: il generatore sa gia'
+    # quanto offre, e window_count() traduce pps + secondi in pacchetti per
+    # istanza. Cosi' --duration governa anche questa ricerca, com'e' sempre
+    # stato per find_saturation.
+    count = _knee_count(gen, gen.offered_estimate if gen else 0, count)
     full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone,
                          tg_devs, repeat, burst, xmit_mode, gen=gen,
                          threshold=threshold)
@@ -3747,7 +3770,13 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         mid = (lo + hi) // 2
         if mid in (lo, hi):
             break
-        r = measure_point(setup, rx_tab, fab, frame, mid, count, n_out,
+        # A ritardo `mid` il rate bersaglio e' noto in anticipo: 1e9/mid per
+        # istanza, moltiplicato per le istanze. Dimensionare la finestra su
+        # quello tiene la DURATA costante lungo tutta la bisezione, invece di
+        # farla allungare man mano che il rate scende.
+        step_pps = (1e9 / mid) * (gen.n_inst if gen else 1)
+        r = measure_point(setup, rx_tab, fab, frame, mid,
+                          _knee_count(gen, step_pps, count), n_out,
                           clone, tg_devs, repeat, burst, xmit_mode, gen=gen,
                           threshold=threshold)
         if r is None:
