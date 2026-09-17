@@ -142,7 +142,7 @@ def _bench_one(descriptor_name, dims, repeat):
     scale = 128
 
     src = build_combined_hardcoded_source(
-        models=[(0, weights, scale, list(range(2, 3)))],
+        models=[(0, weights, scale)],
         features=shape["features"], n_out=n_out, hidden_dims=dims)
     b = BPF(text=src)
     model_fn = b.load_func("model_0", BPF.XDP)
