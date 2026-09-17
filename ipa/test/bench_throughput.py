@@ -314,6 +314,33 @@ def pg_clear_threads(n):
             break                   # fewer threads than CPUs: nothing to clear
 
 
+def pg_add_device(dev, thread=0):
+    """Attacca `dev` al thread generatore `thread` e verifica che ci sia."""
+    pg_write(f"{PKTGEN_DIR}/kpktgend_{thread}", f"add_device {dev}")
+    d = f"{PKTGEN_DIR}/{dev}"
+    if not os.path.exists(d):
+        raise RuntimeError(
+            f"pktgen: {d} non esiste dopo `add_device {dev}`. "
+            f"L'interfaccia esiste ed e' UP? `ip link show {dev}`")
+    return d
+
+
+def pg_set_params(dev, pkt_size, count, delay, dst_ip="10.0.0.2",
+                  dst_mac="02:00:00:00:00:02"):
+    """Cambia i parametri di un device GIA' attaccato, senza staccarlo.
+
+    Separato da pg_configure perche' rimuovere e riaggiungere il device a ogni
+    punto di misura faceva fallire `add_device` con EBUSY -- la rimozione non e'
+    sincrona e il thread lo teneva ancora. Cambiare i parametri e' quello che
+    serviva fin dall'inizio."""
+    d = f"{PKTGEN_DIR}/{dev}"
+    for cmd in (f"count {count}", f"pkt_size {pkt_size}", f"delay {delay}",
+                f"dst {dst_ip}", f"dst_mac {dst_mac}",
+                "udp_src_min 1234", "udp_src_max 1234",
+                "udp_dst_min 9999", "udp_dst_max 9999"):
+        pg_write(d, cmd)
+
+
 def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0,
                  thread=0, burst=0, xmit_mode="start_xmit"):
     """Put one device on one generator thread and configure it.
@@ -581,11 +608,11 @@ LAT_DECLS_SRC = r"""
 BPF_PERCPU_ARRAY(ts_in, __u64, 1);
 /* 0 = quanti, 1 = somma ns, 2 = minimo, 3 = massimo */
 BPF_PERCPU_ARRAY(lat_acc, __u64, 4);
-/* Istogramma: LAT_BUCKETS celle da LAT_BUCKET_NS, piu' l'ultima che raccoglie
- * tutto quello che sfora. Serve per i PERCENTILI: media e massimo su una VM
- * non dicono niente -- misurato, media ~2000 ns con minimo 250 e massimo
- * 10,6 ms, cioe' un singolo valore enorme che trascina la media. */
-BPF_PERCPU_ARRAY(lat_hist, __u64, LAT_BUCKETS);
+/* Istogramma logaritmico: la cella i raccoglie [2^i, 2^(i+1)) ns. Serve per i
+ * PERCENTILI, perche' media e massimo su una VM non dicono niente -- misurato:
+ * media ~2000 ns con minimo 250 e massimo 10,6 ms, cioe' un singolo valore
+ * enorme che trascina la media. */
+BPF_PERCPU_ARRAY(lat_hist, __u64, LAT_BUCKETS);   /* log2: [2^i, 2^(i+1)) */
 """
 
 LAT_COUNTER_SRC = r"""
@@ -595,8 +622,8 @@ int xdp_lat_count(struct xdp_md *ctx) {
     __u64 *t0 = ts_in.lookup(&z);
     if (t0 && *t0 && now > *t0) {
         __u64 d = now - *t0;
-        __u32 bk = (__u32)(d / LAT_BUCKET_NS);
-        if (bk >= LAT_BUCKETS - 1) bk = LAT_BUCKETS - 1;
+        __u32 bk = bpf_log2l(d);
+        if (bk >= LAT_BUCKETS) bk = LAT_BUCKETS - 1;
         int bi = (int)bk;
         __u64 *hb = lat_hist.lookup(&bi); if (hb) *hb += 1;
         int k = 0;
@@ -617,11 +644,19 @@ LAT_STAMP = ("\n    { int _lz = 0; __u64 _lt = bpf_ktime_get_ns();\n"
 
 # Nome della funzione d'ingresso XDP per ciascun metodo: e' quella in cui
 # infilare il timestamp, ed e' quella che si attacca all'interfaccia.
-# 256 celle da 16 ns coprono 0-4 us con risoluzione sufficiente a separare
-# 228, 243 e 267 ns -- le differenze fra le pipeline sono di quell'ordine, e un
-# istogramma logaritmico le metterebbe tutte nello stesso bucket.
-LAT_BUCKETS = 256
-LAT_BUCKET_NS = 16
+# Istogramma LOGARITMICO, 40 celle: la cella i raccoglie [2^i, 2^(i+1)) ns,
+# quindi si copre da 1 ns a ~18 minuti.
+#
+# Il primo tentativo erano 256 celle lineari da 16 ns, scelte per separare 228
+# da 243 da 267 -- le differenze fra le pipeline sono di quell'ordine. Sbagliato
+# per la ragione opposta: quella finestra copre 4 us, e sotto carico p90 e p99
+# stanno molto piu' in alto, quindi venivano riportati come ">4us", cioe' non
+# riportati.
+#
+# La distinzione fine fra pipeline sta nel MINIMO, che e' esatto e non passa per
+# l'istogramma. I percentili servono a descrivere la coda sotto carico, e la'
+# la risoluzione logaritmica (1-2 us, 2-4 us, ...) e' quella giusta.
+LAT_BUCKETS = 40
 
 LAT_ENTRY = {
     "baseline": "xdp_baseline",
@@ -659,8 +694,7 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
             f"non trovo il punto d'ingresso '{anchor}' nel sorgente di "
             f"{method} (trovato {src.count(anchor)} volte). E' cambiata la "
             f"firma del dispatcher?")
-    defines = (f"#define LAT_BUCKETS {LAT_BUCKETS}\n"
-               f"#define LAT_BUCKET_NS {LAT_BUCKET_NS}\n")
+    defines = f"#define LAT_BUCKETS {LAT_BUCKETS}\n"
     src = src.replace(anchor,
                       defines + LAT_DECLS_SRC + "\n" + anchor + LAT_STAMP)
     return src + "\n" + LAT_COUNTER_SRC, weights, scale
@@ -748,18 +782,21 @@ def _read_lat(b):
     hist = b["lat_hist"]
     buckets = [sum(int(v) for v in hist[ct.c_int(i)])
                for i in range(LAT_BUCKETS)]
-    over = buckets[-1]
+    over = buckets[-1]          # oltre 2^39 ns: praticamente mai
 
     def pct(q):
-        """Il bordo superiore del bucket in cui cade il quantile q."""
+        """Il bordo SUPERIORE del bucket log2 in cui cade il quantile q.
+
+        Un bucket i copre [2^i, 2^(i+1)), quindi il valore riportato e' un
+        limite superiore: "il 99% sta sotto questa cifra". E' il modo in cui un
+        percentile da istogramma si legge, e va detto perche' il numero non e'
+        il percentile esatto ma il bordo che lo contiene."""
         target = q * n
         run = 0
         for i, c in enumerate(buckets):
             run += c
             if run >= target:
-                if i == LAT_BUCKETS - 1:
-                    return None          # oltre la portata dell'istogramma
-                return (i + 1) * LAT_BUCKET_NS
+                return 1 << (i + 1)
         return None
 
     return dict(n=n, lat_min_ns=(min(mins) if mins else 0),
@@ -803,6 +840,9 @@ def run_latency(method, model_path, frames, delays, count, threads,
         # quindi `campioni` e' esattamente RX. Riportarli separati avrebbe
         # significato due run e due stati della macchina per due numeri che
         # descrivono lo stesso evento.
+        # Aggiunto una volta per tutto il run: vedi pg_set_params.
+        pg_clear_threads(1)
+        pg_add_device(fab.ingress_peer, thread=0)
         hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>8s} {'RX':>8s} "
                f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
                f"{'min':>6s} {'p50':>6s} {'p90':>6s} {'p99':>7s}")
@@ -812,9 +852,11 @@ def run_latency(method, model_path, frames, delays, count, threads,
             for delay in delays:
                 b["lat_acc"].clear()
                 b["lat_hist"].clear()
-                pg_clear_threads(1)
-                pg_configure(fab.ingress_peer, frame, count, delay,
-                             dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02")
+                # Il device si aggiunge UNA volta (sopra) e poi si cambiano
+                # solo i parametri. Rimuoverlo e riaggiungerlo a ogni punto
+                # faceva fallire `add_device` con EBUSY: la rimozione non e'
+                # istantanea e il thread lo teneva ancora.
+                pg_set_params(fab.ingress_peer, frame, count, delay)
                 try:
                     tx, tx_pps, secs = pg_run_and_read([fab.ingress_peer])
                 except PktgenEmptyRun as e:
@@ -831,18 +873,26 @@ def run_latency(method, model_path, frames, delays, count, threads,
                 rx_pps = int(rx / secs)
                 # Il throughput sul filo conta il frame intero, non il payload.
                 mbps = round(rx * frame * 8 / secs / 1e6, 1)
-                loss = round(100.0 * (tx - rx) / tx, 3) if tx else 0.0
+                # RX > TX non e' una perdita negativa: sono pacchetti
+                # arrivati all'uscita che questo punto non ha trasmesso --
+                # residui in volo dal punto precedente, o traffico del kernel.
+                # Misurato: 100 256 contati su 100 000 inviati dopo un punto
+                # scartato. Riportarlo come -0,26% dava un numero senza senso.
+                excess = max(0, rx - tx)
+                loss = round(100.0 * max(0, tx - rx) / tx, 3) if tx else 0.0
 
                 def _f(v):
                     return f"{v:5d}n" if v is not None else "  >4us"
                 mark = GREEN if loss <= 0.1 else (RED if loss > 1 else YELLOW)
+                tag = f" {GREY}+{excess}{NC}" if excess else ""
                 print(f"  {frame:5d} {delay:6d} {tx:8d} {rx:8d} "
-                      f"{rx_pps:9d} {mbps:7.1f} {mark}{loss:7.2f}%{NC} "
+                      f"{rx_pps:9d} {mbps:7.1f} {mark}{loss:7.2f}%{NC}{tag} "
                       f"{_f(st['lat_min_ns'])} {_f(st['lat_p50_ns'])} "
                       f"{_f(st['lat_p90_ns'])} {_f(st['lat_p99_ns'])}")
                 rows.append(dict(method=method, frame=frame, delay=delay,
                                  tx=tx, rx=rx, tx_pps=tx_pps, rx_pps=rx_pps,
-                                 rx_mbps=mbps, loss_pct=loss, samples=rx, **{
+                                 rx_mbps=mbps, loss_pct=loss,
+                                 excess_rx=excess, samples=rx, **{
                                      k: st[k] for k in
                                      ("lat_min_ns", "lat_p50_ns",
                                       "lat_p90_ns", "lat_p99_ns",
