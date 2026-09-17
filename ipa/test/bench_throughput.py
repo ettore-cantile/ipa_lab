@@ -281,9 +281,27 @@ VALID_TOL = 0.10
 DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
 
 # Scala dei rate per --mode saturate: frazioni del rate CONSEGNATO a delay 0,
-# crescenti. Si parte sotto la capacita' stimata e si sale, e ogni gradino e'
-# confermato da piu' ripetizioni. Non e' una bisezione, ed e' voluto.
-SATURATE_LADDER = (0.50, 0.65, 0.80, 0.90, 0.97, 1.03, 1.10, 1.25)
+# DECRESCENTI. Si scende finche' un gradino esce pulito, poi si risale per
+# raffinare.
+#
+# La prima versione saliva (0.50, 0.65, 0.80, ...) e dava per scontato che
+# meta' della capacita' fosse pulita. Misurato: non lo e'. A 0.50 della
+# capacita' consegnata il device rifiutava ancora il 3-14%, i due gradini
+# successivi peggioravano, la ricerca si fermava e dichiarava "rumore della
+# macchina" su tutte e cinque le pipeline. La conclusione era sbagliata: il
+# rate pulito esisteva, stava solo piu' in basso di dove si guardava.
+#
+# La ragione fisica per cui bisogna scendere tanto: il ptr_ring di veth e' di
+# VETH_RING_SIZE (256) entry. Basta che il kernel thread NAPI venga preempted
+# per un istante perche' il ring trabocchi, e questo succede anche a rate medi.
+# Il rate "senza perdite" e' quindi molto sotto la capacita' di picco -- ed e'
+# proprio la differenza fra i due numeri che la RFC 2544 chiede di riportare.
+SATURATE_LADDER = (0.50, 0.35, 0.25, 0.15, 0.10, 0.05)
+
+# Quanti passi di raffinamento fra l'ultimo gradino sporco e il primo pulito.
+# Si usa la media GEOMETRICA, non l'aritmetica: fra 0.05 e 0.15 della capacita'
+# il punto interessante sta a 0.087, non a 0.10.
+SATURATE_REFINE = 2
 
 # Quanto deve salire il rate offerto perche' clone_skb/burst valgano la perdita
 # di rappresentativita'. Sotto questa soglia il parametro e' accettato dal
@@ -2909,6 +2927,74 @@ def _make_pair(rx, tx, rx_queues, tx_queues):
     return rx, tx, idx
 
 
+def rx_ring(dev):
+    """(attuale, massimo) delle entry della coda RX, secondo ethtool.
+
+    (None, None) se ethtool non c'e' o il device non espone i ringparam. Su
+    veth il ring vale VETH_RING_SIZE = 256 entry, ed e' piccolo: e' cio' che
+    trabocca quando il thread NAPI viene preempted per un istante, e quindi la
+    ragione per cui il rate senza perdite sta molto sotto la capacita' di
+    picco. Se il kernel espone set_ringparam si puo' alzare -- se non lo
+    espone, si dichiara e non si insiste."""
+    try:
+        p = subprocess.run(["ethtool", "-g", dev], capture_output=True,
+                           text=True, check=False)
+    except OSError:
+        return None, None
+    if p.returncode != 0:
+        return None, None
+    cur = mx = None
+    section = None
+    for line in p.stdout.splitlines():
+        low = line.lower()
+        if "pre-set maximums" in low:
+            section = "max"
+        elif "current hardware settings" in low:
+            section = "cur"
+        elif line.strip().upper().startswith("RX:"):
+            try:
+                val = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                continue
+            if section == "max" and mx is None:
+                mx = val
+            elif section == "cur" and cur is None:
+                cur = val
+    return cur, mx
+
+
+def set_rx_ring(dev, size):
+    """Prova ad allargare la coda RX. True se il kernel l'ha accettato.
+
+    Cambia cosa si misura, e va detto: un ring piu' grande assorbe il jitter
+    dello scheduler, quindi il rate senza perdite sale ma la latenza di coda
+    peggiora. E' la stessa manopola che si usa sulle NIC vere nei banchi RFC
+    2544, e come la' va dichiarata accanto al risultato."""
+    cur, mx = rx_ring(dev)
+    if cur is None:
+        info(f"{dev}: ethtool non espone i ringparam, la coda RX resta come "
+             f"il kernel l'ha fatta (su veth: 256 entry)")
+        return False
+    if mx and size > mx:
+        info(f"{dev}: ring RX chiesto {size} ma il massimo e' {mx}: uso {mx}")
+        size = mx
+    if cur == size:
+        return True
+    try:
+        p = subprocess.run(["ethtool", "-G", dev, "rx", str(size)],
+                           capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    if p.returncode != 0:
+        info(f"{dev}: ring RX non modificabile ({p.stderr.strip() or 'rifiutato'}"
+             f"), resta a {cur} entry")
+        return False
+    now, _ = rx_ring(dev)
+    info(f"{dev}: coda RX da {cur} a {now} entry -- assorbe il jitter dello "
+         f"scheduler, ma allunga la coda: la latenza sotto carico peggiora")
+    return True
+
+
 def make_tg_links(n, gen_queues=1, dut_queues=1):
     """`n` coppie veth, ognuna ingresso di un thread generatore in piu'.
 
@@ -3146,7 +3232,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit",
                threaded_napi=True, plan=None, topology="shared",
                diag_enabled=False, asked_pps=None, window_s=WINDOW_S,
-               warmup_s=DEFAULT_WARMUP_S, tune=False, search="ladder"):
+               warmup_s=DEFAULT_WARMUP_S, tune=False, search="ladder",
+               rx_ring_size=None):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -3178,6 +3265,9 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         _map_extra_ingress(setup, ing.ifindexes)
         info(f"pipeline agganciata a {', '.join(ing.dut_devs)} "
              f"(modo {xdp_mode or 'native'})")
+        if rx_ring_size:
+            for dev in ing.dut_devs:
+                set_rx_ring(dev, rx_ring_size)
 
         gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
         gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
@@ -3442,42 +3532,47 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         return full, clean
 
     base = float(full["rx_pps"])
-    steps = []
-    for frac in ladder:
-        rate = base * frac
-        if rate < 1000:
-            continue
+
+    def step(rate):
+        """Un gradino: misura, etichetta, stampa, e restituisce la riga."""
         r = measure_point(setup, rx_tab, fab, frame, gen.delay_for(rate),
                           gen.window_count(rate), n_out, gen.clone,
                           repeat=repeat, burst=gen.burst, xmit_mode=xmit_mode,
                           gen=gen, threshold=threshold, plan=plan, diag=diag)
         if r is None:
-            continue
+            return None
         r.update(method=method, phase="ricerca", clone_skb=gen.clone,
                  threads=gen.n_inst, asked_pps=int(rate))
         out_rows.append(r)
         printer(r)
-        steps.append(r)
-        # Due gradini sporchi di fila: si e' oltre il limite e continuare a
-        # salire misura solo quanto si butta.
-        if len(steps) >= 2 and all(s["loss_worst"] > threshold
-                                   for s in steps[-2:]):
-            break
+        return r
 
-    if not steps:
-        return full, None
-    steps.sort(key=lambda r: r["asked_pps"])
+    # --- DISCESA: si scende finche' un gradino esce pulito.
+    #     Non ci si ferma dopo due gradini sporchi -- scendere e' il punto:
+    #     il rate pulito sta sotto, e fermarsi prima significava dichiarare
+    #     "rumore" un limite che esiste ed e' misurabile.
     best = None
-    for s in steps:
-        if s["loss_worst"] > threshold:
-            break               # il primo sporco chiude la parte monotona
-        best = s
+    dirty_rate = None
+    for frac in ladder:
+        rate = base * frac
+        if rate < 1000:
+            break
+        r = step(rate)
+        if r is None:
+            continue
+        if r["loss_worst"] <= threshold:
+            best = r
+            break
+        dirty_rate = rate       # l'ultimo rate che ancora perdeva
+
     if best is None:
+        lowest = base * ladder[-1]
         print(f"  {RED}nessun rate a perdita nulla determinabile{NC}{GREY}: si "
-              f"perde gia' al gradino piu' basso ({steps[0]['asked_pps']} "
-              f"pps offerti, {steps[0]['loss_worst']:.2f}%), cioe' molto sotto "
-              f"la capacita' misurata a pieno rate. La perdita qui non dipende "
-              f"dal rate: e' rumore della macchina.{NC}")
+              f"perde anche a {int(lowest)} pps chiesti, cioe' al "
+              f"{ladder[-1]:.0%} della capacita' di picco. A quel punto la "
+              f"perdita non dipende piu' dal rate: e' jitter della macchina "
+              f"(il ring di veth trabocca quando il thread NAPI viene "
+              f"preempted), non saturazione del datapath.{NC}")
         noisy = dict(full)
         noisy.update(phase="rumore", gen_bound=0)
         tag, why = classify_bottleneck(noisy, threshold=threshold, plan=plan,
@@ -3485,14 +3580,35 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         noisy["bottleneck"], noisy["bottleneck_why"] = tag, why
         out_rows.append(noisy)
         return full, None
+
+    # --- RAFFINAMENTO: il limite sta fra l'ultimo sporco e il primo pulito.
+    #     Media geometrica e non aritmetica: fra 0.05 e 0.15 della capacita'
+    #     il punto di mezzo interessante e' 0.087, non 0.10.
+    if dirty_rate is not None:
+        lo = float(best["asked_pps"])
+        hi = float(dirty_rate)
+        for _ in range(SATURATE_REFINE):
+            mid = (lo * hi) ** 0.5
+            if mid <= lo * 1.02 or mid >= hi * 0.98:
+                break           # i due estremi sono gia' indistinguibili
+            r = step(mid)
+            if r is None:
+                break
+            if r["loss_worst"] <= threshold:
+                best, lo = r, mid
+            else:
+                hi = mid
+
     clean = dict(best)
     clean.update(phase="zero-perdite", gen_bound=0)
     out_rows.append(clean)
+    frac = (clean["rx_pps"] / base) if base else 0.0
     print(f"  {GREEN}limite senza perdite{NC}{GREY}: {clean['rx_pps']} pps "
           f"consegnati con {clean['asked_pps']} chiesti, perdita "
-          f"{clean['loss_worst']:.2f}% su {clean['repeat']} finestre. Il "
-          f"gradino successivo perde: e' saturazione della pipeline, non del "
-          f"generatore.{NC}")
+          f"{clean['loss_worst']:.2f}% su {clean['repeat']} finestre -- il "
+          f"{frac:.0%} della capacita' di picco ({int(base)} pps). I due "
+          f"numeri sono diversi di proposito: il picco e' un sistema in "
+          f"sovraccarico, questo e' il rate che regge senza buttare nulla.{NC}")
     return full, clean
 
 
@@ -3657,7 +3773,8 @@ def run_compare(methods, model_path, frames, asked_pps=None,
                 repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS, plan=None,
                 topology="shared", xmit_mode="start_xmit",
                 threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
-                warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0):
+                warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0,
+                rx_ring_size=None):
     """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
@@ -3693,6 +3810,9 @@ def run_compare(methods, model_path, frames, asked_pps=None,
         xdp_mode = "generic" if rx_side else None
         for setup in loaded.values():
             _map_extra_ingress(setup, ing.ifindexes)
+        if rx_ring_size:
+            for dev in ing.dut_devs:
+                set_rx_ring(dev, rx_ring_size)
         gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
         gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
                         topology=ing.topology, clone=clone, burst=burst,
@@ -4077,6 +4197,14 @@ def main():
                         "--latency parte da ZERO STRETTO; gli altri da "
                         f"{DEFAULT_LOSS_THRESHOLD}%%, che e' il pacchetto "
                         "perso ogni tanto da una VM condivisa.")
+    m.add_argument("--rx-ring", type=int, default=None, metavar="N",
+                   help="allarga la coda RX del device d'ingresso a N entry "
+                        "(ethtool -G). Su veth il default e' 256, e quel ring "
+                        "trabocca appena il thread NAPI viene preempted: e' la "
+                        "causa dei rifiuti a rate medi. Alzarlo fa salire il "
+                        "rate senza perdite e peggiora la latenza di coda -- "
+                        "va dichiarato accanto al risultato. Se il kernel non "
+                        "espone i ringparam per veth, lo si dice e si prosegue.")
     m.add_argument("--search", choices=("ladder", "bisect"), default="ladder",
                    help="come cercare il punto di saturazione. ladder "
                         "(default) sale per gradini e verifica la monotonia; "
@@ -4208,7 +4336,7 @@ def main():
             topology=a.gen_topology, xmit_mode=a.xmit_mode,
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
-            burst=a.burst)
+            burst=a.burst, rx_ring_size=a.rx_ring)
         rc |= check_validity(rows)
         if a.out and (rows or raw):
             os.makedirs(a.out, exist_ok=True)
@@ -4229,7 +4357,7 @@ def main():
                          topology=a.gen_topology, diag_enabled=a.diag,
                          asked_pps=a.offered_pps, window_s=a.duration,
                          warmup_s=a.warmup, tune=a.tune_generator,
-                         search=a.search)
+                         search=a.search, rx_ring_size=a.rx_ring)
 
     # Il confronto si fa sulle righe a perdita nulla, non su quelle a pieno
     # rate: a pieno rate si confrontano sistemi in sovraccarico.
