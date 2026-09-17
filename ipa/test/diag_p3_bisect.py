@@ -114,6 +114,87 @@ def try_load(src_text, label):
     return True, f"loaded, {n} instructions" if n else "loaded"
 
 
+# --------------------------------------------------------------------------
+# Variants of the CURRENT source
+# --------------------------------------------------------------------------
+# The bisect narrowed the break to one commit, which added two things at once:
+# the node_id_t3 map DECLARATION, and a lookup of it inside layer_first. The
+# lookup has since moved to the dispatcher and layer_first no longer has one --
+# and the program is still refused. So the declaration and the use have to be
+# tested separately, which is what these do: each is a textual edit of the
+# working tree, loaded in isolation.
+
+def _drop_block(src, start_marker, end_marker):
+    """Remove src[start..end], markers included. Returns (src, removed?)."""
+    i = src.find(start_marker)
+    if i < 0:
+        return src, False
+    j = src.find(end_marker, i)
+    if j < 0:
+        return src, False
+    return src[:i] + src[j + len(end_marker):], True
+
+
+def variants(src):
+    """(label, source, note) for each thing worth isolating."""
+    out = [("as-is", src, "the working tree, unchanged")]
+
+    # no use: the dispatcher stops reading node_id_t3, so the node half of the
+    # packed slot is always the unknown sentinel. The map is still declared.
+    no_use, ok = _drop_block(
+        src,
+        "      __u32 _nz = 0;",
+        "__u32 _nd = (_nid && *_nid < 0xffU) ? *_nid : 0xffU;")
+    if ok:
+        no_use = no_use.replace(
+            "      long long v = (long long)((_nd << 16) | _port);",
+            "      long long v = (long long)((0xffU << 16) | _port);")
+        out.append(("no use", no_use,
+                    "map declared, never read -- isolates the DECLARATION"))
+
+    # no map at all: declaration gone too.
+    no_map = (no_use if ok else src)
+    for decl in ("BPF_HASH(node_id_t3, __u32, __u32, 1);",
+                 "BPF_ARRAY(node_id_t3, __u32, 1);"):
+        no_map = no_map.replace(decl, "")
+    if no_map != (no_use if ok else src):
+        out.append(("no map", no_map,
+                    "declaration removed as well -- isolates the MAP itself"))
+
+    # the node index back where it came from, everything else kept.
+    from_model = src
+    i = from_model.find("    int mctx = META_NODE_CTX;")
+    if i >= 0:
+        j = from_model.find("__u32 _node      = (_ctx >> 16) & 0xffU;", i)
+        if j >= 0:
+            j += len("__u32 _node      = (_ctx >> 16) & 0xffU;")
+            from_model = (from_model[:i] +
+                          "    int mif = META_NODE_CTX;\n"
+                          "    long long *ifp = scratch_meta.lookup(&mif);\n"
+                          "    __u32 _raw_iface = ifp ? ((__u32)(*ifp) & 0xffffU) : 0;\n"
+                          "    __u32 _node = (__u32)model_id;" +
+                          from_model[j:])
+            out.append(("node=model_id", from_model,
+                        "the original node source, everything else kept"))
+    return out
+
+
+def run_variants():
+    src = open(os.path.join(REPO, "ipa/ebpf_modular.py"), encoding="utf-8").read()
+    print(f"{YELLOW}{'=' * 74}{NC}")
+    print(f"{YELLOW} Variants of the working tree: what exactly does it not tolerate?{NC}")
+    print(f"{YELLOW}{'=' * 74}{NC}\n")
+    for label, text, note in variants(src):
+        ok, detail = try_load(text, "var_" + label)
+        mark = f"{GREEN}LOADS  {NC}" if ok else f"{RED}refused{NC}"
+        print(f"  {label:14s} {mark} {detail}")
+        print(f"                 {note}")
+    print()
+    print("  Read it as: the first variant that loads names the thing that "
+          "does not fit. If none load, nothing in this file is the cause.")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("    sudo")[0].strip(),
@@ -123,12 +204,18 @@ def main():
                         "last commits that touched ebpf_modular.py, plus the "
                         "working tree")
     p.add_argument("--limit", type=int, default=12)
+    p.add_argument("--variants", action="store_true",
+                   help="instead of walking history, try edits of the CURRENT "
+                        "source that each remove one suspect")
     a = p.parse_args()
 
     if sys.platform != "linux":
         sys.exit(f"needs Linux, not {sys.platform}")
     if os.geteuid() != 0:
         sys.exit("needs root: sudo python3 ipa/test/diag_p3_bisect.py")
+
+    if a.variants:
+        return run_variants()
 
     rel = "ipa/ebpf_modular.py"
     print(f"{YELLOW}{'=' * 74}{NC}")
