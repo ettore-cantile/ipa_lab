@@ -69,17 +69,31 @@ prima di eseguire il programma. E' il costo di "XDP su veth alimentato da un
 mittente non XDP" e nessun parametro di pktgen lo elimina.
 
 --------------------------------------------------------------------------
-TRE PUNTI DI CONTEGGIO, PERCHE' "PERSI" NON BASTA
+QUATTRO PUNTI DI CONTEGGIO, E IL QUARTO E' QUELLO CHE MANCAVA
 --------------------------------------------------------------------------
-  TX   quanti pktgen ne ha trasmessi          (dai suoi contatori)
-  HIT  quanti la pipeline ne ha elaborati     (pkt_stats[0])
-  RX   quanti sono arrivati a destinazione    (il contatore XDP sull'uscita)
+  OFFERTI   quanti ne sono stati presentati al device   (TX + RIFIUTATI)
+  RIFIUTATI quanti il device non ha preso               (pktgen `errors`)
+  TX        quanti sono finiti sul filo                 (`pkts-sofar`)
+  HIT       quanti la pipeline ne ha elaborati          (pkt_stats[0])
+  RX        quanti sono arrivati a destinazione         (contatore XDP d'uscita)
 
-TX - HIT e' quello che non e' nemmeno arrivato al programma (coda del veth,
-softirq). HIT - RX e' quello che il programma ha elaborato ma non e' uscito
-(redirect fallito, oppure la classe scelta era DROP). Un solo numero di
-"perdita" confonderebbe cose diverse -- e con esse confonderebbe il collo di
-bottiglia, che e' cio' che questo banco deve identificare.
+I RIFIUTATI sono il punto. `veth_xmit` restituisce NET_XMIT_DROP quando il
+ptr_ring della RX del peer e' pieno; pktgen allora incrementa `errors` e NON
+incrementa `pkts-sofar`. Quel pacchetto e' stato offerto al DUT e il DUT non
+l'ha preso: e' perdita, ed e' perdita d'INGRESSO del DUT.
+
+Contando la perdita sul solo TX, quei pacchetti sparivano da entrambi i lati
+della frazione e ogni riga usciva "perdita 0.00%, il limite e' il generatore".
+Misurato su questo banco: TX 1 428 722 con 1 470 888 rifiutati -- il 51%
+dell'offerto -- riportato come zero, mentre la CPU del DUT era al 100%.
+
+Quindi qui la perdita e' (OFFERTI - RX) / OFFERTI, e la colonna `rifiut`
+sta accanto a ogni riga. La vecchia definizione resta nel CSV come
+`loss_pct_tx`, ma non e' quella che descrive il datapath.
+
+OFFERTI - HIT e' quello che non e' arrivato al programma (coda piena, softirq).
+HIT - RX e' quello che il programma ha elaborato ma non e' uscito (redirect
+fallito, oppure la classe scelta era DROP).
 
 --------------------------------------------------------------------------
 IL BYTE CHE FA FALLIRE TUTTO IN SILENZIO
@@ -214,7 +228,22 @@ DEFAULT_ROUNDS = 3
 # Uno schema alternativo -- `count 0` e `stop` scritto da un thread dopo T
 # secondi -- darebbe la durata esatta, ma se lo stop fallisce pktgen trasmette
 # per sempre e il run si pianta. Scartato per quello.
-WINDOW_S = 0.30
+#
+# 0.50 e non 0.30: a 0.30 l'avvio dei thread pesava troppo sulla finestra e le
+# due istanze finivano in momenti diversi -- misurato uno scarto del 45% fra la
+# piu' lunga e la piu' corta, che rende il rate aggregato una media su periodi
+# che non coincidono.
+WINDOW_S = 0.50
+
+# Pausa fra una finestra e l'azzeramento dei contatori della successiva. Serve
+# a far svuotare le code veth: senza, i pacchetti della finestra precedente
+# venivano contati in quella nuova e uscivano righe con RX > TX.
+SETTLE_S = 0.05
+
+# Sopra questa percentuale di pacchetti RIFIUTATI dal device (pktgen `errors`,
+# cioe' NET_XMIT_DROP di veth_xmit a ptr_ring pieno) il DUT sta facendo
+# backpressure: la sua coda d'ingresso e' piena, quindi e' saturo. Vedi GenRun.
+GEN_BACKPRESSURE_PCT = 0.5
 
 # Warm-up: una finestra buttata via PRIMA della misura. La prima raffica paga
 # cache fredde, la prima allocazione delle code e l'avvio dei thread, e non
@@ -224,7 +253,7 @@ DEFAULT_WARMUP_S = 0.10
 
 # Sotto questo numero di pacchetti la finestra e' troppo corta perche' i
 # percentili vogliano dire qualcosa, anche se il tempo sarebbe sufficiente.
-MIN_WINDOW_PKTS = 20000
+MIN_WINDOW_PKTS = 50000
 
 # ... e sopra questo numero un punto a rate alto durerebbe molto piu' della
 # finestra bersaglio senza aggiungere informazione. Tiene prevedibile il run.
@@ -857,6 +886,36 @@ class GenRun(tuple):
         sommare i pps per-istanza li somma su finestre che non coincidono."""
         return int(self.tx / self.secs) if self.secs else 0
 
+    # ----------------------------------------------------------------------
+    # OFFERTO != TRASMESSO, ed e' il numero che mancava
+    # ----------------------------------------------------------------------
+    # `pkts-sofar` conta solo i pacchetti che il device ha ACCETTATO. Quando
+    # veth_xmit trova pieno il ptr_ring della RX del peer butta il pacchetto e
+    # restituisce NET_XMIT_DROP; pktgen allora incrementa `errors` e NON
+    # incrementa sofar.
+    #
+    # Quel pacchetto e' stato offerto al DUT e il DUT non l'ha preso: e'
+    # perdita, e per di piu' e' perdita d'INGRESSO del DUT. Contando solo
+    # sofar spariva dalle due parti dell'equazione, e ogni riga usciva
+    # "perdita 0.00%, limite = generatore" mentre il DUT ne buttava meta'.
+    # Misurato sul banco: tx=1 428 722 con errors=1 470 888, cioe' il 51% di
+    # cio' che e' stato offerto, riportato come zero.
+    @property
+    def offered(self):
+        return self.tx + self.errors
+
+    @property
+    def offered_pps(self):
+        return int(self.offered / self.secs) if self.secs else 0
+
+    @property
+    def busy_pct(self):
+        """Quanta parte dell'offerto il device ha rifiutato. E' la spia della
+        BACKPRESSURE: sopra qualche decimo di percento la coda RX del DUT e'
+        piena, e quindi il DUT e' saturo anche se non si perde nulla dopo."""
+        return (round(100.0 * self.errors / self.offered, 3)
+                if self.offered else 0.0)
+
 
 def pg_run_and_read(devs):
     """Start every configured thread, wait, and sum what they sent.
@@ -969,7 +1028,8 @@ class Generator:
         self.window_s = window_s
         self.warmup_s = warmup_s
         self.caps = GenCaps()
-        self.rate_estimate = 0          # pps aggregati a delay 0, da calibrate
+        self.rate_estimate = 0          # pps ACCETTATI a delay 0, da calibrate
+        self.offered_estimate = 0       # pps OFFERTI (rifiutati inclusi)
         self.last_run = None            # l'ultima finestra, per la diagnostica
         self.instances = []             # [{name, dev, cpu, queue_map}]
         self._build_instances()
@@ -1154,7 +1214,16 @@ class Generator:
         seconds = self.window_s if seconds is None else seconds
         self.warmup(frame, 0, min(self.warmup_s, seconds))
         r = self.timed_run(frame, 0, seconds)
+        # Due stime diverse, e servono a due cose diverse:
+        #   rate_estimate     pacchetti ACCETTATI al secondo. Dimensiona le
+        #                     finestre, perche' `count` di pktgen conta i
+        #                     riusciti: a coda piena il generatore ritenta e la
+        #                     finestra si allunga.
+        #   offered_estimate  pacchetti OFFERTI al secondo, rifiutati inclusi.
+        #                     E' il tetto vero del generatore, ed e' la cifra
+        #                     rispetto a cui si giudica se il limite e' suo.
         self.rate_estimate = r.tx_pps_aggregate
+        self.offered_estimate = r.offered_pps
         return r
 
     # -- ricerca automatica della configurazione del generatore ------------
@@ -1173,7 +1242,9 @@ class Generator:
         non fa altro: e' il caso normale di questo banco."""
         seconds = self.window_s if seconds is None else seconds
         base = self.calibrate(frame, seconds)
-        best = base.tx_pps_aggregate
+        # Il guadagno di una manopola si misura sull'OFFERTO: se il DUT non
+        # prende, non e' colpa della manopola.
+        best = base.offered_pps
         chosen = dict(clone=0, burst=0)
         if verbose:
             info(f"generatore a delay 0, condizione di riferimento: "
@@ -1183,7 +1254,7 @@ class Generator:
                 note("nessuna manopola disponibile su questo device: il carico "
                      "offerto si alza solo con i thread (ne ho "
                      f"{self.n_inst}).")
-            self.rate_estimate = best
+            self.offered_estimate = best
             return chosen
         trials = []
         if self.caps.clone:
@@ -1201,7 +1272,7 @@ class Generator:
                 warn(f"{knob}={value} ha rotto la generazione ({e}): scartato")
                 setattr(self, knob, old)
                 continue
-            got = r.tx_pps_aggregate
+            got = r.offered_pps
             gain = (got - best) / best if best else 0.0
             if gain >= GEN_KNOB_MIN_GAIN:
                 chosen[knob] = value
@@ -1217,7 +1288,7 @@ class Generator:
         # Riapplica la configurazione scelta (il ciclo puo' averla cambiata).
         for inst in self.instances:
             self._apply_knobs(inst)
-        self.rate_estimate = best
+        self.offered_estimate = best
         return chosen
 
 
@@ -1489,6 +1560,7 @@ def classify_bottleneck(row, threshold=DEFAULT_LOSS_THRESHOLD, plan=None,
     loss = row.get("loss_worst", row.get("loss_pct", 0.0)) or 0.0
     before = row.get("lost_before")
     after = row.get("lost_after")
+    busy = row.get("gen_busy_pct", 0.0) or 0.0
     g_load, d_load = gen_cpu_load(diag_data, plan)
     tail = ""
     if g_load is not None and d_load is not None:
@@ -1497,6 +1569,14 @@ def classify_bottleneck(row, threshold=DEFAULT_LOSS_THRESHOLD, plan=None,
     if noisy:
         return BN_NOISE, ("la perdita non cresce col rate: e' rumore della "
                           "macchina, non saturazione" + tail)
+    # BACKPRESSURE prima di tutto il resto. Se il device ha RIFIUTATO una parte
+    # dell'offerto, la sua coda d'ingresso era piena: il DUT e' saturo, e non
+    # importa che cio' che e' entrato sia poi uscito tutto. Questa condizione
+    # era invisibile e faceva dichiarare "generatore" su ogni riga.
+    if busy > GEN_BACKPRESSURE_PCT:
+        return BN_IN, (f"il device ha rifiutato il {busy}% dell'offerto "
+                       f"(coda RX piena, NET_XMIT_DROP): il DUT non sta "
+                       f"dietro, ed e' saturo lui, non il generatore" + tail)
     if loss <= threshold:
         if g_load is not None and g_load >= CPU_BUSY_PCT and (
                 d_load is None or d_load < CPU_BUSY_PCT):
@@ -1535,11 +1615,21 @@ def report_generator(gen):
     print(f"{YELLOW}  -- generatore, ultima finestra --{NC}")
     cpu_of = {i["name"]: i["cpu"] for i in gen.instances}
     for d in r.per_dev:
+        off = d["tx"] + d["errors"]
+        pct = (100.0 * d["errors"] / off) if off else 0.0
         print(f"    {d['dev']:16s} cpu{cpu_of.get(d['dev'], '?'):<3} "
               f"tx={d['tx']:>9d} {d['pps']:>9d} pps  {d['secs']:>6.3f} s  "
-              f"errori={d['errors']}")
+              f"rifiutati={d['errors']:>9d} ({pct:.1f}%)")
     print(f"    {'AGGREGATO':16s}     tx={r.tx:>9d} "
-          f"{r.tx_pps_aggregate:>9d} pps  {r.secs:>6.3f} s")
+          f"{r.tx_pps_aggregate:>9d} pps  {r.secs:>6.3f} s  "
+          f"offerti={r.offered} ({r.offered_pps} pps), "
+          f"rifiutati={r.busy_pct}%")
+    if r.busy_pct > GEN_BACKPRESSURE_PCT:
+        # Non e' un difetto del generatore: e' il DUT che non prende. Qui sta
+        # la saturazione che il banco prima non vedeva.
+        warn(f"il device ha respinto il {r.busy_pct}% dell'offerto (coda RX "
+             f"piena): il DUT non sta dietro. Questa e' perdita d'ingresso, "
+             f"non capacita' mancante del generatore.")
     if r.skew_pct > 20.0:
         warn(f"le istanze non hanno lavorato nella stessa finestra "
              f"(scarto {r.skew_pct}% fra la piu' lunga e la piu' corta): il "
@@ -1636,9 +1726,22 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         # della strumentazione, e tenerlo faceva comparire righe con
         # TX == HIT == RX == 200000 marcate 100.00%, perche' la perdita
         # PEGGIORE delle tre ripetizioni veniva da una misura rotta.
-        if r["hit"] > 0 and r["rx"] == 0:
-            warn(f"misura scartata: {r['hit']} elaborati e 0 contati in "
-                 f"uscita -- contatore RX non aggiornato, non perdita")
+        if r["rx"] == 0 and r["tx"] > 0:
+            # Prima il filtro era `hit > 0 and rx == 0`, e lasciava passare il
+            # caso peggiore: una finestra in cui il programma non ha visto
+            # nulla (hit = 0) ma pktgen ha trasmesso. Quella finestra usciva
+            # con perdita 100%, diventava la PEGGIORE delle ripetizioni e
+            # marcava un punto per il resto identico agli altri. Misurato sul
+            # banco: una riga TX = HIT = RX = 959 552 etichettata 100.00%.
+            warn(f"misura scartata: {r['tx']} trasmessi, {r['hit']} elaborati "
+                 f"e 0 contati in uscita -- strumentazione, non perdita")
+            continue
+        if r["secs"] < WINDOW_SHORT_FRACTION * (
+                gen.window_s if gen is not None else WINDOW_S) * 0.5:
+            # Una finestra molto piu' corta del bersaglio e' dominata
+            # dall'avvio dei thread, e i suoi pps sono quelli dell'avvio.
+            warn(f"misura scartata: finestra di {r['secs']}s, troppo corta "
+                 f"per descrivere un regime")
             continue
         runs.append(r)
     diag_data = diag.stop() if diag is not None else {}
@@ -1698,6 +1801,13 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     e si cambiano solo i parametri del punto. Senza, si ricade sul percorso
     storico -- aggiungi, configura, misura -- che serve ai chiamanti che non
     hanno un Generator."""
+    # QUIESCENZA prima di azzerare. I pacchetti della finestra precedente sono
+    # ancora in volo nelle code veth e arrivano all'uscita DOPO lo zero: si
+    # sommavano alla finestra nuova e producevano RX > TX, cioe' righe con
+    # "perdita -0.1%" e, in ladder, gradini puliti per motivi sbagliati.
+    # Misurato sul banco: TX=833 293 HIT=834 041 RX=834 128.
+    if SETTLE_S > 0:
+        time.sleep(SETTLE_S)
     _zero_counters(setup, rx_tab, n_out)
     if gen is not None:
         run = gen.run(frame, count, delay)
@@ -1717,14 +1827,25 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     drop = _read_u64(setup["pkt_stats"], 2)
     rx = _percpu_sum(rx_tab)
     secs = elapsed if elapsed > 0 else 1e-9
-    # Il rate OFFERTO e' quello che pktgen ha chiesto al kernel; quello
-    # AGGREGATO e' il totale diviso la durata globale. Il secondo e' la cifra
-    # da usare: sommare i pps per-istanza li somma su finestre che non
-    # coincidono, e a thread sfasati gonfia il numero.
-    offered = int(1e9 / delay) * len(devs) if delay else None
+    # OFFERTO = accettati dal device + RIFIUTATI dal device. Vedi GenRun: i
+    # rifiutati sono i NET_XMIT_DROP di veth_xmit a coda RX piena, cioe'
+    # perdita d'ingresso del DUT, e contarli solo come `errors` li faceva
+    # sparire dalla perdita.
+    refused = getattr(run, "errors", 0)
+    offered_pkts = tx + refused
+    # Il rate CHIESTO e' quello che il delay impone; quello OFFERTO e' quello
+    # davvero presentato al device nella finestra. Si riportano entrambi,
+    # perche' a delay 0 il primo non esiste e a coda piena il secondo e'
+    # l'unico che descrive il carico.
+    asked = int(1e9 / delay) * len(devs) if delay else None
     return dict(frame=frame, delay=delay, secs=round(secs, 3),
                 tx=tx, tx_pps=run.tx_pps_aggregate or int(tx / secs),
-                tx_pps_sum=tx_pps, offered_pps=offered,
+                tx_pps_sum=tx_pps,
+                asked_pps=asked,
+                offered=offered_pkts,
+                offered_pps=(int(offered_pkts / secs) if secs else 0),
+                gen_refused=refused,
+                gen_busy_pct=getattr(run, "busy_pct", 0.0),
                 gen_threads=len(devs),
                 gen_skew_pct=getattr(run, "skew_pct", 0.0),
                 # Coerenza fra le due letture del rate offerto. Vedi GenRun:
@@ -1738,9 +1859,16 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 rx_pps=int(rx / secs),
                 # Throughput on the wire counts the frame, not the payload.
                 rx_mbps=round(rx * frame * 8 / secs / 1e6, 2),
-                lost_before=max(0, tx - hit),
+                # I rifiutati sono persi PRIMA del programma per definizione:
+                # non sono mai entrati nella coda da cui XDP legge.
+                lost_before=max(0, offered_pkts - hit),
                 lost_after=max(0, hit - rx),
-                loss_pct=round(100.0 * (tx - rx) / tx, 3) if tx else 0.0)
+                # La perdita e' sull'OFFERTO. La vecchia definizione (sul solo
+                # trasmesso) resta come loss_pct_tx per non rompere i CSV gia'
+                # raccolti, ma non e' quella che descrive il datapath.
+                loss_pct=(round(100.0 * (offered_pkts - rx) / offered_pkts, 3)
+                          if offered_pkts else 0.0),
+                loss_pct_tx=round(100.0 * (tx - rx) / tx, 3) if tx else 0.0)
 
 
 # ==========================================================================
@@ -2163,6 +2291,17 @@ def _detach(iface):
                    check=False, capture_output=True)
 
 
+# Il caricamento delle pipeline stampa decine di righe per metodo ([Pipeline2],
+# [class_action], una riga di attach per ogni peer): con 5 pipeline e 6 taglie
+# di frame la tabella dei risultati si perde in mezzo. Per default si zittisce
+# tutto cio' che non e' un risultato; --verbose lo riporta indietro.
+VERBOSE = False
+
+
+def _maybe_quiet():
+    return _noop() if VERBOSE else _quiet()
+
+
 def _noop():
     class _N:
         def __enter__(self):
@@ -2199,7 +2338,8 @@ def run_fair(methods, model_path, frames, delays, count, threads,
         loaded = {}
         for m in methods:
             try:
-                setup, lat_fn = _load_instrumented(m, model_path, fab, sem)
+                with _maybe_quiet():
+                    setup, lat_fn = _load_instrumented(m, model_path, fab, sem)
                 loaded[m] = (setup, lat_fn)
                 info(f"{m}: caricata")
             except Exception as e:
@@ -2431,13 +2571,22 @@ def _one_fair_point(b, fab, frame, delay, count, gen=None):
     if st is None:
         return None
     rx, secs = st["n"], (secs or 1e-9)
+    # Stessa correzione di _measure_once: l'offerto include i pacchetti che il
+    # device ha rifiutato a coda piena, che sono perdita d'ingresso del DUT.
+    refused = getattr(run, "errors", 0)
+    offered_pkts = tx + refused
     return dict(frame=frame, delay=delay, tx=tx, rx=rx, tx_pps=tx_pps,
                 rx_pps=int(rx / secs),
                 rx_mbps=round(rx * frame * 8 / secs / 1e6, 1),
                 secs=round(secs, 3), gen_threads=threads,
-                gen_skew_pct=skew,
-                offered_pps=(int(1e9 / delay) * threads if delay else None),
-                loss_pct=round(100.0 * max(0, tx - rx) / tx, 3) if tx else 0.0,
+                gen_skew_pct=skew, gen_refused=refused,
+                gen_busy_pct=getattr(run, "busy_pct", 0.0),
+                offered=offered_pkts,
+                offered_pps=int(offered_pkts / secs),
+                asked_pps=(int(1e9 / delay) * threads if delay else None),
+                loss_pct=(round(100.0 * max(0, offered_pkts - rx)
+                                / offered_pkts, 3) if offered_pkts else 0.0),
+                loss_pct_tx=round(100.0 * max(0, tx - rx) / tx, 3) if tx else 0.0,
                 excess_rx=max(0, rx - tx),
                 **{k: st[k] for k in ("lat_min_ns", "lat_p50_ns", "lat_p90_ns",
                                       "lat_p99_ns", "lat_avg_ns",
@@ -2986,7 +3135,7 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                clone=0, threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
                repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit",
                threaded_napi=True, plan=None, topology="shared",
-               diag_enabled=False, offered_pps=None, window_s=WINDOW_S,
+               diag_enabled=False, asked_pps=None, window_s=WINDOW_S,
                warmup_s=DEFAULT_WARMUP_S, tune=False, search="ladder"):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
@@ -3001,10 +3150,11 @@ def run_method(method, model_path, frames, delays, count, out_rows,
     rc = 0
     with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
         rx_side = (xmit_mode == "netif_receive")
-        rx_b, rx_tab, attached = attach_rx_counter(fab)
+        with _maybe_quiet():
+            rx_b, rx_tab, attached = attach_rx_counter(fab)
+            setup = build_pipeline(method, model_path, fab, sem)
         info(f"contatore RX su {len(attached)} peer d'uscita (XDP_DROP)")
 
-        setup = build_pipeline(method, model_path, fab, sem)
         ing = build_ingress(fab, plan, topology, rx_side)
         # netif_receive injects at netif_receive_skb, which is PAST the native
         # XDP hook: veth's native program runs in veth_poll, earlier. Attaching
@@ -3012,10 +3162,12 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         # HIT nor MISS, which is exactly what the probe reported. The generic
         # hook is the one on that path, so that is where the program has to go.
         xdp_mode = "generic" if rx_side else None
-        for dev in ing.dut_devs:
-            attach_xdp(setup["b"], setup["disp"], dev, mode=xdp_mode)
+        with _maybe_quiet():
+            for dev in ing.dut_devs:
+                attach_xdp(setup["b"], setup["disp"], dev, mode=xdp_mode)
         _map_extra_ingress(setup, ing.ifindexes)
-        info(f"pipeline agganciata a {', '.join(ing.dut_devs)}")
+        info(f"pipeline agganciata a {', '.join(ing.dut_devs)} "
+             f"(modo {xdp_mode or 'native'})")
 
         gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
         gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
@@ -3093,13 +3245,17 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             gen.tune(frames[0] if frames else 64)
         else:
             gen.calibrate(frames[0] if frames else 64)
-        info(f"tetto del generatore su questo banco: {gen.rate_estimate} pps "
-             f"offerti da {gen.n_inst} thread su cpu "
-             f"{','.join(str(c) for c in plan.gen)}")
+        info(f"tetto del generatore: {gen.offered_estimate} pps offerti da "
+             f"{gen.n_inst} thread su cpu "
+             f"{','.join(str(c) for c in plan.gen)}; di questi il device ne "
+             f"ha accettati {gen.rate_estimate} pps")
 
-        hdr = (f"  {'frame':>5s} {'offerto':>9s} {'TX':>9s} {'HIT':>9s} "
-               f"{'RX':>9s} {'RX pps':>9s} {'Mb/s':>8s} {'s':>5s} "
-               f"{'perdita':>8s} {'collo':>18s}")
+        # `off pps` e' l'offerto VERO (accettati + rifiutati dal device) e
+        # `rifiut` la quota che il device non ha preso: sono le due colonne
+        # che prima mancavano, ed e' dove si legge la saturazione del DUT.
+        hdr = (f"  {'frame':>5s} {'off pps':>9s} {'rifiut':>7s} {'TX':>9s} "
+               f"{'HIT':>9s} {'RX':>9s} {'RX pps':>9s} {'Mb/s':>8s} "
+               f"{'s':>5s} {'perdita':>8s} {'collo':>18s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
 
@@ -3112,8 +3268,10 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                 flag = " INAFFIDABILE" if r.get("unreliable") else ""
                 spread = (f" {col}(x{r['repeat']}, +-{r['spread_pct']:.0f}%"
                           f"{flag}){NC}")
-            off = r.get("offered_pps")
-            print(f"  {r['frame']:5d} {(off if off else 0):9d} {r['tx']:9d} "
+            busy = r.get("gen_busy_pct", 0.0) or 0.0
+            bcol = RED if busy > GEN_BACKPRESSURE_PCT else GREY
+            print(f"  {r['frame']:5d} {r.get('offered_pps', 0):9d} "
+                  f"{bcol}{busy:6.1f}%{NC} {r['tx']:9d} "
                   f"{r['hit']:9d} {r['rx']:9d} "
                   f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} {r['secs']:5.2f} "
                   f"{mark}{r['loss_worst']:7.2f}%{NC} "
@@ -3139,9 +3297,9 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                     r["threads"] = gen.n_inst
                     out_rows.append(r)
                     printer(r)
-            elif offered_pps:
+            elif asked_pps:
                 # Modalita' confronto: un rate solo, uguale per tutti.
-                r = _point_at_rate(setup, rx_tab, fab, frame, offered_pps,
+                r = _point_at_rate(setup, rx_tab, fab, frame, asked_pps,
                                    n_out, gen, repeat, threshold, plan, diag,
                                    xmit_mode)
                 if r is not None:
@@ -3195,7 +3353,9 @@ def _point_at_rate(setup, rx_tab, fab, frame, rate_pps, n_out, gen, repeat,
                       xmit_mode=xmit_mode, gen=gen, threshold=threshold,
                       plan=plan, diag=diag)
     if r is not None:
-        r["offered_pps"] = rate_pps
+        # Il rate CHIESTO. Quello offerto lo misura la finestra e lo scrive
+        # gia' `_measure_once`: sovrascriverlo qui nascondeva i rifiutati.
+        r["asked_pps"] = rate_pps
         r["threads"] = gen.n_inst
         r["clone_skb"] = gen.clone
     return r
@@ -3204,6 +3364,10 @@ def _point_at_rate(setup, rx_tab, fab, frame, rate_pps, n_out, gen, repeat,
 # ==========================================================================
 # SATURAZIONE: salire per gradini, non bisecare
 # ==========================================================================
+# Stampato una volta per run, non per ogni taglia di frame: vedi find_saturation.
+_SAID_GEN_BOUND = False
+
+
 def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
                     printer, threshold=DEFAULT_LOSS_THRESHOLD,
                     repeat=DEFAULT_REPEAT, plan=None, diag=None,
@@ -3240,9 +3404,13 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
     if full is None:
         warn(f"frame {frame}: nessuna misura utilizzabile a pieno rate")
         return None, None
+    # `offered_pps` lo porta gia' la misura (accettati + rifiutati): NON si
+    # sovrascrive. `asked_pps` e' il rate chiesto, che a delay 0 non esiste.
     full.update(method=method, phase="pieno", delay=0, clone_skb=gen.clone,
-                threads=gen.n_inst, offered_pps=None)
+                threads=gen.n_inst, asked_pps=None)
     gen.rate_estimate = max(gen.rate_estimate, full["tx_pps"])
+    gen.offered_estimate = max(gen.offered_estimate,
+                               full.get("offered_pps", 0))
     out_rows.append(full)
     printer(full)
 
@@ -3250,11 +3418,17 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         clean = dict(full)
         clean.update(phase="zero-perdite", gen_bound=1)
         out_rows.append(clean)
-        print(f"  {GREY}a massima spinta non si perde niente: la pipeline non "
-              f"e' satura e questo NON e' il suo massimo. Il tetto e' il "
-              f"generatore ({full['tx_pps']} pps offerti da "
-              f"{gen.n_inst} thread). Per alzarlo: piu' CPU al generatore "
-              f"(--gen-cpus), o meno al DUT (--dut-cpus).{NC}")
+        global _SAID_GEN_BOUND
+        print(f"  {GREY}  nessuna perdita a massima spinta e nessun rifiuto: "
+              f"limite del GENERATORE ({full.get('offered_pps', 0)} pps "
+              f"offerti), non della pipeline.{NC}")
+        if not _SAID_GEN_BOUND:
+            # La spiegazione lunga una volta sola per run: ripetuta per ogni
+            # taglia di frame e per ogni pipeline erano trenta righe identiche.
+            print(f"  {GREY}  (per alzare il tetto: piu' CPU al generatore "
+                  f"con --gen-cpus, o meno al DUT con --dut-cpus, finche' la "
+                  f"perdita compare. Detto una volta sola.){NC}")
+            _SAID_GEN_BOUND = True
         return full, clean
 
     base = float(full["rx_pps"])
@@ -3270,7 +3444,7 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         if r is None:
             continue
         r.update(method=method, phase="ricerca", clone_skb=gen.clone,
-                 threads=gen.n_inst, offered_pps=int(rate))
+                 threads=gen.n_inst, asked_pps=int(rate))
         out_rows.append(r)
         printer(r)
         steps.append(r)
@@ -3282,7 +3456,7 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
 
     if not steps:
         return full, None
-    steps.sort(key=lambda r: r["offered_pps"])
+    steps.sort(key=lambda r: r["asked_pps"])
     best = None
     for s in steps:
         if s["loss_worst"] > threshold:
@@ -3290,7 +3464,7 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         best = s
     if best is None:
         print(f"  {RED}nessun rate a perdita nulla determinabile{NC}{GREY}: si "
-              f"perde gia' al gradino piu' basso ({steps[0]['offered_pps']} "
+              f"perde gia' al gradino piu' basso ({steps[0]['asked_pps']} "
               f"pps offerti, {steps[0]['loss_worst']:.2f}%), cioe' molto sotto "
               f"la capacita' misurata a pieno rate. La perdita qui non dipende "
               f"dal rate: e' rumore della macchina.{NC}")
@@ -3305,7 +3479,7 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
     clean.update(phase="zero-perdite", gen_bound=0)
     out_rows.append(clean)
     print(f"  {GREEN}limite senza perdite{NC}{GREY}: {clean['rx_pps']} pps "
-          f"consegnati con {clean['offered_pps']} offerti, perdita "
+          f"consegnati con {clean['asked_pps']} chiesti, perdita "
           f"{clean['loss_worst']:.2f}% su {clean['repeat']} finestre. Il "
           f"gradino successivo perde: e' saturazione della pipeline, non del "
           f"generatore.{NC}")
@@ -3423,43 +3597,31 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
     under = [r for r in pts if r["loss_worst"] <= threshold]
     strict = [r for r in pts if r["loss_worst"] == 0.0]
     best = max(under, key=lambda r: r["rx_pps"]) if under else None
-    print(f"  {GREY}frame {frame}: massimo {peak['rx_pps']} pps "
-          f"({peak['rx_mbps']} Mb/s, perdita {peak['loss_pct']}%)")
-    # WHERE the loss happens decides what the number means. Measured here at
-    # three generator cores: 8.5% lost with TX == HIT, i.e. the program saw and
-    # processed every packet and the drops were all on the way OUT. Reporting
-    # only the total would read as "the datapath loses 8.5%", which is the
-    # opposite of what happened.
+    # Una riga per frame, non sei. DOVE cade la perdita decide cosa significa
+    # il numero, quindi resta -- ma sta nella stessa riga invece che in un
+    # paragrafo ripetuto per ogni taglia.
+    dove = ""
     if peak["lost_before"] or peak["lost_after"]:
-        if peak["lost_after"] > peak["lost_before"]:
-            print(f"  {GREY}  la perdita e' DOPO l'inferenza: "
-                  f"{peak['lost_after']} pacchetti elaborati e non usciti "
-                  f"({peak['lost_before']} non erano nemmeno arrivati). "
-                  f"A saturare e' l'uscita, non la pipeline.{NC}")
-        else:
-            print(f"  {GREY}  la perdita e' PRIMA dell'inferenza: "
-                  f"{peak['lost_before']} pacchetti mai arrivati al programma "
-                  f"({peak['lost_after']} elaborati e non usciti). "
-                  f"A saturare e' l'ingresso.{NC}")
-    # Same guard as in find_knee, applied to whatever set of points exists:
-    # a clean point is only meaningful if nothing SLOWER lost.
+        dove = (f", persi prima/dopo l'inferenza "
+                f"{peak['lost_before']}/{peak['lost_after']}")
+    # Un punto pulito vale solo se nulla di PIU' LENTO ha perso: altrimenti la
+    # perdita non dipende dal rate ed e' rumore della macchina.
     if best and any(r["loss_worst"] > threshold and r["rx_pps"] < best["rx_pps"]
                     for r in pts):
-        print(f"  {GREY}  nessun rate a perdita nulla determinabile: si perde "
-              f"anche a rate piu' bassi di quelli puliti, quindi la perdita "
-              f"sotto saturazione e' rumore della macchina{NC}")
         best = None
-    if best:
-        print(f"  {GREY}  sotto {threshold}% di perdita: {best['rx_pps']} pps "
-              f"({best['rx_mbps']} Mb/s, perdita {best['loss_pct']}%)")
-        print(f"  {GREY}  collo di bottiglia: {best.get('bottleneck', 'n/d')} "
-              f"-- {best.get('bottleneck_why', '')}{NC}")
-    if strict and best:
-        b0 = max(strict, key=lambda r: r["rx_pps"])
-        print(f"  {GREY}  a perdita esattamente zero: {b0['rx_pps']} pps "
-              f"({b0['rx_mbps']} Mb/s){NC}")
+        nota = "nessun rate pulito determinabile (si perde anche piu' piano)"
+    elif best:
+        b0 = max(strict, key=lambda r: r["rx_pps"]) if strict else None
+        nota = (f"pulito fino a {best['rx_pps']} pps "
+                f"({best['rx_mbps']} Mb/s)"
+                + (f", zero stretto a {b0['rx_pps']}" if b0 else
+                   ", nessun punto a zero stretto"))
     else:
-        print(f"  {GREY}  nessun punto a perdita esattamente zero{NC}")
+        nota = "nessun punto sotto la soglia di perdita"
+    print(f"  {GREY}frame {frame}: picco {peak['rx_pps']} pps "
+          f"({peak['rx_mbps']} Mb/s, perdita {peak['loss_pct']}%{dove}) | "
+          f"{nota} | collo: "
+          f"{(best or peak).get('bottleneck', 'n/d')}{NC}")
 
 
 # ==========================================================================
@@ -3480,7 +3642,7 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
 # che restano sono di elaborazione e non di lunghezza delle code.
 
 
-def run_compare(methods, model_path, frames, offered_pps=None,
+def run_compare(methods, model_path, frames, asked_pps=None,
                 threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
                 repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS, plan=None,
                 topology="shared", xmit_mode="start_xmit",
@@ -3497,7 +3659,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
 
     with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
         rx_side = (xmit_mode == "netif_receive")
-        rx_b, rx_tab, attached = attach_rx_counter(fab)
+        with _maybe_quiet():
+            rx_b, rx_tab, attached = attach_rx_counter(fab)
         info(f"contatore RX su {len(attached)} peer d'uscita (XDP_DROP)")
 
         print(f"\n{YELLOW}{'=' * 78}{NC}")
@@ -3507,7 +3670,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
         loaded = {}
         for m in methods:
             try:
-                loaded[m] = build_pipeline(m, model_path, fab, sem)
+                with _maybe_quiet():
+                    loaded[m] = build_pipeline(m, model_path, fab, sem)
                 info(f"{m}: caricata")
             except Exception as e:
                 warn(f"{m}: non caricata, la salto -- {type(e).__name__}: {e}")
@@ -3573,7 +3737,7 @@ def run_compare(methods, model_path, frames, offered_pps=None,
 
         # --- il rate comune
         frame0 = frames[0] if frames else 64
-        if not offered_pps:
+        if not asked_pps:
             print(f"\n{YELLOW} Calibrazione del rate comune (una volta, poi "
                   f"congelato){NC}")
             delivered = {}
@@ -3596,27 +3760,33 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 ing.cleanup()
                 return [], []
             slowest = min(delivered, key=delivered.get)
-            offered_pps = int(0.9 * delivered[slowest])
+            asked_pps = int(0.9 * delivered[slowest])
             note(f"rate comune = 90% del piu' lento ({slowest}): "
-                 f"{offered_pps} pps. Sotto questo carico nessuna pipeline e' "
+                 f"{asked_pps} pps. Sotto questo carico nessuna pipeline e' "
                  f"in sovraccarico, quindi le differenze non sono lunghezze "
                  f"di coda.")
 
         # --- la misura vera: stessi parametri per tutti, a giri
         print(f"\n{YELLOW}{'=' * 78}{NC}")
         print(f"{YELLOW} Fase 2: {rounds} giri x {len(alive)} pipeline a "
-              f"{offered_pps} pps offerti, frame {frames}{NC}")
+              f"{asked_pps} pps chiesti, frame {frames}{NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
+        # `chiesto` e' il rate identico per tutte (la variabile indipendente);
+        # `off pps` e' quello davvero offerto al device e `rifiut` la quota che
+        # il device ha respinto. Su un carico uguale per tutti, chi respinge di
+        # piu' e' la pipeline piu' lenta -- ed e' la colonna che separa le
+        # pipeline quando la perdita a valle resta a zero.
         hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} "
-               f"{'offerto':>9s} {'TX':>9s} {'RX':>9s} {'persi':>8s} "
-               f"{'RX pps':>9s} {'Mb/s':>8s} {'perdita':>8s} {'collo':>18s}")
+               f"{'chiesto':>9s} {'off pps':>9s} {'rifiut':>7s} {'TX':>9s} "
+               f"{'RX':>9s} {'RX pps':>9s} {'Mb/s':>8s} {'perdita':>8s} "
+               f"{'collo':>18s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         for rnd in range(1, rounds + 1):
             for m in alive:
                 setup = use(m)
                 for frame in frames:
-                    r = _point_at_rate(setup, rx_tab, fab, frame, offered_pps,
+                    r = _point_at_rate(setup, rx_tab, fab, frame, asked_pps,
                                        n_out, gen, repeat, threshold, plan,
                                        diag, xmit_mode)
                     if r is None:
@@ -3625,16 +3795,19 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                     raw.append(r)
                     mark = GREEN if r["loss_worst"] <= threshold else (
                         RED if r["loss_worst"] > 1 else YELLOW)
-                    print(f"  {rnd:4d} {m:10s} {frame:5d} {offered_pps:9d} "
+                    busy = r.get("gen_busy_pct", 0.0) or 0.0
+                    bcol = RED if busy > GEN_BACKPRESSURE_PCT else GREY
+                    print(f"  {rnd:4d} {m:10s} {frame:5d} {asked_pps:9d} "
+                          f"{r.get('offered_pps', 0):9d} "
+                          f"{bcol}{busy:6.1f}%{NC} "
                           f"{r['tx']:9d} {r['rx']:9d} "
-                          f"{max(0, r['tx'] - r['rx']):8d} "
                           f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
                           f"{mark}{r['loss_worst']:7.2f}%{NC} "
                           f"{r.get('bottleneck', ''):>18s}")
 
         if diag_enabled:
             diag.start()
-            gen.timed_run(frame0, gen.delay_for(offered_pps))
+            gen.timed_run(frame0, gen.delay_for(asked_pps))
             diag.report(diag.stop())
             report_generator(gen)
 
@@ -3657,8 +3830,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
               f"carico per tutti{NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
         hdr = (f"  {'pipeline':10s} {'frame':>5s} {'giri':>4s} "
-               f"{'offerto':>9s} {'RX pps':>9s} {'min':>9s} {'max':>9s} "
-               f"{'std':>8s} {'perdita':>8s} {'collo':>18s}")
+               f"{'chiesto':>9s} {'RX pps':>9s} {'min':>9s} {'max':>9s} "
+               f"{'std':>8s} {'rifiut':>7s} {'perdita':>8s} {'collo':>18s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         ordine = {m: i for i, m in enumerate(METHODS)}
@@ -3673,8 +3846,13 @@ def run_compare(methods, model_path, frames, offered_pps=None,
             tags = [r.get("bottleneck") for r in pts if r.get("bottleneck")]
             tag = max(set(tags), key=tags.count) if tags else BN_UNKNOWN
             spread = (100.0 * (a["max"] - a["min"]) / a["min"]) if a["min"] else 0
+            busy = stats.median([r.get("gen_busy_pct", 0.0) or 0.0
+                                 for r in pts])
             row = dict(method=m, frame=frame, phase="confronto",
-                       rounds=len(pts), offered_pps=offered_pps,
+                       rounds=len(pts), asked_pps=asked_pps,
+                       offered_pps=int(stats.median(
+                           [r.get("offered_pps", 0) for r in pts])),
+                       gen_busy_pct=round(busy, 2),
                        rx_pps=int(stats.median(pps)), rx_pps_mean=a["mean"],
                        rx_pps_min=a["min"], rx_pps_max=a["max"],
                        rx_pps_std=a["std"], rx_pps_cv_pct=a["cv_pct"],
@@ -3687,12 +3865,18 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        threads=len(plan.gen), bottleneck=tag)
             summary.append(row)
             flag = f" {RED}+-{spread:.0f}%{NC}" if row["unreliable"] else ""
-            print(f"  {m:10s} {frame:5d} {len(pts):4d} {offered_pps:9d} "
+            bcol = RED if busy > GEN_BACKPRESSURE_PCT else GREY
+            print(f"  {m:10s} {frame:5d} {len(pts):4d} {asked_pps:9d} "
                   f"{row['rx_pps']:9d} {a['min']:9d} {a['max']:9d} "
-                  f"{a['std']:8.1f} {row['loss_pct']:7.2f}% "
+                  f"{a['std']:8.1f} {bcol}{busy:6.1f}%{NC} "
+                  f"{row['loss_pct']:7.2f}% "
                   f"{tag:>18s}{flag}")
-        note("stesso rate offerto, stessa durata, stesse manopole: le "
+        note("stesso rate chiesto, stessa durata, stesse manopole: le "
              "differenze in questa tabella sono del programma XDP.")
+        note("`rifiut` e' la quota di offerto che il device ha respinto a coda "
+             "piena: a carico uguale per tutte, e' la misura piu' sensibile "
+             "della differenza fra le pipeline, perche' compare prima che la "
+             "perdita a valle si muova.")
     return raw, summary
 
 
@@ -3872,8 +4056,10 @@ def main():
                    help="finestre per punto; si tiene la mediana del rate e la "
                         "PEGGIORE delle perdite")
     m.add_argument("--offered-pps", type=int, default=None, metavar="PPS",
-                   help="rate offerto fisso (modalita' compare). Senza, lo "
-                        "decide una calibrazione: 90%% del piu' lento.")
+                   help="rate CHIESTO, fisso e uguale per tutte le pipeline "
+                        "(modalita' compare). Quello davvero offerto lo misura "
+                        "la finestra e puo' essere piu' basso. Senza questo "
+                        "flag lo decide una calibrazione: 90%% del piu' lento.")
     m.add_argument("--loss-threshold", type=float, default=None,
                    metavar="PCT",
                    help="sotto questa percentuale la perdita e' considerata "
@@ -3910,6 +4096,11 @@ def main():
                    help="raccoglie occupazione per core, contatori dei device "
                         "e softnet_stat attorno alle misure. Disattivata per "
                         "default: legge procfs fra un punto e l'altro.")
+    o.add_argument("--verbose", action="store_true",
+                   help="ristampa i log di caricamento delle pipeline e degli "
+                        "attach XDP. Per default sono zittiti: con 5 pipeline "
+                        "e 6 taglie di frame sono centinaia di righe in cui la "
+                        "tabella dei risultati si perde.")
     o.add_argument("--out", default=None, help="dove scrivere i CSV")
     o.add_argument("--latency", action="store_true",
                    help="percorso storico: latenza arrivo->ripartenza con una "
@@ -3922,6 +4113,9 @@ def main():
         sys.exit(f"serve Linux, non {sys.platform}")
     if os.geteuid() != 0:
         sys.exit("serve root: sudo python3 ipa/test/bench_throughput.py")
+
+    global VERBOSE
+    VERBOSE = a.verbose
 
     os.chdir(SHARED_DIR)
     if a.cleanup:
@@ -3998,7 +4192,7 @@ def main():
 
     if a.mode == "compare":
         raw, rows = run_compare(
-            methods, model_path, frames, offered_pps=a.offered_pps,
+            methods, model_path, frames, asked_pps=a.offered_pps,
             threads=plan.threads, threshold=a.loss_threshold,
             repeat=a.repeat, rounds=a.rounds, plan=plan,
             topology=a.gen_topology, xmit_mode=a.xmit_mode,
@@ -4023,7 +4217,7 @@ def main():
                          burst=a.burst, xmit_mode=a.xmit_mode,
                          threaded_napi=not a.no_threaded_napi, plan=plan,
                          topology=a.gen_topology, diag_enabled=a.diag,
-                         offered_pps=a.offered_pps, window_s=a.duration,
+                         asked_pps=a.offered_pps, window_s=a.duration,
                          warmup_s=a.warmup, tune=a.tune_generator,
                          search=a.search)
 
