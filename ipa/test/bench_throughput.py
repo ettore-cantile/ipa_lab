@@ -537,6 +537,238 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
 
 
 
+
+# ==========================================================================
+# LATENZA ARRIVO -> RIPARTENZA, su traffico vero
+# ==========================================================================
+# E' l'unica voce dell'elenco che nessun'altra misura di questo progetto da'.
+#
+# test_suite cronometra il PROGRAMMA: dall'ingresso alla sua return. Non ci
+# sono dentro ne' la consegna del pacchetto al programma, ne' la trasmissione
+# vera, perche' bpf_redirect non spedisce -- accoda, e il pacchetto parte dopo
+# che il programma e' finito. Il generatore, dall'altra parte, misura pacchetti
+# al secondo e perdita, non il tempo di attraversamento.
+#
+# Qui si misura la cosa che interessa a un nodo che inoltra: quanto passa fra
+# l'arrivo e il momento in cui il pacchetto e' davvero uscito.
+#
+# COME. Il dispatcher segna bpf_ktime_get_ns() in una cella PER-CPU; il
+# programma d'uscita rilegge quella cella e fa la differenza. La cella per-CPU
+# regge perche' il redirect avviene sullo stesso core, in modo sincrono: fra la
+# scrittura e la lettura non si cambia CPU.
+#
+# PERCHE' IN UN OGGETTO SOLO. Due oggetti BPF distinti non condividono mappe
+# (servirebbe il pinning su bpffs). Il programma d'uscita viene quindi compilato
+# INSIEME alla pipeline, ed e' la ragione per cui questa modalita' ricostruisce
+# il sorgente invece di riusare verify_prog_run.setup_*.
+#
+# IL PREZZO, DICHIARATO. E' una BUILD STRUMENTATA: la scrittura del timestamp
+# non c'e' nel datapath di produzione. Aggiunge una scrittura di mappa per
+# pacchetto, quindi la latenza misurata qui e' leggermente SUPERIORE a quella
+# vera, e il throughput leggermente inferiore. Stessa scelta gia' fatta per il
+# contatore dei lookup in test_suite, e per lo stesso motivo: una misura che
+# non esiste vale piu' di una misura perfetta impossibile.
+
+LAT_COUNTER_SRC = r"""
+BPF_PERCPU_ARRAY(ts_in, __u64, 1);
+/* 0 = quanti, 1 = somma ns, 2 = minimo, 3 = massimo */
+BPF_PERCPU_ARRAY(lat_acc, __u64, 4);
+
+int xdp_lat_count(struct xdp_md *ctx) {
+    int z = 0;
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *t0 = ts_in.lookup(&z);
+    if (t0 && *t0 && now > *t0) {
+        __u64 d = now - *t0;
+        int k = 0;
+        __u64 *n = lat_acc.lookup(&k); if (n) *n += 1;
+        k = 1; __u64 *sm = lat_acc.lookup(&k); if (sm) *sm += d;
+        k = 2; __u64 *mn = lat_acc.lookup(&k);
+        if (mn && (*mn == 0 || d < *mn)) *mn = d;
+        k = 3; __u64 *mx = lat_acc.lookup(&k); if (mx && d > *mx) *mx = d;
+    }
+    return XDP_DROP;
+}
+"""
+
+# Iniettata subito dopo la graffa del dispatcher: il primo istante in cui il
+# programma ha il pacchetto in mano.
+LAT_STAMP = ("\n    { int _lz = 0; __u64 _lt = bpf_ktime_get_ns();\n"
+             "      ts_in.update(&_lz, &_lt); }\n")
+
+# Nome della funzione d'ingresso XDP per ciascun metodo: e' quella in cui
+# infilare il timestamp, ed e' quella che si attacca all'interfaccia.
+LAT_ENTRY = {
+    "baseline": "xdp_baseline",
+    "p1_static": "ipa_switch_hardcoded",
+    "hardcoded": "ipa_switch_hardcoded",
+    "template": "ipa_switch_template",
+    "modular": "modular_dispatcher",
+}
+
+
+def _instrumented_source(method, model_path, node=STATIC_NODE):
+    """(sorgente, pesi, scale) della pipeline col timestamp e il contatore."""
+    import verify_prog_run as V
+    weights, scale = V.load_weights(model_path)
+
+    if method == "baseline":
+        src = V.EBPF_BASELINE
+    elif method in ("hardcoded", "p1_static"):
+        from ebpf_program import build_combined_hardcoded_source
+        src = build_combined_hardcoded_source(
+            [(0, weights, scale)],
+            static_node=(node if method == "p1_static" else None))
+    elif method == "template":
+        from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
+                                        EBPF_ARCH_GENERIC_2LAYER)
+        src = ("#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER
+               + "\n" + EBPF_ARCH_GENERIC_2LAYER)
+    else:
+        from ebpf_modular import EBPF_MODULAR_FULL
+        src = EBPF_MODULAR_FULL
+
+    anchor = f"int {LAT_ENTRY[method]}(struct xdp_md *ctx) {{"
+    if src.count(anchor) != 1:
+        raise RuntimeError(
+            f"non trovo il punto d'ingresso '{anchor}' nel sorgente di "
+            f"{method} (trovato {src.count(anchor)} volte). E' cambiata la "
+            f"firma del dispatcher?")
+    src = src.replace(anchor, anchor + LAT_STAMP)
+    return src + "\n" + LAT_COUNTER_SRC, weights, scale
+
+
+def _load_instrumented(method, model_path, fab, sem, node=STATIC_NODE):
+    """Compila tutto insieme, carica, e caba la pipeline su questo fabric."""
+    from bcc import BPF
+    import verify_prog_run as V
+    import test_fabric as TF
+
+    src, weights, scale = _instrumented_source(method, model_path, node)
+    b = BPF(text=src)
+    entry = b.load_func(LAT_ENTRY[method], BPF.XDP)
+    lat_fn = b.load_func("xdp_lat_count", BPF.XDP)
+
+    pl = {"baseline": 0, "p1_static": 1, "hardcoded": 1,
+          "template": 2, "modular": 3}[method]
+    setup = {"b": b, "disp": entry, "fn": entry, "weights": weights,
+             "scale": scale, "pipeline": pl,
+             "cls_stats": b["cls_stats" if pl in (0, 1) else
+                            TF._MAC_NAME[pl].replace("mac_table", "cls_stats")],
+             "pkt_stats": b["pkt_stats" if pl in (0, 1) else
+                            TF._MAC_NAME[pl].replace("mac_table", "pkt_stats")]}
+
+    # tail call / pesi, come fa il setup di produzione
+    if pl == 1:
+        model_fn = b.load_func("model_0", BPF.XDP)
+        b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+        b["model_progs"][ct.c_int(PKTGEN_MAGIC_MODEL_ID)] = ct.c_int(model_fn.fd)
+    elif pl == 2:
+        from ebpf_template_arch import load_arch_weights
+        leaf = b.load_func("arch_generic_2layer", BPF.XDP)
+        b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf.fd)
+        for mid in (0, PKTGEN_MAGIC_MODEL_ID):
+            load_arch_weights(b, weights, model_id=mid, scale=scale)
+    elif pl == 3:
+        from ebpf_modular import load_modular_weights
+        first = b.load_func("layer_first", BPF.XDP)
+        hidden = b.load_func("layer_hidden", BPF.XDP)
+        b["layer_chain"][ct.c_int(0)] = ct.c_int(first.fd)
+        for i in range(1, 16):
+            b["layer_chain"][ct.c_int(i)] = ct.c_int(hidden.fd)
+        for mid in (0, PKTGEN_MAGIC_MODEL_ID):
+            load_modular_weights(b, weights, model_id=mid, scale=scale,
+                                 layer_dims=[(65, 4), (4, 4), (4, 7)])
+
+    V._seed_link_state(b, 1)
+    mac_name = "mac_table" if pl in (0, 1) else TF._MAC_NAME[pl]
+    TF._install_fabric_mac_table(b, mac_name, fab, sem.logical_ports)
+    if pl != 0:
+        b[TF._INGRESS_NAME[pl]][ct.c_uint32(fab.ingress_ifindex)] = \
+            ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
+        if method != "p1_static":
+            b[TF._NODEID_NAME[pl]][ct.c_uint32(0)] = \
+                ct.c_uint32(TF.FABRIC_NODE_INDEX)
+    return setup, lat_fn
+
+
+def _read_lat(b):
+    """(quanti, min_ns, media_ns, max_ns) sommando le celle per-CPU."""
+    acc = b["lat_acc"]
+    n = sum(int(v) for v in acc[ct.c_int(0)])
+    tot = sum(int(v) for v in acc[ct.c_int(1)])
+    mins = [int(v) for v in acc[ct.c_int(2)] if int(v) > 0]
+    maxs = [int(v) for v in acc[ct.c_int(3)]]
+    if not n:
+        return 0, 0, 0, 0
+    return n, (min(mins) if mins else 0), tot // n, max(maxs)
+
+
+def run_latency(method, model_path, frames, delays, count, threads,
+                threaded_napi=True):
+    """Latenza arrivo -> ripartenza, a piu' dimensioni di frame e piu' rate."""
+    from netns_fabric import NetnsFabric
+    from common import attach_xdp
+
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} {method} -- latenza arrivo->ripartenza (build "
+          f"strumentata){NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+
+    sem, n_out = class_semantics()
+    rows = []
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+        setup, lat_fn = _load_instrumented(method, model_path, fab, sem)
+        b = setup["b"]
+        for peer in fab.peer_of.values():
+            try:
+                attach_xdp(b, lat_fn, peer)
+            except Exception as e:
+                warn(f"contatore latenza non agganciato a {peer}: {e}")
+        attach_xdp(b, setup["disp"], fab.ingress)
+        info("un oggetto BPF solo: ingresso e uscita condividono le mappe")
+
+        napi_devs = []
+        if threaded_napi:
+            napi_devs = [fab.ingress]
+            if enable_threaded_napi(napi_devs, threads, os.cpu_count() or 1):
+                info("NAPI in thread: generatore e DUT su core separati")
+
+        hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>8s} {'campioni':>9s} "
+               f"{'min':>7s} {'media':>7s} {'max':>8s}")
+        print(f"\n{hdr}")
+        print("  " + "-" * (len(hdr) - 2))
+        for frame in frames:
+            for delay in delays:
+                b["lat_acc"].clear()
+                pg_clear_threads(1)
+                pg_configure(fab.ingress_peer, frame, count, delay,
+                             dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02")
+                try:
+                    tx, _, _ = pg_run_and_read([fab.ingress_peer])
+                except PktgenEmptyRun as e:
+                    warn(f"punto scartato: {e}")
+                    continue
+                n, lo, avg, hi = _read_lat(b)
+                if not n:
+                    warn(f"frame {frame} delay {delay}: nessun campione -- il "
+                         f"pacchetto non e' arrivato all'uscita")
+                    continue
+                print(f"  {frame:5d} {delay:6d} {tx:8d} {n:9d} "
+                      f"{lo:6d}n {avg:6d}n {hi:7d}n")
+                rows.append(dict(method=method, frame=frame, delay=delay,
+                                 tx=tx, samples=n, lat_min_ns=lo,
+                                 lat_avg_ns=avg, lat_max_ns=hi))
+        pg_reset()
+        if napi_devs:
+            disable_threaded_napi(napi_devs)
+    print(f"\n  {GREY}Latenza dal primo istante in cui il programma ha il "
+          f"pacchetto al momento in cui e' uscito. Include la trasmissione, "
+          f"che test_suite non misura, e la scrittura del timestamp, che il "
+          f"datapath di produzione non fa.{NC}")
+    return rows
+
+
 # ==========================================================================
 # THREADED NAPI: separare davvero il generatore dal DUT
 # ==========================================================================
@@ -1227,6 +1459,10 @@ def main():
                         "per pacchetto: alza molto il rate offerto. "
                         "Cambia cosa si misura -- vedi la docstring.")
     p.add_argument("--out", default=None, help="dove scrivere il CSV")
+    p.add_argument("--latency", action="store_true",
+                   help="misura la latenza arrivo->ripartenza invece del "
+                        "throughput. Usa una build strumentata: vedi "
+                        "run_latency.")
     p.add_argument("--cleanup", action="store_true",
                    help="rimuovi un fabric rimasto da un run interrotto")
     a = p.parse_args()
@@ -1258,6 +1494,21 @@ def main():
 
     rows = []
     rc = 0
+    if a.latency:
+        lat_delays = delays or [0, 5000, 20000]
+        for m in methods:
+            rows += run_latency(m, model_path, frames, lat_delays, a.count,
+                                a.threads, not a.no_threaded_napi)
+        if a.out and rows:
+            os.makedirs(a.out, exist_ok=True)
+            path = os.path.join(a.out, "latency.csv")
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                w.writerows(rows)
+            print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
+        return 0
+
     for m in methods:
         rc |= run_method(m, model_path, frames, delays, a.count, rows,
                          a.clone_skb, a.threads, a.loss_threshold,
