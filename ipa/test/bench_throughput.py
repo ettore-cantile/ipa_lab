@@ -594,14 +594,23 @@ def run_method(method, model_path, frames, delays, count, out_rows,
 
     sem, n_out = class_semantics()
     with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+        rx_side = (xmit_mode == "netif_receive")
         rx_b, rx_tab, attached = attach_rx_counter(fab)
         info(f"contatore RX su {len(attached)} peer d'uscita (XDP_DROP)")
 
         setup = build_pipeline(method, model_path, fab, sem)
-        attach_xdp(setup["b"], setup["disp"], fab.ingress)
+        # netif_receive injects at netif_receive_skb, which is PAST the native
+        # XDP hook: veth's native program runs in veth_poll, earlier. Attaching
+        # native and injecting there means no program runs at all -- neither
+        # HIT nor MISS, which is exactly what the probe reported. The generic
+        # hook is the one on that path, so that is where the program has to go.
+        xdp_mode = "generic" if xmit_mode == "netif_receive" else None
+        attach_xdp(setup["b"], setup["disp"], fab.ingress, mode=xdp_mode)
         info(f"pipeline agganciata a {fab.ingress} (ifindex "
              f"{fab.ingress_ifindex})")
 
+        # (rx_side is set above, before the pipeline is attached, because
+        # it decides the XDP mode as well as the device.)
         # WHICH device pktgen is pointed at depends on the injection mode.
         #
         #   start_xmit / queue_xmit : pktgen TRANSMITS, so it takes the PEER of
@@ -614,7 +623,6 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         # Getting this backwards would send every packet somewhere the pipeline
         # is not, and the probe would catch it, but the message would blame the
         # model_id byte.
-        rx_side = (xmit_mode == "netif_receive")
         tg_devs = [fab.ingress if rx_side else fab.ingress_peer]
         extra = []
         if threads > 1:
@@ -622,7 +630,7 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             extra = make_tg_links(threads - 1)
             ing_map = setup["b"][TF._INGRESS_NAME[setup["pipeline"]]]
             for rx, tx, idx in extra:
-                attach_xdp(setup["b"], setup["disp"], rx)
+                attach_xdp(setup["b"], setup["disp"], rx, mode=xdp_mode)
                 # Same logical port as the fabric ingress: these are extra
                 # generator cores feeding one node, not extra node ports.
                 ing_map[ct.c_uint32(idx)] = ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
@@ -776,6 +784,26 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
             hi = mid                # under threshold: try to go faster
         else:
             lo = mid                # still losing: slow down
+    # Is the loss actually driven by the rate? If a point LOSES at a rate
+    # lower than one that stayed clean, it is not: on this bench the sequence
+    # ran 0.00% at 343 kpps, 0.58% at 356 k, 0.57% at 369 k, 0.20% at 400 k and
+    # 0.43% at 600 k -- scattered, with repeat=3 and worst-of-three already
+    # applied. Reporting the fastest clean point as "the no-loss throughput"
+    # would publish whichever rate happened to come out clean three times in a
+    # row, which is a lottery ticket, not a measurement.
+    if best_clean is not None:
+        dirty_below = [r for r in out_rows
+                       if r.get("method") == method and r["frame"] == frame
+                       and r["loss_worst"] > threshold
+                       and r["rx_pps"] < best_clean["rx_pps"]]
+        if dirty_below:
+            worst = min(dirty_below, key=lambda r: r["rx_pps"])
+            print(f"  {RED}la perdita non dipende dal rate{NC}{GREY}: "
+                  f"{worst['loss_worst']:.2f}% a {worst['rx_pps']} pps, "
+                  f"pulito a {best_clean['rx_pps']}. Sotto saturazione qui "
+                  f"si perde per ragioni della macchina, non del datapath: "
+                  f"un rate 'a perdita nulla' non e' determinabile.{NC}")
+            best_clean = None
     return full, best_clean
 
 
@@ -811,10 +839,18 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
                   f"{peak['lost_before']} pacchetti mai arrivati al programma "
                   f"({peak['lost_after']} elaborati e non usciti). "
                   f"A saturare e' l'ingresso.{NC}")
+    # Same guard as in find_knee, applied to whatever set of points exists:
+    # a clean point is only meaningful if nothing SLOWER lost.
+    if best and any(r["loss_worst"] > threshold and r["rx_pps"] < best["rx_pps"]
+                    for r in pts):
+        print(f"  {GREY}  nessun rate a perdita nulla determinabile: si perde "
+              f"anche a rate piu' bassi di quelli puliti, quindi la perdita "
+              f"sotto saturazione e' rumore della macchina{NC}")
+        best = None
     if best:
         print(f"  {GREY}  sotto {threshold}% di perdita: {best['rx_pps']} pps "
               f"({best['rx_mbps']} Mb/s, perdita {best['loss_pct']}%)")
-    if strict:
+    if strict and best:
         b0 = max(strict, key=lambda r: r["rx_pps"])
         print(f"  {GREY}  a perdita esattamente zero: {b0['rx_pps']} pps "
               f"({b0['rx_mbps']} Mb/s){NC}")
