@@ -29,6 +29,37 @@ identico per tutte. Se il collo di bottiglia e' il generatore la cosa si vede
 nei dati (tutte le pipeline allo stesso rate, perdita zero) e va riportata.
 
 --------------------------------------------------------------------------
+CHI E' IL COLLO DI BOTTIGLIA
+--------------------------------------------------------------------------
+Misurato: a `delay 0` e frame da 64 byte questa macchina fa circa 780 kpps con
+la pipeline hardcoded e ZERO perdita. Il picco teorico di quella pipeline e'
+~14 Mpps, quindi a saturare non e' lei: e' il generatore.
+
+E c'e' una ragione strutturale, non solo di potenza. Su veth la RICEZIONE del
+peer avviene nel softirq della STESSA CPU che trasmette: TG e DUT non sono solo
+sulla stessa macchina, sono sullo stesso core, per costruzione. Aggiungere
+thread al generatore non li separa.
+
+Questo non rende la misura inutile, ma cambia la grandezza che misura:
+
+    a delay 0 un core fa {genera + inferisce + redirige}. Il tempo per
+    pacchetto e' t_gen + t_pipeline, e t_gen e' IDENTICO per tutte e tre le
+    pipeline. La differenza fra le loro cifre e' quindi attribuibile alla
+    pipeline, anche se il valore assoluto no.
+
+Conseguenza da riportare e non nascondere: finche' il generatore satura per
+primo, "throughput massimo" e "throughput a perdita nulla" coincidono, perche'
+la perdita non compare mai. Sono due numeri diversi solo quando a saturare e'
+il sistema sotto test.
+
+`--clone-skb N` fa riusare a pktgen lo stesso buffer N volte invece di
+allocarne uno per pacchetto, e alza parecchio il rate offerto. Va usato
+sapendo che cambia cosa si misura: sparisce il costo di allocazione dal lato
+generatore, e il datapath puo' dover prendere una copia privata del buffer
+prima di riscrivere il TTL. Il default e' 0, cioe' un buffer per pacchetto,
+che e' la condizione piu' vicina al traffico vero.
+
+--------------------------------------------------------------------------
 TRE PUNTI DI CONTEGGIO, PERCHE' "PERSI" NON BASTA
 --------------------------------------------------------------------------
   TX   quanti pktgen ne ha trasmessi          (dai suoi contatori)
@@ -85,13 +116,18 @@ GREEN, RED, YELLOW, GREY, NC = (
 PKTGEN_DIR = "/proc/net/pktgen"
 PKTGEN_MAGIC_MODEL_ID = 0xBE      # vedi la docstring
 
+# Quante volte riusare lo stesso buffer quando il generatore satura per primo e
+# bisogna spingere piu' forte. 100000 e' abbastanza da togliere di mezzo il
+# costo di allocazione senza che il conteggio dei pacchetti ne risenta.
+ESCALATE_CLONE = 100000
+
 # Frame sizes. 64 e' il minimo Ethernet; 1514 il massimo senza jumbo. Il frame
 # IPA minimo di questo progetto e' 63 byte, quindi 64 li contiene tutti.
 DEFAULT_FRAMES = [64, 128, 256, 512, 1024, 1514]
 
-# Ritardo fra pacchetti, in nanosecondi, come lo intende pktgen. 0 = piu' veloce
-# possibile. I valori crescenti servono a trovare il rate piu' alto SENZA
-# perdita, che e' una delle due cifre chieste (l'altra e' il massimo assoluto).
+# Ritardi fissi, usati solo se il chiamante li chiede con --delays. Il default
+# e' la ricerca del ginocchio (find_knee), che costa meno punti e centra la
+# risposta invece di avvicinarla.
 DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
 
 METHODS = ("hardcoded", "template", "modular")
@@ -138,7 +174,7 @@ def pg_reset():
     pg_write(f"{PKTGEN_DIR}/pgctrl", "reset")
 
 
-def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac):
+def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0):
     """One device on one kernel thread.
 
     Thread 0 only: with TG and DUT on the same box, more generator threads
@@ -150,6 +186,7 @@ def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac):
     for cmd in (f"count {count}",
                 f"pkt_size {pkt_size}",
                 f"delay {delay}",
+                f"clone_skb {clone}",
                 f"dst {dst_ip}",
                 f"dst_mac {dst_mac}",
                 "udp_src_min 1234", "udp_src_max 1234",
@@ -230,11 +267,11 @@ def _zero_counters(setup, rx_tab, n_out):
     rx_tab.clear()
 
 
-def measure_point(setup, rx_tab, fab, frame, delay, count, n_out):
+def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0):
     """One (frame size, offered rate) point. Returns a dict of counters."""
     _zero_counters(setup, rx_tab, n_out)
     pg_configure(fab.ingress_peer, frame, count, delay,
-                 dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02")
+                 dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02", clone=clone)
     tx, tx_pps, elapsed = pg_run_and_read(fab.ingress_peer)
     hit = _read_u64(setup["pkt_stats"], 0)
     miss = _read_u64(setup["pkt_stats"], 1)
@@ -327,7 +364,8 @@ def attach_rx_counter(fab):
 
 
 # ==========================================================================
-def run_method(method, model_path, frames, delays, count, out_rows):
+def run_method(method, model_path, frames, delays, count, out_rows,
+               clone=0):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -348,7 +386,7 @@ def run_method(method, model_path, frames, delays, count, out_rows):
 
         # -- sonda: un pacchetto solo, per sapere se stiamo misurando
         #    inferenza o XDP_PASS.
-        probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out)
+        probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone)
         if probe["hit"] == 0:
             warn(f"la sonda non ha prodotto nessun HIT "
                  f"(tx={probe['tx']} miss={probe['miss']}).")
@@ -365,18 +403,26 @@ def run_method(method, model_path, frames, delays, count, out_rows):
                f"{'perdita':>8s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
+        def printer(r):
+            mark = GREEN if r["loss_pct"] == 0 else (
+                RED if r["loss_pct"] > 1 else YELLOW)
+            print(f"  {r['frame']:5d} {r['delay']:6d} {r['tx']:9d} "
+                  f"{r['hit']:9d} {r['rx']:9d} {r['tx_pps']:9d} "
+                  f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
+                  f"{mark}{r['loss_pct']:7.2f}%{NC}")
+
         for frame in frames:
-            for delay in delays:
-                r = measure_point(setup, rx_tab, fab, frame, delay, count,
-                                  n_out)
-                r["method"] = method
-                out_rows.append(r)
-                mark = GREEN if r["loss_pct"] == 0 else (
-                    RED if r["loss_pct"] > 1 else YELLOW)
-                print(f"  {r['frame']:5d} {r['delay']:6d} {r['tx']:9d} "
-                      f"{r['hit']:9d} {r['rx']:9d} {r['tx_pps']:9d} "
-                      f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
-                      f"{mark}{r['loss_pct']:7.2f}%{NC}")
+            if delays:
+                # Manual sweep: the caller asked for specific rates.
+                for delay in delays:
+                    r = measure_point(setup, rx_tab, fab, frame, delay, count,
+                                      n_out, clone)
+                    r["clone_skb"], r["method"] = clone, method
+                    out_rows.append(r)
+                    printer(r)
+            else:
+                find_knee(setup, rx_tab, fab, frame, count, n_out, clone,
+                          out_rows, method, printer)
             _summarise(method, frame, out_rows)
 
         pg_reset()
@@ -385,6 +431,76 @@ def run_method(method, model_path, frames, delays, count, out_rows):
                            check=False, capture_output=True)
         del rx_b
     return 0
+
+
+def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
+              method, printer, max_delay=20000, steps=6):
+    """Find the fastest rate this pipeline takes without losing a packet.
+
+    A fixed list of delays spends most of its time at the slow end, where the
+    answer is always "no loss", and still misses the knee unless one of the
+    values happens to land on it. This walks to the knee instead:
+
+      1. offer everything the generator has (delay 0);
+      2. if nothing is lost, the GENERATOR saturated first -- there is no knee
+         to find, and saying so is the result;
+      3. otherwise bisect the delay to the smallest one that loses nothing,
+         which is the no-loss throughput.
+
+    Returns (peak_row, clean_row_or_None). Costs about `steps` measurements
+    instead of one per delay, and lands on the answer rather than near it."""
+    full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone)
+    full["method"], full["clone_skb"], full["delay"] = method, clone, 0
+    out_rows.append(full)
+    printer(full)
+
+    if full["loss_pct"] == 0.0 and clone == 0:
+        # Nothing lost at the generator's best effort. Before concluding that
+        # the pipeline has headroom, PUSH HARDER: with clone_skb pktgen reuses
+        # one buffer instead of allocating per packet, which removes the cost
+        # that dominates it here and can multiply the offered rate.
+        #
+        # This is an escalation, not the default condition: clone_skb changes
+        # what is measured (no allocation on the generator side, and the
+        # datapath may take a private copy before rewriting the TTL). It is
+        # used only to answer "does this pipeline EVER saturate", and the rows
+        # it produces carry clone_skb != 0 so they stay distinguishable.
+        hard = measure_point(setup, rx_tab, fab, frame, 0, count, n_out,
+                             ESCALATE_CLONE)
+        hard["method"], hard["clone_skb"], hard["delay"] = \
+            method, ESCALATE_CLONE, 0
+        out_rows.append(hard)
+        printer(hard)
+        if hard["loss_pct"] > 0.0:
+            print(f"  {GREY}con clone_skb={ESCALATE_CLONE} la pipeline perde: "
+                  f"il ginocchio esiste, lo cerco{NC}")
+            return find_knee(setup, rx_tab, fab, frame, count, n_out,
+                             ESCALATE_CLONE, out_rows, method, printer,
+                             max_delay, steps)
+        print(f"  {GREY}nemmeno con clone_skb={ESCALATE_CLONE}: su questa "
+              f"macchina satura il generatore, non la pipeline{NC}")
+        return (hard if hard["rx_pps"] > full["rx_pps"] else full), hard
+
+    if full["loss_pct"] == 0.0:
+        return full, full          # generator-bound: peak IS the no-loss rate
+
+    lo, hi = 0, max_delay           # lo loses, hi is assumed clean
+    best_clean = None
+    for _ in range(steps):
+        mid = (lo + hi) // 2
+        if mid in (lo, hi):
+            break
+        r = measure_point(setup, rx_tab, fab, frame, mid, count, n_out, clone)
+        r["method"], r["clone_skb"] = method, clone
+        out_rows.append(r)
+        printer(r)
+        if r["loss_pct"] == 0.0:
+            best_clean = r if (best_clean is None or
+                               r["rx_pps"] > best_clean["rx_pps"]) else best_clean
+            hi = mid                # clean: try to go faster
+        else:
+            lo = mid                # still losing: slow down
+    return full, best_clean
 
 
 def _summarise(method, frame, rows):
@@ -413,9 +529,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--method", choices=list(METHODS) + ["all"], default="all")
     p.add_argument("--frames", default=",".join(map(str, DEFAULT_FRAMES)))
-    p.add_argument("--delays", default=",".join(map(str, DEFAULT_DELAYS)))
+    p.add_argument("--delays", default="",
+                   help="ritardi fissi in ns, separati da virgola. Vuoto (il "
+                        "default) cerca il ginocchio invece di spazzolare: "
+                        "meno punti e centra la risposta")
     p.add_argument("--count", type=int, default=200000,
                    help="pacchetti per punto di misura")
+    p.add_argument("--clone-skb", type=int, default=0, metavar="N",
+                   help="riusa lo stesso skb N volte invece di allocarne uno "
+                        "per pacchetto: alza molto il rate offerto. "
+                        "Cambia cosa si misura -- vedi la docstring.")
     p.add_argument("--out", default=None, help="dove scrivere il CSV")
     p.add_argument("--cleanup", action="store_true",
                    help="rimuovi un fabric rimasto da un run interrotto")
@@ -447,7 +570,8 @@ def main():
     rows = []
     rc = 0
     for m in methods:
-        rc |= run_method(m, model_path, frames, delays, a.count, rows)
+        rc |= run_method(m, model_path, frames, delays, a.count, rows,
+                         a.clone_skb)
 
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
