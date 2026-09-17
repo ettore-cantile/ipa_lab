@@ -121,9 +121,20 @@ PKTGEN_MAGIC_MODEL_ID = 0xBE      # vedi la docstring
 # costo di allocazione senza che il conteggio dei pacchetti ne risenta.
 ESCALATE_CLONE = 100000
 
+# veth non espone IFF_TX_SKB_SHARING -- consegna l'skb alla RX del peer, dove
+# XDP lo riscrive -- quindi pktgen rifiuta clone_skb. Una volta saputo, non si
+# riprova: altrimenti ogni punto di misura stampa lo stesso avviso per ogni
+# device, e a tre thread sono sei righe di rumore per misura.
+_CLONE_SUPPORTED = True
+
 # Frame sizes. 64 e' il minimo Ethernet; 1514 il massimo senza jumbo. Il frame
 # IPA minimo di questo progetto e' 63 byte, quindi 64 li contiene tutti.
 DEFAULT_FRAMES = [64, 128, 256, 512, 1024, 1514]
+
+# Sotto questa percentuale la perdita e' considerata rumore della macchina e non
+# saturazione del datapath. Vedi find_knee per la misura che ha imposto questa
+# scelta. Zero stretto resta riportato a parte.
+DEFAULT_LOSS_THRESHOLD = 0.1
 
 # Ritardi fissi, usati solo se il chiamante li chiede con --delays. Il default
 # e' la ricerca del ginocchio (find_knee), che costa meno punti e centra la
@@ -222,15 +233,19 @@ def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0,
         raise RuntimeError(
             f"pktgen: {d} non esiste dopo `add_device {dev}`. "
             f"L'interfaccia esiste ed e' UP? `ip link show {dev}`")
-    if clone:
+    global _CLONE_SUPPORTED
+    if clone and _CLONE_SUPPORTED:
         # Optional by design: clone_skb is the escalation knob, not part of the
         # reference condition. A kernel that refuses it costs one experiment,
-        # not the whole run -- so it is tried separately and its failure is
-        # reported rather than raised.
+        # not the whole run -- so it is tried separately, reported ONCE, and
+        # never attempted again.
         try:
             pg_write(d, f"clone_skb {clone}")
-        except RuntimeError as e:
-            warn(f"clone_skb non accettato, proseguo senza: {e}")
+        except RuntimeError:
+            _CLONE_SUPPORTED = False
+            warn("clone_skb rifiutato da questo device: veth consegna l'skb "
+                 "alla RX del peer e non puo' condividerlo. Proseguo senza, "
+                 "e non ci riprovo.")
     for cmd in (f"count {count}",
                 f"pkt_size {pkt_size}",
                 f"delay {delay}",
@@ -480,7 +495,7 @@ def attach_rx_counter(fab):
 
 # ==========================================================================
 def run_method(method, model_path, frames, delays, count, out_rows,
-               clone=0, threads=1):
+               clone=0, threads=1, threshold=DEFAULT_LOSS_THRESHOLD):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -555,8 +570,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             else:
                 find_knee(setup, rx_tab, fab, frame, count, n_out, clone,
                           out_rows, method, printer, tg_devs=tg_devs,
-                          threads=threads)
-            _summarise(method, frame, out_rows)
+                          threads=threads, threshold=threshold)
+            _summarise(method, frame, out_rows, threshold)
 
         pg_reset()
         del_tg_links(threads - 1)
@@ -569,21 +584,30 @@ def run_method(method, model_path, frames, delays, count, out_rows,
 
 def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
               method, printer, max_delay=20000, steps=6, tg_devs=None,
-              threads=1):
-    """Find the fastest rate this pipeline takes without losing a packet.
-
-    A fixed list of delays spends most of its time at the slow end, where the
-    answer is always "no loss", and still misses the knee unless one of the
-    values happens to land on it. This walks to the knee instead:
+              threads=1, threshold=DEFAULT_LOSS_THRESHOLD):
+    """Find the fastest rate this pipeline takes without losing packets.
 
       1. offer everything the generator has (delay 0);
       2. if nothing is lost, the GENERATOR saturated first -- there is no knee
          to find, and saying so is the result;
-      3. otherwise bisect the delay to the smallest one that loses nothing,
-         which is the no-loss throughput.
+      3. otherwise bisect the delay down to the fastest rate that stays under
+         `threshold`.
 
-    Returns (peak_row, clean_row_or_None). Costs about `steps` measurements
-    instead of one per delay, and lands on the answer rather than near it."""
+    `threshold` is not a convenience. Measured on this bench: at three
+    generator cores the loss along one frame size went 0.00, 0.00, 0.10, 0.01,
+    0.12, 0.02, 0.21 percent as the rate ROSE -- tens to hundreds of packets
+    out of 300 000, scattered, not monotone. That is a busy VM losing the odd
+    packet, not a datapath saturating. A bisection that treats any loss > 0 as
+    "too fast" converges on whichever slow point happened to come out clean,
+    and reports it as the no-loss throughput: here it returned 600 kpps while
+    1.2 Mpps had run at 0.02%.
+
+    So the search uses a DECLARED threshold, and the summary reports both the
+    threshold figure and whether any point was strictly lossless. RFC 2544
+    asks for zero, and on hardware that can hold still zero is the right bar;
+    on a shared VM it measures the neighbours.
+
+    Returns (peak_row, clean_row_or_None)."""
     full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone,
                          tg_devs)
     full["method"], full["clone_skb"], full["delay"] = method, clone, 0
@@ -591,7 +615,7 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
     out_rows.append(full)
     printer(full)
 
-    if full["loss_pct"] == 0.0 and clone == 0:
+    if full["loss_pct"] <= threshold and clone == 0 and _CLONE_SUPPORTED:
         # Nothing lost at the generator's best effort. Before concluding that
         # the pipeline has headroom, PUSH HARDER: with clone_skb pktgen reuses
         # one buffer instead of allocating per packet, which removes the cost
@@ -609,7 +633,7 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         hard["threads"] = threads
         out_rows.append(hard)
         printer(hard)
-        if hard["loss_pct"] > 0.0:
+        if hard["loss_pct"] > threshold:
             print(f"  {GREY}con clone_skb={ESCALATE_CLONE} la pipeline perde: "
                   f"il ginocchio esiste, lo cerco{NC}")
             return find_knee(setup, rx_tab, fab, frame, count, n_out,
@@ -619,7 +643,7 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
               f"macchina satura il generatore, non la pipeline{NC}")
         return (hard if hard["rx_pps"] > full["rx_pps"] else full), hard
 
-    if full["loss_pct"] == 0.0:
+    if full["loss_pct"] <= threshold:
         return full, full          # generator-bound: peak IS the no-loss rate
 
     lo, hi = 0, max_delay           # lo loses, hi is assumed clean
@@ -633,32 +657,40 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         r["method"], r["clone_skb"], r["threads"] = method, clone, threads
         out_rows.append(r)
         printer(r)
-        if r["loss_pct"] == 0.0:
+        if r["loss_pct"] <= threshold:
             best_clean = r if (best_clean is None or
                                r["rx_pps"] > best_clean["rx_pps"]) else best_clean
-            hi = mid                # clean: try to go faster
+            hi = mid                # under threshold: try to go faster
         else:
             lo = mid                # still losing: slow down
     return full, best_clean
 
 
-def _summarise(method, frame, rows):
-    """The two numbers the question is asked in: the peak, and the peak that
-    loses nothing. They are different, and reporting only the first is the
-    usual way to overstate a datapath."""
+def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
+    """Three numbers, because two would hide the thing that matters.
+
+    The peak alone overstates a datapath. The peak plus a "no loss" figure is
+    the usual pair -- but on a machine that drops the odd packet for reasons of
+    its own, strict zero is a lottery. So: the peak, the fastest rate under the
+    declared threshold, and whether ANY point was strictly lossless."""
     pts = [r for r in rows if r["method"] == method and r["frame"] == frame]
     if not pts:
         return
     peak = max(pts, key=lambda r: r["rx_pps"])
-    clean = [r for r in pts if r["loss_pct"] == 0.0]
-    best_clean = max(clean, key=lambda r: r["rx_pps"]) if clean else None
+    under = [r for r in pts if r["loss_pct"] <= threshold]
+    strict = [r for r in pts if r["loss_pct"] == 0.0]
+    best = max(under, key=lambda r: r["rx_pps"]) if under else None
     print(f"  {GREY}frame {frame}: massimo {peak['rx_pps']} pps "
-          f"({peak['rx_mbps']} Mb/s, perdita {peak['loss_pct']}%)", end="")
-    if best_clean:
-        print(f" | a perdita nulla {best_clean['rx_pps']} pps "
-              f"({best_clean['rx_mbps']} Mb/s){NC}")
+          f"({peak['rx_mbps']} Mb/s, perdita {peak['loss_pct']}%)")
+    if best:
+        print(f"  {GREY}  sotto {threshold}% di perdita: {best['rx_pps']} pps "
+              f"({best['rx_mbps']} Mb/s, perdita {best['loss_pct']}%)")
+    if strict:
+        b0 = max(strict, key=lambda r: r["rx_pps"])
+        print(f"  {GREY}  a perdita esattamente zero: {b0['rx_pps']} pps "
+              f"({b0['rx_mbps']} Mb/s){NC}")
     else:
-        print(f" | {RED}nessun punto a perdita nulla{GREY} in questo sweep{NC}")
+        print(f"  {GREY}  nessun punto a perdita esattamente zero{NC}")
 
 
 # ==========================================================================
@@ -674,6 +706,11 @@ def main():
                         "meno punti e centra la risposta")
     p.add_argument("--count", type=int, default=200000,
                    help="pacchetti per punto di misura")
+    p.add_argument("--loss-threshold", type=float,
+                   default=DEFAULT_LOSS_THRESHOLD, metavar="PCT",
+                   help="sotto questa percentuale la perdita e' considerata "
+                        "rumore della macchina, non saturazione. Zero stretto "
+                        "resta riportato a parte.")
     p.add_argument("--threads", type=int, default=1, metavar="N",
                    help="core generatori: N veth d'ingresso, N thread pktgen, "
                         "tutti sullo stesso programma XDP. E' l'unico modo di "
@@ -716,7 +753,7 @@ def main():
     rc = 0
     for m in methods:
         rc |= run_method(m, model_path, frames, delays, a.count, rows,
-                         a.clone_skb, a.threads)
+                         a.clone_skb, a.threads, a.loss_threshold)
 
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
