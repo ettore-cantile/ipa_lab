@@ -114,6 +114,7 @@ META_SCALE        = 1
 META_LAYER_IDX    = 2
 META_INGRESS_IF   = 3
 META_TTL          = 4
+META_NODE_ID      = 5
 
 # Compile-time layer-shape ceilings (see module docstring)
 # Was `PROTO_N_IN = 65   # protocol-fixed IPA feature vector width`. It is not
@@ -362,6 +363,7 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 #define META_LAYER_IDX   2
 #define META_INGRESS_IF  3
 #define META_TTL         4
+#define META_NODE_ID     5
 
 /* Per-model metadata: model_id -> {scale_factor, n_layers}. n_layers tells
  * each hop when it has reached the last layer (layer_idx+1==n_layers). */
@@ -516,6 +518,14 @@ int modular_dispatcher(struct xdp_md *ctx) {
       long long v = _lp ? (long long)(*_lp) : 0LL;
       scratch_meta.update(&idx, &v); }
     idx = META_TTL;        { long long v = ip->ttl;                scratch_meta.update(&idx, &v); }
+    /* This node's own index, resolved here and passed down like the ingress
+     * port. The lookup belongs in the dispatcher, not in the layer: a map read
+     * inside layer_first adds a branch that the verifier must follow through
+     * every iteration of the unrolled feature loop. 256 = unknown. */
+    idx = META_NODE_ID;
+    { __u32 _nz = 0; __u32 *_nid = node_id_t3.lookup(&_nz);
+      long long v = (_nid && *_nid <= 0xffU) ? (long long)(*_nid) : 0x100LL;
+      scratch_meta.update(&idx, &v); }
 
     /* Tail call to layer_chain[0] = layer_first. It reads model_id/scale/
      * ttl/ingress_if straight back out of scratch_meta and link_state --
@@ -595,15 +605,13 @@ int layer_first(struct xdp_md *ctx) {
     long long *ifp = scratch_meta.lookup(&mif);
     __u32 _raw_iface = ifp ? (__u32)(*ifp) : 0;
 
-    /* The NODE's own index, not the packet's model_id -- see node_id_t3.
-     * Bounded to a byte on purpose: this used to come from a __u8, and the
-     * verifier needs that bound to reason about `base + _node` inside the
-     * unrolled feature loop. 256 is the "unknown" sentinel -- outside any
-     * valid index, so no bit is set. An index above 255 is refused by the
-     * control plane rather than truncated here. */
-    __u32 _node = 0x100U;
-    { __u32 _nz = 0; __u32 *_nid = node_id_t3.lookup(&_nz);
-      if (_nid && *_nid <= 0xffU) _node = *_nid; }
+    /* The NODE's own index, not the packet's model_id. Resolved by the
+     * dispatcher and passed through scratch_meta, like the ingress port above:
+     * one read, one bound, no extra branch inside the unrolled loop. The value
+     * is already clamped to [0, 256], 256 meaning unknown. */
+    int mnid = META_NODE_ID;
+    long long *nidp = scratch_meta.lookup(&mnid);
+    __u32 _node = nidp ? ((__u32)(*nidp) & 0x1ffU) : 0x100U;
 
     /* dense feature vectors, each read once (single lookup), reused per neuron.
      * Sized to the topology; the descriptor's per-feature size gates the slots. */

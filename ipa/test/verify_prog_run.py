@@ -571,7 +571,12 @@ def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, layer_idx: int, in
         for i, v in enumerate(h2[:4]):
             leaf[cpu].v[i] = int(v)
     acts_tbl[ct.c_int(0)] = leaf
-    meta = {0: model_id, 1: scale, 2: layer_idx, 3: ingress_ifindex, 4: ttl}
+    # Slot 5 is META_NODE_ID, written by the dispatcher in a normal run.
+    # A primed run bypasses the dispatcher, so it is seeded here to 0x100
+    # -- the "unknown node" sentinel, which sets no bit and therefore
+    # matches a reference called with node_index=None.
+    meta = {0: model_id, 1: scale, 2: layer_idx, 3: ingress_ifindex, 4: ttl,
+            5: 0x100}
     for slot, val in meta.items():
         b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
 
