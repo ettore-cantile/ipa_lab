@@ -273,6 +273,16 @@ KNEE_STEPS = 5
 # lavoro -- cioe' il run misurava il carico della macchina, non il datapath.
 MAX_SPREAD_PCT = 25.0
 
+# Sopra questo sfasamento fra i thread del generatore la finestra non e' una
+# finestra: i thread non hanno lavorato nello stesso intervallo, quindi la somma
+# dei loro pacchetti diviso una durata comune non e' un rate offerto -- e'
+# l'unione di due raffiche distinte, che il DUT ha visto una alla volta.
+#
+# Misurato su questo banco: due thread sfasati del 42% su una riga che riportava
+# 6,8 Mpps offerti e 55% di perdita. Con i thread sovrapposti quel rate non era
+# mai stato offerto: era il picco di uno solo, esteso alla durata di entrambi.
+MAX_GEN_SKEW_PCT = 20.0
+
 # Sotto questa differenza relativa due pipeline non sono distinguibili su questo
 # banco, e un'inversione non e' un difetto del run. Vedi check_validity.
 VALID_TOL = 0.10
@@ -1789,18 +1799,34 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     med["secs_mean"] = round(sum(r["secs"] for r in runs) / len(runs), 3)
     lo, hi = med["rx_pps_min"], med["rx_pps_max"]
     med["spread_pct"] = round(100.0 * (hi - lo) / lo, 1) if lo else None
-    # Una mediana su misure che oscillano del 75% non e' una misura: e' il
-    # carico della macchina in tre momenti diversi. Marcarla e' l'unica cosa
-    # onesta da farne.
-    med["unreliable"] = bool(med["spread_pct"] is not None
-                             and med["spread_pct"] > MAX_SPREAD_PCT)
-    # Due avvisi che riguardano la MISURA e non il datapath: se scattano, la
-    # riga resta ma va letta sapendo che la finestra non era pulita. Solo sulle
-    # finestre di misura: su una sonda da due pacchetti questi rapporti non
-    # vogliono dire niente e sarebbero solo rumore a schermo.
-    if check_window and med.get("gen_skew_pct", 0) > 20.0:
+    # Due motivi indipendenti per non fidarsi di una riga, e servono
+    # entrambi.
+    #
+    # La DISPERSIONE dice che la stessa misura ripetuta da' numeri diversi:
+    # una mediana su misure che oscillano del 75% non e' una misura, e' il
+    # carico della macchina in tre momenti diversi.
+    #
+    # Lo SFASAMENTO dice che dentro una SINGOLA misura i generatori non erano
+    # accesi insieme, quindi il rate offerto non e' mai esistito come rate.
+    # Prima solo la dispersione marcava la riga, e una finestra sfasata del
+    # 42% restava candidata a diventare il risultato della ricerca.
+    skew = med.get("gen_skew_pct", 0.0) or 0.0
+    med["unreliable"] = bool(
+        (med["spread_pct"] is not None and med["spread_pct"] > MAX_SPREAD_PCT)
+        or (check_window and skew > MAX_GEN_SKEW_PCT))
+    # Due avvisi che riguardano la MISURA e non il datapath. Il primo marca
+    # anche la riga (sopra); il secondo no, perche' dice solo quale delle due
+    # letture del rate si sta usando, non che la finestra sia rotta.
+    #
+    # Solo sulle finestre di misura: su una sonda da due pacchetti questi
+    # rapporti non vogliono dire niente e sarebbero solo rumore a schermo.
+    if check_window and skew > MAX_GEN_SKEW_PCT:
         warn(f"thread del generatore sfasati del {med['gen_skew_pct']}%: non "
-             f"hanno lavorato nella stessa finestra")
+             f"hanno lavorato nella stessa finestra, quindi il rate offerto "
+             f"di questa riga non e' mai esistito. Riga marcata inaffidabile. "
+             f"Rimedio: --threads 1 (un thread non puo' sfasarsi con se "
+             f"stesso), oppure --duration piu' lunga perche' l'avvio pesi "
+             f"meno sulla finestra.")
     if check_window and med.get("gen_rate_mismatch_pct", 0) > 25.0:
         warn(f"TX/durata e somma dei pps per istanza differiscono del "
              f"{med['gen_rate_mismatch_pct']}%: uso TX diviso la durata "
@@ -3730,11 +3756,28 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         out_rows.append(r)
         printer(r)
         if r["loss_worst"] <= threshold:
-            best_clean = r if (best_clean is None or
-                               r["rx_pps"] > best_clean["rx_pps"]) else best_clean
+            # Pulita NON basta: dev'essere anche una misura. Una finestra
+            # marcata inaffidabile -- dispersione oltre soglia, o thread del
+            # generatore sfasati -- puo' benissimo riportare perdita zero
+            # proprio perche' la finestra era rotta, e diventerebbe la
+            # risposta della ricerca. Il rate si muove lo stesso (la finestra
+            # dice comunque che a questo ritardo non si perdeva), ma il numero
+            # non viene promosso a risultato.
+            if not r.get("unreliable"):
+                best_clean = r if (best_clean is None or
+                                   r["rx_pps"] > best_clean["rx_pps"]) \
+                    else best_clean
             hi = mid                # under threshold: try to go faster
         else:
             lo = mid                # still losing: slow down
+    if best_clean is None and any(
+            x.get("method") == method and x["frame"] == frame
+            and x["loss_worst"] <= threshold and x.get("unreliable")
+            for x in out_rows):
+        print(f"  {RED}nessun rate senza perdite utilizzabile{NC}{GREY}: i "
+              f"punti puliti trovati erano tutti su finestre inaffidabili. "
+              f"Il banco non e' fermo abbastanza per rispondere. Prova "
+              f"--threads 1 e --duration 1.0.{NC}")
     # Is the loss actually driven by the rate? If a point LOSES at a rate
     # lower than one that stayed clean, it is not.
     if best_clean is not None:
