@@ -20,7 +20,7 @@
 //
 // Build: cc -O2 loader_aot.c -o loader_aot -lbpf
 // Run  : sudo ./loader_aot <literal.o>                 (bench: TEST_RUN)
-//        sudo ./loader_aot <literal.o> --attach <ifidx> [--xdp-mode native|generic|auto]
+//        sudo ./loader_aot <literal.o> --attach <ifidx> [--xdp-mode native|generic|auto] [--node-id N]
 //              (LIVE deploy: attach
 //              xdp_dispatch to the interface, stay resident until Ctrl-C, then
 //              detach -- the AOT alternative to method4_hardcoded's BCC attach)
@@ -43,6 +43,16 @@ struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribu
 /* The interface being attached to, or -1 in bench mode. seed_maps() needs it
  * to fill ingress_port, and it is parsed before seed_maps() runs. */
 static int g_attach_ifindex = -1;
+
+/* This node's index in the node one-hot, or -1 for "unknown".
+ *
+ * An AOT object is built on a build machine, so it cannot carry this: it is
+ * supplied at load time by --node-id or $IPA_NODE_ID, exactly as the Python
+ * control plane resolves it. Left unset, the node one-hot stays empty, which
+ * is honest -- the alternative, defaulting to 0, would make every
+ * unconfigured node claim to be node 0. That was the previous behaviour, via
+ * ipa->model_id, and it is what this replaces. */
+static int g_node_id = -1;
 
 /* Set by SIGINT/SIGTERM so the live-attach deploy mode can detach cleanly. */
 static volatile sig_atomic_t g_stop = 0;
@@ -142,6 +152,36 @@ static int seed_maps(struct bpf_object *obj) {
         fprintf(stderr, "ingress_port left empty (bench mode: no interface), so "
                         "the ingress_iface one-hot contributes nothing\n");
     }
+
+    /* This node's own index. Bounded to a byte because the generated program
+     * bounds it too -- the verifier needs that range to reason about the
+     * switch cheaply, so an index it cannot represent is refused here rather
+     * than truncated into a different node. */
+    struct bpf_map *nid_map = bpf_object__find_map_by_name(obj, "node_id");
+    if (nid_map) {
+        int nid = g_node_id;
+        if (nid < 0) {
+            const char *env = getenv("IPA_NODE_ID");
+            if (env && *env) nid = atoi(env);
+        }
+        if (nid < 0) {
+            fprintf(stderr, "node_id left empty (no --node-id and no "
+                            "$IPA_NODE_ID), so the node one-hot contributes "
+                            "nothing\n");
+        } else if (nid > 0xff) {
+            fprintf(stderr, "node id %d is outside [0, 255], which is what the "
+                            "datapath can represent; leaving node_id empty "
+                            "rather than truncating it\n", nid);
+        } else {
+            __u32 k = 0, v = (__u32)nid;
+            if (bpf_map_update_elem(bpf_map__fd(nid_map), &k, &v, BPF_ANY))
+                fprintf(stderr, "WARNING: could not seed node_id (%s); the node "
+                                "one-hot will contribute nothing\n",
+                        strerror(errno));
+            else
+                fprintf(stderr, "seeded node_id: this node is index %u\n", v);
+        }
+    }
     return 0;
 }
 
@@ -163,6 +203,9 @@ int main(int argc, char **argv) {
     const char *mode_name = "native";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--attach") && i + 1 < argc) g_attach_ifindex = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--node-id") && i + 1 < argc) {
+            g_node_id = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--xdp-mode") && i + 1 < argc) {
             mode_name = argv[++i];
             if (!strcmp(mode_name, "native"))       xdp_flags = XDP_FLAGS_DRV_MODE;

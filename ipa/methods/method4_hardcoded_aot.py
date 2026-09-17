@@ -306,9 +306,19 @@ def main():
             sys.exit(f"[AOT] interface {args.iface!r} not found")
         print(f"[AOT] LIVE deploy: attaching prebuilt .o to {args.iface} "
               f"(ifindex={ifindex}); no clang on this node. Ctrl-C to detach.\n")
-        rc = subprocess.run([loader_bin, o_path, "--attach", str(ifindex),
-                             "--xdp-mode", args.xdp_mode],
-                            cwd=POC_DIR).returncode
+        cmd = [loader_bin, o_path, "--attach", str(ifindex),
+               "--xdp-mode", args.xdp_mode]
+        # The node index, resolved the same way the BCC pipelines resolve it.
+        # Passed explicitly rather than left to the loader's own $IPA_NODE_ID
+        # read, so one resolver decides for every deploy path.
+        try:
+            from common import resolve_node_index
+            _nid = resolve_node_index()
+        except Exception:
+            _nid = None
+        if _nid is not None:
+            cmd += ["--node-id", str(_nid)]
+        rc = subprocess.run(cmd, cwd=POC_DIR).returncode
         if rc != 0:
             sys.exit(f"[AOT] loader_aot live attach failed (rc={rc})")
         return

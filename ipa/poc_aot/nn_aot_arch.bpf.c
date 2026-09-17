@@ -45,6 +45,17 @@ struct { __uint(type, BPF_MAP_TYPE_PROG_ARRAY); __uint(max_entries, 256);
  * before the node exists. */
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64);
          __type(key, __u32); __type(value, __u32); } ingress_port SEC(".maps");
+/* This node's index in the node one-hot, written by the loader at
+ * attach time. It used to come from ipa->model_id -- the packet's
+ * MODEL id, which is not a node identity: the same packet carries it
+ * along its whole path, so every node fired the same slot and 52 of
+ * the 65 inputs carried nothing.
+ *
+ * A HASH, not an ARRAY: an array is pre-allocated and zero-filled, so
+ * a lookup always succeeds and "not installed" reads back as node 0.
+ */
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1);
+         __type(key, __u32); __type(value, __u32); } node_id SEC(".maps");
 
 SEC("xdp")
 int xdp_model(struct xdp_md *ctx) {
@@ -96,8 +107,14 @@ int xdp_model(struct xdp_md *ctx) {
         default: break;
     }
     __u32 _ttl = ((__u32)ip->ttl) & 0xff;   /* feature 'ttl' (scalar) */
-    /* feature 'node' (one-hot): active index = model_id */
-    __u32 _node = (__u32)ipa->model_id;  /* switch default zeroes out-of-range */
+    /* feature 'node' (one-hot): this NODE's index, from the node_id
+     * map -- not ipa->model_id, which identifies the MODEL.
+     * Bounded to a byte so the verifier reasons about the switch
+     * below cheaply; 256 is the unknown sentinel and falls through
+     * to the default, setting no weight. */
+    __u32 _node = 0x100U;
+    { __u32 _nz = 0; __u32 *_nid = bpf_map_lookup_elem(&node_id, &_nz);
+      if (_nid && *_nid <= 0xffU) _node = *_nid; }
     long long w_node_0 = 0LL;
     long long w_node_1 = 0LL;
     long long w_node_2 = 0LL;

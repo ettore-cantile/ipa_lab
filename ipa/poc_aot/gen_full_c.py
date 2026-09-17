@@ -133,8 +133,14 @@ def _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1):
 
 def _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1):
     size = feat["size"]
-    lines = ["    /* feature 'node' (one-hot): active index = model_id */",
-             "    __u32 _node = (__u32)ipa->model_id;  /* switch default zeroes out-of-range */"]
+    lines = ["    /* feature 'node' (one-hot): this NODE's index, from the node_id",
+             "     * map -- not ipa->model_id, which identifies the MODEL.",
+             "     * Bounded to a byte so the verifier reasons about the switch",
+             "     * below cheaply; 256 is the unknown sentinel and falls through",
+             "     * to the default, setting no weight. */",
+             "    __u32 _node = 0x100U;",
+             "    { __u32 _nz = 0; __u32 *_nid = bpf_map_lookup_elem(&node_id, &_nz);",
+             "      if (_nid && *_nid <= 0xffU) _node = *_nid; }"]
     for j in range(n_h1):
         lines.append(f"    long long w_node_{j} = 0LL;")
     lines.append("    switch (_node) {")
@@ -360,6 +366,17 @@ def _emit_maps(shape) -> list:
     A(" * before the node exists. */")
     A("struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64);")
     A("         __type(key, __u32); __type(value, __u32); } ingress_port SEC(\".maps\");")
+    A("/* This node's index in the node one-hot, written by the loader at")
+    A(" * attach time. It used to come from ipa->model_id -- the packet's")
+    A(" * MODEL id, which is not a node identity: the same packet carries it")
+    A(" * along its whole path, so every node fired the same slot and 52 of")
+    A(" * the 65 inputs carried nothing.")
+    A(" *")
+    A(" * A HASH, not an ARRAY: an array is pre-allocated and zero-filled, so")
+    A(" * a lookup always succeeds and \"not installed\" reads back as node 0.")
+    A(" */")
+    A("struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1);")
+    A("         __type(key, __u32); __type(value, __u32); } node_id SEC(\".maps\");")
     return L
 
 

@@ -300,8 +300,12 @@ BPF_HASH(ingress_port, __u32, __u32, 64);
  * the 65 inputs, carrying no information.
  *
  * Which node this is, is a fact of the node, resolved when the node exists --
- * exactly like mac_table and ingress_port. An absent entry means "unknown", and
- * no bit is set, rather than silently meaning node 0.
+ * exactly like mac_table and ingress_port.
+ *
+ * A HASH and not an ARRAY, deliberately: a BPF_ARRAY is pre-allocated and
+ * zero-filled, so a lookup always succeeds and "nothing installed" reads back
+ * as node 0 -- indistinguishable from a real node 0, which is the very defect
+ * this map exists to remove. With a hash, absent means absent.
  */
 BPF_HASH(node_id, __u32, __u32, 1);
 
