@@ -674,6 +674,36 @@ P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
   d'uscita, DROP verificato dal contatore `cls_stats` e non dal silenzio. Questa riga diceva
   il contrario fino a poco fa — era vera quando l'unico banco era un emulatore.
 
+### P3 non ha più margine di verifica: misurato
+
+`layer_first`, il programma più grande di Pipeline 3, **carica a 9 994 istruzioni**.
+Provando a farlo leggere l'indice del nodo da una mappa — invece che dal `model_id` del
+pacchetto, come fanno ora P1 e P2 — il verificatore lo ha **rifiutato quattro volte**:
+
+| forma tentata | istruzioni | esito |
+|---|---:|---|
+| (prima, indice da `model_id`) | 9 994 | carica |
+| lookup di mappa dentro `layer_first` | 9 402 | rifiutato |
+| valore limitato a un byte | 9 205 | rifiutato |
+| risolto nel dispatcher, passato via `scratch_meta` | 9 205 | rifiutato |
+| uscita anticipata invece di ternario | 9 176 | rifiutato |
+
+**Ogni versione rifiutata è più piccola di quella che carica.** Non è la dimensione del
+programma: è la complessità di verifica, e `layer_first` non ha margine per **un solo
+valore tracciato in più**, qualunque forma gli si dia.
+
+Conseguenza, lasciata aperta e non mascherata: su P3 la one-hot del nodo resta guidata dal
+`model_id` del pacchetto, quindi con un solo modello registrato ogni nodo accende lo stesso
+slot e 52 dei 65 ingressi non portano informazione. È l'**ultimo ingresso su cui le tre
+pipeline non concordano**, e il riferimento lo modella esplicitamente invece di ignorarlo.
+
+Chiuderlo richiede di ridurre il corpo srotolato di P3, non di limare la feature.
+
+> Nota sul messaggio d'errore: BCC riporta questo rifiuto come
+> `Program too large (N insns), at most 4096 insns`. Il 4096 è una costante vecchia nella
+> stringa d'errore di BCC — nello stesso run P2 ha caricato a 15 383 istruzioni. Va letto
+> come "il verificatore ha rinunciato", non "il programma è troppo lungo".
+
 ### Il soffitto compilato ha un costo di verifica, e ha un limite
 
 `T2_MAX_H1`, `T2_MAX_H2` e `MAX_N_IN` sono **soffitti a compile-time**: i cicli interni sono

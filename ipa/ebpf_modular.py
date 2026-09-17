@@ -112,9 +112,8 @@ SCRATCH_META_SLOTS = 16    # metadata slots
 META_MODEL_ID     = 0
 META_SCALE        = 1
 META_LAYER_IDX    = 2
-META_INGRESS_IF   = 3
+META_NODE_CTX     = 3   # (node_index << 16) | ingress_port
 META_TTL          = 4
-META_NODE_ID      = 5
 
 # Compile-time layer-shape ceilings (see module docstring)
 # Was `PROTO_N_IN = 65   # protocol-fixed IPA feature vector width`. It is not
@@ -312,23 +311,16 @@ BPF_ARRAY(mac_table_t3, struct fwd_action, MAX_N_OUT);
  * runtime, exactly like mac_table. This is that map, on the ingress side.
  */
 BPF_HASH(ingress_port_t3, __u32, __u32, 64);
-/* This node's index in the node one-hot, a single entry written by the control
- * plane at deploy time.
- *
- * The one-hot used to be indexed by ipa->model_id -- the MODEL identifier from
- * the packet header. That is not a node identity: the same packet carries the
- * same model_id along its whole path, so with one registered model every node
- * fired slot 0 and the feature contributed the same constant everywhere. 52 of
- * the 65 inputs, carrying no information.
- *
- * Which node this is, is a fact of the node, resolved when the node exists --
- * exactly like mac_table and ingress_port.
+
+/* This node's index in the node one-hot, written by the control plane.
  *
  * A HASH and not an ARRAY, deliberately: a BPF_ARRAY is pre-allocated and
  * zero-filled, so a lookup always succeeds and "nothing installed" reads back
  * as node 0 -- indistinguishable from a real node 0, which is the very defect
  * this map exists to remove. With a hash, absent means absent.
- */
+ *
+ * Read ONLY by the dispatcher. layer_first must not grow another map lookup:
+ * see META_NODE_CTX. */
 BPF_HASH(node_id_t3, __u32, __u32, 1);
 
 BPF_ARRAY(class_action_t3, struct class_act, MAX_N_OUT);
@@ -361,9 +353,23 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 #define META_MODEL_ID    0
 #define META_SCALE       1
 #define META_LAYER_IDX   2
-#define META_INGRESS_IF  3
+/* The node's view of this packet, packed into one slot:
+ *
+ *      bits 24..16 : this NODE's index   (0x100 = unknown)
+ *      bits 15..0  : the LOGICAL PORT the packet arrived on (0 = none)
+ *
+ * Packed rather than given a slot each, and this is the whole reason:
+ * layer_first is at the verifier's complexity limit. Every extra
+ * bpf_map_lookup_elem() in it is a helper call, and a helper call costs far
+ * more verifier state than the arithmetic around it. Measured -- layer_first
+ * loads at 9 994 instructions with one lookup here, and was REFUSED at 9 402,
+ * 9 205 and 9 176 with a second one, in four different shapes. Every refused
+ * version was SMALLER than the one that loads.
+ *
+ * Both halves are the same kind of fact -- where this packet is, as the node
+ * sees it -- so one slot is honest, not a hack. */
+#define META_NODE_CTX    3
 #define META_TTL         4
-#define META_NODE_ID     5
 
 /* Per-model metadata: model_id -> {scale_factor, n_layers}. n_layers tells
  * each hop when it has reached the last layer (layer_idx+1==n_layers). */
@@ -509,23 +515,20 @@ int modular_dispatcher(struct xdp_md *ctx) {
     idx = META_MODEL_ID;   { long long v = model_id;               scratch_meta.update(&idx, &v); }
     idx = META_SCALE;      { long long v = lentry->scale_factor;   scratch_meta.update(&idx, &v); }
     idx = META_LAYER_IDX;  { long long v = 0LL;                    scratch_meta.update(&idx, &v); }
-    /* The LOGICAL PORT, not the kernel ifindex -- resolved here, at the
-     * dispatcher, so every tail-called layer reads a node-independent value
-     * from scratch_meta. See the ingress_port_t3 declaration. */
-    idx = META_INGRESS_IF;
+    /* Both halves of the node context, resolved HERE and packed into one
+     * slot, so the layers pay one lookup instead of two. The dispatcher is
+     * small and can afford the two map reads; layer_first cannot afford even
+     * one more. See the META_NODE_CTX comment. */
+    idx = META_NODE_CTX;
     { __u32 _kif = ctx->ingress_ifindex;
       __u32 *_lp = ingress_port_t3.lookup(&_kif);
-      long long v = _lp ? (long long)(*_lp) : 0LL;
+      __u32 _port = _lp ? (*_lp & 0xffffU) : 0U;
+      __u32 _nz = 0;
+      __u32 *_nid = node_id_t3.lookup(&_nz);
+      __u32 _nd = (_nid && *_nid <= 0xffU) ? *_nid : 0x100U;
+      long long v = (long long)((_nd << 16) | _port);
       scratch_meta.update(&idx, &v); }
     idx = META_TTL;        { long long v = ip->ttl;                scratch_meta.update(&idx, &v); }
-    /* This node's own index, resolved here and passed down like the ingress
-     * port. The lookup belongs in the dispatcher, not in the layer: a map read
-     * inside layer_first adds a branch that the verifier must follow through
-     * every iteration of the unrolled feature loop. 256 = unknown. */
-    idx = META_NODE_ID;
-    { __u32 _nz = 0; __u32 *_nid = node_id_t3.lookup(&_nz);
-      long long v = (_nid && *_nid <= 0xffU) ? (long long)(*_nid) : 0x100LL;
-      scratch_meta.update(&idx, &v); }
 
     /* Tail call to layer_chain[0] = layer_first. It reads model_id/scale/
      * ttl/ingress_if straight back out of scratch_meta and link_state --
@@ -601,27 +604,20 @@ int layer_first(struct xdp_md *ctx) {
     long long *ttlp = scratch_meta.lookup(&mtl);
     __u32 _ttl = ttlp ? (__u32)(*ttlp) & 0xff : 0;
 
-    int mif = META_INGRESS_IF;
-    long long *ifp = scratch_meta.lookup(&mif);
-    __u32 _raw_iface = ifp ? (__u32)(*ifp) : 0;
+    /* One lookup, one ternary -- exactly the shape that loads. The node
+     * index rides in the upper half of the same word; unpacking it is two ALU
+     * ops on an already-bounded value, which costs the verifier nothing like a
+     * second helper call would. 0x1000000 is "no port, unknown node". */
+    int mctx = META_NODE_CTX;
+    long long *cxp = scratch_meta.lookup(&mctx);
+    __u32 _ctx = cxp ? (__u32)(*cxp) : 0x1000000U;
+    __u32 _raw_iface = _ctx & 0xffffU;
+    __u32 _node      = (_ctx >> 16) & 0x1ffU;
 
     /* The NODE's own index, not the packet's model_id. Resolved by the
      * dispatcher and passed through scratch_meta, like the ingress port above:
      * one read, one bound, no extra branch inside the unrolled loop. The value
      * is already clamped to [0, 256], 256 meaning unknown. */
-    int mnid = META_NODE_ID;
-    long long *nidp = scratch_meta.lookup(&mnid);
-    /* Early exit, not a ternary. Everything load-bearing in this function uses
-     * this form; the two ternaries above (_ttl, _raw_iface) MERGE two possible
-     * values, and each merged value that the unrolled feature loop reads
-     * multiplies the paths the verifier has to walk. A third merge was enough
-     * to push layer_first past the complexity limit even though the program
-     * got SMALLER (9 994 instructions loaded before, 9 205 did not).
-     *
-     * The dispatcher always writes this slot, so a missing one means something
-     * upstream is broken -- which is exactly when XDP_PASS is the right answer. */
-    if (!nidp) return XDP_PASS;
-    __u32 _node = (__u32)(*nidp) & 0x1ffU;
 
     /* dense feature vectors, each read once (single lookup), reused per neuron.
      * Sized to the topology; the descriptor's per-feature size gates the slots. */

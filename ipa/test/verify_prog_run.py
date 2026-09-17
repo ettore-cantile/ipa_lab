@@ -571,12 +571,11 @@ def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, layer_idx: int, in
         for i, v in enumerate(h2[:4]):
             leaf[cpu].v[i] = int(v)
     acts_tbl[ct.c_int(0)] = leaf
-    # Slot 5 is META_NODE_ID, written by the dispatcher in a normal run.
-    # A primed run bypasses the dispatcher, so it is seeded here to 0x100
-    # -- the "unknown node" sentinel, which sets no bit and therefore
-    # matches a reference called with node_index=None.
-    meta = {0: model_id, 1: scale, 2: layer_idx, 3: ingress_ifindex, 4: ttl,
-            5: 0x100}
+    # Slot 3 is META_NODE_CTX: (node_index << 16) | ingress_port. 0x100 in
+    # the upper half is "unknown node", which sets no bit -- matching a
+    # reference called with node_index=None.
+    meta = {0: model_id, 1: scale, 2: layer_idx,
+            3: (0x100 << 16) | (ingress_ifindex & 0xffff), 4: ttl}
     for slot, val in meta.items():
         b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
 
@@ -1315,10 +1314,19 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     # the ingress_iface one-hot is empty for every pipeline. The reference has
     # to say the same, or the two disagree about a feature neither is using.
     ref_ingress_port = 0
+
+    # Reference NODE index. All three pipelines take it from the `node_id`
+    # map now -- P3 included, by packing it alongside the ingress port in one
+    # scratch_meta slot rather than paying a second map lookup. This runner
+    # installs no entry, so no node resolves and no bit is set, the same for
+    # every pipeline.
+    ref_node_index = None
+
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
         ref_cls, ref_val, h1, h2 = ref_infer(weights, scale, ttl, model_id,
-                                             ingress_port=ref_ingress_port)
+                                             ingress_port=ref_ingress_port,
+                                             node_index=ref_node_index)
         frame = build_frame(model_id, ttl, scale)
         _reset_stats(setup)
         # repeat=1: the program mutates the packet (TTL decrement) and

@@ -299,8 +299,9 @@ def test_modular():
 
     ps, cs = b["pkt_stats_t3"], b["cls_stats_t3"]
     ok = True
-    # Same as P2: neither one-hot contributes, and no longer for a
-    # pipeline-specific reason.
+    # Neither one-hot contributes: no ingress_port entry and no node_id entry
+    # are installed, so both resolve to "unknown" and set no bit -- the same
+    # for all three pipelines.
     ok &= _check("modular", 0, disp_fn.fd, ps, cs, dims0, weights0)
     ok &= _check("modular", 1, disp_fn.fd, ps, cs, dims1, weights1)
     return ok
