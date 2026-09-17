@@ -93,6 +93,19 @@ USO
     sudo python3 ipa/test/bench_throughput.py --out result/
     sudo python3 ipa/test/bench_throughput.py --cleanup        # se resta sporco
 
+Confronto equo (questo e' quello da citare in tesi): un solo fabric, tutte le
+pipeline compilate PRIMA di misurare, e misura a giri con la mediana fra i giri.
+Riporta il tempo arrivo-partenza, non solo la portata.
+
+    sudo python3 ipa/test/bench_throughput.py --latency --rounds 5 --out result/
+    sudo python3 ipa/test/bench_throughput.py --latency --frames 64,512,1514 \
+        --rounds 5 --out result/
+
+Scrive due file: latency.csv (mediana fra i giri) e latency_raw.csv (ogni giro).
+Il secondo serve a leggere la dispersione, che e' cio' che dice se la mediana
+significa qualcosa: su questa VM la latenza varia di pochi ns fra i giri, la
+portata a pieno rate anche del 137%.
+
 Serve Linux, root, BCC e il modulo pktgen (`sudo modprobe pktgen`).
 """
 import io
@@ -1137,6 +1150,55 @@ def _one_fair_point(b, fab, frame, delay, count):
                                       "lat_max_ns")})
 
 
+def _give_back(*paths):
+    """Ridai i file all'utente che ha lanciato il sudo.
+
+    Senza questo i CSV restano di root: il run dopo non puo' sovrascriverli e
+    nemmeno il plotter puo' leggerli comodamente."""
+    uid = os.environ.get("SUDO_UID")
+    if not uid:
+        return
+    gid = int(os.environ.get("SUDO_GID", uid))
+    for base in paths:
+        for root, dirs, files in os.walk(base):
+            for name in list(dirs) + list(files):
+                try:
+                    os.chown(os.path.join(root, name), int(uid), gid)
+                except OSError:
+                    pass
+        try:
+            os.chown(base, int(uid), gid)
+        except OSError:
+            pass
+
+
+def _latency_verdict(rows):
+    """La latenza regge anche dove il throughput no: dirlo esplicitamente.
+
+    Sullo stesso identico run, a pieno rate: il throughput di una pipeline
+    varia del 137% fra i giri, la sua latenza minima di meno dell'1%. Sono due
+    misure con due affidabilita' diverse e vanno riportate come tali, invece di
+    lasciare che il lettore prenda la tabella per buona tutta insieme."""
+    lat = [r for r in rows if r.get("lat_spread_pct") is not None]
+    if not lat:
+        return
+    worst = max(lat, key=lambda r: r["lat_spread_pct"])
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} Latenza: quanto e' riproducibile{NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+    if worst["lat_spread_pct"] <= 5.0:
+        print(f"  {GREEN}[PASS]{NC} la latenza minima varia al massimo del "
+              f"{worst['lat_spread_pct']:.1f}% fra i giri "
+              f"({worst['method']}, frame {worst['frame']}, delay "
+              f"{worst['delay']}).")
+        print(f"  {GREY}E' la misura da citare: riproducibile anche dove il "
+              f"throughput non lo e'.{NC}")
+    else:
+        print(f"  {RED}[FAIL]{NC} la latenza minima varia fino al "
+              f"{worst['lat_spread_pct']:.1f}% fra i giri "
+              f"({worst['method']}): alza --rounds.")
+
+
 def summarise_fair(raw, methods):
     """Mediana fra i giri, per metodo e configurazione."""
     import statistics as stats
@@ -1158,13 +1220,28 @@ def summarise_fair(raw, methods):
         med = {k: stats.median([r[k] for r in pts if r[k] is not None] or [0])
                for k in ("rx_pps", "rx_mbps", "loss_pct", "lat_min_ns",
                          "lat_p50_ns", "lat_p99_ns")}
-        row = dict(method=m, frame=frame, delay=delay, rounds=len(pts), **med)
+        # Dispersione FRA I GIRI, non dentro un punto. E' la cosa che dice se
+        # la mediana significa qualcosa: misurato, hardcoded a pieno rate ha
+        # dato 2,78 / 1,17 / 1,46 Mpps in tre giri -- 137% -- e la sua mediana
+        # e' finita SOTTO template, che fa molto piu' lavoro. Una mediana su
+        # misure cosi' non e' un risultato, ed e' il numero che va marcato.
+        pps = [r["rx_pps"] for r in pts if r["rx_pps"]]
+        spread = (100.0 * (max(pps) - min(pps)) / min(pps)) if pps else 0.0
+        # La latenza ha la sua dispersione, e nei fatti e' un altro mondo:
+        # pochi ns su tre giri contro decine di punti percentuali.
+        lats = [r["lat_min_ns"] for r in pts if r["lat_min_ns"]]
+        lat_spread = (100.0 * (max(lats) - min(lats)) / min(lats)) if lats else 0.0
+        bad = spread > MAX_SPREAD_PCT
+        row = dict(method=m, frame=frame, delay=delay, rounds=len(pts),
+                   pps_spread_pct=round(spread, 1),
+                   lat_spread_pct=round(lat_spread, 1), unreliable=bad, **med)
         out.append(row)
+        flag = f" {RED}pps +-{spread:.0f}%{NC}" if bad else ""
         print(f"  {m:10s} {frame:5d} {delay:6d} {len(pts):4d} "
               f"{int(med['rx_pps']):9d} {med['rx_mbps']:7.1f} "
               f"{med['loss_pct']:7.2f}% "
               f"{int(med['lat_min_ns']):5d}n {int(med['lat_p50_ns']):5d}n "
-              f"{int(med['lat_p99_ns']):6d}n")
+              f"{int(med['lat_p99_ns']):6d}n{flag}")
     return out
 
 
@@ -1819,14 +1896,20 @@ def check_validity(rows):
               f"macchina, non il datapath: le cifre non sono confrontabili "
               f"fra metodi.{NC}")
     if noisy:
-        print(f"  {RED}[FAIL]{NC} dispersione oltre {MAX_SPREAD_PCT}% su: "
-              f"{', '.join(noisy)}.")
-        print(f"  {GREY}Una mediana su misure che oscillano cosi' e' il "
-              f"carico della macchina in momenti diversi.{NC}")
+        print(f"  {RED}[FAIL]{NC} dispersione fra i giri oltre "
+              f"{MAX_SPREAD_PCT:.0f}% su: {', '.join(noisy)}.")
+        print(f"  {GREY}Una mediana su misure che oscillano cosi' non e' una "
+              f"portata: e' il carico della macchina in momenti diversi. "
+              f"Misurato: una pipeline ha dato 2,78 / 1,17 / 1,46 Mpps in tre "
+              f"giri, e la sua mediana e' finita SOTTO una che fa piu' lavoro. "
+              f"Il throughput di queste righe non e' un risultato.{NC}")
+        print(f"  {GREY}La latenza delle stesse righe e' un'altra misura con "
+              f"un'altra dispersione -- vedi il verdetto qui sotto. Un "
+              f"throughput inutilizzabile non la invalida.{NC}")
     print(f"\n  {YELLOW}Che fare{NC}: chiudi tutto il resto, poi rilancia con "
-          f"--repeat 7. Se la dispersione resta, questa VM non e' un banco di "
-          f"misura per il throughput assoluto e vale solo il confronto dentro "
-          f"un singolo metodo.")
+          f"--rounds 7. Se la dispersione resta, questa VM non e' un banco di "
+          f"misura per il throughput assoluto, e cio' che resta valido e' la "
+          f"latenza piu' il confronto dentro un singolo metodo.")
     return 1
 
 
@@ -1917,16 +2000,28 @@ def main():
                        a.threads, not a.no_threaded_napi, a.repeat, a.rounds)
         rows = summarise_fair(raw, methods)
         rc |= check_validity([dict(method=r["method"], rx_pps=r["rx_pps"],
-                                   unreliable=False) for r in rows])
+                                   unreliable=r["unreliable"]) for r in rows])
+        _latency_verdict(rows)
         if a.out and rows:
             os.makedirs(a.out, exist_ok=True)
-            path = os.path.join(a.out, "latency.csv")
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                w.writeheader()
-                w.writerows(rows)
-            print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
-        return 0
+            # Anche i punti grezzi, non solo la mediana: la dispersione fra i
+            # giri si legge solo da questi, ed e' cio' che dice se la mediana
+            # significa qualcosa.
+            for name, data in (("latency.csv", rows),
+                               ("latency_raw.csv", raw)):
+                if not data:
+                    continue
+                path = os.path.join(a.out, name)
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=list(data[0].keys()))
+                    w.writeheader()
+                    w.writerows(data)
+                print(f"  {GREEN}scritto{NC} {path}  ({len(data)} righe)")
+            _give_back(a.out)
+        # Il codice di uscita e' quello del controllo: un run in cui la
+        # baseline non e' la piu' veloce, o in cui la dispersione sfonda, non
+        # deve uscire 0 solo perche' il CSV e' stato scritto.
+        return rc
 
     for m in methods:
         rc |= run_method(m, model_path, frames, delays, a.count, rows,
