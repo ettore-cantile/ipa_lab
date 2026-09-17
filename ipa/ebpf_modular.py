@@ -128,6 +128,7 @@ def reference_n_in():
             os.path.dirname(os.path.abspath(__file__)), "weights.json")),
         topology_config=_mm.load_topology_config())["n_in"]
 ML1_MAX_H1   = 8    # first layer's output width ceiling
+P3_MAX_QUEUES = 1   # must match IPA_MAX_QUEUES in the eBPF source above
 MLH_MAX_H    = 8    # later layers' input/output width ceiling
 LAYER_CHAIN_SIZE = 16
 
@@ -276,7 +277,31 @@ BPF_ARRAY(layer_weights, struct lw_blk, 1);
  * ceiling and recompile -- the control plane checks and says so, instead of
  * silently reading past the vector. See model_meta.MAX_N_IFACES/MAX_N_QUEUES. */
 #define IPA_MAX_IFACES  8
-#define IPA_MAX_QUEUES  8
+/* Pipeline 3's queue ceiling is 1, NOT 8 like Pipeline 2's, and the reason
+ * is measured rather than chosen.
+ *
+ * layer_first sits at the verifier's complexity limit. Reading the node index
+ * from a map -- so the node one-hot means which NODE this is, rather than
+ * which MODEL the packet carries -- adds one independent scalar to the loop,
+ * and the state space is the PRODUCT of the tracked scalars, not the sum.
+ * Twelve configurations were tried and every one was refused, at 9 069 to
+ * 9 402 instructions; the one that loaded was the one where _node was not
+ * independent at all (`_node = model_id`, the same register the verifier was
+ * already tracking).
+ *
+ * What freed the room was not touching the node at all: this ceiling. The
+ * checked-in descriptor declares NO queue feature -- its codes are 1, 2, 3, 4
+ * and queue_occupancy is 5 -- so eight slots were kept alive across the whole
+ * unrolled loop for a feature that is not there. At 1, layer_first loads at
+ * 6 417 instructions WITH the node index from the map.
+ *
+ * Not monotone, and worth knowing: cutting IPA_MAX_IFACES from 8 to 6 as well
+ * made it fail again. These limits are cliffs, so change this number and
+ * re-measure rather than reasoning about it.
+ *
+ * A model that needs more queue slots is REFUSED by load_modular_weights,
+ * never truncated -- see the check there. */
+#define IPA_MAX_QUEUES  1
 struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 
@@ -918,6 +943,22 @@ def load_modular_weights(
     code re-casts each byte to (__s8) before accumulation, so arithmetic
     is correct.
     """
+    # The datapath's queue vector is IPA_MAX_QUEUES wide, and Pipeline 3's is
+    # 1 (see the comment on that #define). A wider queue feature would be
+    # silently truncated to the first slot by the `i < sz` gate, so it is
+    # refused here instead.
+    if features:
+        for _f in features:
+            if _f.get("type") == "queue_occupancy" and int(_f.get("size", 0)) > P3_MAX_QUEUES:
+                raise ValueError(
+                    f"Pipeline 3 compiles a queue_occupancy vector of "
+                    f"{P3_MAX_QUEUES} slot(s); this descriptor asks for "
+                    f"{_f['size']}. Raise IPA_MAX_QUEUES in the eBPF source and "
+                    f"RE-MEASURE whether layer_first still loads -- it sits at "
+                    f"the verifier's complexity limit, and that ceiling is what "
+                    f"currently buys the room for the node index.")
+
+
     from ctypes import c_uint8, c_uint16, c_uint32, Structure
 
     if layer_dims is None:
