@@ -283,7 +283,7 @@ int main(int argc, char **argv) {
                "(BCC recompile of the same model: ~1.3 s, reference not measured here)\n",
                t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d. Ctrl-C to detach.\n",
-               g_g_attach_ifindex);
+               g_attach_ifindex);
         /* Flush now: when stdout is a pipe rather than a
          * TTY) C stdio is fully buffered, so without this the messages above
          * would sit in the buffer -- invisible -- while the loader blocks in
