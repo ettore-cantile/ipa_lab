@@ -590,6 +590,17 @@ int layer_first(struct xdp_md *ctx) {
     __u32 n_out = shape->n_out;
     __u32 woff  = shape->weight_offset;
     if (n_out == 0 || n_out > ML1_MAX_H1) return XDP_PASS;
+    /* The mask is a no-op for any value the check above lets through, and it
+     * exists purely for the verifier. Measured from a load failure log: after
+     * `if (n > CEILING) return XDP_PASS;` the verifier still carried the
+     * ORIGINAL register as [0, 0xffff] -- it constrains the temporary the
+     * comparison produced, not the value itself. It then explored the loops
+     * below for every value up to 65535 instead of up to the ceiling, and ran
+     * past its complexity budget: over 100 000 scalar ids in the log, for a
+     * program of 9 000 instructions.
+     *
+     * Telling it the range explicitly is what lets it prune. */
+    n_out &= 0xfU;               /* ML1_MAX_H1 = 8, so 4 bits suffice */
 
     /* Per-model feature descriptor: n_in (= sum of feature sizes) + feature
      * layout, read at runtime -> the first-hop IV is built GENERICALLY instead
@@ -599,6 +610,7 @@ int layer_first(struct xdp_md *ctx) {
     if (!desc) return XDP_PASS;
     __u32 n_in = desc->n_in;
     if (n_in == 0 || n_in > ML_MAX_N_IN) return XDP_PASS;
+    n_in &= 0xffU;               /* ML_MAX_N_IN = 128: see the n_out note above */
     __u32 bias_off = n_in * n_out;
 
     int mtl = META_TTL;
@@ -770,6 +782,10 @@ int layer_hidden(struct xdp_md *ctx) {
     __u32 n_out = shape->n_out;
     __u32 woff  = shape->weight_offset;
     if (n_in == 0 || n_in > MLH_MAX_H || n_out == 0 || n_out > MLH_MAX_H) return XDP_PASS;
+    /* Same reason as in layer_first: the guard above does not leave the
+     * verifier a usable bound on these registers. */
+    n_in  &= 0xfU;
+    n_out &= 0xfU;
     /* Bias multiplier: the weights are stored as round(w_float * scale), so
      * this layer's products carry scale**(layer_idx+1) while a bias stored the
      * same way carries only scale**1. Multiplying the bias by scale**layer_idx
