@@ -237,6 +237,31 @@ AXES = {
         "cell": lambda v: dict(n_nodes=52, dims=(4, 4), descriptor=v),
         "note": "stesso modello 4-4, IV diverse: 0/1/2 one-hot, piccola (6) o grande (52)",
     },
+    # LARGA CONTRO PROFONDA, a parametri comparabili.
+    #
+    # The width and depth axes above answer "what does it cost to widen / to
+    # deepen", and on both of them the parameter count moves with the axis. The
+    # question they cannot answer is the one that matters for choosing an
+    # architecture: GIVEN a parameter budget, is it better spent on one wide
+    # layer or on several narrow ones?
+    #
+    # These five shapes hold the weight count at 592 +/- 2%: 591, 599, 595,
+    # 604, 589. They are a coherent family -- a funnel, h1 >= h, with every
+    # layer after the second the same width, which is also what P2's compiled
+    # leaf requires -- so the only thing that really changes along the axis is
+    # how the same budget is arranged. Every point is inside the compiled
+    # ceilings of P2 and P3 (h <= 8), so all four pipelines can run all five.
+    #
+    # The achieved weight count is printed per cell (the `pesi` column), so
+    # "comparable" is something the reader checks rather than takes on trust.
+    "isoparam": {
+        "xlabel": "hidden layer, a parita' di parametri (~592 pesi)",
+        "kind": "num",
+        "values": [1, 2, 3, 4, 5],
+        "cell": lambda v: dict(n_nodes=52, dims=ISOPARAM_DIMS[v]),
+        "note": "stesso budget di pesi speso in modi diversi: una layer largo "
+                "contro molti stretti",
+    },
     "sparsity": {
         "xlabel": "frazione di pesi esattamente zero",
         "kind": "num",
@@ -262,6 +287,17 @@ def cell_of(axis, v):
 # which reads like a pipeline problem and is really a missing line here.
 # 4 is under both compiled ceilings (IPA_MAX_QUEUES is 8 in P2 and in P3).
 N_QUEUES = 4
+
+
+# Larghezza per profondita' a budget costante. Ricavate cercando, dentro i
+# soffitti compilati, la famiglia a imbuto che minimizza lo scarto di pesi.
+ISOPARAM_DIMS = {
+    1: (8,),             # 591 pesi -- tutto in un layer largo
+    2: (8, 4),           # 599
+    3: (8, 3, 3),        # 595
+    4: (7, 5, 5, 5),     # 604
+    5: (7, 4, 4, 4, 4),  # 589 -- lo stesso budget spalmato su cinque
+}
 
 
 def topology(n_nodes):
@@ -380,10 +416,14 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
+    # loop over one buffer, not a rate anything sustained. It is reported
+    # because it is the unit the question is usually asked in.
+    mpps = (1000.0 / lo) if lo else 0.0
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps),
-                sparsity_real=sparsity_real)
+                lat_max=hi, mpps=mpps, retval=retval, per_prog=per_prog,
+                n_maps=len(maps), sparsity_real=sparsity_real)
 
 
 def _bench_p2(cell, repeat, trials):
@@ -451,10 +491,14 @@ def _bench_p2(cell, repeat, trials):
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
+    # loop over one buffer, not a rate anything sustained. It is reported
+    # because it is the unit the question is usually asked in.
+    mpps = (1000.0 / lo) if lo else 0.0
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps),
-                sparsity_real=sparsity_real)
+                lat_max=hi, mpps=mpps, retval=retval, per_prog=per_prog,
+                n_maps=len(maps), sparsity_real=sparsity_real)
 
 
 def _bench_p3(cell, repeat, trials):
@@ -499,12 +543,16 @@ def _bench_p3(cell, repeat, trials):
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
+    # loop over one buffer, not a rate anything sustained. It is reported
+    # because it is the unit the question is usually asked in.
+    mpps = (1000.0 / lo) if lo else 0.0
     # Tail calls actually executed: dispatcher -> layer_first -> layer_hidden
     # x (n_layers - 1). NOT the number of distinct programs, which is always 3.
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=len(layer_dims),
                 nw=nw, n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps),
-                sparsity_real=sparsity_real)
+                lat_max=hi, mpps=mpps, retval=retval, per_prog=per_prog,
+                n_maps=len(maps), sparsity_real=sparsity_real)
 
 
 def _bench_p1_static(cell, repeat, trials):
@@ -857,6 +905,7 @@ def run_axis(axis, repeat, trials, out_dir):
                                       "map_bytes", "n_maps", "tail",
                                       "build_ms", "update_ms",
                                       "lat_ns", "lat_p50", "lat_max",
+                                      "mpps",
                                       # requested vs achieved: the weights are
                                       # a prefix of a shuffled pool, so the
                                       # zero fraction of a short prefix is a
@@ -921,6 +970,7 @@ PLOTS = [
     ("insns", "istruzioni eBPF (xlated, scala log)", "scaling_{axis}_insns_log", True),
     ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latenza", False),
     ("lat_ns", "latenza (ns/pacchetto, scala log)", "scaling_{axis}_latenza_log", True),
+    ("mpps", "throughput teorico (Mpps = 1/latenza)", "scaling_{axis}_mpps", False),
     ("update_ms", "installare un modello nuovo (ms)", "scaling_{axis}_update", True),
     ("build_ms", "compilare il programma, una volta (ms)", "scaling_{axis}_build", False),
     ("map_bytes", "memoria delle mappe (byte)", "scaling_{axis}_mappe", False),
@@ -954,6 +1004,13 @@ KEEP = {
     ("sparsity", "insns_log"):
         "con pesi sparsi P1 crolla e le due P1 CONVERGONO: sparsita' e nodo "
         "congelato sono due strade alla stessa riduzione, non si sommano",
+    ("isoparam", "insns"):
+        "a PARITA' di parametri (~592 pesi): quanto costa in dimensione "
+        "spalmarli su piu' layer invece che su uno largo",
+    ("isoparam", "lat_ns"):
+        "e quanto costa in tempo -- e' qui che si risponde a 'larga o profonda'",
+    ("isoparam", "mpps"):
+        "lo stesso in throughput teorico, l'unita' in cui la domanda si pone",
     ("descriptor", "insns"):
         "il controllo: senza feature 'node' le due P1 sono IDENTICHE, con "
         "essa divergono -- il divario e' tutto li' e nient'altro",
