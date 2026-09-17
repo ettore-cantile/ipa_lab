@@ -366,8 +366,23 @@ sudo python3 ipa/test/test_suite.py --only kernel
 ## 10. Analisi parametrica (`bench_scaling.py`)
 
 Le sezioni precedenti misurano **un** modello su **una** topologia. Questa misura
-come cambia il costo al variare della dimensione — e soprattutto se le tre pipeline
-hanno **pendenze diverse**, che è l'argomento per cui ne esistono tre.
+come cambia il costo al variare della dimensione — e soprattutto se le pipeline
+hanno **pendenze diverse**, che è l'argomento per cui ne esiste più di una.
+
+**Quattro pipeline, non tre.** Lo sweep confronta una scala di specializzazione, cioè
+di quanto si sa quando il programma viene compilato:
+
+| | cosa è compilato dentro | un binario per |
+|---|---|---|
+| `p1_static` | pesi **e** indice di questo nodo | **nodo** |
+| `hardcoded` (P1.5) | pesi; il nodo si legge da mappa | modello |
+| `template` (P2) | solo i soffitti | tutto |
+| `modular` (P3) | anche la profondità è a runtime | tutto |
+
+`hardcoded` è la pipeline che il resto del documento chiama P1. Di fronte a
+`p1_static` è in realtà una **P1.5**: la *disposizione* delle feature è compilata, ma
+l'indice del nodo no. Rinominarla nei CSV romperebbe ogni misura già presa, quindi la
+distinzione vive nelle etichette delle figure.
 
 ```bash
 sudo python3 ipa/test/bench_scaling.py --out result/    # misura (Linux + BCC + root)
@@ -404,15 +419,16 @@ attribuisce alla variabile sull'asse x e a nient'altro.
   più per layer, e senza quella chiave il controllo bollava come rumore il suo
   risultato migliore.
 
-### Le otto figure, e cosa deducono
+### Le nove figure, e cosa deducono
 
-Lo sweep può disegnare 35 combinazioni metrica × asse. Sette portano un risultato;
-le altre no (la memoria delle mappe non dipende da nessun asse, `build_ms` è sempre
+Lo sweep può disegnare decine di combinazioni metrica × asse. Nove portano un
+risultato; le altre no (la memoria delle mappe non dipende da nessun asse, `build_ms` è sempre
 la stessa compilazione). Il comando disegna **solo quelle**; `--all-plots` dà la
 matrice intera, per guardare, non per pubblicare.
 
 | # | figura | deduzione |
 |---|---|---|
+| 0 | `scaling_nodes_insns_log` | **La taglia della rete entra nel programma solo in P1.5** (746 → 1 692 istruzioni fra 10 e 100 nodi). Congelando l'indice del nodo la dipendenza **sparisce**: `p1_static` resta fra 611 e 640 a ogni taglia. Scala logaritmica, altrimenti le due curve P1 restano schiacciate contro le 14 628 di P2 e il confronto fra loro — che è il punto della figura — non si vede. |
 | 1 | `scaling_depth_insns` | **P2 cresce di ~780 istruzioni per layer, P3 di zero.** P3 srotola *un* layer denso generico e ci rientra per tail call, quindi la profondità non entra nel programma. P2 deve srotolarli tutti: la sua genericità è sulle larghezze, non sulla profondità. |
 | 2 | `scaling_depth_latenza` | **E P3 lo paga in tempo: ~70 ns per layer**, contro i ~36 di P2. Sono le sue tail call (da 2 a 7 hop). La stessa scelta di progetto spiega entrambe le figure: P3 è più piccolo *perché* riusa un pezzo, ed è più lento *perché* riusarlo costa un salto e delle letture ogni volta. |
 | 3 | `scaling_depth_update` | **Due ordini di grandezza sull'aggiornamento del modello**: P1 ~1 400 ms (rigenera C e chiama clang), P2 e P3 ~7 ms (scritture in mappa). Asse logaritmico, altrimenti le due curve basse si schiacciano sullo zero. È la metrica che decide se una pipeline è usabile in una rete che cambia. |
@@ -420,7 +436,85 @@ matrice intera, per guardare, non per pubblicare.
 | 5 | `scaling_nodes_latenza` | **E non costa nulla a runtime, a nessuna delle tre.** Piatte tutte e cinque le colonne. Il motivo è strutturale: una one-hot legge **una sola colonna di pesi** qualunque sia la sua larghezza. |
 | 6 | `scaling_width_latenza` | **Allargare i layer nascosti invece si paga**, su tutte e tre. Letto insieme alla figura 5: *la rete può crescere quanto vuole, il modello no.* |
 | 7 | `scaling_sparsity_insns_log` | **Con pesi più sparsi P1 crolla** (1 071 → 224 istruzioni al 90% di zeri), P2 e P3 non si muovono di un'istruzione. I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero; per P2/P3 uno zero è un byte in mappa come un altro. Scala logaritmica: su scala lineare P1 sta a ~10³ e P2/P3 a ~10⁴, e il crollo sparisce schiacciato sullo zero. |
-| 8 | `scaling_descriptor_insns` | **Cambiare la composizione del vettore d'ingresso ricompila P1** (da 575 a 1 071 istruzioni fra le quattro IV), mentre P2 e P3 leggono il descrittore da `model_desc` e non cambiano. Barre e non curve: una linea fra `no_onehot` e `big_onehot` disegnerebbe una pendenza fra due nomi. |
+| 8 | `scaling_descriptor_insns` | **Cambiare la composizione del vettore d'ingresso ricompila P1** (da 575 a 1 071 istruzioni fra le quattro IV), mentre P2 e P3 leggono il descrittore da `model_desc` e non cambiano. Ed è anche il **controllo** dell'esperimento sulla specializzazione: dove il descrittore non dichiara la feature `node`, le due P1 sono **identiche alla cifra** (599 e 599, 575 e 575); dove la dichiara, divergono (614 contro 1 071). Il divario è tutto lì e nient'altro. Barre e non curve: una linea fra `no_onehot` e `big_onehot` disegnerebbe una pendenza fra due nomi. |
+
+### Congelare il nodo conviene? Sì, ma non per la ragione che sembra
+
+L'indice del nodo è una **costante di deployment**: non cambia per tutta la vita del
+nodo. Congelarlo a tempo di generazione fa sparire lo `switch` a `n_nodi` casi e la
+lettura della mappa `node_id`; restano `n_h1` costanti che clang piega
+nell'accumulatore. Vale la pena? I numeri dicono sì, e dicono anche che il motivo non
+è quello che verrebbe da indovinare.
+
+**Equivalenza prima di tutto.** Congelare il nodo significa scegliere *una colonna*
+della matrice del primo layer a tempo di compilazione. Sceglierne una sbagliata dà un
+programma più piccolo, più veloce, e che calcola **un altro modello** — e nessuna
+misura di costo se ne accorgerebbe.
+
+```bash
+sudo python3 ipa/test/bench_scaling.py --verify     # 80/80 casi identici
+```
+
+80 casi (ttl 2-11 × 8 pattern di link): la specializzata decide **la stessa classe**
+della P1.5 con lo stesso indice installato. Solo dopo questo i numeri sotto
+significano qualcosa.
+
+**Quello che si guadagna: dimensione, e la sua pendenza.**
+
+| nodi della rete | 10 | 25 | 52 | 75 | 100 |
+|---|---:|---:|---:|---:|---:|
+| P1 specializzata | 617 | 625 | 614 | 611 | **640** |
+| P1.5 hardcoded | 746 | 863 | 1 071 | 1 539 | **1 692** |
+
+A 100 nodi è **2,6× più piccola**. Ma il numero che conta non è il rapporto: è che la
+riga della specializzata è **piatta**. Il costo in dimensione della feature più grossa
+del modello — 52 dei 65 ingressi, 208 dei 319 pesi — smette di dipendere dalla taglia
+della rete.
+
+**Quello che NON si guadagna: velocità.**
+
+| nodi della rete | 10 | 25 | 52 | 75 | 100 |
+|---|---:|---:|---:|---:|---:|
+| P1 specializzata | 58 | 68 | 54 | 55 | 55 ns |
+| P1.5 hardcoded | 61 | 60 | 57 | 59 | 61 ns |
+
+Praticamente identiche, dentro il rumore. Sull'asse larghezza il vantaggio è un po'
+più visibile e costante (35 contro 47 ns a 2 neuroni, 92 contro 107 a 8: circa 10-15
+ns, il 12-15%), perché lo switch assegna `n_h1` pesi e quindi cresce con la larghezza.
+Ma resta un miglioramento modesto.
+
+> **Il motivo per cui la dimensione crolla e il tempo no è lo stesso.** Lo switch ha
+> `n_nodi` casi ma ne **esegue uno**: a runtime è un salto indicizzato, che costa
+> poco. Quelle 208 assegnazioni sono compilate per eseguirne 4. Toglierle libera
+> molto **spazio** e quasi nessun **tempo** — che è, in miniatura, la stessa lezione
+> della tabella principale: le istruzioni misurano quanto è grande il programma, non
+> quanto lavora.
+
+**I due vantaggi non si sommano.** Sull'asse sparsità le due P1 **convergono**:
+
+| pesi a zero | 0% | 25% | 50% | 75% | 90% |
+|---|---:|---:|---:|---:|---:|
+| P1 specializzata | 614 | 566 | 417 | 294 | **216** |
+| P1.5 hardcoded | 1 071 | 939 | 686 | 363 | **224** |
+
+Al 90% di zeri il divario è sparito (216 contro 224). Sparsità e nodo congelato sono
+**due strade alla stessa riduzione**: se i pesi sono già quasi tutti zero, clang
+cancella lo switch da solo e non c'è più niente da congelare.
+
+**Quello che si paga: un binario per nodo.** Una rete da 52 nodi vuole 52
+compilazioni e 52 installazioni, ognuna da ~1,4 s. Il costo di aggiornamento si
+moltiplica per la taglia della rete — esattamente la grandezza da cui la
+specializzazione ha appena liberato la *dimensione*.
+
+**Il verdetto.** Non è un'ottimizzazione di velocità: è ciò che rende P1 **praticabile
+su una rete grande**. Lo switch di P1.5 cresce con il numero di nodi moltiplicato per
+la larghezza del primo layer; su una topologia da 500 nodi con 8 neuroni sarebbero
+4 000 assegnazioni srotolate, e c'è una taglia oltre la quale P1.5 semplicemente non
+si carica più. La specializzata non ci arriva mai. Su Germany50, dove 52 nodi
+costano 1 071 istruzioni contro 614, è una scelta legittima in entrambe le direzioni;
+su una rete dieci volte più grande non lo è più.
+
+---
 
 ### Il risultato che non cercavamo: in P1 i pesi decidono se il programma si carica
 

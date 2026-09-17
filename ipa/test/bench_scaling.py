@@ -870,16 +870,27 @@ KEEP = {
     ("depth", "update_ms"):
         "installare un modello: P1 ricompila (~1,4 s), P2 e P3 scrivono in mappa (~7 ms)",
     ("nodes", "insns"):
-        "la taglia della RETE entra nel programma solo in P1; P2 e P3 non la vedono",
+        "la taglia della rete entra nel programma solo in P1.5; congelando il "
+        "nodo (P1 specializzata) la dipendenza SPARISCE",
+    # Lo stesso dato su scala log: in lineare le due P1 (600-1700) restano
+    # schiacciate contro le 14 628 di P2, e il confronto fra loro -- che e'
+    # il punto della figura -- non si vede.
+    ("nodes", "insns_log"):
+        "lo stesso, leggibile: P1.5 sale 2,3x fra 10 e 100 nodi, la "
+        "specializzata resta piatta",
     ("nodes", "lat_ns"):
-        "e non costa nulla a runtime a nessuna delle tre: la one-hot legge UNA colonna",
+        "ma a runtime non costa a nessuna: la one-hot legge UNA colonna, e lo "
+        "switch ne esegue UN caso",
     ("width", "lat_ns"):
-        "mentre allargare i layer NASCOSTI si paga: piu' pesi letti per pacchetto",
+        "allargare i layer NASCOSTI invece si paga, su tutte e quattro",
     ("sparsity", "insns_log"):
-        "con pesi piu' sparsi P1 crolla (clang cancella i prodotti per zero), P2/P3 no",
+        "con pesi sparsi P1 crolla e le due P1 CONVERGONO: sparsita' e nodo "
+        "congelato sono due strade alla stessa riduzione, non si sommano",
     ("descriptor", "insns"):
-        "cambiare la composizione dell'IV ricompila P1; P2 e P3 leggono il descrittore",
+        "il controllo: senza feature 'node' le due P1 sono IDENTICHE, con "
+        "essa divergono -- il divario e' tutto li' e nient'altro",
 }
+
 STYLE = {
     "p1_static": dict(color="#8e44ad", marker="D", label="P1 specializzata"),
     "hardcoded": dict(color="#c0392b", marker="o", label="P1.5 hardcoded"),

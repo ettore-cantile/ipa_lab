@@ -1129,8 +1129,30 @@ Fin qui tutto è misurato su \emph{un} modello e \emph{una} topologia. La domand
 che manca è come cambia il costo quando la rete o il modello diventano più
 grandi --- e soprattutto se le tre pipeline hanno \textbf{pendenze diverse}.
 
-Se le pendenze fossero uguali, averne tre sarebbe un esercizio. Non lo sono, ed
-è questo il capitolo che lo mostra.
+Se le pendenze fossero uguali, averne più di una sarebbe un esercizio. Non lo
+sono, ed è questo il capitolo che lo mostra.
+
+Le pipeline confrontate sono \textbf{quattro}, e formano una scala di
+\emph{quanto si sa quando il programma viene compilato}:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+& \textbf{compilato dentro} & \textbf{un binario per} \\
+\midrule
+P1 specializzata & pesi \emph{e} indice di questo nodo & \textbf{nodo} \\
+P1.5 hardcoded   & pesi; il nodo si legge a runtime   & modello \\
+P2 template      & solo i soffitti                    & tutto \\
+P3 modular       & anche la profondità è a runtime    & tutto \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La P1.5 è quella che i capitoli precedenti chiamano semplicemente P1: la
+\emph{disposizione} delle feature è scritta nel codice, ma l'indice del nodo no.
+La P1 specializzata congela anche quello --- ed è il confronto con cui si chiude
+il capitolo.
 
 \section{Come è impostata la misura}
 
@@ -1216,6 +1238,117 @@ secondi} in P1 --- che deve rigenerare il C e richiamare il compilatore --- e
 È la misura che decide se una pipeline è usabile in una rete che cambia.
 \end{lezione}
 
+\section{Congelare il nodo: conviene?}
+
+L'indice del nodo è una \textbf{costante del deployment}: un nodo non cambia di
+posto. Il codice però lo legge a runtime, e per farlo porta uno switch con un
+caso per ogni nodo della rete --- 52 casi per Germany50, di cui ne esegue
+\emph{uno}.
+
+Congelandolo a tempo di generazione lo switch sparisce, e con lui la lettura
+della tabella. Restano quattro numeri costanti, che il compilatore può piegare
+dentro al conto.
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_nodes_insns_log.pdf}
+\end{center}
+
+\begin{lezione}
+La taglia della rete entra nel programma \textbf{solo} nella P1.5, che passa da
+746 a 1\,692 istruzioni fra 10 e 100 nodi.
+
+Congelando il nodo quella dipendenza \textbf{sparisce}: la riga viola è piatta,
+fra 611 e 640 a qualunque taglia.
+\end{lezione}
+
+(La scala è logaritmica: in lineare le due righe P1 resterebbero schiacciate
+contro le quattordicimila di P2, e il confronto fra loro --- che è il punto della
+figura --- non si vedrebbe.)
+
+\subsection*{Ma la velocità non cambia}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{nodi} & 10 & 25 & 52 & 75 & 100 \\
+\midrule
+P1 specializzata & 58 & 68 & 54 & 55 & 55 ns \\
+P1.5 hardcoded   & 61 & 60 & 57 & 59 & 61 ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Praticamente identiche, dentro il rumore.
+
+\begin{lezione}
+Il motivo per cui la \emph{dimensione} crolla e il \emph{tempo} no è lo stesso:
+lo switch ha 52 casi ma ne esegue uno. A runtime è un salto indicizzato, che
+costa poco; quelle 208 assegnazioni sono compilate per eseguirne quattro.
+
+Toglierle libera molto \textbf{spazio} e quasi nessun \textbf{tempo}.
+\end{lezione}
+
+\subsection*{Il controllo, e perché ci si può fidare}
+
+Come si fa a essere sicuri che il divario venga davvero dalla one-hot del nodo e
+non da qualcos'altro che è cambiato per caso? Si prende un vettore d'ingresso che
+la feature \emph{non} la contiene:
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_descriptor_insns.pdf}
+\end{center}
+
+Nelle due composizioni senza la feature \texttt{node} le due P1 sono
+\textbf{identiche alla cifra} (599 e 599; 575 e 575). In quelle che ce l'hanno,
+divergono. Il divario è tutto lì e nient'altro.
+
+C'è poi una verifica che viene prima di ogni numero. Congelare il nodo significa
+scegliere \emph{una colonna} della matrice dei pesi al momento di generare il
+codice: sceglierne una sbagliata darebbe un programma più piccolo, più veloce, e
+che calcola \textbf{un altro modello} --- e nessuna misura di costo se ne
+accorgerebbe. Ottanta casi, dieci valori di TTL per otto configurazioni di link:
+la versione congelata decide sempre la stessa classe di quella che legge il nodo
+dalla tabella.
+
+\subsection*{I due vantaggi non si sommano}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{pesi a zero} & 0\%\ & 25\%\ & 50\%\ & 75\%\ & 90\%\ \\
+\midrule
+P1 specializzata & 614 & 566 & 417 & 294 & \textbf{216} \\
+P1.5 hardcoded   & 1\,071 & 939 & 686 & 363 & \textbf{224} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Al 90\%\ di zeri il divario è sparito. Sparsità e nodo congelato sono \textbf{due
+strade alla stessa riduzione}: se i pesi sono già quasi tutti zero, il
+compilatore cancella lo switch da solo e non resta niente da congelare.
+
+\subsection*{Il verdetto}
+
+\begin{lezione}
+Congelare il nodo \textbf{non è un'ottimizzazione di velocità}. È ciò che rende la
+pipeline hardcoded \emph{praticabile su una rete grande}.
+
+Lo switch della P1.5 cresce col numero di nodi moltiplicato per la larghezza del
+primo strato. Su una topologia da 500 nodi con 8 neuroni sarebbero quattromila
+assegnazioni srotolate, e c'è una taglia oltre la quale quel programma non si
+carica più. La specializzata non ci arriva mai.
+
+Il prezzo è \textbf{un binario per nodo}: 52 compilazioni e 52 installazioni,
+una per macchina. Il costo di aggiornamento si moltiplica proprio per la
+grandezza da cui la specializzazione ha appena liberato la dimensione.
+\end{lezione}
+
+Su Germany50, dove la differenza è fra 614 e 1\,071 istruzioni a parità di
+velocità, è una scelta legittima in entrambe le direzioni. Su una rete dieci
+volte più grande non lo è più.
+
 \section{Due larghezze, due risposte opposte}
 
 Questa coppia di figure è il risultato che preferisco di tutta l'analisi, perché
@@ -1272,16 +1405,10 @@ P1 scrive i pesi nel codice come numeri, quindi il compilatore vede una
 moltiplicazione per zero e la cancella. Per P2 e P3 uno zero è un byte in una
 tabella come un altro, e il programma è lo stesso.
 
-Lo stesso vale per la composizione dell'ingresso:
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_descriptor_insns.pdf}
-\end{center}
-
-Cambiare \emph{quali} feature compongono il vettore d'ingresso ricompila P1;
-P2 e P3 leggono il descrittore da una tabella e non cambiano di una istruzione.
-(Barre e non linee: una linea fra due nomi disegnerebbe una pendenza che non
-esiste.)
+Lo stesso vale per la composizione dell'ingresso: la figura del controllo, due
+sezioni più su, mostra che cambiare \emph{quali} feature compongono il vettore
+d'ingresso ricompila entrambe le P1, mentre P2 e P3 leggono il descrittore da
+una tabella e non cambiano di una istruzione.
 
 \section{Il risultato che non cercavamo}
 
@@ -1367,6 +1494,9 @@ del verificatore.
 \item \textbf{analisi parametrica} su cinque assi e tre pipeline: le pendenze
       sono diverse, ed è la misura che giustifica l'esistenza di tre pipeline
       invece di una;
+\item \textbf{versione P1 specializzata}: congela anche l'indice del nodo, e
+      toglie alla pipeline hardcoded la dipendenza dalla taglia della rete ---
+      al prezzo di un binario per nodo;
 \item P2 non è più fissa a due hidden layer: la profondità è diventata un
       inviluppo compilato come già lo erano le larghezze --- al prezzo, onesto e
       misurato, di una ricompilazione per profondità.
