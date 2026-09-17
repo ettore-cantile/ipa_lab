@@ -141,24 +141,50 @@ from bench_depth_vs_width import FEATURE_SETS      # noqa: E402
 DEFAULT_DESCRIPTOR = "default"
 
 
+_POOL_SIZE = 8192
+
+
 def make_weights(nw, sparsity, seed=42):
-    """`nw` int8 weights of which a `sparsity` fraction are exactly zero.
+    """The first `nw` weights of a fixed pool with a `sparsity` fraction of
+    zeros.
 
-    Sparsity is a real variable here, not padding for the sweep. P1 writes the
-    weights into the C source as literals, so clang deletes a multiply by zero
-    outright and turns a multiply by a power of two into a shift: its
-    instruction count depends on the VALUES. P2 and P3 read the same weights
-    from a map, where a zero is a byte like any other. The sparsity axis is
-    what turns that difference from an argument into a measurement.
+    Why the weights matter at all: P1 writes them into the C source as
+    literals, so clang deletes a multiply by zero outright and turns a multiply
+    by a power of two into a shift. P1's instruction count therefore depends on
+    the VALUES, not only on the shape. P2 and P3 read the same weights from a
+    map, where a zero is a byte like any other. The sparsity axis turns that
+    difference from an argument into a measurement.
 
-    Zeros are placed with a seeded RNG, so a given (nw, sparsity) is always the
-    same vector -- two pipelines at the same x get identical weights."""
+    Why a POOL, rather than a fresh vector per shape: exactly because of the
+    above. Drawing an independent vector for each `nw` meant that moving along
+    an axis changed two things at once -- the model's shape AND every one of
+    its weights -- so part of P1's curve was weight noise wearing the x axis's
+    name. Taking a prefix of one pool makes a bigger model an EXTENSION of the
+    smaller one: the weights they share are identical, and only the new ones
+    are new.
+
+    How much this matters is not hypothetical. On the depth axis, the shape
+    (4,4,4,4) with seed 42 is REFUSED by the verifier while seeds 1, 2, 3, 7,
+    123 and 999 all load, at 1 075 to 1 175 instructions -- the same program
+    size, the same architecture, different values. That is a real property of
+    compiling weights in, and it is why this function is written the way it is.
+
+    A prefix holds roughly, not exactly, the requested zero fraction: the pool
+    is shuffled, so any prefix is a random sample of it. The exact count per
+    cell is not the point; holding the weights still while the axis moves
+    is."""
     rng = random.Random(seed)
-    n_zero = int(round(nw * sparsity))
-    vals = [0] * n_zero + [rng.choice([v for v in range(-100, 101) if v != 0])
-                           for _ in range(nw - n_zero)]
-    rng.shuffle(vals)
-    return vals
+    n_zero = int(round(_POOL_SIZE * sparsity))
+    pool = [0] * n_zero + [rng.choice([v for v in range(-100, 101) if v != 0])
+                           for _ in range(_POOL_SIZE - n_zero)]
+    rng.shuffle(pool)
+    if nw > _POOL_SIZE:
+        raise ValueError(
+            f"make_weights: {nw} weights asked of a {_POOL_SIZE}-wide pool. "
+            f"Raise _POOL_SIZE -- but note that doing so changes every weight "
+            f"vector, so re-measure the whole sweep rather than comparing new "
+            f"numbers with old ones.")
+    return pool[:nw]
 
 # One axis = one variable. `cell(v)` returns everything a worker needs, so a
 # new axis is a new entry here and nothing else. `kind` is "num" for an axis
@@ -310,6 +336,7 @@ def _bench_p1(cell, repeat, trials):
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     weights = make_weights(nw, cell["sparsity"])
+    sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     def _load():
         # Codegen is INSIDE the timed region on purpose. For P1 the weights
@@ -338,7 +365,8 @@ def _bench_p1(cell, repeat, trials):
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
+                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps),
+                sparsity_real=sparsity_real)
 
 
 def _bench_p2(cell, repeat, trials):
@@ -370,6 +398,7 @@ def _bench_p2(cell, repeat, trials):
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     weights = make_weights(nw, cell["sparsity"])
+    sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     # The source does not mention the model's WIDTHS anywhere -- that is P2's
     # claim, and why its instruction count is flat on the nodes and width
@@ -407,7 +436,8 @@ def _bench_p2(cell, repeat, trials):
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
+                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps),
+                sparsity_real=sparsity_real)
 
 
 def _bench_p3(cell, repeat, trials):
@@ -420,6 +450,7 @@ def _bench_p3(cell, repeat, trials):
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     weights = make_weights(nw, cell["sparsity"])
+    sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     sizes = [n_in] + list(dims) + [n_out]
     layer_dims = [(sizes[i - 1], sizes[i]) for i in range(1, len(sizes))]
@@ -455,7 +486,8 @@ def _bench_p3(cell, repeat, trials):
     # x (n_layers - 1). NOT the number of distinct programs, which is always 3.
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=len(layer_dims),
                 nw=nw, n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
+                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps),
+                sparsity_real=sparsity_real)
 
 
 _BENCH = {"hardcoded": _bench_p1, "template": _bench_p2, "modular": _bench_p3}
@@ -479,8 +511,20 @@ def _worker(pipeline, spec_json):
         out = {"ok": False, "skipped": True, "detail": str(e)}
     except Exception as e:
         detail = str(e).strip().splitlines()
-        out = {"ok": False, "skipped": False,
-               "detail": f"{type(e).__name__}: {detail[-1][:110] if detail else ''}"}
+        msg = f"{type(e).__name__}: {detail[-1][:110] if detail else ''}"
+        # A verifier refusal is a RESULT, not a failure of this script, and it
+        # must not be filed next to a crash. The kernel answers E2BIG both when
+        # a program is genuinely too long AND when the verifier gives up having
+        # processed more than a million instructions -- and BCC turns that into
+        # "Argument list too long" plus a "at most 4096 insns" string whose
+        # 4096 is a stale constant in BCC itself. A program of 1 120
+        # instructions refused with that text hit the COMPLEXITY ceiling, not
+        # the size one; see docs/testing.md on P3's budget for the same trap.
+        refused = ("Argument list too long" in msg
+                   or "too large" in msg
+                   or "Permission denied" in msg)
+        out = {"ok": False, "skipped": False, "refused": refused,
+               "detail": msg}
     print(json.dumps(out))
     return 0
 
@@ -528,8 +572,18 @@ def _warn_contaminated(rows, factor=2.0):
             if not r.get("lat_ns"):
                 continue
             if r["pipeline"] == pipe:
-                groups.setdefault(r["insns"], []).append((r["x"], r["lat_ns"]))
-        for insns, pts in groups.items():
+                # Grouped by (instructions, TAIL CALLS), not by instructions
+                # alone. P3's program is byte-identical at every depth -- that
+                # is its whole design -- but it executes one more tail call per
+                # layer, so its latency legitimately doubles across the depth
+                # axis. Keyed on instructions only, this check called that real
+                # result contamination, which is the worst thing a check can
+                # do: cry wolf on the finding. Identical code AND identical
+                # hops is what makes a latency swing impossible to attribute to
+                # the x axis.
+                key = (r["insns"], r.get("tail"))
+                groups.setdefault(key, []).append((r["x"], r["lat_ns"]))
+        for (insns, tail), pts in groups.items():
             if len(pts) < 2:
                 continue
             lats = [p[1] for p in pts]
@@ -537,8 +591,9 @@ def _warn_contaminated(rows, factor=2.0):
             if lo > 0 and hi / lo > factor:
                 worst = max(pts, key=lambda p: p[1])
                 print(f"\n  {RED}SOSPETTO{NC} {pipe}: programma identico "
-                      f"({insns} istruzioni) a ogni x, ma la latenza va da "
-                      f"{lo:.0f} a {hi:.0f} ns ({hi / lo:.1f}x).")
+                      f"({insns} istruzioni, {tail} tail call) a ogni x, "
+                      f"ma la latenza va da {lo:.0f} a {hi:.0f} ns "
+                      f"({hi / lo:.1f}x).")
                 print(f"  {GREY}Il binario non cambia lungo questo asse, "
                       f"quindi lo scarto e' la macchina, non la variabile. "
                       f"Il punto peggiore e' x={worst[0]}. Rimisura a macchina "
@@ -598,9 +653,21 @@ def run_axis(axis, repeat, trials, out_dir):
                                      ("nw", "n_in", "insns", "jited",
                                       "map_bytes", "n_maps", "tail",
                                       "build_ms", "update_ms",
-                                      "lat_ns", "lat_p50", "lat_max")}))
+                                      "lat_ns", "lat_p50", "lat_max",
+                                      # requested vs achieved: the weights are
+                                      # a prefix of a shuffled pool, so the
+                                      # zero fraction of a short prefix is a
+                                      # sample of the pool's, not equal to it.
+                                      # Recorded so the x label can be checked
+                                      # rather than trusted.
+                                      "sparsity_real")}))
             else:
-                mark = f"{GREY}n/d{NC}" if r.get("skipped") else f"{RED}CRASH{NC}"
+                if r.get("skipped"):
+                    mark = f"{GREY}n/d{NC}"
+                elif r.get("refused"):
+                    mark = f"{YELLOW}RIFIUTATO{NC}"     # dato, non guasto
+                else:
+                    mark = f"{RED}CRASH{NC}"
                 print(f"  {str(v):>5s} {pipe:10s} {shape_str:>16s} {'':6s} "
                       f"{mark} {GREY}{r.get('detail', '')[:90]}{NC}")
 
