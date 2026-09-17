@@ -581,6 +581,11 @@ LAT_DECLS_SRC = r"""
 BPF_PERCPU_ARRAY(ts_in, __u64, 1);
 /* 0 = quanti, 1 = somma ns, 2 = minimo, 3 = massimo */
 BPF_PERCPU_ARRAY(lat_acc, __u64, 4);
+/* Istogramma: LAT_BUCKETS celle da LAT_BUCKET_NS, piu' l'ultima che raccoglie
+ * tutto quello che sfora. Serve per i PERCENTILI: media e massimo su una VM
+ * non dicono niente -- misurato, media ~2000 ns con minimo 250 e massimo
+ * 10,6 ms, cioe' un singolo valore enorme che trascina la media. */
+BPF_PERCPU_ARRAY(lat_hist, __u64, LAT_BUCKETS);
 """
 
 LAT_COUNTER_SRC = r"""
@@ -590,6 +595,10 @@ int xdp_lat_count(struct xdp_md *ctx) {
     __u64 *t0 = ts_in.lookup(&z);
     if (t0 && *t0 && now > *t0) {
         __u64 d = now - *t0;
+        __u32 bk = (__u32)(d / LAT_BUCKET_NS);
+        if (bk >= LAT_BUCKETS - 1) bk = LAT_BUCKETS - 1;
+        int bi = (int)bk;
+        __u64 *hb = lat_hist.lookup(&bi); if (hb) *hb += 1;
         int k = 0;
         __u64 *n = lat_acc.lookup(&k); if (n) *n += 1;
         k = 1; __u64 *sm = lat_acc.lookup(&k); if (sm) *sm += d;
@@ -608,6 +617,12 @@ LAT_STAMP = ("\n    { int _lz = 0; __u64 _lt = bpf_ktime_get_ns();\n"
 
 # Nome della funzione d'ingresso XDP per ciascun metodo: e' quella in cui
 # infilare il timestamp, ed e' quella che si attacca all'interfaccia.
+# 256 celle da 16 ns coprono 0-4 us con risoluzione sufficiente a separare
+# 228, 243 e 267 ns -- le differenze fra le pipeline sono di quell'ordine, e un
+# istogramma logaritmico le metterebbe tutte nello stesso bucket.
+LAT_BUCKETS = 256
+LAT_BUCKET_NS = 16
+
 LAT_ENTRY = {
     "baseline": "xdp_baseline",
     "p1_static": "ipa_switch_hardcoded",
@@ -644,7 +659,10 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
             f"non trovo il punto d'ingresso '{anchor}' nel sorgente di "
             f"{method} (trovato {src.count(anchor)} volte). E' cambiata la "
             f"firma del dispatcher?")
-    src = src.replace(anchor, LAT_DECLS_SRC + "\n" + anchor + LAT_STAMP)
+    defines = (f"#define LAT_BUCKETS {LAT_BUCKETS}\n"
+               f"#define LAT_BUCKET_NS {LAT_BUCKET_NS}\n")
+    src = src.replace(anchor,
+                      defines + LAT_DECLS_SRC + "\n" + anchor + LAT_STAMP)
     return src + "\n" + LAT_COUNTER_SRC, weights, scale
 
 
@@ -710,15 +728,44 @@ def _load_instrumented(method, model_path, fab, sem, node=STATIC_NODE):
 
 
 def _read_lat(b):
-    """(quanti, min_ns, media_ns, max_ns) sommando le celle per-CPU."""
+    """Statistiche di latenza, sommando le celle per-CPU.
+
+    Restituisce un dizionario con min, p50, p90, p99, media, max e quanti
+    campioni hanno sforato l'istogramma. I percentili vengono dai bucket;
+    minimo e massimo sono esatti.
+
+    La MEDIA e' riportata ma non va usata per concludere: su questa VM un
+    singolo valore da 10 ms fra 100 000 campioni la sposta di piu' di quanto la
+    differenza fra due pipeline. I percentili no."""
     acc = b["lat_acc"]
     n = sum(int(v) for v in acc[ct.c_int(0)])
+    if not n:
+        return None
     tot = sum(int(v) for v in acc[ct.c_int(1)])
     mins = [int(v) for v in acc[ct.c_int(2)] if int(v) > 0]
     maxs = [int(v) for v in acc[ct.c_int(3)]]
-    if not n:
-        return 0, 0, 0, 0
-    return n, (min(mins) if mins else 0), tot // n, max(maxs)
+
+    hist = b["lat_hist"]
+    buckets = [sum(int(v) for v in hist[ct.c_int(i)])
+               for i in range(LAT_BUCKETS)]
+    over = buckets[-1]
+
+    def pct(q):
+        """Il bordo superiore del bucket in cui cade il quantile q."""
+        target = q * n
+        run = 0
+        for i, c in enumerate(buckets):
+            run += c
+            if run >= target:
+                if i == LAT_BUCKETS - 1:
+                    return None          # oltre la portata dell'istogramma
+                return (i + 1) * LAT_BUCKET_NS
+        return None
+
+    return dict(n=n, lat_min_ns=(min(mins) if mins else 0),
+                lat_p50_ns=pct(0.50), lat_p90_ns=pct(0.90),
+                lat_p99_ns=pct(0.99), lat_avg_ns=tot // n,
+                lat_max_ns=max(maxs), over=over)
 
 
 def run_latency(method, model_path, frames, delays, count, threads,
@@ -728,8 +775,8 @@ def run_latency(method, model_path, frames, delays, count, threads,
     from common import attach_xdp
 
     print(f"\n{YELLOW}{'=' * 78}{NC}")
-    print(f"{YELLOW} {method} -- latenza arrivo->ripartenza (build "
-          f"strumentata){NC}")
+    print(f"{YELLOW} {method} -- latenza arrivo->ripartenza E throughput "
+          f"(build strumentata){NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
 
     sem, n_out = class_semantics()
@@ -751,31 +798,56 @@ def run_latency(method, model_path, frames, delays, count, threads,
             if enable_threaded_napi(napi_devs, threads, os.cpu_count() or 1):
                 info("NAPI in thread: generatore e DUT su core separati")
 
-        hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>8s} {'campioni':>9s} "
-               f"{'min':>7s} {'media':>7s} {'max':>8s}")
+        # Throughput E latenza nella stessa riga, perche' vengono dallo
+        # STESSO pacchetto: il programma d'uscita conta e cronometra insieme,
+        # quindi `campioni` e' esattamente RX. Riportarli separati avrebbe
+        # significato due run e due stati della macchina per due numeri che
+        # descrivono lo stesso evento.
+        hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>8s} {'RX':>8s} "
+               f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
+               f"{'min':>6s} {'p50':>6s} {'p90':>6s} {'p99':>7s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
         for frame in frames:
             for delay in delays:
                 b["lat_acc"].clear()
+                b["lat_hist"].clear()
                 pg_clear_threads(1)
                 pg_configure(fab.ingress_peer, frame, count, delay,
                              dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02")
                 try:
-                    tx, _, _ = pg_run_and_read([fab.ingress_peer])
+                    tx, tx_pps, secs = pg_run_and_read([fab.ingress_peer])
                 except PktgenEmptyRun as e:
                     warn(f"punto scartato: {e}")
                     continue
-                n, lo, avg, hi = _read_lat(b)
-                if not n:
+                st = _read_lat(b)
+                if st is None:
                     warn(f"frame {frame} delay {delay}: nessun campione -- il "
                          f"pacchetto non e' arrivato all'uscita")
                     continue
-                print(f"  {frame:5d} {delay:6d} {tx:8d} {n:9d} "
-                      f"{lo:6d}n {avg:6d}n {hi:7d}n")
+
+                rx = st["n"]
+                secs = secs or 1e-9
+                rx_pps = int(rx / secs)
+                # Il throughput sul filo conta il frame intero, non il payload.
+                mbps = round(rx * frame * 8 / secs / 1e6, 1)
+                loss = round(100.0 * (tx - rx) / tx, 3) if tx else 0.0
+
+                def _f(v):
+                    return f"{v:5d}n" if v is not None else "  >4us"
+                mark = GREEN if loss <= 0.1 else (RED if loss > 1 else YELLOW)
+                print(f"  {frame:5d} {delay:6d} {tx:8d} {rx:8d} "
+                      f"{rx_pps:9d} {mbps:7.1f} {mark}{loss:7.2f}%{NC} "
+                      f"{_f(st['lat_min_ns'])} {_f(st['lat_p50_ns'])} "
+                      f"{_f(st['lat_p90_ns'])} {_f(st['lat_p99_ns'])}")
                 rows.append(dict(method=method, frame=frame, delay=delay,
-                                 tx=tx, samples=n, lat_min_ns=lo,
-                                 lat_avg_ns=avg, lat_max_ns=hi))
+                                 tx=tx, rx=rx, tx_pps=tx_pps, rx_pps=rx_pps,
+                                 rx_mbps=mbps, loss_pct=loss, samples=rx, **{
+                                     k: st[k] for k in
+                                     ("lat_min_ns", "lat_p50_ns",
+                                      "lat_p90_ns", "lat_p99_ns",
+                                      "lat_avg_ns", "lat_max_ns")},
+                                 over_4us=st["over"]))
         pg_reset()
         if napi_devs:
             disable_threaded_napi(napi_devs)
@@ -783,6 +855,13 @@ def run_latency(method, model_path, frames, delays, count, threads,
           f"pacchetto al momento in cui e' uscito. Include la trasmissione, "
           f"che test_suite non misura, e la scrittura del timestamp, che il "
           f"datapath di produzione non fa.{NC}")
+    print(f"  {GREY}Leggi il MINIMO e i percentili. La media resta nel CSV "
+          f"per completezza, ma su questa VM un singolo campione da "
+          f"millisecondi la sposta piu' della differenza fra due pipeline.{NC}")
+    print(f"  {GREY}Il throughput qui e' della build STRUMENTATA, che paga una "
+          f"scrittura di mappa per pacchetto in piu': e' quindi un limite "
+          f"INFERIORE di quello di produzione, non lo stesso numero. Per il "
+          f"throughput da citare usa il run senza --latency.{NC}")
     return rows
 
 
