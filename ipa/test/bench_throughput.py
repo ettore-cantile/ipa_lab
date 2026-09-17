@@ -463,6 +463,89 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 loss_pct=round(100.0 * (tx - rx) / tx, 3) if tx else 0.0)
 
 
+
+# ==========================================================================
+# THREADED NAPI: separare davvero il generatore dal DUT
+# ==========================================================================
+# Questo e' il pezzo che rende il banco un banco TG/DUT invece di una misura
+# della somma dei due.
+#
+# In modalita' softirq la RX di un veth gira sulla CPU che ha trasmesso: il
+# generatore e la pipeline finiscono sullo stesso core, e il tempo per pacchetto
+# e' t_gen + t_pipeline. Cosi' il generatore satura sempre per primo e la
+# pipeline non arriva mai al suo limite -- il risultato e' che "throughput
+# massimo" e "throughput a perdita nulla" coincidono, che e' un non-risultato.
+#
+# Dal kernel 5.12 /sys/class/net/<dev>/threaded sposta il poll NAPI in un
+# KERNEL THREAD dedicato (`napi/<dev>-<id>`), che lo scheduler puo' mettere
+# altrove e che si puo' pinnare a mano. Pinnando i thread NAPI sulle CPU che
+# pktgen NON usa, generatore e DUT stanno davvero su core diversi:
+#
+#     CPU 0..T-1   pktgen genera
+#     CPU T..N-1   napi/<dev>-*  esegue XDP, cioe' l'inferenza
+#
+# Da quel momento la domanda "a che rate la pipeline comincia a perdere" ha una
+# risposta, perche' il generatore non le ruba piu' il core.
+#
+# Non e' gratis e va detto: i pacchetti attraversano una frontiera di cache fra
+# il core che genera e quello che elabora, quindi il costo per pacchetto in
+# assoluto puo' salire. In cambio diventa attribuibile, che e' il punto.
+
+
+def _napi_threads(dev):
+    """I PID dei kernel thread NAPI di `dev`. Vuoto se non e' in modo thread."""
+    out = subprocess.run(["ps", "-eo", "pid,comm"], capture_output=True,
+                         text=True, check=False).stdout
+    pids = []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[1].strip().startswith(f"napi/{dev}-"):
+            pids.append(parts[0].strip())
+    return pids
+
+
+def enable_threaded_napi(devs, first_cpu, ncpu):
+    """Metti in modo thread la NAPI di `devs` e pinna i thread da `first_cpu`.
+
+    Restituisce [(dev, pid, cpu), ...] per quello che e' andato a posto. Un
+    device che non supporta `threaded` non e' un errore: si riporta e si
+    proseguec in softirq, perche' meglio una misura dichiarata su un core solo
+    che nessuna misura."""
+    placed = []
+    cpu = first_cpu
+    for dev in devs:
+        path = f"/sys/class/net/{dev}/threaded"
+        if not os.path.exists(path):
+            warn(f"{dev}: /sys/.../threaded non c'e', resto in softirq "
+                 f"(kernel < 5.12?)")
+            continue
+        try:
+            with open(path, "w") as f:
+                f.write("1\n")
+        except OSError as e:
+            warn(f"{dev}: threaded rifiutato ({e.strerror}), resto in softirq")
+            continue
+        for pid in _napi_threads(dev):
+            if cpu >= ncpu:
+                cpu = first_cpu          # piu' thread che CPU libere: gira
+            subprocess.run(["taskset", "-pc", str(cpu), pid],
+                           capture_output=True, check=False)
+            placed.append((dev, pid, cpu))
+            cpu += 1
+    return placed
+
+
+def disable_threaded_napi(devs):
+    for dev in devs:
+        path = f"/sys/class/net/{dev}/threaded"
+        if os.path.exists(path):
+            try:
+                with open(path, "w") as f:
+                    f.write("0\n")
+            except OSError:
+                pass
+
+
 # ==========================================================================
 # extra ingress links: one generator core each
 # ==========================================================================
@@ -595,7 +678,8 @@ def attach_rx_counter(fab):
 # ==========================================================================
 def run_method(method, model_path, frames, delays, count, out_rows,
                clone=0, threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
-               repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit"):
+               repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit",
+               threaded_napi=True):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -652,6 +736,24 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             info("xmit_mode netif_receive: XDP gira in modo GENERIC, non "
                  "native -- non confrontabile con gli altri run")
 
+        # Separazione vera fra generatore e DUT: i thread NAPI che eseguono
+        # l'inferenza vanno sulle CPU che pktgen non usa.
+        napi_devs = []
+        if threaded_napi and not rx_side:
+            ncpu = os.cpu_count() or 1
+            # pktgen usa kpktgend_0..threads-1, cioe' le CPU 0..threads-1.
+            rx_devs = [fab.ingress] + [e[0] for e in extra]
+            napi_devs = rx_devs + [p for p in attached]
+            placed = enable_threaded_napi(napi_devs, threads, ncpu)
+            if placed:
+                where = ", ".join(f"{d}->cpu{c}" for d, _, c in placed)
+                info(f"NAPI in thread, pinnata: {where}")
+                info(f"pktgen su cpu 0-{threads - 1}, inferenza sulle altre: "
+                     f"generatore e DUT su core separati")
+            else:
+                warn("nessun thread NAPI pinnato: generatore e pipeline "
+                     "restano sullo stesso core, e le cifre misurano la somma")
+
         # -- sonda: un pacchetto solo, per sapere se stiamo misurando
         #    inferenza o XDP_PASS.
         probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
@@ -704,6 +806,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             _summarise(method, frame, out_rows, threshold)
 
         pg_reset()
+        if napi_devs:
+            disable_threaded_napi(napi_devs)
         del_tg_links(threads - 1)
         for peer in attached:
             subprocess.run(["ip", "link", "set", "dev", peer, "xdp", "off"],
@@ -883,6 +987,11 @@ def main():
                         "meno punti e centra la risposta")
     p.add_argument("--count", type=int, default=200000,
                    help="pacchetti per punto di misura")
+    p.add_argument("--no-threaded-napi", action="store_true",
+                   help="lascia la RX in softirq sulla CPU che trasmette, "
+                        "cioe' generatore e pipeline sullo stesso core. Serve "
+                        "per riprodurre le misure vecchie, non per farne di "
+                        "nuove.")
     p.add_argument("--burst", type=int, default=0, metavar="N",
                    help="consegna N pacchetti per chiamata (xmit_more). Come "
                         "clone_skb puo' essere rifiutato da veth.")
@@ -942,7 +1051,8 @@ def main():
     for m in methods:
         rc |= run_method(m, model_path, frames, delays, a.count, rows,
                          a.clone_skb, a.threads, a.loss_threshold,
-                         a.repeat, a.burst, a.xmit_mode)
+                         a.repeat, a.burst, a.xmit_mode,
+                         not a.no_threaded_napi)
 
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
