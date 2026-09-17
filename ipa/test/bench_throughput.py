@@ -296,7 +296,7 @@ DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
 # per un istante perche' il ring trabocchi, e questo succede anche a rate medi.
 # Il rate "senza perdite" e' quindi molto sotto la capacita' di picco -- ed e'
 # proprio la differenza fra i due numeri che la RFC 2544 chiede di riportare.
-SATURATE_LADDER = (0.50, 0.35, 0.25, 0.15, 0.10, 0.05)
+SATURATE_LADDER = (0.50, 0.35, 0.25, 0.15, 0.10, 0.05, 0.03, 0.02)
 
 # Quanti passi di raffinamento fra l'ultimo gradino sporco e il primo pulito.
 # Si usa la media GEOMETRICA, non l'aritmetica: fra 0.05 e 0.15 della capacita'
@@ -2347,7 +2347,7 @@ def _fmt_ns(v):
 def run_fair(methods, model_path, frames, delays, count, threads,
              threaded_napi=True, repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS,
              tol=0.0, plan=None, xmit_mode="start_xmit", diag=None,
-             window_s=WINDOW_S, warmup_s=DEFAULT_WARMUP_S):
+             window_s=WINDOW_S, warmup_s=DEFAULT_WARMUP_S, napi_prio=None):
     """Tutte le pipeline sullo stesso fabric, compilate prima, misurate a giri."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
@@ -2417,7 +2417,8 @@ def run_fair(methods, model_path, frames, delays, count, threads,
                     # nulla da mettere in thread.
                     if threaded_napi:
                         napi_devs = [fab.ingress]
-                        if enable_threaded_napi(napi_devs, plan):
+                        if enable_threaded_napi(napi_devs, plan,
+                                                prio=napi_prio):
                             info("NAPI in thread: generatore e DUT su core "
                                  "separati")
                         else:
@@ -2807,7 +2808,45 @@ def _napi_threads(dev):
     return [pid for _, pid in sorted(found)]
 
 
-def enable_threaded_napi(devs, plan_or_first_cpu=None, ncpu=None):
+def set_napi_priority(pids, prio, dev=""):
+    """SCHED_FIFO sui thread NAPI. Restituisce quanti ne ha promossi.
+
+    PERCHE'. Il poll NAPI in modo thread e' un normale task SCHED_OTHER: lo
+    scheduler lo preempta, e mentre e' fermo il ptr_ring da 256 entry di veth
+    si riempie e il mittente comincia a ricevere NET_XMIT_DROP. E' cosi' che
+    nasce la perdita che NON dipende dal rate -- misurato su questo banco: a
+    1,33 Mpps chiesti due finestre su tre pulite e una al 7,2%, con soli l'1,6%
+    di rifiuti nella mediana. Il rate non era il problema: il momento in cui il
+    thread perdeva la CPU lo era.
+
+    Con SCHED_FIFO il poll non cede la CPU a un task normale, il ring non
+    trabocca, e la perdita torna a dipendere solo dal rate -- che e' la
+    condizione in cui "rate a perdita nulla" significa qualcosa.
+
+    IL RISCHIO, DICHIARATO. Un task FIFO che gira al 100% affama gli altri task
+    su quella CPU. Qui e' accettabile per due ragioni: la CPU del DUT e'
+    dedicata (non ci gira il generatore), e il kernel applica comunque il suo
+    RT throttling (sched_rt_runtime_us, 950 ms ogni secondo). Resta una cosa da
+    non fare su una CPU condivisa con qualcosa che conta."""
+    done = 0
+    for pid in pids:
+        try:
+            r = subprocess.run(["chrt", "-f", "-p", str(prio), str(pid)],
+                               capture_output=True, text=True, check=False)
+        except OSError:
+            warn("`chrt` non disponibile (util-linux): i thread NAPI restano "
+                 "SCHED_OTHER, quindi preemptabili, e il ring di veth "
+                 "continuera' a traboccare ogni tanto.")
+            return done
+        if r.returncode == 0:
+            done += 1
+        else:
+            warn(f"{dev}: chrt sul pid {pid} rifiutato "
+                 f"({r.stderr.strip() or 'motivo non riportato'})")
+    return done
+
+
+def enable_threaded_napi(devs, plan_or_first_cpu=None, ncpu=None, prio=None):
     """Metti in modo thread la NAPI di `devs` e pinna i thread sulle CPU DUT.
 
     Il secondo argomento e' un CpuPlan (forma nuova) oppure la prima CPU da
@@ -2870,6 +2909,12 @@ def enable_threaded_napi(devs, plan_or_first_cpu=None, ncpu=None):
             else:
                 warn(f"{dev}: taskset su cpu{cpu} fallito per il pid {pid} "
                      f"({r.stderr.decode().strip() or 'motivo non riportato'})")
+        if pids and prio:
+            n = set_napi_priority(pids, prio, dev)
+            if n:
+                info(f"{dev}: {n} thread NAPI a SCHED_FIFO prio {prio} -- il "
+                     f"poll non viene piu' preempted, il ring di veth smette "
+                     f"di traboccare per jitter")
         if pids:
             placed.append((dev, len(pids), sorted(set(used))))
         else:
@@ -3233,7 +3278,7 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                threaded_napi=True, plan=None, topology="shared",
                diag_enabled=False, asked_pps=None, window_s=WINDOW_S,
                warmup_s=DEFAULT_WARMUP_S, tune=False, search="ladder",
-               rx_ring_size=None):
+               rx_ring_size=None, napi_prio=None):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -3285,7 +3330,7 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         napi_devs = []
         if threaded_napi and not rx_side:
             napi_devs = list(ing.dut_devs)
-            placed = enable_threaded_napi(napi_devs, plan)
+            placed = enable_threaded_napi(napi_devs, plan, prio=napi_prio)
             if placed:
                 where = ", ".join(
                     f"{d}({n} thread)->cpu{','.join(str(c) for c in cs)}"
@@ -3774,7 +3819,7 @@ def run_compare(methods, model_path, frames, asked_pps=None,
                 topology="shared", xmit_mode="start_xmit",
                 threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
                 warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0,
-                rx_ring_size=None):
+                rx_ring_size=None, napi_prio=None):
     """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
@@ -3834,7 +3879,7 @@ def run_compare(methods, model_path, frames, asked_pps=None,
         napi_devs = []
         if threaded_napi and not rx_side:
             napi_devs = list(ing.dut_devs)
-            placed = enable_threaded_napi(napi_devs, plan)
+            placed = enable_threaded_napi(napi_devs, plan, prio=napi_prio)
             if placed:
                 where = ", ".join(
                     f"{d}({n} thread)->cpu{','.join(str(c) for c in cs)}"
@@ -4205,6 +4250,12 @@ def main():
                         "rate senza perdite e peggiora la latenza di coda -- "
                         "va dichiarato accanto al risultato. Se il kernel non "
                         "espone i ringparam per veth, lo si dice e si prosegue.")
+    m.add_argument("--napi-prio", type=int, default=None, metavar="P",
+                   help="metti i thread NAPI del DUT a SCHED_FIFO con questa "
+                        "priorita' (1-99, tipico 50). Il poll non viene piu' "
+                        "preempted, quindi il ring di veth non trabocca per "
+                        "jitter: e' la leva che porta la perdita a ZERO a rate "
+                        "utili. Da usare solo con CPU del DUT dedicate.")
     m.add_argument("--search", choices=("ladder", "bisect"), default="ladder",
                    help="come cercare il punto di saturazione. ladder "
                         "(default) sale per gradini e verifica la monotonia; "
@@ -4302,7 +4353,7 @@ def main():
                        plan.threads, not a.no_threaded_napi, a.repeat,
                        a.rounds, a.loss_threshold, plan=plan,
                        xmit_mode=a.xmit_mode, window_s=a.duration,
-                       warmup_s=a.warmup)
+                       warmup_s=a.warmup, napi_prio=a.napi_prio)
         rows = summarise_fair(raw, methods)
         # Il confronto si fa sulle righe SENZA PERDITE, non su quelle a pieno
         # rate: a pieno rate si confrontano sistemi in sovraccarico, e chi ne
@@ -4336,7 +4387,7 @@ def main():
             topology=a.gen_topology, xmit_mode=a.xmit_mode,
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
-            burst=a.burst, rx_ring_size=a.rx_ring)
+            burst=a.burst, rx_ring_size=a.rx_ring, napi_prio=a.napi_prio)
         rc |= check_validity(rows)
         if a.out and (rows or raw):
             os.makedirs(a.out, exist_ok=True)
@@ -4357,7 +4408,8 @@ def main():
                          topology=a.gen_topology, diag_enabled=a.diag,
                          asked_pps=a.offered_pps, window_s=a.duration,
                          warmup_s=a.warmup, tune=a.tune_generator,
-                         search=a.search, rx_ring_size=a.rx_ring)
+                         search=a.search, rx_ring_size=a.rx_ring,
+                         napi_prio=a.napi_prio)
 
     # Il confronto si fa sulle righe a perdita nulla, non su quelle a pieno
     # rate: a pieno rate si confrontano sistemi in sovraccarico.
