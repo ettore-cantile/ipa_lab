@@ -206,6 +206,41 @@ def variants(src):
             "    __u32 _raw_iface = _if16;")
         out.append(("u8+u16 casts", own,
                     "both halves read through a sized type, not a mask"))
+
+    # Casts made no difference either. Comparing the working variant against
+    # the failing one line by line, what is left is how many values born at a
+    # MERGE point feed the unrolled loop:
+    #
+    #   loads   : _ttl (ternary), _raw_iface (ternary)              -> 2
+    #   refused : _ttl (ternary), _raw_iface and _node, both from
+    #             _ctx which is itself a ternary                    -> 3
+    #
+    # An early exit has no merge: after `if (!p) return`, the pointer is known
+    # non-null and the value has one definition. Tried before, but on a
+    # separate slot -- so that version paid an extra lookup and kept both
+    # ternaries. Never with the packing.
+    block = ("    int mctx = META_NODE_CTX;\n"
+             "    long long *cxp = scratch_meta.lookup(&mctx);\n"
+             "    __u32 _ctx = cxp ? (__u32)(*cxp) : 0xff0000U;")
+    if block in src:
+        early = src.replace(block,
+             "    int mctx = META_NODE_CTX;\n"
+             "    long long *cxp = scratch_meta.lookup(&mctx);\n"
+             "    if (!cxp) return XDP_PASS;\n"
+             "    __u32 _ctx = (__u32)(*cxp);")
+        out.append(("packed+exit", early,
+                    "packed slot, early exit -- ONE merged value in the loop"))
+
+        ttl_block = ("    long long *ttlp = scratch_meta.lookup(&mtl);\n"
+                     "    __u32 _ttl = ttlp ? (__u32)(*ttlp) & 0xff : 0;")
+        if ttl_block in early:
+            zero = early.replace(ttl_block,
+                     "    long long *ttlp = scratch_meta.lookup(&mtl);\n"
+                     "    if (!ttlp) return XDP_PASS;\n"
+                     "    __u32 _ttl = (__u32)(*ttlp) & 0xff;")
+            out.append(("zero merges", zero,
+                        "the ttl ternary made an early exit too -- NO merged "
+                        "value reaches the loop"))
     return out
 
 
