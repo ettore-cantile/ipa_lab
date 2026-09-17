@@ -179,6 +179,12 @@ DEFAULT_LOSS_THRESHOLD = 0.1
 # Vedi measure_point.
 DEFAULT_REPEAT = 3
 
+# Oltre questa dispersione fra le ripetizioni il punto non e' utilizzabile.
+# Misurato: hardcoded ha dato +-75% fra tre misure della stessa cosa, e la
+# baseline e' uscita il 26% PIU' LENTA di una pipeline che fa strettamente piu'
+# lavoro -- cioe' il run misurava il carico della macchina, non il datapath.
+MAX_SPREAD_PCT = 25.0
+
 # Ritardi fissi, usati solo se il chiamante li chiede con --delays. Il default
 # e' la ricerca del ginocchio (find_knee), che costa meno punti e centra la
 # risposta invece di avvicinarla.
@@ -463,10 +469,21 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     runs = []
     for _ in range(max(1, repeat)):
         try:
-            runs.append(_measure_once(setup, rx_tab, fab, frame, delay, count,
-                                      n_out, clone, tg_devs, burst, xmit_mode))
+            r = _measure_once(setup, rx_tab, fab, frame, delay, count,
+                              n_out, clone, tg_devs, burst, xmit_mode)
         except PktgenEmptyRun as e:
-            warn(f"punto scartato: {e}")
+            warn(f"misura scartata: {e}")
+            continue
+        # HIT > 0 e RX == 0 non e' "perdita del 100%": e' il contatore che non
+        # ha visto niente mentre il programma elaborava tutto. E' un guasto
+        # della strumentazione, e tenerlo faceva comparire righe con
+        # TX == HIT == RX == 200000 marcate 100.00%, perche' la perdita
+        # PEGGIORE delle tre ripetizioni veniva da una misura rotta.
+        if r["hit"] > 0 and r["rx"] == 0:
+            warn(f"misura scartata: {r['hit']} elaborati e 0 contati in "
+                 f"uscita -- contatore RX non aggiornato, non perdita")
+            continue
+        runs.append(r)
     if not runs:
         return None
     runs.sort(key=lambda r: r["rx_pps"])
@@ -478,6 +495,13 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     med["rx_pps_max"] = runs[-1]["rx_pps"]
     med["burst"] = burst
     med["xmit_mode"] = xmit_mode
+    lo, hi = med["rx_pps_min"], med["rx_pps_max"]
+    med["spread_pct"] = round(100.0 * (hi - lo) / lo, 1) if lo else None
+    # Una mediana su misure che oscillano del 75% non e' una misura: e' il
+    # carico della macchina in tre momenti diversi. Marcarla e' l'unica cosa
+    # onesta da farne.
+    med["unreliable"] = bool(med["spread_pct"] is not None
+                             and med["spread_pct"] > MAX_SPREAD_PCT)
     return med
 
 
@@ -901,9 +925,11 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             mark = GREEN if r["loss_pct"] == 0 else (
                 RED if r["loss_pct"] > 1 else YELLOW)
             spread = ""
-            if r.get("repeat", 1) > 1 and r["rx_pps_min"]:
-                sp = 100.0 * (r["rx_pps_max"] - r["rx_pps_min"]) / r["rx_pps_min"]
-                spread = f" {GREY}(x{r['repeat']}, +-{sp:.0f}%){NC}"
+            if r.get("spread_pct") is not None:
+                col = RED if r.get("unreliable") else GREY
+                flag = " INAFFIDABILE" if r.get("unreliable") else ""
+                spread = (f" {col}(x{r['repeat']}, +-{r['spread_pct']:.0f}%"
+                          f"{flag}){NC}")
             print(f"  {r['frame']:5d} {r['delay']:6d} {r['tx']:9d} "
                   f"{r['hit']:9d} {r['rx']:9d} {r['tx_pps']:9d} "
                   f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
@@ -1106,6 +1132,59 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
 
 
 # ==========================================================================
+def check_validity(rows):
+    """La baseline deve essere la piu' veloce. Se non lo e', il run e' sporco.
+
+    Non e' una convenzione: la baseline parsa, decrementa il TTL e redirige su
+    una classe FISSA. Fa strettamente MENO lavoro di qualunque pipeline, quindi
+    non puo' consegnare meno pacchetti. Se lo fa, la differenza fra le colonne
+    e' il carico della macchina in momenti diversi e non il costo
+    dell'inferenza, e pubblicare quella classifica sarebbe pubblicare rumore
+    ordinato.
+
+    Questo controllo esiste perche' e' successo: baseline 2 658 k contro
+    p1_static 3 342 k, con dispersioni fino al 75%."""
+    best = {}
+    for r in rows:
+        m = r.get("method")
+        if m and (m not in best or r["rx_pps"] > best[m]["rx_pps"]):
+            best[m] = r
+    if "baseline" not in best or len(best) < 2:
+        return 0
+    base = best["baseline"]["rx_pps"]
+    faster = {m: r["rx_pps"] for m, r in best.items()
+              if m != "baseline" and r["rx_pps"] > base}
+    noisy = sorted({m for m, r in best.items() if r.get("unreliable")})
+
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} Controllo di validita'{NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+    if not faster and not noisy:
+        print(f"  {GREEN}[PASS]{NC} la baseline ({base} pps) e' la piu' veloce, "
+              f"come deve essere: fa strettamente meno lavoro.")
+        print(f"  {GREY}Le differenze sotto di lei sono attribuibili alle "
+              f"pipeline.{NC}")
+        return 0
+    if faster:
+        det = ", ".join(f"{m} {v}" for m, v in sorted(faster.items()))
+        print(f"  {RED}[FAIL]{NC} la baseline ({base} pps) NON e' la piu' "
+              f"veloce: {det}.")
+        print(f"  {GREY}La baseline fa strettamente meno lavoro, quindi non "
+              f"puo' consegnare meno. Questo run misura il carico della "
+              f"macchina, non il datapath: le cifre non sono confrontabili "
+              f"fra metodi.{NC}")
+    if noisy:
+        print(f"  {RED}[FAIL]{NC} dispersione oltre {MAX_SPREAD_PCT}% su: "
+              f"{', '.join(noisy)}.")
+        print(f"  {GREY}Una mediana su misure che oscillano cosi' e' il "
+              f"carico della macchina in momenti diversi.{NC}")
+    print(f"\n  {YELLOW}Che fare{NC}: chiudi tutto il resto, poi rilancia con "
+          f"--repeat 7. Se la dispersione resta, questa VM non e' un banco di "
+          f"misura per il throughput assoluto e vale solo il confronto dentro "
+          f"un singolo metodo.")
+    return 1
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("USO")[0].strip(),
@@ -1184,6 +1263,8 @@ def main():
                          a.clone_skb, a.threads, a.loss_threshold,
                          a.repeat, a.burst, a.xmit_mode,
                          not a.no_threaded_napi)
+
+    rc |= check_validity(rows)
 
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
