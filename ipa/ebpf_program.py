@@ -303,7 +303,7 @@ BPF_HASH(ingress_port, __u32, __u32, 64);
  * exactly like mac_table and ingress_port. An absent entry means "unknown", and
  * no bit is set, rather than silently meaning node 0.
  */
-BPF_ARRAY(node_id, __u32, 1);
+BPF_HASH(node_id, __u32, __u32, 1);
 
 /* model_progs: dispatcher -> model_<id>, indexed directly by ipa->model_id.
  * A single tail call, matching the design-space spec's hardcoded pipeline
@@ -585,9 +585,13 @@ def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1):
     fc1_w[j, offset + node]. One switch total, verifier-safe."""
     size = feat["size"]
     lines = ["    /* feature 'node' (one-hot): active index = model_id */",
-             "    __u32 _node = 0xffffffffU;   /* unknown: the switch default sets no weight */",
-             "    { int _nz = 0; __u32 *_nid = node_id.lookup(&_nz);",
-             "      if (_nid) _node = *_nid; }"]
+             "    /* Bounded to a byte: the verifier reasons about the",
+             "     * switch below far more cheaply with a tight range, and",
+             "     * this used to come from a __u8. 256 = unknown, which",
+             "     * falls through to the default and sets no weight. */",
+             "    __u32 _node = 0x100U;",
+             "    { __u32 _nz = 0; __u32 *_nid = node_id.lookup(&_nz);",
+             "      if (_nid && *_nid <= 0xffU) _node = *_nid; }"]
     for j in range(n_h1):
         lines.append(f"    long long w_node_{j} = 0LL;")
     lines.append("    switch (_node) {")

@@ -224,7 +224,7 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
         nid_name = _NODEID_NAME[setup["pipeline"]]
         node_index = FABRIC_NODE_INDEX
         try:
-            b[nid_name][ct.c_int(0)] = ct.c_uint32(node_index)
+            b[nid_name][ct.c_uint32(0)] = ct.c_uint32(node_index)
             if verbose:
                 info(f"{nid_name}: this node is index {node_index}")
         except Exception as e:
@@ -450,7 +450,7 @@ def run_sweep(timeout, xdp_mode, verbose):
             # An index inside this topology's node count, so it is a valid one.
             node_index = min(FABRIC_NODE_INDEX, n_nodes - 1)
             try:
-                b["node_id"][ct.c_int(0)] = ct.c_uint32(node_index)
+                b["node_id"][ct.c_uint32(0)] = ct.c_uint32(node_index)
             except Exception:
                 node_index = None
 

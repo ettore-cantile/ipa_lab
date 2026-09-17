@@ -470,10 +470,12 @@ BPF_HASH(ingress_port_t2, __u32, __u32, 64);
  * the 65 inputs, carrying no information.
  *
  * Which node this is, is a fact of the node, resolved when the node exists --
- * exactly like mac_table and ingress_port. An absent entry means "unknown", and
- * no bit is set, rather than silently meaning node 0.
+ * exactly like mac_table and ingress_port. A HASH, not an ARRAY: an array is pre-allocated and
+ * zero-filled, so a lookup always succeeds and "not installed" would read
+ * back as node 0 -- indistinguishable from a real node 0, which is the very
+ * defect this map exists to remove. Here absent means absent.
  */
-BPF_ARRAY(node_id_t2, __u32, 1);
+BPF_HASH(node_id_t2, __u32, __u32, 1);
 
 BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
@@ -690,10 +692,12 @@ BPF_HASH(ingress_port_t2, __u32, __u32, 64);
  * the 65 inputs, carrying no information.
  *
  * Which node this is, is a fact of the node, resolved when the node exists --
- * exactly like mac_table and ingress_port. An absent entry means "unknown", and
- * no bit is set, rather than silently meaning node 0.
+ * exactly like mac_table and ingress_port. A HASH, not an ARRAY: an array is pre-allocated and
+ * zero-filled, so a lookup always succeeds and "not installed" would read
+ * back as node 0 -- indistinguishable from a real node 0, which is the very
+ * defect this map exists to remove. Here absent means absent.
  */
-BPF_ARRAY(node_id_t2, __u32, 1);
+BPF_HASH(node_id_t2, __u32, __u32, 1);
 
 BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
@@ -802,10 +806,15 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     { __u32 _kif = ctx->ingress_ifindex;
       __u32 *_lp = ingress_port_t2.lookup(&_kif);
       if (_lp) _raw_iface = *_lp; }
-    /* The NODE's own index, not the packet's model_id -- see node_id_t2. */
-    __u32 _node      = 0xffffffffU;
-    { int _nz = 0; __u32 *_nid = node_id_t2.lookup(&_nz);
-      if (_nid) _node = *_nid; }
+    /* The NODE's own index, not the packet's model_id -- see node_id_t2.
+     * Bounded to a byte on purpose: this used to come from a __u8, and the
+     * verifier needs that bound to reason about `base + _node` inside the
+     * unrolled feature loop. 256 is the "unknown" sentinel -- outside any
+     * valid index, so no bit is set. An index above 255 is refused by the
+     * control plane rather than truncated here. */
+    __u32 _node = 0x100U;
+    { __u32 _nz = 0; __u32 *_nid = node_id_t2.lookup(&_nz);
+      if (_nid && *_nid <= 0xffU) _node = *_nid; }
 
     /* dense feature vectors, each read once with a SINGLE lookup, reused across
      * neurons. Sized to the COMPILED CEILINGS, gated per-feature by the
