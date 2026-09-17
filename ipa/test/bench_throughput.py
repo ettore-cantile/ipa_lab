@@ -1669,8 +1669,24 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     # Una mediana su misure che oscillano del 75% non e' una misura: e' il
     # carico della macchina in tre momenti diversi. Marcarla e' l'unica cosa
     # onesta da farne.
-    med["unreliable"] = bool(med["spread_pct"] is not None
-                             and med["spread_pct"] > MAX_SPREAD_PCT)
+    med["unreliable"] = bool(
+        (med["spread_pct"] is not None and med["spread_pct"] > MAX_SPREAD_PCT)
+        or med.get("gen_skew_pct", 0.0) > 20.0
+        or med.get("gen_rate_mismatch_pct", 0.0) > 25.0
+        or med.get("gen_errors", 0) > 0
+        or med.get("offered_pps") == 0 and med.get("tx", 0) > 0
+    )
+    med["invalid_reason"] = []
+    if med.get("gen_skew_pct", 0.0) > 20.0:
+        med["invalid_reason"].append("generator threads not synchronized")
+    if med.get("gen_rate_mismatch_pct", 0.0) > 25.0:
+        med["invalid_reason"].append("TX/rate mismatch")
+    if med.get("gen_errors", 0) > 0:
+        med["invalid_reason"].append("pktgen errors")
+    if med.get("offered_pps") == 0 and med.get("tx", 0) > 0:
+        med["invalid_reason"].append("zero offered rate with nonzero TX")
+    if med["spread_pct"] is not None and med["spread_pct"] > MAX_SPREAD_PCT:
+        med["invalid_reason"].append("repeat spread too high")
     # Due avvisi che riguardano la MISURA e non il datapath: se scattano, la
     # riga resta ma va letta sapendo che la finestra non era pulita.
     if med.get("gen_skew_pct", 0) > 20.0:
@@ -1680,8 +1696,12 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         warn(f"TX/durata e somma dei pps per istanza differiscono del "
              f"{med['gen_rate_mismatch_pct']}%: uso TX diviso la durata "
              f"globale, che e' la lettura che non gonfia")
-    tag, why = classify_bottleneck(med, threshold=threshold, plan=plan,
-                                   diag_data=diag_data)
+    if med["unreliable"]:
+        tag = "indeterminato"
+        why = "misura non affidabile: " + "; ".join(med["invalid_reason"])
+    else:
+        tag, why = classify_bottleneck(med, threshold=threshold, plan=plan,
+                                       diag_data=diag_data)
     med["bottleneck"] = tag
     med["bottleneck_why"] = why
     if diag_data:
