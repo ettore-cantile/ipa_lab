@@ -397,6 +397,7 @@ attribuisce alla variabile sull'asse x e a nient'altro.
 |---|---|---|
 | `nodes` | 10, 25, 52, 75, 100 nodi | `MAX_N_IN` = 128 in P2/P3 (`n_in = 13 + n_nodi`) |
 | `depth` | 1…6 hidden layer | — |
+| `isoparam` | 1…5 hidden layer, **a parametri fermi** | famiglia a imbuto dentro i soffitti |
 | `width` | 2, 4, 6, 8 neuroni | soffitto compilato 8 in P2 e P3 |
 | `descriptor` | 4 composizioni di IV | 0/1/2 one-hot, piccola (6) o grande (52) |
 | `sparsity` | 0, 25, 50, 75, 90% di pesi zero | — |
@@ -436,7 +437,9 @@ matrice intera, per guardare, non per pubblicare.
 | 5 | `scaling_nodes_latenza` | **E non costa nulla a runtime, a nessuna delle tre.** Piatte tutte e cinque le colonne. Il motivo è strutturale: una one-hot legge **una sola colonna di pesi** qualunque sia la sua larghezza. |
 | 6 | `scaling_width_latenza` | **Allargare i layer nascosti invece si paga**, su tutte e tre. Letto insieme alla figura 5: *la rete può crescere quanto vuole, il modello no.* |
 | 7 | `scaling_sparsity_insns_log` | **Con pesi più sparsi P1 crolla** (1 071 → 224 istruzioni al 90% di zeri), P2 e P3 non si muovono di un'istruzione. I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero; per P2/P3 uno zero è un byte in mappa come un altro. Scala logaritmica: su scala lineare P1 sta a ~10³ e P2/P3 a ~10⁴, e il crollo sparisce schiacciato sullo zero. |
-| 8 | `scaling_descriptor_insns` | **Cambiare la composizione del vettore d'ingresso ricompila P1** (da 575 a 1 071 istruzioni fra le quattro IV), mentre P2 e P3 leggono il descrittore da `model_desc` e non cambiano. Ed è anche il **controllo** dell'esperimento sulla specializzazione: dove il descrittore non dichiara la feature `node`, le due P1 sono **identiche alla cifra** (599 e 599, 575 e 575); dove la dichiara, divergono (614 contro 1 071). Il divario è tutto lì e nient'altro. Barre e non curve: una linea fra `no_onehot` e `big_onehot` disegnerebbe una pendenza fra due nomi. |
+| 8a | `scaling_isoparam_insns` + `scaling_isoparam_latenza` | **A parità di parametri** (592 ± 2%), 1→5 hidden layer. Le due P1 non distinguono larga da profonda a questo budget; P2 cresce del 22% in istruzioni e dell'**84% in latenza**; P3 ha istruzioni **identiche** a tutti e cinque i punti e cresce del **58% in latenza**. Due meccanismi diversi per lo stesso sintomo: P2 srotola ogni layer, P3 ne paga uno in tail call. |
+| 8b | `scaling_isoparam_mpps` | Lo stesso in throughput teorico, l'unità in cui la domanda si pone di solito. È `1/latenza` sotto `BPF_PROG_TEST_RUN`: un **picco**, non un throughput retto. |
+| 9 | `scaling_descriptor_insns` | **Cambiare la composizione del vettore d'ingresso ricompila P1** (da 575 a 1 071 istruzioni fra le quattro IV), mentre P2 e P3 leggono il descrittore da `model_desc` e non cambiano. Ed è anche il **controllo** dell'esperimento sulla specializzazione: dove il descrittore non dichiara la feature `node`, le due P1 sono **identiche alla cifra** (599 e 599, 575 e 575); dove la dichiara, divergono (614 contro 1 071). Il divario è tutto lì e nient'altro. Barre e non curve: una linea fra `no_onehot` e `big_onehot` disegnerebbe una pendenza fra due nomi. |
 
 ### Testa a testa: P1 specializzata contro P1.5
 

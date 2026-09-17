@@ -1238,6 +1238,74 @@ secondi} in P1 --- che deve rigenerare il C e richiamare il compilatore --- e
 È la misura che decide se una pipeline è usabile in una rete che cambia.
 \end{lezione}
 
+\section{Larga o profonda? Dipende da chi la esegue}
+
+Dato un numero di parametri da spendere, conviene metterli in \emph{un} layer
+largo o in \emph{molti} stretti? È una domanda che si fa di solito parlando del
+modello, come se la risposta fosse una proprietà della rete neurale. Qui non lo
+è.
+
+Cinque forme, tutte con lo stesso budget --- 592 pesi, con uno scarto del 2\%\
+--- disposto in modo diverso: da un solo strato da otto neuroni a cinque strati
+stretti. Tutte stanno dentro i soffitti compilati, quindi tutte e quattro le
+pipeline possono eseguirle tutte.
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_isoparam_latenza.pdf}
+\end{center}
+
+\begin{lezione}
+A parità di parametri, le due versioni hardcoded \textbf{non distinguono} una
+rete larga da una profonda. P2 perde l'\textbf{84\%} di latenza e P3 il
+\textbf{58\%}.
+
+La stessa scelta di architettura costa zero o costa il doppio, a seconda della
+pipeline su cui finisce.
+\end{lezione}
+
+E i due che perdono, perdono per ragioni diverse:
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_isoparam_insns.pdf}
+\end{center}
+
+P2 cresce anche in dimensione (dal 14\,140 al 17\,207): deve srotolare ogni
+strato, perché è un programma solo. P3 ha la riga \textbf{perfettamente
+orizzontale} --- dodicimila e trentuno istruzioni a tutti e cinque i punti ---
+e perde comunque il 58\%\ di velocità.
+
+\begin{lezione}
+\textbf{Dimensione costante e tempo crescente} è la firma di un costo di
+transizione, non di calcolo. In P3 si vede allo stato puro: ciò che cresce non è
+il lavoro, è il numero di volte che il programma deve rientrare in sé stesso.
+\end{lezione}
+
+\subsection*{E la conclusione di prima?}
+
+Un capitolo fa avevamo scritto che allargare batte approfondire. Qui le due P1
+dicono di no. Non è una contraddizione: \textbf{dipende dal budget}.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{budget} & \textbf{larga} & \textbf{profonda (8 strati)} \\
+\midrule
+$\sim$300 pesi   &  54 ns & 69 ns \quad($+28\%$) \\
+$\sim$1\,200 pesi & 124 ns & 282 ns \quad($+127\%$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A 592 pesi e cinque strati l'effetto su P1 sta \emph{sotto il rumore della
+misura}; a 1\,200 pesi e otto strati è più che doppio. La frase giusta non è
+"allargare batte approfondire", è \textbf{"allargare batte approfondire sopra
+una certa taglia"}.
+
+Vale la pena notare la differenza fra le due formulazioni. La prima è una legge;
+la seconda è un risultato con un dominio di validità. Solo la seconda è
+sostenuta dai dati.
+
 \section{Congelare il nodo: conviene?}
 
 L'indice del nodo è una \textbf{costante del deployment}: un nodo non cambia di

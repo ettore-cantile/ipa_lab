@@ -209,17 +209,33 @@ dal budget. Le due schede qui sotto vanno lette insieme: D2 varia la profondità
 parametri fermi su tutte e quattro le pipeline, D1 spinge il budget più in alto ma
 solo su P1.
 
-### D1 — A parità di budget-pesi, allargare batte approfondire (P1) ✅⏳
+### D1 — A parità di budget-pesi, allargare batte approfondire (P1) ✅⚠️
 
 | | |
 |---|---|
 | **Ipotesi** | Dato un numero di parametri, spenderli in un layer largo costa meno che in molti stretti. |
-| **Variabile modificata** | La forma, a budget abbinato: 3 tier (~300, ~1 200, ~4 700 pesi), ciascuno in versione larga (1 layer) e profonda (4 e 8 layer). |
-| **Variabili fisse** | Il budget-pesi — lo **scarto è stampato**, non assunto: 6,7% nel tier A, 10,1% nel B, 2,0% nel C. Descrittore, topologia, pipeline (solo P1). |
+| **Variabile modificata** | La profondità, a budget abbinato: 3 tier (~300, ~1 200, ~4 700 pesi), ciascuno in versione larga (1 layer) e profonda (4 e 8 layer). |
+| **Variabili fisse** | Il budget-pesi, **con lo scarto stampato per ogni tier**. Ripetuto su 4 descrittori (0, 1 o 2 one-hot; one-hot piccola da 6 e grande da 52). |
 | **Metrica** | Istruzioni eBPF, latenza (minimo su 15 trial, con p50/p90/max). |
-| **Risultato** | Tier A (~300 pesi): larga 1×4 **54 ns**, base 2×4 56, profonda 8×3 **69 ns** (+28%). Tier B (~1 200): larga 1×16 **124 ns**, profonda 4×11 **218** (+76%), profonda 8×9 **282** (+127%). Tier C (~4 700): **crash sempre**, larga o profonda che sia. |
-| **Conclusione** | Allargare batte approfondire, **e il divario cresce col budget**: trascurabile a 300 pesi, più che raddoppiato a 1 200. Oltre ~1 300 pesi lo stack eBPF da 512 byte va in overflow comunque: non è una scelta di architettura, è il limite del «tutto srotolato in una funzione». |
-| **Stato** | ✅ sul descrittore `default`, rimisurato sul codice corrente. ⏳ sugli altri tre: morivano con `ScenarioError: feature 'queue_occupancy' needs topology dimension 'n_queues'`, perché lo script non dichiarava quella dimensione. Corretto, da rieseguire — serve per poter dire «non è un artefatto delle one-hot». |
+
+**Risultato, sui due descrittori dove il budget è davvero abbinato:**
+
+| descrittore | tier | larga | profonda 4 | profonda 8 |
+|---|---|---:|---:|---:|
+| `default` (n_in 65) | A, scarto 6,7% | 53 ns | — | 70 ns (+32%) |
+| `default` | B, scarto 10,1% | 120 ns | 277 (+131%) | 351 (+193%) |
+| `big_onehot` (n_in 59) | A, scarto 7,3% | 41 ns | — | 57 ns (+39%) |
+| `big_onehot` | B, scarto 14,9% | 106 ns | 207 (+95%) | 269 (+154%) |
+
+Tier C (~4 700 pesi): **crash su tutti e quattro i descrittori**, larga o profonda
+che sia, con `Looks like the BPF stack limit is exceeded`.
+
+| | |
+|---|---|
+| **Conclusione** | Allargare batte approfondire, **e il divario cresce col budget**: +32-39% a ~300 pesi, +154-193% a ~1 200. Oltre ~1 300 pesi lo stack eBPF da 512 byte va in overflow comunque: non è una scelta di architettura, è il limite del «tutto srotolato in una funzione». |
+| **⚠️ Quello che questo run NON sostiene** | Gli altri due descrittori (`no_onehot`, `small_onehot`) hanno uno scarto di budget del **140-160%** nel tier B: la forma «profonda 8» ha lì 2,6× i parametri della «larga», quindi è più lenta anche perché è un modello più grande. Quei numeri **non possono** sostenere la conclusione. E sono proprio i due senza one-hot grande, cioè quelli che dovevano dimostrare che il risultato non è un artefatto delle one-hot: **il controllo è la parte che non ha funzionato.** |
+| **Causa e correzione** | Le forme erano **fisse** fra i descrittori (1×16, 4×11, 8×9) mentre `n_in` cambia da 65 a 11: con 65 ingressi il primo layer domina il budget e gli strati in più lo muovono poco, con 11 no. Ora la larghezza è **risolta per descrittore** per centrare il budget del tier (`solve_width`). Scarti dopo la correzione: tier A 6,6-19,7%, tier B 3,8-9,6%, tier C 0,8-3,8%. Il tier A resta grossolano perché a 300 pesi le larghezze intere fanno passi larghi — ed è stampato, non nascosto. |
+| **Da rifare** | Un run sulle forme abbinate, che è ciò che permette di dire «non è un artefatto delle one-hot». Fino ad allora la conclusione vale su 2 descrittori su 4. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_depth_vs_width.py` |
 
 ### D2 — A parametri fermi, la risposta cambia con la pipeline ✅

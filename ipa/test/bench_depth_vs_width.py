@@ -82,17 +82,72 @@ FEATURE_SETS = {
 
 # (tier, label, hidden_dims) -- SAME architecture grid tested against every
 # descriptor above, so descriptor is the only thing that varies per sweep.
-SHAPES = [
-    ("A (~300 w)",  "baseline 2x4", (4, 4)),
-    ("A (~300 w)",  "wide   1x4",   (4,)),
-    ("A (~300 w)",  "deep   8x3",   (3, 3, 3, 3, 3, 3, 3, 3)),
-    ("B (~1200 w)", "wide   1x16",  (16,)),
-    ("B (~1200 w)", "deep   4x11",  (11, 11, 11, 11)),
-    ("B (~1200 w)", "deep   8x9",   (9, 9, 9, 9, 9, 9, 9, 9)),
-    ("C (~4700 w)", "wide   1x64",  (64,)),
-    ("C (~4700 w)", "deep   4x29",  (29, 29, 29, 29)),
-    ("C (~4700 w)", "deep   8x21",  (21, 21, 21, 21, 21, 21, 21, 21)),
+# (tier label, target weights) x (label, depth). The WIDTH is not written here:
+# it is solved per descriptor so that the tier's weight budget is actually hit.
+#
+# It used to be a fixed list of shapes -- 1x16, 4x11, 8x9 and so on -- shared by
+# every descriptor. That silently broke the thing the whole bench exists to hold
+# constant. The shapes are fixed but `n_in` is not: with 65 inputs the first
+# layer dominates the budget and extra layers barely move it, while with 11
+# inputs they dominate. Measured spreads inside one tier were 10% for the
+# 65-input descriptor and **160%** for the 11-input one -- meaning the "deep"
+# variant there had 2.6x the parameters of the "wide" one, and was slower partly
+# because it was simply a bigger model.
+#
+# Worse, the badly-matched descriptors were precisely the two WITHOUT a large
+# one-hot, i.e. the two that exist to show the conclusion is not an artefact of
+# the one-hot features. The control was the part that did not work.
+#
+# Solving the width per descriptor fixes it at the source. The achieved spread
+# is still printed per tier, because a budget that is held by construction
+# should also be shown to have been held.
+TIERS = [
+    ("A (~300 w)", 300),
+    ("B (~1200 w)", 1200),
+    ("C (~4700 w)", 4700),
 ]
+
+# (label, number of hidden layers). Depth 2 is the project's own shape, kept as
+# a reference point; 1 is "wide", 4 and 8 are "deep".
+DEPTHS = [("wide  ", 1), ("base  ", 2), ("deep 4", 4), ("deep 8", 8)]
+
+# Widths are searched in this range. The upper bound is generous on purpose:
+# tier C is expected to overflow the 512-byte eBPF stack, and that refusal is a
+# result of the bench, not something to design around.
+# 512, not 128: with only 11 inputs a SINGLE layer needs a width in the
+# hundreds to reach the 4 700-weight tier, and a cap of 128 left that cell 63%
+# short of the budget -- reintroducing, in tier C, exactly the mismatch this
+# rewrite removes elsewhere. Those cells overflow the eBPF stack anyway, but a
+# budget that cannot be hit should fail as a stack overflow, not quietly as an
+# unmatched comparison.
+WIDTH_SEARCH = range(2, 513)
+
+
+def solve_width(n_in, n_out, depth, target):
+    """The uniform hidden width whose weight count lands closest to `target`.
+
+    Returns (dims, n_weights). Ties go to the narrower shape, which keeps the
+    comparison conservative: it never inflates the deep variant."""
+    best = None
+    for h in WIDTH_SEARCH:
+        dims = (h,) * depth
+        nw = weight_count(n_in, dims, n_out)
+        key = (abs(nw - target), h)
+        if best is None or key < best[0]:
+            best = (key, dims, nw)
+    return best[1], best[2]
+
+
+def shapes_for(shape):
+    """The (tier, label, dims) grid for ONE descriptor, budgets solved."""
+    n_in, n_out = shape["n_in"], shape["n_out"]
+    out = []
+    for tier, target in TIERS:
+        for name, depth in DEPTHS:
+            dims, nw = solve_width(n_in, n_out, depth, target)
+            out.append((tier, f"{name} {depth}x{dims[0]}", dims))
+    return out
+
 
 
 # The scenario's own topology, plus the one dimension it does not declare.
@@ -250,7 +305,7 @@ def run_descriptor(name, repeat):
     print("=" * 100)
 
     rows = []
-    for tier, label, dims in SHAPES:
+    for tier, label, dims in shapes_for(shape):
         r = bench_shape_isolated(name, label, dims, repeat)
         r["tier"] = tier
         rows.append(r)

@@ -1089,6 +1089,13 @@ def plot_axis(axis, in_dir, fmt, draw_all=False):
         if cat:
             ax.set_xticks(range(len(order)))
             ax.set_xticklabels(order, fontsize=8)
+        else:
+            # Integer x values get integer ticks. Matplotlib's default put
+            # 1.5 and 2.5 on the hidden-layer axis, and half a layer does not
+            # exist.
+            vals = [float(v) for v in AXES[axis]["values"]]
+            if all(v == int(v) for v in vals):
+                ax.set_xticks([int(v) for v in vals])
         ax.set_xlabel(AXES[axis]["xlabel"])
         ax.set_ylabel(ylabel)
         ax.grid(True, linewidth=0.4, alpha=0.4)
