@@ -363,6 +363,118 @@ sudo python3 ipa/test/test_suite.py --only kernel
 
 ---
 
+## 10. Analisi parametrica (`bench_scaling.py`)
+
+Le sezioni precedenti misurano **un** modello su **una** topologia. Questa misura
+come cambia il costo al variare della dimensione — e soprattutto se le tre pipeline
+hanno **pendenze diverse**, che è l'argomento per cui ne esistono tre.
+
+```bash
+sudo python3 ipa/test/bench_scaling.py --out result/    # misura (Linux + BCC + root)
+python3 ipa/test/bench_scaling.py --plot result/        # grafici (basta matplotlib)
+python3 ipa/test/bench_scaling.py --axis width --out result/   # un asse solo
+```
+
+**Cinque assi, una variabile ciascuno.** Tutto il resto è bloccato, così una curva si
+attribuisce alla variabile sull'asse x e a nient'altro.
+
+| asse | valori | fermo a |
+|---|---|---|
+| `nodes` | 10, 25, 52, 75, 100 nodi | `MAX_N_IN` = 128 in P2/P3 (`n_in = 13 + n_nodi`) |
+| `depth` | 1…6 hidden layer | — |
+| `width` | 2, 4, 6, 8 neuroni | soffitto compilato 8 in P2 e P3 |
+| `descriptor` | 4 composizioni di IV | 0/1/2 one-hot, piccola (6) o grande (52) |
+| `sparsity` | 0, 25, 50, 75, 90% di pesi zero | — |
+
+**Metodologia, tre scelte che contano.**
+
+- *Ogni cella in un subprocess isolato.* P1 può far abortire clang (overflow dello
+  stack a 512 byte) con un abort **fatale, non catturabile**; e un rifiuto del
+  verificatore è un **dato**, non un guasto, quindi la tabella lo stampa come
+  `RIFIUTATO` e non come `CRASH`.
+- *Pesi da un pool fisso, presi come prefisso.* Un modello più grande **estende**
+  quello più piccolo invece di sostituirne tutti i pesi. Serve perché in P1 il
+  conteggio istruzioni dipende dai **valori** (vedi sotto): estraendo un vettore
+  nuovo per ogni forma, parte della curva di P1 era rumore dei pesi travestito
+  da asse x.
+- *Allarme di contaminazione.* Se una pipeline mostra lo **stesso programma**
+  (stesse istruzioni **e** stesse tail call) con latenza che varia oltre 2× lungo
+  l'asse, lo scarto è la macchina e lo script lo dice. Il raggruppamento include le
+  tail call apposta: P3 ha il binario identico a ogni profondità ma esegue un hop in
+  più per layer, e senza quella chiave il controllo bollava come rumore il suo
+  risultato migliore.
+
+### Le otto figure, e cosa deducono
+
+Lo sweep può disegnare 35 combinazioni metrica × asse. Sette portano un risultato;
+le altre no (la memoria delle mappe non dipende da nessun asse, `build_ms` è sempre
+la stessa compilazione). Il comando disegna **solo quelle**; `--all-plots` dà la
+matrice intera, per guardare, non per pubblicare.
+
+| # | figura | deduzione |
+|---|---|---|
+| 1 | `scaling_depth_insns` | **P2 cresce di ~780 istruzioni per layer, P3 di zero.** P3 srotola *un* layer denso generico e ci rientra per tail call, quindi la profondità non entra nel programma. P2 deve srotolarli tutti: la sua genericità è sulle larghezze, non sulla profondità. |
+| 2 | `scaling_depth_latenza` | **E P3 lo paga in tempo: ~70 ns per layer**, contro i ~36 di P2. Sono le sue tail call (da 2 a 7 hop). La stessa scelta di progetto spiega entrambe le figure: P3 è più piccolo *perché* riusa un pezzo, ed è più lento *perché* riusarlo costa un salto e delle letture ogni volta. |
+| 3 | `scaling_depth_update` | **Due ordini di grandezza sull'aggiornamento del modello**: P1 ~1 400 ms (rigenera C e chiama clang), P2 e P3 ~7 ms (scritture in mappa). Asse logaritmico, altrimenti le due curve basse si schiacciano sullo zero. È la metrica che decide se una pipeline è usabile in una rete che cambia. |
+| 4 | `scaling_nodes_insns` | **La taglia della rete entra nel programma solo in P1** (da 746 a 1 692 istruzioni fra 10 e 100 nodi: è lo `switch` sulla one-hot che si srotola). P2 e P3 restano alla cifra esatta a ogni punto — il loro sorgente non nomina mai la forma del modello. |
+| 5 | `scaling_nodes_latenza` | **E non costa nulla a runtime, a nessuna delle tre.** Piatte tutte e cinque le colonne. Il motivo è strutturale: una one-hot legge **una sola colonna di pesi** qualunque sia la sua larghezza. |
+| 6 | `scaling_width_latenza` | **Allargare i layer nascosti invece si paga**, su tutte e tre. Letto insieme alla figura 5: *la rete può crescere quanto vuole, il modello no.* |
+| 7 | `scaling_sparsity_insns_log` | **Con pesi più sparsi P1 crolla** (1 071 → 224 istruzioni al 90% di zeri), P2 e P3 non si muovono di un'istruzione. I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero; per P2/P3 uno zero è un byte in mappa come un altro. Scala logaritmica: su scala lineare P1 sta a ~10³ e P2/P3 a ~10⁴, e il crollo sparisce schiacciato sullo zero. |
+| 8 | `scaling_descriptor_insns` | **Cambiare la composizione del vettore d'ingresso ricompila P1** (da 575 a 1 071 istruzioni fra le quattro IV), mentre P2 e P3 leggono il descrittore da `model_desc` e non cambiano. Barre e non curve: una linea fra `no_onehot` e `big_onehot` disegnerebbe una pendenza fra due nomi. |
+
+### Il risultato che non cercavamo: in P1 i pesi decidono se il programma si carica
+
+Nello sweep una cella si è fatta rifiutare dal verificatore: `65-4-4-4-4-7`, 359 pesi.
+Le forme intorno caricavano tutte, compresa `(4,4,4,3)` e la **più grande**
+`(4,4,4,4,4)`. Nessuna proprietà della profondità può produrre questo.
+
+Tenendo fissa la forma e cambiando **solo il seme** dei pesi:
+
+| seme | esito |
+|---|---|
+| 42 | **rifiutato** |
+| 1 | carica, 1 119 istruzioni |
+| 2 | carica, 1 175 |
+| 7 | carica, 1 118 |
+| 999 | carica, 1 075 |
+
+Il seme 1 carica a 1 119, il 42 viene rifiutato a 1 120. **Una istruzione di
+differenza.**
+
+> **In P1, riaddestrare un modello senza toccare l'architettura può renderlo non
+> caricabile.** Stessa rete, stessi iperparametri, pesi nuovi, e il nodo lo rifiuta.
+> P2 e P3 non hanno questo rischio: per loro i pesi sono byte in una mappa e la
+> caricabilità dipende solo dalla forma.
+>
+> È il rovescio esatto del vantaggio della figura 7. La stessa strength reduction che
+> porta P1 a 224 istruzioni è quella che lo rende imprevedibile.
+
+Il meccanismo preciso — quale limite del kernel — **non è stato confermato**, e non
+va inventato: `E2BIG` ha più cause nel percorso di caricamento BPF e BCC ci stampa
+sopra `Program too large (1120 insns), at most 4096 insns`, dove il 4096 è una
+costante morta nella stringa di BCC (nello stesso sweep P2 carica a 18 057). È la
+stessa trappola documentata per P3. Per chiuderlo serve il log del verificatore
+(`BPF(text=src, debug=0x10)`).
+
+### Limiti di questo run, dichiarati
+
+- **Non affiancare latenze prese da assi diversi.** A programma identico P2 misura
+  ~250 ns sugli assi `nodes` e `width` e ~310 su `descriptor` e `sparsity`: la
+  macchina si è caricata nella seconda metà dell'esecuzione. Dentro un asse i
+  confronti reggono, fra assi no. Le istruzioni sono deterministiche e confrontabili
+  ovunque.
+- **La figura 6 va presa per la direzione, non per la pendenza.** I punti a 6 e 8
+  neuroni hanno anche `build_ms` più alto del resto, che è il segno della stessa
+  macchina carica. Che allargare i layer costi è strutturale; *quanto*, su questo
+  run, non è misurato bene.
+- **Oltre ~115 nodi non si va** senza alzare `MAX_N_IN` (128) in P2 e P3. Per dire
+  qualcosa su una rete da 500 nodi bisogna alzarlo e **rimisurare**.
+- La sparsità richiesta e quella ottenuta differiscono di qualche punto (i pesi sono
+  un prefisso di un pool mescolato, quindi un campione). La colonna `sparsity_real`
+  nel CSV riporta quella vera.
+
+---
+
 ## Risultati (kernel, `test_suite.py --only kernel`, 4 vCPU, modello 65→4→4→7, scale=24)
 
 Rimisurati dopo tre correzioni che invalidavano la tabella precedente:

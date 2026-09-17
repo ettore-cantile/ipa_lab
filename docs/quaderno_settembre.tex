@@ -1121,6 +1121,228 @@ un \textbf{picco teorico}, non un throughput retto. Per quello serve traffico
 vero, generato a ritmo, e la misura di quanti pacchetti si perdono.
 
 % ==================================================================
+\chapter{Come cresce il costo}
+
+\section{La domanda}
+
+Fin qui tutto è misurato su \emph{un} modello e \emph{una} topologia. La domanda
+che manca è come cambia il costo quando la rete o il modello diventano più
+grandi --- e soprattutto se le tre pipeline hanno \textbf{pendenze diverse}.
+
+Se le pendenze fossero uguali, averne tre sarebbe un esercizio. Non lo sono, ed
+è questo il capitolo che lo mostra.
+
+\section{Come è impostata la misura}
+
+Cinque assi, e su ciascuno si muove \textbf{una sola} variabile: tutto il resto
+resta fermo, così una curva si può attribuire a quello che c'è scritto sull'asse
+delle ascisse e a nient'altro.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{asse} & \textbf{valori} & \textbf{si ferma perché} \\
+\midrule
+nodi della rete    & 10, 25, 52, 75, 100 & il tetto sugli ingressi è 128 \\
+hidden layer       & da 1 a 6            & --- \\
+neuroni per layer  & 2, 4, 6, 8          & il tetto compilato è 8 \\
+composizione dell'IV & 4 varianti        & 0, 1 o 2 one-hot \\
+pesi a zero        & 0\%\ ... 90\%       & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Tre accortezze che hanno cambiato i risultati, non solo la forma:
+
+\begin{itemize}
+\item \textbf{Ogni misura in un processo separato.} P1 può far abortire il
+      compilatore in modo non recuperabile; e un rifiuto del verificatore è un
+      \emph{dato}, non un guasto dello strumento.
+\item \textbf{I pesi vengono da un sacchetto fisso}, e un modello più grande
+      \emph{estende} quello più piccolo invece di sostituirne tutti i pesi.
+      Senza questo, spostandosi lungo un asse cambiavano due cose insieme, e
+      parte della curva di P1 era rumore dei pesi travestito da asse x.
+\item \textbf{Un allarme automatico sulle misure sporche}: se una pipeline ha
+      lo stesso identico programma e la latenza varia più del doppio lungo
+      l'asse, lo scarto è la macchina e lo strumento lo dice.
+\end{itemize}
+
+\section{Profondità: chi paga in spazio e chi in tempo}
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_depth_insns.pdf}
+\end{center}
+
+\begin{lezione}
+\textbf{P2 cresce di circa 780 istruzioni per ogni hidden layer. P3 di zero.}
+\end{lezione}
+
+P3 srotola \emph{un} solo strato denso generico e ci rientra a ogni passo della
+rete, quindi la profondità non entra nel programma: la sua riga è
+perfettamente orizzontale, da uno a sei strati. P2 deve srotolarli tutti,
+perché è un programma solo.
+
+Ma la storia non finisce lì:
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_depth_latenza.pdf}
+\end{center}
+
+\begin{lezione}
+\textbf{E P3 lo paga in tempo: circa 70 nanosecondi per strato}, contro i 36 di
+P2. Sono i salti fra programmi, da 2 a 7.
+\end{lezione}
+
+Le due figure hanno la \emph{stessa} causa vista dai due lati. P3 è più piccolo
+\textbf{perché} riusa un pezzo, ed è più lento \textbf{perché} riusarlo costa
+un salto e delle letture ogni volta. È il compromesso della modularità, ridotto
+a due numeri.
+
+\section{Aggiornare il modello: due ordini di grandezza}
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_depth_update.pdf}
+\end{center}
+
+Attenzione alla scala verticale: è \textbf{logaritmica}. Su scala lineare le due
+curve basse sarebbero schiacciate sullo zero e si vedrebbe una curva sola.
+
+\begin{lezione}
+Installare un modello nuovo su un nodo già in servizio costa \textbf{circa 1,4
+secondi} in P1 --- che deve rigenerare il C e richiamare il compilatore --- e
+\textbf{circa 7 millisecondi} in P2 e P3, che scrivono in una tabella.
+
+È la misura che decide se una pipeline è usabile in una rete che cambia.
+\end{lezione}
+
+\section{Due larghezze, due risposte opposte}
+
+Questa coppia di figure è il risultato che preferisco di tutta l'analisi, perché
+la risposta non è quella che verrebbe da indovinare.
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_nodes_insns.pdf}
+\end{center}
+
+La taglia della \emph{rete} entra nel programma solo in P1, che passa da 746 a
+1\,692 istruzioni fra 10 e 100 nodi: è lo switch della one-hot che si srotola.
+P2 e P3 restano alla cifra esatta a ogni punto, perché il loro codice non
+nomina mai la forma del modello.
+
+E a runtime?
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_nodes_latenza.pdf}
+\end{center}
+
+\textbf{Piatte tutte e tre.} Cento nodi costano quanto dieci. Il motivo è
+strutturale: una one-hot ha un solo uno, quindi il datapath legge \emph{una
+sola colonna di pesi} qualunque sia la larghezza del vettore.
+
+Allargare i layer \emph{nascosti}, invece:
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_width_latenza.pdf}
+\end{center}
+
+\begin{lezione}
+\textbf{La rete può crescere quanto vuole; il modello no.}
+
+Allargare l'\emph{ingresso} è gratis a runtime, perché una one-hot legge una
+colonna sola. Allargare i layer \emph{nascosti} si paga, su tutte e tre le
+pipeline, perché ogni neurone in più sono pesi in più letti per ogni pacchetto.
+\end{lezione}
+
+\section{I pesi contano, ma solo per una delle tre}
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_sparsity_insns_log.pdf}
+\end{center}
+
+Stessa identica forma in tutti e cinque i punti: cambia solo \emph{quanti} pesi
+valgono zero.
+
+\begin{lezione}
+Con il 90\%\ dei pesi a zero, P1 passa da 1\,071 a \textbf{224 istruzioni}. P2 e
+P3 non si muovono di una.
+\end{lezione}
+
+P1 scrive i pesi nel codice come numeri, quindi il compilatore vede una
+moltiplicazione per zero e la cancella. Per P2 e P3 uno zero è un byte in una
+tabella come un altro, e il programma è lo stesso.
+
+Lo stesso vale per la composizione dell'ingresso:
+
+\begin{center}
+\includegraphics[width=0.92\textwidth]{../result/scaling_descriptor_insns.pdf}
+\end{center}
+
+Cambiare \emph{quali} feature compongono il vettore d'ingresso ricompila P1;
+P2 e P3 leggono il descrittore da una tabella e non cambiano di una istruzione.
+(Barre e non linee: una linea fra due nomi disegnerebbe una pendenza che non
+esiste.)
+
+\section{Il risultato che non cercavamo}
+
+Durante lo sweep una configurazione si è fatta rifiutare dal verificatore:
+quattro hidden layer da quattro neuroni. Le forme intorno caricavano tutte,
+inclusa quella \emph{più grande} con cinque strati. Nessuna proprietà della
+profondità può produrre una cosa del genere.
+
+Tenendo ferma la forma e cambiando solo il seme casuale dei pesi:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rl@{}}
+\toprule
+\textbf{seme} & \textbf{esito} \\
+\midrule
+42  & \textcolor{bad}{\textbf{rifiutato}} \\
+1   & carica, 1\,119 istruzioni \\
+2   & carica, 1\,175 \\
+7   & carica, 1\,118 \\
+999 & carica, 1\,075 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il seme 1 carica a 1\,119 istruzioni; il 42 viene rifiutato a 1\,120. Una
+istruzione di differenza.
+
+\begin{lezione}
+\textbf{In P1, riaddestrare un modello senza toccare l'architettura può renderlo
+non caricabile.} Stessa rete, stessi iperparametri, pesi nuovi, e il nodo lo
+rifiuta.
+
+P2 e P3 non hanno questo rischio: per loro i pesi sono byte in una tabella, e
+che il programma si carichi dipende solo dalla forma.
+\end{lezione}
+
+È il rovescio esatto del vantaggio di due pagine fa. La stessa riduzione del
+compilatore che porta P1 a 224 istruzioni è quella che lo rende imprevedibile.
+Un compromesso vero, misurato su entrambi i lati.
+
+Il meccanismo preciso --- \emph{quale} limite del kernel --- non è stato
+confermato, e non va inventato: il messaggio d'errore parla di un programma
+troppo lungo e cita un limite di 4096 istruzioni che nella stessa esecuzione P2
+supera di quattro volte. È la stessa costante morta già incontrata sul capitolo
+del verificatore.
+
+\section{Che cosa questi grafici non dicono}
+
+\begin{itemize}
+\item \textbf{Non si confrontano latenze prese da assi diversi.} A programma
+      identico, P2 misura circa 250 ns su due assi e circa 310 sugli altri due:
+      la macchina si è caricata a metà esecuzione. Dentro un asse i confronti
+      reggono. Le istruzioni, che sono deterministiche, si confrontano ovunque.
+\item La figura sulla larghezza va letta per la \emph{direzione}, non per la
+      pendenza, per lo stesso motivo.
+\item Oltre circa 115 nodi non si va senza alzare un tetto compilato e
+      \textbf{rimisurare}.
+\end{itemize}
+
+% ==================================================================
 \chapter{Quel che resta}
 
 \section{Fatto}
@@ -1141,7 +1363,13 @@ vero, generato a ritmo, e la misura di quanti pacchetti si perdono.
       di \textbf{rimettere la riga delle letture di tabella}, che era n.d.;
 \item oggetto precompilato (AOT) compilato, caricato e misurato: aggiornamento
       del modello da 1\,242 ms a 37 ms, a parità di costo per pacchetto;
-\item tabella dei risultati rifatta su uno stato del codice solo.
+\item tabella dei risultati rifatta su uno stato del codice solo;
+\item \textbf{analisi parametrica} su cinque assi e tre pipeline: le pendenze
+      sono diverse, ed è la misura che giustifica l'esistenza di tre pipeline
+      invece di una;
+\item P2 non è più fissa a due hidden layer: la profondità è diventata un
+      inviluppo compilato come già lo erano le larghezze --- al prezzo, onesto e
+      misurato, di una ricompilazione per profondità.
 \end{itemize}
 
 \section{Aperto}
@@ -1166,6 +1394,13 @@ vero, generato a ritmo, e la misura di quanti pacchetti si perdono.
 \item \textbf{I salti fra programmi di P3}: sono tre per pacchetto ed è lì che
       sta la latenza, non nella dimensione. Ridurli è un lavoro diverso da
       quello fatto finora.
+\item \textbf{Perché quel modello non si carica}: sappiamo che dipende dai pesi
+      e non dall'architettura, ma non \emph{quale} limite del kernel venga
+      toccato. Il messaggio d'errore ne nomina uno sbagliato. Serve il registro
+      del verificatore, ed è un'ora di lavoro, non una settimana.
+\item \textbf{Rimisurare a macchina scarica}: metà delle latenze dell'analisi
+      parametrica sono state prese mentre la VM era occupata. Le istruzioni no,
+      quelle sono deterministiche.
 \end{itemize}
 
 \section{Il filo conduttore}
@@ -1187,6 +1422,7 @@ $n_{\text{nodi}} = 52$ di default & si provava una topologia sola \\
 bias dell'uscita $\times\, s^0$ & si provava coi link tutti attivi \\
 one-hot del nodo $=$ \texttt{model\_id} & si registrava un modello solo \\
 tabella vuota $=$ nodo 0 & l'array è preallocato a zero \\
+si carica $\Rightarrow$ dipende dall'architettura & non si era mai cambiato solo i pesi \\
 \bottomrule
 \end{tabular}
 \end{center}

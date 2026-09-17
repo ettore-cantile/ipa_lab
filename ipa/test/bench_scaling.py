@@ -698,13 +698,53 @@ def run_axis(axis, repeat, trials, out_dir):
 # on a linear axis the two cheap pipelines collapse onto the zero line and the
 # graph shows one curve instead of three. The whole finding is the DISTANCE
 # between them, which is what a log axis is for.
+# Every (metric, axis) pair this sweep can draw -- 7 metrics x 5 axes = 35
+# figures. Most of them say nothing: map memory does not depend on any axis,
+# build_ms is the same compile every time, and a log twin of a metric whose
+# range is one decade adds no reading.
+#
+# KEEP lists the pairs that carry a result, and it is what gets drawn by
+# default. --all-plots draws the whole matrix, for looking rather than for
+# publishing.
 PLOTS = [
     ("insns", "istruzioni eBPF (xlated)", "scaling_{axis}_insns", False),
+    # The log twin exists for one figure only. P1 runs at ~10^3 instructions
+    # and P2/P3 at ~10^4, so on a LINEAR axis P1's curve is pinned to the
+    # bottom and its collapse with sparser weights -- 1 071 to 224, the
+    # sharpest result in the sweep -- is invisible. On a LOG axis that is
+    # plain, but P2's rise with depth (1.3x) flattens out. Neither scale
+    # serves both readings, so each figure takes the one that shows what it
+    # is about.
+    ("insns", "istruzioni eBPF (xlated, scala log)", "scaling_{axis}_insns_log", True),
     ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latenza", False),
+    ("lat_ns", "latenza (ns/pacchetto, scala log)", "scaling_{axis}_latenza_log", True),
     ("update_ms", "installare un modello nuovo (ms)", "scaling_{axis}_update", True),
     ("build_ms", "compilare il programma, una volta (ms)", "scaling_{axis}_build", False),
     ("map_bytes", "memoria delle mappe (byte)", "scaling_{axis}_mappe", False),
 ]
+
+# (axis, metric) -> the one-line reading that figure supports. Keeping the
+# claim next to the selection is deliberate: a figure nobody can state a
+# conclusion for does not belong in a thesis, and this list is where that
+# question gets asked.
+KEEP = {
+    ("depth", "insns"):
+        "P2 cresce di ~780 istruzioni per layer, P3 di ZERO: riusa layer_hidden",
+    ("depth", "lat_ns"):
+        "e P3 lo paga in tempo, ~70 ns per layer, che sono le sue tail call",
+    ("depth", "update_ms"):
+        "installare un modello: P1 ricompila (~1,4 s), P2 e P3 scrivono in mappa (~7 ms)",
+    ("nodes", "insns"):
+        "la taglia della RETE entra nel programma solo in P1; P2 e P3 non la vedono",
+    ("nodes", "lat_ns"):
+        "e non costa nulla a runtime a nessuna delle tre: la one-hot legge UNA colonna",
+    ("width", "lat_ns"):
+        "mentre allargare i layer NASCOSTI si paga: piu' pesi letti per pacchetto",
+    ("sparsity", "insns_log"):
+        "con pesi piu' sparsi P1 crolla (clang cancella i prodotti per zero), P2/P3 no",
+    ("descriptor", "insns"):
+        "cambiare la composizione dell'IV ricompila P1; P2 e P3 leggono il descrittore",
+}
 STYLE = {
     "hardcoded": dict(color="#c0392b", marker="o", label="P1 hardcoded"),
     "template": dict(color="#2980b9", marker="s", label="P2 template"),
@@ -712,7 +752,7 @@ STYLE = {
 }
 
 
-def plot_axis(axis, in_dir, fmt):
+def plot_axis(axis, in_dir, fmt, draw_all=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -735,6 +775,11 @@ def plot_axis(axis, in_dir, fmt):
 
     made = 0
     for metric, ylabel, stem, logy in PLOTS:
+        # "insns_log" and "insns" are the same column with different scales;
+        # KEEP is keyed on the figure, not the column.
+        fig_key = metric + ("_log" if logy and stem.endswith("_log") else "")
+        if not draw_all and (axis, fig_key) not in KEEP:
+            continue
         fig, ax = plt.subplots(figsize=(6.2 if cat else 5.6, 3.6))
         drawn = False
         if metric not in rows[0]:
@@ -784,7 +829,10 @@ def plot_axis(axis, in_dir, fmt):
         out = os.path.join(in_dir, stem.format(axis=axis) + "." + fmt)
         fig.savefig(out, dpi=160)
         plt.close(fig)
+        why = KEEP.get((axis, fig_key))
         print(f"  {GREEN}scritto{NC} {out}")
+        if why:
+            print(f"           {GREY}{why}{NC}")
         made += 1
     return made
 
@@ -804,6 +852,9 @@ def main():
     p.add_argument("--plot", metavar="DIR", default=None,
                    help="non misurare: genera i grafici dai CSV in DIR")
     p.add_argument("--format", default="pdf", choices=["pdf", "png"])
+    p.add_argument("--all-plots", action="store_true",
+                   help="disegna tutte le combinazioni metrica x asse, non "
+                        "solo quelle che portano un risultato")
     p.add_argument("--_worker", nargs=2, help=argparse.SUPPRESS)
     a = p.parse_args()
 
@@ -814,7 +865,7 @@ def main():
         import importlib.util
         if importlib.util.find_spec("matplotlib") is None:
             sys.exit("serve matplotlib per i grafici: pip install matplotlib")
-        n = sum(plot_axis(ax, a.plot, a.format) for ax in AXES)
+        n = sum(plot_axis(ax, a.plot, a.format, a.all_plots) for ax in AXES)
         print(f"\n{GREEN}{n} grafici{NC} in {a.plot}")
         return 0
 
