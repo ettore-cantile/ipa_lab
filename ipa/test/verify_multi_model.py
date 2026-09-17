@@ -52,7 +52,7 @@ PASS_RETVALS = frozenset({0, 4})
 
 
 def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int,
-                    ifindex: int = 0, scale: int = 1):
+                    ingress_port: int = 0, scale: int = 1, node_index=None):
     """
     Generalized reference forward for an MLP of arbitrary depth/width,
     layer_dims = [(n_in0,n_out0), (n_in1,n_out1), ...] with n_in0 == 65
@@ -69,10 +69,15 @@ def ref_infer_shape(weights: list, layer_dims: list, ttl: int, model_id: int,
     for i in range(6):
         x[i] = 1
     x[12] = ttl
-    if 1 <= ifindex <= 6:
-        x[5 + ifindex] = 1
-    if 0 <= model_id <= 51:
-        x[13 + model_id] = 1
+    # LOGICAL PORT, not a kernel ifindex: all three pipelines resolve
+    # ctx->ingress_ifindex through the ingress_port map now, and with no entry
+    # installed nothing resolves.
+    if 1 <= ingress_port <= 6:
+        x[5 + ingress_port] = 1
+    # The NODE's own index, not model_id. model_id selects which MODEL runs;
+    # it never said anything about which node this is.
+    if node_index is not None and 0 <= node_index <= 51:
+        x[13 + node_index] = 1
 
     layer_offsets, offset = [], 0
     for (n_in, n_out) in layer_dims:
@@ -147,22 +152,29 @@ def _reset(ps, cs, n_cls=7):
 
 
 def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3,
-           ifindex=0, scale=24):
+           ingress_port=0, scale=24, node_index=None):
     """
-    ifindex: the reference's assumed LOGICAL PORT. All three pipelines now
-    resolve ctx->ingress_ifindex through the `ingress_port` map, and this test
-    installs no entry, so no port resolves and the one-hot is empty everywhere
-    -- 0 for the reference too. This parameter used to carry a real asymmetry:
-    P1 translated through a compiled-in table that mapped nothing, while P2/P3
-    clamped the RAW ctx->ingress_ifindex directly
-    (1 <= x <= 6), and the empirically observed default under TEST_RUN is 1
-    -- so their reference must assume ifindex=1, not 0, or a close/tied
-    class can flip (this was silently masked by verify_prog_run.py's real
-    trained-model weights never being sensitive to it -- see the multi-model
-    test's synthetic-weight diagnostics for the discrepancy this exposed).
+    ingress_port / node_index: the two one-hot indices, both of which this
+    runner leaves unset because it installs neither the ingress_port map nor
+    the node_id map -- so the datapath sets no bit for either, and the
+    reference must do the same.
+
+    Both parameters used to carry real asymmetries, and both are gone:
+
+      - the ingress one-hot was indexed by the RAW ctx->ingress_ifindex in
+        P2/P3 and through a compiled-in table in P1, so the three pipelines
+        selected DIFFERENT columns for the same packet. All three now resolve
+        it through the ingress_port map;
+      - the node one-hot came from ipa->model_id, the packet's MODEL id, which
+        is not a node identity at all. It now comes from the node_id map.
+
+    This test uses synthetic weights, which unlike the trained checkpoint ARE
+    sensitive to a single flipped input -- which is how the first of these two
+    discrepancies was originally exposed.
     """
     ref_cls, ref_val = ref_infer_shape(weights, ref_layer_dims, ttl, model_id,
-                                       ifindex=ifindex, scale=scale)
+                                       ingress_port=ingress_port, scale=scale,
+                                       node_index=node_index)
     frame = build_frame(model_id, ttl, scale)
     _reset(ps, cs)
     retval, _ = prog_test_run(disp_fd, frame, repeat=1)
@@ -223,11 +235,10 @@ def test_hardcoded():
 
     ps, cs = b["pkt_stats"], b["cls_stats"]
     ok = True
-    # ifindex=0: no ingress_port entry is installed here, so the kernel's
-    # TEST_RUN ingress_ifindex resolves to no logical port and _iface stays 0
-    # -- the same for all three pipelines.
-    ok &= _check("hardcoded", 0, disp_fn.fd, ps, cs, dims, weights0, ifindex=0)
-    ok &= _check("hardcoded", 1, disp_fn.fd, ps, cs, dims, weights0, ifindex=0)
+    # Neither one-hot contributes here: no ingress_port entry and no node_id
+    # entry are installed, so both resolve to "unknown" and set no bit.
+    ok &= _check("hardcoded", 0, disp_fn.fd, ps, cs, dims, weights0)
+    ok &= _check("hardcoded", 1, disp_fn.fd, ps, cs, dims, weights0)
     return ok
 
 
@@ -257,11 +268,10 @@ def test_template():
 
     ps, cs = b["pkt_stats_t2"], b["cls_stats_t2"]
     ok = True
-    # ifindex=1: P2 clamps the RAW ctx->ingress_ifindex (1<=x<=6) directly,
-    # no translation table -- the empirically observed TEST_RUN default (1)
-    # falls inside that range and DOES contribute a feature.
-    ok &= _check("template", 0, disp_fn.fd, ps, cs, dims0, weights0, ifindex=1)
-    ok &= _check("template", 1, disp_fn.fd, ps, cs, dims1, weights1, ifindex=1)
+    # Neither one-hot contributes: no ingress_port entry, no node_id entry.
+    # The same is now true for all three pipelines -- P2 used to differ here.
+    ok &= _check("template", 0, disp_fn.fd, ps, cs, dims0, weights0)
+    ok &= _check("template", 1, disp_fn.fd, ps, cs, dims1, weights1)
     return ok
 
 
@@ -289,10 +299,10 @@ def test_modular():
 
     ps, cs = b["pkt_stats_t3"], b["cls_stats_t3"]
     ok = True
-    # ifindex=1: layer_first also clamps the RAW ctx->ingress_ifindex
-    # directly, same reasoning as P2 above.
-    ok &= _check("modular", 0, disp_fn.fd, ps, cs, dims0, weights0, ifindex=1)
-    ok &= _check("modular", 1, disp_fn.fd, ps, cs, dims1, weights1, ifindex=1)
+    # Same as P2: neither one-hot contributes, and no longer for a
+    # pipeline-specific reason.
+    ok &= _check("modular", 0, disp_fn.fd, ps, cs, dims0, weights0)
+    ok &= _check("modular", 1, disp_fn.fd, ps, cs, dims1, weights1)
     return ok
 
 

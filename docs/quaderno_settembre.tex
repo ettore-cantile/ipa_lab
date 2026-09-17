@@ -1,0 +1,859 @@
+\documentclass[11pt,a4paper,oneside]{report}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[italian]{babel}
+\usepackage[a4paper,margin=2.8cm,top=3cm,bottom=3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{mathpazo}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+\usepackage[hidelinks]{hyperref}
+
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+
+\definecolor{accent}{HTML}{1F3A5F}
+\definecolor{soft}{HTML}{6B7C93}
+\definecolor{rule}{HTML}{C8D0DA}
+\definecolor{boxbg}{HTML}{F4F6F9}
+\definecolor{good}{HTML}{2E7D52}
+\definecolor{bad}{HTML}{A33A3A}
+\definecolor{codebg}{HTML}{F7F8FA}
+
+\hypersetup{colorlinks=true,linkcolor=accent,urlcolor=accent,citecolor=accent}
+
+\titleformat{\chapter}[display]
+  {\normalfont\Large\bfseries\color{accent}}
+  {\normalfont\normalsize\color{soft}\MakeUppercase{\chaptertitlename}\ \thechapter}
+  {0.6em}{\Huge}
+\titlespacing*{\chapter}{0pt}{-10pt}{30pt}
+\titleformat{\section}{\normalfont\large\bfseries\color{accent}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries\color{accent}}{\thesubsection}{0.6em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\small\color{soft}\nouppercase{\leftmark}}
+\fancyhead[R]{\small\color{soft}\thepage}
+
+\setlist[itemize]{leftmargin=1.3em,itemsep=2pt,topsep=4pt}
+\setlist[enumerate]{leftmargin=1.5em,itemsep=2pt,topsep=4pt}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  frame=none,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  xleftmargin=8pt,
+  framexleftmargin=8pt,
+  aboveskip=8pt, belowskip=8pt,
+}
+
+\newtcolorbox{prima}[1][]{colback=boxbg,colframe=rule,boxrule=0.5pt,
+  arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt,
+  title={\color{accent}\bfseries #1},coltitle=accent,
+  fonttitle=\bfseries,colbacktitle=boxbg,titlerule=0pt}
+
+\newtcolorbox{lezione}{colback=white,colframe=accent,boxrule=1pt,
+  arc=2pt,left=10pt,right=10pt,top=7pt,bottom=7pt,
+  borderline west={3pt}{0pt}{accent}}
+
+\newcommand{\tick}{\textcolor{good}{\textbf{\checkmark}}}
+\newcommand{\cross}{\textcolor{bad}{\textbf{\texttimes}}}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{3cm}
+{\color{soft}\large Quaderno di lavoro}\\[1.2cm]
+{\color{accent}\Huge\bfseries Che cosa è cambiato\\[0.3cm] e perché}\\[0.9cm]
+{\Large Settembre 2026 --- dal laboratorio emulato\\ al datapath reale}\\[2.5cm]
+\rule{0.6\linewidth}{0.8pt}\\[0.8cm]
+{\large Progetto \textbf{IPA/eBPF}}\\[0.3cm]
+{\color{soft} inferenza di una rete neurale dentro il kernel, a bordo del pacchetto}
+\vfill
+{\color{soft}\small Ogni numero di questo quaderno viene da una misura eseguita,\\
+non da una stima. Dove una cosa non è stata verificata, è scritto.}
+\end{titlepage}
+
+\tableofcontents
+\clearpage
+
+% ==================================================================
+\chapter{Di che cosa stiamo parlando}
+
+\section{L'idea in una pagina}
+
+Un router normale decide dove mandare un pacchetto consultando una tabella
+riempita da un protocollo di routing. L'idea di \textbf{IPA} (\emph{Intelligent
+PAckets}) è diversa: il pacchetto \textbf{porta con sé} una piccola rete
+neurale, e ogni nodo che attraversa la esegue per decidere l'uscita.
+
+Niente segnalazione, niente tabella condivisa: la decisione nasce dai dati che
+il nodo ha sotto mano in quel momento.
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=8mm,
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=8mm,
+              inner sep=5pt,font=\small},
+  arr/.style={-{Stealth[length=5pt]},draw=soft,thick}
+]
+\node[box] (p) {pacchetto};
+\node[box,right=14mm of p] (n) {nodo};
+\node[box,below=9mm of n,fill=white] (st) {stato locale del nodo};
+\node[box,right=14mm of n] (o) {porta di uscita};
+\draw[arr] (p) -- (n);
+\draw[arr] (st) -- (n);
+\draw[arr] (n) -- (o);
+\node[font=\scriptsize\itshape,color=soft,above=1mm of p] {pesi + descrittore};
+\node[font=\scriptsize\itshape,color=soft,below=1mm of st]
+     {link su/giù, TTL, interfaccia d'ingresso};
+\end{tikzpicture}
+\end{center}
+
+Il modello è una rete piccola: quattro tipi di ingresso, due strati nascosti da
+quattro neuroni, sette uscite. In tutto \textbf{319 pesi}. Deve stare in un
+header ed essere eseguibile in decine di nanosecondi.
+
+\section{Dove gira: XDP}
+
+Il codice gira in \textbf{eBPF} agganciato a \textbf{XDP}, il punto più
+precoce in cui il kernel Linux permette di toccare un pacchetto: prima che
+venga costruita la struttura \texttt{sk\_buff}, quindi prima di quasi tutto il
+resto dello stack di rete.
+
+Questo impone un vincolo forte, che spiega metà delle scelte di progetto: un
+programma eBPF deve essere \textbf{dimostrato sicuro} da un componente del
+kernel chiamato \emph{verificatore} prima di poter girare. Niente cicli di
+lunghezza ignota, niente accessi non controllati alla memoria, niente
+ricorsione. Tutto ciò che nel documento sembra contorto — cicli srotolati,
+tetti dichiarati a priori, tabelle al posto di calcoli — nasce da lì.
+
+\section{Le tre pipeline}
+
+Lo stesso modello è implementato in tre modi, per misurare un compromesso.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+& \textbf{i pesi stanno} & \textbf{cambiare modello} \\
+\midrule
+\textbf{P1} hardcoded & scritti nel codice C & ricompilare \\
+\textbf{P2} template  & in una mappa         & scrivere la mappa \\
+\textbf{P3} modular   & in una mappa, uno strato per programma & scrivere la mappa \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+P1 è veloce perché il compilatore vede i pesi e li semplifica; è rigido perché
+ogni modello nuovo richiede una ricompilazione. P2 e P3 sono l'opposto. Il
+lavoro di settembre serve a rendere questo confronto \emph{misurabile davvero}.
+
+% ==================================================================
+\chapter{La matematica che sta dentro il kernel}
+
+\section{Perché i numeri sono interi}
+
+Nel kernel non ci sono numeri in virgola mobile: eBPF lavora con interi. Il
+modello però è addestrato in virgola mobile. Serve una conversione, e si chiama
+\textbf{quantizzazione}.
+
+Ogni peso reale $w$ diventa un intero a 8 bit:
+\[
+  w_{\text{int}} = \operatorname{round}(w \cdot s)
+\]
+dove $s$ è il \textbf{fattore di scala}, uno solo per tutta la rete.
+
+Perché il risultato stia in un byte con segno serve
+\[
+  s \cdot \max_i |w_i| \;\le\; 127 .
+\]
+
+Sul modello depositato $\max|w| = 5{,}098$, quindi $s \le 24{,}9$. Due scelte
+convivono nel progetto: $s = 24$ (il massimo intero ammesso) e $s = 16$ (la
+potenza di due più vicina per difetto, che rende le divisioni degli shift).
+
+\begin{lezione}
+Superare quel limite non dà un errore: dà un \emph{overflow silenzioso}. I pesi
+grandi si troncano e il modello sbaglia senza che nulla lo segnali. Per questo i
+test distinguono le scale \emph{rappresentabili} da quelle che saturano, e
+misurano solo sulle prime.
+\end{lezione}
+
+\section{Il problema dei bias, e l'errore che ci stava dentro}
+
+Qui sta l'errore più sottile trovato in settembre, e vale la pena seguirlo
+passo passo perché è istruttivo.
+
+Quando moltiplichiamo un ingresso per un peso quantizzato, il risultato porta
+un fattore $s$ in più rispetto al valore reale:
+\[
+  x \cdot w_{\text{int}} \;=\; x \cdot w \cdot s .
+\]
+
+Se impiliamo gli strati, quel fattore si accumula. Dopo $\ell+1$ moltiplicazioni
+l'accumulatore dello strato $\ell$ porta $s^{\ell+1}$.
+
+Ma il \textbf{bias} è memorizzato come un peso qualsiasi, cioè con un solo
+fattore $s$. Sommarlo così com'è significa sommare una quantità
+sistematicamente troppo piccola. Va riportato nelle unità dell'accumulatore:
+
+\begin{center}
+\begin{tikzpicture}[
+  lay/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum width=30mm,
+              minimum height=9mm,font=\small},
+  arr/.style={-{Stealth[length=5pt]},draw=soft,thick}
+]
+\node[lay] (l0) {strato 0};
+\node[lay,right=16mm of l0] (l1) {strato 1};
+\node[lay,right=16mm of l1] (l2) {uscita};
+\draw[arr] (l0) -- (l1);
+\draw[arr] (l1) -- (l2);
+\node[font=\scriptsize,color=soft,below=2mm of l0] {accumulatore $s^1$};
+\node[font=\scriptsize,color=soft,below=2mm of l1] {accumulatore $s^2$};
+\node[font=\scriptsize,color=soft,below=2mm of l2] {accumulatore $s^3$};
+\node[font=\scriptsize,color=accent,above=2mm of l0] {bias $\times\, s^0$};
+\node[font=\scriptsize,color=accent,above=2mm of l1] {bias $\times\, s^1$};
+\node[font=\scriptsize,color=accent,above=2mm of l2] {bias $\times\, s^2$};
+\end{tikzpicture}
+\end{center}
+
+La regola è semplice: allo strato $\ell$ (contando da zero) il bias va
+moltiplicato per $s^{\ell}$.
+
+\begin{prima}[L'errore]
+Il modello di riferimento in Python --- quello con cui si controlla che il
+datapath calcoli la cosa giusta --- applicava $s^0$ e $s^1$ correttamente ai
+primi due strati, e lasciava l'\textbf{ultimo strato a $s^0$} invece di $s^2$.
+
+Il bias dell'uscita era sottopesato di $s^2 = 24^2 = 576$.
+\end{prima}
+
+\begin{prima}[Perché nessuno se n'era accorto per mesi]
+Tutti i test eseguivano il modello con \textbf{tutti i link attivi}. In quella
+condizione gli accumulatori sono grandi e un errore di 576 non sposta mai il
+massimo. Basta spegnere qualche link perché gli accumulatori si riducano e
+l'errore decida l'esito.
+
+Nello stesso file c'era una seconda funzione di riferimento, scritta per forme
+arbitrarie, che usava la formula generale $s^{\ell}$ ed era \textbf{già
+corretta}. Due riferimenti, uno giusto e uno sbagliato, e quello sbagliato era
+l'unico mai esercitato con link spenti.
+\end{prima}
+
+Corretto l'errore, il riferimento e le tre pipeline concordano su tutti i casi
+provati.
+
+\begin{lezione}
+La lezione non è "c'era un bug". È che \textbf{un test che varia un solo
+ingresso non è un test}: verifica una condizione e la ripete. Ci torneremo nel
+capitolo~5, dove lo stesso schema si ripresenta in una forma ancora più netta.
+\end{lezione}
+
+\section{Il TTL: dividere il prodotto, mai il valore}
+
+Il modello è addestrato con il TTL \emph{normalizzato}, cioè
+$\text{ttl}/T$ con $T = 30$ il valore iniziale. Con i numeri interi
+\[
+  \frac{\text{ttl}}{30} = 0 \qquad \text{per ogni } \text{ttl} < 30 ,
+\]
+e la feature sparirebbe. La divisione va quindi applicata al \emph{prodotto}:
+\[
+  \left\lfloor \frac{\text{ttl} \cdot w_{\text{int}}}{T} \right\rfloor
+  \quad\text{e non}\quad
+  \left\lfloor \frac{\text{ttl}}{T} \right\rfloor \cdot w_{\text{int}} .
+\]
+
+Nel C generato si legge esattamente così:
+\begin{lstlisting}
+(((__s64)_ttl * 11LL) / 30LL)
+\end{lstlisting}
+
+% ==================================================================
+\chapter{Le classi non sono porte}
+
+\section{Il problema}
+
+La rete produce sette numeri; il più grande vince. Ma \emph{che cosa significa}
+la classe vincente?
+
+All'inizio di settembre la risposta era sparsa e incoerente. In punti diversi
+del progetto convivevano quattro convenzioni su quale classe significasse
+"scarta il pacchetto":
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Convenzione} & \textbf{Dove} \\
+\midrule
+la classe 6 è DROP & in un punto \\
+la classe 5 è DROP & in un altro \\
+DROP $=$ $n_{\text{out}} - 1$ & in un terzo \\
+DROP $=$ $\max(\text{etichette}) + 1$ & dedotto dai dati \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+E sotto ce n'era una quinta, implicita e più insidiosa: che la classe $k$
+volesse dire "manda fuori dall'interfaccia $k$". Funzionava per caso, perché nel
+modello depositato le porte sono numerate come le classi.
+
+\section{La soluzione: una catena esplicita}
+
+Adesso il significato è \textbf{dichiarato}, mai dedotto, e passa per una
+catena di quattro passi, ognuno con un responsabile diverso:
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=9mm,
+              inner sep=6pt,font=\small,align=center},
+  arr/.style={-{Stealth[length=5pt]},draw=accent,thick}
+]
+\node[box] (c) {classe\\{\scriptsize il modello}};
+\node[box,right=11mm of c] (a) {azione\\{\scriptsize il descrittore}};
+\node[box,right=11mm of a] (p) {porta logica\\{\scriptsize il descrittore}};
+\node[box,right=11mm of p] (i) {ifindex\\{\scriptsize il nodo}};
+\draw[arr] (c) -- (a);
+\draw[arr] (a) -- (p);
+\draw[arr] (p) -- (i);
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+\item \textbf{classe}: quello che il modello ha calcolato;
+\item \textbf{azione}: \texttt{FORWARD}, \texttt{DROP} o \texttt{UNUSED} --- una
+      classe mai addestrata esiste ed è dichiarata tale;
+\item \textbf{porta logica}: un numero che il \emph{modello} conosce;
+\item \textbf{ifindex}: l'interfaccia vera, che solo il \emph{nodo} conosce e
+      che è diversa su ogni macchina.
+\end{itemize}
+
+Nel modello depositato la dichiarazione è:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rll@{}}
+\toprule
+\textbf{classe} & \textbf{azione} & \textbf{porta logica} \\
+\midrule
+0--4 & FORWARD & 0--4 \\
+5    & DROP    & --- \\
+6    & UNUSED  & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+Il punto non è che adesso funziona: funzionava anche prima, per coincidenza
+numerica. Il punto è che adesso \textbf{smetterebbe di funzionare rumorosamente}
+se il modello cambiasse, invece di continuare a girare dando risposte
+plausibili e sbagliate.
+\end{lezione}
+
+\section{Un errore che questa separazione ha fatto emergere}
+
+Il datapath teneva un contatore per classe, ma scriveva nella casella
+della \emph{porta} invece che in quella della \emph{classe}. Sembrava
+giusto perché le due numerazioni coincidono nel modello depositato.
+
+Con un modello in cui non coincidono, il contatore avrebbe misurato la cosa
+sbagliata in silenzio. Separare i due spazi di indici ha reso l'errore visibile
+e correggibile.
+
+% ==================================================================
+\chapter{Il motore non è lo scenario}
+
+\section{Com'era}
+
+Il progetto era nato attorno a una topologia precisa: \textbf{Germany50}, una
+rete di 50 router usata come riferimento in letteratura, con due host attaccati,
+emulata con \textbf{Kathara} (container Docker connessi a formare la rete).
+
+Due numeri erano ovunque nel codice:
+\[
+  n_{\text{nodi}} = 52, \qquad n_{\text{interfacce}} = 6 .
+\]
+
+Il primo è $50 + 2$. Il secondo è il \textbf{grado massimo} della rete: il nodo
+con più vicini. Non è il grado di un nodo qualsiasi --- tutti gli altri riempiono
+di zeri gli slot che non usano.
+
+Questi numeri determinano la larghezza dell'ingresso:
+\[
+  n_{\text{in}} = \underbrace{6}_{\text{link}} + \underbrace{6}_{\text{iface}}
+  + \underbrace{1}_{\text{ttl}} + \underbrace{52}_{\text{nodo}} = 65 .
+\]
+
+Il problema non era che esistessero, ma che il motore li conoscesse. C'era un
+\emph{default} interno: se nessuno diceva niente, il motore assumeva 6 e 52.
+Ogni chiamante che dimenticava di specificare lo scenario risultava
+silenziosamente corretto per Germany50 e silenziosamente sbagliato altrove.
+
+\section{Com'è adesso: tre strati}
+
+\begin{center}
+\begin{tikzpicture}[
+  lay/.style={draw=rule,fill=boxbg,rounded corners=3pt,minimum width=74mm,
+              minimum height=13mm,inner sep=6pt,font=\small,align=left},
+  arr/.style={-{Stealth[length=6pt]},draw=accent,very thick}
+]
+\node[lay] (a) {\textbf{Motore} \\ {\scriptsize pipeline, inferenza, semantica delle classi}};
+\node[lay,below=11mm of a] (b) {\textbf{Configurazione} \\ {\scriptsize quanti nodi, quante interfacce, che modello}};
+\node[lay,below=11mm of b] (c) {\textbf{Scenario} \\ {\scriptsize la rete concreta su cui si misura}};
+\draw[arr] (c) -- node[right,font=\scriptsize\itshape,color=soft] {descrive} (b);
+\draw[arr] (b) -- node[right,font=\scriptsize\itshape,color=soft] {configura} (a);
+\end{tikzpicture}
+\end{center}
+
+La dipendenza punta \textbf{solo verso l'alto}. Il motore non sa che cosa sia
+Germany50.
+
+Le dimensioni si risolvono in ordine: una variabile d'ambiente, poi un file di
+sistema, poi il blocco \texttt{trained\_on} del descrittore del modello. Se
+nessuna delle tre risponde, il motore \textbf{si ferma} e dice dove ha cercato.
+
+\begin{lezione}
+Un default comodo è il modo più efficace di nascondere un'assunzione. Preferire
+un errore esplicito a un valore plausibile è una scelta di progetto, non
+pignoleria: il valore plausibile non si manifesta mai come errore, solo come
+risultato sbagliato mesi dopo.
+\end{lezione}
+
+\section{La prova}
+
+Non basta dirlo. Il motore genera oggi un datapath corretto per cinque
+topologie che non hanno niente a che vedere con quella d'origine:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rrlrrl@{}}
+\toprule
+\textbf{iface} & \textbf{nodi} & \textbf{strati} & $n_{\text{in}}$ & $n_{\text{out}}$ & \textbf{vettore link} \\
+\midrule
+3 &  8 & 4-4     & 15 & 4 & \texttt{v[3]} \\
+4 & 16 & 6       & 25 & 5 & \texttt{v[4]} \\
+5 & 24 & 4-4-4   & 35 & 6 & \texttt{v[5]} \\
+2 &  6 & 3-3     & 11 & 3 & \texttt{v[2]} \\
+6 & 52 & 4-4     & 65 & 7 & \texttt{v[6]} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Nessuna riga di C scritta a mano cambia fra una riga e l'altra.
+
+% ==================================================================
+\chapter{Dall'emulatore al kernel vero}
+
+\section{Che cosa provavano i test di prima}
+
+Fino a settembre ogni misura veniva da una chiamata di sistema,
+\mbox{\texttt{BPF\_PROG\_TEST\_RUN}}: si dà al programma un buffer, lo si
+esegue $N$ volte, e il kernel riporta quanti nanosecondi in media.
+
+È utile e onesto per confrontare le tre pipeline fra loro. Ma non tocca
+un'interfaccia, non ha un driver, non consegna niente. Il programma poteva dire
+\emph{"redirigerei sulla porta 3"} e nessuno verificava che un pacchetto ne
+uscisse davvero.
+
+\section{Il banco nuovo}
+
+Kathara è stato sostituito da qualcosa di più semplice e più vicino al vero:
+coppie di interfacce virtuali (\texttt{veth}) create sull'host.
+
+\begin{center}
+\begin{tikzpicture}[
+  n/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum width=17mm,
+            minimum height=7mm,font=\scriptsize},
+  arr/.style={-{Stealth[length=4pt]},draw=soft},
+  xdp/.style={draw=accent,fill=white,rounded corners=2pt,minimum width=22mm,
+              minimum height=9mm,font=\scriptsize,thick}
+]
+\node[n] (inp) {\texttt{ipainp}};
+\node[xdp,right=9mm of inp] (ing) {\texttt{ipain} + XDP};
+\node[n,right=13mm of ing,yshift=13mm] (p0) {\texttt{ipa0}};
+\node[n,right=13mm of ing,yshift=0mm]  (p1) {\texttt{ipa1}};
+\node[n,right=13mm of ing,yshift=-13mm](p2) {\texttt{ipa2}};
+\node[n,right=8mm of p0] (q0) {\texttt{ipa0p}};
+\node[n,right=8mm of p1] (q1) {\texttt{ipa1p}};
+\node[n,right=8mm of p2] (q2) {\texttt{ipa2p}};
+\draw[arr] (inp) -- (ing);
+\draw[arr] (ing) -- (p0);
+\draw[arr] (ing) -- (p1);
+\draw[arr] (ing) -- (p2);
+\draw[arr] (p0) -- (q0);
+\draw[arr] (p1) -- (q1);
+\draw[arr] (p2) -- (q2);
+\node[font=\scriptsize\itshape,color=soft,below=1mm of inp,align=center]
+     {iniezione};
+\node[font=\scriptsize\itshape,color=soft,right=1mm of q2,align=left]
+     {cattura};
+\end{tikzpicture}
+\end{center}
+
+Si inietta un frame da un capo, il programma XDP gira davvero, e si legge da
+quale interfaccia è uscito. Questo risponde alla domanda che
+\texttt{BPF\_PROG\_TEST\_RUN} non può porre.
+
+\subsection*{Due dettagli che sembrano minori e non lo sono}
+
+\textbf{Modalità di attacco.} XDP si può agganciare in due modi: \emph{native},
+dentro il driver, prima che esista la \texttt{sk\_buff}; oppure \emph{generic},
+dopo. Il progetto usava sempre generic, e il motivo era scritto nel codice:
+serviva per le interfacce dentro i container dell'emulatore. Tolto l'emulatore,
+quel motivo cade. Adesso il default è native, la modalità \emph{davvero in
+effetto} viene riletta dal kernel dopo l'aggancio, e un fallimento è un errore,
+non una retrocessione silenziosa.
+
+\textbf{Il vincolo delle veth.} Redirigere \emph{verso} una veth funziona solo
+se il lato ricevente ha a sua volta un programma XDP agganciato: il kernel
+alloca le code necessarie solo in quel caso. Senza, il redirect fallisce in
+silenzio e il pacchetto sparisce --- indistinguibile da un modello che decide di
+scartare tutto. Il banco aggancia quindi un programma minimo a ogni capo.
+
+\section{Tre difetti del test, trovati misurando}
+
+Il banco nuovo ha trovato più difetti nei \emph{test} che nel prodotto. Vale la
+pena elencarli, perché il motivo per cui erano invisibili è sempre lo stesso.
+
+\begin{prima}[1. Il TTL non muove questo modello]
+La prima versione del test variava il TTL da 2 a 8 e riportava
+\emph{"7 verifiche su 7 superate"}.
+
+Misurando lo spazio raggiungibile si scopre che con tutti i link attivi il
+modello risponde \textbf{sempre classe 2}, per qualsiasi TTL. Quel 7 su 7 era
+\textbf{un caso solo, ripetuto sette volte}.
+
+È \texttt{link\_state} la feature che sposta la decisione. Il test adesso
+\emph{cerca} un ingresso per ogni classe, invece di spazzare alla cieca.
+\end{prima}
+
+\begin{prima}[2. Un pacchetto del kernel contato come risultato]
+Su una veth appena creata il kernel manda del traffico suo (IPv6 multicast). Una
+volta è stato catturato e contato come la risposta della pipeline. È passato per
+caso, perché era sulla porta giusta.
+
+Adesso la cattura filtra sui campi che il datapath non riscrive, e IPv6 viene
+disabilitato sulle interfacce del banco.
+\end{prima}
+
+\begin{prima}[3. La porta 0 era invisibile per costruzione]
+L'ingresso era anche la porta logica 0. Una classe che inoltrava su quella porta
+rimandava il frame fuori dall'interfaccia da cui era entrato --- dove la cattura
+non lo distingue da quello appena iniettato. Una decisione \emph{corretta} sulla
+porta 0 non era osservabile.
+
+Il banco ha adesso un ingresso dedicato, separato da tutte le porte.
+\end{prima}
+
+\begin{lezione}
+Un test che non può fallire non è un test. In tutti e tre i casi il risultato
+era verde e privo di contenuto, e in tutti e tre il difetto è emerso solo
+mettendo in mezzo un kernel vero.
+\end{lezione}
+
+\section{Il risultato}
+
+Tutte e tre le pipeline superano oggi la verifica end-to-end su un datapath
+reale: XDP native, redirect vero, pacchetto ripreso sulla porta d'uscita, e
+scarto verificato dal \emph{contatore} e non dal silenzio --- perché "non è
+arrivato niente" è anche ciò che si osserva quando il redirect si perde.
+
+% ==================================================================
+\chapter{La feature che non c'era}
+
+\section{Il sintomo}
+
+Il modello ha quattro ingressi. Uno di questi è \emph{da quale interfaccia è
+arrivato il pacchetto}, codificato \emph{one-hot}: un vettore di sei posizioni
+con un solo uno.
+
+Il datapath leggeva l'indice dell'interfaccia dato dal kernel --- l'
+\texttt{ifindex} --- e lo usava direttamente come posizione nel vettore, con un
+controllo di validità:
+\[
+  1 \le \text{ifindex} \le n_{\text{interfacce}} .
+\]
+
+Gli \texttt{ifindex} però li assegna il kernel, in ordine di creazione. Su un
+container appena avviato valgono 2, 3, 4. Su una macchina che ha creato qualche
+interfaccia virtuale valgono 205, 217, 229.
+
+Il controllo falliva sempre. \textbf{Nessun bit veniva acceso.} Il modello
+girava di fatto su tre ingressi invece di quattro.
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=8mm,
+              inner sep=5pt,font=\scriptsize,align=center},
+  arr/.style={-{Stealth[length=4pt]},draw=soft,thick},
+  bad/.style={draw=bad,text=bad}
+]
+\node[box] (k) {ifindex del kernel\\\texttt{205}};
+\node[box,right=13mm of k,bad] (t) {$1 \le x \le 6$ ?};
+\node[box,right=13mm of t,bad] (z) {one-hot\\tutto zero};
+\draw[arr] (k) -- (t);
+\draw[arr] (t) -- node[above,font=\scriptsize,color=bad] {no} (z);
+\end{tikzpicture}
+\end{center}
+
+\section{Perché nessun test lo vedeva}
+
+Perché nessun test controllava che quella feature \emph{contribuisse} qualcosa.
+Riferimento e datapath la ignoravano entrambi, quindi \textbf{concordavano} --- e
+l'accordo veniva registrato come successo.
+
+Una pipeline aveva in effetti una tabella di traduzione, ma compilata dentro il
+programma come $[2,3,4,5,6,7]$: la stessa assunzione, scritta in un altro modo.
+Le altre due usavano l'indice grezzo. Le tre pipeline sceglievano quindi
+\emph{colonne diverse} per lo stesso pacchetto --- una discrepanza documentata in
+un commento e mai risolta.
+
+\section{La correzione}
+
+La traduzione è diventata una \textbf{tabella a runtime}, riempita dal piano di
+controllo leggendo le interfacce del nodo:
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=8mm,
+              inner sep=5pt,font=\scriptsize,align=center},
+  arr/.style={-{Stealth[length=4pt]},draw=accent,thick}
+]
+\node[box] (k) {ifindex\\\texttt{205}};
+\node[box,right=12mm of k,draw=accent] (m) {tabella\\\texttt{ingress\_port}};
+\node[box,right=12mm of m,draw=good,text=good] (p) {porta logica\\\texttt{1}};
+\draw[arr] (k) -- (m);
+\draw[arr] (m) -- (p);
+\end{tikzpicture}
+\end{center}
+
+È il \textbf{simmetrico} della tabella già usata in uscita: là "quale
+interfaccia realizza la porta che il modello ha scelto", qui "quale porta è
+l'interfaccia da cui il pacchetto è arrivato". Entrambe sono fatti del nodo,
+entrambe si risolvono quando il nodo esiste.
+
+\section{La prova che adesso è viva}
+
+Prima e dopo la correzione, gli ingressi che raggiungono ciascuna classe
+\textbf{cambiano}:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rll@{}}
+\toprule
+\textbf{classe} & \textbf{prima} (feature morta) & \textbf{dopo} (feature viva) \\
+\midrule
+0 & \texttt{100110}, ttl 27 & \texttt{100111}, ttl 20 \\
+1 & \texttt{010000}, ttl 2  & \texttt{010000}, ttl \textbf{14} \\
+5 & \texttt{000000}, ttl 2  & \texttt{000000}, ttl \textbf{12} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Stesso stato dei link, TTL diverso per ottenere la stessa classe: l'ingresso in
+più contribuisce. E il TTL ora sposta la decisione, cosa che prima non faceva.
+
+\section{Il prezzo, misurato}
+
+Una lettura di tabella in più per pacchetto:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{prima} & \textbf{dopo} \\
+\midrule
+letture per pacchetto (P1) & 4,0 & 5,0 \\
+letture per pacchetto (P3) & 26,0 & 28,0 \\
+istruzioni (P1) & 997 & 971 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le istruzioni di P1 \emph{calano}: la tabella ha sostituito un blocco
+\texttt{switch} a sei casi, e una lettura costa meno di un salto.
+
+% ==================================================================
+\chapter{I numeri, e che cosa dicono davvero}
+
+\section{La tabella}
+
+Misure su una macchina virtuale a 4 processori, modello 65-4-4-7, scala 24.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+& \textbf{baseline} & \textbf{P1} & \textbf{P2} & \textbf{P3} \\
+\midrule
+istruzioni caricate & 155 & 971 & 16\,185 & 11\,826 \\
+salti fra programmi & 0 & 1 & 1 & 3 \\
+letture di tabella  & 3,0 & 5,0 & n.d. & 28,0 \\
+latenza, esecuzione 1 & 35 ns & 62 ns & 243 ns & 478 ns \\
+latenza, esecuzione 2 & 28 ns & 67 ns & 247 ns & 422 ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il \emph{baseline} è un programma che analizza il pacchetto e lo rimanda fuori
+senza alcuna inferenza: è il pavimento contro cui si legge tutto il resto.
+
+\section{Primo risultato: la dimensione non predice la velocità}
+
+\begin{lezione}
+\textbf{P3 ha il 27\% di istruzioni in meno di P2 ed è quasi il doppio più
+lento.}
+
+Il motivo sta nelle due righe centrali: tre salti fra programmi invece di uno, e
+ventotto letture di tabella per pacchetto.
+\end{lezione}
+
+Il conteggio delle istruzioni misura quanto è \emph{grande} il programma
+caricato, non quanto \emph{lavoro} fa per pacchetto. In questo regime a dominare
+sono le letture di memoria e i salti, non l'aritmetica.
+
+Questo si vede solo perché le quattro colonne vengono dalla stessa esecuzione,
+sulla stessa macchina, nello stesso minuto.
+
+\section{Secondo risultato: quanto valgono le latenze assolute}
+
+Le due esecuzioni in tabella sono lo \textbf{stesso identico binario}, a minuti
+di distanza.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+& baseline & P1 & P2 & P3 \\
+\midrule
+scarto fra le due esecuzioni & $-20\%$ & $+8\%$ & $+2\%$ & $-12\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le \textbf{istruzioni sono identiche} nelle due esecuzioni: sono deterministiche.
+Le latenze no.
+
+\begin{lezione}
+Su questa macchina virtuale una differenza di latenza sotto il 20\% fra due
+misure prese in momenti diversi \textbf{non significa nulla}. Vale il confronto
+\emph{dentro} una singola esecuzione.
+
+Ogni cifra assoluta va letta come ordine di grandezza su questa VM, mai come
+prestazione del sistema.
+\end{lezione}
+
+Questo ha reso necessario rifare la tabella dei risultati: la versione
+precedente presentava tre esecuzioni etichettate come ripetizioni, ma venivano
+in realtà da \emph{stati diversi del codice}.
+
+\section{Terzo risultato: la genericità ha un costo di verifica}
+
+P2 serve qualsiasi modello che stia sotto certi tetti dichiarati a priori
+(numero massimo di neuroni, di ingressi, di feature). È il suo pregio: non
+ricompila mai.
+
+Il conto però lo paga il verificatore del kernel, che percorre ogni cammino del
+corpo srotolato. Con i tetti larghi il kernel si arrende:
+
+\begin{lstlisting}
+processed 1000001 insns (limit 1000000) ... total_states 13864
+\end{lstlisting}
+
+Da notare: il programma è lungo circa 14\,900 istruzioni, \textbf{ampiamente
+dentro} il limite di dimensione. Quello che finisce è la \emph{complessità di
+verifica}, che è un limite diverso e cresce col \textbf{prodotto} dei tetti:
+\[
+  \text{costo di verifica} \;\sim\; H_{\max} \times F_{\max} \times N_{\max} .
+\]
+
+\begin{lezione}
+È la misura concreta di quanto un programma "generico" possa esserlo. La
+genericità di P2 non è gratis: si paga in stati del verificatore, e il tetto si
+tocca con numeri ragionevoli (8 neuroni, 4 feature, 128 ingressi).
+\end{lezione}
+
+\section{Che cosa questi numeri non dicono}
+
+\texttt{BPF\_PROG\_TEST\_RUN} esegue il programma in un ciclo sullo stesso
+buffer. Niente scheda di rete, niente driver, nessuna allocazione, nessuna
+pressione di cache da traffico vero.
+
+Il valore in "milioni di pacchetti al secondo" è semplicemente $1/\text{latenza}$:
+un \textbf{picco teorico}, non un throughput retto. Per quello serve traffico
+vero, generato a ritmo, e la misura di quanti pacchetti si perdono.
+
+% ==================================================================
+\chapter{Quel che resta}
+
+\section{Fatto}
+
+\begin{itemize}
+\item semantica delle classi dichiarata, mai dedotta; catena classe $\to$ azione
+      $\to$ porta logica $\to$ interfaccia;
+\item motore indipendente dallo scenario, dimostrato su cinque topologie diverse;
+\item emulatore rimosso; verifica end-to-end su datapath reale con XDP native;
+\item errore del bias nell'ultimo strato corretto;
+\item feature dell'interfaccia d'ingresso resa viva in tutte e tre le pipeline;
+\item tabella dei risultati rifatta su uno stato del codice solo.
+\end{itemize}
+
+\section{Aperto}
+
+\begin{itemize}
+\item \textbf{Throughput reale}: generare traffico a ritmo e misurare pacchetti
+      al secondo, perdite e carico di CPU. È la misura che manca se la metrica
+      principale è la velocità.
+\item \textbf{Versione intermedia fra P1 e P2}: pesi scritti nel codice ma
+      descrittore letto a runtime. Oggi il salto fra P1 e P2 confonde due
+      cambiamenti insieme, e non si può attribuire il costo all'uno o all'altro.
+\item \textbf{Hardware vero}: la scheda di rete di questa macchina virtuale è
+      emulata e non supporta XDP native. I numeri assoluti restano non citabili
+      come prestazioni di sistema.
+\end{itemize}
+
+\section{Il filo conduttore}
+
+Guardando indietro, quasi tutti i problemi trovati a settembre hanno la stessa
+forma. Non erano calcoli sbagliati: erano \textbf{assunzioni non dichiarate} che
+risultavano vere per caso nell'unica configurazione mai provata.
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Assunzione} & \textbf{Vera solo perché} \\
+\midrule
+classe $k$ $=$ interfaccia $k$ & le porte erano numerate come le classi \\
+DROP $=$ ultima classe & nel modello depositato capitava così \\
+$n_{\text{nodi}} = 52$ di default & si provava una topologia sola \\
+\texttt{eth0} $=$ ifindex 2 & si provava dentro un container pulito \\
+bias dell'uscita $\times\, s^0$ & si provava coi link tutti attivi \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+E quasi tutte sono emerse allo stesso modo: cambiando \emph{una} condizione che
+nessun test aveva mai cambiato.
+
+\begin{lezione}
+Un test verde dice che il codice si comporta come il test si aspetta. Non dice
+che il test stia chiedendo qualcosa.
+\end{lezione}
+
+\end{document}

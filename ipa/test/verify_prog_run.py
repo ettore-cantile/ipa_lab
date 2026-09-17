@@ -324,7 +324,7 @@ def _feature_scales(features) -> list:
 
 
 def ref_infer(weights, scale: int, ttl: int, model_id: int, ingress_port: int = 0,
-              link_state=None):
+              link_state=None, node_index=None):
     """Integer reference for the checked-in 65-4-4-7 model.
 
     `link_state` is the egress up/down vector as seeded into the map. It
@@ -355,8 +355,12 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ingress_port: int = 
     # feature. Passing a raw ifindex here would set a bit the datapath does not.
     if 1 <= ingress_port <= 6:
         x[5 + ingress_port] = 1
-    if 0 <= model_id <= 51:
-        x[13 + model_id] = 1
+    # The NODE's own index, not the packet's model_id. They used to be the same
+    # thing here because the datapath derived the one-hot from model_id; now it
+    # reads the node_id map, and a run that installs no entry sets no bit.
+    _node = node_index
+    if _node is not None and 0 <= _node <= 51:
+        x[13 + _node] = 1
     # Per-column divisors: only the ttl column (12) is scaled, by the
     # checkpoint's initial_ttl. See model_meta.DEFAULT_TTL_SCALE.
     import model_meta as _mm
@@ -415,7 +419,8 @@ def build_frame_sparse(model_id: int, ttl: int, scale: int, n_in: int, n_out: in
 
 
 def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
-                     map_values, ingress_port=0, scale: int = 1):
+                     map_values, ingress_port=0, scale: int = 1,
+                     node_index=None):
     """Python reference for the heterogeneous sparse route: builds the input
     vector feature by feature from the descriptor (mirroring the per-kind C
     generators in ebpf_program.py), then runs the MLP + argmax. Returns
@@ -454,8 +459,9 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
             if 1 <= logical <= size:
                 x[o + (logical - 1)] = 1
         elif kind == "onehot" and t == "node":
-            if 0 <= model_id < size:
-                x[o + model_id] = 1
+            _n = node_index if node_index is not None else -1
+            if 0 <= _n < size:
+                x[o + _n] = 1
         o += size
 
     # Generic per-layer reference: layer_sizes = [n_in, h1, ..., hk, n_out].

@@ -101,7 +101,7 @@ def _is_probe_frame(data: bytes) -> bool:
 
 
 def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30,
-                            ingress_port=0):
+                            ingress_port=0, node_index=None):
     """One (link_state, ttl) per output class the model can actually reach.
 
     Sweeping TTL alone is not a test: for the checked-in checkpoint every TTL
@@ -124,6 +124,7 @@ def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30,
         for ttl in range(2, max_ttl + 1):
             cls = V.ref_infer(weights, scale, ttl, model_id,
                               ingress_port=ingress_port,
+                              node_index=node_index,
                               link_state=list(bits))[0]
             if cls not in found:
                 found[cls] = (list(bits), ttl)
@@ -152,6 +153,12 @@ def _delta(before, after):
 
 _MAC_NAME = {1: "mac_table", 2: "mac_table_t2", 3: "mac_table_t3"}
 _INGRESS_NAME = {1: "ingress_port", 2: "ingress_port_t2", 3: "ingress_port_t3"}
+_NODEID_NAME = {1: "node_id", 2: "node_id_t2", 3: "node_id_t3"}
+
+# The index this fabric claims to be. Any value that is not 0 makes the
+# change visible: the node one-hot used to fire slot 0 on every node
+# because it was driven by the packet's model_id.
+FABRIC_NODE_INDEX = 7
 
 # The one-hot slot the fabric's ingress interface occupies. On a real node the
 # ingress is one of the node's own ports; the fabric keeps it on a separate
@@ -212,11 +219,25 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
             info(f"{ing_name} unavailable ({e}); the ingress_iface feature "
                  f"contributes nothing in this run")
 
+        # This node's own index. Without it the node one-hot is empty; with it
+        # the feature finally varies with the node rather than with the packet.
+        nid_name = _NODEID_NAME[setup["pipeline"]]
+        node_index = FABRIC_NODE_INDEX
+        try:
+            b[nid_name][ct.c_int(0)] = ct.c_uint32(node_index)
+            if verbose:
+                info(f"{nid_name}: this node is index {node_index}")
+        except Exception as e:
+            node_index = None
+            info(f"{nid_name} unavailable ({e}); the node feature contributes "
+                 f"nothing in this run")
+
         # --ttl-max now bounds the SEARCH for per-class inputs, not a blind
         # sweep: the sweep was what made 7/7 mean one class seven times.
         cases = _cases_covering_classes(V, weights, scale, 0, n_out,
                                         max_ttl=max(ttl_range),
-                                        ingress_port=ingress_port)
+                                        ingress_port=ingress_port,
+                                        node_index=node_index)
         missing = [c for c in range(n_out) if c not in cases]
         info(f"classes reachable by varying link_state and ttl: "
              f"{sorted(cases)}" + (f"; unreachable: {missing}" if missing else ""))
@@ -231,7 +252,8 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
                 # they are answering different questions.
                 write_vector_map(b, "link_state", ls)
                 got_cls = V.ref_infer(weights, scale, ttl, 0,
-                                      ingress_port=ingress_port, link_state=ls)[0]
+                                      ingress_port=ingress_port,
+                                      node_index=node_index, link_state=ls)[0]
                 assert got_cls == exp_cls, (
                     f"the case search and the per-case reference disagree "
                     f"({exp_cls} vs {got_cls}) on the same input -- they are "
@@ -425,6 +447,12 @@ def run_sweep(timeout, xdp_mode, verbose):
                 ingress_port = FABRIC_INGRESS_SLOT
             except Exception:
                 ingress_port = 0
+            # An index inside this topology's node count, so it is a valid one.
+            node_index = min(FABRIC_NODE_INDEX, n_nodes - 1)
+            try:
+                b["node_id"][ct.c_int(0)] = ct.c_uint32(node_index)
+            except Exception:
+                node_index = None
 
             # Find an input per class the same way the single-scenario run
             # does, but through the sparse reference, which handles any shape.
@@ -438,7 +466,8 @@ def run_sweep(timeout, xdp_mode, verbose):
                     cls, _ = V.ref_infer_sparse(
                         weights, features, dims, n_out, ttl, model_id=0,
                         map_values={"link_state": ls_all_up},
-                        ingress_port=ingress_port, scale=scale)
+                        ingress_port=ingress_port, node_index=node_index,
+                        scale=scale)
                     seen.setdefault(cls, ttl)
                 info(f"classes reachable by ttl alone: {sorted(seen)}")
 

@@ -317,6 +317,71 @@ def install_ingress_port_table(b, map_name: str, node_cfg,
                   f"one-hot slot {li}")
     return written
 
+
+def resolve_node_index(node_cfg=None, n_nodes: int = None):
+    """This node's index in the node one-hot, or None if it cannot be known.
+
+    Resolution order, loudest first:
+
+      1. $IPA_NODE_ID                    -- explicit, and what tests use
+      2. the topology's name -> index table (node_config.node_index_of)
+      3. None
+
+    Returns None rather than 0 when nothing answers. Zero is a valid node, so
+    defaulting to it would make every unconfigured node claim to be node 0 --
+    which is exactly the defect this replaces: the one-hot used to be indexed
+    by ipa->model_id, so with a single registered model every node fired slot 0
+    and 52 of the 65 inputs carried no information at all.
+
+    NOTE ON MEANING: the index has to match the ordering the model was TRAINED
+    on for the decisions to mean anything about the real network. If the point
+    of a run is to measure the pipeline rather than the routing, any index that
+    varies per node will do -- but then the decisions are arbitrary, and that
+    should be stated wherever the numbers are reported.
+    """
+    env = os.environ.get("IPA_NODE_ID")
+    if env is not None:
+        try:
+            idx = int(env)
+        except ValueError:
+            raise ValueError(f"IPA_NODE_ID={env!r} is not an integer")
+        if n_nodes is not None and not 0 <= idx < n_nodes:
+            raise ValueError(
+                f"IPA_NODE_ID={idx} outside [0, {n_nodes}) for this topology")
+        return idx
+
+    if node_cfg is not None and getattr(node_cfg, "node_index", None) is not None:
+        return int(node_cfg.node_index)
+
+    try:
+        from node_config import load_topology, node_index_of
+        import socket as _socket
+        idx = node_index_of(_socket.gethostname(), load_topology())
+        if idx is not None:
+            return int(idx)
+    except Exception:
+        pass
+    return None
+
+
+def install_node_id(b, map_name: str, node_cfg=None, n_nodes: int = None):
+    """Write this node's index into the single-entry `map_name`.
+
+    Returns the index written, or None if none could be resolved -- in which
+    case the map is left empty and the datapath sets no bit, which is the
+    honest representation of "this node does not know which node it is".
+    """
+    idx = resolve_node_index(node_cfg, n_nodes)
+    if idx is None:
+        print(f"[node] WARNING: {map_name} left empty -- no node index resolved "
+              f"($IPA_NODE_ID, or a name->index table in the topology). The "
+              f"node one-hot will contribute nothing to any decision.")
+        return None
+    b[map_name][ctypes.c_int(0)] = ctypes.c_uint32(int(idx))
+    print(f"[node] {map_name}: this node is index {idx}"
+          + (f" of {n_nodes}" if n_nodes else ""))
+    return idx
+
 def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
                              interval: float = 5.0):
     """Start a daemon thread that periodically re-reads /proc/net/arp and

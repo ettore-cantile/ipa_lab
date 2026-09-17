@@ -290,6 +290,20 @@ BPF_ARRAY(mac_table, struct fwd_action, {mac_capacity});
  * silently contributes nothing. Which interface realises which logical port is
  * a NODE fact, resolved at runtime -- the same reason mac_table is a map. */
 BPF_HASH(ingress_port, __u32, __u32, 64);
+/* This node's index in the node one-hot, a single entry written by the control
+ * plane at deploy time.
+ *
+ * The one-hot used to be indexed by ipa->model_id -- the MODEL identifier from
+ * the packet header. That is not a node identity: the same packet carries the
+ * same model_id along its whole path, so with one registered model every node
+ * fired slot 0 and the feature contributed the same constant everywhere. 52 of
+ * the 65 inputs, carrying no information.
+ *
+ * Which node this is, is a fact of the node, resolved when the node exists --
+ * exactly like mac_table and ingress_port. An absent entry means "unknown", and
+ * no bit is set, rather than silently meaning node 0.
+ */
+BPF_ARRAY(node_id, __u32, 1);
 
 /* model_progs: dispatcher -> model_<id>, indexed directly by ipa->model_id.
  * A single tail call, matching the design-space spec's hardcoded pipeline
@@ -571,7 +585,9 @@ def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1):
     fc1_w[j, offset + node]. One switch total, verifier-safe."""
     size = feat["size"]
     lines = ["    /* feature 'node' (one-hot): active index = model_id */",
-             "    __u32 _node = (__u32)ipa->model_id;  /* switch default zeroes out-of-range */"]
+             "    __u32 _node = 0xffffffffU;   /* unknown: the switch default sets no weight */",
+             "    { int _nz = 0; __u32 *_nid = node_id.lookup(&_nz);",
+             "      if (_nid) _node = *_nid; }"]
     for j in range(n_h1):
         lines.append(f"    long long w_node_{j} = 0LL;")
     lines.append("    switch (_node) {")

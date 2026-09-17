@@ -311,6 +311,20 @@ BPF_ARRAY(mac_table_t3, struct fwd_action, MAX_N_OUT);
  * runtime, exactly like mac_table. This is that map, on the ingress side.
  */
 BPF_HASH(ingress_port_t3, __u32, __u32, 64);
+/* This node's index in the node one-hot, a single entry written by the control
+ * plane at deploy time.
+ *
+ * The one-hot used to be indexed by ipa->model_id -- the MODEL identifier from
+ * the packet header. That is not a node identity: the same packet carries the
+ * same model_id along its whole path, so with one registered model every node
+ * fired slot 0 and the feature contributed the same constant everywhere. 52 of
+ * the 65 inputs, carrying no information.
+ *
+ * Which node this is, is a fact of the node, resolved when the node exists --
+ * exactly like mac_table and ingress_port. An absent entry means "unknown", and
+ * no bit is set, rather than silently meaning node 0.
+ */
+BPF_ARRAY(node_id_t3, __u32, 1);
 
 BPF_ARRAY(class_action_t3, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
@@ -577,7 +591,10 @@ int layer_first(struct xdp_md *ctx) {
     long long *ifp = scratch_meta.lookup(&mif);
     __u32 _raw_iface = ifp ? (__u32)(*ifp) : 0;
 
-    __u32 _node = (__u32)model_id;
+    /* The NODE's own index, not the packet's model_id -- see node_id_t3. */
+    __u32 _node = 0xffffffffU;
+    { int _nz = 0; __u32 *_nid = node_id_t3.lookup(&_nz);
+      if (_nid) _node = *_nid; }
 
     /* dense feature vectors, each read once (single lookup), reused per neuron.
      * Sized to the topology; the descriptor's per-feature size gates the slots. */

@@ -46,7 +46,7 @@ from ebpf_modular import (
     load_modular_weights,
 )
 from common import (
-    load_weights, attach_xdp, detach_xdp, INGRESS_IFACE, resolve_ifindex,
+    load_weights, attach_xdp, detach_xdp, install_node_id, INGRESS_IFACE, resolve_ifindex,
     install_mac_per_port, start_mac_refresh_thread,
 )
 from link_state_monitor import init_link_state_up, start_monitor_thread
@@ -148,6 +148,8 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         print(f"[Method 6] NOTE: {_p}")
     mac_info = install_mac_per_port(b, "mac_table_t3", node_cfg,
                                     semantics.logical_ports)
+    install_node_id(b, "node_id_t3", node_cfg,
+                    n_nodes=load_topology_config().get("n_nodes"))
     load_class_action(b, "class_action_t3", semantics)
     if mac_info["pending"]:
         start_mac_refresh_thread(b, "mac_table_t3", mac_info["pending"], interval=5.0)

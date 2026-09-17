@@ -460,6 +460,20 @@ BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
  * runtime, exactly like mac_table. This is that map, on the ingress side.
  */
 BPF_HASH(ingress_port_t2, __u32, __u32, 64);
+/* This node's index in the node one-hot, a single entry written by the control
+ * plane at deploy time.
+ *
+ * The one-hot used to be indexed by ipa->model_id -- the MODEL identifier from
+ * the packet header. That is not a node identity: the same packet carries the
+ * same model_id along its whole path, so with one registered model every node
+ * fired slot 0 and the feature contributed the same constant everywhere. 52 of
+ * the 65 inputs, carrying no information.
+ *
+ * Which node this is, is a fact of the node, resolved when the node exists --
+ * exactly like mac_table and ingress_port. An absent entry means "unknown", and
+ * no bit is set, rather than silently meaning node 0.
+ */
+BPF_ARRAY(node_id_t2, __u32, 1);
 
 BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
@@ -666,6 +680,20 @@ BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
  * runtime, exactly like mac_table. This is that map, on the ingress side.
  */
 BPF_HASH(ingress_port_t2, __u32, __u32, 64);
+/* This node's index in the node one-hot, a single entry written by the control
+ * plane at deploy time.
+ *
+ * The one-hot used to be indexed by ipa->model_id -- the MODEL identifier from
+ * the packet header. That is not a node identity: the same packet carries the
+ * same model_id along its whole path, so with one registered model every node
+ * fired slot 0 and the feature contributed the same constant everywhere. 52 of
+ * the 65 inputs, carrying no information.
+ *
+ * Which node this is, is a fact of the node, resolved when the node exists --
+ * exactly like mac_table and ingress_port. An absent entry means "unknown", and
+ * no bit is set, rather than silently meaning node 0.
+ */
+BPF_ARRAY(node_id_t2, __u32, 1);
 
 BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
@@ -774,7 +802,10 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     { __u32 _kif = ctx->ingress_ifindex;
       __u32 *_lp = ingress_port_t2.lookup(&_kif);
       if (_lp) _raw_iface = *_lp; }
-    __u32 _node      = (__u32)ipa->model_id;
+    /* The NODE's own index, not the packet's model_id -- see node_id_t2. */
+    __u32 _node      = 0xffffffffU;
+    { int _nz = 0; __u32 *_nid = node_id_t2.lookup(&_nz);
+      if (_nid) _node = *_nid; }
 
     /* dense feature vectors, each read once with a SINGLE lookup, reused across
      * neurons. Sized to the COMPILED CEILINGS, gated per-feature by the
