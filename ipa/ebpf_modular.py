@@ -128,7 +128,7 @@ def reference_n_in():
             os.path.dirname(os.path.abspath(__file__)), "weights.json")),
         topology_config=_mm.load_topology_config())["n_in"]
 ML1_MAX_H1   = 8    # first layer's output width ceiling
-P3_MAX_QUEUES = 1   # must match IPA_MAX_QUEUES in the eBPF source above
+P3_MAX_QUEUES = 8   # must match IPA_MAX_QUEUES in the eBPF source above
 MLH_MAX_H    = 8    # later layers' input/output width ceiling
 LAYER_CHAIN_SIZE = 16
 
@@ -277,31 +277,45 @@ BPF_ARRAY(layer_weights, struct lw_blk, 1);
  * ceiling and recompile -- the control plane checks and says so, instead of
  * silently reading past the vector. See model_meta.MAX_N_IFACES/MAX_N_QUEUES. */
 #define IPA_MAX_IFACES  8
-/* Pipeline 3's queue ceiling is 1, NOT 8 like Pipeline 2's, and the reason
- * is measured rather than chosen.
+/* Back to 8, matching Pipeline 2 -- but the round trip is the interesting
+ * part, so it is recorded here rather than thrown away.
  *
- * layer_first sits at the verifier's complexity limit. Reading the node index
- * from a map -- so the node one-hot means which NODE this is, rather than
- * which MODEL the packet carries -- adds one independent scalar to the loop,
- * and the state space is the PRODUCT of the tracked scalars, not the sum.
- * Twelve configurations were tried and every one was refused, at 9 069 to
- * 9 402 instructions; the one that loaded was the one where _node was not
- * independent at all (`_node = model_id`, the same register the verifier was
- * already tracking).
+ * This was 8, then 1, now 8 again. It went to 1 because layer_first sat at the
+ * verifier's complexity limit: reading the node index from a map -- so the
+ * node one-hot means which NODE this is, rather than which MODEL the packet
+ * carries -- adds one independent scalar to the unrolled loop, and the state
+ * space is the PRODUCT of the tracked scalars, not their sum. Twelve
+ * configurations were tried and every one was refused; the only one that
+ * loaded was the one where the node was not independent at all. Cutting this
+ * ceiling to 1 was what freed the room, because the checked-in descriptor
+ * declares NO queue feature -- its codes are 1, 2, 3, 4 and queue_occupancy is
+ * 5 -- so eight slots were kept alive across the whole loop for nothing.
  *
- * What freed the room was not touching the node at all: this ceiling. The
- * checked-in descriptor declares NO queue feature -- its codes are 1, 2, 3, 4
- * and queue_occupancy is 5 -- so eight slots were kept alive across the whole
- * unrolled loop for a feature that is not there. At 1, layer_first loads at
- * 6 417 instructions WITH the node index from the map.
+ * What made 8 affordable again is the INVERTED LOOP NEST in layer_first (see
+ * the comment there). It cost +433 instructions and removed 28 evaluations of
+ * the five-way descriptor dispatch and 56 dense gates per packet. Those are
+ * different currencies: the verifier charges for PATHS, not for size, and the
+ * program got bigger while getting very much cheaper to verify.
  *
- * Not monotone, and worth knowing: cutting IPA_MAX_IFACES from 8 to 6 as well
- * made it fail again. These limits are cliffs, so change this number and
- * re-measure rather than reasoning about it.
+ * Measured with `diag_p3_bisect.py --ceilings` on that rewrite:
  *
- * A model that needs more queue slots is REFUSED by load_modular_weights,
- * never truncated -- see the check there. */
-#define IPA_MAX_QUEUES  1
+ *     queues 1 -> layer_first  6 850 instructions, loads
+ *     queues 2 ->              7 320, loads
+ *     queues 4 ->              8 365, loads
+ *     queues 8 ->             10 207, loads
+ *
+ * Before the rewrite, at queues 8, nothing loaded at all.
+ *
+ * The cost of sitting at 8 with a descriptor that declares no queue feature is
+ * STATIC SIZE ONLY: the FEAT_QUEUE_OCC arm is never taken at runtime, so the
+ * executed path does not change. What does run is zeroing qs[], eight stores
+ * instead of one.
+ *
+ * These limits are cliffs, not slopes -- cutting IPA_MAX_IFACES from 8 to 6
+ * *as well* once made it fail again. Change this number and re-measure with
+ * --ceilings; do not reason about it. And a model needing more slots than this
+ * is REFUSED by load_modular_weights, never truncated. */
+#define IPA_MAX_QUEUES  8
 struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 

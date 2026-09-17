@@ -379,82 +379,151 @@ Rimisurati dopo tre correzioni che invalidavano la tabella precedente:
 > registravano già `~2 618→16 988` per un cambiamento successivo. Non erano numeri da
 > correggere: era la tabella da rifare. Qui c'è **un solo stato del codice**.
 
-Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo. Sono
-riportate **due esecuzioni consecutive dello stesso identico binario**, perché la
-distanza fra loro è il dato metodologico più importante della sezione.
+Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo.
+**Un solo run, un solo stato del codice**, con il nido di cicli invertito in
+`layer_first` (P3) e `fc1` (P2) -- vedi più sotto.
 
-| Metrica | run | baseline | P1 hardcoded | P2 template | P3 modular |
-|---|---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | 1 e 2 | 155 | 971 | 16 185 | 11 826 |
-| Codice jited (byte) | 1 e 2 | 709 | 4 764 | 79 051 | 57 831 |
-| Tail call / pacchetto | — | 0 | 1 | 1 | 3 |
-| Map lookup / pacchetto (reali) | — | 3.0 | 5.0 | n.d. | 28.0 |
-| Memoria mappe (byte) | — | 280 | 2 356 | 10 416 | 19 508 |
-| **Latenza min (ns/pkt)** | **1** | **35.0** | **62.0** | **243.0** | **478.0** |
-| **Latenza min (ns/pkt)** | **2** | **28.0** | **67.0** | **247.0** | **422.0** |
-| ...p50 | 2 | 30.0 | 73.0 | 261.0 | 445.0 |
-| ...max | 2 | 38.0 | 80.0 | 278.0 | 455.0 |
-| ...spread (max−min)/min | 2 | 36% | 19% | 13% | 8% |
-| Throughput teorico (Mpps, da min) | 2 | 35.714 | 14.925 | 4.049 | 2.370 |
+| Metrica | baseline | P1 hardcoded | P2 template | P3 modular |
+|---|---:|---:|---:|---:|
+| Istruzioni eBPF (xlated) | 155 | 1 026 | 14 628 | 8 674 |
+| Codice jited (byte) | 709 | 4 985 | 63 975 | 39 794 |
+| Tail call / pacchetto | 0 | 1 | 1 | **3** |
+| Map lookup / pacchetto (reali) | 3.0 | 6.0 | 11.0 | **29.0** |
+| Memoria mappe (byte) | 280 | 2 356 | 10 416 | 19 480 |
+| **Latenza min (ns/pkt)** | **29.0** | **69.0** | **259.0** | **419.0** |
+| ...p50 | 30.0 | 71.0 | 262.0 | 440.0 |
+| ...max | 36.0 | 85.0 | 302.0 | 514.0 |
+| ...spread (max−min)/min | 24% | 23% | 17% | 23% |
+| Throughput teorico (Mpps, da min) | 34.483 | 14.493 | 3.861 | 2.387 |
 
-Suddivisione per programma (identica nei due run):
+Suddivisione per programma:
 
 | | dispatcher | leaf |
 |---|---|---|
 | baseline | — | `xdp_baseline` 155 |
-| P1 hardcoded | `ipa_switch_hardcoded` 29 | `model_0` 942 |
-| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 16 144 |
-| P3 modular | `modular_dispatcher` 116 | `layer_first` 9 994 + `layer_hidden` 1 716 |
+| P1 hardcoded | `ipa_switch_hardcoded` 29 | `model_0` 997 |
+| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 14 587 |
+| P3 modular | `modular_dispatcher` 136 | `layer_first` 6 850 + `layer_hidden` 1 688 |
 
-Correttezza, run 2:
+Correttezza, stesso run:
 
 | | |
 |---|---|
 | Dispatch (TTL 2-6) | 5/5 PASS su tutte e tre |
 | Gestione TTL (decremento + checksum + scadenza) | 2/2 PASS su tutte e tre |
-| `link_state` reroute | PASS, **11/30** casi di link-down cambiano uscita |
+| `link_state` reroute | PASS, **15/30** casi di link-down cambiano uscita |
 | Architetture alternative (65-8-7, 65-4-4-4-7) | 5/5 PASS |
 | Multi-modello concorrente (P2 65-6-5-7, P3 65-5-6-4-7) | PASS |
-| Aggiornamento modello P1 (ricompila + ricarica) | 1 476 ms |
+| Aggiornamento modello P1 (ricompila + ricarica) | 1 481 ms |
+| Datapath reale (`test_fabric.py`, XDP native, veth) | **18/18**, 6 classi su 7 |
+
+### Perché P2 è più grande di P3, che pure è più lento
+
+Le due domande hanno la stessa risposta, ed è strutturale: **P3 non tiene la rete
+intera in un programma.**
+
+```
+P2:  arch_generic_2layer = 14 587      una sola immagine
+     fc1 (65->8) + fc2 (8x8) + out (32x8), tutti srotolati insieme
+
+P3:  layer_first  =  6 850             IV sparsa dal descrittore, 8 uscite
+     layer_hidden =  1 688             UN layer denso generico 8x8
+     dispatcher   =    136
+                     8 674             layer_hidden e' UNA copia, eseguita DUE volte
+```
+
+P3 srotola **un** layer denso generico e ci rientra per tail call a ogni hop,
+quindi la profondità del modello non costa dimensione. P2 deve srotolare tutti e
+tre gli strati, perché è un programma solo.
+
+Due voci fanno quasi tutta la differenza di dimensione:
+
+| | P2 | P3 |
+|---|---:|---:|
+| strato d'uscita, moltiplica-accumula srotolate | `MAX_N_OUT` 32 × `T2_MAX_H2` 8 = **256** | `MLH_MAX_H` 8 × 8 = **64** |
+| strati densi nel corpo | 3 | 1, riusato |
+
+Le 256 dell'argmax di P2 servono a **7** classi reali: il soffitto `MAX_N_OUT=32`
+è nove volte il bisogno. È il singolo numero più sprecato della tabella.
 
 ### Il risultato principale: la dimensione non predice la velocità
 
-**P3 ha il 27% di istruzioni in meno di P2 ed è quasi il doppio più lento** (11 826 contro
-16 185 istruzioni; 422 contro 247 ns). Il motivo è nelle due righe centrali: 3 tail call
-contro 1, e 28 letture di mappa per pacchetto.
+**P3 ha il 41% di istruzioni in meno di P2 ed è il 62% più lento** (8 674 contro
+14 628 istruzioni; 419 contro 259 ns). Le due righe che lo spiegano sono al
+centro della tabella, ed è lo stesso riuso di sopra visto dall'altro lato:
 
-Il conteggio `xlated` misura quanto è grande il programma caricato, non quanto lavoro
-fa per pacchetto. A dominare in questo regime sono **lookup e salti**, non l'aritmetica —
-ed è visibile solo perché le quattro righe vengono dallo stesso run, sulla stessa
-macchina, nello stesso minuto.
+- **3 tail call** contro 1;
+- **29 lookup di mappa** per pacchetto contro 11.
 
-`n.d.` sui lookup di P2: contarli richiede di strumentare il programma, e la versione
-strumentata sfora il tetto (`Program too large (16497 insns), at most 4096`). È lo stesso
-limite del verificatore discusso nelle note oneste, raggiunto da un'altra direzione.
+Rientrare in `layer_hidden` a ogni strato è ciò che tiene piccolo P3, e ogni
+rientro ripaga in una tail call e nelle letture di mappa che servono a ricostruire
+il contesto (`scratch_meta`, `scratch_acts`, `layer_shapes`, i pesi). Il conteggio
+`xlated` misura quanto è grande il programma caricato, non quanto lavoro fa per
+pacchetto: in questo regime dominano **lookup e salti**, non l'aritmetica.
 
 > ⚠️ **Le istruzioni sono un conteggio STATICO, non il percorso eseguito.** Dividere
-> 971 istruzioni per 67 ns darebbe ~4.8 istruzioni per ciclo a 3 GHz, sopra il massimo
-> pratico su x86 (3-4). Non è una contraddizione: `xlated` misura la dimensione del
-> programma caricato, non quante istruzioni girano per pacchetto. In P1 lo switch della
-> one-hot `node` ha 52 casi ma ne esegue **uno solo**; inoltre, con i pesi come letterali,
-> clang applica strength reduction (i pesi a zero spariscono, quelli potenza di due
-> diventano shift). Il percorso dinamico è quindi una frazione delle 971 — ed è
-> precisamente il vantaggio strutturale che la hardcoded ha sulle altre due. Vale la pena
-> saperlo perché è la prima obiezione naturale davanti a questa tabella.
->
-> (La versione precedente di questa nota citava anche uno switch a 6 casi per
-> `ingress_iface`. Non c'è più: quella traduzione è una lettura della mappa
-> `ingress_port`, perché una tabella compilata di ifindex non corrisponde a nulla su una
-> macchina reale.)
+> 1 026 istruzioni per 69 ns darebbe ~4.5 istruzioni per ciclo a 3 GHz, sopra il
+> massimo pratico su x86 (3-4). Non è una contraddizione: `xlated` misura la
+> dimensione del programma caricato. In P1 lo switch della one-hot `node` ha 52 casi
+> ma ne esegue **uno solo**; inoltre, con i pesi come letterali, clang applica
+> strength reduction (i pesi a zero spariscono, quelli potenza di due diventano
+> shift). Il percorso dinamico è quindi una frazione delle 1 026 — ed è precisamente
+> il vantaggio strutturale della hardcoded sulle altre due.
 
-### Un lookup in più per pacchetto, misurato
+### I lookup si contano di nuovo, su tutte e quattro
 
-P1 passa da 4.0 a 5.0 letture di mappa per pacchetto e P3 da 26.0 a 28.0: è la mappa
-`ingress_port`, che traduce l'ifindex del kernel in porta logica. È il prezzo di rendere
-viva una feature che prima non contribuiva nulla, ed è esattamente un lookup.
+La riga "Map lookup / pacchetto" riportava `n.d.` per P2 **e** P3: contarli richiede
+di ricompilare il programma con un contatore su ogni sito di lookup, e le due build
+strumentate sforavano il limite del verificatore. Ora caricano entrambe — 21 siti
+strumentati per P2, 34 per P3 — e la riga è piena per la prima volta:
 
-Nello stesso cambiamento P1 perde 26 istruzioni (997→971): la mappa ha sostituito uno
-`switch` a 6 casi letterali, e il lookup costa meno del salto.
+```
+[count_lookups] template: 21 lookup sites (arch_generic_2layer=19  ipa_switch_template=1  <header>=1)
+[count_lookups] modular : 34 lookup sites (layer_first=11  layer_hidden=6  ml_argmax_forward=12
+                                           modular_dispatcher=3  <header>=2)
+```
+
+Non è stato reinserito niente a mano: è il margine di verifica liberato dal nido di
+cicli invertito che ha reso caricabili le build strumentate. La misura che prima era
+impossibile adesso è una riga di tabella.
+
+P1 passa da 5.0 a 6.0 lookup: è la mappa `node_id`, il prezzo di far dire alla
+one-hot del nodo *quale nodo è questo* invece di *quale modello porta il pacchetto*.
+
+### Il nido di cicli invertito: cosa ha cambiato e cosa no
+
+In `layer_first` (P3) e `fc1` (P2) il ciclo sulle feature era **dentro** quello sui
+neuroni. Ma `code`, `size` e `col_off` di una voce del descrittore non dipendono dal
+neurone, quindi la catena a cinque rami su `code` veniva rivalutata
+`8 x 4 = 32` volte per pacchetto e il gate `i < size` su un vettore denso 64 volte,
+per ricavare ogni volta la stessa risposta. Invertito: 4 dispatch, 8 gate, e cicli
+interni di sola moltiplica-accumula senza un ramo.
+
+**L'aritmetica non cambia, termine per termine.** Cambia solo l'ordine della somma, e
+l'addizione int64 in complemento a due è associativa e commutativa (anche in
+overflow, che avvolge uguale nei due ordini): ogni accumulatore finisce
+bit-identico. L'accumulatore è ora `out[]`/`h1[]`, che erano già vivi attraverso il
+ciclo, quindi non si aggiunge stato tracciato.
+
+Effetto misurato:
+
+| | prima | dopo |
+|---|---:|---:|
+| P2 `arch_generic_2layer` | 16 144 | **14 587** |
+| P3 `layer_first` | 6 417 | **6 850** |
+| P3 build strumentata (conteggio lookup) | non caricava | **carica** |
+| P3 `IPA_MAX_QUEUES` caricabile | 1 | **8** |
+
+P3 è **cresciuto** di 433 istruzioni ed è diventato molto più economico da
+verificare. Non è una contraddizione: **il verificatore paga i cammini, non la
+dimensione**, e sono valute diverse. Prima della riscrittura, a `IPA_MAX_QUEUES=8`
+non caricava niente; dopo, `layer_first` carica a 10 207 istruzioni con otto slot di
+coda. Il soffitto delle code è tornato a 8, come in P2, e l'asimmetria fra le due
+pipeline è chiusa.
+
+Con un descrittore che non dichiara la feature coda — quello depositato — il costo
+di stare a 8 è **solo dimensione statica**: il ramo `FEAT_QUEUE_OCC` non viene mai
+preso a runtime.
 
 ### Attendibilita' dei numeri di latenza
 
@@ -715,6 +784,27 @@ Il control plane protegge il soffitto invece di subirlo: `load_modular_weights`
 invece di troncarlo silenziosamente al primo. Un modello che serve davvero quella feature
 fa alzare la costante e ripetere la misura.
 
+#### Epilogo: il soffitto è tornato a 8
+
+Tagliare `IPA_MAX_QUEUES` a 1 era una perdita reale, non una pulizia: a 1, un modello che
+dichiari `queue_occupancy` più larga di uno slot viene **rifiutato**. Il nido di cicli
+invertito (sezione Risultati) ha restituito il margine, e la misura è
+`diag_p3_bisect.py --ceilings`:
+
+| `IPA_MAX_QUEUES` | `layer_first` | esito |
+|---:|---:|---|
+| 1 | 6 850 | carica |
+| 2 | 7 320 | carica |
+| 4 | 8 365 | carica |
+| **8** | **10 207** | **carica** |
+
+Prima della riscrittura, a 8 non caricava niente. Il soffitto è di nuovo 8, uguale a
+Pipeline 2, e l'asimmetria fra le due è chiusa.
+
+La lettura da portarsi via è che **istruzioni e complessità di verifica sono valute
+diverse**: la riscrittura ha fatto *crescere* `layer_first` di 433 istruzioni e gli ha
+fatto accettare un corpo da 10 207. Il verificatore paga i cammini.
+
 Conseguenza per le tre pipeline: l'indice del nodo ora viene dalla mappa `node_id` in
 **tutte e tre**, letto a runtime, senza tabelle compilate. È la chiusura dell'ultimo
 ingresso su cui non concordavano.
@@ -723,7 +813,7 @@ ingresso su cui non concordavano.
 >
 > BCC riporta il rifiuto come `Program too large (N insns), at most 4096 insns`. Il 4096 è
 > una **costante vecchia nella stringa d'errore di BCC**: nello stesso run P2 carica a
-> 15 383 istruzioni. Va letto come "il verificatore ha rinunciato", non "il programma è
+> oltre 14 000 istruzioni. Va letto come "il verificatore ha rinunciato", non "il programma è
 > troppo lungo".
 >
 > E il numero `layer_first=9994` è il conteggio **xlated**, cioè di un programma già
