@@ -380,21 +380,21 @@ Rimisurati dopo tre correzioni che invalidavano la tabella precedente:
 > correggere: era la tabella da rifare. Qui c'è **un solo stato del codice**.
 
 Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo.
-**Un solo run, un solo stato del codice**, con il nido di cicli invertito in
-`layer_first` (P3) e `fc1` (P2) -- vedi più sotto.
+**Un solo run, un solo stato del codice**: nido di cicli invertito in
+`layer_first` (P3) e `fc1` (P2), `IPA_MAX_QUEUES = 8` in entrambe.
 
 | Metrica | baseline | P1 hardcoded | P2 template | P3 modular |
 |---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | 155 | 1 026 | 14 628 | 8 674 |
-| Codice jited (byte) | 709 | 4 985 | 63 975 | 39 794 |
+| Istruzioni eBPF (xlated) | 155 | 1 026 | 14 628 | 12 031 |
+| Codice jited (byte) | 709 | 4 985 | 63 975 | 55 015 |
 | Tail call / pacchetto | 0 | 1 | 1 | **3** |
 | Map lookup / pacchetto (reali) | 3.0 | 6.0 | 11.0 | **29.0** |
-| Memoria mappe (byte) | 280 | 2 356 | 10 416 | 19 480 |
-| **Latenza min (ns/pkt)** | **29.0** | **69.0** | **259.0** | **419.0** |
-| ...p50 | 30.0 | 71.0 | 262.0 | 440.0 |
-| ...max | 36.0 | 85.0 | 302.0 | 514.0 |
-| ...spread (max−min)/min | 24% | 23% | 17% | 23% |
-| Throughput teorico (Mpps, da min) | 34.483 | 14.493 | 3.861 | 2.387 |
+| Memoria mappe (byte) | 280 | 2 356 | 10 416 | 19 508 |
+| **Latenza min (ns/pkt)** | **29.0** | **73.0** | **262.0** | **421.0** |
+| ...p50 | 30.0 | 88.0 | 278.0 | 453.0 |
+| ...max | 32.0 | 99.0 | 327.0 | 476.0 |
+| ...spread (max−min)/min | 10% | 36% | 25% | 13% |
+| Throughput teorico (Mpps, da min) | 34.483 | 13.699 | 3.817 | 2.375 |
 
 Suddivisione per programma:
 
@@ -403,7 +403,7 @@ Suddivisione per programma:
 | baseline | — | `xdp_baseline` 155 |
 | P1 hardcoded | `ipa_switch_hardcoded` 29 | `model_0` 997 |
 | P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 14 587 |
-| P3 modular | `modular_dispatcher` 136 | `layer_first` 6 850 + `layer_hidden` 1 688 |
+| P3 modular | `modular_dispatcher` 136 | `layer_first` 10 207 + `layer_hidden` 1 688 |
 
 Correttezza, stesso run:
 
@@ -414,68 +414,70 @@ Correttezza, stesso run:
 | `link_state` reroute | PASS, **15/30** casi di link-down cambiano uscita |
 | Architetture alternative (65-8-7, 65-4-4-4-7) | 5/5 PASS |
 | Multi-modello concorrente (P2 65-6-5-7, P3 65-5-6-4-7) | PASS |
-| Aggiornamento modello P1 (ricompila + ricarica) | 1 481 ms |
+| Aggiornamento modello P1 (ricompila + ricarica) | 1 242 ms |
 | Datapath reale (`test_fabric.py`, XDP native, veth) | **18/18**, 6 classi su 7 |
+
+### Il risultato principale: la dimensione non predice la velocità
+
+**P3 ha il 18% di istruzioni in meno di P2 ed è il 61% più lento** (12 031 contro
+14 628 istruzioni; 421 contro 262 ns). Le due righe che lo spiegano sono al centro
+della tabella:
+
+- **3 tail call** contro 1;
+- **29 lookup di mappa** per pacchetto contro 11.
+
+Il conteggio `xlated` misura quanto è grande il programma caricato, non quanto lavoro
+fa per pacchetto. In questo regime dominano **lookup e salti**, non l'aritmetica.
 
 ### Perché P2 è più grande di P3, che pure è più lento
 
-Le due domande hanno la stessa risposta, ed è strutturale: **P3 non tiene la rete
-intera in un programma.**
+Le due cose hanno la stessa causa: **P3 non tiene la rete intera in un programma.**
 
 ```
 P2:  arch_generic_2layer = 14 587      una sola immagine
      fc1 (65->8) + fc2 (8x8) + out (32x8), tutti srotolati insieme
 
-P3:  layer_first  =  6 850             IV sparsa dal descrittore, 8 uscite
+P3:  layer_first  = 10 207             IV sparsa dal descrittore, 8 uscite
      layer_hidden =  1 688             UN layer denso generico 8x8
      dispatcher   =    136
-                     8 674             layer_hidden e' UNA copia, eseguita DUE volte
+                    12 031             layer_hidden e' UNA copia, eseguita DUE volte
 ```
 
-P3 srotola **un** layer denso generico e ci rientra per tail call a ogni hop,
-quindi la profondità del modello non costa dimensione. P2 deve srotolare tutti e
-tre gli strati, perché è un programma solo.
+P3 srotola **un** layer denso generico e ci rientra per tail call a ogni hop, quindi
+la profondità del modello non costa dimensione: un modello a 4 strati gira sullo
+stesso binario (provato sopra, `65-5-6-4-7`). P2 deve srotolarli tutti e tre, perché
+è un programma solo — e più strati significa un altro binario.
 
-Due voci fanno quasi tutta la differenza di dimensione:
+Quel riuso è esattamente ciò che P3 paga in latenza: ogni rientro è una tail call più
+le letture di mappa che ricostruiscono il contesto (`scratch_meta`, `scratch_acts`,
+`layer_shapes`, i pesi). 29 lookup contro 11.
 
-| | P2 | P3 |
-|---|---:|---:|
-| strato d'uscita, moltiplica-accumula srotolate | `MAX_N_OUT` 32 × `T2_MAX_H2` 8 = **256** | `MLH_MAX_H` 8 × 8 = **64** |
-| strati densi nel corpo | 3 | 1, riusato |
-
-Le 256 dell'argmax di P2 servono a **7** classi reali: il soffitto `MAX_N_OUT=32`
-è nove volte il bisogno. È il singolo numero più sprecato della tabella.
-
-### Il risultato principale: la dimensione non predice la velocità
-
-**P3 ha il 41% di istruzioni in meno di P2 ed è il 62% più lento** (8 674 contro
-14 628 istruzioni; 419 contro 259 ns). Le due righe che lo spiegano sono al
-centro della tabella, ed è lo stesso riuso di sopra visto dall'altro lato:
-
-- **3 tail call** contro 1;
-- **29 lookup di mappa** per pacchetto contro 11.
-
-Rientrare in `layer_hidden` a ogni strato è ciò che tiene piccolo P3, e ogni
-rientro ripaga in una tail call e nelle letture di mappa che servono a ricostruire
-il contesto (`scratch_meta`, `scratch_acts`, `layer_shapes`, i pesi). Il conteggio
-`xlated` misura quanto è grande il programma caricato, non quanto lavoro fa per
-pacchetto: in questo regime dominano **lookup e salti**, non l'aritmetica.
+> ⚠️ **Il confronto sulla DIMENSIONE è in parte un confronto fra soffitti, non fra
+> pipeline.** Entrambe portano capacità inutilizzata, e non la stessa:
+>
+> | | soffitto | bisogno reale del modello depositato |
+> |---|---:|---:|
+> | P2, strato d'uscita | `MAX_N_OUT` 32 × `T2_MAX_H2` 8 = 256 MAC | 7 × 4 = 28 |
+> | P3, vettore code | `IPA_MAX_QUEUES` 8 | 0 (nessuna feature coda dichiarata) |
+>
+> Con `IPA_MAX_QUEUES=1` P3 misura 8 674 istruzioni invece di 12 031, cioè il 41% in
+> meno di P2 invece del 18%, **a parità di latenza** (419 contro 421 ns). Il numero
+> di istruzioni si sposta del 39% senza che cambi nulla di ciò che gira. È il motivo
+> per cui la riga delle istruzioni non va letta come una misura di costo.
 
 > ⚠️ **Le istruzioni sono un conteggio STATICO, non il percorso eseguito.** Dividere
-> 1 026 istruzioni per 69 ns darebbe ~4.5 istruzioni per ciclo a 3 GHz, sopra il
-> massimo pratico su x86 (3-4). Non è una contraddizione: `xlated` misura la
-> dimensione del programma caricato. In P1 lo switch della one-hot `node` ha 52 casi
-> ma ne esegue **uno solo**; inoltre, con i pesi come letterali, clang applica
-> strength reduction (i pesi a zero spariscono, quelli potenza di due diventano
-> shift). Il percorso dinamico è quindi una frazione delle 1 026 — ed è precisamente
-> il vantaggio strutturale della hardcoded sulle altre due.
+> 1 026 istruzioni per 73 ns darebbe ~4.2 istruzioni per ciclo a 3 GHz, sopra il
+> massimo pratico su x86 (3-4). In P1 lo switch della one-hot `node` ha 52 casi ma ne
+> esegue **uno solo**; inoltre, con i pesi come letterali, clang applica strength
+> reduction (i pesi a zero spariscono, quelli potenza di due diventano shift). Il
+> percorso dinamico è una frazione delle 1 026 — ed è il vantaggio strutturale della
+> hardcoded sulle altre due.
 
 ### I lookup si contano di nuovo, su tutte e quattro
 
-La riga "Map lookup / pacchetto" riportava `n.d.` per P2 **e** P3: contarli richiede
-di ricompilare il programma con un contatore su ogni sito di lookup, e le due build
-strumentate sforavano il limite del verificatore. Ora caricano entrambe — 21 siti
-strumentati per P2, 34 per P3 — e la riga è piena per la prima volta:
+La riga "Map lookup / pacchetto" riportava `n.d.` per P2 **e** P3: contarli richiede di
+ricompilare il programma con un contatore su ogni sito di lookup, e le due build
+strumentate sforavano il verificatore. Ora caricano entrambe:
 
 ```
 [count_lookups] template: 21 lookup sites (arch_generic_2layer=19  ipa_switch_template=1  <header>=1)
@@ -484,46 +486,58 @@ strumentati per P2, 34 per P3 — e la riga è piena per la prima volta:
 ```
 
 Non è stato reinserito niente a mano: è il margine di verifica liberato dal nido di
-cicli invertito che ha reso caricabili le build strumentate. La misura che prima era
-impossibile adesso è una riga di tabella.
+cicli invertito che ha reso caricabili le build strumentate. Una misura prima
+impossibile è adesso una riga di tabella.
 
-P1 passa da 5.0 a 6.0 lookup: è la mappa `node_id`, il prezzo di far dire alla
-one-hot del nodo *quale nodo è questo* invece di *quale modello porta il pacchetto*.
+P1 passa da 5.0 a 6.0 lookup: è la mappa `node_id`, il prezzo di far dire alla one-hot
+del nodo *quale nodo è questo* invece di *quale modello porta il pacchetto*.
 
 ### Il nido di cicli invertito: cosa ha cambiato e cosa no
 
 In `layer_first` (P3) e `fc1` (P2) il ciclo sulle feature era **dentro** quello sui
 neuroni. Ma `code`, `size` e `col_off` di una voce del descrittore non dipendono dal
-neurone, quindi la catena a cinque rami su `code` veniva rivalutata
-`8 x 4 = 32` volte per pacchetto e il gate `i < size` su un vettore denso 64 volte,
-per ricavare ogni volta la stessa risposta. Invertito: 4 dispatch, 8 gate, e cicli
-interni di sola moltiplica-accumula senza un ramo.
+neurone, quindi la catena a cinque rami su `code` veniva rivalutata `8 × 4 = 32` volte
+per pacchetto e il gate `i < size` su un vettore denso 64 volte, per ricavare ogni
+volta la stessa risposta. Invertito: 4 dispatch, 8 gate, e cicli interni di sola
+moltiplica-accumula senza un ramo.
 
 **L'aritmetica non cambia, termine per termine.** Cambia solo l'ordine della somma, e
-l'addizione int64 in complemento a due è associativa e commutativa (anche in
-overflow, che avvolge uguale nei due ordini): ogni accumulatore finisce
-bit-identico. L'accumulatore è ora `out[]`/`h1[]`, che erano già vivi attraverso il
-ciclo, quindi non si aggiunge stato tracciato.
-
-Effetto misurato:
+l'addizione int64 in complemento a due è associativa e commutativa (anche in overflow,
+che avvolge uguale nei due ordini): ogni accumulatore finisce bit-identico.
+L'accumulatore diventa `out[]`/`h1[]`, che erano già vivi attraverso il ciclo, quindi
+non si aggiunge stato tracciato.
 
 | | prima | dopo |
 |---|---:|---:|
 | P2 `arch_generic_2layer` | 16 144 | **14 587** |
-| P3 `layer_first` | 6 417 | **6 850** |
+| P3 `layer_first` (a parità di soffitti) | 6 417 | **6 850** |
 | P3 build strumentata (conteggio lookup) | non caricava | **carica** |
-| P3 `IPA_MAX_QUEUES` caricabile | 1 | **8** |
+| P3 `IPA_MAX_QUEUES` massimo caricabile | 1 | **8** |
 
-P3 è **cresciuto** di 433 istruzioni ed è diventato molto più economico da
-verificare. Non è una contraddizione: **il verificatore paga i cammini, non la
-dimensione**, e sono valute diverse. Prima della riscrittura, a `IPA_MAX_QUEUES=8`
-non caricava niente; dopo, `layer_first` carica a 10 207 istruzioni con otto slot di
-coda. Il soffitto delle code è tornato a 8, come in P2, e l'asimmetria fra le due
-pipeline è chiusa.
+P3 è **cresciuto** di 433 istruzioni ed è diventato molto più economico da verificare.
+Non è una contraddizione: **il verificatore paga i cammini, non la dimensione**, e sono
+valute diverse. Prima della riscrittura, a `IPA_MAX_QUEUES=8` non caricava niente.
 
-Con un descrittore che non dichiara la feature coda — quello depositato — il costo
-di stare a 8 è **solo dimensione statica**: il ramo `FEAT_QUEUE_OCC` non viene mai
-preso a runtime.
+### Il soffitto delle code è tornato a 8, e non costa tempo
+
+Misurato, non dedotto — due run consecutivi dello stesso codice con il solo `#define`
+cambiato:
+
+| | `IPA_MAX_QUEUES` 1 | `IPA_MAX_QUEUES` 8 |
+|---|---:|---:|
+| `layer_first` | 6 850 | 10 207 |
+| modular, totale | 8 674 | 12 031 |
+| **latenza min** | **419.0 ns** | **421.0 ns** |
+| lookup / pacchetto | 29.0 | 29.0 |
+| memoria mappe | 19 480 B | 19 508 B |
+
+**+3 357 istruzioni, +2 ns** — dentro uno spread del 13% — e i lookup identici. Con un
+descrittore che non dichiara la feature coda, il ramo `FEAT_QUEUE_OCC` non viene mai
+preso: cresce la dimensione statica, non il percorso eseguito. Le uniche voci che si
+muovono davvero sono i 28 byte di `queue_state` (8 slot invece di 1).
+
+È la dimostrazione più pulita, in questo documento, che dimensione statica e costo per
+pacchetto sono cose diverse.
 
 ### Attendibilita' dei numeri di latenza
 
@@ -658,34 +672,59 @@ quantificare davvero il costo del solo salto usa `bench_tailcall_overhead.py` (s
 che confronta due programmi che differiscono **solo** per un hop `PROG_ARRAY` e non
 dipende da questo rapporto.
 
-### AOT-literal deploy (P1, `method4_hardcoded_aot.py`)
+### AOT-literal deploy (P1, `poc_aot/loader_aot.c`)
 
-| | run A | run B |
+Run del 17/09, **stessa sessione** del suite kernel qui sopra — che è la condizione
+senza la quale il confronto per-pacchetto non vale niente.
+
+| | BCC hardcoded | AOT literal |
 |---|---:|---:|
-| open_file | 0.27 ms | 0.16 ms |
-| load (verify+JIT) | 4.40 ms | 6.00 ms |
-| **deploy totale** | **4.66 ms** | **6.15 ms** |
-| build offline (clang → .o) | — | 147 ms |
-| perf: insn totali | 1 010 (disp 28 + model 982) | 1 026 (disp 28 + model 998) |
-| perf: latenza / throughput | 90 ns / 11.1 Mpps | 57 ns / 17.5 Mpps |
+| aggiornamento modello | **1 242 ms** (clang sul nodo) | **37.2 ms** (`open` 0.73 + `load` 36.5) |
+| istruzioni | 1 026 (disp 29 + model 997) | 979 (disp 28 + model 951) |
+| latenza | 73.0 ns | **74.0 ns** |
+| throughput teorico | 13.699 Mpps | 13.51 Mpps |
 
-Confronto con BCC hardcoded **nella stessa sessione del run B**: BCC 997 istruzioni
-(29 + 968) a 48 ns, AOT 1 026 (28 + 998) a 57 ns. Cioè AOT è nello stesso ordine di
-grandezza ma **non identico**: i due passano per versioni di clang diverse e dialetti
-di accesso alle mappe diversi (BCC rewriter vs `bpf_map_lookup_elem` di libbpf), quindi
-il codice generato differisce di qualche punto percentuale. Affermazioni tipo
-"byte-identical" o "prestazioni identiche" non sono supportate dai dati; quello che è
-supportato è che **la strength reduction sui pesi letterali è preservata** e il costo
-per pacchetto resta nella classe della hardcoded, lontanissimo da P2/P3.
+**74.0 contro 73.0 ns: la stessa cifra**, dentro uno spread del 36% misurato nello
+stesso run. Il guadagno dell'AOT non è per-pacchetto e non è mai stato quello: è che
+la strength reduction sui pesi letterali **resta dentro l'oggetto**, quindi il costo
+per pacchetto non peggiora, e il compilatore sparisce dal nodo datapath.
 
-Il guadagno vero non è la latenza per pacchetto ma il **costo di deploy sul nodo**:
-~5-6 ms di `open+load` contro ~1.3 s di `clang` a runtime, cioè oltre due ordini di
-grandezza, e senza bisogno di clang sul nodo datapath.
+I due binari non sono identici (979 contro 1 026 istruzioni): passano per versioni di
+clang diverse e per dialetti di accesso alle mappe diversi (rewriter di BCC contro
+`bpf_map_lookup_elem` di libbpf). Affermazioni tipo "byte-identical" non sono
+supportate; quello che è supportato è che stanno nella stessa classe di costo,
+lontanissime da P2/P3.
 
-> Il numero "~1.3 s" citato qui è il costo di ricompilazione BCC misurato dalla riga
-> `[M1 update timing]` di `--only kernel` (1 258.9 ms nel run B; 1.26-1.66 s osservati
-> su box diversi). Non è misurato da `method4_hardcoded_aot.py`, che non esegue mai il
-> percorso BCC: quello script lo stampa come valore di riferimento, non come misura.
+> ⚠️ **La cifra di deploy varia molto fra run.** Per lo stesso oggetto sono stati
+> osservati 4.66, 6.15, 20.7 e 37.2 ms, quasi tutto in `load` (verify+JIT). Regge
+> l'**ordine di grandezza** rispetto a 1.2-1.3 s di clang, cioè un fattore fra 30 e
+> 300, non il valore preciso. Una riga che citi "5 ms" o "37 ms" come proprietà
+> dell'AOT sta sovra-interpretando un campione.
+
+Il `1 242 ms` non è misurato da `loader_aot`, che non esegue mai il percorso BCC: è la
+riga `[M1 update timing]` di `--only kernel` nello stesso run.
+
+#### L'indice del nodo cambia la decisione, e si vede qui
+
+Un oggetto AOT è costruito su una macchina di build, quindi non può portarsi dentro
+l'indice del nodo: arriva al caricamento, da `--node-id` o `$IPA_NODE_ID`, come fa il
+control plane Python. Due esecuzioni dello **stesso identico binario**:
+
+```
+$ sudo ./loader_aot nn_aot_arch.o
+node_id left empty (no --node-id and no $IPA_NODE_ID) ...      retval=1   (XDP_DROP)
+
+$ sudo ./loader_aot nn_aot_arch.o --node-id 7
+seeded node_id: this node is index 7                          retval=2   (XDP_PASS)
+```
+
+Cambia solo la mappa `node_id`, e cambia la classe scelta. È la prova più diretta in
+tutto il repository che quella feature — 208 pesi su 319 — **contribuisce davvero**,
+e non un test che verifica sé stesso.
+
+Senza `--node-id` la one-hot resta **spenta**, non messa a zero: il default è "non lo
+so", non "sono il nodo 0". È lo stesso motivo per cui la mappa è un `HASH` e non un
+`ARRAY`.
 
 ### Costo di aggiunta modello (`bench_model_add.py`, 3 modelli)
 

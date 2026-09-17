@@ -688,6 +688,212 @@ istruzioni (P1) & 997 & 971 \\
 Le istruzioni di P1 \emph{calano}: la tabella ha sostituito un blocco
 \texttt{switch} a sei casi, e una lettura costa meno di un salto.
 
+Una lettura in più arriverà poco dopo, per la stessa ragione applicata a un
+altro ingresso: è il capitolo che segue. Le cifre finali sono 6,0 letture per
+P1 e 29,0 per P3.
+
+% ==================================================================
+\chapter{Il nodo non sapeva di essere un nodo}
+
+\section{L'ingresso più grande di tutti}
+
+Dei quattro ingressi del modello, quello che pesa di più è \emph{quale nodo sta
+elaborando il pacchetto}. Su Germany50 sono 52 nodi, quindi un vettore one-hot
+di 52 posizioni: \textbf{208 dei 319 pesi} della rete, quasi due terzi.
+
+\section{Il sintomo}
+
+Il datapath riempiva quel vettore con il campo \texttt{model\_id} preso
+dall'intestazione IPA del pacchetto.
+
+Sono due cose diverse. \texttt{model\_id} dice \emph{quale modello} il pacchetto
+chiede di usare; il vettore vuole sapere \emph{quale nodo} lo sta elaborando. E
+il \texttt{model\_id} non cambia lungo il percorso: è scritto dal mittente e
+viaggia identico fino alla destinazione.
+
+\begin{lezione}
+Con un solo modello registrato --- il caso normale --- \textbf{ogni nodo della
+rete accendeva la stessa identica posizione}. Due terzi dei pesi della rete non
+distinguevano nulla.
+\end{lezione}
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=8mm,
+              inner sep=5pt,font=\scriptsize,align=center},
+  arr/.style={-{Stealth[length=4pt]},draw=soft,thick},
+  bad/.style={draw=bad,text=bad},
+  ok/.style={draw=good,text=good}
+]
+\node[box] (n1) {nodo 7};
+\node[box,below=4mm of n1] (n2) {nodo 23};
+\node[box,below=4mm of n2] (n3) {nodo 41};
+\node[box,right=16mm of n2,bad] (m) {\texttt{model\_id} $= 0$\\(dal pacchetto)};
+\node[box,right=14mm of m,bad] (o) {one-hot\\posizione 0\\\emph{sempre}};
+\draw[arr] (n1) -- (m);
+\draw[arr] (n2) -- (m);
+\draw[arr] (n3) -- (m);
+\draw[arr] (m) -- (o);
+\end{tikzpicture}
+\end{center}
+
+\section{La correzione, e perché una tabella e non un array}
+
+Stessa forma della correzione precedente: una \textbf{tabella letta a runtime},
+riempita quando il nodo viene messo in servizio, dalla variabile d'ambiente
+\texttt{IPA\_NODE\_ID} o dall'indice del nodo nella topologia.
+
+Un dettaglio che sembra tecnico e non lo è: la tabella è di tipo \emph{hash} e
+non \emph{array}. Un array in questo ambiente è preallocato e riempito di zeri,
+quindi una lettura riesce \textbf{sempre}: "non configurato" e "sono il nodo 0"
+tornerebbero lo stesso valore, indistinguibili. Sarebbe esattamente il difetto
+che la tabella serve a togliere. Con un hash, finché nessuno scrive non c'è
+voce: il vettore resta spento, ed è la risposta onesta.
+
+Questo errore è stato commesso e corretto: la prima versione usava un array, e
+un test su un'architettura alternativa è fallito 5 volte su 5 prima che se ne
+capisse il motivo.
+
+\section{Una pipeline ha resistito un giorno}
+
+P1 e P2 hanno accettato la modifica subito. P3 no: il verificatore del kernel ha
+\textbf{rifiutato il programma}, dodici configurazioni di fila.
+
+Il motivo è controintuitivo e vale la pena averlo scritto. Il verificatore non
+misura quanto è lungo il programma: esplora i \emph{cammini} possibili, e il
+numero di stati che deve tenere è il \textbf{prodotto} dei valori indipendenti
+che segue dentro un ciclo srotolato, non la loro somma.
+
+\[
+  \text{stati} \;\sim\; v_1 \times v_2 \times \dots \times v_k
+\]
+
+L'unica versione che caricava era quella in cui l'indice del nodo \emph{non era
+un valore indipendente}: \texttt{nodo = model\_id}, cioè lo stesso registro che
+il verificatore stava già seguendo. Un valore, non due.
+
+Escluse una a una, ognuna con la sua prova: il tipo di tabella, la sua
+dichiarazione, il valore, il tipo del dato, il numero di letture, la larghezza
+in bit. Nessuna era la causa.
+
+Quello che ha liberato spazio non toccava il nodo: un \textbf{tetto} di tutt'altra
+feature. Il programma teneva in vita otto posizioni per un vettore di occupazione
+delle code che il modello depositato \emph{non dichiara nemmeno}. Portato quel
+tetto da 8 a 1, il programma ha caricato --- e più piccolo di prima.
+
+\begin{lezione}
+Questi limiti sono \textbf{scogliere, non pendenze}. Nello stesso giro, ridurre
+\emph{anche} un secondo tetto --- cioè chiedere \emph{meno} --- ha fatto fallire
+di nuovo il caricamento. Un tetto qui si cambia e \textbf{si rimisura}; non si
+ragiona.
+\end{lezione}
+
+\section{La prova che il nodo è vivo}
+
+Stesso programma compilato, due esecuzioni che differiscono solo per la tabella
+del nodo:
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{esecuzione} & \textbf{esito sul pacchetto} \\
+\midrule
+senza indice di nodo & scartato \\
+indice di nodo $= 7$ & non scartato \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Nient'altro è cambiato fra le due. L'ingresso sposta la decisione.
+
+% ==================================================================
+\chapter{Il verificatore non conta le istruzioni}
+
+\section{Due monete diverse}
+
+Il tetto sulle code portato a 1 era una perdita vera: a 1, un modello che
+dichiari davvero quella feature viene \emph{rifiutato}. Per recuperarlo serviva
+margine di verifica, e il margine è arrivato da una riscrittura che non toglie
+niente.
+
+\section{Il ciclo era girato dalla parte sbagliata}
+
+Il primo strato della rete si calcola così: per ogni neurone, si sommano i
+contributi di ogni feature dichiarata nel descrittore.
+
+Il codice lo faceva nell'ordine ovvio --- neuroni fuori, feature dentro:
+
+\begin{lstlisting}
+per ogni neurone j (8 volte)
+    per ogni feature f (4 volte)
+        di che tipo e' f?         <- catena a 5 rami
+        di che larghezza e' f?    <- controllo per ogni posizione
+        accumula
+\end{lstlisting}
+
+Ma \emph{di che tipo} e \emph{di che larghezza} è una feature non dipende dal
+neurone. Quella catena a cinque rami veniva quindi rivalutata $8 \times 4 = 32$
+volte per pacchetto, e il controllo sulla larghezza di un vettore denso
+$8 \times 8 = 64$ volte, per ottenere ogni volta la stessa risposta.
+
+Girato al contrario --- feature fuori, neuroni dentro --- diventa:
+
+\begin{lstlisting}
+per ogni feature f (4 volte)
+    di che tipo e' f?             <- 4 volte, non 32
+    di che larghezza e' f?        <- 8 volte, non 64
+    per ogni neurone j (8 volte)
+        accumula                  <- nessun ramo qui dentro
+\end{lstlisting}
+
+\section{Perché il risultato non cambia di un bit}
+
+Cambia solo l'\textbf{ordine in cui i termini vengono sommati}. I termini sono
+gli stessi, calcolati allo stesso modo. E la somma fra interi a 64 bit in
+complemento a due è associativa e commutativa --- anche in caso di traboccamento,
+che si comporta identicamente nei due ordini:
+\[
+  (a + b) + c \;=\; a + (b + c) .
+\]
+Ogni accumulatore finisce quindi \textbf{bit per bit identico}. Non "circa
+uguale": identico.
+
+\section{Il risultato, che sembra un errore}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{prima} & \textbf{dopo} \\
+\midrule
+P2, programma principale & 16\,144 & \textbf{14\,587} \\
+P3, primo strato & 6\,417 & \textbf{6\,850} \\
+P3, tetto sulle code caricabile & 1 & \textbf{8} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+P3 è \textbf{cresciuto} di 433 istruzioni ed è diventato molto più economico da
+verificare. Prima della riscrittura, col tetto delle code a 8 non caricava
+niente; dopo, carica a 10\,207 istruzioni.
+
+Dimensione del programma e complessità di verifica sono \textbf{monete diverse}.
+Il verificatore paga i cammini.
+\end{lezione}
+
+\section{Un effetto collaterale che vale una riga di tabella}
+
+Contare quante letture di tabella fa un programma per pacchetto richiede di
+ricompilarlo con un contatore su ogni punto di lettura. Le versioni strumentate
+di P2 e P3 \textbf{sforavano il verificatore}: per questo la riga "letture di
+tabella" riportava \emph{n.d.} per entrambe.
+
+Con il margine liberato dalla riscrittura, tutte e due caricano. La misura che
+era impossibile è diventata una riga di tabella --- 11 letture per P2, 29 per P3
+--- senza che nessuno abbia riscritto il contatore.
+
 % ==================================================================
 \chapter{I numeri, e che cosa dicono davvero}
 
@@ -701,11 +907,11 @@ Misure su una macchina virtuale a 4 processori, modello 65-4-4-7, scala 24.
 \toprule
 & \textbf{baseline} & \textbf{P1} & \textbf{P2} & \textbf{P3} \\
 \midrule
-istruzioni caricate & 155 & 971 & 16\,185 & 11\,826 \\
+istruzioni caricate & 155 & 1\,026 & 14\,628 & 12\,031 \\
 salti fra programmi & 0 & 1 & 1 & 3 \\
-letture di tabella  & 3,0 & 5,0 & n.d. & 28,0 \\
-latenza, esecuzione 1 & 35 ns & 62 ns & 243 ns & 478 ns \\
-latenza, esecuzione 2 & 28 ns & 67 ns & 247 ns & 422 ns \\
+letture di tabella  & 3,0 & 6,0 & 11,0 & 29,0 \\
+memoria delle tabelle & 280 B & 2\,356 B & 10\,416 B & 19\,508 B \\
+latenza (minimo di 7) & 29 ns & 73 ns & 262 ns & 421 ns \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -713,27 +919,67 @@ latenza, esecuzione 2 & 28 ns & 67 ns & 247 ns & 422 ns \\
 Il \emph{baseline} è un programma che analizza il pacchetto e lo rimanda fuori
 senza alcuna inferenza: è il pavimento contro cui si legge tutto il resto.
 
+Tutte le colonne vengono dalla \textbf{stessa esecuzione}, sulla stessa
+macchina, nello stesso minuto. La riga "letture di tabella" è piena per la prima
+volta: fino alla riscrittura del capitolo precedente, per P2 e P3 diceva
+\emph{n.d.}
+
 \section{Primo risultato: la dimensione non predice la velocità}
 
 \begin{lezione}
-\textbf{P3 ha il 27\% di istruzioni in meno di P2 ed è quasi il doppio più
-lento.}
+\textbf{P3 ha il 18\% di istruzioni in meno di P2 ed è il 61\% più lento.}
 
 Il motivo sta nelle due righe centrali: tre salti fra programmi invece di uno, e
-ventotto letture di tabella per pacchetto.
+ventinove letture di tabella per pacchetto invece di undici.
 \end{lezione}
 
 Il conteggio delle istruzioni misura quanto è \emph{grande} il programma
 caricato, non quanto \emph{lavoro} fa per pacchetto. In questo regime a dominare
 sono le letture di memoria e i salti, non l'aritmetica.
 
-Questo si vede solo perché le quattro colonne vengono dalla stessa esecuzione,
-sulla stessa macchina, nello stesso minuto.
+\subsection*{Perché P2 è più grande, pur essendo più veloce}
+
+Le due cose hanno la stessa causa: \textbf{P3 non tiene la rete intera in un
+programma}.
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=7mm,
+              inner sep=4pt,font=\scriptsize,align=center},
+  arr/.style={-{Stealth[length=4pt]},draw=soft,thick},
+  lp/.style={-{Stealth[length=4pt]},draw=accent,thick}
+]
+\node[box,draw=accent] (p2) {\textbf{P2} --- un programma solo\\[1pt]
+  strato 1 \;+\; strato 2 \;+\; uscita\\[1pt]
+  \emph{tutti srotolati insieme: 14\,587}};
+\node[box,below=7mm of p2,draw=good] (p3a) {\textbf{P3} --- primo strato: 10\,207};
+\node[box,below=4mm of p3a,draw=good] (p3b) {strato denso generico: 1\,688\\[1pt]
+  \emph{UNA copia, eseguita DUE volte}};
+\draw[lp] (p3a) -- (p3b);
+\draw[lp] (p3b.east) -- ++(9mm,0) |- node[right,font=\scriptsize,pos=0.25] {salto} (p3b.north east);
+\end{tikzpicture}
+\end{center}
+
+P3 srotola \textbf{un} solo strato denso generico e ci rientra, con un salto fra
+programmi, a ogni passo della rete. Così la \emph{profondità} del modello non
+costa dimensione: un modello a quattro strati gira sullo stesso identico binario.
+P2 deve srotolarli tutti, perché è un programma solo --- e un modello più
+profondo richiede un altro binario.
+
+Quel riuso è esattamente ciò che P3 paga in latenza: ogni rientro è un salto più
+le letture che servono a ricostruire il contesto perduto.
+
+\begin{lezione}
+La stessa scelta di progetto spiega \emph{entrambi} i numeri: P3 è più piccolo
+\textbf{perché} riusa un pezzo, ed è più lento \textbf{perché} riusarlo costa un
+salto e delle letture ogni volta.
+\end{lezione}
 
 \section{Secondo risultato: quanto valgono le latenze assolute}
 
-Le due esecuzioni in tabella sono lo \textbf{stesso identico binario}, a minuti
-di distanza.
+Ogni cifra di latenza in tabella è il \textbf{minimo di sette misure}
+indipendenti. Guardando come sono distribuite quelle sette, dentro una singola
+esecuzione:
 
 \begin{center}
 \small
@@ -741,21 +987,55 @@ di distanza.
 \toprule
 & baseline & P1 & P2 & P3 \\
 \midrule
-scarto fra le due esecuzioni & $-20\%$ & $+8\%$ & $+2\%$ & $-12\%$ \\
+minimo   & 29 ns & 73 ns & 262 ns & 421 ns \\
+mediana  & 30 ns & 88 ns & 278 ns & 453 ns \\
+massimo  & 32 ns & 99 ns & 327 ns & 476 ns \\
+\midrule
+dispersione & 10\% & \textbf{36\%} & 25\% & 13\% \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Le \textbf{istruzioni sono identiche} nelle due esecuzioni: sono deterministiche.
-Le latenze no.
+Il 36\% di P1 è \emph{dentro} una sola esecuzione, sullo stesso binario, in
+pochi secondi. Le \textbf{istruzioni sono identiche} fra esecuzioni diverse: sono
+deterministiche. Le latenze no.
 
 \begin{lezione}
-Su questa macchina virtuale una differenza di latenza sotto il 20\% fra due
-misure prese in momenti diversi \textbf{non significa nulla}. Vale il confronto
-\emph{dentro} una singola esecuzione.
+Su questa macchina virtuale una differenza di latenza sotto il 20\%--30\%
+\textbf{non significa nulla}, nemmeno dentro la stessa esecuzione. Valgono i
+rapporti fra le colonne, non le cifre.
 
-Ogni cifra assoluta va letta come ordine di grandezza su questa VM, mai come
+Ogni valore assoluto va letto come ordine di grandezza su questa VM, mai come
 prestazione del sistema.
+\end{lezione}
+
+\subsection*{Un caso in cui la regola è servita}
+
+Il tetto sulle code di P3, riportato da 1 a 8, aggiunge \textbf{3\,357
+istruzioni} al programma:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{tetto 1} & \textbf{tetto 8} \\
+\midrule
+istruzioni (P3) & 8\,674 & 12\,031 \\
+letture per pacchetto & 29,0 & 29,0 \\
+\textbf{latenza} & \textbf{419 ns} & \textbf{421 ns} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il 39\% di istruzioni in più costa \textbf{2 nanosecondi}, cioè niente, e le
+letture non si muovono di una. Il motivo è semplice: il modello depositato non
+dichiara la feature delle code, quindi quel ramo del programma \emph{non viene
+mai eseguito}. Cresce la dimensione statica; il percorso eseguito è lo stesso.
+
+\begin{lezione}
+Una metrica che si sposta del 39\% senza che cambi nulla di ciò che gira
+\textbf{non è una misura di costo}. Il numero di istruzioni va letto come
+"quanto è grande il binario", mai come "quanto lavora".
 \end{lezione}
 
 Questo ha reso necessario rifare la tabella dei risultati: la versione
@@ -788,6 +1068,48 @@ genericità di P2 non è gratis: si paga in stati del verificatore, e il tetto s
 tocca con numeri ragionevoli (8 neuroni, 4 feature, 128 ingressi).
 \end{lezione}
 
+\section{Quarto risultato: togliere il compilatore dal nodo}
+
+P1 scrive i pesi \emph{dentro} il codice come numeri letterali. È ciò che la
+rende veloce --- il compilatore può far sparire le moltiplicazioni per zero e
+trasformare in scorrimenti quelle per potenze di due --- ma ha un prezzo: ogni
+volta che il modello cambia, bisogna \textbf{rieseguire il compilatore sul nodo}.
+
+Misurato in questa esecuzione: \textbf{1\,242 ms}. Più di un secondo in cui quel
+nodo non sta aggiornando niente.
+
+L'alternativa è compilare \emph{prima}, su una macchina qualunque, e spedire al
+nodo l'oggetto già pronto. Al momento del deploy il nodo apre il file e lo carica,
+senza compilatore:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{con compilatore sul nodo} & \textbf{oggetto precompilato} \\
+\midrule
+costo di messa in servizio & 1\,242 ms & 37 ms \\
+istruzioni & 1\,026 & 979 \\
+latenza per pacchetto & 73 ns & 74 ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+Due ordini di grandezza sul costo di aggiornamento, e \textbf{nessun costo per
+pacchetto}: 74 ns contro 73 ns è la stessa cifra, dentro il rumore misurato
+sopra. La riduzione fatta dal compilatore sui pesi letterali resta dentro
+l'oggetto.
+\end{lezione}
+
+Una cautela sul numero 37: il costo di caricamento varia molto fra esecuzioni
+--- sono stati osservati 4,7, 6,2, 20,7 e 37,2 ms per lo stesso oggetto. Quello
+che regge è l'\emph{ordine di grandezza} rispetto al secondo e un quarto del
+compilatore, non la cifra precisa.
+
+Vale solo quando i modelli sono noti in anticipo, che è l'ipotesi sotto cui P1
+esiste.
+
 \section{Che cosa questi numeri non dicono}
 
 \texttt{BPF\_PROG\_TEST\_RUN} esegue il programma in un ciclo sullo stesso
@@ -810,6 +1132,15 @@ vero, generato a ritmo, e la misura di quanti pacchetti si perdono.
 \item emulatore rimosso; verifica end-to-end su datapath reale con XDP native;
 \item errore del bias nell'ultimo strato corretto;
 \item feature dell'interfaccia d'ingresso resa viva in tutte e tre le pipeline;
+\item \textbf{indice del nodo} letto a runtime da tabella in tutte e tre: era
+      l'ultimo ingresso su cui le pipeline non concordavano, e pesa 208 pesi su
+      319;
+\item primo strato riscritto con i cicli invertiti in P2 e P3: stesso risultato
+      bit per bit, un terzo dei rami in meno, e il margine di verifica che ne è
+      uscito ha permesso di \textbf{recuperare il tetto sulle code} (da 1 a 8) e
+      di \textbf{rimettere la riga delle letture di tabella}, che era n.d.;
+\item oggetto precompilato (AOT) compilato, caricato e misurato: aggiornamento
+      del modello da 1\,242 ms a 37 ms, a parità di costo per pacchetto;
 \item tabella dei risultati rifatta su uno stato del codice solo.
 \end{itemize}
 
@@ -825,6 +1156,16 @@ vero, generato a ritmo, e la misura di quanti pacchetti si perdono.
 \item \textbf{Hardware vero}: la scheda di rete di questa macchina virtuale è
       emulata e non supporta XDP native. I numeri assoluti restano non citabili
       come prestazioni di sistema.
+\item \textbf{Il tetto sull'uscita di P2}: lo strato finale è srotolato a 32
+      classi per un modello che ne ha 7, cioè 256 moltiplicazioni dove ne
+      servono 28. Abbassarlo ridurrebbe molto il programma, ma \emph{cambia il
+      comportamento}: restringe l'insieme dei modelli rappresentabili. La strada
+      pulita è generare quel tetto dall'inviluppo dichiarato dal deployment
+      invece di fissarlo nel sorgente --- una ricompilazione per inviluppo, non
+      per modello.
+\item \textbf{I salti fra programmi di P3}: sono tre per pacchetto ed è lì che
+      sta la latenza, non nella dimensione. Ridurli è un lavoro diverso da
+      quello fatto finora.
 \end{itemize}
 
 \section{Il filo conduttore}
@@ -844,6 +1185,8 @@ DROP $=$ ultima classe & nel modello depositato capitava così \\
 $n_{\text{nodi}} = 52$ di default & si provava una topologia sola \\
 \texttt{eth0} $=$ ifindex 2 & si provava dentro un container pulito \\
 bias dell'uscita $\times\, s^0$ & si provava coi link tutti attivi \\
+one-hot del nodo $=$ \texttt{model\_id} & si registrava un modello solo \\
+tabella vuota $=$ nodo 0 & l'array è preallocato a zero \\
 \bottomrule
 \end{tabular}
 \end{center}

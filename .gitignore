@@ -16,3 +16,11 @@ ipa/poc_aot/loader_aot
 # one of these byte-identically (seed 20260916); test_synth.py generates its own
 # into temp dirs and never reads this tree. 42 files / 4.4 MB of pure output.
 ipa/synth/scenarios/
+
+# LaTeX build artefacts. The .tex is the source and the .pdf is tracked (it is
+# what gets read); everything pdflatex writes in between is regenerable by
+# running it again, and .aux/.out churn on every compile.
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
