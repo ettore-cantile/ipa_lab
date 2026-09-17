@@ -196,14 +196,24 @@ def pg_reset():
     pg_write(f"{PKTGEN_DIR}/pgctrl", "reset")
 
 
-def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0):
-    """One device on one kernel thread.
+def pg_clear_threads(n):
+    """Detach every device from the first `n` generator threads."""
+    for i in range(n):
+        try:
+            pg_write(f"{PKTGEN_DIR}/kpktgend_{i}", "rem_device_all")
+        except RuntimeError:
+            break                   # fewer threads than CPUs: nothing to clear
 
-    Thread 0 only: with TG and DUT on the same box, more generator threads
-    would take CPUs away from the pipeline being measured and the comparison
-    between pipelines would stop being about the pipelines."""
-    pg_write(f"{PKTGEN_DIR}/kpktgend_0", "rem_device_all")
-    pg_write(f"{PKTGEN_DIR}/kpktgend_0", f"add_device {dev}")
+
+def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0,
+                 thread=0):
+    """Put one device on one generator thread and configure it.
+
+    One thread per device, one device per thread. pktgen threads are pinned to
+    a CPU each, so N devices on N threads is N generator cores -- which is the
+    only way to raise the offered load on this bench, clone_skb being refused
+    by veth (it modifies the skb, so it cannot advertise IFF_TX_SKB_SHARING)."""
+    pg_write(f"{PKTGEN_DIR}/kpktgend_{thread}", f"add_device {dev}")
     d = f"{PKTGEN_DIR}/{dev}"
     # add_device creates this entry, and a failed add leaves it missing. Saying
     # so here beats an ENOENT from the first pgset, which points at the wrong
@@ -248,29 +258,40 @@ _USEC_RE = re.compile(r"Result: OK:\s*(\d+)\(")
 _PPS_RE = re.compile(r"(\d+)pps")
 
 
-def pg_run_and_read(dev):
-    """Start, wait for the run to finish, and parse this device's result.
+def pg_run_and_read(devs):
+    """Start every configured thread, wait, and sum what they sent.
 
-    Returns (packets_sent, pps, seconds). pktgen's own report is the TX truth:
-    counting on the receiving side would already be the thing under test."""
+    `pgctrl start` runs ALL threads at once and blocks until the last one
+    finishes, so one call drives the whole generator. TX is the sum over
+    devices; the duration is the LONGEST of them, because the offered rate is
+    what the slowest thread finished in -- taking the shortest would inflate
+    every pps in the table."""
+    if isinstance(devs, str):
+        devs = [devs]
     wall0 = time.time()
-    pg_write(f"{PKTGEN_DIR}/pgctrl", "start")     # blocks until done
+    pg_write(f"{PKTGEN_DIR}/pgctrl", "start")     # blocks until all are done
     wall = time.time() - wall0
-    with open(f"{PKTGEN_DIR}/{dev}") as f:
-        text = f.read()
 
-    m = _SOFAR_RE.search(text)
-    sent = int(m.group(1)) if m else 0
-    m = _USEC_RE.search(text)
-    secs = (int(m.group(1)) / 1e6) if m else wall
-    m = _PPS_RE.search(text)
-    pps = int(m.group(1)) if m else (int(sent / secs) if secs else 0)
+    sent = pps = 0
+    secs = 0.0
+    for dev in devs:
+        with open(f"{PKTGEN_DIR}/{dev}") as f:
+            text = f.read()
+        m = _SOFAR_RE.search(text)
+        sent += int(m.group(1)) if m else 0
+        m = _USEC_RE.search(text)
+        if m:
+            secs = max(secs, int(m.group(1)) / 1e6)
+        m = _PPS_RE.search(text)
+        pps += int(m.group(1)) if m else 0
+    secs = secs or wall
+    pps = pps or (int(sent / secs) if secs else 0)
     if sent == 0:
         # Nothing parsed usually means the device was never added, or pktgen
         # refused the config. Hand the raw text over rather than reporting a
         # silent zero that looks like 100% loss.
         raise RuntimeError(
-            f"pktgen non riporta pacchetti per {dev}. Uscita grezza:\n"
+            f"pktgen non riporta pacchetti per {devs}. Uscita grezza:\n"
             + text[:600])
     return sent, pps, secs
 
@@ -304,12 +325,20 @@ def _zero_counters(setup, rx_tab, n_out):
     rx_tab.clear()
 
 
-def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0):
-    """One (frame size, offered rate) point. Returns a dict of counters."""
+def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
+                  tg_devs=None):
+    """One (frame size, offered rate) point. Returns a dict of counters.
+
+    `count` is per generator thread, so the offered load scales with the number
+    of threads and the per-thread duration stays comparable."""
+    devs = tg_devs or [fab.ingress_peer]
     _zero_counters(setup, rx_tab, n_out)
-    pg_configure(fab.ingress_peer, frame, count, delay,
-                 dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02", clone=clone)
-    tx, tx_pps, elapsed = pg_run_and_read(fab.ingress_peer)
+    pg_clear_threads(len(devs))
+    for i, dev in enumerate(devs):
+        pg_configure(dev, frame, count, delay,
+                     dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02",
+                     clone=clone, thread=i)
+    tx, tx_pps, elapsed = pg_run_and_read(devs)
     hit = _read_u64(setup["pkt_stats"], 0)
     miss = _read_u64(setup["pkt_stats"], 1)
     drop = _read_u64(setup["pkt_stats"], 2)
@@ -324,6 +353,55 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0):
                 lost_before=max(0, tx - hit),
                 lost_after=max(0, hit - rx),
                 loss_pct=round(100.0 * (tx - rx) / tx, 3) if tx else 0.0)
+
+
+# ==========================================================================
+# extra ingress links: one generator core each
+# ==========================================================================
+TG_PREFIX = "ipatg"
+
+
+def _ip(*args, check=True):
+    return subprocess.run(["ip", *args], capture_output=True, text=True,
+                          check=check)
+
+
+def make_tg_links(n):
+    """`n` extra veth pairs, each the ingress of one more generator thread.
+
+    Why this exists: clone_skb is refused by veth, so a single pktgen thread
+    cannot be made faster. What CAN be added is threads -- pktgen pins one per
+    CPU -- and each needs its own device. All of them feed the SAME XDP
+    program, so the offered load scales with cores while the thing under test
+    stays one program with one set of maps.
+
+    That is also what makes the result interesting rather than just bigger:
+    pkt_stats and cls_stats are shared BPF_ARRAYs incremented with
+    __sync_fetch_and_add, so several cores hammering them contend on the same
+    cache line. Whether that shows up is the question this can answer and the
+    single-core measurement cannot.
+
+    Returns [(rx_dev, tx_dev, rx_ifindex), ...]."""
+    made = []
+    for i in range(n):
+        rx, tx = f"{TG_PREFIX}{i}", f"{TG_PREFIX}{i}p"
+        _ip("link", "del", rx, check=False)          # leftovers from a crash
+        _ip("link", "add", rx, "type", "veth", "peer", tx)
+        for dev in (rx, tx):
+            _ip("link", "set", dev, "up")
+            # IPv6 autoconf would put router solicitations on the same wire and
+            # they would be counted as traffic that nobody generated.
+            subprocess.run(["sysctl", "-qw",
+                            f"net.ipv6.conf.{dev}.disable_ipv6=1"],
+                           capture_output=True, check=False)
+        idx = int(_ip("-o", "link", "show", rx).stdout.split(":")[0])
+        made.append((rx, tx, idx))
+    return made
+
+
+def del_tg_links(n):
+    for i in range(n):
+        _ip("link", "del", f"{TG_PREFIX}{i}", check=False)
 
 
 # ==========================================================================
@@ -402,7 +480,7 @@ def attach_rx_counter(fab):
 
 # ==========================================================================
 def run_method(method, model_path, frames, delays, count, out_rows,
-               clone=0):
+               clone=0, threads=1):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -421,9 +499,25 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         info(f"pipeline agganciata a {fab.ingress} (ifindex "
              f"{fab.ingress_ifindex})")
 
+        # Thread 0 uses the fabric's own ingress; the rest get their own veth.
+        tg_devs = [fab.ingress_peer]
+        extra = []
+        if threads > 1:
+            import test_fabric as TF
+            extra = make_tg_links(threads - 1)
+            ing_map = setup["b"][TF._INGRESS_NAME[setup["pipeline"]]]
+            for rx, tx, idx in extra:
+                attach_xdp(setup["b"], setup["disp"], rx)
+                # Same logical port as the fabric ingress: these are extra
+                # generator cores feeding one node, not extra node ports.
+                ing_map[ct.c_uint32(idx)] = ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
+                tg_devs.append(tx)
+            info(f"{threads} core generatori: {', '.join(tg_devs)}")
+
         # -- sonda: un pacchetto solo, per sapere se stiamo misurando
         #    inferenza o XDP_PASS.
-        probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone)
+        probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
+                              tg_devs)
         if probe["hit"] == 0:
             warn(f"la sonda non ha prodotto nessun HIT "
                  f"(tx={probe['tx']} miss={probe['miss']}).")
@@ -453,16 +547,19 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                 # Manual sweep: the caller asked for specific rates.
                 for delay in delays:
                     r = measure_point(setup, rx_tab, fab, frame, delay, count,
-                                      n_out, clone)
+                                      n_out, clone, tg_devs)
                     r["clone_skb"], r["method"] = clone, method
+                    r["threads"] = threads
                     out_rows.append(r)
                     printer(r)
             else:
                 find_knee(setup, rx_tab, fab, frame, count, n_out, clone,
-                          out_rows, method, printer)
+                          out_rows, method, printer, tg_devs=tg_devs,
+                          threads=threads)
             _summarise(method, frame, out_rows)
 
         pg_reset()
+        del_tg_links(threads - 1)
         for peer in attached:
             subprocess.run(["ip", "link", "set", "dev", peer, "xdp", "off"],
                            check=False, capture_output=True)
@@ -471,7 +568,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
 
 
 def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
-              method, printer, max_delay=20000, steps=6):
+              method, printer, max_delay=20000, steps=6, tg_devs=None,
+              threads=1):
     """Find the fastest rate this pipeline takes without losing a packet.
 
     A fixed list of delays spends most of its time at the slow end, where the
@@ -486,8 +584,10 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
 
     Returns (peak_row, clean_row_or_None). Costs about `steps` measurements
     instead of one per delay, and lands on the answer rather than near it."""
-    full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone)
+    full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone,
+                         tg_devs)
     full["method"], full["clone_skb"], full["delay"] = method, clone, 0
+    full["threads"] = threads
     out_rows.append(full)
     printer(full)
 
@@ -503,9 +603,10 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         # used only to answer "does this pipeline EVER saturate", and the rows
         # it produces carry clone_skb != 0 so they stay distinguishable.
         hard = measure_point(setup, rx_tab, fab, frame, 0, count, n_out,
-                             ESCALATE_CLONE)
+                             ESCALATE_CLONE, tg_devs)
         hard["method"], hard["clone_skb"], hard["delay"] = \
             method, ESCALATE_CLONE, 0
+        hard["threads"] = threads
         out_rows.append(hard)
         printer(hard)
         if hard["loss_pct"] > 0.0:
@@ -513,7 +614,7 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
                   f"il ginocchio esiste, lo cerco{NC}")
             return find_knee(setup, rx_tab, fab, frame, count, n_out,
                              ESCALATE_CLONE, out_rows, method, printer,
-                             max_delay, steps)
+                             max_delay, steps, tg_devs, threads)
         print(f"  {GREY}nemmeno con clone_skb={ESCALATE_CLONE}: su questa "
               f"macchina satura il generatore, non la pipeline{NC}")
         return (hard if hard["rx_pps"] > full["rx_pps"] else full), hard
@@ -527,8 +628,9 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         mid = (lo + hi) // 2
         if mid in (lo, hi):
             break
-        r = measure_point(setup, rx_tab, fab, frame, mid, count, n_out, clone)
-        r["method"], r["clone_skb"] = method, clone
+        r = measure_point(setup, rx_tab, fab, frame, mid, count, n_out,
+                          clone, tg_devs)
+        r["method"], r["clone_skb"], r["threads"] = method, clone, threads
         out_rows.append(r)
         printer(r)
         if r["loss_pct"] == 0.0:
@@ -572,6 +674,11 @@ def main():
                         "meno punti e centra la risposta")
     p.add_argument("--count", type=int, default=200000,
                    help="pacchetti per punto di misura")
+    p.add_argument("--threads", type=int, default=1, metavar="N",
+                   help="core generatori: N veth d'ingresso, N thread pktgen, "
+                        "tutti sullo stesso programma XDP. E' l'unico modo di "
+                        "alzare il carico offerto, visto che veth rifiuta "
+                        "clone_skb.")
     p.add_argument("--clone-skb", type=int, default=0, metavar="N",
                    help="riusa lo stesso skb N volte invece di allocarne uno "
                         "per pacchetto: alza molto il rate offerto. "
@@ -590,6 +697,7 @@ def main():
     if a.cleanup:
         from netns_fabric import cleanup
         cleanup()
+        del_tg_links(16)
         if pg_available():
             pg_reset()
         return 0
@@ -608,7 +716,7 @@ def main():
     rc = 0
     for m in methods:
         rc |= run_method(m, model_path, frames, delays, a.count, rows,
-                         a.clone_skb)
+                         a.clone_skb, a.threads)
 
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
