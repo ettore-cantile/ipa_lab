@@ -162,8 +162,30 @@ def warn(m):
 # pktgen
 # ==========================================================================
 def pg_write(path, cmd):
-    with open(path, "w") as f:
-        f.write(cmd + "\n")
+    """Write one pktgen command, and say which one if it fails.
+
+    os.open(O_WRONLY) rather than open(path, "w"): the builtin adds O_TRUNC,
+    and a procfs file with no truncate handler answers that with
+    `OSError: [Errno 95] Operation not supported` -- an error about the OPEN
+    that reads like an error about pktgen.
+
+    The failure is wrapped because the bare OSError names neither the command
+    nor the file, and pktgen has a dozen commands per configuration: without
+    this the message says only "Operation not supported"."""
+    try:
+        fd = os.open(path, os.O_WRONLY)
+    except OSError as e:
+        raise RuntimeError(
+            f"pktgen: non posso aprire {path} ({e.strerror}). "
+            f"Se il file non esiste, `add_device` non ha avuto effetto.") from e
+    try:
+        os.write(fd, (cmd + "\n").encode())
+    except OSError as e:
+        raise RuntimeError(
+            f"pktgen: comando '{cmd}' rifiutato da {path} "
+            f"({e.strerror}). Questo kernel potrebbe non supportarlo.") from e
+    finally:
+        os.close(fd)
 
 
 def pg_available():
@@ -183,10 +205,25 @@ def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0):
     pg_write(f"{PKTGEN_DIR}/kpktgend_0", "rem_device_all")
     pg_write(f"{PKTGEN_DIR}/kpktgend_0", f"add_device {dev}")
     d = f"{PKTGEN_DIR}/{dev}"
+    # add_device creates this entry, and a failed add leaves it missing. Saying
+    # so here beats an ENOENT from the first pgset, which points at the wrong
+    # step.
+    if not os.path.exists(d):
+        raise RuntimeError(
+            f"pktgen: {d} non esiste dopo `add_device {dev}`. "
+            f"L'interfaccia esiste ed e' UP? `ip link show {dev}`")
+    if clone:
+        # Optional by design: clone_skb is the escalation knob, not part of the
+        # reference condition. A kernel that refuses it costs one experiment,
+        # not the whole run -- so it is tried separately and its failure is
+        # reported rather than raised.
+        try:
+            pg_write(d, f"clone_skb {clone}")
+        except RuntimeError as e:
+            warn(f"clone_skb non accettato, proseguo senza: {e}")
     for cmd in (f"count {count}",
                 f"pkt_size {pkt_size}",
                 f"delay {delay}",
-                f"clone_skb {clone}",
                 f"dst {dst_ip}",
                 f"dst_mac {dst_mac}",
                 "udp_src_min 1234", "udp_src_max 1234",
