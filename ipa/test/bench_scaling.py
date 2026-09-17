@@ -175,8 +175,21 @@ def _sample(disp_fd, frame, repeat, trials):
 
 def _totals(b, progs):
     """Sum xlated + jited over every loaded program, and map memory over every
-    map, exactly as test_suite.py reports them."""
+    map, exactly as test_suite.py reports them.
+
+    The map names come from test_suite._PIPELINE_MAP_NAMES rather than a copy
+    kept here. That list carries a warning about staying in sync with the three
+    eBPF sources, and it earned it: it was once incomplete, and because a
+    missing map is silently skipped, the only symptom was a footprint smaller
+    than the truth. A second copy would reintroduce exactly that failure.
+
+    (A BCC `BPF` object has no .items(): it exposes maps through __getitem__
+    and only caches the ones already asked for, so iterating it would have
+    returned whatever happened to have been touched. That is what the first
+    version of this function did, and every cell of the sweep crashed with
+    `AttributeError: 'BPF' object has no attribute 'items'`.)"""
     from verify_prog_run import prog_insn_count, map_bytes, _nr_cpus
+    from test_suite import _PIPELINE_MAP_NAMES
     insns = jited = 0
     per_prog = {}
     for name, fd in progs.items():
@@ -186,12 +199,15 @@ def _totals(b, progs):
         jited += j
     nr = _nr_cpus()
     mb = 0
-    for _name, table in b.items():
+    counted = []
+    for mname in _PIPELINE_MAP_NAMES:
         try:
-            mb += map_bytes(table.map_fd, nr)
+            one = map_bytes(b[mname].map_fd, nr)
         except Exception:
-            pass
-    return insns, jited, mb, per_prog
+            continue          # not a map this pipeline declares
+        mb += one
+        counted.append(mname)
+    return insns, jited, mb, per_prog, counted
 
 
 def _bench_p1(n_nodes, dims, repeat, trials):
@@ -219,27 +235,31 @@ def _bench_p1(n_nodes, dims, repeat, trials):
     (b, model_fn, disp_fn), build_ms = _timed(_load)
     _seed_link_state(b, 1)
 
-    insns, jited, mb, per_prog = _totals(
+    insns, jited, mb, per_prog, maps = _totals(
         b, {"ipa_switch_hardcoded": disp_fn.fd, "model_0": model_fn.fd})
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog)
+                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
 
 
 def _bench_p2(n_nodes, dims, repeat, trials):
+    # Checked BEFORE the imports on purpose: "P2 cannot do this depth" is a
+    # property of P2, not of whether BCC happens to be installed. Behind the
+    # imports, a machine without BCC would report this cell as a crash rather
+    # than as the structural limit it is.
+    if len(dims) != 2:
+        raise NotImplementedError(
+            f"P2 compila esattamente 2 hidden layer (fc1, fc2); "
+            f"questa forma ne chiede {len(dims)}")
+
     from bcc import BPF
     from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
                                     EBPF_ARCH_GENERIC_2LAYER,
                                     load_arch_weights)
     from verify_prog_run import build_frame_sparse, _seed_link_state
-
-    if len(dims) != 2:
-        raise NotImplementedError(
-            f"P2 compila esattamente 2 hidden layer (fc1, fc2); "
-            f"questa forma ne chiede {len(dims)}")
 
     shape = build_shape(n_nodes, dims)
     n_in, n_out = shape["n_in"], shape["n_out"]
@@ -267,7 +287,7 @@ def _bench_p2(n_nodes, dims, repeat, trials):
                       semantics=shape.get("semantics"))
     _seed_link_state(b, 1)
 
-    insns, jited, mb, per_prog = _totals(
+    insns, jited, mb, per_prog, maps = _totals(
         b, {"ipa_switch_template": disp_fn.fd,
             "arch_generic_2layer": leaf_fn.fd})
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
@@ -275,7 +295,7 @@ def _bench_p2(n_nodes, dims, repeat, trials):
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog)
+                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
 
 
 def _bench_p3(n_nodes, dims, repeat, trials):
@@ -309,7 +329,7 @@ def _bench_p3(n_nodes, dims, repeat, trials):
                          semantics=shape.get("semantics"))
     _seed_link_state(b, 1)
 
-    insns, jited, mb, per_prog = _totals(
+    insns, jited, mb, per_prog, maps = _totals(
         b, {"modular_dispatcher": disp_fn.fd,
             "layer_first": first_fn.fd,
             "layer_hidden": hidden_fn.fd})
@@ -320,7 +340,7 @@ def _bench_p3(n_nodes, dims, repeat, trials):
     # x (n_layers - 1). NOT the number of distinct programs, which is always 3.
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=len(layer_dims),
                 nw=nw, n_in=n_in, build_ms=build_ms, lat_ns=lo, lat_p50=med,
-                lat_max=hi, retval=retval, per_prog=per_prog)
+                lat_max=hi, retval=retval, per_prog=per_prog, n_maps=len(maps))
 
 
 _BENCH = {"hardcoded": _bench_p1, "template": _bench_p2, "modular": _bench_p3}
@@ -397,7 +417,7 @@ def run_axis(axis, repeat, trials, out_dir):
             else:
                 mark = f"{GREY}n/d{NC}" if r.get("skipped") else f"{RED}CRASH{NC}"
                 print(f"  {v:5d} {pipe:10s} {shape_str:>16s} {'':6s} "
-                      f"{mark} {GREY}{r.get('detail', '')[:44]}{NC}")
+                      f"{mark} {GREY}{r.get('detail', '')[:90]}{NC}")
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
