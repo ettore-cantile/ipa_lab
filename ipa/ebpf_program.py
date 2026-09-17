@@ -584,11 +584,56 @@ def _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1):
-    """node one-hot: active index = model_id (0..size-1), weight switch selects
-    fc1_w[j, offset + node]. One switch total, verifier-safe."""
+def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1,
+                             static_index=None):
+    """node one-hot: the weight switch selects fc1_w[j, offset + node].
+
+    Two modes, and the difference between them is a whole pipeline:
+
+    static_index=None (the DEFAULT, "P1.5")
+        The node index is read from the `node_id` map at runtime, and the
+        switch carries every node's weights -- `size` cases of `n_h1`
+        assignments each, of which exactly ONE runs. For Germany50 that is
+        52 x 4 = 208 literal assignments compiled in to execute 4. One binary
+        serves the whole network.
+
+    static_index=k ("P1", fully specialised)
+        The node index is frozen at code-generation time, so the switch
+        collapses to the `n_h1` literals of row k and the map read disappears
+        with it. Those literals are now compile-time constants feeding an
+        accumulator, so clang folds them: a zero weight vanishes entirely, a
+        power of two becomes a shift. The cost is that the binary is valid on
+        ONE node -- every node in the topology needs its own.
+
+    Freezing the node is legitimate in a way freezing `ingress_iface` would
+    not be: a node's own index is a deployment constant, while the interface a
+    packet arrives on changes per packet."""
     size = feat["size"]
-    lines = ["    /* feature 'node' (one-hot): active index = model_id */",
+    if static_index is not None:
+        if not (0 <= static_index < size):
+            raise ValueError(
+                f"static_node={static_index} outside [0, {size}) for a node "
+                f"one-hot of width {size}. Refused rather than silently "
+                f"emitting an all-zero column, which would look like a "
+                f"working program for a node that is not in the topology.")
+        lines = [f"    /* feature 'node' (one-hot) FROZEN at index "
+                 f"{static_index} of {size}.",
+                 "     * No node_id map read and no switch: this binary is "
+                 "valid on that",
+                 "     * node alone. The weights below are constants, so clang "
+                 "folds them",
+                 "     * into the accumulator -- zeros disappear, powers of two "
+                 "become",
+                 "     * shifts. See _gen_feature_onehot_node. */"]
+        for j in range(n_h1):
+            w = fc1_w[j * n_in + offset + static_index]
+            lines.append(f"    long long w_node_{j} = {_lit(w)}LL;")
+
+        def term_static(j):
+            return f"w_node_{j}"
+        return lines, term_static
+
+    lines = ["    /* feature 'node' (one-hot): index read from the node_id map */",
              "    /* Bounded to a byte: the verifier reasons about the",
              "     * switch below far more cheaply with a tight range, and",
              "     * this used to come from a __u8. 256 = unknown, which",
@@ -610,7 +655,7 @@ def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _gen_feature(feat, offset, n_in, fc1_w, n_h1):
+def _gen_feature(feat, offset, n_in, fc1_w, n_h1, static_node=None):
     """Dispatch to the right per-kind generator for one descriptor entry."""
     t = feat["type"]
     kind = _model_meta.FEATURE_CATALOG[t]["kind"]
@@ -622,7 +667,8 @@ def _gen_feature(feat, offset, n_in, fc1_w, n_h1):
         if t == "ingress_iface":
             return _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1)
         if t == "node":
-            return _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1)
+            return _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1,
+                                            static_index=static_node)
     raise ValueError(f"no C generator for feature type {t!r} (kind {kind!r})")
 
 
@@ -641,6 +687,7 @@ def generate_ebpf_hardcoded(
     features: list = None,
     n_out: int = None,
     semantics=None,
+    static_node: int = None,
 ) -> str:
     """
     Generate an eBPF XDP program, function name `model_<model_id>`, for
@@ -740,7 +787,8 @@ def generate_ebpf_hardcoded(
     term_fns  = []
     offset = 0
     for feat in features:
-        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1)
+        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1,
+                                 static_node=static_node)
         fc1_lines.extend(pre)
         term_fns.append(term)
         offset += feat["size"]
@@ -833,6 +881,7 @@ def build_combined_hardcoded_source(
     features: list = None,
     n_out: int = None,
     semantics=None,
+    static_node: int = None,
 ) -> str:
     """
     models: list of (model_id, weights_int8, scale) tuples,
@@ -896,7 +945,7 @@ def build_combined_hardcoded_source(
         src += "\n" + generate_ebpf_hardcoded(
             weights_int8, scale, model_id, include_header=False,
             hidden_dims=hidden_dims, features=features, n_out=n_out,
-            semantics=semantics)
+            semantics=semantics, static_node=static_node)
     return src
 
 

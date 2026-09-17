@@ -132,7 +132,23 @@ GREEN, RED, YELLOW, GREY, NC = (
 N_INTERFACES = 6
 N_OUT = 7
 SCALE = 128
-PIPELINES = ("hardcoded", "template", "modular")
+# Four points on one ladder: how much is known when the program is compiled.
+#
+#   p1_static  weights AND this node's index baked in    -> one binary per NODE
+#   hardcoded  weights baked, node index from a map      -> one binary per MODEL
+#   template   nothing baked but the ceilings            -> one binary
+#   modular    depth read at runtime too                 -> one binary
+#
+# `hardcoded` is the pipeline the rest of this project calls P1; against
+# p1_static it is really a P1.5, because its feature LAYOUT is compiled in but
+# the node index is not. Naming it here would break every existing CSV, so the
+# distinction lives in this comment and in the figures' labels.
+PIPELINES = ("p1_static", "hardcoded", "template", "modular")
+
+# Which node this node is, when the index is frozen at compile time. Any value
+# inside the topology works; 7 is what the fabric test installs, so the two
+# agree by eye. Axes go down to 10 nodes, so 7 is always in range.
+STATIC_NODE = 7
 
 # Input-vector compositions. Imported rather than copied: bench_depth_vs_width
 # already curates this set to separate onehot COUNT from onehot SIZE, and two
@@ -326,7 +342,7 @@ def _totals(b, progs):
     return insns, jited, mb, per_prog, counted
 
 
-def _bench_p1(cell, repeat, trials):
+def _bench_p1(cell, repeat, trials, static_node=None):
     from bcc import BPF
     from ebpf_program import build_combined_hardcoded_source
     from verify_prog_run import build_frame_sparse, _seed_link_state
@@ -347,7 +363,8 @@ def _bench_p1(cell, repeat, trials):
         # what distinguishes it from P2 and P3.
         src = build_combined_hardcoded_source(
             models=[(0, weights, SCALE)],
-            features=shape["features"], n_out=n_out, hidden_dims=tuple(dims))
+            features=shape["features"], n_out=n_out, hidden_dims=tuple(dims),
+            static_node=static_node)
         bb = BPF(text=src)
         m = bb.load_func("model_0", BPF.XDP)
         d = bb.load_func("ipa_switch_hardcoded", BPF.XDP)
@@ -490,7 +507,15 @@ def _bench_p3(cell, repeat, trials):
                 sparsity_real=sparsity_real)
 
 
-_BENCH = {"hardcoded": _bench_p1, "template": _bench_p2, "modular": _bench_p3}
+def _bench_p1_static(cell, repeat, trials):
+    """P1 with this node's index frozen into the source. The node one-hot
+    switch and the node_id map read both disappear; what is left are n_h1
+    constants clang can fold. The binary is then valid on ONE node."""
+    return _bench_p1(cell, repeat, trials, static_node=STATIC_NODE)
+
+
+_BENCH = {"p1_static": _bench_p1_static, "hardcoded": _bench_p1,
+          "template": _bench_p2, "modular": _bench_p3}
 
 
 def _worker(pipeline, spec_json):
@@ -618,6 +643,111 @@ def _give_back(path):
         pass
 
 
+
+# ==========================================================================
+# EQUIVALENCE: the specialised P1 must DECIDE the same thing as P1.5
+# ==========================================================================
+def _build_p1(cell, static_node):
+    """Build and load one P1 variant; returns (bpf, dispatcher fd, frame)."""
+    from bcc import BPF
+    from ebpf_program import build_combined_hardcoded_source
+    from verify_prog_run import _install_mac_table
+
+    dims = cell["dims"]
+    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
+    n_in, n_out = shape["n_in"], shape["n_out"]
+    nw = weight_count(n_in, dims, n_out)
+    weights = make_weights(nw, cell["sparsity"])
+    src = build_combined_hardcoded_source(
+        models=[(0, weights, SCALE)], features=shape["features"],
+        n_out=n_out, hidden_dims=tuple(dims), static_node=static_node)
+    b = BPF(text=src)
+    model_fn = b.load_func("model_0", BPF.XDP)
+    disp_fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+    _install_mac_table(b, "mac_table")
+    return b, disp_fn.fd, shape
+
+
+def _decide(b, disp_fd, n_in, n_out, ttl, links):
+    """Run ONE packet and report which class fired. Counters are cleared
+    first, so the answer describes this packet and not the run before it."""
+    from verify_prog_run import (prog_test_run, build_frame_sparse,
+                                 _read_u64)
+    from common import write_vector_map
+    for c in range(n_out):
+        b["cls_stats"][ct.c_int(c)] = ct.c_ulonglong(0)
+    for k in range(4):
+        b["pkt_stats"][ct.c_int(k)] = ct.c_ulonglong(0)
+    write_vector_map(b, "link_state", list(links))
+    frame = build_frame_sparse(model_id=0, ttl=ttl, scale=SCALE,
+                               n_in=n_in, n_out=n_out)
+    retval, _ = prog_test_run(disp_fd, frame, repeat=1)
+    fired = -1
+    for c in range(n_out):
+        if _read_u64(b["cls_stats"], c) > 0:
+            fired = c
+            break
+    return retval, fired
+
+
+def verify_static(node=None):
+    """P1 with the node index FROZEN must decide exactly what P1.5 decides
+    with that same index installed in the node_id map.
+
+    This is the check that makes every speed number in the p1_static column
+    mean something. Folding the node one-hot picks ONE column out of the
+    first layer's weight matrix at code-generation time; picking the wrong
+    column produces a program that is smaller, faster, and computes a
+    different model -- and nothing else in this sweep would notice, because
+    the sweep measures cost, not correctness.
+
+    Two programs, the same packets, the same class every time, or it fails."""
+    node = STATIC_NODE if node is None else node
+    cell = cell_of("nodes", 52)
+    n_if = N_INTERFACES
+
+    b_s, fd_s, shape = _build_p1(cell, static_node=node)
+    b_d, fd_d, _ = _build_p1(cell, static_node=None)
+    # P1.5 learns the node at runtime; the frozen build already knows it.
+    b_d["node_id"][ct.c_uint(0)] = ct.c_uint(node)
+
+    n_in, n_out = shape["n_in"], shape["n_out"]
+    print(f"{YELLOW}{'=' * 70}{NC}")
+    print(f"{YELLOW} P1 specializzata (nodo {node} congelato) contro P1.5 "
+          f"(nodo da mappa){NC}")
+    print(f"{YELLOW}{'=' * 70}{NC}\n")
+
+    cases = []
+    for ttl in range(2, 12):
+        for pattern in (0, 1, 2, 3, 5, 7, 0b101010, 0b111111):
+            links = [(pattern >> i) & 1 for i in range(n_if)]
+            cases.append((ttl, tuple(links)))
+
+    bad = 0
+    for ttl, links in cases:
+        rv_s, cl_s = _decide(b_s, fd_s, n_in, n_out, ttl, links)
+        rv_d, cl_d = _decide(b_d, fd_d, n_in, n_out, ttl, links)
+        if (rv_s, cl_s) != (rv_d, cl_d):
+            bad += 1
+            if bad <= 6:
+                ls = "".join(map(str, links))
+                print(f"  {RED}DIVERGE{NC} ttl={ttl:2d} link={ls}: "
+                      f"congelata retval={rv_s} classe={cl_s}, "
+                      f"P1.5 retval={rv_d} classe={cl_d}")
+
+    n = len(cases)
+    if bad:
+        print(f"\n  {RED}{bad}/{n} casi divergono{NC} -- la colonna di pesi "
+              f"congelata NON e' quella del nodo {node}.")
+        print(f"  {GREY}Finche' questo non passa, ogni numero della colonna "
+              f"p1_static misura un modello diverso.{NC}")
+        return 1
+    print(f"  {GREEN}{n}/{n} casi identici{NC} (ttl 2-11 x 8 pattern di link).")
+    print(f"  {GREY}Congelare il nodo cambia il codice, non la decisione.{NC}")
+    return 0
+
+
 def run_axis(axis, repeat, trials, out_dir):
     spec = AXES[axis]
     print(f"\n{YELLOW}{'=' * 78}{NC}")
@@ -626,7 +756,7 @@ def run_axis(axis, repeat, trials, out_dir):
     print(f"{YELLOW}{'=' * 78}{NC}\n")
 
     rows = []
-    hdr = (f"  {'x':>5s} {'pipeline':10s} {'forma':>16s} {'pesi':>6s} "
+    hdr = (f"  {'x':>5s} {'pipeline':11s} {'forma':>16s} {'pesi':>6s} "
            f"{'insns':>7s} {'ns':>7s} {'update ms':>10s} {'build ms':>9s} "
            f"{'mappe B':>8s} {'tail':>4s}")
     print(hdr)
@@ -643,7 +773,7 @@ def run_axis(axis, repeat, trials, out_dir):
         for pipe in PIPELINES:
             r = bench_cell(pipe, cell, repeat, trials)
             if r.get("ok"):
-                print(f"  {str(v):>5s} {pipe:10s} {shape_str:>16s} {r['nw']:6d} "
+                print(f"  {str(v):>5s} {pipe:11s} {shape_str:>16s} {r['nw']:6d} "
                       f"{r['insns']:7d} {r['lat_ns']:7.1f} "
                       f"{r['update_ms']:10.2f} {r['build_ms']:9.1f} "
                       f"{r['map_bytes']:8d} {r['tail']:4d}")
@@ -668,7 +798,7 @@ def run_axis(axis, repeat, trials, out_dir):
                     mark = f"{YELLOW}RIFIUTATO{NC}"     # dato, non guasto
                 else:
                     mark = f"{RED}CRASH{NC}"
-                print(f"  {str(v):>5s} {pipe:10s} {shape_str:>16s} {'':6s} "
+                print(f"  {str(v):>5s} {pipe:11s} {shape_str:>16s} {'':6s} "
                       f"{mark} {GREY}{r.get('detail', '')[:90]}{NC}")
 
     _warn_contaminated(rows)
@@ -746,7 +876,8 @@ KEEP = {
         "cambiare la composizione dell'IV ricompila P1; P2 e P3 leggono il descrittore",
 }
 STYLE = {
-    "hardcoded": dict(color="#c0392b", marker="o", label="P1 hardcoded"),
+    "p1_static": dict(color="#8e44ad", marker="D", label="P1 specializzata"),
+    "hardcoded": dict(color="#c0392b", marker="o", label="P1.5 hardcoded"),
     "template": dict(color="#2980b9", marker="s", label="P2 template"),
     "modular": dict(color="#27ae60", marker="^", label="P3 modular"),
 }
@@ -852,6 +983,9 @@ def main():
     p.add_argument("--plot", metavar="DIR", default=None,
                    help="non misurare: genera i grafici dai CSV in DIR")
     p.add_argument("--format", default="pdf", choices=["pdf", "png"])
+    p.add_argument("--verify", action="store_true",
+                   help="non misurare: verifica che la P1 specializzata decida "
+                        "come la P1.5 con lo stesso nodo installato")
     p.add_argument("--all-plots", action="store_true",
                    help="disegna tutte le combinazioni metrica x asse, non "
                         "solo quelle che portano un risultato")
@@ -873,6 +1007,10 @@ def main():
         sys.exit(f"la misura richiede Linux, non {sys.platform}")
     if os.geteuid() != 0:
         sys.exit("serve root: sudo python3 ipa/test/bench_scaling.py")
+
+    if a.verify:
+        os.chdir(SHARED_DIR)
+        return verify_static()
 
     # Resolved BEFORE the chdir: a relative --out is relative to where the
     # USER ran the command, not to ipa/. Resolving it after the chdir put
