@@ -569,11 +569,21 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
 # contatore dei lookup in test_suite, e per lo stesso motivo: una misura che
 # non esiste vale piu' di una misura perfetta impossibile.
 
-LAT_COUNTER_SRC = r"""
+# Le DICHIARAZIONI vanno inserite prima del dispatcher che le usa: in C non si
+# usa un simbolo prima di dichiararlo, e appendendo tutto in fondo al sorgente
+# il dispatcher vedeva `ts_in` non dichiarata e clang si fermava -- errore che
+# BCC riporta solo come "Failed to compile BPF module".
+#
+# Vanno anche DOPO gli #include della pipeline, perche' servono i tipi del
+# kernel: il punto giusto e' quindi immediatamente sopra il dispatcher, cioe'
+# lo stesso anchor usato per il timestamp.
+LAT_DECLS_SRC = r"""
 BPF_PERCPU_ARRAY(ts_in, __u64, 1);
 /* 0 = quanti, 1 = somma ns, 2 = minimo, 3 = massimo */
 BPF_PERCPU_ARRAY(lat_acc, __u64, 4);
+"""
 
+LAT_COUNTER_SRC = r"""
 int xdp_lat_count(struct xdp_md *ctx) {
     int z = 0;
     __u64 now = bpf_ktime_get_ns();
@@ -634,7 +644,7 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
             f"non trovo il punto d'ingresso '{anchor}' nel sorgente di "
             f"{method} (trovato {src.count(anchor)} volte). E' cambiata la "
             f"firma del dispatcher?")
-    src = src.replace(anchor, anchor + LAT_STAMP)
+    src = src.replace(anchor, LAT_DECLS_SRC + "\n" + anchor + LAT_STAMP)
     return src + "\n" + LAT_COUNTER_SRC, weights, scale
 
 
@@ -645,7 +655,14 @@ def _load_instrumented(method, model_path, fab, sem, node=STATIC_NODE):
     import test_fabric as TF
 
     src, weights, scale = _instrumented_source(method, model_path, node)
-    b = BPF(text=src)
+    try:
+        b = BPF(text=src)
+    except Exception as e:
+        # BCC riporta solo "Failed to compile BPF module": la diagnostica di
+        # clang l'ha gia' stampata su stderr, SOPRA questa riga.
+        raise RuntimeError(
+            f"la build strumentata di {method} non compila. L'errore di clang "
+            f"e' nelle righe SOPRA questa. ({e})") from e
     entry = b.load_func(LAT_ENTRY[method], BPF.XDP)
     lat_fn = b.load_func("xdp_lat_count", BPF.XDP)
 
