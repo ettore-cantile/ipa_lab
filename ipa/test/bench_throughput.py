@@ -180,7 +180,23 @@ DEFAULT_REPEAT = 3
 # risposta invece di avvicinarla.
 DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
 
-METHODS = ("hardcoded", "template", "modular")
+# Cinque gradini, e i due estremi servono a leggere i tre in mezzo.
+#
+#   baseline   XDP che parsa, decrementa il TTL e redirige su una classe FISSA.
+#              Nessuna inferenza. E' il TETTO DEL BANCO: se satura anche lei a
+#              X pacchetti/s, allora X e' il limite del veth e delle CPU, non
+#              della pipeline, e ogni cifra sotto va letta rispetto a quello.
+#              Senza questa colonna non si sa se si sta misurando il datapath o
+#              la macchina.
+#   p1_static  pesi E indice del nodo compilati dentro: un binario per nodo.
+#   hardcoded  pesi compilati, nodo da mappa (la "P1.5").
+#   template   solo i soffitti compilati.
+#   modular    anche la profondita' a runtime.
+METHODS = ("baseline", "p1_static", "hardcoded", "template", "modular")
+
+# Il nodo che la P1 specializzata si porta dentro. Lo stesso che installa
+# test_fabric, cosi' le due misure parlano dello stesso nodo.
+STATIC_NODE = 7
 
 # Contatore sull'uscita: XDP_DROP, cosi' il conteggio non paga lo stack di rete
 # e non falsa la misura con il costo di consegnare a un socket.
@@ -514,6 +530,12 @@ def enable_threaded_napi(devs, first_cpu, ncpu):
     placed = []
     cpu = first_cpu
     for dev in devs:
+        # ONE CPU per device, not one per NAPI thread. A multi-queue veth has a
+        # NAPI thread per queue, so pinning them round-robin scattered one
+        # device's work over every DUT core and, with two ingress devices and
+        # five egress counters, put ten threads on two CPUs -- measured: the
+        # generator offered 4.17 Mpps and the datapath delivered 118 k, a
+        # collapse rather than saturation. A device is one DUT core.
         path = f"/sys/class/net/{dev}/threaded"
         if not os.path.exists(path):
             warn(f"{dev}: /sys/.../threaded non c'e', resto in softirq "
@@ -525,13 +547,15 @@ def enable_threaded_napi(devs, first_cpu, ncpu):
         except OSError as e:
             warn(f"{dev}: threaded rifiutato ({e.strerror}), resto in softirq")
             continue
-        for pid in _napi_threads(dev):
-            if cpu >= ncpu:
-                cpu = first_cpu          # piu' thread che CPU libere: gira
+        if cpu >= ncpu:
+            cpu = first_cpu              # piu' device che CPU libere: gira
+        pids = _napi_threads(dev)
+        for pid in pids:
             subprocess.run(["taskset", "-pc", str(cpu), pid],
                            capture_output=True, check=False)
-            placed.append((dev, pid, cpu))
-            cpu += 1
+        if pids:
+            placed.append((dev, len(pids), cpu))
+        cpu += 1
     return placed
 
 
@@ -604,6 +628,37 @@ def del_tg_links(n):
 # ==========================================================================
 # setup
 # ==========================================================================
+def setup_p1_static(model_id, model_path, node=STATIC_NODE):
+    """setup_hardcoded, ma con l'indice del nodo congelato nel sorgente.
+
+    Non e' in verify_prog_run perche' la specializzazione e' nata qui: lo
+    switch a n_nodi casi sulla one-hot del nodo sparisce e con lui la lettura
+    della mappa node_id, restando n_h1 costanti che clang piega
+    nell'accumulatore. Vedi _gen_feature_onehot_node in ebpf_program.py, e
+    `bench_scaling.py --verify` per la prova che decide come la P1.5."""
+    from bcc import BPF
+    from ebpf_program import build_combined_hardcoded_source
+    import verify_prog_run as V
+
+    weights, scale = V.load_weights(model_path)
+    src = build_combined_hardcoded_source(
+        [(model_id, weights, scale)], static_node=node)
+    b = BPF(text=src)
+    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
+    disp = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+    b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
+    V._seed_link_state(b, 1)
+    V._install_mac_table(b, "mac_table")
+    return {
+        "b": b, "fn": model_fn, "disp": disp,
+        "weights": weights, "scale": scale,
+        "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
+        "pipeline": 1, "static_node": node,
+        "progs": {"ipa_switch_hardcoded": disp.fd,
+                  f"model_{model_id}": model_fn.fd},
+    }
+
+
 def class_semantics():
     """The declared class semantics, resolved the same way test_fabric does."""
     import model_meta as mm
@@ -625,14 +680,34 @@ def build_pipeline(method, model_path, fab, sem):
     import verify_prog_run as V
     import test_fabric as TF
 
-    setup = getattr(V, TF._SETUP[method])(0, model_path)
+    if method == "baseline":
+        setup = V.setup_baseline(0, model_path)
+    elif method == "p1_static":
+        setup = setup_p1_static(0, model_path)
+    else:
+        setup = getattr(V, TF._SETUP[method])(0, model_path)
     b, pl = setup["b"], setup["pipeline"]
 
-    TF._install_fabric_mac_table(b, TF._MAC_NAME[pl], fab, sem.logical_ports)
+    # mac_table serve a tutte: e' la catena porta logica -> ifindex, ed e' cio'
+    # che fa uscire il pacchetto dal veth giusto. La baseline redirige su una
+    # classe fissa, quindi le basta la porta 0, ma installarle tutte non costa.
+    mac_name = "mac_table" if pl in (0, 1) else TF._MAC_NAME[pl]
+    TF._install_fabric_mac_table(b, mac_name, fab, sem.logical_ports)
+
+    if method == "baseline":
+        # Nessuna feature: non c'e' ingress_port, non c'e' node_id, e il
+        # programma non legge nemmeno ipa->model_id. Niente da cablare, ed e'
+        # esattamente cio' che la rende il tetto del banco.
+        return setup
+
     b[TF._INGRESS_NAME[pl]][ct.c_uint32(fab.ingress_ifindex)] = \
         ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
-    b[TF._NODEID_NAME[pl]][ct.c_uint32(0)] = \
-        ct.c_uint32(TF.FABRIC_NODE_INDEX)
+    if method != "p1_static":
+        # La specializzata ha l'indice del nodo compilato dentro: la mappa e'
+        # ancora dichiarata nell'header condiviso ma nessuno la legge, e
+        # scriverci darebbe l'impressione sbagliata che serva.
+        b[TF._NODEID_NAME[pl]][ct.c_uint32(0)] = \
+            ct.c_uint32(TF.FABRIC_NODE_INDEX)
 
     # The model under the id pktgen writes. See the docstring: this is the
     # difference between measuring inference and measuring XDP_PASS.
@@ -642,7 +717,7 @@ def build_pipeline(method, model_path, fab, sem):
 
 def _register_alias(method, setup, model_id):
     b, w, scale = setup["b"], setup["weights"], setup["scale"]
-    if method == "hardcoded":
+    if method in ("hardcoded", "p1_static"):
         b["model_progs"][ct.c_int(model_id)] = ct.c_int(setup["fn"].fd)
     elif method == "template":
         from ebpf_template_arch import load_arch_weights
@@ -742,11 +817,16 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         if threaded_napi and not rx_side:
             ncpu = os.cpu_count() or 1
             # pktgen usa kpktgend_0..threads-1, cioe' le CPU 0..threads-1.
-            rx_devs = [fab.ingress] + [e[0] for e in extra]
-            napi_devs = rx_devs + [p for p in attached]
+            # SOLO gli ingressi. I peer d'uscita portano il contatore, che
+            # e' strumentazione e non il DUT: lasciarli in softirq li fa girare
+            # sul core che ha elaborato il pacchetto, come farebbe l'uscita di
+            # un nodo vero. Metterli in thread su CPU proprie li ha messi in
+            # concorrenza con l'inferenza sulle stesse due CPU.
+            napi_devs = [fab.ingress] + [e[0] for e in extra]
             placed = enable_threaded_napi(napi_devs, threads, ncpu)
             if placed:
-                where = ", ".join(f"{d}->cpu{c}" for d, _, c in placed)
+                where = ", ".join(f"{d}({n} code)->cpu{c}"
+                                  for d, n, c in placed)
                 info(f"NAPI in thread, pinnata: {where}")
                 info(f"pktgen su cpu 0-{threads - 1}, inferenza sulle altre: "
                      f"generatore e DUT su core separati")
@@ -759,6 +839,11 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
                               tg_devs, repeat=1, burst=burst,
                               xmit_mode=xmit_mode)
+        if probe["hit"] == 0 and method == "baseline":
+            warn("la baseline non ha prodotto HIT: non legge model_id, quindi "
+                 "il problema e' a monte (il pacchetto non arriva o mac_table "
+                 "e' vuota). Mi fermo.")
+            return 1
         if probe["hit"] == 0:
             warn(f"la sonda non ha prodotto nessun HIT "
                  f"(tx={probe['tx']} miss={probe['miss']}).")
