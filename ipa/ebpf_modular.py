@@ -611,7 +611,17 @@ int layer_first(struct xdp_md *ctx) {
      * is already clamped to [0, 256], 256 meaning unknown. */
     int mnid = META_NODE_ID;
     long long *nidp = scratch_meta.lookup(&mnid);
-    __u32 _node = nidp ? ((__u32)(*nidp) & 0x1ffU) : 0x100U;
+    /* Early exit, not a ternary. Everything load-bearing in this function uses
+     * this form; the two ternaries above (_ttl, _raw_iface) MERGE two possible
+     * values, and each merged value that the unrolled feature loop reads
+     * multiplies the paths the verifier has to walk. A third merge was enough
+     * to push layer_first past the complexity limit even though the program
+     * got SMALLER (9 994 instructions loaded before, 9 205 did not).
+     *
+     * The dispatcher always writes this slot, so a missing one means something
+     * upstream is broken -- which is exactly when XDP_PASS is the right answer. */
+    if (!nidp) return XDP_PASS;
+    __u32 _node = (__u32)(*nidp) & 0x1ffU;
 
     /* dense feature vectors, each read once (single lookup), reused per neuron.
      * Sized to the topology; the descriptor's per-feature size gates the slots. */
