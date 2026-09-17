@@ -212,8 +212,19 @@ def cell_of(axis, v):
     return c
 
 
+# n_queues is declared even though the default descriptor does not use a
+# queue feature: the `no_onehot` set does, and a descriptor cannot resolve a
+# dimension the topology does not state. Leaving it out made all three
+# pipelines fail that column with
+#   ScenarioError: feature 'queue_occupancy' needs topology dimension 'n_queues'
+# which reads like a pipeline problem and is really a missing line here.
+# 4 is under both compiled ceilings (IPA_MAX_QUEUES is 8 in P2 and in P3).
+N_QUEUES = 4
+
+
 def topology(n_nodes):
-    return {"n_interfaces": N_INTERFACES, "n_nodes": n_nodes}
+    return {"n_interfaces": N_INTERFACES, "n_nodes": n_nodes,
+            "n_queues": N_QUEUES}
 
 
 def build_shape(n_nodes, hidden_dims, descriptor=DEFAULT_DESCRIPTOR):
@@ -336,15 +347,18 @@ def _bench_p2(cell, repeat, trials):
     # imports, a machine without BCC would report this cell as a crash rather
     # than as the structural limit it is.
     dims = cell["dims"]
-    if len(dims) < 2:
-        raise NotImplementedError(
-            f"P2 ha sempre fc1 e fc2: profondita' minima 2, questa forma "
-            f"ne chiede {len(dims)}")
+    if len(dims) < 1:
+        raise NotImplementedError("P2 ha almeno un hidden layer")
     if len(set(dims[1:])) > 1:
         raise NotImplementedError(
             f"in P2 i layer oltre il secondo sono larghi n_h2; questa forma "
             f"chiede larghezze diverse: {dims[1:]}")
     n_hidden = len(dims)
+    # With one hidden layer there is no fc2, and the datapath carries h1 into
+    # h2 unchanged -- so n_h2 must be registered equal to n_h1. See
+    # build_arch_leaf; load_arch_weights refuses any other value.
+    n_h1 = dims[0]
+    n_h2 = dims[1] if n_hidden >= 2 else dims[0]
 
     from bcc import BPF
     from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
@@ -380,7 +394,7 @@ def _bench_p2(cell, repeat, trials):
     # ONE-TIME cost paid when the node starts and never again.
     _, update_ms = _timed(lambda: load_arch_weights(
         b, weights, model_id=0, scale=SCALE,
-        n_h1=dims[0], n_h2=dims[1], n_hidden=n_hidden,
+        n_h1=n_h1, n_h2=n_h2, n_hidden=n_hidden,
         features=shape["features"], n_in=n_in,
         semantics=shape.get("semantics")))
     _seed_link_state(b, 1)
@@ -494,6 +508,61 @@ def bench_cell(pipeline, cell, repeat, trials):
 # ==========================================================================
 # SWEEP
 # ==========================================================================
+def _warn_contaminated(rows, factor=2.0):
+    """Say so when a latency cannot be a property of the x axis.
+
+    P2 and P3 compile a source that does not mention the model, so along the
+    nodes, width, descriptor and sparsity axes their program is byte-identical
+    at every point -- same instruction count, same jited size. If the latency
+    of an IDENTICAL program swings by more than `factor` across the axis, the
+    swing is the machine, not the variable on the x axis: another process, CPU
+    frequency, a noisy neighbour on the hypervisor.
+
+    Taking the min of N trials protects against a spike inside a cell. It does
+    nothing when the whole cell was measured during a busy period, which is
+    what this catches. Without it the reader is invited to explain a 3x jump
+    that has no cause in the model."""
+    for pipe in PIPELINES:
+        groups = {}
+        for r in rows:
+            if not r.get("lat_ns"):
+                continue
+            if r["pipeline"] == pipe:
+                groups.setdefault(r["insns"], []).append((r["x"], r["lat_ns"]))
+        for insns, pts in groups.items():
+            if len(pts) < 2:
+                continue
+            lats = [p[1] for p in pts]
+            lo, hi = min(lats), max(lats)
+            if lo > 0 and hi / lo > factor:
+                worst = max(pts, key=lambda p: p[1])
+                print(f"\n  {RED}SOSPETTO{NC} {pipe}: programma identico "
+                      f"({insns} istruzioni) a ogni x, ma la latenza va da "
+                      f"{lo:.0f} a {hi:.0f} ns ({hi / lo:.1f}x).")
+                print(f"  {GREY}Il binario non cambia lungo questo asse, "
+                      f"quindi lo scarto e' la macchina, non la variabile. "
+                      f"Il punto peggiore e' x={worst[0]}. Rimisura a macchina "
+                      f"scarica prima di metterlo in un grafico.{NC}")
+
+
+def _give_back(path):
+    """Hand a file or directory created under sudo back to the invoking user.
+
+    The measuring run needs root; plotting does not, and the documented next
+    step is to run --plot WITHOUT sudo. Without this, that second command dies
+    with `PermissionError: 'results/scaling_nodes_insns.pdf'`, because root
+    owns the directory the plots go into. Silently ignored when not running
+    under sudo, or if the chown is refused."""
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if not uid or os.name != "posix":
+        return
+    try:
+        os.chown(path, int(uid), int(gid or uid))
+    except OSError:
+        pass
+
+
 def run_axis(axis, repeat, trials, out_dir):
     spec = AXES[axis]
     print(f"\n{YELLOW}{'=' * 78}{NC}")
@@ -511,10 +580,13 @@ def run_axis(axis, repeat, trials, out_dir):
     for v in spec["values"]:
         cell = cell_of(axis, v)
         dims = cell["dims"]
+        # Computed here, not read back from the result: a cell that was
+        # skipped or that crashed has no n_in to report, and printing "?-4-7"
+        # made a structural note look like a broken measurement.
+        n_in = build_shape(cell["n_nodes"], dims, cell["descriptor"])["n_in"]
+        shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{N_OUT}"
         for pipe in PIPELINES:
             r = bench_cell(pipe, cell, repeat, trials)
-            n_in = r.get("n_in") or "?"
-            shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{N_OUT}"
             if r.get("ok"):
                 print(f"  {str(v):>5s} {pipe:10s} {shape_str:>16s} {r['nw']:6d} "
                       f"{r['insns']:7d} {r['lat_ns']:7.1f} "
@@ -532,14 +604,18 @@ def run_axis(axis, repeat, trials, out_dir):
                 print(f"  {str(v):>5s} {pipe:10s} {shape_str:>16s} {'':6s} "
                       f"{mark} {GREY}{r.get('detail', '')[:90]}{NC}")
 
+    _warn_contaminated(rows)
+
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+        _give_back(out_dir)
         path = os.path.join(out_dir, f"scaling_{axis}.csv")
         if rows:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                 w.writeheader()
                 w.writerows(rows)
+            _give_back(path)
             print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
         else:
             print(f"\n  {RED}nessuna riga da scrivere per {axis}{NC}")

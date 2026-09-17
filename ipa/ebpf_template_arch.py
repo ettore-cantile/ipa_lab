@@ -127,6 +127,11 @@ def arch_weight_count(n_h1: int, n_h2: int, n_in: int = None,
         _in, _out = reference_widths()
         n_in = _in if n_in is None else n_in
         n_out = _out if n_out is None else n_out
+    if n_hidden == 1:
+        # fc1 then straight to the output: no fc2 block at all. The datapath
+        # copies h1 into h2 and registers n_h2 == n_h1, so the output term is
+        # the same expression.
+        return (n_in * n_h1 + n_h1) + (n_h1 * n_out + n_out)
     # Layers beyond the second are n_h2 -> n_h2 (see build_arch_leaf), so each
     # contributes one square weight matrix plus a bias row. n_hidden=2 leaves
     # the term at zero and the expression is the original one.
@@ -795,7 +800,7 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     /* out_w_off skips the EXTRA hidden layers (if this leaf was built with
      * any): each is n_h2 -> n_h2, so weights + bias = n_h2*n_h2 + n_h2. With
      * no extra layers the term is zero and this is the original expression. */
-    __u32 out_w_off = fc2_b_off + n_h2 + /*@EXTRA_SPAN@*/0;
+    __u32 out_w_off = /*@OUT_W_OFF@*/fc2_b_off + n_h2 + 0;
     __u32 out_b_off = out_w_off + n_h2 * n_out;
 
     /* ONE bound check for this model's whole weight block, replacing the ~139
@@ -951,21 +956,7 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     for (int j = 0; j < T2_MAX_H1; j++)
         h1[j] = (j < n_h1) ? RELU(h1[j]) : 0LL;
 
-    /* h1[i]==0 for i>=n_h1 (set above), so the inner loop can always unroll
-     * to T2_MAX_H1: out-of-range weight reads still get multiplied by 0. */
-    long long h2[T2_MAX_H2];
-    #pragma unroll
-    for (int j = 0; j < T2_MAX_H2; j++) {
-        if (j >= n_h2) { h2[j] = 0LL; continue; }
-
-        long long acc = AW_W(AW, woff + fc2_b_off + j) * bias_mul_2;
-        #pragma unroll
-        for (int i = 0; i < T2_MAX_H1; i++) {
-            acc += h1[i] * AW_W(AW, woff + fc2_w_off + j * n_h1 + i);
-        }
-        h2[j] = RELU(acc);
-    }
-
+/*@FC2_BLOCK@*/
 /*@EXTRA_LAYERS@*/
     /* Same trick: h2[i]==0 for i>=n_h2, so the output loop is always
      * unrolled to T2_MAX_H2 regardless of this model's actual n_h2. */
@@ -1084,7 +1075,26 @@ int arch_generic_2layer(struct xdp_md *ctx) {
 #
 # n_hidden=2 reproduces the previous source exactly: the extra-span term is 0,
 # the bias multiplier is scale**2, and no block is inserted.
-T2_MIN_HIDDEN = 2
+T2_MIN_HIDDEN = 1
+
+# The fc1 -> fc2 block, lifted out of the template so a 1-hidden-layer leaf can
+# leave it out. Unchanged from what the source always said.
+_FC2_BLOCK = """    /* h1[i]==0 for i>=n_h1 (set above), so the inner loop can always unroll
+     * to T2_MAX_H1: out-of-range weight reads still get multiplied by 0. */
+    long long h2[T2_MAX_H2];
+    #pragma unroll
+    for (int j = 0; j < T2_MAX_H2; j++) {
+        if (j >= n_h2) { h2[j] = 0LL; continue; }
+
+        long long acc = AW_W(AW, woff + fc2_b_off + j) * bias_mul_2;
+        #pragma unroll
+        for (int i = 0; i < T2_MAX_H1; i++) {
+            acc += h1[i] * AW_W(AW, woff + fc2_w_off + j * n_h1 + i);
+        }
+        h2[j] = RELU(acc);
+    }
+
+"""
 
 
 def build_arch_leaf(n_hidden: int = 2) -> str:
@@ -1092,10 +1102,9 @@ def build_arch_leaf(n_hidden: int = 2) -> str:
     layers. See the comment above for what that does and does not buy."""
     if n_hidden < T2_MIN_HIDDEN:
         raise ValueError(
-            f"build_arch_leaf: n_hidden={n_hidden}; P2's leaf always has fc1 "
-            f"and fc2, so {T2_MIN_HIDDEN} is the minimum. For a shallower "
-            f"model use Pipeline 1 or 3.")
-    n_extra = n_hidden - 2
+            f"build_arch_leaf: n_hidden={n_hidden}, but a leaf needs at least "
+            f"{T2_MIN_HIDDEN} hidden layer.")
+    n_extra = max(0, n_hidden - 2)
 
     span = ("0" if n_extra == 0
             else f"{n_extra}U * (n_h2 * n_h2 + n_h2)")
@@ -1126,8 +1135,32 @@ def build_arch_leaf(n_hidden: int = 2) -> str:
         for (int j = 0; j < T2_MAX_H2; j++) h2[j] = hx[j];
     }}""")
 
+    if n_hidden == 1:
+        # One hidden layer: fc1 feeds the output directly. Rather than
+        # templating the output loop -- which reads h2 with stride n_h2 -- fc2
+        # becomes a COPY of h1 into h2 and the control plane registers
+        # n_h2 = n_h1. The output loop then reads the right values with the
+        # right stride, unchanged. No fc2 weights exist, so out_w_off skips
+        # straight past fc1's bias row.
+        #
+        # The copy costs T2_MAX_H2 moves per packet, which is the price of not
+        # having a second variant of the output layer to keep in step with the
+        # first. load_arch_weights enforces the n_h2 == n_h1 half of this.
+        fc2_block = """    /* n_hidden == 1: no fc2. h1 is carried into h2 unchanged so the output
+     * layer below -- which reads h2 with stride n_h2, and n_h2 == n_h1 for a
+     * 1-hidden-layer model -- needs no special case. */
+    long long h2[T2_MAX_H2];
+    #pragma unroll
+    for (int j = 0; j < T2_MAX_H2; j++) h2[j] = (j < n_h1) ? h1[j] : 0LL;
+"""
+        out_w = "fc1_b_off + n_h1"
+    else:
+        fc2_block = _FC2_BLOCK
+        out_w = "fc2_b_off + n_h2 + " + span
+
     src = _ARCH_LEAF_TEMPLATE
-    src = src.replace("/*@EXTRA_SPAN@*/0", span)
+    src = src.replace("/*@FC2_BLOCK@*/", fc2_block)
+    src = src.replace("/*@OUT_W_OFF@*/fc2_b_off + n_h2 + 0", out_w)
     src = src.replace("/*@BIAS_OUT@*/(long long)scale * (long long)scale",
                       bias_out)
     src = src.replace("/*@EXTRA_LAYERS@*/", "".join(blocks))
@@ -1215,6 +1248,11 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     # runtime field to check it against -- arch_entry carries widths, not
     # depth -- so the caller is responsible for passing the same number it
     # passed to build_arch_leaf().
+    if n_hidden == 1 and n_h2 != n_h1:
+        raise ValueError(
+            f"n_hidden=1 leaves P2 with one hidden layer, and the datapath "
+            f"carries h1 into h2 unchanged -- so n_h2 must equal n_h1 "
+            f"({n_h1}), not {n_h2}. See build_arch_leaf.")
     n_weights = arch_weight_count(n_h1, n_h2, n_in, semantics.n_out,
                                   n_hidden=n_hidden)
     arch_id   = 0
