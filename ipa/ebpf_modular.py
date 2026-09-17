@@ -224,6 +224,20 @@ void ipa_ttl_dec(struct iphdr *iph) {
 #define SCRATCH_ACT_SIZE   128
 #define SCRATCH_META_SLOTS  16
 struct act_vec { long long v[SCRATCH_ACT_SIZE]; };
+/* Make the compiler forget what it knows about a variable's range.
+ *
+ * Needed because clang and the verifier reason differently. After
+ *     if (n > CEILING) return XDP_PASS;
+ * clang knows n <= CEILING and deletes any mask as redundant, while the
+ * verifier keeps carrying the register's original range -- measured at
+ * [0, 0xffff] for n_out, which made it walk the loops below for 65 536 values
+ * instead of 8 and blow past its complexity budget (over 100 000 scalar ids
+ * for a 9 000-instruction program).
+ *
+ * The barrier makes the mask survive compilation, and the verifier reads the
+ * real bound off it. */
+#define barrier_var(x) asm volatile("" : "=r"(x) : "0"(x))
+
 BPF_PERCPU_ARRAY(scratch_acts, struct act_vec, 1);
 BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
 
@@ -548,6 +562,7 @@ int modular_dispatcher(struct xdp_md *ctx) {
 EBPF_LAYER_FIRST = EBPF_MODULAR_COMMON_HEADER + r"""
 /* PROTO_N_IN is gone: it was 65, the Germany50 feature sum, and layer_first
  * reads its input sparsely through model_desc, never through that width. */
+
 #define ML1_MAX_H1   8
 /* Compiled CEILING on the queue_occupancy feature, not the deployment's queue
  * count. Was `ML_N_QUEUES 4` -- the lab's value, read as if it were a law.
@@ -590,16 +605,9 @@ int layer_first(struct xdp_md *ctx) {
     __u32 n_out = shape->n_out;
     __u32 woff  = shape->weight_offset;
     if (n_out == 0 || n_out > ML1_MAX_H1) return XDP_PASS;
-    /* The mask is a no-op for any value the check above lets through, and it
-     * exists purely for the verifier. Measured from a load failure log: after
-     * `if (n > CEILING) return XDP_PASS;` the verifier still carried the
-     * ORIGINAL register as [0, 0xffff] -- it constrains the temporary the
-     * comparison produced, not the value itself. It then explored the loops
-     * below for every value up to 65535 instead of up to the ceiling, and ran
-     * past its complexity budget: over 100 000 scalar ids in the log, for a
-     * program of 9 000 instructions.
-     *
-     * Telling it the range explicitly is what lets it prune. */
+    /* Barrier then mask: see barrier_var. The mask is a no-op for every value
+     * the guard lets through, and exists only so the verifier can prune. */
+    barrier_var(n_out);
     n_out &= 0xfU;               /* ML1_MAX_H1 = 8, so 4 bits suffice */
 
     /* Per-model feature descriptor: n_in (= sum of feature sizes) + feature
@@ -610,7 +618,8 @@ int layer_first(struct xdp_md *ctx) {
     if (!desc) return XDP_PASS;
     __u32 n_in = desc->n_in;
     if (n_in == 0 || n_in > ML_MAX_N_IN) return XDP_PASS;
-    n_in &= 0xffU;               /* ML_MAX_N_IN = 128: see the n_out note above */
+    barrier_var(n_in);
+    n_in &= 0xffU;               /* ML_MAX_N_IN = 128 */
     __u32 bias_off = n_in * n_out;
 
     int mtl = META_TTL;
@@ -782,8 +791,9 @@ int layer_hidden(struct xdp_md *ctx) {
     __u32 n_out = shape->n_out;
     __u32 woff  = shape->weight_offset;
     if (n_in == 0 || n_in > MLH_MAX_H || n_out == 0 || n_out > MLH_MAX_H) return XDP_PASS;
-    /* Same reason as in layer_first: the guard above does not leave the
-     * verifier a usable bound on these registers. */
+    /* Same reason as in layer_first. */
+    barrier_var(n_in);
+    barrier_var(n_out);
     n_in  &= 0xfU;
     n_out &= 0xfU;
     /* Bias multiplier: the weights are stored as round(w_float * scale), so
