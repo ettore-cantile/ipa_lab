@@ -113,6 +113,10 @@ for _p in (SHARED_DIR, _TEST_DIR):
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
+class PktgenEmptyRun(RuntimeError):
+    """Un run che non ha trasmesso nulla. Segnalato al chiamante, non fatale."""
+
+
 PKTGEN_DIR = "/proc/net/pktgen"
 PKTGEN_MAGIC_MODEL_ID = 0xBE      # vedi la docstring
 
@@ -274,6 +278,27 @@ def pg_reset():
     pg_write(f"{PKTGEN_DIR}/pgctrl", "reset")
 
 
+def probe_clone_support(dev):
+    """Chiedi UNA volta se questo device accetta clone_skb, prima di misurare.
+
+    Il rifiuto costa una misura: il tentativo mancato lascia il device in uno
+    stato da cui `start` non parte -- pktgen riporta `pkts-sofar: 0` e
+    `started: 0us` -- e quella misura andava a zero pacchetti in mezzo allo
+    sweep. Scoprirlo prima, su un device gia' configurato per essere buttato,
+    toglie il problema alla radice invece di gestirne le conseguenze."""
+    global _CLONE_SUPPORTED
+    if not os.path.exists(f"{PKTGEN_DIR}/{dev}"):
+        return _CLONE_SUPPORTED
+    try:
+        pg_write(f"{PKTGEN_DIR}/{dev}", "clone_skb 1")
+        pg_write(f"{PKTGEN_DIR}/{dev}", "clone_skb 0")
+    except RuntimeError:
+        _CLONE_SUPPORTED = False
+        info("clone_skb non supportato su questo device (veth consegna l'skb "
+             "alla RX del peer e non puo' condividerlo): niente escalation")
+    return _CLONE_SUPPORTED
+
+
 def pg_clear_threads(n):
     """Detach every device from the first `n` generator threads."""
     for i in range(n):
@@ -379,12 +404,14 @@ def pg_run_and_read(devs):
     secs = secs or wall
     pps = pps or (int(sent / secs) if secs else 0)
     if sent == 0:
+        # Non fatale: un punto che non si misura e' un punto che non si
+        # misura, non la fine dell'esperimento. Alzare qui buttava via anche
+        # le misure gia' riuscite dello stesso run.
         # Nothing parsed usually means the device was never added, or pktgen
         # refused the config. Hand the raw text over rather than reporting a
         # silent zero that looks like 100% loss.
-        raise RuntimeError(
-            f"pktgen non riporta pacchetti per {devs}. Uscita grezza:\n"
-            + text[:600])
+        raise PktgenEmptyRun(
+            f"pktgen non riporta pacchetti per {devs}")
     return sent, pps, secs
 
 
@@ -433,9 +460,15 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     datapath. Worst for the LOSS, because a rate that drops packets on one run
     out of three is not a rate this datapath sustains, and calling it clean
     would be the optimistic lie this whole script exists to avoid."""
-    runs = [_measure_once(setup, rx_tab, fab, frame, delay, count, n_out,
-                          clone, tg_devs, burst, xmit_mode)
-            for _ in range(max(1, repeat))]
+    runs = []
+    for _ in range(max(1, repeat)):
+        try:
+            runs.append(_measure_once(setup, rx_tab, fab, frame, delay, count,
+                                      n_out, clone, tg_devs, burst, xmit_mode))
+        except PktgenEmptyRun as e:
+            warn(f"punto scartato: {e}")
+    if not runs:
+        return None
     runs.sort(key=lambda r: r["rx_pps"])
     med = runs[len(runs) // 2]
     med["repeat"] = len(runs)
@@ -839,6 +872,10 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
                               tg_devs, repeat=1, burst=burst,
                               xmit_mode=xmit_mode)
+        probe_clone_support(tg_devs[0])
+        if probe is None:
+            warn("la sonda non ha trasmesso nulla: pktgen non e' partito.")
+            return 1
         if probe["hit"] == 0 and method == "baseline":
             warn("la baseline non ha prodotto HIT: non legge model_id, quindi "
                  "il problema e' a monte (il pacchetto non arriva o mac_table "
@@ -879,6 +916,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                     r = measure_point(setup, rx_tab, fab, frame, delay, count,
                                       n_out, clone, tg_devs, repeat, burst,
                                       xmit_mode)
+                    if r is None:
+                        continue
                     r["clone_skb"], r["method"] = clone, method
                     r["threads"] = threads
                     out_rows.append(r)
@@ -930,6 +969,9 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
     Returns (peak_row, clean_row_or_None)."""
     full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone,
                          tg_devs, repeat, burst, xmit_mode)
+    if full is None:
+        warn(f"frame {frame}: nessuna misura utilizzabile a pieno rate")
+        return None, None
     full["method"], full["clone_skb"], full["delay"] = method, clone, 0
     full["threads"] = threads
     out_rows.append(full)
@@ -949,6 +991,8 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         hard = measure_point(setup, rx_tab, fab, frame, 0, count, n_out,
                              ESCALATE_CLONE, tg_devs, repeat, burst,
                              xmit_mode)
+        if hard is None:
+            return full, full
         hard["method"], hard["clone_skb"], hard["delay"] = \
             method, ESCALATE_CLONE, 0
         hard["threads"] = threads
@@ -976,6 +1020,8 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
             break
         r = measure_point(setup, rx_tab, fab, frame, mid, count, n_out,
                           clone, tg_devs, repeat, burst, xmit_mode)
+        if r is None:
+            break
         r["method"], r["clone_skb"], r["threads"] = method, clone, threads
         out_rows.append(r)
         printer(r)
