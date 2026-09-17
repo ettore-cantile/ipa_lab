@@ -682,6 +682,22 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
     best = max(under, key=lambda r: r["rx_pps"]) if under else None
     print(f"  {GREY}frame {frame}: massimo {peak['rx_pps']} pps "
           f"({peak['rx_mbps']} Mb/s, perdita {peak['loss_pct']}%)")
+    # WHERE the loss happens decides what the number means. Measured here at
+    # three generator cores: 8.5% lost with TX == HIT, i.e. the program saw and
+    # processed every packet and the drops were all on the way OUT. Reporting
+    # only the total would read as "the datapath loses 8.5%", which is the
+    # opposite of what happened.
+    if peak["lost_before"] or peak["lost_after"]:
+        if peak["lost_after"] > peak["lost_before"]:
+            print(f"  {GREY}  la perdita e' DOPO l'inferenza: "
+                  f"{peak['lost_after']} pacchetti elaborati e non usciti "
+                  f"({peak['lost_before']} non erano nemmeno arrivati). "
+                  f"A saturare e' l'uscita, non la pipeline.{NC}")
+        else:
+            print(f"  {GREY}  la perdita e' PRIMA dell'inferenza: "
+                  f"{peak['lost_before']} pacchetti mai arrivati al programma "
+                  f"({peak['lost_after']} elaborati e non usciti). "
+                  f"A saturare e' l'ingresso.{NC}")
     if best:
         print(f"  {GREY}  sotto {threshold}% di perdita: {best['rx_pps']} pps "
               f"({best['rx_mbps']} Mb/s, perdita {best['loss_pct']}%)")
