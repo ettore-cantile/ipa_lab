@@ -27,6 +27,7 @@ Needs Linux + BCC + root, and a git checkout.
 """
 import argparse
 import importlib.util
+import re
 import os
 import subprocess
 import sys
@@ -262,21 +263,98 @@ def variants(src):
     # 1,2,3,4 and queue_occupancy is 5 -- so those 8 slots are tracked for
     # nothing. These variants shrink the ceilings and see whether the room
     # that frees is what the node index needs.
-    for name, val in (("IPA_MAX_QUEUES", 1), ("IPA_MAX_QUEUES", 2),
-                      ("IPA_MAX_IFACES", 6)):
-        old = f"#define {name}  8"
-        if old in src:
-            out.append((f"{name}={val}",
-                        src.replace(old, f"#define {name}  {val}"),
-                        f"as-is with {name} cut from 8 to {val}"))
-
-    # And both at once: queues to 1, ifaces to the 6 the topology declares.
-    both = src.replace("#define IPA_MAX_QUEUES  8", "#define IPA_MAX_QUEUES  1")
-    both = both.replace("#define IPA_MAX_IFACES  8", "#define IPA_MAX_IFACES  6")
-    if both != src:
-        out.append(("both ceilings", both,
-                    "queues 8->1 and ifaces 8->6, as-is otherwise"))
+    # Ceiling sweeps used to live here, anchored on the literal text
+    # "#define IPA_MAX_QUEUES  8". That constant is 1 now, so the anchors
+    # stopped matching and the variants silently produced NOTHING -- a run
+    # that looks complete and tests nothing. They moved to --ceilings, which
+    # reads the current value instead of assuming one, and says so when an
+    # anchor is missing.
     return out
+
+
+
+# --------------------------------------------------------------------------
+# Ceiling sweep: how much verifier room is there, really?
+# --------------------------------------------------------------------------
+# IPA_MAX_QUEUES was cut from 8 to 1 to make room for the node index, and that
+# is a real loss: at 1, a model whose descriptor declares queue_occupancy wider
+# than one slot is REFUSED by load_modular_weights rather than truncated. If an
+# optimisation frees verifier room, the first thing worth spending it on is
+# putting that ceiling back.
+#
+# This sweep answers that with a measurement rather than an argument. It edits
+# the two #defines in the current source, loads each combination, and prints
+# the instruction count of the ones that load. The highest queue value that
+# loads is the ceiling the source can afford TODAY -- and because these limits
+# are cliffs, not slopes, it has to be re-run after any change to layer_first.
+#
+# Raising the ceiling for real means editing TWO places that must agree:
+#   - #define IPA_MAX_QUEUES in the eBPF source
+#   - P3_MAX_QUEUES in the Python control plane (the guard in
+#     load_modular_weights reads it)
+# ebpf_modular.py asserts they match.
+
+CEIL_RE = {
+    "IPA_MAX_QUEUES": re.compile(r"#define IPA_MAX_QUEUES\s+(\d+)"),
+    "IPA_MAX_IFACES": re.compile(r"#define IPA_MAX_IFACES\s+(\d+)"),
+}
+
+
+def _set_ceiling(src, name, val):
+    """Return (src, old_value). Raises if the #define is not there."""
+    m = CEIL_RE[name].search(src)
+    if not m:
+        raise RuntimeError(
+            f"no '#define {name}' in ebpf_modular.py -- this sweep edits that "
+            f"line, so it cannot run. Renamed, or moved?")
+    old = int(m.group(1))
+    return CEIL_RE[name].sub(f"#define {name}  {val}", src, count=1), old
+
+
+def run_ceilings(queue_values, iface_values):
+    src = open(os.path.join(REPO, "ipa/ebpf_modular.py"), encoding="utf-8").read()
+    cur_q = int(CEIL_RE["IPA_MAX_QUEUES"].search(src).group(1))
+    cur_i = int(CEIL_RE["IPA_MAX_IFACES"].search(src).group(1))
+
+    print(f"{YELLOW}{'=' * 74}{NC}")
+    print(f"{YELLOW} Pipeline 3 ceiling sweep -- how much room does layer_first "
+          f"have?{NC}")
+    print(f"{YELLOW}{'=' * 74}{NC}")
+    print(f"  working tree: IPA_MAX_QUEUES={cur_q}, IPA_MAX_IFACES={cur_i}\n")
+    print(f"  {'queues':>6s} {'ifaces':>6s}  result")
+    print(f"  {'-' * 6} {'-' * 6}  {'-' * 46}")
+
+    best_q = None
+    for nq in queue_values:
+        for ni in iface_values:
+            text, _ = _set_ceiling(src, "IPA_MAX_QUEUES", nq)
+            text, _ = _set_ceiling(text, "IPA_MAX_IFACES", ni)
+            ok, detail = try_load(text, f"ceil_q{nq}_i{ni}")
+            mark = f"{GREEN}LOADS  {NC}" if ok else f"{RED}refused{NC}"
+            print(f"  {nq:6d} {ni:6d}  {mark} {detail}")
+            if ok and ni == cur_i and (best_q is None or nq > best_q):
+                best_q = nq
+
+    print()
+    if best_q is None:
+        print(f"  {RED}Nothing loaded at IPA_MAX_IFACES={cur_i}.{NC} Either the "
+              f"source is broken\n  independently of the ceilings, or "
+              f"layer_first no longer fits at all.")
+    elif best_q > cur_q:
+        print(f"  {GREEN}IPA_MAX_QUEUES can go from {cur_q} to {best_q}.{NC} To "
+              f"take it, set BOTH\n  #define IPA_MAX_QUEUES and P3_MAX_QUEUES "
+              f"in ipa/ebpf_modular.py to {best_q},\n  then run the kernel "
+              f"suite -- a program that loads is not yet a program\n  that is "
+              f"correct.")
+    else:
+        print(f"  IPA_MAX_QUEUES={cur_q} is still the most that loads. The "
+              f"queue feature stays\n  capped, and load_modular_weights keeps "
+              f"refusing a wider descriptor.")
+    print("\n  These limits are CLIFFS: a value that loads here can stop "
+          "loading after\n  an unrelated change, and asking for LESS "
+          "elsewhere has made it fail before.\n  Re-run this after touching "
+          "layer_first.")
+    return 0
 
 
 def run_variants():
@@ -307,12 +385,31 @@ def main():
     p.add_argument("--variants", action="store_true",
                    help="instead of walking history, try edits of the CURRENT "
                         "source that each remove one suspect")
+    p.add_argument("--ceilings", action="store_true",
+                   help="sweep IPA_MAX_QUEUES / IPA_MAX_IFACES and report which "
+                        "combinations layer_first still loads at -- how much "
+                        "verifier room an optimisation actually bought")
+    p.add_argument("--queues", default="1,2,4,8",
+                   help="queue ceilings to try with --ceilings (default 1,2,4,8)")
+    p.add_argument("--ifaces", default="",
+                   help="iface ceilings to try with --ceilings; default is the "
+                        "source's current value alone")
     a = p.parse_args()
 
     if sys.platform != "linux":
         sys.exit(f"needs Linux, not {sys.platform}")
     if os.geteuid() != 0:
         sys.exit("needs root: sudo python3 ipa/test/diag_p3_bisect.py")
+
+    if a.ceilings:
+        qs = [int(x) for x in a.queues.split(",") if x.strip()]
+        if a.ifaces.strip():
+            ifs = [int(x) for x in a.ifaces.split(",") if x.strip()]
+        else:
+            _src = open(os.path.join(REPO, "ipa/ebpf_modular.py"),
+                        encoding="utf-8").read()
+            ifs = [int(CEIL_RE["IPA_MAX_IFACES"].search(_src).group(1))]
+        return run_ceilings(qs, ifs)
 
     if a.variants:
         return run_variants()

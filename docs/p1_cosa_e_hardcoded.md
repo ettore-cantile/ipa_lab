@@ -72,7 +72,7 @@ zero: 52 moltiplicazioni di cui 51 danno zero. Il generatore **non le scrive
 proprio**. Emette uno switch che assegna direttamente il peso giusto:
 
 ```c
-switch (_node) {                       /* _node = ipa->model_id, dal pacchetto */
+switch (_node) {                  /* _node = mappa node_id, letta a runtime */
     case 0: w_node_0 = 27LL; w_node_1 = -6LL;  w_node_2 =  7LL; w_node_3 =  0LL; break;
     case 1: w_node_0 = 12LL; w_node_1 = -6LL;  w_node_2 =  9LL; w_node_3 = -7LL; break;
     case 2: w_node_0 =  8LL; w_node_1 = -14LL; w_node_2 = -9LL; w_node_3 = 17LL; break;
@@ -81,9 +81,9 @@ switch (_node) {                       /* _node = ipa->model_id, dal pacchetto *
 ```
 
 ```
-   pacchetto ──► model_id = 37
-                      │
-                      ▼
+  mappa node_id ──► _node = 37
+   (letta a runtime,      │
+    seminata al deploy)   ▼
             ┌─────────────────────────────────────┐
             │  switch (_node)                     │
             │    case  0:  w = 27, -6,   7,   0   │
@@ -101,6 +101,15 @@ switch (_node) {                       /* _node = ipa->model_id, dal pacchetto *
 Qui **non c'è niente da ridurre**: la riduzione è già fatta dal generatore, che
 ha eliminato il prodotto a monte. L'indice resta a runtime; è il *peso* a essere
 scelto fra alternative compilate.
+
+> Da dove viene `_node`. Non dal pacchetto: dalla mappa `node_id`, un `BPF_HASH`
+> che il control plane semina al deploy (`$IPA_NODE_ID`, oppure l'indice del nodo
+> nella topologia). Prima veniva da `ipa->model_id`, che è una cosa diversa —
+> *quale modello* il pacchetto trasporta, non *quale nodo* lo sta elaborando — e
+> con un solo modello registrato ogni nodo accendeva lo stesso slot. La mappa è
+> un `HASH` e non un `ARRAY` apposta: un array è preallocato a zero, quindi
+> "non configurato" e "sono il nodo 0" sarebbero indistinguibili. Senza entry la
+> one-hot resta spenta, che è onesto.
 
 ---
 

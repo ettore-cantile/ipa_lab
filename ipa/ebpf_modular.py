@@ -704,6 +704,93 @@ int layer_first(struct xdp_md *ctx) {
      * because its products carry scale**(layer_idx+1). See ebpf_program.py's
      * _gen_dense_layer for the derivation. */
     long long out[ML1_MAX_H1];
+
+    /* The loop nest here is INVERTED with respect to the obvious form: the
+     * feature loop is OUTSIDE and the neuron loop INSIDE. It reads oddly, so
+     * the reason is worth stating.
+     *
+     * A descriptor entry's fields -- code, size, col_off -- do not depend on
+     * which neuron is being computed. With the neuron loop outside, as it was,
+     * the five-way dispatch on `code` was re-evaluated
+     * ML1_MAX_H1 * ML_MAX_FEAT = 32 times per packet, and the `i < size` gate
+     * on a dense vector 8 * 8 = 64 times, all to re-derive the same answer.
+     * Inverted, the dispatch runs ML_MAX_FEAT = 4 times and each dense gate
+     * once per slot; the inner neuron loops are then straight-line
+     * multiply-accumulate with no branch in them at all.
+     *
+     * THE ARITHMETIC IS UNCHANGED, term for term. Only the order in which the
+     * terms are summed differs, and two's-complement int64 addition is
+     * associative and commutative -- including on overflow, which wraps
+     * identically either way -- so every accumulator ends bit-identical to the
+     * previous form. Each term is still computed exactly as before: in
+     * particular the TTL term still divides the PRODUCT, once, at full width.
+     *
+     * out[] is the accumulator now, in place of the per-neuron `acc`. That is
+     * deliberate: out[] was ALREADY live across the whole loop, so this moves
+     * state the verifier was tracking anyway rather than adding any. */
+    #pragma unroll
+    for (int j = 0; j < ML1_MAX_H1; j++)
+        out[j] = LW_W(LW, woff + bias_off + j);
+
+    /* No `j < n_out` gate inside the accumulation: neurons past n_out are
+     * computed and thrown away. Their weight rows fall outside this model's
+     * block, but LW_W masks every index to the compiled array, so the read is
+     * in bounds -- just meaningless. Nothing ever sees it: the argmax below
+     * skips those neurons, and layer_hidden gates its input loop on n_in
+     * rather than trusting zeros. Gating here instead would cost 8 branches in
+     * the TTL arm and 64 in the link_state arm, which is the cost this whole
+     * rewrite exists to remove. Pipeline 2 already relies on the same
+     * property for h1/h2. */
+    #pragma unroll
+    for (int f = 0; f < ML_MAX_FEAT; f++) {
+        if (f >= desc->n_feat) continue;
+        __u8  code = desc->feats[f].code;
+        __u32 sz   = desc->feats[f].size;
+        __u32 coff = desc->feats[f].col_off;
+        if (code == FEAT_TTL) {
+            /* Divided by the training scale -- see T2_TTL_SCALE in
+             * ebpf_template_arch.py and model_meta.DEFAULT_TTL_SCALE. */
+            #pragma unroll
+            for (int j = 0; j < ML1_MAX_H1; j++)
+                out[j] += ((long long)_ttl
+                           * LW_W(LW, woff + j * n_in + coff)) / ML_TTL_SCALE;
+        } else if (code == FEAT_LINK_STATE) {
+            #pragma unroll
+            for (int i = 0; i < IPA_MAX_IFACES; i++) {
+                if ((__u32)i >= sz) continue;
+                long long x = ls[i];
+                #pragma unroll
+                for (int j = 0; j < ML1_MAX_H1; j++)
+                    out[j] += x * LW_W(LW, woff + j * n_in + coff + i);
+            }
+        } else if (code == FEAT_QUEUE_OCC) {
+            #pragma unroll
+            for (int i = 0; i < IPA_MAX_QUEUES; i++) {
+                if ((__u32)i >= sz) continue;
+                long long x = qs[i];
+                #pragma unroll
+                for (int j = 0; j < ML1_MAX_H1; j++)
+                    out[j] += x * LW_W(LW, woff + j * n_in + coff + i);
+            }
+        } else if (code == FEAT_INGRESS_IF) {
+            /* One-hot: a single column, the same column for every neuron, so
+             * the bound check happens once instead of once per neuron. */
+            if (_raw_iface >= 1 && _raw_iface <= sz) {
+                __u32 c = coff + (_raw_iface - 1);
+                #pragma unroll
+                for (int j = 0; j < ML1_MAX_H1; j++)
+                    out[j] += LW_W(LW, woff + j * n_in + c);
+            }
+        } else if (code == FEAT_NODE_ID) {
+            if (_node < sz) {
+                __u32 c = coff + _node;
+                #pragma unroll
+                for (int j = 0; j < ML1_MAX_H1; j++)
+                    out[j] += LW_W(LW, woff + j * n_in + c);
+            }
+        }
+    }
+
     /* LLONG_MIN, not -1e7: the logits of a 1-layer model are unbounded int64
      * accumulations (ttl up to 255 x int8 weights), so an all-negative output
      * row below the old -9999999 sentinel would leave best_cls at its initial
@@ -711,52 +798,18 @@ int layer_first(struct xdp_md *ctx) {
     long long best_val = -9223372036854775807LL - 1LL;
     int best_cls = 0;
 
+    /* Finalise: ReLU (or argmax) over the real neurons, zero over the rest.
+     * The argmax still walks j in ascending order with a strict `>`, so a tie
+     * still resolves to the lowest class, exactly as when it was interleaved
+     * with the accumulation. The zeroing keeps the activation vector this hop
+     * publishes byte-for-byte what it was before this rewrite. */
     #pragma unroll
     for (int j = 0; j < ML1_MAX_H1; j++) {
         if (j >= n_out) { out[j] = 0LL; continue; }
-
-        long long acc = LW_W(LW, woff + bias_off + j);
-
-        /* Descriptor-driven IV: each declared feature contributes at its runtime
-         * column offset (layer-0 row = j*n_in + col_off). Unrolled to
-         * ML_MAX_FEAT; slots past n_feat skipped. Dense features gate on feat
-         * size; one-hot (iface/node) is a single runtime-indexed weight. */
-        #pragma unroll
-        for (int f = 0; f < ML_MAX_FEAT; f++) {
-            if (f < desc->n_feat) {
-                __u8  code = desc->feats[f].code;
-                __u32 sz   = desc->feats[f].size;
-                __u32 base = woff + j * n_in + desc->feats[f].col_off;
-                if (code == FEAT_TTL) {
-                    /* Divided by the training scale -- see T2_TTL_SCALE in
-                     * ebpf_template_arch.py and model_meta.DEFAULT_TTL_SCALE. */
-                    acc += ((long long)_ttl * LW_W(LW, base)) / ML_TTL_SCALE;
-                } else if (code == FEAT_LINK_STATE) {
-                    #pragma unroll
-                    for (int i = 0; i < IPA_MAX_IFACES; i++) {
-                        if ((__u32)i < sz)
-                            acc += ls[i] * LW_W(LW, base + i);
-                    }
-                } else if (code == FEAT_QUEUE_OCC) {
-                    #pragma unroll
-                    for (int i = 0; i < IPA_MAX_QUEUES; i++) {
-                        if ((__u32)i < sz)
-                            acc += qs[i] * LW_W(LW, base + i);
-                    }
-                } else if (code == FEAT_INGRESS_IF) {
-                    if (_raw_iface >= 1 && _raw_iface <= sz)
-                        acc += LW_W(LW, base + (_raw_iface - 1));
-                } else if (code == FEAT_NODE_ID) {
-                    if (_node < sz)
-                        acc += LW_W(LW, base + _node);
-                }
-            }
-        }
-
         if (is_last) {
-            if (acc > best_val) { best_val = acc; best_cls = j; }
+            if (out[j] > best_val) { best_val = out[j]; best_cls = j; }
         } else {
-            out[j] = RELU(acc);
+            out[j] = RELU(out[j]);
         }
     }
 

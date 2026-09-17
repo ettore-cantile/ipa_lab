@@ -674,35 +674,67 @@ P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
   d'uscita, DROP verificato dal contatore `cls_stats` e non dal silenzio. Questa riga diceva
   il contrario fino a poco fa — era vera quando l'unico banco era un emulatore.
 
-### P3 non ha più margine di verifica: misurato
+### P3 era al limite del verificatore: com'è stato chiuso
 
-`layer_first`, il programma più grande di Pipeline 3, **carica a 9 994 istruzioni**.
-Provando a farlo leggere l'indice del nodo da una mappa — invece che dal `model_id` del
-pacchetto, come fanno ora P1 e P2 — il verificatore lo ha **rifiutato quattro volte**:
+Per un giorno intero questa sezione ha detto che su Pipeline 3 la one-hot del nodo
+**non si poteva** fare: `layer_first` caricava a 9 994 istruzioni con l'indice preso dal
+`model_id` del pacchetto, e ogni tentativo di leggerlo da una mappa veniva rifiutato.
+Adesso l'indice arriva dalla mappa e `layer_first` carica a **6 417 istruzioni**, più
+piccolo di prima. Vale la pena raccontare perché, perché la conclusione sbagliata era
+ragionevole e la diagnosi ha richiesto dodici configurazioni.
 
-| forma tentata | istruzioni | esito |
+**Il meccanismo.** Il costo per il verificatore non è la somma degli scalari che il ciclo
+srotolato tiene vivi: è il loro **prodotto**. La versione che caricava era quella in cui
+`_node = model_id`, cioè *lo stesso registro* che il verificatore stava già seguendo —
+uno scalare, non due. Qualunque `_node` indipendente ne aggiunge un secondo, e il numero
+di stati si moltiplica.
+
+Escluse una per una, ciascuna con la sua prova: il tipo di mappa, la dichiarazione della
+mappa, il valore in sé, il cast a `__u8`, il numero di chiamate helper, il numero di
+valori nati da una fusione (ternari), la larghezza in bit dell'intervallo, `barrier_var`
+con maschera esplicita. Tutte rifiutate, fra 9 069 e 9 402 istruzioni.
+
+**Quello che ha liberato spazio non tocca il nodo**: `IPA_MAX_QUEUES` in
+`ipa/ebpf_modular.py`, da 8 a 1. Il descrittore depositato **non dichiara** nessuna
+feature `queue_occupancy` (i suoi codici sono 1, 2, 3, 4; queue è 5), quindi otto slot
+restavano vivi lungo tutto il corpo srotolato per una feature che non c'è.
+
+| | istruzioni | esito |
 |---|---:|---|
-| (prima, indice da `model_id`) | 9 994 | carica |
-| lookup di mappa dentro `layer_first` | 9 402 | rifiutato |
-| valore limitato a un byte | 9 205 | rifiutato |
-| risolto nel dispatcher, passato via `scratch_meta` | 9 205 | rifiutato |
-| uscita anticipata invece di ternario | 9 176 | rifiutato |
+| indice da `model_id`, `IPA_MAX_QUEUES` 8 | 9 994 | carica (ma il nodo non è il nodo) |
+| indice da mappa, `IPA_MAX_QUEUES` 8 — 12 varianti | 9 069 – 9 402 | tutte rifiutate |
+| **indice da mappa, `IPA_MAX_QUEUES` 1** | **6 417** | **carica** |
+| indice da mappa, queues 1 **e** `IPA_MAX_IFACES` 6 | — | rifiutato |
 
-**Ogni versione rifiutata è più piccola di quella che carica.** Non è la dimensione del
-programma: è la complessità di verifica, e `layer_first` non ha margine per **un solo
-valore tracciato in più**, qualunque forma gli si dia.
+**Questi limiti sono scogliere, non pendenze.** L'ultima riga è la lezione: ridurre *anche*
+`IPA_MAX_IFACES` da 8 a 6 — cioè chiedere *meno* — fa fallire di nuovo. Un soffitto qui si
+cambia e **si rimisura**, non si ragiona.
 
-Conseguenza, lasciata aperta e non mascherata: su P3 la one-hot del nodo resta guidata dal
-`model_id` del pacchetto, quindi con un solo modello registrato ogni nodo accende lo stesso
-slot e 52 dei 65 ingressi non portano informazione. È l'**ultimo ingresso su cui le tre
-pipeline non concordano**, e il riferimento lo modella esplicitamente invece di ignorarlo.
+Il control plane protegge il soffitto invece di subirlo: `load_modular_weights`
+**rifiuta** un descrittore che chieda più slot di coda di quanti il datapath ne compili,
+invece di troncarlo silenziosamente al primo. Un modello che serve davvero quella feature
+fa alzare la costante e ripetere la misura.
 
-Chiuderlo richiede di ridurre il corpo srotolato di P3, non di limare la feature.
+Conseguenza per le tre pipeline: l'indice del nodo ora viene dalla mappa `node_id` in
+**tutte e tre**, letto a runtime, senza tabelle compilate. È la chiusura dell'ultimo
+ingresso su cui non concordavano.
 
-> Nota sul messaggio d'errore: BCC riporta questo rifiuto come
-> `Program too large (N insns), at most 4096 insns`. Il 4096 è una costante vecchia nella
-> stringa d'errore di BCC — nello stesso run P2 ha caricato a 15 383 istruzioni. Va letto
-> come "il verificatore ha rinunciato", non "il programma è troppo lungo".
+> **Due trappole nel leggere il fallimento**, entrambe costate ore.
+>
+> BCC riporta il rifiuto come `Program too large (N insns), at most 4096 insns`. Il 4096 è
+> una **costante vecchia nella stringa d'errore di BCC**: nello stesso run P2 carica a
+> 15 383 istruzioni. Va letto come "il verificatore ha rinunciato", non "il programma è
+> troppo lungo".
+>
+> E il numero `layer_first=9994` è il conteggio **xlated**, cioè di un programma già
+> caricato, mentre quello nel messaggio d'errore è il conteggio **grezzo** prima del
+> caricamento. Confrontarli direttamente porta alla conclusione "ogni versione rifiutata è
+> più piccola di quella che carica", che è un artefatto di due unità di misura diverse. Quella
+> frase è stata in questo documento per un giorno.
+
+Lo strumento che ha chiuso la questione è `ipa/test/diag_p3_bisect.py`: con `--variants`
+costruisce modifiche testuali del sorgente corrente e riporta quali caricano; senza flag
+ripercorre la storia git. Le ipotesi sono state escluse da lì, non ragionando.
 
 ### Il soffitto compilato ha un costo di verifica, e ha un limite
 

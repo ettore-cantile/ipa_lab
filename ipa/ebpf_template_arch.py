@@ -812,8 +812,9 @@ int arch_generic_2layer(struct xdp_md *ctx) {
       if (_lp) _raw_iface = *_lp; }
     /* The NODE's own index, not the packet's model_id -- see node_id_t2.
      * Bounded to a byte on purpose: this used to come from a __u8, and the
-     * verifier needs that bound to reason about `base + _node` inside the
-     * unrolled feature loop. 256 is the "unknown" sentinel -- outside any
+     * verifier needs that bound to reason about the weight column `coff +
+     * _node` inside the unrolled feature loop. 256 is the "unknown" sentinel
+     * -- outside any
      * valid index, so no bit is set. An index above 255 is refused by the
      * control plane rather than truncated here. */
     __u32 _node = 0x100U;
@@ -848,53 +849,96 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     }
 
     long long h1[T2_MAX_H1];
+
+    /* Feature loop OUTSIDE, neuron loop INSIDE -- the inverse of the obvious
+     * nest, and the same rewrite layer_first in ebpf_modular.py carries. See
+     * the long comment there for the reasoning; in short: a descriptor entry's
+     * code/size/col_off do not depend on the neuron, so with the neuron loop
+     * outside the five-way dispatch on `code` ran T2_MAX_H1 * MAX_FEAT = 32
+     * times per packet and each dense-vector gate 8 * 8 = 64 times, all to
+     * re-derive the same answer. Inverted: 4 dispatches, 8 gates, and inner
+     * neuron loops that are straight-line multiply-accumulate.
+     *
+     * Same terms, same values, different summation order -- and int64 addition
+     * in two's complement is associative and commutative, so each accumulator
+     * ends bit-identical. h1[] becomes the accumulator; it was already live
+     * across the loop, so no state is added. */
     #pragma unroll
-    for (int j = 0; j < T2_MAX_H1; j++) {
-        if (j >= n_h1) { h1[j] = 0LL; continue; }
+    for (int j = 0; j < T2_MAX_H1; j++)
+        h1[j] = AW_W(AW, woff + fc1_b_off + j) * bias_mul_1;
 
-        long long acc = AW_W(AW, woff + fc1_b_off + j) * bias_mul_1;
-
-        /* Descriptor-driven IV: accumulate each declared feature's contribution
-         * at its runtime column offset (fc1 row = j*n_in + col_off). Unrolled to
-         * MAX_FEAT; slots past the model's n_feat are skipped. One-hot features
-         * (iface/node) are a single runtime-indexed weight; dense features
-         * (link_state/queue) unroll to their topology size, gated by feat size. */
-        #pragma unroll
-        for (int f = 0; f < MAX_FEAT; f++) {
-            if (f < desc->n_feat) {
-                __u8  code = desc->feats[f].code;
-                __u32 sz   = desc->feats[f].size;
-                __u32 base = woff + fc1_w_off + j * n_in + desc->feats[f].col_off;
-                if (code == FEAT_TTL) {
-                    /* Divided by the training scale: the model was trained on
-                     * ttl/initial_ttl in (0,1], not on the raw hop count. See
-                     * model_meta.DEFAULT_TTL_SCALE. The PRODUCT is divided --
-                     * dividing _ttl itself would collapse it to 0 or 1. */
-                    acc += ((long long)_ttl * AW_W(AW, base)) / T2_TTL_SCALE;
-                } else if (code == FEAT_LINK_STATE) {
-                    #pragma unroll
-                    for (int i = 0; i < IPA_MAX_IFACES; i++) {
-                        if ((__u32)i < sz && ls[i])
-                            acc += ls[i] * AW_W(AW, base + i);
-                    }
-                } else if (code == FEAT_QUEUE_OCC) {
-                    #pragma unroll
-                    for (int i = 0; i < IPA_MAX_QUEUES; i++) {
-                        if ((__u32)i < sz && qs[i])
-                            acc += qs[i] * AW_W(AW, base + i);
-                    }
-                } else if (code == FEAT_INGRESS_IF) {
-                    if (_raw_iface >= 1 && _raw_iface <= sz)
-                        acc += AW_W(AW, base + (_raw_iface - 1));
-                } else if (code == FEAT_NODE_ID) {
-                    if (_node < sz)
-                        acc += AW_W(AW, base + _node);
-                }
+    /* Deliberately NOT gated on `j < n_h1` here: neurons past the model's
+     * width are computed and discarded, and zeroed below before anything
+     * reads them. AW_W masks every index into the compiled array, so a weight
+     * row past this model's block is an in-bounds read of another model's
+     * bytes -- meaningless, never observed. Gating instead would put 8
+     * branches in the TTL arm and 64 in the link_state arm, which is the cost
+     * this rewrite removes. */
+    #pragma unroll
+    for (int f = 0; f < MAX_FEAT; f++) {
+        if (f >= desc->n_feat) continue;
+        __u8  code = desc->feats[f].code;
+        __u32 sz   = desc->feats[f].size;
+        __u32 coff = desc->feats[f].col_off;
+        if (code == FEAT_TTL) {
+            /* Divided by the training scale: the model was trained on
+             * ttl/initial_ttl in (0,1], not on the raw hop count. See
+             * model_meta.DEFAULT_TTL_SCALE. The PRODUCT is divided --
+             * dividing _ttl itself would collapse it to 0 or 1. */
+            #pragma unroll
+            for (int j = 0; j < T2_MAX_H1; j++)
+                h1[j] += ((long long)_ttl
+                          * AW_W(AW, woff + fc1_w_off + j * n_in + coff))
+                         / T2_TTL_SCALE;
+        } else if (code == FEAT_LINK_STATE) {
+            #pragma unroll
+            for (int i = 0; i < IPA_MAX_IFACES; i++) {
+                if ((__u32)i >= sz) continue;
+                long long x = ls[i];
+                /* The zero skip is kept -- it was `&& ls[i]` before -- but it
+                 * now runs once per interface instead of once per
+                 * (interface, neuron) pair. Adding zero is a no-op either
+                 * way, so skipping or not cannot change the result. */
+                if (!x) continue;
+                #pragma unroll
+                for (int j = 0; j < T2_MAX_H1; j++)
+                    h1[j] += x * AW_W(AW, woff + fc1_w_off + j * n_in + coff + i);
+            }
+        } else if (code == FEAT_QUEUE_OCC) {
+            #pragma unroll
+            for (int i = 0; i < IPA_MAX_QUEUES; i++) {
+                if ((__u32)i >= sz) continue;
+                long long x = qs[i];
+                if (!x) continue;
+                #pragma unroll
+                for (int j = 0; j < T2_MAX_H1; j++)
+                    h1[j] += x * AW_W(AW, woff + fc1_w_off + j * n_in + coff + i);
+            }
+        } else if (code == FEAT_INGRESS_IF) {
+            /* One-hot: one column, the same for every neuron, so the bound
+             * check happens once rather than once per neuron. */
+            if (_raw_iface >= 1 && _raw_iface <= sz) {
+                __u32 c = coff + (_raw_iface - 1);
+                #pragma unroll
+                for (int j = 0; j < T2_MAX_H1; j++)
+                    h1[j] += AW_W(AW, woff + fc1_w_off + j * n_in + c);
+            }
+        } else if (code == FEAT_NODE_ID) {
+            if (_node < sz) {
+                __u32 c = coff + _node;
+                #pragma unroll
+                for (int j = 0; j < T2_MAX_H1; j++)
+                    h1[j] += AW_W(AW, woff + fc1_w_off + j * n_in + c);
             }
         }
-
-        h1[j] = RELU(acc);
     }
+
+    /* ReLU over the real neurons, zero over the rest. The zeroing is not
+     * cosmetic: the fc2 loop below unrolls to T2_MAX_H1 with NO n_h1 gate and
+     * relies on h1[i] == 0 past the model's width. */
+    #pragma unroll
+    for (int j = 0; j < T2_MAX_H1; j++)
+        h1[j] = (j < n_h1) ? RELU(h1[j]) : 0LL;
 
     /* h1[i]==0 for i>=n_h1 (set above), so the inner loop can always unroll
      * to T2_MAX_H1: out-of-range weight reads still get multiplied by 0. */
