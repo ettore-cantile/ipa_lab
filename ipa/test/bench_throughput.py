@@ -239,7 +239,19 @@ def pg_write(path, cmd):
 
 
 def pg_available():
-    return os.path.isdir(PKTGEN_DIR)
+    """Is pktgen loaded -- and if not, load it.
+
+    The module unloads between sessions (a reboot, an autoclean), and the
+    script already runs as root, so sending the user off to find `modprobe`
+    is a stop for something it can do itself. Only the failure is worth
+    reporting."""
+    if os.path.isdir(PKTGEN_DIR):
+        return True
+    subprocess.run(["modprobe", "pktgen"], check=False, capture_output=True)
+    if os.path.isdir(PKTGEN_DIR):
+        info("modulo pktgen caricato")
+        return True
+    return False
 
 
 def pg_reset():
@@ -915,7 +927,8 @@ def main():
         return 0
 
     if not pg_available():
-        sys.exit(f"{PKTGEN_DIR} non c'e': `sudo modprobe pktgen` e riprova.")
+        sys.exit(f"{PKTGEN_DIR} non c'e' e `modprobe pktgen` non l'ha "
+                 f"creato: questo kernel non ha il modulo.")
     pg_reset()
 
     import model_meta as mm
