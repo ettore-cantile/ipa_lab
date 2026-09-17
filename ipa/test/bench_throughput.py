@@ -187,7 +187,12 @@ _CLONE_SUPPORTED = True
 
 # Frame sizes. 64 e' il minimo Ethernet; 1514 il massimo senza jumbo. Il frame
 # IPA minimo di questo progetto e' 63 byte, quindi 64 li contiene tutti.
-DEFAULT_FRAMES = [64, 128, 256, 512, 1024, 1514]
+#
+# Tre taglie e non sei: l'inferenza legge sempre gli stessi header, quindi il
+# suo costo NON dipende dalla lunghezza del frame e le taglie intermedie
+# ripetevano la stessa misura allungando il run. Restano il minimo, una di
+# mezzo e il massimo. Le altre si chiedono con --frames.
+DEFAULT_FRAMES = [64, 512, 1514]
 
 # Sotto questa percentuale la perdita e' considerata rumore della macchina e non
 # saturazione del datapath. Vedi find_knee per la misura che ha imposto questa
@@ -254,7 +259,12 @@ DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
 # Scala dei rate per --mode saturate: frazioni del rate CONSEGNATO a delay 0,
 # crescenti. Si parte sotto la capacita' stimata e si sale, e ogni gradino e'
 # confermato da piu' ripetizioni. Non e' una bisezione, ed e' voluto.
-SATURATE_LADDER = (0.50, 0.65, 0.80, 0.90, 0.97, 1.03, 1.10, 1.25)
+# Cinque frazioni e non otto. Ogni gradino costa `repeat` finestre, e da quando
+# i rifiutati del generatore contano come perdita (vedi _measure_once) la scala
+# viene percorsa davvero invece di fermarsi al primo punto: otto gradini per
+# taglia per pipeline erano un run lungo il triplo per una risoluzione che il
+# banco non ha. Fitti dove sta il ginocchio, radi lontano.
+SATURATE_LADDER = (0.60, 0.80, 0.90, 1.00, 1.15)
 
 # Quanto deve salire il rate offerto perche' clone_skb/burst valgano la perdita
 # di rappresentativita'. Sotto questa soglia il parametro e' accettato dal
@@ -826,7 +836,12 @@ class GenRun(tuple):
     La DURATA aggregata e' il MASSIMO fra le istanze, non il minimo e non la
     media. `pgctrl start` blocca finche' l'ultimo thread ha finito, quindi la
     finestra vera e' lunga quanto il thread piu' lento; dividere il totale per
-    una durata piu' corta gonfierebbe ogni pps della tabella."""
+    una durata piu' corta gonfierebbe ogni pps della tabella.
+
+    `window` e' la durata dell'INTERO blocco su pgctrl start. E' l'intervallo
+    in cui i contatori del DUT accumulano -- si azzerano prima dello start e si
+    leggono dopo il ritorno -- ed e' quindi l'unico divisore onesto per i pps
+    in ricezione."""
 
     def __new__(cls, tx, pps, secs, per_dev=None, wall=0.0, errors=0):
         self = super().__new__(cls, (tx, pps, secs))
@@ -836,6 +851,12 @@ class GenRun(tuple):
         self.per_dev = per_dev or []
         self.wall = wall
         self.errors = errors
+        # La finestra dei contatori non e' la durata che un thread si
+        # attribuisce: a thread sfasati i due intervalli non coincidono, e
+        # dividere RX per la durata del thread piu' lungo dava rate piu' alti
+        # del tetto del generatore -- misurato 6,5 Mpps a 128 byte contro 3,6
+        # Mpps a 64, cioe' frame piu' grandi "piu' veloci", che e' impossibile.
+        self.window = max(wall, secs)
         durs = [d["secs"] for d in self.per_dev if d.get("secs")]
         # Skew: quanto sono durate diversamente le istanze. Sopra il 20% i
         # thread non hanno lavorato nella stessa finestra e il rate aggregato
@@ -846,7 +867,7 @@ class GenRun(tuple):
         # Coerenza: il totale trasmesso diviso la durata globale deve
         # assomigliare alla somma dei pps che pktgen riporta per istanza. Se non
         # ci assomiglia, uno dei due non descrive questa finestra.
-        agg = (tx / secs) if secs else 0.0
+        agg = (tx / self.window) if self.window else 0.0
         self.rate_mismatch_pct = (round(100.0 * abs(agg - pps) / pps, 1)
                                   if pps else 0.0)
         return self
@@ -855,7 +876,7 @@ class GenRun(tuple):
     def tx_pps_aggregate(self):
         """TX totale diviso la durata GLOBALE. E' la cifra onesta da usare:
         sommare i pps per-istanza li somma su finestre che non coincidono."""
-        return int(self.tx / self.secs) if self.secs else 0
+        return int(self.tx / self.window) if self.window else 0
 
 
 def pg_run_and_read(devs):
@@ -1669,20 +1690,25 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     # Una mediana su misure che oscillano del 75% non e' una misura: e' il
     # carico della macchina in tre momenti diversi. Marcarla e' l'unica cosa
     # onesta da farne.
+    #
+    # Due condizioni che qui NON entrano piu', perche' non dicono niente sulla
+    # bonta' della riga:
+    #   - gli errori di pktgen: sono la perdita in ingresso del DUT e adesso
+    #     stanno dentro offered_tx e dentro la perdita (vedi _measure_once).
+    #     Marcarli invalidi buttava via proprio le righe in cui la pipeline
+    #     era satura, cioe' le uniche interessanti;
+    #   - lo scarto fra le due letture del rate offerto: e' gia' risolto
+    #     scegliendo quella che non gonfia, e i pps in ricezione si dividono
+    #     comunque per la finestra del blocco su pgctrl, che nessuna delle due
+    #     letture puo' accorciare.
     med["unreliable"] = bool(
         (med["spread_pct"] is not None and med["spread_pct"] > MAX_SPREAD_PCT)
         or med.get("gen_skew_pct", 0.0) > 20.0
-        or med.get("gen_rate_mismatch_pct", 0.0) > 25.0
-        or med.get("gen_errors", 0) > 0
         or med.get("offered_pps") == 0 and med.get("tx", 0) > 0
     )
     med["invalid_reason"] = []
     if med.get("gen_skew_pct", 0.0) > 20.0:
         med["invalid_reason"].append("generator threads not synchronized")
-    if med.get("gen_rate_mismatch_pct", 0.0) > 25.0:
-        med["invalid_reason"].append("TX/rate mismatch")
-    if med.get("gen_errors", 0) > 0:
-        med["invalid_reason"].append("pktgen errors")
     if med.get("offered_pps") == 0 and med.get("tx", 0) > 0:
         med["invalid_reason"].append("zero offered rate with nonzero TX")
     if med["spread_pct"] is not None and med["spread_pct"] > MAX_SPREAD_PCT:
@@ -1742,12 +1768,24 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     miss = _read_u64(setup["pkt_stats"], 1)
     drop = _read_u64(setup["pkt_stats"], 2)
     rx = _percpu_sum(rx_tab)
-    secs = elapsed if elapsed > 0 else 1e-9
+    # La finestra dei contatori e' quella del blocco su pgctrl (GenRun.window),
+    # non la durata che pktgen attribuisce al thread piu' lungo.
+    secs = getattr(run, "window", 0.0) or elapsed
+    secs = secs if secs > 0 else 1e-9
     # Il rate OFFERTO e' quello che pktgen ha chiesto al kernel; quello
     # AGGREGATO e' il totale diviso la durata globale. Il secondo e' la cifra
     # da usare: sommare i pps per-istanza li somma su finestre che non
     # coincidono, e a thread sfasati gonfia il numero.
     offered = int(1e9 / delay) * len(devs) if delay else None
+    # Gli "errors" di pktgen su veth sono pacchetti PREPARATI e non accettati
+    # dal device: la coda d'ingresso del DUT era piena. Non entrano in
+    # pkts-sofar, quindi trattarli solo come guasto della strumentazione faceva
+    # sparire dalla misura proprio la perdita del DUT: ogni riga usciva a
+    # 0,00% con l'etichetta "non satura" mentre il generatore ne buttava
+    # 670 000 su 976 000. Sono carico offerto e non consegnato, e come tali
+    # entrano nel totale offerto e nella perdita.
+    errors = getattr(run, "errors", 0)
+    offered_tx = tx + errors
     return dict(frame=frame, delay=delay, secs=round(secs, 3),
                 tx=tx, tx_pps=run.tx_pps_aggregate or int(tx / secs),
                 tx_pps_sum=tx_pps, offered_pps=offered,
@@ -1759,14 +1797,24 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 # quella usata ovunque qui e' la prima -- che e' quella che non
                 # puo' gonfiare il risultato.
                 gen_rate_mismatch_pct=getattr(run, "rate_mismatch_pct", 0.0),
-                gen_errors=getattr(run, "errors", 0),
+                gen_errors=errors,
+                offered_tx=offered_tx,
+                offered_real_pps=int(offered_tx / secs),
                 hit=hit, miss=miss, drop=drop, rx=rx,
                 rx_pps=int(rx / secs),
                 # Throughput on the wire counts the frame, not the payload.
                 rx_mbps=round(rx * frame * 8 / secs / 1e6, 2),
-                lost_before=max(0, tx - hit),
+                lost_before=max(0, offered_tx - hit),
                 lost_after=max(0, hit - rx),
-                loss_pct=round(100.0 * (tx - rx) / tx, 3) if tx else 0.0)
+                # RX maggiore dell'offerto non e' una perdita NEGATIVA: sono
+                # residui in volo dal punto precedente. Si taglia a zero
+                # invece di stampare -0,03%.
+                loss_pct=(round(100.0 * max(0, offered_tx - rx) / offered_tx, 3)
+                          if offered_tx else 0.0),
+                # La perdita sui soli pacchetti davvero messi sul filo, cioe'
+                # quella che si leggeva prima senza i rifiutati.
+                loss_wire_pct=(round(100.0 * max(0, tx - rx) / tx, 3)
+                               if tx else 0.0))
 
 
 # ==========================================================================
@@ -3130,6 +3178,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                f"{'perdita':>8s} {'collo':>18s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
+        print(f"  {GREY}offerto = trasmessi + rifiutati dal device (coda "
+              f"d'ingresso piena); la perdita e' calcolata su quello.{NC}")
 
         def printer(r):
             mark = GREEN if r["loss_worst"] <= threshold else (
@@ -3140,8 +3190,12 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                 flag = " INAFFIDABILE" if r.get("unreliable") else ""
                 spread = (f" {col}(x{r['repeat']}, +-{r['spread_pct']:.0f}%"
                           f"{flag}){NC}")
-            off = r.get("offered_pps")
-            print(f"  {r['frame']:5d} {(off if off else 0):9d} {r['tx']:9d} "
+            # A delay 0 non c'e' un rate richiesto: si stampa quello davvero
+            # offerto (trasmessi + rifiutati, diviso la finestra), che e' la
+            # cifra rispetto a cui va letta la perdita. Prima la colonna
+            # stampava 0 su ogni riga a massima spinta.
+            off = r.get("offered_pps") or r.get("offered_real_pps") or 0
+            print(f"  {r['frame']:5d} {off:9d} {r['tx']:9d} "
                   f"{r['hit']:9d} {r['rx']:9d} "
                   f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} {r['secs']:5.2f} "
                   f"{mark}{r['loss_worst']:7.2f}%{NC} "
@@ -3280,7 +3334,8 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         out_rows.append(clean)
         print(f"  {GREY}a massima spinta non si perde niente: la pipeline non "
               f"e' satura e questo NON e' il suo massimo. Il tetto e' il "
-              f"generatore ({full['tx_pps']} pps offerti da "
+              f"generatore ({full.get('offered_real_pps') or full['tx_pps']}"
+              f" pps offerti da "
               f"{gen.n_inst} thread). Per alzarlo: piu' CPU al generatore "
               f"(--gen-cpus), o meno al DUT (--dut-cpus).{NC}")
         return full, clean
