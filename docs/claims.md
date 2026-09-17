@@ -209,34 +209,49 @@ dal budget. Le due schede qui sotto vanno lette insieme: D2 varia la profondità
 parametri fermi su tutte e quattro le pipeline, D1 spinge il budget più in alto ma
 solo su P1.
 
-### D1 — A parità di budget-pesi, allargare batte approfondire (P1) ✅⚠️
+### D1 — «Allargare batte approfondire» vale, ma non sempre ✅
 
 | | |
 |---|---|
-| **Ipotesi** | Dato un numero di parametri, spenderli in un layer largo costa meno che in molti stretti. |
-| **Variabile modificata** | La profondità, a budget abbinato: 3 tier (~300, ~1 200, ~4 700 pesi), ciascuno in versione larga (1 layer) e profonda (4 e 8 layer). |
-| **Variabili fisse** | Il budget-pesi, **con lo scarto stampato per ogni tier**. Ripetuto su 4 descrittori (0, 1 o 2 one-hot; one-hot piccola da 6 e grande da 52). |
-| **Metrica** | Istruzioni eBPF, latenza (minimo su 15 trial, con p50/p90/max). |
+| **Ipotesi** | Dato un numero di parametri, spenderli in un layer largo costa meno che in molti stretti. **Vera solo per certi vettori d'ingresso.** |
+| **Variabile modificata** | La profondità: 1, 2, 4, 8 hidden layer. |
+| **Variabili fisse** | Il budget-pesi, con la larghezza **risolta per descrittore** perché il budget sia davvero centrato, e lo **scarto stampato per ogni tier** (3,9-21,8%). Tre tier: ~300, ~1 200, ~4 700 pesi. Quattro descrittori: 0, 1 o 2 one-hot, piccola da 6 e grande da 52. |
+| **Metrica** | Latenza (min di 15 trial), istruzioni eBPF, e se il programma si compila e si carica. |
 
-**Risultato, sui due descrittori dove il budget è davvero abbinato:**
+**Tier B (~1 200 pesi), il meglio abbinato (scarti 3,9-10,1%):**
 
-| descrittore | tier | larga | profonda 4 | profonda 8 |
-|---|---|---:|---:|---:|
-| `default` (n_in 65) | A, scarto 6,7% | 53 ns | — | 70 ns (+32%) |
-| `default` | B, scarto 10,1% | 120 ns | 277 (+131%) | 351 (+193%) |
-| `big_onehot` (n_in 59) | A, scarto 7,3% | 41 ns | — | 57 ns (+39%) |
-| `big_onehot` | B, scarto 14,9% | 106 ns | 207 (+95%) | 269 (+154%) |
+| descrittore | n_in | larga | 2 layer | 4 layer | 8 layer |
+|---|---:|---:|---:|---:|---:|
+| `default` (2 one-hot) | 65 | **122 ns** | 183 (+50%) | 279 (+129%) | 293 (**+140%**) |
+| `big_onehot` (1 grande) | 59 | **110 ns** | 161 (+46%) | 215 (+95%) | 268 (**+144%**) |
+| `no_onehot` (0) | 11 | *crash* | *crash* | 501 ns | 457 ns |
+| `small_onehot` (1 piccola) | 13 | *crash* | *crash* | *rifiutata* | 465 ns |
 
-Tier C (~4 700 pesi): **crash su tutti e quattro i descrittori**, larga o profonda
-che sia, con `Looks like the BPF stack limit is exceeded`.
+**Tier A (~300 pesi):**
+
+| descrittore | n_in | larga | 2 layer | 4 layer | 8 layer |
+|---|---:|---:|---:|---:|---:|
+| `default` | 65 | **54 ns** | 56 | 58 | 70 (+30%) |
+| `big_onehot` | 59 | 41 ns | **38** | 59 | 57 (+39%) |
+| `no_onehot` | 11 | 107 ns | 110 | 107 | **102 (−5%)** |
+| `small_onehot` | 13 | 93 ns | **92** | 105 | 112 (+20%) |
 
 | | |
 |---|---|
-| **Conclusione** | Allargare batte approfondire, **e il divario cresce col budget**: +32-39% a ~300 pesi, +154-193% a ~1 200. Oltre ~1 300 pesi lo stack eBPF da 512 byte va in overflow comunque: non è una scelta di architettura, è il limite del «tutto srotolato in una funzione». |
-| **⚠️ Quello che questo run NON sostiene** | Gli altri due descrittori (`no_onehot`, `small_onehot`) hanno uno scarto di budget del **140-160%** nel tier B: la forma «profonda 8» ha lì 2,6× i parametri della «larga», quindi è più lenta anche perché è un modello più grande. Quei numeri **non possono** sostenere la conclusione. E sono proprio i due senza one-hot grande, cioè quelli che dovevano dimostrare che il risultato non è un artefatto delle one-hot: **il controllo è la parte che non ha funzionato.** |
-| **Causa e correzione** | Le forme erano **fisse** fra i descrittori (1×16, 4×11, 8×9) mentre `n_in` cambia da 65 a 11: con 65 ingressi il primo layer domina il budget e gli strati in più lo muovono poco, con 11 no. Ora la larghezza è **risolta per descrittore** per centrare il budget del tier (`solve_width`). Scarti dopo la correzione: tier A 6,6-19,7%, tier B 3,8-9,6%, tier C 0,8-3,8%. Il tier A resta grossolano perché a 300 pesi le larghezze intere fanno passi larghi — ed è stampato, non nascosto. |
-| **Da rifare** | Un run sulle forme abbinate, che è ciò che permette di dire «non è un artefatto delle one-hot». Fino ad allora la conclusione vale su 2 descrittori su 4. |
+| **Conclusione 1** | Con un ingresso **grande e dominato da una one-hot** (`default`, `big_onehot`), allargare batte approfondire e il divario **cresce col budget**: +30-39% a 300 pesi, **+140-144%** a 1 200. Il meccanismo è una spesa fissa per strato, non aritmetica. |
+| **Conclusione 2, nuova** | Con un ingresso **piccolo e denso** (`no_onehot`, n_in=11) il vantaggio **sparisce**: a 300 pesi la versione a 8 strati è marginalmente *più veloce* (102 contro 107 ns) e anche *più piccola* (1 280 contro 1 583 istruzioni). Una one-hot larga costa poco per pacchetto perché il datapath ne legge **una colonna**; un ingresso denso no, e allora allargare il primo strato moltiplica le letture di mappa. **La risposta dipende da com'è fatto il vettore d'ingresso**, non solo dal budget. |
+| **Conclusione 3, il limite mangia prima le larghe** | A parità di budget, la forma larga sfonda lo **stack eBPF da 512 byte** prima di quella profonda, perché il primo strato è dove lo stack si consuma. Su `no_onehot` a 1 200 pesi: larga 1×63 (stack stimato 584) **crash**, 2×26 (288) **crash**, 4×17 (216) **carica**, 8×11 (168) **carica**. Con un ingresso piccolo e un budget medio, **la rete profonda è l'unica che sta in piedi**. |
+| **Due limiti distinti, entrambi osservati** | `small_onehot` tier B mostra tutti e due: `1×57` e `2×25` muoiono nello **stack** (`Looks like the BPF stack limit is exceeded`, un abort di clang), mentre `4×16` passa la compilazione e viene rifiutata dal **verificatore** (`Program too large (5637 insns)`). Compilazione ed esecuzione sono soglie diverse e si incontrano in punti diversi. |
+| **Il tier C non esiste** | ~4 700 pesi: **crash su tutti e quattro i descrittori e tutte e quattro le profondità**. Oltre ~1 300 pesi il modello non ci sta, larga o profonda che sia: non è una scelta di architettura, è il tetto del «tutto srotolato in una funzione». |
+| **Limite dichiarato** | ⚠️ Il tier A ha scarti fino al 21,8%: a 300 pesi le larghezze intere fanno passi grossi (a 65 ingressi, quattro strati possono avere 262 o 359 pesi, niente in mezzo). Le differenze di 2-3 ns dentro quel tier non sono risolvibili. Il tier B è quello su cui appoggiarsi. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_depth_vs_width.py` |
+
+> **La frase per la tesi.** Non «le reti larghe sono preferibili a quelle profonde»,
+> ma: *con un ingresso dominato da feature one-hot — il caso di IPA — allargare
+> batte approfondire, e sempre di più al crescere del budget; con un ingresso
+> piccolo e denso il vantaggio sparisce, e oltre una certa taglia è la forma larga
+> a non compilare più.* La prima è una legge che i dati non sostengono; la seconda
+> è un risultato con un dominio di validità.
 
 ### D2 — A parametri fermi, la risposta cambia con la pipeline ✅
 

@@ -1298,13 +1298,40 @@ $\sim$1\,200 pesi & 124 ns & 282 ns \quad($+127\%$) \\
 \end{center}
 
 A 592 pesi e cinque strati l'effetto su P1 sta \emph{sotto il rumore della
-misura}; a 1\,200 pesi e otto strati è più che doppio. La frase giusta non è
-"allargare batte approfondire", è \textbf{"allargare batte approfondire sopra
-una certa taglia"}.
+misura}; a 1\,200 pesi e otto strati è più che doppio.
 
-Vale la pena notare la differenza fra le due formulazioni. La prima è una legge;
-la seconda è un risultato con un dominio di validità. Solo la seconda è
-sostenuta dai dati.
+E c'è una seconda condizione, emersa provando quattro vettori d'ingresso diversi
+a budget abbinato. Con un ingresso \textbf{grande e dominato da una one-hot} ---
+il caso di IPA, 52 dei 65 valori --- allargare batte approfondire nettamente:
+$+140\%$ di latenza a otto strati. Con un ingresso \textbf{piccolo e denso}
+(undici valori, nessuna one-hot) il vantaggio \textbf{sparisce}: a 300 pesi la
+versione a otto strati è perfino un poco più veloce, e più piccola.
+
+Il motivo è lo stesso di due sezioni fa. Una one-hot larga costa poco per
+pacchetto, perché il datapath ne legge \emph{una colonna sola}; un ingresso
+denso invece fa moltiplicare le letture per la larghezza del primo strato.
+
+\begin{lezione}
+La frase giusta non è "le reti larghe sono preferibili a quelle profonde". È:
+\emph{con un ingresso dominato da feature one-hot, allargare batte
+approfondire, e sempre di più al crescere del budget; con un ingresso piccolo e
+denso il vantaggio sparisce, e oltre una certa taglia è la forma larga a non
+compilare più.}
+
+La prima è una legge, e i dati non la sostengono. La seconda è un risultato con
+un dominio di validità.
+\end{lezione}
+
+\subsection*{Il limite mangia prima le larghe}
+
+A parità di parametri la forma larga sfonda lo stack eBPF da 512 byte
+\emph{prima} di quella profonda, perché è il primo strato a consumarlo. Su
+undici ingressi e 1\,200 pesi, in ordine di stack stimato: larga $1\times63$
+crash, $2\times26$ crash, profonda $4\times17$ carica, profonda $8\times11$
+carica.
+
+Con un ingresso piccolo e un budget medio, \textbf{la rete profonda è l'unica
+che sta in piedi}.
 
 \section{Congelare il nodo: conviene?}
 
