@@ -372,14 +372,16 @@ def install_node_id(b, map_name: str, node_cfg=None, n_nodes: int = None):
     honest representation of "this node does not know which node it is".
     """
     idx = resolve_node_index(node_cfg, n_nodes)
-    if idx is not None and not 0 <= idx <= 255:
+    if idx is not None and not 0 <= idx <= 254:
         # The datapath holds this index in a byte-bounded value, because the
         # verifier needs that bound to reason about the feature loop. Truncating
         # here would make node 300 silently claim to be node 44.
         raise ValueError(
-            f"node index {idx} is outside [0, 255], which is what the datapath "
-            f"can represent. A topology with more than 256 nodes needs a wider "
-            f"bound in the generated C as well.")
+            f"node index {idx} is outside [0, 254]. The datapath holds this "
+            f"in exactly one byte -- the range the verifier needs to keep "
+            f"Pipeline 3's layer_first inside its complexity budget -- and 255 "
+            f"is reserved to mean \"unknown\". Truncating here would make node "
+            f"300 silently claim to be node 44.")
     if idx is None:
         print(f"[node] WARNING: {map_name} left empty -- no node index resolved "
               f"($IPA_NODE_ID, or a name->index table in the topology). The "

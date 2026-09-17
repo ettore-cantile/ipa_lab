@@ -355,7 +355,7 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 #define META_LAYER_IDX   2
 /* The node's view of this packet, packed into one slot:
  *
- *      bits 24..16 : this NODE's index   (0x100 = unknown)
+ *      bits 23..16 : this NODE's index   (0xff = unknown, so 0..254)
  *      bits 15..0  : the LOGICAL PORT the packet arrived on (0 = none)
  *
  * Packed rather than given a slot each, and this is the whole reason:
@@ -525,7 +525,8 @@ int modular_dispatcher(struct xdp_md *ctx) {
       __u32 _port = _lp ? (*_lp & 0xffffU) : 0U;
       __u32 _nz = 0;
       __u32 *_nid = node_id_t3.lookup(&_nz);
-      __u32 _nd = (_nid && *_nid <= 0xffU) ? *_nid : 0x100U;
+      /* 0xff = unknown, so a node index is 0..254. */
+      __u32 _nd = (_nid && *_nid < 0xffU) ? *_nid : 0xffU;
       long long v = (long long)((_nd << 16) | _port);
       scratch_meta.update(&idx, &v); }
     idx = META_TTL;        { long long v = ip->ttl;                scratch_meta.update(&idx, &v); }
@@ -607,12 +608,16 @@ int layer_first(struct xdp_md *ctx) {
     /* One lookup, one ternary -- exactly the shape that loads. The node
      * index rides in the upper half of the same word; unpacking it is two ALU
      * ops on an already-bounded value, which costs the verifier nothing like a
-     * second helper call would. 0x1000000 is "no port, unknown node". */
+     * second helper call would. 0xff0000 is "no port, unknown node". */
     int mctx = META_NODE_CTX;
     long long *cxp = scratch_meta.lookup(&mctx);
-    __u32 _ctx = cxp ? (__u32)(*cxp) : 0x1000000U;
+    __u32 _ctx = cxp ? (__u32)(*cxp) : 0xff0000U;
     __u32 _raw_iface = _ctx & 0xffffU;
-    __u32 _node      = (_ctx >> 16) & 0x1ffU;
+    /* EXACTLY one byte, [0, 255] -- the range the verifier had when this
+     * came from `(__u32)model_id`, a __u8. Holding a 256 "unknown" sentinel
+     * needed 9 bits, and that was the last difference from the version that
+     * loads. 0xff is the sentinel instead, so node indices run 0..254. */
+    __u32 _node      = (_ctx >> 16) & 0xffU;
 
     /* The NODE's own index, not the packet's model_id. Resolved by the
      * dispatcher and passed through scratch_meta, like the ingress port above:
