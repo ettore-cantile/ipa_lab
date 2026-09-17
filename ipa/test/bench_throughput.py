@@ -121,6 +121,40 @@ PKTGEN_MAGIC_MODEL_ID = 0xBE      # vedi la docstring
 # costo di allocazione senza che il conteggio dei pacchetti ne risenta.
 ESCALATE_CLONE = 100000
 
+# --------------------------------------------------------------------------
+# DOVE VA IL TEMPO PER PACCHETTO, E LE TRE MANOPOLE CHE LO TOCCANO
+# --------------------------------------------------------------------------
+# A ~550 kpps per core il costo per pacchetto e' ~1800 ns, e l'inferenza ne
+# spiega 60 (P1). Il resto e' il banco, e si divide in tre pezzi che si possono
+# aggredire separatamente.
+#
+# 1. LA COPIA PER HEADROOM. XDP su veth pretende XDP_PACKET_HEADROOM (256 byte)
+#    davanti al pacchetto; gli skb di pktgen ne hanno NET_SKB_PAD (64). Quindi
+#    veth_xdp_rcv_skb ne fa una copia PER OGNI PACCHETTO prima di eseguire il
+#    programma. E' il costo noto di "XDP su veth alimentato da un mittente non
+#    XDP" e non si toglie con una manopola di pktgen: si toglie cambiando modo
+#    di iniezione (punto 3).
+#
+# 2. IL SECONDO SALTO VETH. Ogni pacchetto rediretto attraversa un ALTRO veth e
+#    ci trova un ALTRO programma XDP (il contatore). Sono due traversate e due
+#    invocazioni XDP per pacchetto, mentre su un nodo vero il redirect va su una
+#    NIC. Il contatore serve -- e' cio' che ha mostrato che la perdita e' in
+#    uscita -- ma va saputo che sta dentro la cifra.
+#
+# 3. IL MODO DI INIEZIONE. `xmit_mode netif_receive` fa iniettare a pktgen i
+#    pacchetti direttamente nel percorso RX del device, saltando veth_xmit, la
+#    NAPI del peer e la conversione skb->xdp. E' il modo documentato per
+#    misurare l'elaborazione in ricezione. ATTENZIONE: si entra a
+#    netif_receive_skb, quindi XDP gira in modo GENERIC, non native -- i numeri
+#    non sono confrontabili con quelli in modo native, e la colonna xmit_mode
+#    del CSV serve a non mescolarli.
+#
+# `burst N` chiede a pktgen di consegnare N pacchetti per chiamata (xmit_more).
+# Come clone_skb puo' essere rifiutato da veth; come clone_skb, il rifiuto e' un
+# esperimento in meno e non un run perso.
+XMIT_MODES = ("start_xmit", "netif_receive", "queue_xmit")
+_BURST_SUPPORTED = True
+
 # veth non espone IFF_TX_SKB_SHARING -- consegna l'skb alla RX del peer, dove
 # XDP lo riscrive -- quindi pktgen rifiuta clone_skb. Una volta saputo, non si
 # riprova: altrimenti ogni punto di misura stampa lo stesso avviso per ogni
@@ -135,6 +169,11 @@ DEFAULT_FRAMES = [64, 128, 256, 512, 1024, 1514]
 # saturazione del datapath. Vedi find_knee per la misura che ha imposto questa
 # scelta. Zero stretto resta riportato a parte.
 DEFAULT_LOSS_THRESHOLD = 0.1
+
+# Quante volte ripetere ogni punto. Non e' prudenza generica: tre misure della
+# stessa identica configurazione hanno dato 0.06%, 19.52% e 0.00% di perdita.
+# Vedi measure_point.
+DEFAULT_REPEAT = 3
 
 # Ritardi fissi, usati solo se il chiamante li chiede con --delays. Il default
 # e' la ricerca del ginocchio (find_knee), che costa meno punti e centra la
@@ -217,7 +256,7 @@ def pg_clear_threads(n):
 
 
 def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0,
-                 thread=0):
+                 thread=0, burst=0, xmit_mode="start_xmit"):
     """Put one device on one generator thread and configure it.
 
     One thread per device, one device per thread. pktgen threads are pinned to
@@ -233,7 +272,17 @@ def pg_configure(dev, pkt_size, count, delay, dst_ip, dst_mac, clone=0,
         raise RuntimeError(
             f"pktgen: {d} non esiste dopo `add_device {dev}`. "
             f"L'interfaccia esiste ed e' UP? `ip link show {dev}`")
-    global _CLONE_SUPPORTED
+    global _CLONE_SUPPORTED, _BURST_SUPPORTED
+    if xmit_mode != "start_xmit":
+        # Set before anything else: it changes which path the packets take, and
+        # some settings are only meaningful on one of them.
+        pg_write(d, f"xmit_mode {xmit_mode}")
+    if burst and _BURST_SUPPORTED:
+        try:
+            pg_write(d, f"burst {burst}")
+        except RuntimeError:
+            _BURST_SUPPORTED = False
+            warn("burst rifiutato da questo device, proseguo senza.")
     if clone and _CLONE_SUPPORTED:
         # Optional by design: clone_skb is the escalation knob, not part of the
         # reference condition. A kernel that refuses it costs one experiment,
@@ -341,7 +390,38 @@ def _zero_counters(setup, rx_tab, n_out):
 
 
 def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
-                  tg_devs=None):
+                  tg_devs=None, repeat=DEFAULT_REPEAT, burst=0,
+                  xmit_mode="start_xmit"):
+    """`repeat` runs of the same point; returns the median by rx_pps, carrying
+    the WORST loss seen across them.
+
+    Single samples are not usable here. Measured on this bench, three runs of
+    one identical configuration -- same pipeline, same rate, same frame,
+    clone_skb already known refused -- gave 0.06%, 19.52% and 0.00% loss. A
+    knee search reading one of those decides on noise: the 19.52% made it
+    conclude the datapath was saturating and restart the search.
+
+    Median for the RATE, because a slow outlier is a busy machine and not the
+    datapath. Worst for the LOSS, because a rate that drops packets on one run
+    out of three is not a rate this datapath sustains, and calling it clean
+    would be the optimistic lie this whole script exists to avoid."""
+    runs = [_measure_once(setup, rx_tab, fab, frame, delay, count, n_out,
+                          clone, tg_devs, burst, xmit_mode)
+            for _ in range(max(1, repeat))]
+    runs.sort(key=lambda r: r["rx_pps"])
+    med = runs[len(runs) // 2]
+    med["repeat"] = len(runs)
+    med["loss_worst"] = max(r["loss_pct"] for r in runs)
+    med["loss_best"] = min(r["loss_pct"] for r in runs)
+    med["rx_pps_min"] = runs[0]["rx_pps"]
+    med["rx_pps_max"] = runs[-1]["rx_pps"]
+    med["burst"] = burst
+    med["xmit_mode"] = xmit_mode
+    return med
+
+
+def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
+                  tg_devs=None, burst=0, xmit_mode="start_xmit"):
     """One (frame size, offered rate) point. Returns a dict of counters.
 
     `count` is per generator thread, so the offered load scales with the number
@@ -352,7 +432,8 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     for i, dev in enumerate(devs):
         pg_configure(dev, frame, count, delay,
                      dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02",
-                     clone=clone, thread=i)
+                     clone=clone, thread=i, burst=burst,
+                     xmit_mode=xmit_mode)
     tx, tx_pps, elapsed = pg_run_and_read(devs)
     hit = _read_u64(setup["pkt_stats"], 0)
     miss = _read_u64(setup["pkt_stats"], 1)
@@ -401,7 +482,13 @@ def make_tg_links(n):
     for i in range(n):
         rx, tx = f"{TG_PREFIX}{i}", f"{TG_PREFIX}{i}p"
         _ip("link", "del", rx, check=False)          # leftovers from a crash
-        _ip("link", "add", rx, "type", "veth", "peer", tx)
+        # One queue per CPU on both sides: with a single queue every
+        # generator thread funnels through one NAPI instance, which caps the
+        # aggregate before any pipeline does.
+        ncpu = str(os.cpu_count() or 1)
+        _ip("link", "add", rx, "numrxqueues", ncpu, "numtxqueues", ncpu,
+            "type", "veth", "peer", tx,
+            "numrxqueues", ncpu, "numtxqueues", ncpu)
         for dev in (rx, tx):
             _ip("link", "set", dev, "up")
             # IPv6 autoconf would put router solicitations on the same wire and
@@ -495,7 +582,8 @@ def attach_rx_counter(fab):
 
 # ==========================================================================
 def run_method(method, model_path, frames, delays, count, out_rows,
-               clone=0, threads=1, threshold=DEFAULT_LOSS_THRESHOLD):
+               clone=0, threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
+               repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit"):
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -514,8 +602,20 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         info(f"pipeline agganciata a {fab.ingress} (ifindex "
              f"{fab.ingress_ifindex})")
 
-        # Thread 0 uses the fabric's own ingress; the rest get their own veth.
-        tg_devs = [fab.ingress_peer]
+        # WHICH device pktgen is pointed at depends on the injection mode.
+        #
+        #   start_xmit / queue_xmit : pktgen TRANSMITS, so it takes the PEER of
+        #       the DUT's ingress; the packet crosses the veth and arrives on
+        #       the ingress, where the pipeline's XDP runs.
+        #   netif_receive : pktgen injects straight into a device's RECEIVE
+        #       path, so it takes the INGRESS itself. No veth crossing, no
+        #       peer NAPI, no skb->xdp conversion -- and XDP runs generic.
+        #
+        # Getting this backwards would send every packet somewhere the pipeline
+        # is not, and the probe would catch it, but the message would blame the
+        # model_id byte.
+        rx_side = (xmit_mode == "netif_receive")
+        tg_devs = [fab.ingress if rx_side else fab.ingress_peer]
         extra = []
         if threads > 1:
             import test_fabric as TF
@@ -526,13 +626,17 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                 # Same logical port as the fabric ingress: these are extra
                 # generator cores feeding one node, not extra node ports.
                 ing_map[ct.c_uint32(idx)] = ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
-                tg_devs.append(tx)
+                tg_devs.append(rx if rx_side else tx)
             info(f"{threads} core generatori: {', '.join(tg_devs)}")
+        if rx_side:
+            info("xmit_mode netif_receive: XDP gira in modo GENERIC, non "
+                 "native -- non confrontabile con gli altri run")
 
         # -- sonda: un pacchetto solo, per sapere se stiamo misurando
         #    inferenza o XDP_PASS.
         probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
-                              tg_devs)
+                              tg_devs, repeat=1, burst=burst,
+                              xmit_mode=xmit_mode)
         if probe["hit"] == 0:
             warn(f"la sonda non ha prodotto nessun HIT "
                  f"(tx={probe['tx']} miss={probe['miss']}).")
@@ -552,17 +656,22 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         def printer(r):
             mark = GREEN if r["loss_pct"] == 0 else (
                 RED if r["loss_pct"] > 1 else YELLOW)
+            spread = ""
+            if r.get("repeat", 1) > 1 and r["rx_pps_min"]:
+                sp = 100.0 * (r["rx_pps_max"] - r["rx_pps_min"]) / r["rx_pps_min"]
+                spread = f" {GREY}(x{r['repeat']}, +-{sp:.0f}%){NC}"
             print(f"  {r['frame']:5d} {r['delay']:6d} {r['tx']:9d} "
                   f"{r['hit']:9d} {r['rx']:9d} {r['tx_pps']:9d} "
                   f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
-                  f"{mark}{r['loss_pct']:7.2f}%{NC}")
+                  f"{mark}{r['loss_worst']:7.2f}%{NC}{spread}")
 
         for frame in frames:
             if delays:
                 # Manual sweep: the caller asked for specific rates.
                 for delay in delays:
                     r = measure_point(setup, rx_tab, fab, frame, delay, count,
-                                      n_out, clone, tg_devs)
+                                      n_out, clone, tg_devs, repeat, burst,
+                                      xmit_mode)
                     r["clone_skb"], r["method"] = clone, method
                     r["threads"] = threads
                     out_rows.append(r)
@@ -570,7 +679,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             else:
                 find_knee(setup, rx_tab, fab, frame, count, n_out, clone,
                           out_rows, method, printer, tg_devs=tg_devs,
-                          threads=threads, threshold=threshold)
+                          threads=threads, threshold=threshold,
+                          repeat=repeat, burst=burst, xmit_mode=xmit_mode)
             _summarise(method, frame, out_rows, threshold)
 
         pg_reset()
@@ -584,7 +694,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
 
 def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
               method, printer, max_delay=20000, steps=6, tg_devs=None,
-              threads=1, threshold=DEFAULT_LOSS_THRESHOLD):
+              threads=1, threshold=DEFAULT_LOSS_THRESHOLD,
+              repeat=DEFAULT_REPEAT, burst=0, xmit_mode="start_xmit"):
     """Find the fastest rate this pipeline takes without losing packets.
 
       1. offer everything the generator has (delay 0);
@@ -609,13 +720,13 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
 
     Returns (peak_row, clean_row_or_None)."""
     full = measure_point(setup, rx_tab, fab, frame, 0, count, n_out, clone,
-                         tg_devs)
+                         tg_devs, repeat, burst, xmit_mode)
     full["method"], full["clone_skb"], full["delay"] = method, clone, 0
     full["threads"] = threads
     out_rows.append(full)
     printer(full)
 
-    if full["loss_pct"] <= threshold and clone == 0 and _CLONE_SUPPORTED:
+    if full["loss_worst"] <= threshold and clone == 0 and _CLONE_SUPPORTED:
         # Nothing lost at the generator's best effort. Before concluding that
         # the pipeline has headroom, PUSH HARDER: with clone_skb pktgen reuses
         # one buffer instead of allocating per packet, which removes the cost
@@ -627,23 +738,25 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         # used only to answer "does this pipeline EVER saturate", and the rows
         # it produces carry clone_skb != 0 so they stay distinguishable.
         hard = measure_point(setup, rx_tab, fab, frame, 0, count, n_out,
-                             ESCALATE_CLONE, tg_devs)
+                             ESCALATE_CLONE, tg_devs, repeat, burst,
+                             xmit_mode)
         hard["method"], hard["clone_skb"], hard["delay"] = \
             method, ESCALATE_CLONE, 0
         hard["threads"] = threads
         out_rows.append(hard)
         printer(hard)
-        if hard["loss_pct"] > threshold:
+        if hard["loss_worst"] > threshold:
             print(f"  {GREY}con clone_skb={ESCALATE_CLONE} la pipeline perde: "
                   f"il ginocchio esiste, lo cerco{NC}")
             return find_knee(setup, rx_tab, fab, frame, count, n_out,
                              ESCALATE_CLONE, out_rows, method, printer,
-                             max_delay, steps, tg_devs, threads)
+                             max_delay, steps, tg_devs, threads,
+                             threshold, repeat, burst, xmit_mode)
         print(f"  {GREY}nemmeno con clone_skb={ESCALATE_CLONE}: su questa "
               f"macchina satura il generatore, non la pipeline{NC}")
         return (hard if hard["rx_pps"] > full["rx_pps"] else full), hard
 
-    if full["loss_pct"] <= threshold:
+    if full["loss_worst"] <= threshold:
         return full, full          # generator-bound: peak IS the no-loss rate
 
     lo, hi = 0, max_delay           # lo loses, hi is assumed clean
@@ -653,11 +766,11 @@ def find_knee(setup, rx_tab, fab, frame, count, n_out, clone, out_rows,
         if mid in (lo, hi):
             break
         r = measure_point(setup, rx_tab, fab, frame, mid, count, n_out,
-                          clone, tg_devs)
+                          clone, tg_devs, repeat, burst, xmit_mode)
         r["method"], r["clone_skb"], r["threads"] = method, clone, threads
         out_rows.append(r)
         printer(r)
-        if r["loss_pct"] <= threshold:
+        if r["loss_worst"] <= threshold:
             best_clean = r if (best_clean is None or
                                r["rx_pps"] > best_clean["rx_pps"]) else best_clean
             hi = mid                # under threshold: try to go faster
@@ -677,8 +790,8 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
     if not pts:
         return
     peak = max(pts, key=lambda r: r["rx_pps"])
-    under = [r for r in pts if r["loss_pct"] <= threshold]
-    strict = [r for r in pts if r["loss_pct"] == 0.0]
+    under = [r for r in pts if r["loss_worst"] <= threshold]
+    strict = [r for r in pts if r["loss_worst"] == 0.0]
     best = max(under, key=lambda r: r["rx_pps"]) if under else None
     print(f"  {GREY}frame {frame}: massimo {peak['rx_pps']} pps "
           f"({peak['rx_mbps']} Mb/s, perdita {peak['loss_pct']}%)")
@@ -722,6 +835,16 @@ def main():
                         "meno punti e centra la risposta")
     p.add_argument("--count", type=int, default=200000,
                    help="pacchetti per punto di misura")
+    p.add_argument("--burst", type=int, default=0, metavar="N",
+                   help="consegna N pacchetti per chiamata (xmit_more). Come "
+                        "clone_skb puo' essere rifiutato da veth.")
+    p.add_argument("--xmit-mode", choices=XMIT_MODES, default="start_xmit",
+                   help="netif_receive inietta nel percorso RX saltando la "
+                        "traversata veth, ma XDP gira GENERIC: numeri non "
+                        "confrontabili con gli altri modi.")
+    p.add_argument("--repeat", type=int, default=DEFAULT_REPEAT, metavar="R",
+                   help="misure per punto; si tiene la mediana del rate e la "
+                        "PEGGIORE delle perdite")
     p.add_argument("--loss-threshold", type=float,
                    default=DEFAULT_LOSS_THRESHOLD, metavar="PCT",
                    help="sotto questa percentuale la perdita e' considerata "
@@ -769,7 +892,8 @@ def main():
     rc = 0
     for m in methods:
         rc |= run_method(m, model_path, frames, delays, a.count, rows,
-                         a.clone_skb, a.threads, a.loss_threshold)
+                         a.clone_skb, a.threads, a.loss_threshold,
+                         a.repeat, a.burst, a.xmit_mode)
 
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
