@@ -438,6 +438,43 @@ matrice intera, per guardare, non per pubblicare.
 | 7 | `scaling_sparsity_insns_log` | **Con pesi più sparsi P1 crolla** (1 071 → 224 istruzioni al 90% di zeri), P2 e P3 non si muovono di un'istruzione. I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero; per P2/P3 uno zero è un byte in mappa come un altro. Scala logaritmica: su scala lineare P1 sta a ~10³ e P2/P3 a ~10⁴, e il crollo sparisce schiacciato sullo zero. |
 | 8 | `scaling_descriptor_insns` | **Cambiare la composizione del vettore d'ingresso ricompila P1** (da 575 a 1 071 istruzioni fra le quattro IV), mentre P2 e P3 leggono il descrittore da `model_desc` e non cambiano. Ed è anche il **controllo** dell'esperimento sulla specializzazione: dove il descrittore non dichiara la feature `node`, le due P1 sono **identiche alla cifra** (599 e 599, 575 e 575); dove la dichiara, divergono (614 contro 1 071). Il divario è tutto lì e nient'altro. Barre e non curve: una linea fra `no_onehot` e `big_onehot` disegnerebbe una pendenza fra due nomi. |
 
+### Testa a testa: P1 specializzata contro P1.5
+
+Figura dedicata: `duel_p1_vs_p15.pdf`, quattro pannelli con le sole due P1 — in
+tutte le altre figure P2 e P3 stanno un ordine di grandezza sopra e schiacciano
+questo confronto sul fondo del grafico.
+
+**Su Germany50** (52 nodi, 65-4-4-7, il punto di riferimento di tutto il progetto):
+
+| | P1 specializzata | P1.5 hardcoded | |
+|---|---:|---:|---|
+| istruzioni eBPF | **614** | 1 071 | −43% |
+| codice nativo (byte) | **2 740** | 5 218 | −47% |
+| latenza (ns/pkt) | 54 | 57 | −5%, dentro il rumore |
+| memoria mappe (byte) | 2 356 | 2 356 | identica |
+| aggiornare il modello | ~1 550 ms | ~1 460 ms | identico |
+| lettura di `node_id` per pacchetto | **0** | 1 | una in meno |
+| binari da compilare e installare | **uno per nodo** | uno per modello | ⚠️ |
+
+**A 100 nodi** il divario si allarga, perché una delle due cresce e l'altra no:
+
+| | P1 specializzata | P1.5 hardcoded | |
+|---|---:|---:|---|
+| istruzioni eBPF | **640** | 1 692 | −62% |
+| codice nativo (byte) | **2 837** | 8 432 | −66% |
+| latenza (ns/pkt) | 55 | 61 | −10% |
+
+Due righe da leggere con attenzione perché smentiscono un'aspettativa ragionevole:
+
+- **La memoria delle mappe è identica.** Il programma specializzato non *legge* più
+  `node_id`, ma la mappa resta **dichiarata** nell'header condiviso. Sono pochi byte
+  e non cambia nulla nelle misure, ma è codice morto: un header specializzato potrebbe
+  non dichiararla affatto.
+- **Il costo di aggiornamento è identico.** Il sorgente è più piccolo, ma il tempo è
+  dominato dal costo fisso di far partire clang, non dalla lunghezza del file. La
+  specializzazione non rende la compilazione più veloce — e visto che ne servono N
+  invece di una, il costo totale di deployment **peggiora** di un fattore N.
+
 ### Congelare il nodo conviene? Sì, ma non per la ragione che sembra
 
 L'indice del nodo è una **costante di deployment**: non cambia per tutta la vita del

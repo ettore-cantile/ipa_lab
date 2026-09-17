@@ -1329,6 +1329,49 @@ Al 90\%\ di zeri il divario è sparito. Sparsità e nodo congelato sono \textbf{
 strade alla stessa riduzione}: se i pesi sono già quasi tutti zero, il
 compilatore cancella lo switch da solo e non resta niente da congelare.
 
+\subsection*{Le quattro risposte in una figura}
+
+\begin{center}
+\includegraphics[width=\textwidth]{../result/duel_p1_vs_p15.pdf}
+\end{center}
+
+Qui ci sono solo le due P1: in tutte le altre figure P2 e P3 stanno un ordine di
+grandezza più su e schiacciano questo confronto sul fondo del grafico.
+
+I quattro pannelli non dicono la stessa cosa, ed è questo il punto. La dimensione
+crolla e smette di dipendere dalla rete; il codice nativo crolla ancora di più
+(2\,837 byte contro 8\,432 a cento nodi); la velocità si muove appena; e con i
+pesi sparsi le due curve si toccano.
+
+\subsection*{Due aspettative smentite}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{su Germany50} & \textbf{specializzata} & \textbf{P1.5} \\
+\midrule
+istruzioni eBPF     & \textbf{614}   & 1\,071 \\
+codice nativo (byte)& \textbf{2\,740}& 5\,218 \\
+latenza             & 54 ns          & 57 ns \\
+memoria delle tabelle & 2\,356 B     & 2\,356 B \\
+aggiornare il modello & 1\,550 ms    & 1\,460 ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le ultime due righe meritano attenzione perché smentiscono due aspettative
+ragionevoli.
+
+La \textbf{memoria delle tabelle non cambia}: il programma specializzato non
+\emph{legge} più la tabella del nodo, ma continua a \emph{dichiararla}, perché
+l'intestazione è condivisa. Sono pochi byte, ma è codice morto.
+
+Il \textbf{costo di aggiornamento non cala}: il sorgente è più piccolo, ma il
+tempo se lo mangia l'avvio del compilatore, non la lunghezza del file. La
+specializzazione non rende la compilazione più veloce --- e siccome ne servono N
+invece di una, il costo totale di installazione \emph{peggiora} di un fattore N.
+
 \subsection*{Il verdetto}
 
 \begin{lezione}

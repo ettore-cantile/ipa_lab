@@ -574,6 +574,74 @@ def bench_cell(pipeline, cell, repeat, trials):
                        f"exit {proc.returncode} (abort fatale: stack o verifier)")}
 
 
+
+# ==========================================================================
+# HEAD TO HEAD: the two P1 variants, on their own scale
+# ==========================================================================
+# Every other figure draws four pipelines, and P2/P3 sit an order of magnitude
+# above the two P1s -- so the comparison between THOSE TWO, which is a question
+# on its own, is squashed into the bottom of the plot. This figure drops the
+# other two and gives the duel the whole canvas.
+#
+# Four panels, because the answer has four parts and they do not all point the
+# same way: size collapses, native code collapses harder, speed barely moves,
+# and with sparse weights the advantage disappears altogether.
+DUEL_PANELS = [
+    ("nodes", "insns", "nodi della rete", "istruzioni eBPF",
+     "la dipendenza dalla taglia della rete sparisce"),
+    ("nodes", "jited", "nodi della rete", "codice nativo (byte)",
+     "e nel codice generato il divario e' anche piu' largo"),
+    ("width", "lat_ns", "neuroni per hidden layer", "latenza (ns/pacchetto)",
+     "la velocita', invece, si muove appena"),
+    ("sparsity", "insns", "frazione di pesi a zero", "istruzioni eBPF",
+     "e con pesi sparsi il vantaggio si annulla"),
+]
+
+
+def plot_duel(in_dir, fmt):
+    """One figure, four panels: P1 specialised against P1.5."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(9.6, 6.4))
+    drawn = 0
+    for ax, (axis, metric, xlab, ylab, note) in zip(axes.ravel(), DUEL_PANELS):
+        path = os.path.join(in_dir, f"scaling_{axis}.csv")
+        if not os.path.exists(path):
+            ax.set_visible(False)
+            continue
+        with open(path, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        for pipe in ("p1_static", "hardcoded"):
+            pts = sorted((float(r["x"]), float(r[metric]))
+                         for r in rows
+                         if r["pipeline"] == pipe and r.get(metric))
+            if not pts:
+                continue
+            xs, ys = zip(*pts)
+            ax.plot(xs, ys, linewidth=1.8, markersize=6, **STYLE[pipe])
+            drawn += 1
+        ax.set_xlabel(xlab, fontsize=9)
+        ax.set_ylabel(ylab, fontsize=9)
+        ax.set_title(note, fontsize=9, loc="left", color="#444444")
+        ax.tick_params(labelsize=8)
+        ax.grid(True, linewidth=0.4, alpha=0.4)
+        ax.set_ylim(bottom=0)
+    if not drawn:
+        plt.close(fig)
+        print(f"  {GREY}niente da disegnare: mancano i CSV{NC}")
+        return 0
+    axes.ravel()[0].legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    out = os.path.join(in_dir, "duel_p1_vs_p15." + fmt)
+    fig.savefig(out, dpi=160)
+    plt.close(fig)
+    print(f"  {GREEN}scritto{NC} {out}")
+    print(f"           {GREY}P1 specializzata contro P1.5, sulla loro scala{NC}")
+    return 1
+
+
 # ==========================================================================
 # SWEEP
 # ==========================================================================
@@ -1016,6 +1084,7 @@ def main():
         if importlib.util.find_spec("matplotlib") is None:
             sys.exit("serve matplotlib per i grafici: pip install matplotlib")
         n = sum(plot_axis(ax, a.plot, a.format, a.all_plots) for ax in AXES)
+        n += plot_duel(a.plot, a.format)
         print(f"\n{GREEN}{n} grafici{NC} in {a.plot}")
         return 0
 
