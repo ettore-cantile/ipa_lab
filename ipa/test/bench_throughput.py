@@ -1809,11 +1809,18 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     # Scartare l'anomala sarebbe barare. Misurare la dispersione su una
     # statistica che non le da' tutto il peso, e DIRE quante ce ne sono, no:
     # e' la stessa scelta gia' fatta per la perdita (si riporta la peggiore,
-    # si decide sulla mediana). Serve almeno un quinto campione perche' i
-    # quartili vogliano dire qualcosa; sotto, resta il solo min-max.
+    # si decide sulla mediana).
+    #
+    # La soglia e' QUATTRO campioni, non cinque. Con quattro gli indici usati
+    # qui (1, 2, 3) escludono il minimo, che e' esattamente l'anomalo da
+    # spogliare del suo peso; con tre, l'indice q1 ricade sul minimo e non si
+    # guadagna niente. Quattro non e' un caso raro: basta una finestra
+    # troncata e un punto chiesto a cinque ripetizioni ne consegna quattro.
+    # Misurato il 2026-09-18: p1_static a 1514 byte, quattro ripetizioni, e
+    # la dispersione e' ricaduta sul min-max (141.6%) bocciando il run.
     pps_ord = sorted(r["rx_pps"] for r in runs)
     n = len(pps_ord)
-    if n >= 5:
+    if n >= 4:
         q1, q2, q3 = (pps_ord[n // 4], pps_ord[n // 2], pps_ord[(3 * n) // 4])
         med["spread_iqr_pct"] = round(100.0 * (q3 - q1) / q2, 1) if q2 else None
         # Quante ripetizioni cadono fuori da 1.5 IQR: e' il conteggio delle

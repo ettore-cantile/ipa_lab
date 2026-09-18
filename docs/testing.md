@@ -1110,35 +1110,39 @@ tempo del percorso completo; la baseline fa lo stesso percorso **meno l'inferenz
 la differenza è il costo dell'inferenza. Il termine `t_gen` è comune a tutte le righe della
 stessa taglia e sottraendo la baseline si cancella.
 
-Due run indipendenti, stessi parametri, a sette minuti di distanza (`131b7a6b` e
-`f3821c1e`). Riportarli entrambi è il punto: è l'unico modo di sapere quali differenze
-sopravvivono alla ripetizione.
+**Tre run indipendenti**, stessi parametri, nell'arco di dodici minuti (`131b7a6b`,
+`f3821c1e`, `f4daa6d9`). Riportarli tutti è il punto: è l'unico modo di sapere quali
+differenze sopravvivono alla ripetizione. `spread` è `(max − min) / media` fra i run.
 
-**Costo dell'inferenza, ns/pacchetto sopra la baseline**
+**Costo dell'inferenza a 512 byte, ns/pacchetto sopra la baseline**
 
-| pipeline | 512 B run A | 512 B run B | 1514 B run A | 1514 B run B |
+| pipeline | run A | run B | run C | spread |
 |---|---|---|---|---|
-| p1_static (P1) | +164 | +96 | +79 | +82 |
-| hardcoded (P1.5) | +65 | +186 | +175 | +225 |
-| template (P2) | +440 | — | +390 | — |
-| modular (P3) | +697 | +704 | +627 | +682 |
+| p1_static (P1) | +164 | +96 | +37 | 128% |
+| hardcoded (P1.5) | +65 | +186 | +120 | 98% |
+| template (P2) | +440 | — | +465 | **5%** |
+| modular (P3) | +697 | +704 | +691 | **2%** |
 
 **Cosa sopravvive alla ripetizione, e cosa no.**
 
-- **P3 è misurato**: +697 e +704 ns a 512 byte, cioè l'1% di scarto fra due run
-  indipendenti. A 1514 byte +627 e +682, entro il 9%. È la cifra più solida di questa
-  sezione.
-- **P2 sta stabilmente fra P1 e P3**, ma è stato misurato una volta sola: nel run B la
-  pipeline è saltata per un difetto del banco (pktgen si teneva l'ifindex del fabric
-  precedente, ora corretto con un riaggancio e una seconda sonda). Il numero va riconfermato.
-- **P1 e P1.5 NON sono separabili su questo banco.** Nel run A `hardcoded` risulta più
-  veloce di `p1_static` a 64 e 512 byte; nel run B l'ordine si inverte. La differenza fra
-  le due pipeline (~90-100 ns) è dello stesso ordine della loro variazione fra un run e
-  l'altro (~68 e ~121 ns). Una versione precedente di questa sezione attribuiva
-  l'inversione alla riduzione di forza di clang sui pesi letterali (sez. 10): l'ipotesi non
-  serve, il secondo run mostra che è rumore run-to-run.
-- **La colonna 1514 byte è la più riproducibile**, ed è l'unica in cui l'ordine atteso
-  P1 < P1.5 < P2 < P3 regge in entrambi i run. È la colonna da citare.
+- **P3 è misurato**: 697, 704, 691 ns su tre run indipendenti, **2% di spread**. È la cifra
+  più solida di questa sezione.
+- **P2 è misurato**: 440 e 465 ns, **5%**. Nel run B la pipeline era saltata per un difetto
+  del banco — pktgen si teneva l'ifindex del fabric precedente, ora corretto con un
+  riaggancio e una seconda sonda — e il run C l'ha recuperata.
+- **P1 e P1.5 NON sono separabili su questo banco, a nessuna taglia di frame.** I loro
+  costi variano del 98-176% fra un run e l'altro, cioè molto più della differenza fra le
+  due (~90-100 ns), e fra i run l'ordine reciproco si inverte. Sono entrambi "sotto i 200 ns
+  e indistinguibili"; qualunque affermazione più fine di così non è sostenuta da questi dati.
+  In particolare: l'inversione P1/P1.5 **non** richiede la spiegazione fine (riduzione di
+  forza di clang sui pesi letterali, sez. 10) che una stesura precedente di questa sezione
+  proponeva. È rumore, e bastano due run a mostrarlo.
+- **La taglia 512 byte è quella di riferimento.** A 64 byte P3 sale al 38% di spread e a
+  1514 al 24%; a 512 sta al 2%. Le altre due taglie confermano l'ordine ma non i valori.
+
+**L'ordine che regge, ed è quello che l'architettura prevede:** P1 ≈ P1.5 (< 200 ns,
+indistinguibili) < P2 (~450 ns) < P3 (~700 ns). Misurato su traffico reale, senza perdere
+un pacchetto, non stimato da `BPF_PROG_TEST_RUN`.
 
 ### 11.4 Come si leggono le due colonne di perdita
 
