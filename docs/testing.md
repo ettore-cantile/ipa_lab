@@ -1167,23 +1167,45 @@ strumentata**, quindi la cifra è leggermente superiore a quella di produzione.
 (core separati), non in softirq. I pps che riporta (1,4 Mpps contro gli 875 k della 11.2)
 sono di un altro esperimento.
 
-**Latenza minima a scarico (50 kpps, nessuna coda davanti), ns**
+**Latenza minima a scarico (50 kpps, nessuna coda davanti), ns sopra la baseline**
 
-| pipeline | giri | mediana | spread | vs baseline | costo da throughput (11.3) |
-|---|---|---|---|---|---|
-| baseline | 344 / 368 / 377 | 368 | 9% | — | — |
-| p1_static (P1) | 444 / 445 / 439 | 444 | 1% | **+76** | 82 |
-| hardcoded (P1.5) | 406 / 472 / 470 | 470 | 15% | **+102** | 116 |
-| template (P2) | 629 / 645 | 637 | 3% | **+269** | 430 |
-| modular (P3) | 808 / 823 / 783 | 808 | 5% | **+440** | 673 |
+Due run, a 3 e a 5 giri (`2b85d1f0` e `b0447b3e`). Mediana fra i giri.
+
+| pipeline | 3 giri | 5 giri | media |
+|---|---|---|---|
+| baseline (assoluto) | 368 ns | 342 ns | 355 ns |
+| p1_static (P1) | +76 | +107 | ~92 |
+| hardcoded (P1.5) | +102 | +91 | ~97 |
+| template (P2) | +269 | +288 | ~279 |
+| modular (P3) | +440 | +473 | ~457 |
+
+P2 e P3 concordano fra i due run entro il 7-8%. **P1 e P1.5 restano indistinguibili** — 92
+contro 97 ns, e fra i due run il loro ordine si inverte — esattamente come nella 11.3.
 
 **Solo la colonna `min` è utilizzabile, e va detto perché.** Il minimo viene da un
 accumulatore ed è esatto. I percentili vengono da un istogramma `bpf_log2l`, quindi i
 bucket sono potenze di due e il valore riportato è il **bordo superiore** di quello che
-contiene il quantile: la risoluzione è un fattore 2. Nel run tutte e cinque le pipeline
+contiene il quantile: la risoluzione è un fattore 2. Nei run tutte e cinque le pipeline
 cadono negli stessi due bucket — `p50` fra 4 e 8 µs, `p99` fra 16 e 32 µs — quindi p50 e
-p99 **non separano niente** e non vanno riportati come misure. La tabella del banco ora li
+p99 **non separano niente** e non vanno riportati come misure. La tabella del banco li
 stampa come `<8192n` per rendere la lettura obbligata.
+
+**Un difetto del banco trovato proprio qui, e la ragione per cui la mediana è la statistica
+giusta.** Il percorso `--latency` non passa da `_measure_once` e per questo non aveva
+nessuna delle protezioni sulle finestre aggiunte per la modalità `saturate`. Al giro 5 la
+fase `scarico` di `hardcoded` ha consegnato **171 pacchetti invece di ~100 000**, ed è
+entrata in tabella con `min 5627 ns` contro i ~430 degli altri quattro giri. Effetto:
+
+| | spread di `hardcoded` |
+|---|---|
+| con la finestra rotta | 1227% → `[FAIL]` |
+| senza | **4%** → passa |
+
+La **mediana non si è spostata di un nanosecondo** — 433 ns con e senza. A cadere è stato
+solo il controllo di riproducibilità, che usa max/min. È la conferma pratica della scelta
+fatta in 11.4: riportare il caso peggiore, decidere sulla statistica robusta. Le protezioni
+(scarto delle finestre troncate, drenaggio prima e dopo) sono ora anche in
+`_one_fair_point`.
 
 **Il confronto fra le due stime del costo è esso stesso un risultato.** Per P1 e P1.5 la
 latenza minima e il costo dedotto dal throughput coincidono (76 contro 82, 102 contro 116).

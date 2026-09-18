@@ -2721,7 +2721,23 @@ def _delay_for(rate, gen=None):
 
 
 def _one_fair_point(b, fab, frame, delay, count, gen=None):
-    """Un punto: throughput e latenza dallo stesso pacchetto."""
+    """Un punto: throughput e latenza dallo stesso pacchetto.
+
+    QUESTO PERCORSO NON PASSA DA `_measure_once`, quindi le protezioni sulle
+    finestre vanno ripetute qui. Non e' duplicazione per pigrizia: sono due
+    strade diverse verso pktgen -- quella a contatori di pipeline e questa a
+    istogramma di latenza -- e per mesi solo la prima e' stata irrobustita.
+
+    Misurato il 2026-09-18 (b0447b3e, --rounds 5): al giro 5 la fase `scarico`
+    di `hardcoded` ha consegnato **171 pacchetti** invece di ~100 000, e la
+    riga e' entrata nella tabella con `min 5627n` contro i ~430 degli altri
+    quattro giri. Da li' il controllo di riproducibilita' della latenza e'
+    uscito a **1227%**, cioe' ha bocciato una misura che era buona in quattro
+    giri su cinque per colpa di una finestra che non era una misura."""
+    # Il drenaggio prima di azzerare: la coda della finestra precedente deve
+    # essere atterrata, altrimenti i suoi campioni finiscono nell'istogramma
+    # di questa.
+    time.sleep(DRAIN_S)
     b["lat_acc"].clear()
     b["lat_hist"].clear()
     try:
@@ -2739,6 +2755,17 @@ def _one_fair_point(b, fab, frame, delay, count, gen=None):
     except PktgenEmptyRun as e:
         warn(f"punto scartato: {e}")
         return None
+    # Stessa regola di `_measure_once`: una finestra che ha trasmesso una
+    # frazione dei pacchetti chiesti e' un run troncato, non un punto.
+    atteso = count * (gen.n_inst if gen is not None else 1)
+    if atteso and tx < atteso * WINDOW_MIN_TX_FRACTION:
+        warn(f"punto scartato: finestra troncata, {tx} trasmessi su {atteso} "
+             f"chiesti ({100.0 * tx / atteso:.1f}%) in {secs:.2f}s")
+        return None
+    # ...e il drenaggio dopo: `pgctrl start` ritorna quando il generatore ha
+    # finito, non quando il DUT ha svuotato la coda. Senza, gli ultimi
+    # campioni di latenza non sono ancora nell'istogramma.
+    time.sleep(DRAIN_S)
     st = _read_lat(b)
     if st is None:
         return None
