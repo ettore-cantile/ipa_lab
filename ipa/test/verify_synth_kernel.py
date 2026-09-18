@@ -438,6 +438,49 @@ def confronta(d, n, seed, node_index, dry=False):
 
 
 # ==========================================================================
+# Gli scenari: presenti o rigenerati, mai pretesi
+# ==========================================================================
+def scenari(base_richiesta=None, n_inputs=64):
+    """Le cartelle degli scenari, generandole se non ci sono.
+
+    `ipa/synth/scenarios/` e' in .gitignore di proposito: sono artefatti
+    rigenerabili, e `make_scenario.py --preset all` li riscrive
+    byte-identici a parita' di seme. Una copia fresca del repository quindi
+    NON li ha, e pretenderli faceva morire questo script con un
+    FileNotFoundError su una macchina perfettamente sana.
+
+    Generarli qui costa qualche secondo, non sporca il repository (si scrive
+    in una cartella temporanea) e toglie di mezzo la domanda "li hai
+    rigenerati?" -- che e' una domanda a cui un test non dovrebbe costringere.
+    """
+    # `n_inputs` basso di proposito: gli ingressi depositati in inputs.json
+    # QUI non si usano -- questo script campiona i propri, fra quelli che il
+    # datapath sa esprimere. Dell'artefatto serve solo `col_scales`, che non
+    # dipende da quanti vettori ci sono dentro. Generarne mille costerebbe una
+    # forward di torch per ciascuno, per poi buttarli.
+    import tempfile
+    from synth.generate import preset, generate_scenario, PRESETS
+
+    if base_richiesta and os.path.isdir(base_richiesta):
+        dirs = sorted(os.path.join(base_richiesta, d)
+                      for d in os.listdir(base_richiesta)
+                      if os.path.isdir(os.path.join(base_richiesta, d)))
+        if dirs:
+            note(f"scenari gia' presenti in {base_richiesta}")
+            return dirs
+
+    base = tempfile.mkdtemp(prefix="ipa_synth_scen_")
+    info(f"scenari non presenti: li rigenero in {base} "
+         f"({len(PRESETS)} preset, seme fisso)")
+    dirs = []
+    for nome in PRESETS:
+        d = os.path.join(base, nome)
+        generate_scenario(preset(nome), d, n_inputs=n_inputs)
+        dirs.append(d)
+    return dirs
+
+
+# ==========================================================================
 def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("USO")[0].strip(),
@@ -464,10 +507,13 @@ def main():
             sys.exit("serve root: sudo python3 ipa/test/verify_synth_kernel.py ...")
 
     if a.all:
-        base = os.path.join(SHARED_DIR, "synth", "scenarios")
-        dirs = sorted(os.path.join(base, d) for d in os.listdir(base)
-                      if os.path.isdir(os.path.join(base, d)))
+        dirs = scenari(os.path.join(SHARED_DIR, "synth", "scenarios"))
     elif a.scenario:
+        if not os.path.isdir(a.scenario):
+            sys.exit(f"{a.scenario} non esiste. Gli scenari sono artefatti "
+                     f"rigenerabili e non stanno in git: usa --all, che li "
+                     f"genera da solo, oppure "
+                     f"`python3 ipa/synth/make_scenario.py --preset all`.")
         dirs = [a.scenario]
     else:
         p.error("serve --scenario DIR oppure --all")
