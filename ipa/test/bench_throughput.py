@@ -266,6 +266,21 @@ DEFAULT_DELAYS = [0, 200, 500, 1000, 2000, 5000, 10000]
 # banco non ha. Fitti dove sta il ginocchio, radi lontano.
 SATURATE_LADDER = (0.60, 0.80, 0.90, 1.00, 1.15)
 
+# Frazioni SOTTO il gradino piu' basso della scala, usate solo quando anche
+# quello perde.
+#
+# Senza questa discesa il banco concludeva "la perdita non dipende dal rate:
+# e' rumore della macchina" senza aver mai provato sotto il 60% del rate
+# consegnato a massima spinta. E' una conclusione che i dati non reggono: il
+# ginocchio puo' benissimo stare al 30%, e li' nessuno era andato a guardare.
+# Misurato il 2026-09-18, ogni taglia e ogni pipeline finivano cosi'.
+SATURATE_DESCENT = (0.40, 0.25, 0.15, 0.08, 0.04)
+
+# Sotto questo rate la finestra non contiene abbastanza pacchetti perche' la
+# perdita voglia dire qualcosa, e scendere ancora misurerebbe solo il rumore
+# del contatore. La discesa si ferma qui e lo dichiara.
+MIN_LADDER_PPS = 20_000
+
 # Quanto deve salire il rate offerto perche' clone_skb/burst valgano la perdita
 # di rappresentativita'. Sotto questa soglia il parametro e' accettato dal
 # device ma inutile, e si torna alla condizione di riferimento.
@@ -1658,14 +1673,30 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         except PktgenEmptyRun as e:
             warn(f"misura scartata: {e}")
             continue
-        # HIT > 0 e RX == 0 non e' "perdita del 100%": e' il contatore che non
-        # ha visto niente mentre il programma elaborava tutto. E' un guasto
-        # della strumentazione, e tenerlo faceva comparire righe con
-        # TX == HIT == RX == 200000 marcate 100.00%, perche' la perdita
-        # PEGGIORE delle tre ripetizioni veniva da una misura rotta.
-        if r["hit"] > 0 and r["rx"] == 0:
-            warn(f"misura scartata: {r['hit']} elaborati e 0 contati in "
-                 f"uscita -- contatore RX non aggiornato, non perdita")
+        # RX == 0 con del traffico offerto non e' "perdita del 100%": e' una
+        # finestra in cui la misura non ha visto niente. Due casi, tutti e due
+        # strumentali, tutti e due da scartare:
+        #
+        #   HIT > 0  il programma ha elaborato e il contatore d'uscita non e'
+        #            stato aggiornato in tempo;
+        #   HIT == 0 il programma non e' nemmeno partito nella finestra --
+        #            thread NAPI non ancora schedulato dopo il pinning, o
+        #            contatori riletti prima che la coda fosse drenata.
+        #
+        # Il secondo caso NON era coperto: la guardia chiedeva `hit > 0`, e
+        # una finestra con hit == 0 passava e portava loss_pct = 100%. Siccome
+        # la perdita del punto e' la PEGGIORE delle ripetizioni, una sola
+        # finestra cosi' marcava 100.00% un punto che aveva consegnato milioni
+        # di pacchetti -- misurato il 2026-09-18: `512 ... RX 2 169 116 ...
+        # 100.00%`. Ed essendo il gradino piu' basso, mandava a vuoto tutta la
+        # ricerca del rate a perdita nulla.
+        if r["rx"] == 0 and r.get("offered_tx", 0) > 0:
+            dove = (f"{r['hit']} elaborati e 0 contati in uscita"
+                    if r["hit"] > 0 else
+                    f"{r['offered_tx']} offerti e il programma non e' mai "
+                    f"partito (hit 0)")
+            warn(f"misura scartata: {dove} -- finestra strumentalmente vuota, "
+                 f"non perdita del 100%")
             continue
         runs.append(r)
     diag_data = diag.stop() if diag is not None else {}
@@ -3311,9 +3342,16 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
 
     Qui invece si misurano TUTTI i gradini e poi si applica una regola che la
     non monotonia non rompe: il risultato e' il rate piu' alto che sia pulito
-    E che abbia puliti TUTTI i gradini sotto di se'. Se il gradino piu' basso
-    e' sporco, non c'e' nessun rate a perdita nulla da riportare, e si dice
-    questo invece di scegliere il piu' fortunato."""
+    E che abbia puliti TUTTI i gradini sotto di se'.
+
+    E SE ANCHE IL GRADINO PIU' BASSO PERDE, si SCENDE (vedi
+    SATURATE_DESCENT) invece di concludere. Dire "la perdita non dipende dal
+    rate" avendo provato solo dal 60% in su e' una conclusione che i dati non
+    reggono: sotto c'e' un intervallo intero mai misurato. Si scende
+    dimezzando finche' un gradino esce pulito, e quel gradino viene CONFERMATO
+    da uno ancora piu' basso -- perche' un punto pulito isolato su una
+    sequenza non monotona e' esattamente il punto fortunato che questo banco
+    esiste per non pubblicare."""
     est_count = gen.window_count(gen.rate_estimate or 3_000_000)
     full = measure_point(setup, rx_tab, fab, frame, 0, est_count, n_out,
                          gen.clone, repeat=repeat, burst=gen.burst,
@@ -3367,16 +3405,66 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         return full, None
     steps.sort(key=lambda r: r["offered_pps"])
     best = None
+    giu = []                    # i gradini della discesa, se si scende
     for s in steps:
         if s["loss_worst"] > threshold:
             break               # il primo sporco chiude la parte monotona
         best = s
+
     if best is None:
+        # Il gradino piu' basso della scala perde. Prima di dichiarare rumore
+        # si scende: la scala parte dal 60% del rate consegnato a pieno
+        # regime, e sotto quel 60% non e' stato misurato niente.
+        print(f"  {GREY}anche il gradino piu' basso perde "
+              f"({steps[0]['offered_pps']} pps offerti, "
+              f"{steps[0]['loss_worst']:.2f}%): scendo, invece di concludere "
+              f"su un intervallo mai misurato.{NC}")
+        for frac in SATURATE_DESCENT:
+            rate = base * frac
+            if rate < MIN_LADDER_PPS:
+                print(f"  {GREY}discesa fermata a {int(rate)} pps: sotto "
+                      f"{MIN_LADDER_PPS} pps la finestra non contiene "
+                      f"abbastanza pacchetti perche' la perdita significhi "
+                      f"qualcosa.{NC}")
+                break
+            r = measure_point(setup, rx_tab, fab, frame, gen.delay_for(rate),
+                              gen.window_count(rate), n_out, gen.clone,
+                              repeat=repeat, burst=gen.burst,
+                              xmit_mode=xmit_mode, gen=gen,
+                              threshold=threshold, plan=plan, diag=diag)
+            if r is None:
+                continue
+            r.update(method=method, phase="ricerca", clone_skb=gen.clone,
+                     threads=gen.n_inst, offered_pps=int(rate))
+            out_rows.append(r)
+            printer(r)
+            giu.append(r)
+            # Il primo pulito non basta: serve che sia pulito anche quello
+            # SOTTO. Su una sequenza non monotona un singolo punto pulito e'
+            # il punto fortunato, non un limite.
+            if len(giu) >= 2 and giu[-1]["loss_worst"] <= threshold \
+                    and giu[-2]["loss_worst"] <= threshold:
+                best = giu[-2]
+                break
+        if best is None and giu:
+            puliti = [r for r in giu if r["loss_worst"] <= threshold]
+            if puliti:
+                print(f"  {YELLOW}punto pulito isolato a "
+                      f"{puliti[-1]['offered_pps']} pps, non confermato dal "
+                      f"gradino sotto: non lo riporto come limite.{NC}")
+
+    if best is None:
+        giu_txt = ""
+        piu_basso = min((r["offered_pps"] for r in giu), default=None)
+        if piu_basso:
+            giu_txt = (f" La discesa e' arrivata fino a {piu_basso} pps "
+                       f"offerti, cioe' al {100.0 * piu_basso / base:.0f}% del "
+                       f"rate consegnato a pieno regime, e perde anche li'.")
         print(f"  {RED}nessun rate a perdita nulla determinabile{NC}{GREY}: si "
               f"perde gia' al gradino piu' basso ({steps[0]['offered_pps']} "
               f"pps offerti, {steps[0]['loss_worst']:.2f}%), cioe' molto sotto "
-              f"la capacita' misurata a pieno rate. La perdita qui non dipende "
-              f"dal rate: e' rumore della macchina.{NC}")
+              f"la capacita' misurata a pieno rate.{giu_txt} La perdita qui "
+              f"non dipende dal rate: e' rumore della macchina.{NC}")
         noisy = dict(full)
         noisy.update(phase="rumore", gen_bound=0)
         tag, why = classify_bottleneck(noisy, threshold=threshold, plan=plan,
