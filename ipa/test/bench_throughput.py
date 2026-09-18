@@ -245,6 +245,29 @@ WINDOW_SHORT_FRACTION = 0.5
 # stata usata come punto della scala insieme alle altre.
 WINDOW_MIN_TX_FRACTION = 0.5
 
+# Dimensione bersaglio della coda RX del veth, in descrittori.
+#
+# QUESTO E' IL NUMERO CHE DECIDE LE PERDITE A RATE BASSO. Quando si attacca
+# XDP a un veth, il kernel alloca un `ptr_ring` sul lato ricevente e
+# `veth_xmit` risponde NET_XMIT_DROP appena quel ring e' pieno. Storicamente
+# veth.c lo fissa a VETH_RING_SIZE = 256 descrittori, non configurabile.
+#
+# 256 descrittori a 1,5 Mpps sono 170 MICROSECONDI di traffico. Vuol dire che
+# il kernel thread NAPI del DUT deve essere schedulato entro 170 us OGNI
+# VOLTA, per sempre, altrimenti il ring trabocca e il generatore si vede
+# respingere pacchetti. Su un guest VirtualBox, il cui vCPU l'host puo'
+# deschedulare per millisecondi interi, questo e' impossibile: qualche punto
+# percentuale di respinti a QUALUNQUE rate sopra il centinaio di kpps e'
+# strutturale e non dice niente sulla pipeline.
+#
+# Il conto torna con le misure: a 74 kpps il ring copre 3,5 ms e la perdita
+# era 0,10%; a 1,5 Mpps copre 0,17 ms e la perdita sta fra il 9 e il 18%.
+#
+# I kernel recenti espongono la dimensione via `ethtool -G <dev> rx N`. Non si
+# da' per scontato che ci sia: si PROVA, si rilegge, e si riporta l'esito fra
+# le condizioni del test -- la stessa regola gia' usata per clone_skb e burst.
+VETH_RING_TARGET = 4096
+
 # Pausa fra la fine della trasmissione e la lettura dei contatori.
 #
 # `pgctrl start` ritorna quando i THREAD DEL GENERATORE hanno finito, non
@@ -1746,6 +1769,23 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     med["repeat"] = len(runs)
     med["loss_worst"] = max(r["loss_pct"] for r in runs)
     med["loss_best"] = min(r["loss_pct"] for r in runs)
+    # La MEDIANA delle perdite, accanto alla peggiore.
+    #
+    # La peggiore resta la cifra riportata, ed e' la regola giusta: RFC 2544
+    # definisce il throughput come il rate a cui NON si perde nemmeno un
+    # frame, e una finestra sporca su cinque squalifica il rate.
+    #
+    # Ma RFC 2544 presuppone un DUT quieto e dedicato. Qui il DUT e' un guest
+    # VirtualBox su un host a core ibridi: capita che il vCPU venga
+    # deschedulato per l'INTERA finestra, e allora quella ripetizione non
+    # descrive il rate, descrive l'host. Misurato: cinque ripetizioni dello
+    # stesso punto con dispersione +-426%, perdita peggiore 98.11% e mediana
+    # a una cifra.
+    #
+    # Quindi: si RIPORTA la peggiore, si DECIDE sulla mediana, e la deviazione
+    # da RFC 2544 sta scritta qui e nel report invece di essere nascosta in
+    # una soglia.
+    med["loss_med"] = round(statistics.median([r["loss_pct"] for r in runs]), 3)
     med["rx_pps_min"] = runs[0]["rx_pps"]
     med["rx_pps_max"] = runs[-1]["rx_pps"]
     med["burst"] = burst
@@ -2932,8 +2972,68 @@ def _make_pair(rx, tx, rx_queues, tx_queues):
         subprocess.run(["sysctl", "-qw",
                         f"net.ipv6.conf.{dev}.disable_ipv6=1"],
                        capture_output=True, check=False)
+    # Il lato DUT e' quello che porta XDP, quindi e' il suo ring quello che
+    # `veth_xmit` riempie dall'altra parte. Si alza QUI, cioe' prima che il
+    # programma venga attaccato: il ring si alloca all'attach.
+    raise_veth_ring(rx)
     idx = int(_ip("-o", "link", "show", rx).stdout.split(":")[0])
     return rx, tx, idx
+
+
+# Esito dell'ultimo innalzamento, per le condizioni del test. Globale perche'
+# _make_pair e' chiamata da tre percorsi diversi e il dato serve a capture_env,
+# che non ne vede nessuno.
+VETH_RING_STATE = {}
+
+
+def _ethtool_ring(dev):
+    """(RX attuale, RX massima) dalla sezione giusta di `ethtool -g`.
+
+    L'output ha DUE sezioni -- "Pre-set maximums" e "Current hardware
+    settings" -- ognuna con una riga `RX:`. Prendere la prima che capita vuol
+    dire leggere il massimo credendo di leggere l'attuale."""
+    r = subprocess.run(["ethtool", "-g", dev], capture_output=True, text=True,
+                       check=False)
+    if r.returncode != 0:
+        return None, None
+    massimo = attuale = None
+    sezione = None
+    for line in r.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Pre-set maximums"):
+            sezione = "max"
+        elif s.startswith("Current hardware settings"):
+            sezione = "cur"
+        elif s.startswith("RX:") and sezione:
+            val = s.split(":", 1)[1].strip()
+            if val.isdigit():
+                if sezione == "max":
+                    massimo = int(val)
+                else:
+                    attuale = int(val)
+    return attuale, massimo
+
+
+def raise_veth_ring(dev, target=VETH_RING_TARGET):
+    """Alza la coda RX del veth, PRIMA che XDP venga attaccato.
+
+    L'ordine non e' un dettaglio: il ring viene allocato quando il programma
+    XDP si attacca, quindi cambiarlo dopo non ha effetto su quello in uso."""
+    attuale, massimo = _ethtool_ring(dev)
+    stato = dict(dev=dev, supportato=attuale is not None,
+                 prima=attuale, massimo=massimo, chiesto=target, dopo=attuale)
+    if attuale is None:
+        VETH_RING_STATE[dev] = stato
+        return stato
+    voluto = min(target, massimo) if massimo else target
+    if attuale >= voluto:
+        VETH_RING_STATE[dev] = stato
+        return stato
+    subprocess.run(["ethtool", "-G", dev, "rx", str(voluto)],
+                   capture_output=True, text=True, check=False)
+    stato["dopo"] = _ethtool_ring(dev)[0]
+    VETH_RING_STATE[dev] = stato
+    return stato
 
 
 def make_tg_links(n, gen_queues=1, dut_queues=1):
@@ -3095,6 +3195,10 @@ def attach_rx_counter(fab):
     attached = []
     for port, peer in fab.peer_of.items():
         try:
+            # Anche qui prima dell'attach: `bpf_redirect` finisce in
+            # `veth_xmit` verso QUESTO peer, quindi un ring d'uscita piccolo
+            # fa fallire il redirect e produce `persi_dopo`.
+            raise_veth_ring(peer)
             attach_xdp(b, fn, peer)
             attached.append(peer)
         except Exception as e:
@@ -3402,6 +3506,17 @@ def _point_at_rate(setup, rx_tab, fab, frame, rate_pps, n_out, gen, repeat,
 # ==========================================================================
 # SATURAZIONE: salire per gradini, non bisecare
 # ==========================================================================
+def _loss_decide(row):
+    """La perdita su cui si DECIDE se un rate e' pulito.
+
+    Mediana delle ripetizioni quando ce ne sono almeno tre, altrimenti la
+    peggiore -- che con una o due ripetizioni e' anche l'unica cosa onesta.
+    Vedi measure_point per il perche' la mediana e non il massimo."""
+    if row.get("repeat", 1) >= 3 and row.get("loss_med") is not None:
+        return row["loss_med"]
+    return row.get("loss_worst", row.get("loss_pct", 0.0))
+
+
 def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
                     printer, threshold=DEFAULT_LOSS_THRESHOLD,
                     repeat=DEFAULT_REPEAT, plan=None, diag=None,
@@ -3451,7 +3566,7 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
     out_rows.append(full)
     printer(full)
 
-    if full["loss_worst"] <= threshold:
+    if _loss_decide(full) <= threshold:
         clean = dict(full)
         clean.update(phase="zero-perdite", gen_bound=1)
         out_rows.append(clean)
@@ -3482,7 +3597,7 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
         steps.append(r)
         # Due gradini sporchi di fila: si e' oltre il limite e continuare a
         # salire misura solo quanto si butta.
-        if len(steps) >= 2 and all(s["loss_worst"] > threshold
+        if len(steps) >= 2 and all(_loss_decide(s) > threshold
                                    for s in steps[-2:]):
             break
 
@@ -3492,7 +3607,7 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
     best = None
     giu = []                    # i gradini della discesa, se si scende
     for s in steps:
-        if s["loss_worst"] > threshold:
+        if _loss_decide(s) > threshold:
             break               # il primo sporco chiude la parte monotona
         best = s
 
@@ -3527,12 +3642,12 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
             # Il primo pulito non basta: serve che sia pulito anche quello
             # SOTTO. Su una sequenza non monotona un singolo punto pulito e'
             # il punto fortunato, non un limite.
-            if len(giu) >= 2 and giu[-1]["loss_worst"] <= threshold \
-                    and giu[-2]["loss_worst"] <= threshold:
+            if len(giu) >= 2 and _loss_decide(giu[-1]) <= threshold \
+                    and _loss_decide(giu[-2]) <= threshold:
                 best = giu[-2]
                 break
         if best is None and giu:
-            puliti = [r for r in giu if r["loss_worst"] <= threshold]
+            puliti = [r for r in giu if _loss_decide(r) <= threshold]
             if puliti:
                 print(f"  {YELLOW}punto pulito isolato a "
                       f"{puliti[-1]['offered_pps']} pps, non confermato dal "
@@ -3676,7 +3791,7 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
     if not pts:
         return
     peak = max(pts, key=lambda r: r["rx_pps"])
-    under = [r for r in pts if r["loss_worst"] <= threshold]
+    under = [r for r in pts if _loss_decide(r) <= threshold]
     strict = [r for r in pts if r["loss_worst"] == 0.0]
     best = max(under, key=lambda r: r["rx_pps"]) if under else None
     print(f"  {GREY}frame {frame}: massimo {peak['rx_pps']} pps "
@@ -3732,8 +3847,8 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
     # stampava come "sotto 0.1% di perdita: 68 576 pps". Il punto piu' lento
     # dell'intervallo provato e' sempre "pulito e senza niente sotto che
     # perda", perche' sotto non c'e' niente.
-    if best and any(r["loss_worst"] > threshold and r["rx_pps"] < best["rx_pps"]
-                    for r in pts):
+    if best and any(_loss_decide(r) > threshold
+                    and r["rx_pps"] < best["rx_pps"] for r in pts):
         print(f"  {GREY}  nessun rate a perdita nulla determinabile: si perde "
               f"anche a rate piu' bassi di quelli puliti, quindi la perdita "
               f"sotto saturazione e' rumore della macchina{NC}")
@@ -4288,6 +4403,19 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
 
     # ---- percorso dati: e' la riserva piu' importante sui numeri assoluti
     add("datapath", "veth (XDP nativo), TG e DUT sulla stessa macchina")
+    # La coda del veth e' una condizione del test quanto il numero di core:
+    # decide a che rate cominciano i respinti, indipendentemente dalla
+    # pipeline. Riportarla e' cio' che permette di confrontare due run.
+    if VETH_RING_STATE:
+        for dev, st in VETH_RING_STATE.items():
+            if not st["supportato"]:
+                add(f"coda_rx_{dev}",
+                    "non configurabile su questo kernel (ethtool -g rifiutato)"
+                    " -- VETH_RING_SIZE fissa, storicamente 256 descrittori")
+            else:
+                add(f"coda_rx_{dev}",
+                    f"{st['dopo']} descrittori (era {st['prima']}, massimo "
+                    f"{st['massimo']})")
     add("copia_headroom",
         "si -- pktgen riserva NET_SKB_PAD (64B), XDP su veth pretende "
         "XDP_PACKET_HEADROOM (256B): una copia per pacchetto")
@@ -4409,6 +4537,7 @@ def report_rows(rows, threshold=DEFAULT_LOSS_THRESHOLD):
             max_rx_pps=int(_num(peak, "rx_pps")),
             max_rx_mbps=_num(peak, "rx_mbps"),
             max_loss_pct=round(_loss_of(peak), 3),
+            max_loss_med_pct=_num(peak, "loss_med", ""),
             max_offered_pps=int(_num(peak, "offered_real_pps",
                                      _num(peak, "offered_pps"))),
             rx_pkts=int(_num(peak, "rx")),
@@ -4483,7 +4612,19 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
     L.append(f"Soglia di perdita per la colonna \"perdita nulla\": "
              f"{threshold}%.")
     L.append("")
-    head = ["pipeline", "frame B", "max RX pps", "max Mb/s", "perdita @max %",
+    L.append("**Due colonne di perdita, e una deviazione dichiarata da RFC "
+             "2544.** La norma definisce il throughput come il rate a cui non "
+             "si perde nemmeno un frame, e squalifica il rate se una sola "
+             "finestra sporca. Presuppone pero' un DUT quieto e dedicato. "
+             "Qui il DUT e' un guest su un host a core ibridi, e capita che "
+             "il vCPU venga sospeso per l'intera finestra: quella ripetizione "
+             "descrive l'host, non il rate. Si riporta quindi la perdita "
+             "**peggiore** fra le ripetizioni, ma si **decide** sulla "
+             "mediana. Chi vuole la lettura stretta RFC 2544 legge la colonna "
+             "peggiore.")
+    L.append("")
+    head = ["pipeline", "frame B", "max RX pps", "max Mb/s",
+            "perdita @max % (peggiore)", "perdita @max % (mediana)",
             "RX pkt", "offerti pkt", "respinti (veth)", "persi dal DUT",
             "perdita DUT %", "perdita nulla pps", "perdita nulla Mb/s",
             "zero stretto pps", "collo di bottiglia"]
@@ -4497,7 +4638,8 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
         # collo di bottiglia invece che sulla riga intera.
         name = r["method"] + (" *" if r["unreliable"] else "")
         cells = [name, r["frame"], r["max_rx_pps"], r["max_rx_mbps"],
-                 r["max_loss_pct"], r["rx_pkts"], r["tx_pkts"],
+                 r["max_loss_pct"], r["max_loss_med_pct"],
+                 r["rx_pkts"], r["tx_pkts"],
                  r["respinti"], r["persi_dut"], r["loss_dut_pct"],
                  r["noloss_rx_pps"] or "non determinato",
                  r["noloss_rx_mbps"] or "",
