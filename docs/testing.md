@@ -1156,7 +1156,45 @@ diversi: `respinti (veth)` — mai entrati nel DUT, backpressure; `persi in coda
 e mai arrivati al programma; `persi dopo` — elaborati e non usciti. In tutti i run di questa
 sezione gli ultimi due sono **zero**.
 
-### 11.5 Cosa questo banco NON può dare su questa macchina
+### 11.5 Latenza end-to-end (`--latency`)
+
+Run del 2026-09-18, commit `2b85d1f0`, `--frames 512 --rounds 3 --repeat 5 --threads 1`.
+Il dispatcher marca `bpf_ktime_get_ns()` in una cella per-CPU e il programma d'uscita rilegge
+e sottrae: si misura arrivo → ripartenza, non la durata del solo programma. È una **build
+strumentata**, quindi la cifra è leggermente superiore a quella di produzione.
+
+**Attenzione a non confrontarla con 11.2 e 11.3**: questo percorso gira con NAPI in thread
+(core separati), non in softirq. I pps che riporta (1,4 Mpps contro gli 875 k della 11.2)
+sono di un altro esperimento.
+
+**Latenza minima a scarico (50 kpps, nessuna coda davanti), ns**
+
+| pipeline | giri | mediana | spread | vs baseline | costo da throughput (11.3) |
+|---|---|---|---|---|---|
+| baseline | 344 / 368 / 377 | 368 | 9% | — | — |
+| p1_static (P1) | 444 / 445 / 439 | 444 | 1% | **+76** | 82 |
+| hardcoded (P1.5) | 406 / 472 / 470 | 470 | 15% | **+102** | 116 |
+| template (P2) | 629 / 645 | 637 | 3% | **+269** | 430 |
+| modular (P3) | 808 / 823 / 783 | 808 | 5% | **+440** | 673 |
+
+**Solo la colonna `min` è utilizzabile, e va detto perché.** Il minimo viene da un
+accumulatore ed è esatto. I percentili vengono da un istogramma `bpf_log2l`, quindi i
+bucket sono potenze di due e il valore riportato è il **bordo superiore** di quello che
+contiene il quantile: la risoluzione è un fattore 2. Nel run tutte e cinque le pipeline
+cadono negli stessi due bucket — `p50` fra 4 e 8 µs, `p99` fra 16 e 32 µs — quindi p50 e
+p99 **non separano niente** e non vanno riportati come misure. La tabella del banco ora li
+stampa come `<8192n` per rendere la lettura obbligata.
+
+**Il confronto fra le due stime del costo è esso stesso un risultato.** Per P1 e P1.5 la
+latenza minima e il costo dedotto dal throughput coincidono (76 contro 82, 102 contro 116).
+Per P2 e P3 divergono, e la divergenza cresce con la complessità: +269 contro 430 per P2,
++440 contro 673 per P3, cioè il 53% in più. La lettura: il minimo è il cammino più
+fortunato — tutto in cache, nessuna contesa — mentre il costo dedotto dal throughput è
+quello medio sotto carico continuo. Le pipeline che usano tail call e lookup di mappa (P2,
+P3) pagano sotto carico quello che nel caso migliore non si vede. **Per dimensionare un
+nodo va usata la cifra da throughput, non la latenza minima.**
+
+### 11.6 Cosa questo banco NON può dare su questa macchina
 
 L'NDR vero. Con i core separati il pavimento del ring distrugge la misura a perdita nulla;
 con i core condivisi il generatore è sempre il collo di bottiglia, perché la sua CPU fa

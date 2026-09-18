@@ -2341,7 +2341,7 @@ def run_latency(method, model_path, frames, delays, count, threads,
         # descrivono lo stesso evento.
         hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>8s} {'RX':>8s} "
                f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
-               f"{'min':>6s} {'p50':>6s} {'p90':>6s} {'p99':>7s}")
+               f"{'min':>6s} {'p50<':>7s} {'p90<':>7s} {'p99<':>8s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
         for frame in frames:
@@ -2473,6 +2473,19 @@ def _fmt_ns(v):
     return f"{v:5d}n" if v is not None else "  n/d"
 
 
+def _fmt_bucket(v):
+    """Un percentile da istogramma log2, stampato per quello che e'.
+
+    Il valore e' il bordo SUPERIORE del bucket [2^i, 2^(i+1)) in cui cade il
+    quantile, quindi l'unica lettura corretta e' "sotto questa cifra". Senza il
+    `<` la colonna si legge come una misura, e con bucket a potenze di 2 la
+    risoluzione e' un fattore DUE: p50 e p99 non separano due pipeline che
+    distano meno di cosi'. Il minimo, che viene dall'accumulatore e non
+    dall'istogramma, resta esatto ed e' l'unica cifra di latenza confrontabile
+    su questo banco."""
+    return f"<{v:5d}n" if v is not None else "   n/d"
+
+
 def run_fair(methods, model_path, frames, delays, count, threads,
              threaded_napi=True, repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS,
              tol=0.0, plan=None, xmit_mode="start_xmit", diag=None,
@@ -2517,7 +2530,7 @@ def run_fair(methods, model_path, frames, delays, count, threads,
         hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} "
                f"{'fase':12s} "
                f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
-               f"{'min':>6s} {'p50':>6s} {'p99':>7s}")
+               f"{'min':>6s} {'p50<':>7s} {'p99<':>8s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
 
@@ -2566,8 +2579,8 @@ def run_fair(methods, model_path, frames, delays, count, threads,
                               f"{r['rx_pps']:9d} {r['rx_mbps']:7.1f} "
                               f"{r['loss_pct']:7.2f}% "
                               f"{_fmt_ns(r['lat_min_ns'])} "
-                              f"{_fmt_ns(r['lat_p50_ns'])} "
-                              f"{_fmt_ns(r['lat_p99_ns'])}")
+                              f"{_fmt_bucket(r['lat_p50_ns'])} "
+                              f"{_fmt_bucket(r['lat_p99_ns'])}")
 
         gen.detach()
         pg_reset()
@@ -2613,6 +2626,9 @@ def _fair_sweep(b, fab, frame, tol, steps=KNEE_STEPS, gen=None, plan=None,
     #     sovraccarico da riportare accanto a quella pulita.
     full = _one_fair_point(b, fab, frame, 0, wc(3_000_000), gen=gen)
     if full is None:
+        warn(f"frame {frame}: nessuna finestra utilizzabile a pieno regime, "
+             f"questo giro non produce righe per questa pipeline (la mediana "
+             f"finale sara' calcolata su meno giri).")
         return rows
     full["phase"] = "pieno"
     rows.append(full)
@@ -2815,7 +2831,7 @@ def summarise_fair(raw, methods):
     print(f"{YELLOW}{'=' * 78}{NC}")
     hdr = (f"  {'pipeline':10s} {'frame':>5s} {'fase':12s} {'giri':>4s} "
            f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
-           f"{'min':>6s} {'p50':>6s} {'p99':>7s} {'collo':>18s}")
+           f"{'min':>6s} {'p50<':>7s} {'p99<':>8s} {'collo':>18s}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for m, frame, phase in keys:
@@ -2860,8 +2876,9 @@ def summarise_fair(raw, methods):
         print(f"  {col}{m:10s} {frame:5d} {phase:12s}{end} {len(pts):4d} "
               f"{int(med['rx_pps']):9d} {med['rx_mbps']:7.1f} "
               f"{med['loss_pct']:7.2f}% "
-              f"{int(med['lat_min_ns']):5d}n {int(med['lat_p50_ns']):5d}n "
-              f"{int(med['lat_p99_ns']):6d}n {tag:>18s}{flag}")
+              f"{int(med['lat_min_ns']):5d}n "
+              f"<{int(med['lat_p50_ns']):5d}n "
+              f"<{int(med['lat_p99_ns']):6d}n {tag:>18s}{flag}")
     return out
 
 
