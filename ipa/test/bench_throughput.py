@@ -3403,7 +3403,29 @@ def run_method(method, model_path, frames, delays, count, out_rows,
                               gen=gen, warmup=False, threshold=threshold,
                               plan=plan)
         if probe is None:
-            warn("la sonda non ha trasmesso nulla: pktgen non e' partito.")
+            # Il fabric viene ricostruito per ogni pipeline, quindi il device
+            # d'ingresso ha lo STESSO NOME ma un altro ifindex. `ensure`
+            # copre il caso in cui pktgen se ne sia dimenticato (il file in
+            # procfs sparisce), non quello in cui se lo ricordi SBAGLIATO: li'
+            # il file c'e', pktgen accetta i comandi e non trasmette niente.
+            #
+            # Costava un'intera pipeline: misurato il 2026-09-18, `template`
+            # e' uscito dal run con "pktgen non riporta pacchetti" e il report
+            # ha riportato 12 configurazioni invece di 15. Un riaggancio
+            # completo e una seconda sonda costano un secondo.
+            warn("la sonda non ha trasmesso nulla: riaggancio il generatore "
+                 "e riprovo (il fabric e' stato ricostruito e pktgen puo' "
+                 "tenersi un ifindex vecchio).")
+            gen.detach()
+            time.sleep(0.2)          # la rimozione in pktgen non e' sincrona
+            gen.attach(verbose=False)
+            probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
+                                  repeat=1, burst=burst, xmit_mode=xmit_mode,
+                                  gen=gen, warmup=False, threshold=threshold,
+                                  plan=plan)
+        if probe is None:
+            warn("la sonda non ha trasmesso nulla nemmeno dopo il riaggancio: "
+                 "pktgen non e' partito.")
             gen.detach()
             ing.cleanup()
             return 1

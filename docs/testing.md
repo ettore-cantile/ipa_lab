@@ -1098,6 +1098,11 @@ alto.
 | template (P2) | ≥ 643 508 | ≥ 637 925 | ≥ 542 678 |
 | modular (P3) | ≥ 549 003 | ≥ 548 085 | ≥ 480 756 |
 
+**Variazione fra run.** Un secondo run identico sette minuti dopo (`f3821c1e`) ha dato
+baseline 913 530 / 889 125 / 713 687 e p1_static 839 712 / 819 103 / 674 403: le cifre
+assolute si spostano del 4-14% da un run all'altro, sempre verso l'alto o verso il basso
+insieme. È il motivo per cui la sezione seguente sottrae la baseline invece di citare i pps.
+
 ### 11.3 Costo dell'inferenza per pacchetto
 
 È la cifra che il regime senza perdite rende pulita. Senza code di mezzo `1/RX pps` è il
@@ -1105,30 +1110,35 @@ tempo del percorso completo; la baseline fa lo stesso percorso **meno l'inferenz
 la differenza è il costo dell'inferenza. Il termine `t_gen` è comune a tutte le righe della
 stessa taglia e sottraendo la baseline si cancella.
 
-| pipeline | ns/pkt @512 B | costo inferenza |
-|---|---|---|
-| baseline | 1127.5 | — |
-| hardcoded (P1.5) | 1192.6 | **+65 ns** |
-| p1_static (P1) | 1291.7 | **+164 ns** |
-| template (P2) | 1567.6 | **+440 ns** |
-| modular (P3) | 1824.5 | **+697 ns** |
+Due run indipendenti, stessi parametri, a sette minuti di distanza (`131b7a6b` e
+`f3821c1e`). Riportarli entrambi è il punto: è l'unico modo di sapere quali differenze
+sopravvivono alla ripetizione.
 
-L'ordine P2 < P3 e il salto fra P1 e P2 sono quelli che l'architettura prevede, e sono
-misurati su traffico reale invece che stimati.
+**Costo dell'inferenza, ns/pacchetto sopra la baseline**
 
-**Riserva sul denominatore.** La riga baseline a 512 byte, da cui si sottrae tutto il resto
-della colonna, è una di quelle con una ripetizione anomala (quattro d'accordo, la quinta a
-94,70% di perdita) ed è stata marcata inaffidabile dalla dispersione min-max. La mediana
-resta coerente con la riga a 64 byte (886 897 contro 879 581, meno dell'1% di differenza,
-com'è atteso visto che il costo dell'inferenza non dipende dalla lunghezza del frame), ma i
-delta vanno riconfermati su un run in cui quella riga esca pulita.
+| pipeline | 512 B run A | 512 B run B | 1514 B run A | 1514 B run B |
+|---|---|---|---|---|
+| p1_static (P1) | +164 | +96 | +79 | +82 |
+| hardcoded (P1.5) | +65 | +186 | +175 | +225 |
+| template (P2) | +440 | — | +390 | — |
+| modular (P3) | +697 | +704 | +627 | +682 |
 
-**Anomalia aperta, non risolta.** A 64 e 512 byte `hardcoded` risulta **più veloce** di
-`p1_static`, che compila anche l'indice del nodo e quindi dovrebbe fare strettamente meno
-lavoro; a 1514 byte l'ordine si inverte e torna quello atteso. Candidato: in P1 i pesi sono
-letterali C, quindi la riduzione di forza di clang dipende dai **valori** e due build della
-stessa architettura possono generare codice diverso (stesso meccanismo già visto sulla
-caricabilità, sez. 10). Va indagato prima di citare P1 e P1.5 come separati.
+**Cosa sopravvive alla ripetizione, e cosa no.**
+
+- **P3 è misurato**: +697 e +704 ns a 512 byte, cioè l'1% di scarto fra due run
+  indipendenti. A 1514 byte +627 e +682, entro il 9%. È la cifra più solida di questa
+  sezione.
+- **P2 sta stabilmente fra P1 e P3**, ma è stato misurato una volta sola: nel run B la
+  pipeline è saltata per un difetto del banco (pktgen si teneva l'ifindex del fabric
+  precedente, ora corretto con un riaggancio e una seconda sonda). Il numero va riconfermato.
+- **P1 e P1.5 NON sono separabili su questo banco.** Nel run A `hardcoded` risulta più
+  veloce di `p1_static` a 64 e 512 byte; nel run B l'ordine si inverte. La differenza fra
+  le due pipeline (~90-100 ns) è dello stesso ordine della loro variazione fra un run e
+  l'altro (~68 e ~121 ns). Una versione precedente di questa sezione attribuiva
+  l'inversione alla riduzione di forza di clang sui pesi letterali (sez. 10): l'ipotesi non
+  serve, il secondo run mostra che è rumore run-to-run.
+- **La colonna 1514 byte è la più riproducibile**, ed è l'unica in cui l'ordine atteso
+  P1 < P1.5 < P2 < P3 regge in entrambi i run. È la colonna da citare.
 
 ### 11.4 Come si leggono le due colonne di perdita
 
