@@ -3877,6 +3877,14 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
               f"anche a rate piu' bassi di quelli puliti, quindi la perdita "
               f"sotto saturazione e' rumore della macchina{NC}")
         best = None
+    elif best and not any(r["rx_pps"] > best["rx_pps"] for r in pts):
+        # Pulito e in cima: e' un LIMITE INFERIORE dell'NDR, non un limite
+        # mancato. Si riporta con il maggiore-uguale e si dice di chi e' il
+        # tetto.
+        print(f"  {GREY}  a perdita nulla: >= {best['rx_pps']} pps "
+              f"({best['rx_mbps']} Mb/s). E' un limite INFERIORE: a massima "
+              f"spinta non si e' perso niente, quindi la pipeline non e' "
+              f"satura e il tetto e' il generatore.{NC}")
     elif best and not any(r["rx_pps"] < best["rx_pps"] for r in pts):
         print(f"  {GREY}  {best['rx_pps']} pps e' pulito ma e' il punto piu' "
               f"lento provato: non c'e' nessun gradino sotto a confermarlo, "
@@ -4580,6 +4588,10 @@ def report_rows(rows, threshold=DEFAULT_LOSS_THRESHOLD):
             persi_dopo=int(_num(peak, "persi_dopo")),
             loss_dut_pct=_num(peak, "loss_dut_pct"),
             noloss_rx_pps=int(_num(best, "rx_pps")) if best else 0,
+            # Il rate a perdita nulla e' un limite INFERIORE quando a massima
+            # spinta non si e' perso niente: la pipeline non era satura, quindi
+            # il vero NDR sta piu' in alto e questo banco non lo raggiunge.
+            noloss_gen_bound=bool(best and _num(best, "gen_bound")),
             noloss_rx_mbps=_num(best, "rx_mbps") if best else 0,
             noloss_loss_pct=round(_loss_of(best), 3) if best else "",
             zero_rx_pps=int(_num(zero, "rx_pps")) if zero else 0,
@@ -4593,15 +4605,40 @@ def report_rows(rows, threshold=DEFAULT_LOSS_THRESHOLD):
     return out
 
 
+def _costo_ns(pps):
+    return round(1e9 / pps, 1) if pps else None
+
+
+def aggiungi_costo(summ):
+    """Aggiunge ns/pacchetto e il delta rispetto alla baseline, per taglia.
+
+    Il confronto e' DENTRO una taglia di frame: il costo per pacchetto cambia
+    con la lunghezza (la copia di headroom la paga per byte), quindi un delta
+    calcolato fra taglie diverse non sarebbe il costo dell'inferenza."""
+    base = {r["frame"]: r["max_rx_pps"] for r in summ
+            if r["method"] == "baseline"}
+    for r in summ:
+        r["ns_pkt"] = _costo_ns(r["max_rx_pps"])
+        b = _costo_ns(base.get(r["frame"]))
+        if b is not None and r["ns_pkt"] is not None and r["method"] != "baseline":
+            r["ns_pkt_vs_baseline"] = round(r["ns_pkt"] - b, 1)
+        else:
+            r["ns_pkt_vs_baseline"] = ""
+    return summ
+
+
 def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
                  title="Throughput end-to-end, misurato"):
     """Un markdown con la tabella per configurazione e le condizioni sotto.
 
     Markdown e non solo CSV perche' questa e' la forma in cui il risultato
     viene letto e citato; il CSV resta accanto per rifare i grafici."""
-    summ = report_rows(rows, threshold)
+    summ = aggiungi_costo(report_rows(rows, threshold))
     if not summ:
         return None
+    # Il delta per pacchetto si cita solo se NON si e' perso niente: con code
+    # di mezzo `1/rx_pps` e' il tempo di coda, non il costo del programma.
+    costo_pulito = all(r["max_loss_pct"] <= threshold for r in summ)
     lat = any(r["lat_p50_ns"] for r in summ)
     path = os.path.join(out_dir, "throughput_report.md")
     L = []
@@ -4647,7 +4684,8 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
              "mediana. Chi vuole la lettura stretta RFC 2544 legge la colonna "
              "peggiore.")
     L.append("")
-    head = ["pipeline", "frame B", "max RX pps", "max Mb/s",
+    head = ["pipeline", "frame B", "max RX pps", "max Mb/s", "ns/pkt",
+            "ns/pkt vs baseline",
             "perdita @max % (peggiore)", "perdita @max % (mediana)",
             "RX pkt", "offerti pkt", "respinti (veth)", "persi dal DUT",
             "perdita DUT %", "perdita nulla pps", "perdita nulla Mb/s",
@@ -4662,10 +4700,12 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
         # collo di bottiglia invece che sulla riga intera.
         name = r["method"] + (" *" if r["unreliable"] else "")
         cells = [name, r["frame"], r["max_rx_pps"], r["max_rx_mbps"],
+                 r["ns_pkt"], r["ns_pkt_vs_baseline"],
                  r["max_loss_pct"], r["max_loss_med_pct"],
                  r["rx_pkts"], r["tx_pkts"],
                  r["respinti"], r["persi_dut"], r["loss_dut_pct"],
-                 r["noloss_rx_pps"] or "non determinato",
+                 (f">= {r['noloss_rx_pps']}" if r["noloss_gen_bound"]
+                  else (r["noloss_rx_pps"] or "non determinato")),
                  r["noloss_rx_mbps"] or "",
                  r["zero_rx_pps"] or "nessuno"]
         if lat:
@@ -4684,6 +4724,31 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
              "soffitti compilati; `modular` = P3, anche la profondita' a "
              "runtime.")
     L.append("")
+    if costo_pulito:
+        L.append("**`ns/pkt vs baseline` e' il costo dell'inferenza per "
+                 "pacchetto**, misurato su traffico vero. Vale perche' qui "
+                 "non si perde niente: senza code di mezzo `1/RX pps` e' il "
+                 "tempo del percorso completo, e la baseline fa lo stesso "
+                 "percorso meno l'inferenza. Se il generatore e' in softirq "
+                 "il rate e' `1/(t_gen + t_pipeline)`, ma `t_gen` e' comune a "
+                 "tutte le righe della stessa taglia e sottraendo la baseline "
+                 "si cancella.")
+        L.append("")
+    else:
+        L.append("**`ns/pkt vs baseline` NON e' citabile in questa tabella**: "
+                 "ci sono righe con perdita, e con le code di mezzo "
+                 "`1/RX pps` misura il tempo di attesa, non il costo del "
+                 "programma. La colonna resta per confronto interno.")
+        L.append("")
+    if any(r["noloss_gen_bound"] for r in summ):
+        L.append("`>=` nella colonna a perdita nulla vuol dire **limite "
+                 "inferiore**: a massima spinta non si e' perso nemmeno un "
+                 "pacchetto, quindi la pipeline non era satura e il tetto "
+                 "misurato e' quello del GENERATORE. L'NDR vero sta piu' in "
+                 "alto e questo banco, su questa macchina, non lo raggiunge. "
+                 "Il confronto fra pipeline resta valido perche' tutte hanno "
+                 "visto lo stesso generatore.")
+        L.append("")
     L.append("**Le due perdite non sono la stessa cosa.** `respinti (veth)` "
              "sono pacchetti a cui `veth_xmit` ha risposto `NET_XMIT_DROP` "
              "perche' il ptr_ring della RX del DUT era pieno: non sono MAI "
