@@ -2985,6 +2985,10 @@ def _make_pair(rx, tx, rx_queues, tx_queues):
 # che non ne vede nessuno.
 VETH_RING_STATE = {}
 
+# Device per cui l'avviso e' gia' stato stampato: il fabric viene ricostruito
+# per ogni pipeline, quindi senza questo l'avviso uscirebbe cinque volte.
+_RING_DETTO = set()
+
 
 def _ethtool_ring(dev):
     """(RX attuale, RX massima) dalla sezione giusta di `ethtool -g`.
@@ -3024,6 +3028,12 @@ def raise_veth_ring(dev, target=VETH_RING_TARGET):
                  prima=attuale, massimo=massimo, chiesto=target, dopo=attuale)
     if attuale is None:
         VETH_RING_STATE[dev] = stato
+        if dev not in _RING_DETTO:
+            _RING_DETTO.add(dev)
+            warn(f"coda RX di {dev}: `ethtool -g` non la espone su questo "
+                 f"kernel. veth.c la fissa a VETH_RING_SIZE (storicamente 256 "
+                 f"descrittori) e non e' configurabile: i respinti a rate "
+                 f"basso sono un pavimento del banco, non della pipeline.")
         return stato
     voluto = min(target, massimo) if massimo else target
     if attuale >= voluto:
@@ -3033,6 +3043,14 @@ def raise_veth_ring(dev, target=VETH_RING_TARGET):
                    capture_output=True, text=True, check=False)
     stato["dopo"] = _ethtool_ring(dev)[0]
     VETH_RING_STATE[dev] = stato
+    if stato["dopo"] and stato["dopo"] != attuale:
+        info(f"coda RX di {dev}: {attuale} -> {stato['dopo']} descrittori "
+             f"(massimo {massimo})")
+    else:
+        warn(f"coda RX di {dev} resta a {attuale} descrittori: "
+             f"`ethtool -G rx {voluto}` non ha avuto effetto. A 1 Mpps "
+             f"{attuale} descrittori sono {attuale} us di traffico, e i respinti a rate "
+             f"basso sono strutturali.")
     return stato
 
 
@@ -4870,6 +4888,16 @@ def main():
     env = capture_env(a, plan, methods, frames)
     print_env(env)
 
+    def env_finale():
+        """Le condizioni RILETTE a fine run.
+
+        `capture_env` gira prima di qualunque misura, ed e' giusto cosi': se il
+        run si interrompe resta scritto su che macchina stava girando. Ma la
+        coda RX del veth si conosce solo quando la coppia viene creata, cioe'
+        dentro il primo run_method. Le condizioni che finiscono su disco vanno
+        quindi rilette alla fine, quando tutto cio' che le compone esiste."""
+        return capture_env(a, plan, methods, frames)
+
     rows = []
     rc = 0
     if a.latency:
@@ -4898,8 +4926,8 @@ def main():
                                ("latency_raw.csv", raw)):
                 if data:
                     _write_csv(os.path.join(a.out, name), data)
-            write_env(a.out, env)
-            write_report(a.out, rows, env, a.loss_threshold,
+            write_env(a.out, env_finale())
+            write_report(a.out, rows, env_finale(), a.loss_threshold,
                          "Throughput end-to-end e latenza, misurati")
             _give_back(a.out)
         # Il codice di uscita e' quello del controllo: un run in cui la
@@ -4923,11 +4951,11 @@ def main():
                 _write_csv(os.path.join(a.out, "compare.csv"), rows)
             if raw:
                 _write_csv(os.path.join(a.out, "compare_raw.csv"), raw)
-            write_env(a.out, env)
+            write_env(a.out, env_finale())
             # Sulle righe di SINTESI, cioe' sulle mediane dei giri: costruirlo
             # sulle righe grezze farebbe vincere il giro piu' fortunato, che a
             # rate offerto fisso e' esattamente l'errore da evitare.
-            write_report(a.out, rows or raw, env, a.loss_threshold,
+            write_report(a.out, rows or raw, env_finale(), a.loss_threshold,
                          "Throughput end-to-end a carico identico")
             _give_back(a.out)
         _closing_note(plan)
@@ -4952,8 +4980,8 @@ def main():
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
         _write_csv(os.path.join(a.out, "throughput.csv"), rows)
-        write_env(a.out, env)
-        write_report(a.out, rows, env, a.loss_threshold)
+        write_env(a.out, env_finale())
+        write_report(a.out, rows, env_finale(), a.loss_threshold)
         _give_back(a.out)
 
     _closing_note(plan)
