@@ -278,6 +278,27 @@ VETH_RING_TARGET = 4096
 # Un drenaggio esplicito da entrambi i lati toglie tutti e due gli errori.
 DRAIN_S = 0.05
 
+# Finestre della calibrazione del generatore, e perche' se ne prende il MASSIMO.
+#
+# `rate_estimate` non e' un numero di comodo: da lui si ricava il `count` di
+# ogni punto, e quindi la DURATA della finestra di misura. Sottostimarlo
+# accorcia le finestre, e una finestra corta su questa macchina e' dominata da
+# un singolo intoppo dello scheduler.
+#
+# Misurato il 2026-09-18 (commit d2aa8792): la calibrazione e' uscita a
+# 127 988 pps quando il rate vero era ~570 000. Il count del punto a pieno
+# regime e' diventato 127 988 x 2.0 = 255 976 pacchetti, che a 570 kpps durano
+# 0.45 s invece dei 2.0 s chiesti. Il primo punto del run -- baseline a 64
+# byte -- e' uscito a 567 563 pps contro gli 850-880 k delle altre misure, e il
+# controllo di validita' ha bocciato il run perche' "la baseline non e' la piu'
+# veloce". Non lo era: era stata misurata in una finestra lunga un quarto.
+#
+# Il MASSIMO e non la mediana: qui si stima di cosa e' CAPACE il generatore, e
+# una finestra bassa e' un vCPU sospeso, non un generatore piu' lento. Per la
+# perdita e per il confronto fra pipeline vale la regola opposta (mediana), e i
+# due casi sono diversi apposta.
+CALIB_WINDOWS = 3
+
 # Passi di bisezione nella ricerca del ginocchio nel percorso storico
 # (--latency). La modalita' saturate non biseca: vedi find_saturation.
 KNEE_STEPS = 5
@@ -1257,9 +1278,18 @@ class Generator:
         """
         seconds = self.window_s if seconds is None else seconds
         self.warmup(frame, 0, min(self.warmup_s, seconds))
-        r = self.timed_run(frame, 0, seconds)
-        self.rate_estimate = r.tx_pps_aggregate
-        return r
+        migliore = None
+        for _ in range(max(1, CALIB_WINDOWS)):
+            try:
+                r = self.timed_run(frame, 0, seconds)
+            except (PktgenEmptyRun, RuntimeError):
+                continue
+            if migliore is None or r.tx_pps_aggregate > migliore.tx_pps_aggregate:
+                migliore = r
+        if migliore is None:
+            raise PktgenEmptyRun("calibrazione: nessuna finestra utilizzabile")
+        self.rate_estimate = migliore.tx_pps_aggregate
+        return migliore
 
     # -- ricerca automatica della configurazione del generatore ------------
     def tune(self, frame=64, seconds=None, verbose=True):
@@ -3459,12 +3489,21 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         # Il TETTO DEL GENERATORE, misurato una volta e stampato: e' la cifra
         # rispetto a cui va letto tutto il resto. Se un risultato ci arriva
         # vicino, il limite e' qui e non nella pipeline.
-        if tune:
-            # tune() calibra da sola e lascia sul generatore le manopole che
-            # hanno davvero alzato il rate.
-            gen.tune(frames[0] if frames else 64)
-        else:
-            gen.calibrate(frames[0] if frames else 64)
+        # Una calibrazione fallita non deve costare l'intera pipeline: si
+        # riparte da una stima di comodo e si dice che e' di comodo. Il primo
+        # punto a pieno regime la corregge da solo (vedi find_saturation).
+        try:
+            if tune:
+                # tune() calibra da sola e lascia sul generatore le manopole
+                # che hanno davvero alzato il rate.
+                gen.tune(frames[0] if frames else 64)
+            else:
+                gen.calibrate(frames[0] if frames else 64)
+        except (PktgenEmptyRun, RuntimeError) as e:
+            gen.rate_estimate = gen.rate_estimate or 1_000_000
+            warn(f"calibrazione fallita ({e}): parto da "
+                 f"{gen.rate_estimate} pps di comodo, il primo punto la "
+                 f"corregge.")
         info(f"tetto del generatore su questo banco: {gen.rate_estimate} pps "
              f"offerti da {gen.n_inst} thread su cpu "
              f"{','.join(str(c) for c in plan.gen)}")
@@ -3651,6 +3690,27 @@ def find_saturation(setup, rx_tab, fab, frame, n_out, gen, out_rows, method,
                          gen.clone, repeat=repeat, burst=gen.burst,
                          xmit_mode=xmit_mode, gen=gen, threshold=threshold,
                          plan=plan, diag=diag)
+    # `Generator.timed_run` ricalibra una volta la finestra uscita corta, ma
+    # QUESTO percorso non passa di li': il `count` glielo si da' gia' fatto,
+    # calcolato su una stima che puo' essere vecchia o sbagliata. Senza il
+    # controllo, una stima bassa produceva una finestra lunga un quarto del
+    # bersaglio e un punto non confrontabile con gli altri. Stessa regola,
+    # applicata dove mancava.
+    if full is not None and 0 < full["secs"] < gen.window_s * WINDOW_SHORT_FRACTION:
+        vero = full.get("tx_pps") or 0
+        if vero > 0:
+            note(f"frame {frame}: finestra uscita a {full['secs']:.2f}s invece "
+                 f"di {gen.window_s:.2f}s (stima del rate troppo bassa: "
+                 f"{gen.rate_estimate} contro {vero} misurati). Rifaccio il "
+                 f"punto con il conteggio giusto.")
+            gen.rate_estimate = max(gen.rate_estimate, vero)
+            rifatto = measure_point(
+                setup, rx_tab, fab, frame, 0, gen.window_count(vero), n_out,
+                gen.clone, repeat=repeat, burst=gen.burst,
+                xmit_mode=xmit_mode, gen=gen, threshold=threshold, plan=plan,
+                diag=diag)
+            if rifatto is not None:
+                full = rifatto
     if full is None:
         warn(f"frame {frame}: nessuna misura utilizzabile a pieno rate")
         return None, None
