@@ -1659,24 +1659,120 @@ Il pacchetto viene consegnato? & no, non esce mai &
   sì, attraversa il collegamento ed esce dall'altra parte \\[3pt]
 Che cosa finisce nella cifra & solo il programma &
   programma $+$ driver $+$ code $+$ schedulatore \\[3pt]
-Cifra tipica (baseline) & $\approx 20$ ns, cioè 50 Mpps &
-  $\approx 200$ ns, 2,1 Mpps misurati \\[3pt]
+Cifra tipica (baseline) & 29 ns, cioè 34,5 Mpps &
+  1\,142 ns, 0,88 Mpps misurati \\[3pt]
 Serve per & confrontare le pipeline fra loro &
   dire se il sistema sta in piedi sotto carico \\[3pt]
 Riproducibile? & sì, è deterministico &
-  la latenza sì, la portata no \\
+  la latenza sì; la portata solo come \emph{differenza}
+  rispetto alla baseline (\S\ref{sec:confronto-mpps}) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \begin{lezione}
-I 50 Mpps della baseline non sono un throughput: sono il reciproco della durata
-di una funzione. Un pacchetto che non viene mai consegnato non ha un throughput.
+I 34,5 Mpps della baseline non sono un throughput: sono il reciproco della
+durata di una funzione. Un pacchetto che non viene mai consegnato non ha un
+throughput.
 \end{lezione}
 
-Il rapporto fra le due colonne --- $20$ ns contro $200$ --- non è un difetto del
-secondo banco. È la risposta alla domanda \emph{quanto costa la rete intorno al
-programma}, e su questa macchina la risposta è: nove volte il programma stesso.
+Il rapporto fra le due colonne --- $29$ ns contro $1\,142$ --- non è un difetto
+del secondo banco. È la risposta alla domanda \emph{quanto costa la rete intorno
+al programma}, e su questa macchina la risposta è: quasi quaranta volte il
+programma stesso. Il conto, e il motivo per cui il confronto fra pipeline
+sopravvive lo stesso, stanno in \S\ref{sec:confronto-mpps}.
+
+\section{L'architettura del banco, e che cosa si misura dove}
+
+Prima dei numeri conviene avere in testa il disegno, perché ogni cifra di questo
+capitolo è presa in un punto preciso di questa catena.
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=6mm,
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=11mm,
+              minimum width=24mm,inner sep=4pt,font=\small,align=center},
+  dut/.style={box,fill=white,draw=accent,thick,minimum width=30mm},
+  arr/.style={-{Stealth[length=5pt]},draw=soft,thick},
+  cpu/.style={font=\scriptsize\itshape,color=soft},
+  pt/.style={font=\scriptsize\bfseries,color=accent}
+]
+\node[box] (tg) {\texttt{pktgen}\\ generatore};
+\node[dut,right=20mm of tg] (dut) {pipeline XDP\\ inferenza +\\ \texttt{bpf\_redirect}};
+\node[box,right=20mm of dut] (rx) {contatore\\ \texttt{XDP\_DROP}};
+
+\draw[arr] (tg) -- node[above,font=\scriptsize,color=soft]{\texttt{veth}}
+                  node[below,font=\scriptsize,color=soft]{\texttt{ipainp}$\to$\texttt{ipain}} (dut);
+\draw[arr] (dut) -- node[above,font=\scriptsize,color=soft]{\texttt{veth}}
+                   node[below,font=\scriptsize,color=soft]{\texttt{ipa0}$\to$\texttt{ipa0p}} (rx);
+
+\node[cpu,above=2mm of tg] {CPU 1};
+\node[cpu,above=2mm of dut] {CPU 2--3};
+
+\node[pt,below=9mm of tg] (ptx) {TX};
+\node[pt,below=9mm of dut] (phit) {HIT};
+\node[pt,below=9mm of rx] (prx) {RX};
+\draw[densely dotted,draw=soft] (tg) -- (ptx);
+\draw[densely dotted,draw=soft] (dut) -- (phit);
+\draw[densely dotted,draw=soft] (rx) -- (prx);
+\end{tikzpicture}
+\end{center}
+
+Tre soggetti e tre punti di conteggio. I soggetti:
+
+\begin{itemize}
+\item \textbf{Il generatore (TG)} è \texttt{pktgen}, che vive \emph{dentro} il
+      kernel: non è un programma che apre una socket, è un thread del kernel che
+      fabbrica pacchetti e li consegna direttamente al dispositivo. È il motivo
+      per cui arriva a centinaia di migliaia di pacchetti al secondo da un core
+      solo, dove un mittente in spazio utente si fermerebbe molto prima.
+\item \textbf{Il nodo sotto prova (DUT)} è la pipeline eBPF agganciata a XDP
+      sull'interfaccia d'ingresso. Fa l'inferenza, sceglie la classe, e chiama
+      \texttt{bpf\_redirect} verso l'interfaccia d'uscita corrispondente.
+\item \textbf{Il destinatario} è un secondo programma XDP, minuscolo, che
+      incrementa un contatore e restituisce \texttt{XDP\_DROP}. Conta senza
+      consegnare, così il numero misura la consegna del datapath e non il costo
+      di passare il pacchetto allo stack di rete.
+\end{itemize}
+
+I tre punti di conteggio, e perché non basta uno solo:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{7.6cm}@{}}
+\toprule
+\textbf{Punto} & \textbf{Chi lo conta} & \textbf{Che cosa dice} \\
+\midrule
+TX  & \texttt{pktgen} & quanti pacchetti sono stati \emph{accettati} dal
+      dispositivo. I rifiutati a coda piena finiscono in un contatore separato
+      (\texttt{errors}) e sono carico offerto, non consegnato. \\
+HIT & la pipeline    & quanti pacchetti il programma ha davvero elaborato.
+      \textbf{TX $-$ HIT} sono quelli entrati e mai arrivati all'inferenza. \\
+RX  & il contatore   & quanti sono arrivati a destinazione.
+      \textbf{HIT $-$ RX} sono quelli elaborati e non usciti: \texttt{redirect}
+      fallito, oppure la classe scelta era \textsc{drop}. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Un solo numero di ``perdita'' confonderebbe tre cause che chiedono tre rimedi
+diversi. In tutte le misure di questo capitolo \textbf{HIT $-$ RX vale zero e
+TX $=$ HIT}: la pipeline non ha mai perso un pacchetto che le sia stato
+consegnato. Tutto ciò che manca all'appello è stato \emph{rifiutato all'ingresso}
+dal \texttt{veth}, cioè è controspinta --- la prova che il nodo è saturo, non
+che sbagli.
+
+\begin{prima}[Dove finisce il tempo, e dove si misura]
+La latenza è marcata \textbf{dentro} la pipeline: un timestamp quando il
+pacchetto entra nel programma, uno quando il programma d'uscita lo vede. Copre
+quindi inferenza \emph{più} il tragitto fino all'altra interfaccia, non il
+tempo che il pacchetto passa in coda prima di essere elaborato.
+
+La portata, invece, si misura \textbf{agli estremi}: pacchetti contati
+all'uscita, diviso la durata della finestra. Dentro quel numero c'è tutto,
+compreso ciò che non è la pipeline.
+\end{prima}
+
 
 \section{Il banco}
 
@@ -1904,9 +2000,9 @@ accelerare non produce throughput: produce scarti.
 
 Il codice è stato rimosso. Quello che resta è il numero: \textbf{su questo banco
 il tetto è $\approx$ 1,4--2,1 Mpps, ed è una proprietà del collegamento
-virtuale, non di IPA.} È anche la ragione per cui i 50 Mpps stimati dalla durata
-del programma non saranno mai misurabili qui: mancherebbe un tetto di venti
-volte, e il tetto non è il programma.
+virtuale, non di IPA.} È anche la ragione per cui i 34,5 Mpps stimati dalla
+durata del programma non saranno mai misurabili qui: mancherebbe un tetto di
+oltre quindici volte, e il tetto non è il programma.
 
 \subsection*{La cosa utile venuta fuori per sbaglio}
 
@@ -1932,6 +2028,141 @@ Un nanosecondo di differenza. La misura di latenza \textbf{non dipende da come
 sono fatti i pacchetti}, e questa è la conferma più forte che abbiamo che la
 tabella della latenza misura la pipeline e non il banco. Un esperimento fallito
 ha prodotto il controllo che all'esperimento riuscito mancava.
+
+\section{Le stesse pipeline, quaranta volte più lente}
+\label{sec:confronto-mpps}
+
+Fin qui il quaderno ha riportato due famiglie di numeri senza mai metterle nella
+stessa unità di misura, e questo ha nascosto la cosa più interessante. Adesso
+sono entrambi in \textbf{milioni di pacchetti al secondo}.
+
+A sinistra \texttt{test\_suite}, che esegue il programma centomila volte sullo
+stesso pacchetto in memoria e divide il tempo. A destra il banco con
+\texttt{pktgen}: traffico vero, frame da 512 byte, perdita $0{,}00\%$,
+generatore e nodo sullo stesso core (modalità \emph{softirq}), controllo di
+validità superato.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Pipeline} & \textbf{\texttt{test\_suite}} & \textbf{banco} &
+\textbf{rapporto} \\
+\midrule
+baseline      & 34,48 Mpps & 0,876 Mpps & $39{,}4\times$ \\
+P1 hardcoded  & 13,70 Mpps & 0,810 Mpps & $16{,}9\times$ \\
+P2 template   &  3,82 Mpps & 0,655 Mpps & $5{,}8\times$ \\
+P3 modular    &  2,38 Mpps & 0,574 Mpps & $4{,}1\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Quaranta volte, per la baseline. La prima reazione è che una delle due misure
+sia sbagliata. Non lo è nessuna delle due: misurano due cose diverse, e il modo
+per vederlo è girare la tabella in nanosecondi per pacchetto.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Pipeline} & \textbf{\texttt{test\_suite}} & \textbf{banco} &
+\textbf{differenza} \\
+\midrule
+baseline      &  29 ns & 1\,142 ns & $+1\,113$ ns \\
+P1 hardcoded  &  73 ns & 1\,235 ns & $+1\,162$ ns \\
+P2 template   & 262 ns & 1\,526 ns & $+1\,264$ ns \\
+P3 modular    & 421 ns & 1\,743 ns & $+1\,322$ ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+La differenza non è un fattore: è un \textbf{addendo}, e vale fra 1\,113 e
+1\,322 nanosecondi --- varia del 19\% mentre le pipeline variano di quattordici
+volte. Non è rumore e non è un difetto della misura: è il costo di tutto ciò che
+sta \emph{intorno} al programma, ed è quasi lo stesso per chiunque lo attraversi.
+\end{lezione}
+
+Quel migliaio di nanosecondi ha tre voci identificabili, tutte già incontrate:
+
+\begin{enumerate}
+\item \textbf{Un'allocazione per pacchetto.} Su \texttt{veth} il kernel rifiuta
+      \texttt{clone\_skb}: il buffer non si può riusare, perché
+      viene consegnato al peer, dove XDP lo riscrive. \texttt{test\_suite} riusa
+      sempre lo stesso.
+\item \textbf{Una copia per l'headroom.} XDP pretende 256 byte davanti al
+      pacchetto, gli \texttt{skb} di \texttt{pktgen} ne riservano 64: il kernel
+      copia ogni pacchetto prima di eseguire il programma.
+\item \textbf{Il generatore stesso.} In modalità \emph{softirq} la ricezione
+      gira sulla CPU che ha trasmesso, quindi il tempo per pacchetto è
+      \emph{generazione più elaborazione}, non elaborazione soltanto.
+\end{enumerate}
+
+Nessuna delle tre è il datapath. Tutte e tre sparirebbero con due macchine e una
+scheda di rete vera --- che è esattamente il motivo per cui le cifre assolute di
+questo banco non vanno citate come prestazioni del sistema.
+
+\section{Perché il confronto regge lo stesso}
+
+Se l'addendo è comune, allora \emph{sottrarlo} restituisce il costo della sola
+inferenza. È il conto che rende utile un banco altrimenti saturo:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Sopra la baseline} & \textbf{\texttt{test\_suite}} & \textbf{banco} &
+\textbf{rapporto} \\
+\midrule
+P1 hardcoded & $+44$ ns  & $+93$ ns  & $2{,}1\times$ \\
+P2 template  & $+233$ ns & $+385$ ns & $1{,}7\times$ \\
+P3 modular   & $+392$ ns & $+601$ ns & $1{,}5\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+L'ordine è identico, le distanze sono dello stesso ordine di grandezza, e i
+rapporti stanno fra $1{,}5$ e $2{,}1$ --- cioè sotto traffico vero l'inferenza
+costa circa il doppio di quanto costi in laboratorio. È un risultato in sé, e ha
+una spiegazione: il ciclo caldo di \texttt{test\_suite} tiene pesi e codice in
+cache e ammortizza i salti fra programmi, mentre sotto traffico continuo ogni
+pacchetto porta con sé pressione di cache. Le pipeline che usano salti e letture
+di mappa --- P2 e P3 --- sono quelle che pagano di più questa differenza, ed è
+coerente con il fatto che il rapporto \emph{scende} al crescere del lavoro: chi
+fa già molto lavoro utile ammortizza meglio l'overhead fisso.
+
+\begin{prima}[Che cosa vuol dire ``saturo'' qui]
+In questo banco il collo di bottiglia non è mai la pipeline. In modalità
+\emph{softirq} il tetto è il generatore, che condivide il core; a core separati
+il tetto è la coda del \texttt{veth}, fissa a 256 descrittori. In entrambi i casi
+il nodo sotto prova \textbf{non arriva a saturare}, e infatti la perdita
+osservata è zero.
+
+Questo toglie un risultato e ne lascia un altro. Toglie la \emph{portata
+massima}: il numero in Mpps è il tetto del banco, non della pipeline, e va
+riportato come limite inferiore. Lascia il \emph{costo per pacchetto}: siccome
+non ci sono code di mezzo, $1/\text{pps}$ è il tempo del percorso completo, e la
+baseline percorre la stessa strada meno l'inferenza. La sottrazione elimina il
+banco e lascia la pipeline.
+\end{prima}
+
+Le percentuali dicono la stessa cosa da un'altra angolazione. Rispetto alla
+baseline, P3 vale il $6{,}9\%$ sotto \texttt{test\_suite} e il $65{,}5\%$ sul
+banco: l'overhead comune \textbf{comprime} le differenze, e le comprime tanto
+più quanto è grande rispetto al lavoro utile. Per questo un banco così non serve
+a dire ``P3 è quindici volte più lenta della baseline'' --- quella cifra è di
+\texttt{test\_suite} --- ma serve a dire che l'ordine e le distanze in
+nanosecondi si ritrovano anche quando i pacchetti sono veri. Le due misure non
+si contraddicono: una isola il programma, l'altra lo pesa dentro un sistema.
+
+\begin{lezione}
+Un banco saturo non è un banco inutile: è un banco in cui vanno citate le
+\emph{differenze} e non i \emph{valori}. La regola pratica che ne è uscita: se
+il collo di bottiglia dichiarato è il generatore o il trasporto, la colonna in
+Mpps si riporta con il ``maggiore o uguale'' e il confronto si fa sulla colonna
+in nanosecondi, dopo aver sottratto la baseline.
+\end{lezione}
+
 
 \section{Che cosa questi numeri non dicono}
 
@@ -2005,15 +2236,24 @@ ha prodotto il controllo che all'esperimento riuscito mancava.
       tentativo di alzarlo cambiando generatore lo ha \emph{abbassato}: il collo
       di bottiglia è il lato ricezione, non la fabbricazione dei pacchetti.
       Oltre questa cifra servono due macchine e un cavo, non un'altra manopola.
-\item \textbf{La portata non è ancora citabile.} La dispersione fra i giri
-      arriva al 137\% sulle pipeline veloci, tutte limitate dal generatore. La
-      latenza sì, ed è la misura su cui appoggiare le affermazioni di velocità
-      finché questa resta così.
-\item \textbf{Lo sweep sulle taglie di frame} (512 e 1514 byte) è impostato ma
-      non ancora eseguito con il banco equo: finora solo 64 byte.
-\item \textbf{Versione intermedia fra P1 e P2}: pesi scritti nel codice ma
-      descrittore letto a runtime. Oggi il salto fra P1 e P2 confonde due
-      cambiamenti insieme, e non si può attribuire il costo all'uno o all'altro.
+\item \textbf{La portata assoluta resta non citabile; la sua \emph{differenza}
+      no.} A core separati la dispersione fra i giri arriva al 137\% e il
+      pavimento è la coda del collegamento virtuale; a core condivisi il tetto
+      è il generatore. In nessuna delle due configurazioni il nodo satura,
+      quindi il numero in Mpps va riportato come limite inferiore. Quello che
+      si cita è il costo per pacchetto \emph{dopo aver sottratto la baseline}:
+      vedi \S\ref{sec:confronto-mpps}.
+\item \textbf{Lo sweep sulle taglie di frame} è stato eseguito su 64, 512 e
+      1514 byte. Il costo dell'inferenza non dipende dalla lunghezza del frame,
+      come atteso; a 1514 byte comincia a pesare la copia dell'headroom. La
+      taglia con la dispersione minore, e quindi quella di riferimento, è
+      \textbf{512 byte}.
+\item \textbf{Versione intermedia fra P1 e P2}: esiste ed è stata misurata
+      (\texttt{hardcoded}, pesi nel codice e nodo letto da mappa). Il risultato
+      è negativo in senso utile: su questo banco \textbf{non si distingue da
+      P1}. Le due variano fra un run e l'altro più di quanto distino fra loro, e
+      il loro ordine reciproco si inverte. Separarle richiede un banco con meno
+      rumore, non un'altra misura qui.
 \item \textbf{Hardware vero}: la scheda di rete di questa macchina virtuale è
       emulata e non supporta XDP native. I numeri assoluti restano non citabili
       come prestazioni di sistema.

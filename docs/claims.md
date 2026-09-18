@@ -75,6 +75,21 @@ scheda lo dice invece di nasconderlo.
 
 ---
 
+### A5 — L'equivalenza numerica vale anche sui modelli sintetici ⏳
+
+| | |
+|---|---|
+| **Ipotesi** | Che i pesi sintetici **compilino** e passino il verificatore dimostra che le pipeline sono corrette indipendentemente dal modello. |
+| **Variabile modificata** | Il modello: 7 scenari sintetici (`deep`, `ipa_like`, `large`, `mixed`, `ones`, `small`, `sparse`), pesi casuali, forme da 11-2-3 a 117-8-8-9. |
+| **Variabili fisse** | La pipeline (P1), il descrittore di ciascuno scenario, l'insieme di ingressi campionato con seme fisso. |
+| **Metrica** | Accordo fra argmax su quattro vie: float (Python), int8 (`synth.reference`), int8 (`verify_prog_run.ref_infer_sparse`, implementazione indipendente), int8 (eBPF nel kernel). |
+| **Risultato** | ⏳ Le vie Python girano e concordano: `--dry-run` su tutti e 7 gli scenari passa, e i `col_scales` ricalcolati dal descrittore coincidono con quelli depositati. La via **eBPF non e' ancora stata eseguita**: serve Linux con BCC. |
+| **Conclusione attesa** | `int8 (Python)` contro `int8 (eBPF)` deve valere **100%**: un solo disaccordo li' e' un difetto del datapath, non della quantizzazione. Finche' quel numero non c'e', l'ipotesi resta dimostrata solo per la compilazione. |
+| **Nota** | L'accordo float/int8 misurato qui (97,7-100%) **non e'** il `quant_agreement` di `expected.json` (0,789 per `ipa_like`): li' gli ingressi sono campionati liberamente, qui solo fra quelli che il datapath sa esprimere. Distribuzioni diverse, numeri diversi. |
+| **Come rigirarlo** | `sudo python3 ipa/test/verify_synth_kernel.py --all --n 300` — oppure `--dry-run` senza kernel |
+
+---
+
 ## B. Il costo della flessibilità
 
 Questa è la sezione che risponde all'esempio del relatore. La scala ha **quattro**
@@ -298,15 +313,63 @@ solo su P1.
 | **Conclusione** | Tre meccanismi distinti per lo stesso sintomo. In P3 si vede allo stato puro: **dimensione costante, tempo crescente** è la firma di un costo di transizione e non di calcolo. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis depth --out result/` |
 
-## E. Che cosa nessun test di questo progetto dimostra
+## E. Traffico vero: throughput end-to-end e latenza
+
+Questa sezione risponde alla riserva che la sezione E dichiarava aperta: fino a
+qui ogni cifra in Mpps era `1/latenza` sotto `BPF_PROG_TEST_RUN`. Ora c'e' un
+generatore che manda pacchetti veri e un contatore che li conta all'arrivo.
+
+### E1 — Il datapath non perde pacchetti; a perdere e' il trasporto ✅
+
+| | |
+|---|---|
+| **Ipotesi** | Le perdite osservate su un banco `veth` sono della pipeline. |
+| **Variabile modificata** | Il punto di conteggio: trasmessi (TX), elaborati dal programma (HIT), arrivati a destinazione (RX), piu' i rifiutati da `veth_xmit`. |
+| **Variabili fisse** | Modello, topologia, taglia del frame, durata della finestra. |
+| **Metrica** | `TX − HIT`, `HIT − RX`, e i rifiutati contati a parte. |
+| **Risultato** | In **tutte** le configurazioni misurate `TX = HIT = RX` e `HIT − RX = 0`. Ogni pacchetto mancante all'appello e' stato rifiutato da `veth_xmit` a coda piena, cioe' non e' mai entrato nel DUT. |
+| **Conclusione** | L'ipotesi e' falsa: la perdita e' **controspinta del trasporto**, prova che il nodo e' saturo, non che sbagli. Un solo numero di "perdita" avrebbe attribuito alla pipeline un difetto del banco. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --mode saturate --frames 64,512,1514 --threads 1 --duration 2.0 --repeat 5 --no-threaded-napi --out result/ndr/` |
+
+### E2 — Fra i due banchi c'e' un addendo costante, non un fattore ✅
+
+| | |
+|---|---|
+| **Ipotesi** | Le cifre del banco con traffico vero e quelle di `test_suite` non sono riconciliabili. |
+| **Variabile modificata** | Il banco: `BPF_PROG_TEST_RUN` contro `pktgen` + `veth` + XDP nativo, stesse pipeline. |
+| **Variabili fisse** | Modello 65-4-4-7, frame 512 B, stessa macchina. |
+| **Metrica** | Mpps e ns/pacchetto, per pipeline. |
+| **Risultato** | 34,48 / 13,70 / 3,82 / 2,38 Mpps contro 0,876 / 0,810 / 0,655 / 0,574. In nanosecondi la differenza vale **1 113, 1 162, 1 264, 1 322 ns**: varia del 19% mentre le pipeline variano di quattordici volte. |
+| **Conclusione** | La differenza e' un **addendo comune** — allocazione per pacchetto, copia dell'headroom, generatore sullo stesso core — non un fattore. Sottraendo la baseline si elimina il banco e resta la pipeline: +93 / +385 / +601 ns contro +44 / +233 / +392 di `test_suite`, stesso ordine, rapporti fra 1,5 e 2,1. |
+| **Limite dichiarato** | ⚠️ Il throughput assoluto non e' della pipeline: in softirq il tetto e' il generatore, a core separati e' la coda del `veth` (256 descrittori, non configurabile su questo kernel). Si riporta come **limite inferiore**. |
+| **Come rigirarlo** | Come E1, piu' `sudo python3 ipa/test/test_suite.py --only kernel` |
+
+### E3 — Il costo dell'inferenza si ritrova anche nella latenza end-to-end ✅
+
+| | |
+|---|---|
+| **Ipotesi** | Il costo dedotto dal throughput e quello misurato come latenza sono la stessa cosa. |
+| **Variabile modificata** | Come si stima il costo: `1/pps` in regime senza perdite contro marcatura temporale arrivo → ripartenza. |
+| **Variabili fisse** | Modello, frame 512 B, rate di 50 kpps per la latenza (nessuna coda). |
+| **Metrica** | ns/pacchetto sopra la baseline, su tre run indipendenti per ciascuna via. |
+| **Risultato** | Latenza minima: P1 ~101, P1.5 ~96, P2 ~288, P3 ~478 ns. Da throughput: 82, 116, 430, 673 ns. |
+| **Conclusione** | Ipotesi vera per P1 e P1.5, **falsa per P2 e P3**: li' il costo sotto carico continuo supera del 40-50% il minimo. Il minimo e' il cammino piu' fortunato; sotto traffico, salti fra programmi e letture di mappa si pagano. Per dimensionare un nodo vale la cifra da throughput. |
+| **Limite dichiarato** | ⚠️ Solo il **minimo** e' esatto: i percentili vengono da un istogramma `bpf_log2l`, risoluzione un fattore 2, e nei run tutte e cinque le pipeline cadono negli stessi due bucket. `p50` e `p99` non separano niente. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --latency --frames 512 --rounds 5 --repeat 5 --threads 1 --duration 2.0 --out result/lat/` |
+
+---
+
+## F. Che cosa nessun test di questo progetto dimostra
 
 Dichiarato per non far sembrare coperto ciò che non lo è.
 
-- **Throughput reale.** Tutte le cifre in Mpps sono `1/latenza` sotto
-  `BPF_PROG_TEST_RUN`, cioè un ciclo sullo stesso buffer: niente scheda di rete,
-  niente driver, nessuna allocazione, nessuna pressione di cache da traffico
-  vero. È un **picco teorico**, non un throughput retto. Serve traffico generato a
-  ritmo e la misura dei pacchetti persi.
+- **Throughput assoluto.** ~~Tutte le cifre in Mpps sono `1/latenza`~~ — chiuso
+  dalla sezione E: il traffico vero c'è, i pacchetti persi sono misurati e
+  attribuiti. Resta aperto il **valore assoluto**: su questo banco il nodo non
+  satura mai (il tetto è il generatore o la coda del `veth`), quindi la cifra in
+  Mpps è un limite inferiore e ciò che si cita è la **differenza** rispetto alla
+  baseline. Per un throughput assoluto servono due macchine e una scheda di rete
+  che supporti XDP nativo.
 - **Prestazioni citabili.** VM a 4 vCPU, nessun pinning dei core, nessuna
   frequenza fissata, nessun C-state disabilitato. Valgono i rapporti fra le
   colonne dentro una stessa esecuzione, mai le cifre assolute.

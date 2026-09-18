@@ -306,8 +306,15 @@ def t_kernel(root):
         except Exception as e:
             fail(f"{label}: {e}")
 
-    info("full dispatch equivalence on synthetic weights: run "
-         "verify_prog_run with --weights pointing at the scenario directory")
+    # Questo blocco prova la COMPILAZIONE, non l'equivalenza numerica: che i
+    # pesi sintetici passino il verificatore non dice niente su quale classe il
+    # programma poi sceglie. Il rimando qui diceva "verify_prog_run --weights",
+    # un'opzione che non e' mai esistita, e la distinzione andava quindi presa
+    # sulla fiducia. Adesso il test c'e' e si chiama per nome.
+    info("equivalenza NUMERICA sui pesi sintetici (float / int8 Python / eBPF): "
+         "sudo python3 ipa/test/verify_synth_kernel.py --all")
+    info("  ...oppure, senza kernel, le sole vie Python: "
+         "python3 ipa/test/verify_synth_kernel.py --all --dry-run")
 
 
 # ---------------------------------------------------------------------------

@@ -1169,18 +1169,26 @@ sono di un altro esperimento.
 
 **Latenza minima a scarico (50 kpps, nessuna coda davanti), ns sopra la baseline**
 
-Due run, a 3 e a 5 giri (`2b85d1f0` e `b0447b3e`). Mediana fra i giri.
+Tre run: uno a 3 giri e due a 5 (`2b85d1f0`, `b0447b3e`, `11fad915`). Mediana fra i giri.
 
-| pipeline | 3 giri | 5 giri | media |
-|---|---|---|---|
-| baseline (assoluto) | 368 ns | 342 ns | 355 ns |
-| p1_static (P1) | +76 | +107 | ~92 |
-| hardcoded (P1.5) | +102 | +91 | ~97 |
-| template (P2) | +269 | +288 | ~279 |
-| modular (P3) | +440 | +473 | ~457 |
+| pipeline | 3 giri | 5 giri | 5 giri | media | spread |
+|---|---|---|---|---|---|
+| p1_static (P1) | +76 | +107 | +121 | ~101 | 44% |
+| hardcoded (P1.5) | +102 | +91 | +94 | ~96 | 11% |
+| template (P2) | +269 | +288 | +308 | ~288 | 14% |
+| modular (P3) | +440 | +473 | +520 | ~478 | 17% |
 
-P2 e P3 concordano fra i due run entro il 7-8%. **P1 e P1.5 restano indistinguibili** — 92
-contro 97 ns, e fra i due run il loro ordine si inverte — esattamente come nella 11.3.
+**P1 e P1.5 sono indistinguibili anche qui**: ~101 e ~96 ns, e l'ordine si inverte fra i
+run. Terza strada indipendente che dà la stessa conclusione della 11.3.
+
+**Un confondente da dichiarare.** La baseline assoluta scende da un run all'altro — 368,
+342, 332 ns — e siccome i delta si calcolano sottraendola, crescono di conseguenza. Non è
+un trend delle pipeline: è la macchina che deriva. Va letto come "P3 costa fra 440 e 520 ns
+sopra un percorso che costa fra 330 e 370", non come "P3 sta peggiorando".
+
+Dispersione dentro l'ultimo run: baseline 7%, P1.5 3,6%, P3 6,8%, P2 12,6%, P1 13,4%. Il
+`[FAIL]` residuo è su P1 a 13,4%, marginale e reale — non più l'artefatto da 1227% del run
+precedente.
 
 **Solo la colonna `min` è utilizzabile, e va detto perché.** Il minimo viene da un
 accumulatore ed è esatto. I percentili vengono da un istogramma `bpf_log2l`, quindi i
