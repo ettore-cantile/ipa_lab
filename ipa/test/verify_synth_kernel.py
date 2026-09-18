@@ -90,6 +90,13 @@ GREEN, RED, YELLOW, GREY, NC = (
 # una volta, evita di sparpagliare il caso speciale nel resto del file.
 NOMI = {"queue_occ": "queue_occupancy"}
 
+# L'ifindex finto con cui si entra nel programma. Il datapath non usa
+# l'ifindex del kernel come indice della feature: lo risolve attraverso la
+# mappa `ingress_port`, perche' gli ifindex veri sono arbitrari (205, 217...)
+# e una tabella compilata non li indovina. Qui se ne sceglie uno qualunque e
+# gli si associa, di volta in volta, la porta logica del campione.
+IFINDEX_FINTO = 100
+
 
 def ok(m):
     print(f"  {GREEN}[PASS]{NC} {m}")
@@ -287,11 +294,23 @@ def via_ebpf(setup, caso, model, scale):
     for nome, vals in caso["mappe"].items():
         write_vector_map(setup["b"], nome, vals)
 
+    # LA PORTA D'INGRESSO VA DETTA AL KERNEL, non solo al riferimento.
+    #
+    # Prima qui c'era `ingress_ifindex=0` fisso mentre il lato Python usava
+    # `caso["porta"]`, che varia: le due meta' costruivano due vettori
+    # d'ingresso diversi e il confronto misurava quella differenza invece del
+    # datapath. Si vedeva benissimo nei dati -- `mixed`, l'unico scenario
+    # SENZA la feature `ingress_iface`, era anche l'unico al 100%.
+    if "ingress_port" in setup:
+        setup["ingress_port"][ct.c_uint32(IFINDEX_FINTO)] = \
+            ct.c_uint32(int(caso["porta"]))
+
     n_out = int(model["arch"]["n_out"])
     frame = build_frame_sparse(0, caso["ttl"], scale,
                                int(model["arch"]["n_in"]), n_out)
     _reset_stats(setup, n_classes=n_out)
-    prog_test_run(setup["disp"].fd, frame, repeat=1, ingress_ifindex=0)
+    prog_test_run(setup["disp"].fd, frame, repeat=1,
+                  ingress_ifindex=IFINDEX_FINTO)
 
     # La classe scelta si legge da cls_stats, che le pipeline scrivono su OGNI
     # esito -- inoltro, DROP e UNUSED. Prima veniva scritta solo sul percorso
@@ -327,14 +346,29 @@ def costruisci_p1(model, wi, feats, node_index):
 
     semantics = mm.descriptor_semantics_or_reference(n_out, "verify:synth")
     _install_mac_table(b, "mac_table", semantics=semantics)
-    return {"b": b, "disp": disp, "fn": model_fn, "scale": scale,
-            "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"]}
+    setup = {"b": b, "disp": disp, "fn": model_fn, "scale": scale,
+             "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"]}
+    # La mappa esiste solo se il descrittore usa `ingress_iface`: gli scenari
+    # che non la dichiarano non la fanno nemmeno generare.
+    try:
+        setup["ingress_port"] = b["ingress_port"]
+    except Exception:
+        pass
+    return setup
 
 
 def confronta(d, n, seed, node_index, dry=False):
     nome = os.path.basename(os.path.abspath(d))
     model, wi, wf = carica_scenario(d)
     feats = descrittore(model)
+    # Il nodo congelato deve stare dentro la larghezza del one-hot di QUESTO
+    # scenario: `ones` ne ha 4, e il 7 di default faceva rifiutare la
+    # generazione. Il generatore ha ragione a rifiutare -- una colonna tutta a
+    # zero sembrerebbe un programma funzionante per un nodo che non esiste --
+    # quindi si sceglie un indice valido invece di insistere.
+    larghezza_nodo = next((f["size"] for f in feats if f["type"] == "node"), 0)
+    if larghezza_nodo and node_index >= larghezza_nodo:
+        node_index = larghezza_nodo - 1
     scale = int(model["quant"]["scale_factor"])
     layer_dims = dims_strati(model)
     scales = scale_colonne(model)
@@ -355,6 +389,33 @@ def confronta(d, n, seed, node_index, dry=False):
                  f"({scales[:8]}... contro {list(depositati)[:8]}...)")
             return False
         ok("col_scales ricalcolati dal descrittore == quelli depositati")
+
+    # LA SCALA DICHIARATA DAL MODELLO CONTRO QUELLA CHE IL DATAPATH COMPILA.
+    #
+    # `model_meta.feature_scale` risponde con la scala del CATALOGO, uguale per
+    # tutti i modelli, e i tre datapath la fissano a compile time
+    # (`feature_scale` in P1, `T2_TTL_SCALE` in P2, `ML_TTL_SCALE` in P3). Un
+    # modello addestrato con una normalizzazione diversa viene quindi eseguito
+    # con la scala sbagliata, e il disaccordo che ne esce NON e' ne'
+    # quantizzazione ne' un difetto di questo script.
+    #
+    # Va detto prima delle tabelle, o le tabelle sembrano accusare il datapath
+    # di un errore di calcolo quando l'errore e' di configurazione.
+    import model_meta as _mm
+    diverse = []
+    for f in model["descriptor"]:
+        t = NOMI.get(f["name"], f["name"])
+        dichiarata = int(f.get("scale", 1) or 1)
+        compilata = int(_mm.feature_scale(t))
+        if dichiarata != compilata:
+            diverse.append((t, dichiarata, compilata))
+    if diverse:
+        for t, dich, comp in diverse:
+            fail(f"scala della feature `{t}`: il modello dichiara {dich}, il "
+                 f"datapath compila {comp}")
+        note("i tre datapath fissano la scala a compile time e ignorano quella "
+             "del descrittore: le righe che seguono misurano ANCHE questa "
+             "differenza, non solo l'implementazione.")
 
     setup = None
     if not dry:
