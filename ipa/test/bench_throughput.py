@@ -3407,15 +3407,19 @@ def run_method(method, model_path, frames, delays, count, out_rows,
 
         hdr = (f"  {'frame':>5s} {'offerto':>9s} {'TX':>9s} {'HIT':>9s} "
                f"{'RX':>9s} {'RX pps':>9s} {'Mb/s':>8s} {'s':>5s} "
-               f"{'perdita':>8s} {'collo':>18s}")
+               f"{'perd.pegg':>9s} {'perd.med':>9s} {'collo':>18s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
         print(f"  {GREY}offerto = trasmessi + rifiutati dal device (coda "
-              f"d'ingresso piena); la perdita e' calcolata su quello.{NC}")
+              f"d'ingresso piena); la perdita e' calcolata su quello. "
+              f"`perd.pegg` e' la peggiore delle ripetizioni (lettura stretta "
+              f"RFC 2544), `perd.med` la mediana: si riporta la prima, si "
+              f"decide sulla seconda, ed e' la seconda a essere colorata.{NC}")
 
         def printer(r):
-            mark = GREEN if r["loss_worst"] <= threshold else (
-                RED if r["loss_worst"] > 1 else YELLOW)
+            deciso = _loss_decide(r)
+            mark = GREEN if deciso <= threshold else (
+                RED if deciso > 1 else YELLOW)
             spread = ""
             if r.get("repeat", 0) <= 1:
                 # "+-0%" su un campione solo e' la dispersione di se stesso con
@@ -3433,11 +3437,13 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             # cifra rispetto a cui va letta la perdita. Prima la colonna
             # stampava 0 su ogni riga a massima spinta.
             off = r.get("offered_pps") or r.get("offered_real_pps") or 0
+            med = r.get("loss_med")
             print(f"  {r['frame']:5d} {off:9d} {r['tx']:9d} "
                   f"{r['hit']:9d} {r['rx']:9d} "
                   f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} {r['secs']:5.2f} "
-                  f"{mark}{r['loss_worst']:7.2f}%{NC} "
-                  f"{r.get('bottleneck', ''):>18s}{spread}")
+                  f"{GREY}{r['loss_worst']:8.2f}%{NC} "
+                  f"{mark}{(f'{med:8.2f}%' if med is not None else ' ' * 9)}"
+                  f"{NC} {r.get('bottleneck', ''):>18s}{spread}")
 
         for frame in frames:
             if delays:
