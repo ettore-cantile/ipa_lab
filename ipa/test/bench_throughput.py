@@ -239,6 +239,22 @@ MAX_WINDOW_PKTS = 4_000_000
 # ricalibrata una volta: vuol dire che la stima del rate era troppo bassa.
 WINDOW_SHORT_FRACTION = 0.5
 
+# Una finestra che ha trasmesso meno di questa frazione dei pacchetti chiesti
+# non e' una misura: e' un run troncato. Misurato il 2026-09-18, una riga e'
+# uscita con 2 032 pacchetti su 542 870 chiesti in 0.14 s invece di 2 s, ed e'
+# stata usata come punto della scala insieme alle altre.
+WINDOW_MIN_TX_FRACTION = 0.5
+
+# Pausa fra la fine della trasmissione e la lettura dei contatori.
+#
+# `pgctrl start` ritorna quando i THREAD DEL GENERATORE hanno finito, non
+# quando il DUT ha finito di elaborare: i pacchetti ancora nel ptr_ring del
+# veth e nella coda NAPI non sono ancora stati contati. Leggendo subito,
+# quella coda diventa "perdita" -- e leggendo subito DOPO aver azzerato,
+# diventa un conteggio della finestra precedente (si e' visto RX > HIT).
+# Un drenaggio esplicito da entrambi i lati toglie tutti e due gli errori.
+DRAIN_S = 0.05
+
 # Passi di bisezione nella ricerca del ginocchio nel percorso storico
 # (--latency). La modalita' saturate non biseca: vedi find_saturation.
 KNEE_STEPS = 5
@@ -1159,11 +1175,34 @@ class Generator:
 
     def warmup(self, frame, delay=0, seconds=None):
         """Una finestra buttata via prima della misura. Il risultato si ignora
-        di proposito: serve solo a scaldare cache e code."""
+        di proposito: serve solo a scaldare cache e code.
+
+        IL CONTEGGIO SI RICAVA DAL `delay` DEL PUNTO, non dal rate massimo del
+        generatore. Due difetti, tutti e due misurati il 2026-09-18:
+
+        1. DURATA. Il conteggio veniva da `rate_estimate` (il tetto del
+           generatore, ~1.9 Mpps) mentre il `delay` era gia' quello del punto.
+           A 74 kpps il warm-up chiedeva quindi 186 000 pacchetti pacchettati
+           a 74 kpps: 2,5 secondi di "riscaldamento" da 0,1 secondi, per ogni
+           punto della scala.
+
+        2. CODA EREDITATA. Se invece il delay era 0, il warm-up sparava a
+           piena velocita' e lasciava il ptr_ring del veth PIENO. La misura
+           subito dopo cominciava con la coda gia' satura e i primi pacchetti
+           venivano respinti -- perdita che finiva nel conto del punto e non
+           dipendeva dal suo rate. E' la firma delle perdite del 4-10%
+           osservate a rate bassissimi, dove il DUT aveva due ordini di
+           grandezza di margine.
+
+        Il drenaggio esplicito in `_measure_once` (DRAIN_S) chiude la (2) da
+        valle; questo la chiude da monte, che e' dove nasce."""
         seconds = self.warmup_s if seconds is None else seconds
         if seconds <= 0:
             return None
-        rate = self.rate_estimate or 1_000_000
+        if delay > 0:
+            rate = (1e9 / delay) * self.n_inst
+        else:
+            rate = self.rate_estimate or 1_000_000
         try:
             return self.run(frame, self.window_count(rate, seconds), delay)
         except (PktgenEmptyRun, RuntimeError):
@@ -1781,6 +1820,10 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     e si cambiano solo i parametri del punto. Senza, si ricade sul percorso
     storico -- aggiungi, configura, misura -- che serve ai chiamanti che non
     hanno un Generator."""
+    # PRIMA di azzerare: la coda della finestra precedente (warm-up o
+    # ripetizione) deve essere atterrata, altrimenti i suoi pacchetti finiscono
+    # nei contatori di questa. E' cosi' che si ottiene RX > HIT.
+    time.sleep(DRAIN_S)
     _zero_counters(setup, rx_tab, n_out)
     if gen is not None:
         run = gen.run(frame, count, delay)
@@ -1795,6 +1838,17 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                          xmit_mode=xmit_mode)
         run = pg_run_and_read(devs)
     tx, tx_pps, elapsed = run
+    # Una finestra troncata non e' un punto di misura. Il `count` chiesto e'
+    # per istanza, quindi il totale atteso e' count * numero di istanze.
+    atteso = count * (gen.n_inst if gen is not None else len(devs))
+    if atteso and tx < atteso * WINDOW_MIN_TX_FRACTION:
+        raise PktgenEmptyRun(
+            f"finestra troncata: {tx} trasmessi su {atteso} chiesti "
+            f"({100.0 * tx / atteso:.1f}%) in {elapsed:.2f}s")
+    # DOPO la trasmissione: `pgctrl start` ritorna quando il GENERATORE ha
+    # finito, non quando il DUT ha drenato. Senza questa pausa la coda ancora
+    # in volo non e' contata in RX e diventa "perdita" della pipeline.
+    time.sleep(DRAIN_S)
     hit = _read_u64(setup["pkt_stats"], 0)
     miss = _read_u64(setup["pkt_stats"], 1)
     drop = _read_u64(setup["pkt_stats"], 2)
@@ -1833,6 +1887,31 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 offered_real_pps=int(offered_tx / secs),
                 hit=hit, miss=miss, drop=drop, rx=rx,
                 rx_pps=int(rx / secs),
+                # I TRE MODI DI PERDERE UN PACCHETTO, tenuti separati perche'
+                # accusano tre colpevoli diversi:
+                #
+                #   respinti       veth_xmit ha detto NET_XMIT_DROP: il
+                #                  ptr_ring della RX del peer era pieno. Il
+                #                  pacchetto non e' MAI entrato nel DUT. E'
+                #                  backpressure del trasporto.
+                #   persi_in_coda  accettati dal veth e mai arrivati al
+                #                  programma: la coda si e' svuotata male,
+                #                  oppure NAPI non ha tenuto.
+                #   persi_dopo     elaborati dal programma e non usciti:
+                #                  redirect fallito, o classe DROP.
+                #
+                # Solo gli ultimi due sono perdita del DUT. Sommarli tutti e
+                # tre in una colonna sola -- come faceva `lost_before` -- fa
+                # sembrare che la pipeline butti via pacchetti che non ha mai
+                # ricevuto.
+                respinti=errors,
+                persi_in_coda=max(0, tx - hit),
+                persi_dopo=max(0, hit - rx),
+                respinti_pct=(round(100.0 * errors / offered_tx, 3)
+                              if offered_tx else 0.0),
+                loss_dut_pct=(round(100.0 * (max(0, tx - hit)
+                                             + max(0, hit - rx)) / offered_tx, 3)
+                              if offered_tx else 0.0),
                 # Throughput on the wire counts the frame, not the payload.
                 rx_mbps=round(rx * frame * 8 / secs / 1e6, 2),
                 lost_before=max(0, offered_tx - hit),
@@ -3216,7 +3295,13 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             mark = GREEN if r["loss_worst"] <= threshold else (
                 RED if r["loss_worst"] > 1 else YELLOW)
             spread = ""
-            if r.get("spread_pct") is not None:
+            if r.get("repeat", 0) <= 1:
+                # "+-0%" su un campione solo e' la dispersione di se stesso con
+                # se stesso, e si legge come "perfettamente riproducibile".
+                # Meglio dire che non c'e' dispersione perche' non c'e' un
+                # secondo campione.
+                spread = f" {YELLOW}(1 sola finestra, nessuna dispersione){NC}"
+            elif r.get("spread_pct") is not None:
                 col = RED if r.get("unreliable") else GREY
                 flag = " INAFFIDABILE" if r.get("unreliable") else ""
                 spread = (f" {col}(x{r['repeat']}, +-{r['spread_pct']:.0f}%"
@@ -3601,6 +3686,29 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
     # processed every packet and the drops were all on the way OUT. Reporting
     # only the total would read as "the datapath loses 8.5%", which is the
     # opposite of what happened.
+    # La distinzione che conta: un pacchetto RESPINTO da veth_xmit non e'
+    # entrato nel DUT, quindi non e' una perdita della pipeline. Se tutta la
+    # perdita e' li', la pipeline non ha buttato via niente e va detto -- e'
+    # la differenza fra "il DUT perde il 20%" e "il DUT e' saturo e il
+    # trasporto rifiuta il 20% del carico offerto".
+    resp = peak.get("respinti", 0)
+    dut = peak.get("persi_in_coda", 0) + peak.get("persi_dopo", 0)
+    if resp or dut:
+        if dut == 0:
+            print(f"  {GREY}  la pipeline non ha perso NIENTE: "
+                  f"{peak['rx']} ricevuti su {peak['hit']} elaborati su "
+                  f"{peak['tx']} accettati. I {resp} mancanti "
+                  f"({peak.get('respinti_pct', 0)}%) sono stati RESPINTI da "
+                  f"veth_xmit a coda piena e non sono mai entrati nel DUT: "
+                  f"e' backpressure, cioe' il DUT e' saturo, non che perda."
+                  f"{NC}")
+        else:
+            print(f"  {GREY}  perdita del DUT: {dut} pacchetti "
+                  f"({peak.get('loss_dut_pct', 0)}%) su "
+                  f"{peak.get('persi_in_coda', 0)} mai arrivati al programma "
+                  f"e {peak.get('persi_dopo', 0)} elaborati e non usciti. "
+                  f"Altri {resp} respinti da veth_xmit prima di entrare."
+                  f"{NC}")
     if peak["lost_before"] or peak["lost_after"]:
         if peak["lost_after"] > peak["lost_before"]:
             print(f"  {GREY}  la perdita e' DOPO l'inferenza: "
@@ -3612,13 +3720,28 @@ def _summarise(method, frame, rows, threshold=DEFAULT_LOSS_THRESHOLD):
                   f"{peak['lost_before']} pacchetti mai arrivati al programma "
                   f"({peak['lost_after']} elaborati e non usciti). "
                   f"A saturare e' l'ingresso.{NC}")
-    # Same guard as in find_knee, applied to whatever set of points exists:
-    # a clean point is only meaningful if nothing SLOWER lost.
+    # Stessa regola di find_saturation, e per lo stesso motivo. Un punto
+    # pulito vale solo se e' CONFERMATO da cio' che sta sotto:
+    #
+    #   a) niente di piu' lento deve aver perso, e
+    #   b) qualcosa di piu' lento deve essere stato misurato.
+    #
+    # La (b) mancava, e le due parti del programma si contraddicevano sullo
+    # stesso punto: find_saturation rifiutava "74 397 pps, pulito isolato, non
+    # confermato dal gradino sotto" e due righe piu' giu' _summarise lo
+    # stampava come "sotto 0.1% di perdita: 68 576 pps". Il punto piu' lento
+    # dell'intervallo provato e' sempre "pulito e senza niente sotto che
+    # perda", perche' sotto non c'e' niente.
     if best and any(r["loss_worst"] > threshold and r["rx_pps"] < best["rx_pps"]
                     for r in pts):
         print(f"  {GREY}  nessun rate a perdita nulla determinabile: si perde "
               f"anche a rate piu' bassi di quelli puliti, quindi la perdita "
               f"sotto saturazione e' rumore della macchina{NC}")
+        best = None
+    elif best and not any(r["rx_pps"] < best["rx_pps"] for r in pts):
+        print(f"  {GREY}  {best['rx_pps']} pps e' pulito ma e' il punto piu' "
+              f"lento provato: non c'e' nessun gradino sotto a confermarlo, "
+              f"quindi non lo riporto come limite a perdita nulla{NC}")
         best = None
     if best:
         print(f"  {GREY}  sotto {threshold}% di perdita: {best['rx_pps']} pps "
@@ -4292,6 +4415,17 @@ def report_rows(rows, threshold=DEFAULT_LOSS_THRESHOLD):
             tx_pkts=int(_num(peak, "offered_tx", _num(peak, "tx"))),
             lost_before=int(_num(peak, "lost_before")),
             lost_after=int(_num(peak, "lost_after")),
+            # La perdita spezzata per colpevole: respinta dal trasporto, o
+            # persa dal DUT. E' la distinzione che decide se una riga dice
+            # "la pipeline butta via pacchetti" oppure "la pipeline e' satura
+            # e il veth rifiuta il carico in eccesso".
+            respinti=int(_num(peak, "respinti")),
+            respinti_pct=_num(peak, "respinti_pct"),
+            persi_dut=int(_num(peak, "persi_in_coda")
+                          + _num(peak, "persi_dopo")),
+            persi_in_coda=int(_num(peak, "persi_in_coda")),
+            persi_dopo=int(_num(peak, "persi_dopo")),
+            loss_dut_pct=_num(peak, "loss_dut_pct"),
             noloss_rx_pps=int(_num(best, "rx_pps")) if best else 0,
             noloss_rx_mbps=_num(best, "rx_mbps") if best else 0,
             noloss_loss_pct=round(_loss_of(best), 3) if best else "",
@@ -4350,9 +4484,9 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
              f"{threshold}%.")
     L.append("")
     head = ["pipeline", "frame B", "max RX pps", "max Mb/s", "perdita @max %",
-            "RX pkt", "offerti pkt", "persi prima", "persi dopo",
-            "perdita nulla pps", "perdita nulla Mb/s", "zero stretto pps",
-            "collo di bottiglia"]
+            "RX pkt", "offerti pkt", "respinti (veth)", "persi dal DUT",
+            "perdita DUT %", "perdita nulla pps", "perdita nulla Mb/s",
+            "zero stretto pps", "collo di bottiglia"]
     if lat:
         head[-1:-1] = ["lat p50 ns", "lat misurata a pps"]
     L.append("| " + " | ".join(head) + " |")
@@ -4364,7 +4498,7 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
         name = r["method"] + (" *" if r["unreliable"] else "")
         cells = [name, r["frame"], r["max_rx_pps"], r["max_rx_mbps"],
                  r["max_loss_pct"], r["rx_pkts"], r["tx_pkts"],
-                 r["lost_before"], r["lost_after"],
+                 r["respinti"], r["persi_dut"], r["loss_dut_pct"],
                  r["noloss_rx_pps"] or "non determinato",
                  r["noloss_rx_mbps"] or "",
                  r["zero_rx_pps"] or "nessuno"]
@@ -4384,12 +4518,17 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
              "soffitti compilati; `modular` = P3, anche la profondita' a "
              "runtime.")
     L.append("")
-    L.append("`persi prima` = offerti meno elaborati dal programma: coda "
-             "d'ingresso del DUT piena, il pacchetto non e' mai arrivato "
-             "all'inferenza. `persi dopo` = elaborati e non usciti: redirect "
-             "fallito, oppure la classe scelta era DROP. Un solo numero di "
-             "perdita confonderebbe le due cose, e con esse il collo di "
-             "bottiglia.")
+    L.append("**Le due perdite non sono la stessa cosa.** `respinti (veth)` "
+             "sono pacchetti a cui `veth_xmit` ha risposto `NET_XMIT_DROP` "
+             "perche' il ptr_ring della RX del DUT era pieno: non sono MAI "
+             "entrati nel dispositivo sotto test, quindi non sono una perdita "
+             "della pipeline -- sono la prova che la pipeline e' satura e sta "
+             "facendo backpressure. `persi dal DUT` sono quelli accettati e "
+             "poi non consegnati (coda d'ingresso, oppure elaborati e non "
+             "usciti per redirect fallito o classe DROP), e quelli SI' sono "
+             "perdita del datapath. La colonna `perdita @max %` li somma "
+             "entrambi sul carico offerto, ed e' quindi la piu' pessimista "
+             "delle tre.")
     if any(r["unreliable"] for r in summ):
         L.append("")
         L.append(f"`*` = dispersione fra le ripetizioni sopra "
@@ -4551,6 +4690,12 @@ def main():
     if not pg_available():
         sys.exit(f"{PKTGEN_DIR} non c'e' e `modprobe pktgen` non l'ha "
                  f"creato: questo kernel non ha il modulo.")
+    if a.repeat <= 1:
+        warn("--repeat 1: ogni punto e' UNA finestra. La mediana del rate, la "
+             "peggiore delle perdite e la dispersione -- cioe' tutto cio' che "
+             "rende confrontabili due pipeline su questa macchina -- si "
+             "spengono. Le righe che ne escono non sono confrontabili fra "
+             "metodi; servono solo a vedere se il banco gira.")
     pg_reset()
 
     # Il piano CPU si fa PRIMA di qualunque misura e si stampa: e' la
