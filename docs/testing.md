@@ -1110,39 +1110,35 @@ tempo del percorso completo; la baseline fa lo stesso percorso **meno l'inferenz
 la differenza è il costo dell'inferenza. Il termine `t_gen` è comune a tutte le righe della
 stessa taglia e sottraendo la baseline si cancella.
 
-**Tre run indipendenti**, stessi parametri, nell'arco di dodici minuti (`131b7a6b`,
-`f3821c1e`, `f4daa6d9`). Riportarli tutti è il punto: è l'unico modo di sapere quali
-differenze sopravvivono alla ripetizione. `spread` è `(max − min) / media` fra i run.
+**Quattro run indipendenti** a `--repeat 5`, stessi parametri, nell'arco di mezz'ora
+(`131b7a6b`, `f3821c1e`, `f4daa6d9`, `ee973cde`). `spread` è `(max − min) / media`.
 
-**Costo dell'inferenza a 512 byte, ns/pacchetto sopra la baseline**
+**Costo dell'inferenza, ns/pacchetto sopra la baseline**
 
-| pipeline | run A | run B | run C | spread |
-|---|---|---|---|---|
-| p1_static (P1) | +164 | +96 | +37 | 128% |
-| hardcoded (P1.5) | +65 | +186 | +120 | 98% |
-| template (P2) | +440 | — | +465 | **5%** |
-| modular (P3) | +697 | +704 | +691 | **2%** |
+| pipeline | 512 B: A / B / C / E | media | spread | 1514 B media | spread |
+|---|---|---|---|---|---|
+| p1_static (P1) | 164 / 96 / 37 / 32 | 82 | 160% | 81 | 104% |
+| hardcoded (P1.5) | 65 / 186 / 120 / 93 | 116 | 104% | 135 | 154% |
+| template (P2) | 440 / — / 465 / 385 | **430** | 19% | 424 | 25% |
+| modular (P3) | 697 / 704 / 691 / 601 | **673** | 15% | 692 | 25% |
 
-**Cosa sopravvive alla ripetizione, e cosa no.**
+**Cosa si può affermare, e con quale precisione.**
 
-- **P3 è misurato**: 697, 704, 691 ns su tre run indipendenti, **2% di spread**. È la cifra
-  più solida di questa sezione.
-- **P2 è misurato**: 440 e 465 ns, **5%**. Nel run B la pipeline era saltata per un difetto
-  del banco — pktgen si teneva l'ifindex del fabric precedente, ora corretto con un
-  riaggancio e una seconda sonda — e il run C l'ha recuperata.
-- **P1 e P1.5 NON sono separabili su questo banco, a nessuna taglia di frame.** I loro
-  costi variano del 98-176% fra un run e l'altro, cioè molto più della differenza fra le
-  due (~90-100 ns), e fra i run l'ordine reciproco si inverte. Sono entrambi "sotto i 200 ns
-  e indistinguibili"; qualunque affermazione più fine di così non è sostenuta da questi dati.
-  In particolare: l'inversione P1/P1.5 **non** richiede la spiegazione fine (riduzione di
-  forza di clang sui pesi letterali, sez. 10) che una stesura precedente di questa sezione
-  proponeva. È rumore, e bastano due run a mostrarlo.
-- **La taglia 512 byte è quella di riferimento.** A 64 byte P3 sale al 38% di spread e a
-  1514 al 24%; a 512 sta al 2%. Le altre due taglie confermano l'ordine ma non i valori.
+- **L'ordine P1 ≈ P1.5 < P2 < P3 regge in tutti e quattro i run**, a tutte le taglie. È
+  l'affermazione solida di questa sezione.
+- **P3 costa ~670 ns per pacchetto, P2 ~430 ns**, con uno spread del 15-19% fra run. Sono
+  misure a una cifra significativa: "circa 0,7 µs" e "circa 0,4 µs", non 697 e 440.
+- **P1 e P1.5 stanno entrambi sotto i ~200 ns e non sono separabili**, né fra loro né
+  individualmente con precisione: i loro spread superano il 100%, cioè la variazione fra
+  run è maggiore del valore stesso. Fra i run il loro ordine reciproco si inverte.
+- **512 byte resta la taglia di riferimento** (spread 15-19% contro 25% a 1514).
 
-**L'ordine che regge, ed è quello che l'architettura prevede:** P1 ≈ P1.5 (< 200 ns,
-indistinguibili) < P2 (~450 ns) < P3 (~700 ns). Misurato su traffico reale, senza perdere
-un pacchetto, non stimato da `BPF_PROG_TEST_RUN`.
+**Nota metodologica, e vale più dei numeri.** Una stesura precedente di questa sezione
+riportava P3 a "697/704/691 ns, spread 2%" sulla base dei primi tre run, e ne concludeva
+che fosse "la cifra più solida". Il quarto run ha dato 601 ns e ha portato lo spread al
+15%. Tre misure concordi su una macchina rumorosa non sono una misura precisa: sono tre
+estrazioni che è capitato cadessero vicine. Lo spread va ricalcolato a ogni run aggiunto,
+mai congelato al primo numero che fa una bella impressione.
 
 ### 11.4 Come si leggono le due colonne di perdita
 
