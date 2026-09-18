@@ -457,6 +457,225 @@ topologie che non hanno niente a che vedere con quella d'origine:
 Nessuna riga di C scritta a mano cambia fra una riga e l'altra.
 
 % ==================================================================
+\chapter{Il modello non è quello depositato}
+
+\section{La domanda}
+
+Il capitolo precedente ha tolto la topologia dalle assunzioni del codice.
+Restava dentro un'assunzione più silenziosa: \textbf{un solo modello}. Ogni
+misura, ogni confronto fra pipeline e ogni prova di correttezza girava sullo
+stesso checkpoint fornito dal relatore --- 65-4-4-7, scala 25.
+
+Il rischio non è teorico. Un datapath che calcola la cosa giusta su un modello
+può calcolarla per caso: perché quel modello ha una forma particolare, perché i
+suoi pesi cadono in un intervallo comodo, o perché una costante scritta nel
+codice coincide con un suo parametro. Finché il modello è uno solo, la
+differenza fra ``corretto'' e ``corretto qui'' non si vede.
+
+\section{I modelli sintetici}
+
+La risposta sono \textbf{sette scenari generati}, con pesi casuali e nessun
+rapporto con il checkpoint depositato. Coprono un asse ciascuno:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Scenario} & \textbf{Forma} & \textbf{Pesi} \\
+\midrule
+\texttt{ones}     & 11-2-3       &    33 \\
+\texttt{small}    & 15-4-4       &    84 \\
+\texttt{mixed}    & 18-6-5       &   149 \\
+\texttt{ipa\_like}& 65-4-4-7     &   319 \\
+\texttt{sparse}   & 65-4-4-7     &   319 \\
+\texttt{deep}     & 65-4-4-4-7   &   339 \\
+\texttt{large}    & 117-8-8-9    & 1\,097 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il generatore non produce solo numeri a caso: rispetta la \textbf{struttura}
+delle feature, che è la parte che un datapath può sbagliare. Ogni feature
+dichiara il suo tipo --- \texttt{real} (un valore in un intervallo, che il
+datapath porta come intero diviso per una scala), \texttt{integer},
+\texttt{binary} (un vettore di 0/1), \texttt{onehot} (esattamente un 1) --- con
+i suoi estremi, la sua scala e i suoi vincoli. Ogni scenario porta con sé
+\textbf{1\,000 vettori d'ingresso}, nella versione intera e in quella a virgola
+mobile, e le predizioni attese per entrambe.
+
+Gli artefatti non stanno in git: sono rigenerabili byte per byte a parità di
+seme, e il test li rigenera da solo se non li trova.
+
+\section{Che cosa era già provato, e che cosa no}
+
+Su quei sette scenari il progetto verificava che i pesi \textbf{compilassero} e
+passassero il verificatore del kernel, e che i control plane accettassero i
+blocchi. È una prova reale ma di una cosa sola: che il programma esiste. Non
+dice \emph{quale classe sceglie}.
+
+\begin{prima}[La distinzione che mancava]
+Un programma che compila e gira può comunque decidere diversamente dal modello
+che dovrebbe eseguire. La domanda scoperta era: \emph{a parità di ingresso, il
+datapath sceglie la stessa classe del riferimento?}
+\end{prima}
+
+\section{Il confronto a quattro vie}
+
+Due confronti non bastano, perché un disaccordo ha più di una causa possibile e
+le cause chiedono rimedi diversi. Le vie sono quattro:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{8.4cm}@{}}
+\toprule
+\textbf{Confronto} & \textbf{Che cosa isola} \\
+\midrule
+float vs int8 (Python) &
+  l'errore di \textbf{quantizzazione}: il modello a interi decide diversamente
+  da quello a virgola mobile. Può legittimamente non essere 100\%. \\
+int8 (Python) vs int8 (riferimento) &
+  \textbf{controprova}: due implementazioni intere indipendenti del progetto
+  devono concordare fra loro, o non è chiaro quale sia il riferimento. \\
+int8 (riferimento) vs int8 (eBPF) &
+  se il datapath è esatto \textbf{rispetto alla configurazione che gli è stata
+  data}. \\
+int8 (Python) vs int8 (eBPF) &
+  l'errore di \textbf{implementazione}. Deve valere 100\%: un solo disaccordo
+  qui è un difetto del datapath. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{Perché non i 1\,000 vettori depositati}
+
+Il datapath non accetta un vettore d'ingresso arbitrario: lo \emph{costruisce}
+da ciò che ha sotto mano --- le mappe dense, il TTL del pacchetto, la porta
+d'ingresso risolta, l'indice del nodo. Un one-hot \texttt{node} diverso a ogni
+campione vorrebbe dire ricompilare il programma a ogni campione.
+
+Si campiona quindi nello spazio che il datapath sa davvero esprimere, e il
+vettore Python si costruisce allo stesso modo. Confrontare due implementazioni
+su ingressi che una delle due non potrebbe mai ricevere non direbbe niente su
+nessuna delle due.
+
+\section{Il risultato}
+
+Trecento ingressi per scenario, seme fisso, pipeline P1.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Scenario} & \textbf{float vs int8} &
+\textbf{int8 Python vs eBPF} & \textbf{decisioni} \\
+\midrule
+\texttt{ones}      & 100,00\,\% & \textbf{100,00\,\%} & 300/300 \\
+\texttt{small}     &  98,00\,\% & \textbf{100,00\,\%} & 300/300 \\
+\texttt{mixed}     & 100,00\,\% & \textbf{100,00\,\%} & 300/300 \\
+\texttt{ipa\_like} &  97,67\,\% & \textbf{100,00\,\%} & 300/300 \\
+\texttt{sparse}    &  99,33\,\% & \textbf{100,00\,\%} & 300/300 \\
+\texttt{deep}      &  98,67\,\% & \textbf{100,00\,\%} & 300/300 \\
+\texttt{large}     &  99,67\,\% & \textbf{100,00\,\%} & 300/300 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Sette scenari su sette, equivalenza numerica esatta.} La colonna di
+sinistra --- fra 97,67\,\% e 100\,\% --- è la quantizzazione, cioè una
+proprietà del modello e della scala scelta, non un difetto.
+
+\section{Ma ci è arrivato trovando due difetti}
+
+Il valore del test non sta nella tabella: sta nel fatto che la prima esecuzione
+\textbf{non} dava 7/7. Dava 1/7, e le due cause erano di natura diversa.
+
+\subsection*{Il primo: il banco}
+
+Cinque scenari su sette stavano fra il 71\,\% e l'85\,\%. Il banco non
+comunicava al kernel la porta d'ingresso: \texttt{prog\_test\_run} accetta un
+parametro \texttt{ingress\_ifindex} ma lo \textbf{ignora} --- gira senza
+\texttt{ctx\_in}, e il programma vede sempre l'ifindex del dispositivo di prova
+del kernel. Il riferimento Python usava una porta variabile, il datapath ne
+vedeva sempre nessuna, e le due metà costruivano due ingressi diversi.
+
+Il segnale diagnostico è stato più utile del sintomo: dopo la prima correzione
+le percentuali non si erano mosse \textbf{di un centesimo}. Codice che non
+cambia niente non è codice sbagliato: è codice mai eseguito. Confermato senza
+kernel, simulando ``il datapath vede porta 0'': le percentuali osservate si
+riproducono con scarto \textbf{0,00} su sei scenari.
+
+\subsection*{Il secondo: la scala compilata}
+
+Resisteva \texttt{small}, al 70,33\,\%. Con una coincidenza che era la
+risposta: le righe \emph{int8 Python vs riferimento} e \emph{int8 Python vs
+eBPF} davano lo stesso identico numero, e \emph{riferimento vs eBPF} dava
+100\,\%. Il datapath non sbagliava un conto: eseguiva \textbf{esattamente} una
+configurazione sbagliata.
+
+Tutte e tre le pipeline fissavano la scala della feature \texttt{ttl} a
+\textbf{30} in fase di compilazione --- \texttt{feature\_scale()} in P1,
+\texttt{T2\_TTL\_SCALE} in P2, \texttt{ML\_TTL\_SCALE} in P3 --- e la struttura
+del descrittore letto a runtime, \texttt{struct feat\_ent}, non aveva un campo
+dove metterla. Un modello addestrato su $\text{ttl}/16$ veniva eseguito con
+$\text{ttl}/30$. Gli scenari \texttt{small} (16), \texttt{large} (64) e
+\texttt{ones} (8) sono esattamente quei modelli.
+
+Sul checkpoint depositato, che usa 30, il difetto è invisibile.
+
+\begin{lezione}
+La genericità di P2 e P3 --- ``il descrittore si legge a runtime, quindi
+qualunque modello va bene'' --- era vera per la forma, il numero di feature e
+gli offset, e \textbf{falsa per la scala}: l'unico numero del descrittore che
+deve seguire il modello era l'unico compilato dentro. Un'affermazione di
+genericità va verificata voce per voce, non in blocco.
+\end{lezione}
+
+\section{La correzione}
+
+La scala ora viaggia nel descrittore. Il campo c'era già: \texttt{struct
+feat\_ent} aveva un byte di riempimento inutilizzato, e le scale in gioco
+(8, 16, 30, 64) ci stanno.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{8.8cm}@{}}
+\toprule
+\textbf{Dove} & \textbf{Che cosa cambia} \\
+\midrule
+\texttt{model\_meta} & \texttt{feature\_scale\_of(feat)} risponde per
+  \emph{feature} e non per \emph{tipo}; la scala entra nel descrittore
+  risolto. \\
+P1 & compila la scala del descrittore invece di quella del catalogo. \\
+P2 / P3 & \texttt{\_pad} diventa \texttt{scale}; la divisione la legge dalla
+  mappa. Con 0 si ricade sul default compilato, quindi i descrittori scritti
+  prima restano validi. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il modello depositato risolve a 30 come prima: nessuna regressione.
+
+\begin{prima}[Un effetto collaterale che il compilatore ha fermato]
+Passare da una costante a una variabile ha rotto la compilazione di P2:
+\emph{``unsupported signed division''}. Finché il divisore era un \texttt{\#define}
+clang lo trasformava in uno spostamento di bit; da variabile diventa una
+divisione vera, e \textbf{BPF non ha la divisione con segno}. Il numeratore qui
+ce l'ha, perché i pesi possono essere negativi.
+
+La correzione divide il valore assoluto senza segno e rimette il segno, con
+troncamento verso lo zero --- lo stesso arrotondamento del riferimento Python,
+perché sui negativi le due implementazioni coincidono solo se arrotondano allo
+stesso modo.
+\end{prima}
+
+\section{Che cosa questo capitolo dimostra}
+
+Che le tre pipeline calcolano ciò che il modello dice, su sette modelli che
+nessuno ha scelto per farle funzionare. E, di passaggio, che l'affermazione era
+falsa prima di essere verificata --- il che è il motivo per cui la verifica
+serviva.
+
+
 \chapter{Dall'emulatore al kernel vero}
 
 \section{Che cosa provavano i test di prima}
@@ -2348,6 +2567,10 @@ python3 ipa/test/test_class_semantics.py
 # topologie sintetiche: il motore non deve dipendere dallo scenario
 python3 ipa/test/test_synth.py
 
+# modelli sintetici, le sole vie Python (nessun kernel, nessun root):
+# costruzione degli ingressi e confronto float / int8
+python3 ipa/test/verify_synth_kernel.py --all --dry-run
+
 # che cosa decide il modello, senza kernel di mezzo
 python3 ipa/test/diag_model_decisions.py
 \end{lstlisting}
@@ -2376,6 +2599,11 @@ sudo python3 ipa/test/verify_multi_model.py
 # le stesse prove di semantica e topologia, ma dentro al kernel
 sudo python3 ipa/test/test_class_semantics.py --kernel
 sudo python3 ipa/test/test_synth.py --kernel
+
+# equivalenza NUMERICA sui sette modelli sintetici, nel kernel:
+# float / int8 Python / int8 eBPF a confronto, 300 ingressi per scenario.
+# La riga che conta e' "int8 (Python) vs int8 (eBPF)": deve dare 100%.
+sudo python3 ipa/test/verify_synth_kernel.py --all --n 300
 \end{lstlisting}
 
 \section{Datapath reale: il pacchetto attraversa davvero}

@@ -341,6 +341,29 @@ BPF_ARRAY(queue_state, struct qs_vec, 1);
  * default compilato, cosi' i descrittori scritti prima restano validi. */
 struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 scale; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[ML_MAX_FEAT]; };
+
+/* Divisione con TRONCAMENTO VERSO LO ZERO e divisore a runtime.
+ *
+ * BPF non ha la divisione con segno: clang si ferma con "unsupported signed
+ * division, please convert to unsigned div/mod". Finche' il divisore era un
+ * #define il compilatore lo trasformava in uno shift e il problema non
+ * esisteva; da quando la scala viene dal descrittore il divisore e' una
+ * variabile, e la divisione va fatta a mano.
+ *
+ * Il numeratore E' con segno -- i pesi possono essere negativi -- mentre il
+ * divisore e' sempre positivo. Si divide quindi il valore assoluto senza
+ * segno e si rimette il segno. Il troncamento verso lo zero non e' un
+ * dettaglio: e' esattamente cio' che fa `trunc_div` nel riferimento Python, e
+ * le due implementazioni coincidono sui negativi solo se arrotondano allo
+ * stesso modo. */
+static __always_inline long long ipa_div_trunc(long long num, __u64 den)
+{
+    if (den == 0) den = 1;
+    if (num < 0)
+        return -(long long)(((__u64)(-num)) / den);
+    return (long long)(((__u64)num) / den);
+}
+
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
 
 /* Layer chain tail-call map: slot 0 = layer_first.fd, slots 1..15 =
@@ -766,14 +789,16 @@ int layer_first(struct xdp_md *ctx) {
         __u32 sz   = desc->feats[f].size;
         __u32 coff = desc->feats[f].col_off;
         if (code == FEAT_TTL) {
-            /* Divided by the training scale -- see T2_TTL_SCALE in
-             * ebpf_template_arch.py and model_meta.DEFAULT_TTL_SCALE. */
+            /* Diviso per la scala di ADDESTRAMENTO, che viene dal descrittore
+             * (feat_ent.scale); con 0 si ricade sul default compilato. La
+             * divisione passa da ipa_div_trunc perche' BPF non ha la
+             * divisione con segno e il numeratore qui ce l'ha. */
+            __u64 _sc = desc->feats[f].scale ? desc->feats[f].scale
+                                             : ML_TTL_SCALE;
             #pragma unroll
             for (int j = 0; j < ML1_MAX_H1; j++)
-                out[j] += ((long long)_ttl
-                           * LW_W(LW, woff + j * n_in + coff))
-                          / (desc->feats[f].scale ? desc->feats[f].scale
-                                                  : ML_TTL_SCALE);
+                out[j] += ipa_div_trunc((long long)_ttl
+                           * LW_W(LW, woff + j * n_in + coff), _sc);
         } else if (code == FEAT_LINK_STATE) {
             #pragma unroll
             for (int i = 0; i < IPA_MAX_IFACES; i++) {
