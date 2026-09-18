@@ -683,27 +683,6 @@ BPF_ARRAY(queue_state, struct qs_vec, 1);
 struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 scale; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
 
-/* Divisione con TRONCAMENTO VERSO LO ZERO e divisore a runtime.
- *
- * BPF non ha la divisione con segno: clang si ferma con "unsupported signed
- * division, please convert to unsigned div/mod". Finche' il divisore era un
- * #define il compilatore lo trasformava in uno shift e il problema non
- * esisteva; da quando la scala viene dal descrittore il divisore e' una
- * variabile, e la divisione va fatta a mano.
- *
- * Il numeratore E' con segno -- i pesi possono essere negativi -- mentre il
- * divisore e' sempre positivo. Si divide quindi il valore assoluto senza
- * segno e si rimette il segno. Il troncamento verso lo zero non e' un
- * dettaglio: e' esattamente cio' che fa `trunc_div` nel riferimento Python, e
- * le due implementazioni coincidono sui negativi solo se arrotondano allo
- * stesso modo. */
-static __always_inline long long ipa_div_trunc(long long num, __u64 den)
-{
-    if (den == 0) den = 1;
-    if (num < 0)
-        return -(long long)(((__u64)(-num)) / den);
-    return (long long)(((__u64)num) / den);
-}
 
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
@@ -759,6 +738,31 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 #define CTR_INC() do {} while (0)
 #endif
 #endif /* IPA_ARCH_COMBINED */
+
+#ifndef IPA_DIV_TRUNC_DEFINED
+#define IPA_DIV_TRUNC_DEFINED
+/* Divisione con TRONCAMENTO VERSO LO ZERO e divisore a runtime.
+ *
+ * BPF non ha la divisione con segno: clang si ferma con "unsupported signed
+ * division, please convert to unsigned div/mod". Finche' il divisore era un
+ * #define il compilatore lo trasformava in uno shift e il problema non
+ * esisteva; da quando la scala viene dal descrittore il divisore e' una
+ * variabile, e la divisione va fatta a mano.
+ *
+ * Il numeratore E' con segno -- i pesi possono essere negativi -- mentre il
+ * divisore e' sempre positivo. Si divide quindi il valore assoluto senza
+ * segno e si rimette il segno. Il troncamento verso lo zero non e' un
+ * dettaglio: e' esattamente cio' che fa `trunc_div` nel riferimento Python, e
+ * le due implementazioni coincidono sui negativi solo se arrotondano allo
+ * stesso modo. */
+static __always_inline long long ipa_div_trunc(long long num, __u64 den)
+{
+    if (den == 0) den = 1;
+    if (num < 0)
+        return -(long long)(((__u64)(-num)) / den);
+    return (long long)(((__u64)num) / den);
+}
+#endif
 
 int arch_generic_2layer(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
