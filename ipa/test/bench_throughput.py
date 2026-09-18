@@ -3762,6 +3762,22 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        rx_pps_min=a["min"], rx_pps_max=a["max"],
                        rx_pps_std=a["std"], rx_pps_cv_pct=a["cv_pct"],
                        loss_pct=round(loss, 3),
+                       # La PEGGIORE delle perdite fra i giri, non la mediana:
+                       # e' la convenzione usata ovunque altrove nel banco, e
+                       # un giro pulito su tre non e' un rate pulito.
+                       loss_worst=round(max(r["loss_worst"] for r in pts), 3),
+                       # I conteggi, non solo i rate: "quanti pacchetti sono
+                       # arrivati" e' una domanda a cui un pps non risponde,
+                       # e senza offerti/persi la perdita non e' verificabile
+                       # a mano dal CSV.
+                       rx=int(stats.median([r["rx"] for r in pts])),
+                       tx=int(stats.median([r["tx"] for r in pts])),
+                       offered_tx=int(stats.median([r["offered_tx"]
+                                                    for r in pts])),
+                       lost_before=int(stats.median([r["lost_before"]
+                                                     for r in pts])),
+                       lost_after=int(stats.median([r["lost_after"]
+                                                    for r in pts])),
                        rx_mbps=round(stats.median([r["rx_mbps"]
                                                    for r in pts]), 2),
                        secs=round(stats.median([r["secs"] for r in pts]), 3),
@@ -3882,6 +3898,352 @@ def _write_csv(path, rows):
         w.writerows(rows)
     print(f"  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
     return len(rows)
+
+
+# ==========================================================================
+# CONDIZIONI DEL TEST: l'unica parte della misura che non si puo' rifare dopo
+# ==========================================================================
+# Un pacchetti-al-secondo senza la macchina che l'ha prodotto non e' citabile.
+# Su questo banco TG, DUT e contatore stanno sulla STESSA VM: il numero di
+# vCPU, il governor della frequenza e perfino `mitigations=` sulla riga di
+# comando del kernel entrano nel risultato quanto la pipeline sotto test.
+#
+# I CSV si riaprono e i grafici si rifanno; la configurazione della macchina
+# no, perche' al giro dopo e' gia' un'altra. Va quindi scritta INSIEME ai
+# numeri, nello stesso istante e nella stessa cartella -- non ricostruita a
+# posteriori dalla memoria di chi ha lanciato il run.
+#
+# Niente qui puo' far fallire un run: la raccolta e' tutta best-effort e ogni
+# campo mancante diventa "n/d". Perdere una misura gia' fatta perche' `clang`
+# non era nel PATH sarebbe il modo peggiore di documentarla.
+
+
+def _read_text(path, default=""):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def _first_line(path, default="n/d"):
+    txt = _read_text(path).strip()
+    return txt.splitlines()[0].strip() if txt else default
+
+
+def _cmd_line(args, default="n/d"):
+    """Prima riga dell'output di un comando, o il default. Mai un'eccezione."""
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return default
+    out = (r.stdout or r.stderr or "").strip().splitlines()
+    return out[0].strip() if out else default
+
+
+def _cpu_model():
+    for line in _read_text("/proc/cpuinfo").splitlines():
+        if line.startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return "n/d"
+
+
+def _mem_total_mb():
+    for line in _read_text("/proc/meminfo").splitlines():
+        if line.startswith("MemTotal:"):
+            try:
+                return str(int(line.split()[1]) // 1024)
+            except (IndexError, ValueError):
+                break
+    return "n/d"
+
+
+def _distro():
+    for line in _read_text("/etc/os-release").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return "n/d"
+
+
+def _bcc_version():
+    try:
+        import bcc
+    except ImportError:
+        return "assente"
+    v = getattr(bcc, "__version__", None)
+    if v:
+        return str(v)
+    # bcc non espone sempre __version__: il pacchetto della distribuzione si',
+    # ed e' quello che si e' davvero installato.
+    return _cmd_line(["dpkg-query", "-W", "-f=${Version}", "python3-bpfcc"],
+                     "presente, versione ignota")
+
+
+def capture_env(a=None, plan=None, methods=(), frames=()):
+    """Condizioni hardware, software e di run, come lista di coppie ordinata.
+
+    Lista di coppie e non dizionario: l'ORDINE e' il documento. Si legge
+    dall'alto -- macchina, kernel, strumenti, parametri del run -- e chi lo
+    rilegge fra sei mesi non deve ricostruirlo."""
+    u = os.uname()
+    env = []
+
+    def add(k, v):
+        env.append((k, "n/d" if v is None or v == "" else str(v)))
+
+    add("data", time.strftime("%Y-%m-%d %H:%M:%S"))
+    add("commit", _cmd_line(["git", "-C", SHARED_DIR, "rev-parse", "--short",
+                             "HEAD"]))
+
+    # ---- macchina
+    add("cpu", _cpu_model())
+    add("cpu_online", len(online_cpus()))
+    add("cpu_governor", _first_line(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"))
+    add("ram_mb", _mem_total_mb())
+    # systemd-detect-virt manca su parecchie immagini minimali: l'assenza e'
+    # essa stessa un'informazione, non un errore.
+    add("virtualizzazione", _cmd_line(["systemd-detect-virt"], "sconosciuta"))
+
+    # ---- kernel e software
+    add("kernel", f"{u.sysname} {u.release} {u.machine}")
+    add("distribuzione", _distro())
+    add("cmdline_kernel", _first_line("/proc/cmdline"))
+    add("python", sys.version.split()[0])
+    add("clang", _cmd_line(["clang", "--version"]))
+    add("bcc", _bcc_version())
+    add("pktgen", "presente" if os.path.isdir(PKTGEN_DIR) else "assente")
+
+    # ---- percorso dati: e' la riserva piu' importante sui numeri assoluti
+    add("datapath", "veth (XDP nativo), TG e DUT sulla stessa macchina")
+    add("copia_headroom",
+        "si -- pktgen riserva NET_SKB_PAD (64B), XDP su veth pretende "
+        "XDP_PACKET_HEADROOM (256B): una copia per pacchetto")
+
+    # ---- parametri del run
+    if plan is not None:
+        add("cpu_generatore", ",".join(str(c) for c in plan.gen))
+        add("cpu_dut", ",".join(str(c) for c in plan.dut))
+    if a is not None:
+        add("modalita", "latency" if getattr(a, "latency", False) else a.mode)
+        add("napi_threaded", "no" if a.no_threaded_napi else "si")
+        add("topologia_generatore", a.gen_topology)
+        add("xmit_mode", a.xmit_mode)
+        add("finestra_s", a.duration)
+        add("warmup_s", a.warmup)
+        add("ripetizioni_per_punto", a.repeat)
+        add("giri", a.rounds)
+        add("soglia_perdita_pct", a.loss_threshold)
+        add("clone_skb", a.clone_skb)
+        add("burst", a.burst)
+    if frames:
+        add("frame_byte", ",".join(str(f) for f in frames))
+    if methods:
+        add("pipeline", ",".join(methods))
+    return env
+
+
+def print_env(env):
+    print(f"\n{YELLOW}== condizioni del test =={NC}")
+    width = max(len(k) for k, _ in env)
+    for k, v in env:
+        print(f"  {GREY}{k:<{width}}{NC}  {v}")
+
+
+def write_env(out_dir, env):
+    """env.csv accanto ai numeri. Due colonne e non una riga larga: i campi
+    cambiano da un run all'altro, e una tabella a colonne fisse invecchia."""
+    path = os.path.join(out_dir, "env.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["campo", "valore"])
+        w.writerows(env)
+    print(f"  {GREEN}scritto{NC} {path}  ({len(env)} campi)")
+    return path
+
+
+# ==========================================================================
+# IL REPORT: una riga per configurazione, con dentro cio' che si cita
+# ==========================================================================
+# I CSV hanno tutti i punti, ed e' giusto che sia cosi'. Ma la domanda a cui
+# questo banco risponde -- "a che rate regge ciascuna pipeline, e quanto
+# perde" -- si legge su POCHE righe: una per (pipeline, frame).
+#
+# Le due cifre di throughput non sono intercambiabili e vanno stampate
+# insieme, perche' citarne una sola e' il modo classico di dire il falso:
+#
+#   massimo        il rate CONSEGNATO piu' alto osservato. E' un sistema in
+#                  sovraccarico: significa qualcosa solo se accanto c'e' la
+#                  perdita con cui e' stato ottenuto.
+#   perdita nulla  il rate piu' alto sotto la soglia dichiarata. E' il
+#                  throughput nel senso della RFC 2544, ed e' la riga da
+#                  citare.
+
+
+def _num(row, key, default=0):
+    v = row.get(key, default)
+    return default if v in (None, "") else v
+
+
+def _loss_of(row):
+    return float(_num(row, "loss_worst", _num(row, "loss_pct", 0.0)))
+
+
+def report_rows(rows, threshold=DEFAULT_LOSS_THRESHOLD):
+    """Riduce i punti grezzi a una riga per (pipeline, frame).
+
+    Le fasi `ricerca` e `rumore` restano fuori: la prima e' l'impalcatura
+    della salita, la seconda e' gia' stata marcata come non descrittiva del
+    datapath. Tenerle dentro farebbe vincere la finestra fortunata."""
+    ordine = {m: i for i, m in enumerate(METHODS)}
+    keys = []
+    for r in rows:
+        k = (r.get("method"), r.get("frame"))
+        if k[0] and k[1] and k not in keys:
+            keys.append(k)
+    keys.sort(key=lambda k: (ordine.get(k[0], 99), k[1]))
+
+    out = []
+    for meth, frame in keys:
+        pts = [r for r in rows
+               if r.get("method") == meth and r.get("frame") == frame
+               and r.get("phase") not in ("rumore", "ricerca")]
+        if not pts:
+            continue
+        peak = max(pts, key=lambda r: _num(r, "rx_pps"))
+        # La riga a perdita nulla e' quella che il banco ha GIA' marcato come
+        # tale dove esiste (saturate, latency); altrove la si ricava dalla
+        # soglia. Non si ricalcola quando c'e': find_saturation ha gia'
+        # applicato il controllo di monotonia, che qui non si potrebbe rifare.
+        clean = [r for r in pts if r.get("phase") == "zero-perdite"]
+        if not clean:
+            clean = [r for r in pts if _loss_of(r) <= threshold]
+        best = max(clean, key=lambda r: _num(r, "rx_pps")) if clean else None
+        strict = [r for r in pts if _loss_of(r) == 0.0]
+        zero = max(strict, key=lambda r: _num(r, "rx_pps")) if strict else None
+        # La latenza si cita DA SCARICO. A pieno rate il numero e' dominato
+        # dalla coda davanti al programma: due pipeline con code diverse
+        # darebbero latenze diverse anche eseguendo lo stesso identico codice,
+        # e il confronto misurerebbe la coda. Il percorso --latency produce
+        # apposta una riga `scarico`; dove non c'e' si ripiega sul punto piu'
+        # lento misurato, che e' il meno congestionato disponibile.
+        lat_src = next((r for r in pts if r.get("phase") == "scarico"), None)
+        if lat_src is None:
+            with_lat = [r for r in pts if _num(r, "lat_p50_ns")]
+            lat_src = (min(with_lat, key=lambda r: _num(r, "rx_pps"))
+                       if with_lat else peak)
+        out.append(dict(
+            method=meth, frame=frame,
+            max_rx_pps=int(_num(peak, "rx_pps")),
+            max_rx_mbps=_num(peak, "rx_mbps"),
+            max_loss_pct=round(_loss_of(peak), 3),
+            max_offered_pps=int(_num(peak, "offered_real_pps",
+                                     _num(peak, "offered_pps"))),
+            rx_pkts=int(_num(peak, "rx")),
+            tx_pkts=int(_num(peak, "offered_tx", _num(peak, "tx"))),
+            lost_before=int(_num(peak, "lost_before")),
+            lost_after=int(_num(peak, "lost_after")),
+            noloss_rx_pps=int(_num(best, "rx_pps")) if best else 0,
+            noloss_rx_mbps=_num(best, "rx_mbps") if best else 0,
+            noloss_loss_pct=round(_loss_of(best), 3) if best else "",
+            zero_rx_pps=int(_num(zero, "rx_pps")) if zero else 0,
+            lat_p50_ns=int(_num(lat_src, "lat_p50_ns")) or "",
+            lat_min_ns=int(_num(lat_src, "lat_min_ns")) or "",
+            lat_rx_pps=int(_num(lat_src, "rx_pps")) or "",
+            bottleneck=(best or peak).get("bottleneck", "n/d"),
+            unreliable=bool(peak.get("unreliable", False)),
+            rounds=_num(peak, "rounds", _num(peak, "repeat", 1)),
+        ))
+    return out
+
+
+def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
+                 title="Throughput end-to-end, misurato"):
+    """Un markdown con la tabella per configurazione e le condizioni sotto.
+
+    Markdown e non solo CSV perche' questa e' la forma in cui il risultato
+    viene letto e citato; il CSV resta accanto per rifare i grafici."""
+    summ = report_rows(rows, threshold)
+    if not summ:
+        return None
+    lat = any(r["lat_p50_ns"] for r in summ)
+    path = os.path.join(out_dir, "throughput_report.md")
+    L = []
+    L.append(f"# {title}")
+    L.append("")
+    L.append("Traffico REALE: pktgen (TG) genera, la pipeline XDP (DUT) "
+             "inferisce e redirige, un contatore XDP sull'uscita conta chi e' "
+             "arrivato davvero. Nessuna cifra in questa tabella e' "
+             "`1/latenza` sotto `BPF_PROG_TEST_RUN`.")
+    L.append("")
+    L.append(f"Soglia di perdita per la colonna \"perdita nulla\": "
+             f"{threshold}%.")
+    L.append("")
+    head = ["pipeline", "frame B", "max RX pps", "max Mb/s", "perdita @max %",
+            "RX pkt", "offerti pkt", "persi prima", "persi dopo",
+            "perdita nulla pps", "perdita nulla Mb/s", "zero stretto pps",
+            "collo di bottiglia"]
+    if lat:
+        head[-1:-1] = ["lat p50 ns", "lat misurata a pps"]
+    L.append("| " + " | ".join(head) + " |")
+    L.append("|" + "|".join("---" for _ in head) + "|")
+    for r in summ:
+        # L'asterisco sta sul NOME della pipeline, non in fondo alla riga:
+        # in fondo finirebbe dentro l'ultima cella e sembrerebbe una nota sul
+        # collo di bottiglia invece che sulla riga intera.
+        name = r["method"] + (" *" if r["unreliable"] else "")
+        cells = [name, r["frame"], r["max_rx_pps"], r["max_rx_mbps"],
+                 r["max_loss_pct"], r["rx_pkts"], r["tx_pkts"],
+                 r["lost_before"], r["lost_after"],
+                 r["noloss_rx_pps"] or "non determinato",
+                 r["noloss_rx_mbps"] or "",
+                 r["zero_rx_pps"] or "nessuno"]
+        if lat:
+            cells.append(r["lat_p50_ns"] or "")
+            cells.append(r["lat_rx_pps"] or "")
+        cells.append(r["bottleneck"])
+        L.append("| " + " | ".join(str(c) for c in cells) + " |")
+    L.append("")
+    # I nomi in tabella sono quelli interni, perche' sono le chiavi con cui i
+    # CSV si uniscono. La corrispondenza con i nomi della tesi va scritta
+    # accanto, altrimenti la tabella non e' citabile senza il codice a fianco.
+    L.append("Pipeline: `baseline` = nessuna inferenza, solo redirect (il "
+             "pavimento del percorso); `p1_static` = P1, pesi e nodo "
+             "compilati; `hardcoded` = versione intermedia (P1.5), pesi "
+             "compilati e nodo letto da mappa; `template` = P2, solo i "
+             "soffitti compilati; `modular` = P3, anche la profondita' a "
+             "runtime.")
+    L.append("")
+    L.append("`persi prima` = offerti meno elaborati dal programma: coda "
+             "d'ingresso del DUT piena, il pacchetto non e' mai arrivato "
+             "all'inferenza. `persi dopo` = elaborati e non usciti: redirect "
+             "fallito, oppure la classe scelta era DROP. Un solo numero di "
+             "perdita confonderebbe le due cose, e con esse il collo di "
+             "bottiglia.")
+    if any(r["unreliable"] for r in summ):
+        L.append("")
+        L.append(f"`*` = dispersione fra le ripetizioni sopra "
+                 f"{MAX_SPREAD_PCT}%: quella riga non e' utilizzabile per un "
+                 f"confronto.")
+    L.append("")
+    L.append("## Condizioni del test")
+    L.append("")
+    L.append("| campo | valore |")
+    L.append("|---|---|")
+    for k, v in env:
+        L.append(f"| {k} | {v} |")
+    L.append("")
+    L.append("TG, DUT e contatore stanno sulla stessa macchina e il percorso "
+             "e' veth: il costo della traversata e della copia di headroom e' "
+             "dentro ogni cifra. Il CONFRONTO fra pipeline a parita' di "
+             "condizioni regge; le cifre assolute sono di questo percorso "
+             "veth, non di una NIC.")
+    L.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+    print(f"  {GREEN}scritto{NC} {path}  ({len(summ)} configurazioni)")
+    _write_csv(os.path.join(out_dir, "throughput_summary.csv"), summ)
+    return path
 
 
 # ==========================================================================
@@ -4045,6 +4407,12 @@ def main():
         a.loss_threshold = 0.0 if a.latency else DEFAULT_LOSS_THRESHOLD
     methods = list(METHODS) if a.method == "all" else [a.method]
 
+    # Le condizioni si leggono PRIMA di misurare e si stampano subito: se
+    # il run viene interrotto a meta' resta comunque scritto su che
+    # macchina stava girando, ed e' la meta' che non si puo' ricostruire.
+    env = capture_env(a, plan, methods, frames)
+    print_env(env)
+
     rows = []
     rc = 0
     if a.latency:
@@ -4073,6 +4441,9 @@ def main():
                                ("latency_raw.csv", raw)):
                 if data:
                     _write_csv(os.path.join(a.out, name), data)
+            write_env(a.out, env)
+            write_report(a.out, rows, env, a.loss_threshold,
+                         "Throughput end-to-end e latenza, misurati")
             _give_back(a.out)
         # Il codice di uscita e' quello del controllo: un run in cui la
         # baseline non e' la piu' veloce, o in cui la dispersione sfonda, non
@@ -4095,6 +4466,12 @@ def main():
                 _write_csv(os.path.join(a.out, "compare.csv"), rows)
             if raw:
                 _write_csv(os.path.join(a.out, "compare_raw.csv"), raw)
+            write_env(a.out, env)
+            # Sulle righe di SINTESI, cioe' sulle mediane dei giri: costruirlo
+            # sulle righe grezze farebbe vincere il giro piu' fortunato, che a
+            # rate offerto fisso e' esattamente l'errore da evitare.
+            write_report(a.out, rows or raw, env, a.loss_threshold,
+                         "Throughput end-to-end a carico identico")
             _give_back(a.out)
         _closing_note(plan)
         return rc
@@ -4118,6 +4495,8 @@ def main():
     if a.out and rows:
         os.makedirs(a.out, exist_ok=True)
         _write_csv(os.path.join(a.out, "throughput.csv"), rows)
+        write_env(a.out, env)
+        write_report(a.out, rows, env, a.loss_threshold)
         _give_back(a.out)
 
     _closing_note(plan)
