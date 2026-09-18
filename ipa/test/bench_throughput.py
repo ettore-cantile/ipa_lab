@@ -1797,6 +1797,34 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     med["secs_mean"] = round(sum(r["secs"] for r in runs) / len(runs), 3)
     lo, hi = med["rx_pps_min"], med["rx_pps_max"]
     med["spread_pct"] = round(100.0 * (hi - lo) / lo, 1) if lo else None
+    # DISPERSIONE ROBUSTA, accanto a quella fra gli estremi.
+    #
+    # `spread_pct` e' (max - min) / min: la statistica piu' sensibile che
+    # esista a un singolo valore anomalo. Su questa macchina l'anomalo c'e' e
+    # ha una causa nota: ogni tanto l'host sospende il vCPU per l'intera
+    # finestra, e quella ripetizione esce vicina a zero. Misurato il
+    # 2026-09-18 in softirq: baseline a 512 byte, quattro ripetizioni
+    # d'accordo e la quinta a perdita 94.70%, `spread_pct` +-286%.
+    #
+    # Scartare l'anomala sarebbe barare. Misurare la dispersione su una
+    # statistica che non le da' tutto il peso, e DIRE quante ce ne sono, no:
+    # e' la stessa scelta gia' fatta per la perdita (si riporta la peggiore,
+    # si decide sulla mediana). Serve almeno un quinto campione perche' i
+    # quartili vogliano dire qualcosa; sotto, resta il solo min-max.
+    pps_ord = sorted(r["rx_pps"] for r in runs)
+    n = len(pps_ord)
+    if n >= 5:
+        q1, q2, q3 = (pps_ord[n // 4], pps_ord[n // 2], pps_ord[(3 * n) // 4])
+        med["spread_iqr_pct"] = round(100.0 * (q3 - q1) / q2, 1) if q2 else None
+        # Quante ripetizioni cadono fuori da 1.5 IQR: e' il conteggio delle
+        # finestre in cui la macchina ha fatto altro, e va riportato perche'
+        # e' una proprieta' della macchina, non del datapath.
+        iqr = q3 - q1
+        med["ripetizioni_anomale"] = sum(
+            1 for v in pps_ord if v < q1 - 1.5 * iqr or v > q3 + 1.5 * iqr)
+    else:
+        med["spread_iqr_pct"] = None
+        med["ripetizioni_anomale"] = 0
     # Una mediana su misure che oscillano del 75% non e' una misura: e' il
     # carico della macchina in tre momenti diversi. Marcarla e' l'unica cosa
     # onesta da farne.
@@ -1811,8 +1839,13 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     #     scegliendo quella che non gonfia, e i pps in ricezione si dividono
     #     comunque per la finestra del blocco su pgctrl, che nessuna delle due
     #     letture puo' accorciare.
+    # La dispersione su cui si DECIDE: quella robusta dove esiste, altrimenti
+    # min-max. Vedi sopra per il perche'.
+    disp = (med["spread_iqr_pct"] if med.get("spread_iqr_pct") is not None
+            else med["spread_pct"])
+    med["spread_deciso_pct"] = disp
     med["unreliable"] = bool(
-        (med["spread_pct"] is not None and med["spread_pct"] > MAX_SPREAD_PCT)
+        (disp is not None and disp > MAX_SPREAD_PCT)
         or med.get("gen_skew_pct", 0.0) > 20.0
         or med.get("offered_pps") == 0 and med.get("tx", 0) > 0
     )
@@ -1821,8 +1854,10 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         med["invalid_reason"].append("generator threads not synchronized")
     if med.get("offered_pps") == 0 and med.get("tx", 0) > 0:
         med["invalid_reason"].append("zero offered rate with nonzero TX")
-    if med["spread_pct"] is not None and med["spread_pct"] > MAX_SPREAD_PCT:
-        med["invalid_reason"].append("repeat spread too high")
+    if disp is not None and disp > MAX_SPREAD_PCT:
+        med["invalid_reason"].append(
+            f"dispersione fra le ripetizioni {disp}% "
+            f"(min-max {med['spread_pct']}%)")
     # Due avvisi che riguardano la MISURA e non il datapath: se scattano, la
     # riga resta ma va letta sapendo che la finestra non era pulita.
     if med.get("gen_skew_pct", 0) > 20.0:
@@ -3430,8 +3465,14 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             elif r.get("spread_pct") is not None:
                 col = RED if r.get("unreliable") else GREY
                 flag = " INAFFIDABILE" if r.get("unreliable") else ""
-                spread = (f" {col}(x{r['repeat']}, +-{r['spread_pct']:.0f}%"
-                          f"{flag}){NC}")
+                disp = r.get("spread_deciso_pct", r["spread_pct"])
+                # Se le due dispersioni divergono si stampano entrambe: la
+                # differenza fra loro E' l'informazione (quanto pesa la coda).
+                due = (f"+-{disp:.0f}%" if abs(disp - r["spread_pct"]) < 1
+                       else f"+-{disp:.0f}% (min-max {r['spread_pct']:.0f}%)")
+                fuori = r.get("ripetizioni_anomale", 0)
+                anom = f", {fuori} anomala/e" if fuori else ""
+                spread = f" {col}(x{r['repeat']}, {due}{anom}{flag}){NC}"
             # A delay 0 non c'e' un rate richiesto: si stampa quello davvero
             # offerto (trasmessi + rifiutati, diviso la finestra), che e' la
             # cifra rispetto a cui va letta la perdita. Prima la colonna

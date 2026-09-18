@@ -1049,6 +1049,114 @@ il passaggio media→minimo, e il fatto che registrare un modello sia ora **una*
 `model_desc` popolato correttamente anche per shape non-default: P2 `model_id=1` = 65-**6-5**-7,
 P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
 
+## 11. Throughput end-to-end misurato (`bench_throughput.py`)
+
+Tutte le cifre di throughput nelle sezioni precedenti sono `1 / latenza` sotto
+`BPF_PROG_TEST_RUN`: un ciclo sullo stesso buffer, senza driver e senza un pacchetto che
+arrivi davvero. Sono **picchi teorici**. Questa sezione riporta l'altra cosa: pktgen (TG,
+in-kernel) genera traffico vero, la pipeline XDP (DUT) lo elabora e lo redirige, e un
+contatore XDP sull'interfaccia d'uscita conta quanti ne sono arrivati.
+
+### 11.1 Il banco, e perché ne servono due
+
+TG, DUT e contatore stanno sulla **stessa** macchina, collegati da una coppia veth con XDP
+in modalità nativa. Quel vincolo genera un dilemma che non si risolve su questa VM:
+
+| | NAPI in thread (core separati) | softirq (`--no-threaded-napi`) |
+|---|---|---|
+| dove gira la RX | kernel thread su una CPU dedicata | sulla CPU che ha trasmesso |
+| perdita osservata | 8-70%, **a qualunque rate** | **0.00%** |
+| collo di bottiglia | la coda del veth | il generatore |
+| serve per | throughput massimo, confronto | rate a perdita nulla, costo per pacchetto |
+
+**Perché la prima colonna perde a qualunque rate.** Attaccando XDP a un veth il kernel
+alloca un `ptr_ring` sul lato ricevente, che `veth.c` fissa a `VETH_RING_SIZE` (256
+descrittori) e che su questo kernel `ethtool -g` non espone — verificato, non è
+configurabile. 256 descrittori a 1,5 Mpps sono **170 µs** di traffico: il thread NAPI deve
+essere schedulato entro 170 µs ogni volta, e un guest VirtualBox su host a core ibridi non
+lo garantisce. Il conto torna con le misure: a 74 kpps il ring copre 3,5 ms e la perdita è
+0,10%; a 1,5 Mpps copre 0,17 ms e sta fra il 9 e il 18%. È un pavimento del banco, non
+della pipeline — in tutte le righe `TX == HIT == RX`, cioè **il datapath non ha mai perso
+un pacchetto che gli sia stato consegnato**.
+
+In softirq la RX gira sulla CPU che ha trasmesso, il ring si drena in pratica
+sincronamente e la perdita sparisce. Il prezzo è che generatore e pipeline condividono il
+core, quindi il rate misurato è `1/(t_gen + t_pipeline)` e il tetto è sempre il generatore.
+
+### 11.2 Rate a perdita nulla (softirq, perdita 0.00%)
+
+Run del 2026-09-18, commit `131b7a6b`, `--threads 1 --duration 2.0 --repeat 5
+--no-threaded-napi`. Sono **limiti inferiori** dell'NDR nel senso di RFC 2544: a massima
+spinta non si è perso niente, quindi la pipeline non era satura e il vero NDR sta più in
+alto.
+
+| pipeline | 64 B | 512 B | 1514 B |
+|---|---|---|---|
+| baseline (nessuna inferenza) | ≥ 879 581 | ≥ 886 897 | ≥ 688 287 |
+| p1_static (P1) | ≥ 784 711 | ≥ 774 151 | ≥ 652 699 |
+| hardcoded (P1.5) | ≥ 847 622 | ≥ 838 514 | ≥ 614 433 |
+| template (P2) | ≥ 643 508 | ≥ 637 925 | ≥ 542 678 |
+| modular (P3) | ≥ 549 003 | ≥ 548 085 | ≥ 480 756 |
+
+### 11.3 Costo dell'inferenza per pacchetto
+
+È la cifra che il regime senza perdite rende pulita. Senza code di mezzo `1/RX pps` è il
+tempo del percorso completo; la baseline fa lo stesso percorso **meno l'inferenza**, quindi
+la differenza è il costo dell'inferenza. Il termine `t_gen` è comune a tutte le righe della
+stessa taglia e sottraendo la baseline si cancella.
+
+| pipeline | ns/pkt @512 B | costo inferenza |
+|---|---|---|
+| baseline | 1127.5 | — |
+| hardcoded (P1.5) | 1192.6 | **+65 ns** |
+| p1_static (P1) | 1291.7 | **+164 ns** |
+| template (P2) | 1567.6 | **+440 ns** |
+| modular (P3) | 1824.5 | **+697 ns** |
+
+L'ordine P2 < P3 e il salto fra P1 e P2 sono quelli che l'architettura prevede, e sono
+misurati su traffico reale invece che stimati.
+
+**Riserva sul denominatore.** La riga baseline a 512 byte, da cui si sottrae tutto il resto
+della colonna, è una di quelle con una ripetizione anomala (quattro d'accordo, la quinta a
+94,70% di perdita) ed è stata marcata inaffidabile dalla dispersione min-max. La mediana
+resta coerente con la riga a 64 byte (886 897 contro 879 581, meno dell'1% di differenza,
+com'è atteso visto che il costo dell'inferenza non dipende dalla lunghezza del frame), ma i
+delta vanno riconfermati su un run in cui quella riga esca pulita.
+
+**Anomalia aperta, non risolta.** A 64 e 512 byte `hardcoded` risulta **più veloce** di
+`p1_static`, che compila anche l'indice del nodo e quindi dovrebbe fare strettamente meno
+lavoro; a 1514 byte l'ordine si inverte e torna quello atteso. Candidato: in P1 i pesi sono
+letterali C, quindi la riduzione di forza di clang dipende dai **valori** e due build della
+stessa architettura possono generare codice diverso (stesso meccanismo già visto sulla
+caricabilità, sez. 10). Va indagato prima di citare P1 e P1.5 come separati.
+
+### 11.4 Come si leggono le due colonne di perdita
+
+Il banco riporta `perd.pegg` (la peggiore delle ripetizioni) e `perd.med` (la mediana), e
+**decide** sulla seconda. È una deviazione dichiarata da RFC 2544, che definisce il
+throughput come il rate a cui non si perde nemmeno un frame: la norma presuppone un DUT
+quieto e dedicato, mentre qui capita che l'host sospenda il vCPU per l'intera finestra e
+quella ripetizione descriva l'host, non il rate. Misurato: baseline a 512 byte, quattro
+ripetizioni d'accordo e la quinta a 94,70% di perdita. Per la stessa ragione la dispersione
+si valuta sull'intervallo interquartile e le ripetizioni anomale vengono **contate e
+riportate** invece che scartate in silenzio.
+
+La perdita è anche spezzata per colpevole, perché tre cause diverse chiedono tre rimedi
+diversi: `respinti (veth)` — mai entrati nel DUT, backpressure; `persi in coda` — accettati
+e mai arrivati al programma; `persi dopo` — elaborati e non usciti. In tutti i run di questa
+sezione gli ultimi due sono **zero**.
+
+### 11.5 Cosa questo banco NON può dare su questa macchina
+
+L'NDR vero. Con i core separati il pavimento del ring distrugge la misura a perdita nulla;
+con i core condivisi il generatore è sempre il collo di bottiglia, perché la sua CPU fa
+anche la RX — e aggiungere core al generatore ne aggiunge anche al DUT, quindi il rapporto
+fra i due non cambia mai. Servirebbero due macchine, o una NIC che supporti XDP nativo
+(l'unica fisica qui è `e1000`, emulata, che non lo supporta).
+
+Quello che resta valido, ed è su cui si basano 11.2 e 11.3: il **confronto** fra pipeline a
+parità di condizioni, e il costo per pacchetto in regime senza perdite.
+
 ## Note oneste
 
 - **Ordine design-space confermato**: costo (istruzioni, jited, tail call, lookup, memoria)
@@ -1194,6 +1302,7 @@ luce non dipende dal backend: è il verificatore del kernel, lo stesso per entra
   (fino a 20× su un singolo campione, rumore a senso unico — vedi sez. 7): tutti gli script
   di benchmark aggiunti in questa sessione (7, 8) usano minimo su N trial indipendenti, mai
   un campione singolo.
+
 - **Limiti dell'ambiente (onestà, cfr. Heiser "Benchmarking Crimes", arXiv:1801.02381)**:
   nessun CPU pinning/isolamento core, nessuna frequenza CPU fissata, nessun C-state
   disabilitato, VM — i numeri assoluti (ns/pacchetto, Mpps) non sono comparabili con
