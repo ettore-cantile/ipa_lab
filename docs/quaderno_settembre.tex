@@ -668,6 +668,91 @@ perché sui negativi le due implementazioni coincidono solo se arrotondano allo
 stesso modo.
 \end{prima}
 
+\section{Che cosa è costata, e la prova che regge}
+
+Una correzione che tocca il codice che gira per ogni pacchetto va pagata e
+misurata, non solo dichiarata. La suite kernel, rieseguita sul modello
+depositato:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Pipeline} & \textbf{istruzioni prima} & \textbf{dopo} &
+\textbf{differenza} \\
+\midrule
+baseline        &    155 &    155 & \textbf{invariata} \\
+P1 hardcoded    & 1\,026 & 1\,026 & \textbf{invariata} \\
+P2 template     & 14\,628 & 14\,985 & $+357$ \quad($+2{,}4\,\%$) \\
+P3 modular      & 12\,031 & 12\,349 & $+318$ \quad($+2{,}6\,\%$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il costo è \textbf{due virgola cinque per cento} sulle due pipeline generiche:
+il codice della divisione a divisore variabile più la lettura della scala dalla
+mappa. Che \texttt{baseline} e P1 restino \emph{identiche al conteggio} è la
+verifica che il cambiamento non ha toccato percorsi che non doveva toccare ---
+P1 compila la scala come prima, solo presa da un posto diverso.
+
+\begin{prima}[Perché la latenza non si può usare per giudicare]
+Nello stesso run la latenza si è spostata su tutte e quattro le colonne,
+\textbf{compresa la baseline}: da 29 a 35 ns, cioè $+21\,\%$, su un programma
+che non è stato modificato di una riga.
+
+Quel $+21\,\%$ è il metro del rumore della macchina in quell'esecuzione, e sta
+\emph{sopra} lo spostamento di P2 ($+9\,\%$) e P3 ($+5\,\%$). Le differenze di
+latenza qui non sono attribuibili alla modifica: l'unica colonna che dice
+qualcosa è quella delle istruzioni, che è deterministica.
+\end{prima}
+
+L'esito funzionale è \texttt{kernel suite: PASS} --- le quattro pipeline, la
+gestione del TTL, il reroute su link caduto, le architetture alternative e i
+due modelli concorrenti registrati insieme su P2 e su P3. E nel registro del
+descrittore si legge la scala arrivare a destinazione:
+
+\begin{center}
+\footnotesize
+\texttt{model\_desc[0] = feats=[}\\[2pt]
+\texttt{(1,6,0,\textbf{1})\ (2,6,6,\textbf{1})\ (3,1,12,\textbf{30})\ (4,52,13,\textbf{1})}
+\end{center}
+
+Il quarto campo è la scala: \texttt{ttl} porta 30 fin dentro la mappa, e non è
+più un numero scritto nel sorgente.
+
+\section{Tre difetti, e chi li ha trovati}
+
+Vale la pena tenere il conto, perché dice qualcosa sul metodo più che sul
+codice.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Difetto} & \textbf{Di chi} & \textbf{Trovato da} \\
+\midrule
+Porta d'ingresso non detta al kernel & banco &
+  il confronto, al primo run \\
+Scala del TTL compilata a 30 & datapath &
+  il confronto, tolto il primo \\
+Divisione con segno, non ammessa da BPF & correzione &
+  il compilatore \\
+Funzione nel ramo sbagliato di \texttt{\#ifndef} & correzione &
+  il compilatore, al secondo giro \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Gli ultimi due sono stati introdotti \emph{riparando} il secondo, e nessuno dei
+due sarebbe stato visibile senza compilare davvero. Da lì è nato
+\texttt{check\_source\_visibility.py}: i sorgenti eBPF di questo progetto non
+sono file ma stringhe, concatenate in combinazioni diverse dai chiamanti e
+ritagliate dal preprocessore con macro diverse. Una funzione può stare prima
+del suo uso \emph{nel file} e sparire lo stesso nella combinazione che conta.
+Il controllo valuta le guardie e verifica la visibilità in tutte e cinque le
+combinazioni realmente compilate --- senza root e senza BCC, quindi prima di
+spedire e non dopo.
+
 \section{Che cosa questo capitolo dimostra}
 
 Che le tre pipeline calcolano ciò che il modello dice, su sette modelli che

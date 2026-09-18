@@ -1216,4 +1216,5 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
                              scale=min(255, int(e.get("scale", 0) or 0)))
     bpf_obj["model_desc"][c_uint8(model_id)] = d
     print(f"[Pipeline3] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
-          f"feats={[(e['code'], e['size'], e['col_off']) for e in ents]}")
+          f"feats={[(e['code'], e['size'], e['col_off'], e.get('scale'))
+                    for e in ents]}")

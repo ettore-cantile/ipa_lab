@@ -684,16 +684,36 @@ Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo.
 
 | Metrica | baseline | P1 hardcoded | P2 template | P3 modular |
 |---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | 155 | 1 026 | 14 628 | 12 031 |
-| Codice jited (byte) | 709 | 4 985 | 63 975 | 55 015 |
+| Istruzioni eBPF (xlated) | 155 | 1 026 | 14 985 | 12 349 |
+| Codice jited (byte) | 709 | 4 985 | 67 183 | 57 372 |
 | Tail call / pacchetto | 0 | 1 | 1 | **3** |
 | Map lookup / pacchetto (reali) | 3.0 | 6.0 | 11.0 | **29.0** |
 | Memoria mappe (byte) | 280 | 2 356 | 10 416 | 19 508 |
-| **Latenza min (ns/pkt)** | **29.0** | **73.0** | **262.0** | **421.0** |
-| ...p50 | 30.0 | 88.0 | 278.0 | 453.0 |
-| ...max | 32.0 | 99.0 | 327.0 | 476.0 |
-| ...spread (max−min)/min | 10% | 36% | 25% | 13% |
-| Throughput teorico (Mpps, da min) | 34.483 | 13.699 | 3.817 | 2.375 |
+| **Latenza min (ns/pkt)** | **35.0** | **70.0** | **286.0** | **444.0** |
+| ...p50 | 37.0 | 74.0 | 299.0 | 475.0 |
+| ...max | 41.0 | 100.0 | 353.0 | 556.0 |
+| ...spread (max−min)/min | 17% | 43% | 23% | 25% |
+| Throughput teorico (Mpps, da min) | 28.571 | 14.286 | 3.497 | 2.252 |
+
+> **Rimisurata il 2026-09-18**, dopo che la scala per-feature e' passata dal
+> `#define` al descrittore a runtime (vedi il capitolo sui modelli sintetici nel
+> quaderno). Che cosa e' cambiato e che cosa no:
+>
+> - **Istruzioni**: P2 `+357`, P3 `+318`. E' il codice della divisione a
+>   divisore variabile piu' la lettura della scala dalla mappa. `baseline` e
+>   `hardcoded` sono **identiche** al conteggio precedente, come deve essere:
+>   quei due percorsi non sono stati toccati.
+> - **Latenza**: si e' spostata su tutte e quattro le colonne, **compresa la
+>   baseline** (29 -> 35 ns, `+21%`) che non e' stata modificata di una riga.
+>   Quel `+21%` e' il metro del rumore della macchina in questo run, e sta
+>   sopra lo spostamento di P2 (`+9%`) e P3 (`+5%`). Le differenze di latenza
+>   qui **non sono attribuibili** alla modifica.
+>
+> Le cifre di P2/P3 che compaiono altrove in questo documento e in `claims.md`
+> (sweep di scalabilita', sparsita', iso-parametri) vengono da esecuzioni
+> **precedenti** a questo cambiamento e sono quindi basse di circa 320-360
+> istruzioni. Non sono state riscritte perche' quegli sweep non sono stati
+> rieseguiti: vanno rimisurati prima di citarli insieme a questa tabella.
 
 Suddivisione per programma:
 
