@@ -4779,6 +4779,25 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
     # controllo di validita' ha bocciato il run vuol dire produrre una tabella
     # che sembra un risultato e non lo e'. Il terminale lo diceva, ma il
     # terminale si chiude e il file resta.
+    # Un run a una o due finestre per punto non e' confrontabile fra pipeline,
+    # e il markdown e' cio' che si cita: l'avviso a terminale scorre via, il
+    # file resta. Misurato il 2026-09-18: a `--repeat 1` la baseline a 512 byte
+    # e' uscita il 4.9% sopra la media dei run a repeat 5, e siccome e' il
+    # denominatore di tutta la colonna ha gonfiato ogni costo -- P3 a 893 ns
+    # contro i 697 stabili su tre run.
+    rip = next((int(v) for k, v in env if k == "ripetizioni_per_punto"
+                and str(v).isdigit()), None)
+    if rip is not None and rip < 3:
+        L.append(f"> **MISURATO A {rip} FINESTRA/E PER PUNTO -- non "
+                 f"confrontabile fra pipeline.**")
+        L.append(">")
+        L.append("> Con meno di tre ripetizioni la mediana del rate, la "
+                 "peggiore delle perdite e la dispersione non esistono. In "
+                 "particolare la riga `baseline`, che fa da denominatore alla "
+                 "colonna `ns/pkt vs baseline`, e' una finestra sola: il suo "
+                 "errore si propaga a ogni costo della tabella. Serve almeno "
+                 "`--repeat 3`, meglio 5.")
+        L.append("")
     bad = [m for e, m in VERDICT if e == "FAIL"]
     if bad:
         L.append("> **RUN BOCCIATO DAL CONTROLLO DI VALIDITA' -- "
