@@ -443,7 +443,11 @@ BPF_ARRAY(queue_state, struct qs_vec, 1);
  * arch_generic_2layer to build the IV generically -> different models use
  * different feature subsets/orders WITHOUT recompiling. */
 #define MAX_FEAT 4
-struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
+/* `scale` era `_pad`. E' la normalizzazione con cui il modello e' stato
+ * addestrato (ttl/30, ttl/16, ...): una proprieta' del MODELLO, quindi va
+ * nel descrittore a runtime e non in un #define. Con 0 si ricade sul
+ * default compilato, cosi' i descrittori scritti prima restano validi. */
+struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 scale; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
 
@@ -672,7 +676,11 @@ struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 struct qs_vec { __u32 v[IPA_MAX_QUEUES]; };
 BPF_ARRAY(queue_state, struct qs_vec, 1);
-struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
+/* `scale` era `_pad`. E' la normalizzazione con cui il modello e' stato
+ * addestrato (ttl/30, ttl/16, ...): una proprieta' del MODELLO, quindi va
+ * nel descrittore a runtime e non in un #define. Con 0 si ricade sul
+ * default compilato, cosi' i descrittori scritti prima restano validi. */
+struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 scale; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
@@ -901,11 +909,17 @@ int arch_generic_2layer(struct xdp_md *ctx) {
              * ttl/initial_ttl in (0,1], not on the raw hop count. See
              * model_meta.DEFAULT_TTL_SCALE. The PRODUCT is divided --
              * dividing _ttl itself would collapse it to 0 or 1. */
+            /* La scala viene dal descrittore. Lo zero vuol dire "non
+             * dichiarata" e ricade sul default compilato; il ternario e' anche
+             * cio' che rende ovvia al verificatore l'impossibilita' di una
+             * divisione per zero. */
+            long long _sc = desc->feats[f].scale ? desc->feats[f].scale
+                                                 : T2_TTL_SCALE;
             #pragma unroll
             for (int j = 0; j < T2_MAX_H1; j++)
                 h1[j] += ((long long)_ttl
                           * AW_W(AW, woff + fc1_w_off + j * n_in + coff))
-                         / T2_TTL_SCALE;
+                         / _sc;
         } else if (code == FEAT_LINK_STATE) {
             #pragma unroll
             for (int i = 0; i < IPA_MAX_IFACES; i++) {
@@ -1355,7 +1369,7 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
     class FeatEnt(Structure):
         _pack_ = 1
         _fields_ = [("code", c_uint8), ("size", c_uint8),
-                    ("col_off", c_uint8), ("_pad", c_uint8)]
+                    ("col_off", c_uint8), ("scale", c_uint8)]
 
     class ModelDesc(Structure):
         _pack_ = 1
@@ -1365,10 +1379,13 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
 
     d = ModelDesc(n_feat=len(ents), n_in=n_in)
     for i, e in enumerate(ents):
-        d.feats[i] = FeatEnt(code=e["code"], size=e["size"], col_off=e["col_off"])
+        d.feats[i] = FeatEnt(code=e["code"], size=e["size"],
+                             col_off=e["col_off"],
+                             scale=min(255, int(e.get("scale", 0) or 0)))
     bpf_obj["model_desc"][c_uint8(model_id)] = d
     print(f"[Pipeline2] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
-          f"feats={[(e['code'], e['size'], e['col_off']) for e in ents]}")
+          f"feats={[(e['code'], e['size'], e['col_off'], e.get('scale'))
+                    for e in ents]}")
 
 
 def load_class_action(bpf_obj, map_name: str, semantics) -> None:

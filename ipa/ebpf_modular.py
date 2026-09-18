@@ -335,7 +335,11 @@ BPF_ARRAY(queue_state, struct qs_vec, 1);
  * LAYER_CHAIN_SIZE (the BPF_PROG_ARRAY size): a model cannot have more layers
  * than the chain has slots, so the loop always covers every reachable depth. */
 #define ML_MAX_DEPTH 16
-struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 _pad; };
+/* `scale` era `_pad`. E' la normalizzazione con cui il modello e' stato
+ * addestrato (ttl/30, ttl/16, ...): una proprieta' del MODELLO, quindi va
+ * nel descrittore a runtime e non in un #define. Con 0 si ricade sul
+ * default compilato, cosi' i descrittori scritti prima restano validi. */
+struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 scale; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[ML_MAX_FEAT]; };
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
 
@@ -767,7 +771,9 @@ int layer_first(struct xdp_md *ctx) {
             #pragma unroll
             for (int j = 0; j < ML1_MAX_H1; j++)
                 out[j] += ((long long)_ttl
-                           * LW_W(LW, woff + j * n_in + coff)) / ML_TTL_SCALE;
+                           * LW_W(LW, woff + j * n_in + coff))
+                          / (desc->feats[f].scale ? desc->feats[f].scale
+                                                  : ML_TTL_SCALE);
         } else if (code == FEAT_LINK_STATE) {
             #pragma unroll
             for (int i = 0; i < IPA_MAX_IFACES; i++) {
@@ -1170,7 +1176,7 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
     class FeatEnt(Structure):
         _pack_ = 1
         _fields_ = [("code", c_uint8), ("size", c_uint8),
-                    ("col_off", c_uint8), ("_pad", c_uint8)]
+                    ("col_off", c_uint8), ("scale", c_uint8)]
 
     class ModelDesc(Structure):
         _pack_ = 1
@@ -1180,7 +1186,9 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
 
     d = ModelDesc(n_feat=len(ents), n_in=n_in)
     for i, e in enumerate(ents):
-        d.feats[i] = FeatEnt(code=e["code"], size=e["size"], col_off=e["col_off"])
+        d.feats[i] = FeatEnt(code=e["code"], size=e["size"],
+                             col_off=e["col_off"],
+                             scale=min(255, int(e.get("scale", 0) or 0)))
     bpf_obj["model_desc"][c_uint8(model_id)] = d
     print(f"[Pipeline3] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
           f"feats={[(e['code'], e['size'], e['col_off']) for e in ents]}")

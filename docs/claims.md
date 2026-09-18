@@ -75,17 +75,18 @@ scheda lo dice invece di nasconderlo.
 
 ---
 
-### A5 — L'equivalenza numerica vale anche sui modelli sintetici ⏳
+### A5 — L'equivalenza numerica vale anche sui modelli sintetici ✅
 
 | | |
 |---|---|
 | **Ipotesi** | Che i pesi sintetici **compilino** e passino il verificatore dimostra che le pipeline sono corrette indipendentemente dal modello. |
 | **Variabile modificata** | Il modello: 7 scenari sintetici (`deep`, `ipa_like`, `large`, `mixed`, `ones`, `small`, `sparse`), pesi casuali, forme da 11-2-3 a 117-8-8-9. |
-| **Variabili fisse** | La pipeline (P1), il descrittore di ciascuno scenario, l'insieme di ingressi campionato con seme fisso. |
-| **Metrica** | Accordo fra argmax su quattro vie: float (Python), int8 (`synth.reference`), int8 (`verify_prog_run.ref_infer_sparse`, implementazione indipendente), int8 (eBPF nel kernel). |
-| **Risultato** | ⏳ Le vie Python girano e concordano: `--dry-run` su tutti e 7 gli scenari passa, e i `col_scales` ricalcolati dal descrittore coincidono con quelli depositati. La via **eBPF non e' ancora stata eseguita**: serve Linux con BCC. |
-| **Conclusione attesa** | `int8 (Python)` contro `int8 (eBPF)` deve valere **100%**: un solo disaccordo li' e' un difetto del datapath, non della quantizzazione. Finche' quel numero non c'e', l'ipotesi resta dimostrata solo per la compilazione. |
-| **Nota** | L'accordo float/int8 misurato qui (97,7-100%) **non e'** il `quant_agreement` di `expected.json` (0,789 per `ipa_like`): li' gli ingressi sono campionati liberamente, qui solo fra quelli che il datapath sa esprimere. Distribuzioni diverse, numeri diversi. |
+| **Variabili fisse** | La pipeline (P1), il descrittore di ciascuno scenario, 300 ingressi per scenario con seme fisso. |
+| **Metrica** | Accordo fra argmax su quattro vie: float (Python), int8 (`synth.reference`, scala **dichiarata dal modello**), int8 (`verify_prog_run.ref_infer_sparse`, scala **del catalogo**), int8 (eBPF nel kernel). |
+| **Risultato** | **6/7 scenari: 300/300 decisioni identiche** fra riferimento intero ed eBPF. Il settimo (`small`) sta a 70,33%, ma la riga `int8 (riferim.) vs int8 (eBPF)` resta a **100%**: l'eBPF concorda esattamente con il riferimento che usa la sua stessa scala. |
+| **Conclusione** | L'ipotesi era **troppo debole, e la sua verifica ha trovato due difetti diversi**. L'aritmetica del datapath e' esatta su tutti e 7 gli scenari. Su `small` e' esatta rispetto a una configurazione sbagliata: il modello dichiara `ttl/16`, i tre datapath compilano `ttl/30` e non leggono il descrittore per questo campo (`struct feat_ent` non ha un posto dove metterlo). Costo: 29,67 punti di accordo su quel modello. |
+| **Difetto del banco trovato per primo** | Nel run iniziale cinque scenari su sette davano 71-85%. Era `verify_synth_kernel` che non comunicava al kernel la porta d'ingresso: `prog_test_run` accetta `ingress_ifindex` ma lo **ignora** (niente `ctx_in`), e il programma vede sempre `TEST_RUN_DEFAULT_INGRESS_IFINDEX = 1`. Confermato senza kernel: simulando "l'eBPF vede porta 0" si riproducono le percentuali osservate con scarto **0,00** su 6 scenari. |
+| **Nota** | L'accordo float/int8 misurato qui (97,7-100%) **non e'** il `quant_agreement` di `expected.json` (0,789 per `ipa_like`): li' gli ingressi sono campionati liberamente, qui solo fra quelli che il datapath sa esprimere. |
 | **Come rigirarlo** | `sudo python3 ipa/test/verify_synth_kernel.py --all --n 300` — oppure `--dry-run` senza kernel |
 
 ---

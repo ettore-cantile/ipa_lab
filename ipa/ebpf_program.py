@@ -527,9 +527,10 @@ def _gen_feature_scalar(feat, offset, n_in, fc1_w, n_h1):
     use int(a/b) (not //) to match on negative weights.
     See model_meta.DEFAULT_TTL_SCALE for why `ttl` is scaled at all.
     """
-    from model_meta import feature_scale
+    from model_meta import feature_scale_of
     var, expr = _SCALAR_SOURCE[feat["type"]]
-    scale = feature_scale(feat["type"])
+    # La scala del DESCRITTORE, non del tipo: vedi model_meta.feature_scale_of.
+    scale = feature_scale_of(feat)
     preamble = [f"    __u32 {var} = {expr};   /* feature '{feat['type']}' (scalar) */"]
     def term(j):
         prod = f"(__s64){var} * {_lit(fc1_w[j * n_in + offset])}LL"

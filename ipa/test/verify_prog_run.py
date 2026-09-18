@@ -319,7 +319,7 @@ def _feature_scales(features) -> list:
     import model_meta as _mm
     out = []
     for f in features:
-        out += [_mm.feature_scale(f["type"])] * int(f["size"])
+        out += [_mm.feature_scale_of(f)] * int(f["size"])
     return out
 
 

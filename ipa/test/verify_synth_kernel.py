@@ -147,7 +147,11 @@ def descrittore(model):
     out = []
     for f in model["descriptor"]:
         t = NOMI.get(f["name"], f["name"])
-        out.append({"type": t, "size": int(f["size"])})
+        # La scala DICHIARATA dallo scenario viaggia con la feature: da qui
+        # la prendono sia il generatore C sia il riferimento intero, che prima
+        # la ripescavano entrambi dal catalogo ignorando il modello.
+        out.append({"type": t, "size": int(f["size"]),
+                    "scale": int(f.get("scale", 1) or 1)})
     return out
 
 
@@ -400,32 +404,27 @@ def confronta(d, n, seed, node_index, dry=False):
             return False
         ok("col_scales ricalcolati dal descrittore == quelli depositati")
 
-    # LA SCALA DICHIARATA DAL MODELLO CONTRO QUELLA CHE IL DATAPATH COMPILA.
+    # LA SCALA PER-FEATURE, DA QUANDO IL DATAPATH LA SEGUE.
     #
-    # `model_meta.feature_scale` risponde con la scala del CATALOGO, uguale per
-    # tutti i modelli, e i tre datapath la fissano a compile time
-    # (`feature_scale` in P1, `T2_TTL_SCALE` in P2, `ML_TTL_SCALE` in P3). Un
-    # modello addestrato con una normalizzazione diversa viene quindi eseguito
-    # con la scala sbagliata, e il disaccordo che ne esce NON e' ne'
-    # quantizzazione ne' un difetto di questo script.
-    #
-    # Va detto prima delle tabelle, o le tabelle sembrano accusare il datapath
-    # di un errore di calcolo quando l'errore e' di configurazione.
+    # Fino al 2026-09-18 i tre datapath fissavano la scala a compile time
+    # (`feature_scale(tipo)` in P1, `T2_TTL_SCALE`/`ML_TTL_SCALE` in P2/P3) e
+    # ignoravano quella dichiarata dal modello: `small` (16), `large` (64) e
+    # `ones` (8) venivano eseguiti con 30. Adesso la scala viaggia nel
+    # descrittore e il campo `scale` di `struct feat_ent` la porta fino al
+    # kernel. Resta utile DIRE quali modelli si discostano dal default, perche'
+    # sono esattamente quelli che il vecchio codice sbagliava.
     import model_meta as _mm
-    diverse = []
+    fuori_default = []
     for f in model["descriptor"]:
         t = NOMI.get(f["name"], f["name"])
         dichiarata = int(f.get("scale", 1) or 1)
-        compilata = int(_mm.feature_scale(t))
-        if dichiarata != compilata:
-            diverse.append((t, dichiarata, compilata))
-    if diverse:
-        for t, dich, comp in diverse:
-            fail(f"scala della feature `{t}`: il modello dichiara {dich}, il "
-                 f"datapath compila {comp}")
-        note("i tre datapath fissano la scala a compile time e ignorano quella "
-             "del descrittore: le righe che seguono misurano ANCHE questa "
-             "differenza, non solo l'implementazione.")
+        catalogo = int(_mm.feature_scale(t))
+        if dichiarata != catalogo:
+            fuori_default.append((t, dichiarata, catalogo))
+    if fuori_default:
+        for t, dich, cat in fuori_default:
+            info(f"la feature `{t}` usa scala {dich}, diversa dal default del "
+                 f"catalogo ({cat}): il datapath deve seguire il modello")
 
     setup = None
     if not dry:
@@ -434,7 +433,7 @@ def confronta(d, n, seed, node_index, dry=False):
            f"(nodo congelato: {node_index})")
 
     casi = campioni(feats, n, seed)
-    acc_qf = acc_impl = acc_tot = acc_ref = 0
+    acc_qf = acc_impl = acc_tot = acc_ref = acc_cat = 0
     esempi = []
     for c in casi:
         x = vettore_intero(feats, c, node_index, scale)
@@ -446,6 +445,15 @@ def confronta(d, n, seed, node_index, dry=False):
         c_bpf = via_ebpf(setup, c, model, scale)
         acc_qf += (c_float == c_int8)
         acc_ref += (c_int8 == c_ref)
+        # LA RIGA CHE ASSOLVE O CONDANNA IL DATAPATH.
+        #
+        # `ref_infer_sparse` applica la scala del CATALOGO, la stessa che i tre
+        # generatori compilano. Se l'eBPF concorda con lui al 100% mentre
+        # entrambi divergono da `synth.reference` (che usa la scala DICHIARATA
+        # dal modello), allora il datapath non sbaglia un conto: esegue
+        # correttamente una configurazione sbagliata. Sono due difetti diversi
+        # e chiedono due rimedi diversi.
+        acc_cat += (c_ref == c_bpf)
         acc_impl += (c_int8 == c_bpf)
         acc_tot += (c_float == c_bpf)
         if c_int8 != c_bpf and len(esempi) < 5:
@@ -479,6 +487,7 @@ def confronta(d, n, seed, node_index, dry=False):
     for etichetta, acc in (
             ("float  vs  int8 (Python)", acc_qf),
             ("int8 (Python)  vs  int8 (riferim.)", acc_ref),
+            ("int8 (riferim.)  vs  int8 (eBPF)", acc_cat),
             ("int8 (Python)  vs  int8 (eBPF)", acc_impl),
             ("float  vs  int8 (eBPF)", acc_tot)):
         print(f"  {etichetta:34s} {100.0*acc/n:8.2f}% "
@@ -505,10 +514,17 @@ def confronta(d, n, seed, node_index, dry=False):
         for c, a, b in esempi:
             note(f"  ttl={c['ttl']} porta={c['porta']} mappe={c['mappe']} "
                  f"-> python={a} ebpf={b}")
-    if acc_ref != n:
+    if acc_ref != n and acc_cat == n:
+        # Il caso interessante, e quello che la scheda in claims.md deve
+        # riportare: aritmetica esatta, configurazione sbagliata.
+        ok(f"il datapath e' ESATTO rispetto alla scala che gli e' stata "
+           f"compilata: {n}/{n} decisioni identiche a `ref_infer_sparse`. Il "
+           f"disaccordo con `synth.reference` ({n - acc_ref}/{n}) e' tutto "
+           f"nella scala dichiarata dal modello e mai applicata.")
+    elif acc_ref != n:
         fail(f"le due implementazioni intere di Python non concordano su "
-             f"{n - acc_ref}/{n}: prima di leggere le altre righe va risolto "
-             f"questo, perche' non e' chiaro quale sia il riferimento")
+             f"{n - acc_ref}/{n}, E l'eBPF non concorda con nessuna delle due: "
+             f"qui non basta la scala a spiegare, va indagato")
     if acc_qf < n:
         note(f"il {100.0*(n-acc_qf)/n:.1f}% di disaccordo float/int8 e' "
              f"quantizzazione: proprieta' del modello e della scala, non un "

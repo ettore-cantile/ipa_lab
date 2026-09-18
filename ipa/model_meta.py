@@ -203,7 +203,7 @@ def resolve_descriptor(features: list) -> list:
     col = 0
     for f in features:
         out.append({"code": FEATURE_CODE[f["type"]], "size": int(f["size"]),
-                    "col_off": col})
+                    "col_off": col, "scale": feature_scale_of(f)})
         col += int(f["size"])
     return out
 
@@ -399,6 +399,21 @@ def feature_scale(feature_type: str) -> int:
     return int(FEATURE_CATALOG[feature_type].get("scale", 1))
 
 
+def feature_scale_of(feat: dict) -> int:
+    """La scala di QUESTA feature: quella che il modello dichiara se c'e',
+    quella del catalogo altrimenti.
+
+    `feature_scale(type)` risponde per TIPO, cioe' uguale per tutti i modelli.
+    Ma la scala e' la normalizzazione con cui il modello e' stato ADDESTRATO:
+    un modello allenato su `ttl/16` eseguito con `ttl/30` calcola un'altra
+    cosa. Finche' l'unico modello in gioco era quello depositato, che usa 30,
+    la differenza non si vedeva; i modelli sintetici la rendono visibile e
+    misurabile (scenari `small` 16, `large` 64, `ones` 8).
+    """
+    s = feat.get("scale")
+    return int(s) if s is not None else feature_scale(feat["type"])
+
+
 def feature_size(feature_type: str, topology_config: dict) -> int:
     """Size (number of IV slots) of a feature type — from the topology
     config (per-network), not from the model."""
@@ -484,7 +499,13 @@ def derive_shape(meta: dict, topology_config: dict = None,
                   f"what the classes mean -- add \"n_out\" and "
                   f"\"class_semantics\" to model_meta.json.")
 
-    features = [{"type": t, "size": feature_size(t, cfg)} for t in types]
+    # La scala per-feature entra nel descrittore risolto. `feature_scales` nel
+    # model_meta.json la dichiara per tipo; senza, vale quella del catalogo --
+    # quindi i descrittori gia' scritti non cambiano di una virgola.
+    _scales = dict(meta.get("feature_scales") or {})
+    features = [{"type": t, "size": feature_size(t, cfg),
+                 "scale": int(_scales.get(t, feature_scale(t)))}
+                for t in types]
     n_in = sum(f["size"] for f in features)
     if n_in > MAX_N_IN:
         raise ValueError(f"n_in={n_in} exceeds MAX_N_IN={MAX_N_IN}")
