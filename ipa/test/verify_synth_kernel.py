@@ -90,12 +90,19 @@ GREEN, RED, YELLOW, GREY, NC = (
 # una volta, evita di sparpagliare il caso speciale nel resto del file.
 NOMI = {"queue_occ": "queue_occupancy"}
 
-# L'ifindex finto con cui si entra nel programma. Il datapath non usa
-# l'ifindex del kernel come indice della feature: lo risolve attraverso la
-# mappa `ingress_port`, perche' gli ifindex veri sono arbitrari (205, 217...)
-# e una tabella compilata non li indovina. Qui se ne sceglie uno qualunque e
-# gli si associa, di volta in volta, la porta logica del campione.
-IFINDEX_FINTO = 100
+# L'ifindex sotto cui il programma vede arrivare il pacchetto.
+#
+# NON si puo' scegliere. `prog_test_run` accetta un parametro
+# `ingress_ifindex` ma la sua docstring dice che e' "accepted for API
+# compatibility but unused": BPF_PROG_TEST_RUN gira senza `ctx_in`, perche' la
+# semantica dei campi di xdp_md per ctx_in non e' portabile fra kernel, e il
+# programma vede quindi l'ifindex del dispositivo di prova del kernel --
+# `TEST_RUN_DEFAULT_INGRESS_IFINDEX`, che su questo kernel vale 1.
+#
+# Costato un giro a vuoto: scrivevo la mappa `ingress_port` alla chiave 100 e
+# passavo `ingress_ifindex=100`, mentre il programma cercava la chiave 1. La
+# riga non aveva alcun effetto, e infatti i tre scenari che dovevano risalire
+# al 100% sono rimasti alla cifra precedente, identica al centesimo.
 
 
 def ok(m):
@@ -302,15 +309,18 @@ def via_ebpf(setup, caso, model, scale):
     # datapath. Si vedeva benissimo nei dati -- `mixed`, l'unico scenario
     # SENZA la feature `ingress_iface`, era anche l'unico al 100%.
     if "ingress_port" in setup:
-        setup["ingress_port"][ct.c_uint32(IFINDEX_FINTO)] = \
+        from verify_prog_run import TEST_RUN_DEFAULT_INGRESS_IFINDEX as _KIF
+        setup["ingress_port"][ct.c_uint32(_KIF)] = \
             ct.c_uint32(int(caso["porta"]))
 
     n_out = int(model["arch"]["n_out"])
     frame = build_frame_sparse(0, caso["ttl"], scale,
                                int(model["arch"]["n_in"]), n_out)
     _reset_stats(setup, n_classes=n_out)
-    prog_test_run(setup["disp"].fd, frame, repeat=1,
-                  ingress_ifindex=IFINDEX_FINTO)
+    # `ingress_ifindex` non viene passato: il parametro esiste ma e' ignorato,
+    # e passarlo darebbe l'impressione di controllare qualcosa che non si
+    # controlla. Quello che si controlla e' la MAPPA, scritta qui sopra.
+    prog_test_run(setup["disp"].fd, frame, repeat=1)
 
     # La classe scelta si legge da cls_stats, che le pipeline scrivono su OGNI
     # esito -- inoltro, DROP e UNUSED. Prima veniva scritta solo sul percorso
@@ -481,9 +491,17 @@ def confronta(d, n, seed, node_index, dry=False):
         ok(f"implementazione: {n}/{n} decisioni identiche fra riferimento "
            f"intero ed eBPF")
     else:
+        # Non si dice "difetto del datapath" e basta. Misurato il
+        # 2026-09-18: un disaccordo del 29% su cinque scenari veniva tutto da
+        # un difetto di QUESTO script, che non comunicava al kernel la porta
+        # d'ingresso, e il messaggio accusava il datapath di un errore di
+        # calcolo che non aveva fatto. Si elencano le cause possibili in
+        # ordine di probabilita', e la prima e' il banco.
         fail(f"implementazione: {n - acc_impl}/{n} decisioni DIVERSE fra "
-             f"riferimento intero ed eBPF -- e' un difetto del datapath, "
-             f"non della quantizzazione")
+             f"riferimento intero ed eBPF. NON e' quantizzazione. Le cause, "
+             f"in ordine: (1) il banco non passa al kernel un ingresso che il "
+             f"riferimento usa; (2) una scala dichiarata dal modello che il "
+             f"datapath non applica, vedi sopra; (3) un difetto del datapath.")
         for c, a, b in esempi:
             note(f"  ttl={c['ttl']} porta={c['porta']} mappe={c['mappe']} "
                  f"-> python={a} ebpf={b}")
