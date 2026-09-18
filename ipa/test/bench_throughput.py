@@ -3796,6 +3796,13 @@ def run_compare(methods, model_path, frames, offered_pps=None,
 
 
 # ==========================================================================
+# Il verdetto dell'ultimo check_validity, in chiaro. Esiste perche' il report
+# markdown e' la cosa che si cita, e un report che non dice "questo run e'
+# stato bocciato" e' peggio di nessun report: i CSV almeno nessuno li legge
+# senza contesto. Lista di coppie (esito, motivo), riempita da check_validity.
+VERDICT = []
+
+
 def check_validity(rows):
     """La baseline deve essere la piu' veloce. Se non lo e', il run e' sporco.
 
@@ -3807,28 +3814,60 @@ def check_validity(rows):
     ordinato.
 
     Questo controllo esiste perche' e' successo: baseline 2 658 k contro
-    p1_static 3 342 k, con dispersioni fino al 75%."""
-    best = {}
+    p1_static 3 342 k, con dispersioni fino al 75%.
+
+    IL CONFRONTO E' DENTRO UNA TAGLIA DI FRAME, mai fra taglie. Prendendo il
+    massimo di ciascun metodo su TUTTE le taglie il controllo confrontava punti
+    diversi: misurato il 2026-09-18, ha dichiarato "baseline 1 289 781 NON e'
+    la piu' veloce: hardcoded 1 604 321" mettendo a confronto la baseline a
+    1514 byte con hardcoded a 512. Per taglia, lo stesso run era coerente a 64
+    e a 1514 e contaminato solo a 512 -- che e' una diagnosi, mentre l'altra
+    era un artefatto del controllo."""
+    VERDICT.clear()
+    per_frame = {}
     for r in rows:
         m = r.get("method")
-        if m and (m not in best or r["rx_pps"] > best[m]["rx_pps"]):
+        if not m:
+            continue
+        # Le righe del percorso --latency non portano la taglia: finiscono
+        # tutte nello stesso gruppo, che li' e' corretto perche' la taglia e'
+        # una sola.
+        best = per_frame.setdefault(r.get("frame"), {})
+        if m not in best or r["rx_pps"] > best[m]["rx_pps"]:
             best[m] = r
-    if "baseline" not in best or len(best) < 2:
+    usable = {k: b for k, b in per_frame.items()
+              if "baseline" in b and len(b) >= 2}
+    if not usable:
         return 0
-    base = best["baseline"]["rx_pps"]
+    order = sorted(usable, key=lambda k: (k is None, k))
     # Tolleranza: un'inversione ENTRO questa soglia non e' contaminazione, e'
     # rumore fra due pipeline che il banco non riesce a distinguere. Misurato:
     # baseline 1 377 k contro hardcoded 1 423 k, cioe' il 3% -- entrambe
     # limitate dal generatore, quindi il throughput non le separa. Chiamarlo
     # "run contaminato" avrebbe buttato via una misura che invece dice una cosa
     # vera: che sono indistinguibili.
-    faster = {m: r["rx_pps"] for m, r in best.items()
-              if m != "baseline" and r["rx_pps"] > base * (1 + VALID_TOL)}
-    close = {m: r["rx_pps"] for m, r in best.items()
-             if m != "baseline" and base < r["rx_pps"] <= base * (1 + VALID_TOL)}
-    noisy = sorted({m for m, r in best.items() if r.get("unreliable")})
-    gen_bound = sorted({m for m, r in best.items()
-                        if r.get("bottleneck") == BN_GEN})
+    faster, close, clean_frames = {}, {}, []
+    noisy, gen_bound = set(), set()
+    for k in order:
+        best = usable[k]
+        base = best["baseline"]["rx_pps"]
+        sopra = {m: r["rx_pps"] for m, r in best.items()
+                 if m != "baseline" and r["rx_pps"] > base * (1 + VALID_TOL)}
+        for m, v in sopra.items():
+            faster[(k, m)] = (v, base)
+        for m, r in best.items():
+            if m != "baseline" and base < r["rx_pps"] <= base * (1 + VALID_TOL):
+                close[(k, m)] = r["rx_pps"]
+            if r.get("unreliable"):
+                noisy.add(m)
+            if r.get("bottleneck") == BN_GEN:
+                gen_bound.add(m)
+        if not sopra:
+            clean_frames.append(k)
+    noisy, gen_bound = sorted(noisy), sorted(gen_bound)
+
+    def _fr(k):
+        return "ogni taglia" if k is None else f"{k}B"
 
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} Controllo di validita'{NC}")
@@ -3841,26 +3880,48 @@ def check_validity(rows):
               f"DUT (--dut-cpus) finche' la perdita compare: solo allora il "
               f"numero e' della pipeline.{NC}")
     if not faster and not noisy:
-        print(f"  {GREEN}[PASS]{NC} la baseline ({base} pps) e' la piu' veloce "
-              f"entro {VALID_TOL:.0%}, come deve essere: fa strettamente meno "
-              f"lavoro.")
+        det = ", ".join(f"{_fr(k)} {usable[k]['baseline']['rx_pps']} pps"
+                        for k in order)
+        msg = (f"la baseline e' la piu' veloce entro {VALID_TOL:.0%} in ogni "
+               f"taglia ({det}), come deve essere: fa strettamente meno "
+               f"lavoro. Le differenze oltre la tolleranza sono attribuibili "
+               f"alle pipeline.")
+        VERDICT.append(("PASS", msg))
+        print(f"  {GREEN}[PASS]{NC} {msg}")
         if close:
-            det = ", ".join(f"{m} {v}" for m, v in sorted(close.items()))
+            det = ", ".join(f"{_fr(k)} {m} {v}" for (k, m), v
+                            in sorted(close.items(), key=lambda kv: str(kv[0])))
             print(f"  {GREY}Indistinguibili da lei entro il rumore: {det}. "
                   f"Sono limitate dal generatore, non da se stesse: il "
                   f"throughput non le separa, la latenza si'.{NC}")
-        print(f"  {GREY}Le differenze oltre la tolleranza sono attribuibili "
-              f"alle pipeline.{NC}")
         return 0
     if faster:
-        det = ", ".join(f"{m} {v}" for m, v in sorted(faster.items()))
-        print(f"  {RED}[FAIL]{NC} la baseline ({base} pps) NON e' la piu' "
-              f"veloce: {det}.")
+        det = "; ".join(f"{_fr(k)}: {m} {v} contro baseline {b}"
+                        for (k, m), (v, b) in sorted(faster.items(),
+                                                     key=lambda kv: str(kv[0])))
+        msg = (f"la baseline NON e' la piu' veloce -- {det}. La baseline fa "
+               f"strettamente meno lavoro, quindi non puo' consegnare meno: "
+               f"su quelle taglie il run misura il carico della macchina e "
+               f"non il datapath, e le cifre non sono confrontabili fra "
+               f"pipeline.")
+        VERDICT.append(("FAIL", msg))
+        print(f"  {RED}[FAIL]{NC} la baseline NON e' la piu' veloce: {det}.")
         print(f"  {GREY}La baseline fa strettamente meno lavoro, quindi non "
-              f"puo' consegnare meno. Questo run misura il carico della "
-              f"macchina, non il datapath: le cifre non sono confrontabili "
-              f"fra metodi.{NC}")
+              f"puo' consegnare meno. Su quelle taglie il run misura il "
+              f"carico della macchina, non il datapath.{NC}")
+        # Quali taglie si sono salvate e' la meta' utile del referto: una
+        # contaminazione che colpisce una taglia sola non e' una proprieta'
+        # del banco, e' cio' che girava sulla macchina in quel momento.
+        if clean_frames:
+            det2 = ", ".join(_fr(k) for k in clean_frames)
+            print(f"  {GREY}Coerenti invece a: {det2}.{NC}")
     if noisy:
+        VERDICT.append(("FAIL", f"dispersione fra i giri oltre "
+                                f"{MAX_SPREAD_PCT:.0f}% su: "
+                                f"{', '.join(noisy)}. Una mediana su misure "
+                                f"che oscillano cosi' non e' una portata, e' "
+                                f"il carico della macchina in momenti "
+                                f"diversi."))
         print(f"  {RED}[FAIL]{NC} dispersione fra i giri oltre "
               f"{MAX_SPREAD_PCT:.0f}% su: {', '.join(noisy)}.")
         print(f"  {GREY}Una mediana su misure che oscillano cosi' non e' una "
@@ -4171,6 +4232,27 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
     L = []
     L.append(f"# {title}")
     L.append("")
+    # IL VERDETTO PRIMA DELLA TABELLA, sempre. Il markdown e' la forma in cui
+    # questi numeri vengono letti e citati; scriverlo senza dire che il
+    # controllo di validita' ha bocciato il run vuol dire produrre una tabella
+    # che sembra un risultato e non lo e'. Il terminale lo diceva, ma il
+    # terminale si chiude e il file resta.
+    bad = [m for e, m in VERDICT if e == "FAIL"]
+    if bad:
+        L.append("> **RUN BOCCIATO DAL CONTROLLO DI VALIDITA' -- "
+                 "le cifre qui sotto NON sono citabili.**")
+        L.append(">")
+        for m in bad:
+            L.append(f"> - {m}")
+        L.append(">")
+        L.append("> La tabella resta scritta perche' serve a capire "
+                 "*perche'* il run e' stato bocciato, non a "
+                 "riportare una portata.")
+        L.append("")
+    elif VERDICT:
+        for _, m in VERDICT:
+            L.append(f"Controllo di validita': **PASS** -- {m}")
+            L.append("")
     L.append("Traffico REALE: pktgen (TG) genera, la pipeline XDP (DUT) "
              "inferisce e redirige, un contatore XDP sull'uscita conta chi e' "
              "arrivato davvero. Nessuna cifra in questa tabella e' "
