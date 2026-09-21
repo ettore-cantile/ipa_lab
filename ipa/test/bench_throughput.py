@@ -4659,6 +4659,25 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                     tx = run[0]
                     errors = getattr(run, "errors", 0)
                     secs = (getattr(run, "window", 0.0) or run[2]) or 1e-9
+                    # Hanno consegnato TUTTE le istanze del generatore? Il
+                    # conteggio chiesto e' esatto e pktgen manda esattamente
+                    # quello, quindi un TX inferiore vuol dire che un thread
+                    # non ha lavorato -- non che la pipeline abbia perso.
+                    #
+                    # Misurato: `template` a 0,5 Mpps con TX 25 019 su 150 000
+                    # chiesti e' uscito con il 46% di "perdita del DUT". Quei
+                    # pacchetti alla pipeline non sono mai stati offerti.
+                    # WINDOW_MIN_TX_FRACTION copre lo stesso caso ma vive in
+                    # _measure_once, e questo percorso non ci passa.
+                    atteso_tx = cnt * gen.n_inst
+                    if tx < atteso_tx:
+                        warn(f"rate {rate/1e6:.2f} Mpps {m}: punto scartato "
+                             f"-- {tx} trasmessi su {atteso_tx} chiesti "
+                             f"({100.0 * tx / atteso_tx:.0f}%), cioe' una o "
+                             f"piu' istanze del generatore non hanno "
+                             f"consegnato. Cio' che manca non e' stato offerto "
+                             f"alla pipeline, quindi non e' una sua perdita.")
+                        continue
                     hit = _read_u64(setup["pkt_stats"], 0)
                     st = _read_lat_all(b)
                     rx = st["rx"]
