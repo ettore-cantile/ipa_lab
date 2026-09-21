@@ -4718,49 +4718,72 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} Mediana fra i round{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
-    hdr = (f"  {'rate':>8s} {'pipeline':11s} {'RX pps':>10s} "
+    hdr = (f"  {'chiesto':>8s} {'ottenuto':>9s} {'resa':>6s} {'pipeline':11s} "
            f"{'perdita':>8s} {'pipe T2-T1':>11s} {'e2e T3-T1':>10s} "
            f"{'xport T3-T2':>12s} {'round':>6s}")
     print(f"\n{hdr}")
     print("  " + "-" * (len(hdr) - 2))
 
-    sostenibile = {}
+    # sostenibile[m] = (rate OTTENUTO, rate chiesto) del punto piu' alto senza
+    # perdita del DUT. Si tiene l'ottenuto perche' e' l'unico dei due che il
+    # DUT ha davvero visto.
+    sostenibile, resa_min = {}, {}
     for (m, rate) in sorted(per, key=lambda k: (k[0], k[1])):
         rs = per[(m, rate)]
         loss = _median([x["loss_dut_pct"] for x in rs])
-        rxp = _median([x["rx_pps"] for x in rs])
+        rxp = _median([x["rx_pps"] for x in rs]) or 0
         pipe = _median([x["pipe_min_ns"] for x in rs])
         e2e = _median([x["e2e_min_ns"] for x in rs])
         xp = _median([x["xport_min_ns"] for x in rs])
+        resa = 100.0 * rxp / rate if rate else 0.0
         ok = loss is not None and loss <= threshold
-        if ok:
-            sostenibile[m] = max(sostenibile.get(m, 0), rate)
+        if ok and rxp > sostenibile.get(m, (0, 0))[0]:
+            sostenibile[m] = (int(rxp), rate)
+        resa_min[m] = min(resa_min.get(m, 999.0), resa)
         mark = GREEN if ok else RED
-        print(f"  {rate/1e6:7.2f}M {m:11s} {int(rxp or 0):10d} "
+        rmark = GREEN if resa >= 90 else (YELLOW if resa >= 70 else RED)
+        print(f"  {rate/1e6:7.2f}M {int(rxp)/1e6:8.2f}M "
+              f"{rmark}{resa:5.0f}%{NC} {m:11s} "
               f"{mark}{loss if loss is not None else 0:7.3f}%{NC} "
               f"{_fmt_ns(pipe):>11s} {_fmt_ns(e2e):>10s} "
               f"{_fmt_ns(xp):>12s} {len(rs):6d}")
 
-    print(f"\n{YELLOW} Throughput SOSTENIBILE (TX, HIT e RX allineati, "
-          f"perdita <= {threshold}%){NC}")
-    print("  " + "-" * 60)
+    print(f"\n{YELLOW} Throughput SOSTENIBILE -- rate OTTENUTO, non quello "
+          f"chiesto (TX = HIT = RX, perdita <= {threshold}%){NC}")
+    print("  " + "-" * 68)
     metodi = sorted({r["method"] for r in raw})
     for m in metodi:
         v = sostenibile.get(m)
         if v:
-            print(f"    {m:11s} {GREEN}{v/1e6:.2f} Mpps{NC}")
+            print(f"    {m:11s} {GREEN}>= {v[0]/1e6:.2f} Mpps{NC}  "
+                  f"{GREY}(al punto chiesto {v[1]/1e6:.2f} Mpps){NC}")
         else:
             print(f"    {m:11s} {RED}nessun rate provato e' sostenibile{NC} "
                   f"{GREY}(gia' il piu' basso perde: abbassa --rates){NC}")
+
+    # La resa: quanto di cio' che si e' chiesto e' davvero arrivato. Se resta
+    # bassa a OGNI rate, compreso il piu' basso, allora il tetto e' del
+    # generatore e nessun punto di questo sweep ha messo il DUT sotto sforzo.
+    peggiore = max(resa_min.values()) if resa_min else 0.0
+    if peggiore < 90.0:
+        warn(f"il generatore non ha mai consegnato piu' del {peggiore:.0f}% di "
+             f"quanto chiesto, nemmeno al rate piu' basso. Il tetto di questo "
+             f"sweep e' il GENERATORE, non il DUT: i numeri qui sopra dicono "
+             f"che il DUT regge almeno quel carico, non dove si romperebbe.")
     top = max((r["rate_req_pps"] for r in raw), default=0)
-    if sostenibile and max(sostenibile.values()) >= top:
-        warn(f"il rate piu' alto provato ({top/1e6:.2f} Mpps) e' ancora "
-             f"sostenibile: il massimo non e' stato raggiunto, e il "
-             f"sostenibile riportato e' un LIMITE INFERIORE. Alza --rates.")
-    print(f"\n  {GREY}Il massimo Mpps osservato NON e' il throughput della "
+    if sostenibile and all(v[1] >= top for v in sostenibile.values()):
+        warn(f"nessuna pipeline ha perso un pacchetto nemmeno al rate piu' "
+             f"alto provato ({top/1e6:.2f} Mpps chiesti): il ginocchio non e' "
+             f"stato raggiunto e ogni cifra di sostenibile e' un LIMITE "
+             f"INFERIORE. Alza --rates, o aggiungi thread al generatore.")
+    print(f"\n  {GREY}`chiesto` e' il rate offerto a pktgen, `ottenuto` "
+          f"quello davvero consegnato, `resa` il rapporto fra i due. Una resa "
+          f"bassa non e' perdita del DUT: e' carico che non e' mai partito, e "
+          f"si legge nei respinti delle righe grezze.{NC}")
+    print(f"  {GREY}Il massimo Mpps osservato NON e' il throughput della "
           f"pipeline se TX > HIT o HIT > RX: in quella zona il numero "
           f"descrive il generatore o il veth. La riga da citare e' il "
-          f"sostenibile.{NC}")
+          f"sostenibile, e va letto come un >=.{NC}")
     print(f"  {GREY}pipe = T2-T1, la pipeline sul percorso reale. "
           f"e2e = T3-T1. xport = T3-T2, cioe' redirect + veth + NAPI. "
           f"Sono MINIMI: la mediana fra i round sta nella colonna, i "
