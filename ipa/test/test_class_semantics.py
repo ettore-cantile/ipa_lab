@@ -13,6 +13,9 @@ The five configurations the datapath must handle, none of them Germany50:
   D  n_out=5, DROP=0, FORWARD on non-consecutive ports
   E  n_out different from the node's interface count
 
+Section [6] covers the other direction of the same chain: the kernel ifindex
+a packet arrived on -> the slot it occupies in the ingress_iface one-hot.
+
 Case B is the checked-in model's REAL semantics: its trained DROP class is 5
 (dataset.py maps label -1 to max(label)+1 = 5) while the datapath used to
 hardcode 6. Case B therefore doubles as a regression test for that bug.
@@ -232,8 +235,110 @@ def t_node_resolution():
         os.unlink(path)
 
 
+# ---------------------------------------------------------------------------
+class _FakeMap(dict):
+    """Una mappa BPF quanto basta a install_ingress_port_table.
+
+    BCC accetta chiavi e valori ctypes; qui si scartano, cosi' il test gira
+    senza kernel, senza BCC e senza root -- che e' il punto: la convenzione
+    ifindex -> slot e' una decisione del control plane, e va verificata dove
+    viene presa."""
+
+    @staticmethod
+    def _v(x):
+        return x.value if hasattr(x, "value") else x
+
+    def __setitem__(self, k, v):
+        super().__setitem__(self._v(k), self._v(v))
+
+
+def _node_with(ifindexes, port_to_iface):
+    """Un NodeConfig con ifindex decisi dal test.
+
+    `ifindexes[port] is None` = quella porta non esiste su questo nodo, che e'
+    il caso in cui la binding resta `present=False` e non va mappata."""
+    cfg = NC.NodeConfig(hostname="testnode", port_to_iface=dict(port_to_iface))
+    for port, iface in port_to_iface.items():
+        b = NC.PortBinding(logical_port=port, iface=iface)
+        idx = ifindexes.get(port)
+        if idx is not None:
+            b.present, b.ifindex = True, idx
+        cfg.bindings[port] = b
+    return cfg
+
+
+def t_ingress_port():
+    """ifindex del kernel -> slot del one-hot ingress_iface.
+
+    Lo specchio di install_mac_per_port. mac_table e' indicizzata dal NUMERO di
+    porta logica (0-based); ingress_port porta lo SLOT del one-hot, 1-based,
+    perche' la guardia nel datapath e' `>= 1 && <= size` e quindi lo zero --
+    cioe' l'assenza -- si legge da solo come "non e' una mia porta"."""
+    print(f"\n{YELLOW}[6] ifindex del kernel -> slot del one-hot ingress{NC_}")
+    from common import install_ingress_port_table
+
+    # Porte non contigue, come nel caso D: il modello sceglie 0, 2 e 7.
+    porte = [0, 2, 7]
+    nomi = {0: "wanA", 2: "wanB", 7: "wanC"}
+
+    # Gli ifindex sono in ordine INVERSO rispetto alle porte. Se qualcuno
+    # rifacesse la tabella ordinando gli ifindex invece di passare per il nome
+    # dell'interfaccia, la porta 7 prenderebbe lo slot 1: questo e' il caso che
+    # lo fa vedere.
+    cfg = _node_with({0: 300, 2: 42, 7: 5}, nomi)
+    b = {"ingress_port": _FakeMap()}
+    scritti = install_ingress_port_table(b, "ingress_port", cfg, porte)
+
+    check(scritti == {300: 1, 42: 2, 5: 3},
+          f"ogni ifindex configurato da' il suo slot: {scritti}")
+    check(b["ingress_port"] == {300: 1, 42: 2, 5: 3},
+          "la mappa contiene esattamente quello che la funzione dichiara")
+    check(scritti[300] == 1 and scritti[5] == 3,
+          "lo slot segue l'ordine delle PORTE, non quello degli ifindex "
+          "(ifindex 300 -> slot 1, ifindex 5 -> slot 3)")
+
+    for ifx, atteso in scritti.items():
+        got = b["ingress_port"].get(ifx, 0)
+        check(got == atteso, f"ifindex {ifx} -> slot {got} (atteso {atteso})")
+
+    for ignoto in (1, 2, 43, 299, 301, 65535):
+        check(b["ingress_port"].get(ignoto, 0) == 0,
+              f"ifindex {ignoto} non configurato -> 0, cioe' nessun bit acceso")
+
+    # Una porta che il modello puo' scegliere ma il nodo non ha resta NON
+    # mappata -- e le altre non scalano per riempire il buco: lo slot e' una
+    # proprieta' del modello, uguale su ogni nodo, o la stessa colonna di pesi
+    # vorrebbe dire porte diverse su nodi diversi.
+    cfg2 = _node_with({0: 300, 2: None, 7: 5}, nomi)
+    b2 = {"ingress_port": _FakeMap()}
+    scritti2 = install_ingress_port_table(b2, "ingress_port", cfg2, porte)
+    check(scritti2 == {300: 1, 5: 3},
+          f"porta assente sul nodo -> non mappata, le altre non scalano: {scritti2}")
+    check(3 not in b2["ingress_port"].values() or scritti2.get(5) == 3,
+          "la porta 7 tiene lo slot 3 anche se la porta 2 manca")
+
+    # Nessuna porta realizzabile: mappa vuota, e la funzione lo dichiara.
+    cfg3 = _node_with({0: None, 2: None, 7: None}, nomi)
+    b3 = {"ingress_port": _FakeMap()}
+    check(install_ingress_port_table(b3, "ingress_port", cfg3, porte) == {}
+          and b3["ingress_port"] == {},
+          "nessuna interfaccia risolta -> mappa vuota (con WARNING), non voci inventate")
+
+    # Porte contigue 0..4, il caso del modello depositato: slot = porta + 1.
+    cfg4 = _node_with({p: 200 + p for p in range(5)},
+                      {p: f"eth{p}" for p in range(5)})
+    b4 = {"ingress_port": _FakeMap()}
+    s4 = install_ingress_port_table(b4, "ingress_port", cfg4, list(range(5)))
+    check(all(s4[200 + p] == p + 1 for p in range(5)),
+          "porte contigue da 0: lo slot e' porta + 1 (il modello depositato)")
+
+    # La convenzione dell'altra direzione non e' la stessa, ed e' voluto.
+    info("mac_table resta indicizzata dal NUMERO di porta logica (0-based); "
+         "ingress_port porta lo slot del one-hot (1-based)")
+
+
 def t_label_mapping():
-    print(f"\n{YELLOW}[6] Dataset label -> class, declared not derived{NC_}")
+    print(f"\n{YELLOW}[7] Dataset label -> class, declared not derived{NC_}")
     m = identity_ports_with_drop([0, 1, 2, 3, 4], drop_label=-1, drop_class=5)
     check(m.n_out == 6, f"n_out follows the mapping ({m.n_out}), no spare class")
     check(m.verify([-1, 0, 1, 2, 3, 4], strict=False) == [],
@@ -261,7 +366,7 @@ def t_label_mapping():
 
 
 def t_codegen():
-    print(f"\n{YELLOW}[7] P1 / AOT generate the declared semantics{NC_}")
+    print(f"\n{YELLOW}[8] P1 / AOT generate the declared semantics{NC_}")
     import json
     from ebpf_program import generate_ebpf_hardcoded
     with open(os.path.join(SHARED_DIR, "weights.json")) as f:
@@ -291,7 +396,7 @@ def t_codegen():
 
 
 def t_kernel():
-    print(f"\n{YELLOW}[8] In-kernel: DROP drops, FORWARD redirects, UNUSED passes{NC_}")
+    print(f"\n{YELLOW}[9] In-kernel: DROP drops, FORWARD redirects, UNUSED passes{NC_}")
     try:
         from bcc import BPF
         import json
@@ -330,6 +435,7 @@ def main():
     t_action_table()
     t_chain_and_logging()
     t_node_resolution()
+    t_ingress_port()
     t_label_mapping()
     t_codegen()
     if a.kernel:

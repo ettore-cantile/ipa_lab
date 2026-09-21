@@ -21,6 +21,8 @@
 // Build: cc -O2 loader_aot.c -o loader_aot -lbpf
 // Run  : sudo ./loader_aot <literal.o>                 (bench: TEST_RUN)
 //        sudo ./loader_aot <literal.o> --attach <ifidx> [--xdp-mode native|generic|auto] [--node-id N]
+//              [--ingress-port IFINDEX=SLOT,...]  (ifindex del kernel -> slot del one-hot
+//              ingress_iface; senza di essa la feature non contribuisce nulla)
 //              (LIVE deploy: attach
 //              xdp_dispatch to the interface, stay resident until Ctrl-C, then
 //              detach -- the AOT alternative to method4_hardcoded's BCC attach)
@@ -53,6 +55,59 @@ static int g_attach_ifindex = -1;
  * unconfigured node claim to be node 0. That was the previous behaviour, via
  * ipa->model_id, and it is what this replaces. */
 static int g_node_id = -1;
+
+/* ifindex del kernel -> slot del one-hot ingress_iface, cosi' come lo ha
+ * risolto il control plane (common.ingress_port_slots): logical_port -> nome
+ * dell'interfaccia via NodeConfig, nome -> ifindex via if_nametoindex, e lo
+ * slot e' il RANGO della porta fra quelle che il modello puo' scegliere.
+ *
+ * Passato invece che dedotto qui perche' il .o e' costruito su una macchina di
+ * build che non sa quali ifindex il nodo assegnera', e perche' la convenzione
+ * deve avere UNA definizione sola: e' la stessa funzione Python che riempie
+ * ingress_port_t2 e ingress_port_t3 per le altre due pipeline. */
+#define MAX_INGRESS_ENTRIES 64
+static __u32 g_ingress_ifx[MAX_INGRESS_ENTRIES];
+static __u32 g_ingress_slot[MAX_INGRESS_ENTRIES];
+static int   g_n_ingress = 0;
+
+/* "207=1,209=2,..." -- ritorna 0, oppure -1 con un messaggio. */
+static int parse_ingress_ports(const char *spec) {
+    const char *p = spec;
+    while (*p) {
+        char *end;
+        long ifx = strtol(p, &end, 10);
+        if (end == p || *end != '=') {
+            fprintf(stderr, "--ingress-port: attese coppie IFINDEX=SLOT "
+                            "separate da virgola, trovato \"%s\"\n", p);
+            return -1;
+        }
+        p = end + 1;
+        long slot = strtol(p, &end, 10);
+        if (end == p) {
+            fprintf(stderr, "--ingress-port: manca lo slot dopo ifindex %ld\n", ifx);
+            return -1;
+        }
+        if (ifx <= 0 || slot < 1 || slot > 0xffff) {
+            fprintf(stderr, "--ingress-port: %ld=%ld fuori intervallo "
+                            "(ifindex > 0, slot in [1, 65535])\n", ifx, slot);
+            return -1;
+        }
+        if (g_n_ingress >= MAX_INGRESS_ENTRIES) {
+            fprintf(stderr, "--ingress-port: piu' di %d voci\n", MAX_INGRESS_ENTRIES);
+            return -1;
+        }
+        g_ingress_ifx[g_n_ingress]  = (__u32)ifx;
+        g_ingress_slot[g_n_ingress] = (__u32)slot;
+        g_n_ingress++;
+        p = end;
+        if (*p == ',') p++;
+        else if (*p) {
+            fprintf(stderr, "--ingress-port: carattere inatteso \"%s\"\n", p);
+            return -1;
+        }
+    }
+    return 0;
+}
 
 /* Set by SIGINT/SIGTERM so the live-attach deploy mode can detach cleanly. */
 static volatile sig_atomic_t g_stop = 0;
@@ -133,21 +188,39 @@ static int seed_maps(struct bpf_object *obj) {
      * ingress_iface one-hot stays empty and a trained feature contributes
      * nothing -- silently, which is how it went unnoticed for so long.
      *
-     * In --attach mode the ingress is known: it is the interface being attached
-     * to, and it is logical port 1 unless the deployment says otherwise. In
-     * bench mode there is no interface at all, so nothing is seeded and the
-     * feature is empty -- which is what the reference is told too. */
+     * La tabella arriva da --ingress-port, risolta dal control plane. Prima
+     * veniva inventata qui: una sola voce, l'interfaccia di attach, slot 1
+     * fisso, con un commento che diceva "logical port 1 unless the deployment
+     * says otherwise" -- ma non c'era modo per il deployment di dire
+     * altrimenti. Su un nodo con piu' di una porta quello e' un mapping
+     * sbagliato che non rompe niente: fa contribuire la colonna di pesi di
+     * un'altra porta. Adesso senza --ingress-port non si indovina.
+     *
+     * In bench mode non c'e' interfaccia, quindi non si semina nulla e la
+     * feature resta vuota -- che e' anche quello che viene detto al
+     * riferimento, cosi' le due parti confrontano la stessa cosa. */
     struct bpf_map *ip_map = bpf_object__find_map_by_name(obj, "ingress_port");
-    if (ip_map && g_attach_ifindex >= 0) {
-        __u32 kif = (__u32)g_attach_ifindex, port = 1;
-        if (bpf_map_update_elem(bpf_map__fd(ip_map), &kif, &port, BPF_ANY)) {
-            fprintf(stderr, "WARNING: could not seed ingress_port for ifindex "
-                            "%d (%s); the ingress_iface feature will contribute "
-                            "nothing\n", g_attach_ifindex, strerror(errno));
-        } else {
-            fprintf(stderr, "seeded ingress_port: ifindex %d -> one-hot slot %u\n",
-                    g_attach_ifindex, port);
+    if (ip_map && g_n_ingress > 0) {
+        int done = 0;
+        for (int i = 0; i < g_n_ingress; i++) {
+            if (bpf_map_update_elem(bpf_map__fd(ip_map), &g_ingress_ifx[i],
+                                    &g_ingress_slot[i], BPF_ANY)) {
+                fprintf(stderr, "WARNING: could not seed ingress_port for ifindex "
+                                "%u (%s)\n", g_ingress_ifx[i], strerror(errno));
+            } else {
+                fprintf(stderr, "seeded ingress_port: ifindex %u -> one-hot slot %u\n",
+                        g_ingress_ifx[i], g_ingress_slot[i]);
+                done++;
+            }
         }
+        if (!done)
+            fprintf(stderr, "WARNING: ingress_port is empty after seeding, so the "
+                            "ingress_iface feature contributes nothing\n");
+    } else if (ip_map && g_attach_ifindex >= 0) {
+        fprintf(stderr, "ingress_port left empty: --attach without --ingress-port, "
+                        "and which logical port an ifindex realises is a NODE fact "
+                        "this loader cannot derive. The ingress_iface one-hot "
+                        "contributes nothing to any decision.\n");
     } else if (ip_map) {
         fprintf(stderr, "ingress_port left empty (bench mode: no interface), so "
                         "the ingress_iface one-hot contributes nothing\n");
@@ -205,6 +278,9 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--attach") && i + 1 < argc) g_attach_ifindex = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--node-id") && i + 1 < argc) {
             g_node_id = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--ingress-port") && i + 1 < argc) {
+            if (parse_ingress_ports(argv[++i])) return 2;
         }
         else if (!strcmp(argv[i], "--xdp-mode") && i + 1 < argc) {
             mode_name = argv[++i];

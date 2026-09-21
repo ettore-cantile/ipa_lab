@@ -44,7 +44,8 @@ from ebpf_template_arch import (
 )
 from common import (
     load_weights, attach_xdp, detach_xdp, install_node_id, INGRESS_IFACE, resolve_ifindex,
-    install_mac_per_port, start_mac_refresh_thread,
+    install_mac_per_port, install_ingress_port_table,
+    start_mac_refresh_thread,
 )
 from link_state_monitor import init_link_state_up, start_monitor_thread
 from model_meta import (derive_shape, load_model_meta, load_topology_config,
@@ -138,6 +139,14 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         print(f"[Method 5] NOTE: {_p}")
     mac_info = install_mac_per_port(b, "mac_table_t2", node_cfg,
                                     semantics.logical_ports)
+    # The mirror of install_mac_per_port: that one answers "the model chose
+    # class k, which interface do I send out of"; this one answers "the packet
+    # arrived on interface X, which of my ports is that" -- the question the
+    # trained ingress_iface one-hot asks. Without it the map stays empty, every
+    # lookup misses, and that feature contributes nothing to any decision --
+    # silently, with the suite still green because nothing checked it did.
+    install_ingress_port_table(b, "ingress_port_t2", node_cfg,
+                               semantics.logical_ports)
     install_node_id(b, "node_id_t2", node_cfg,
                     n_nodes=load_topology_config().get("n_nodes"))
     load_class_action(b, "class_action_t2", semantics)

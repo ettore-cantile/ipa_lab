@@ -318,6 +318,37 @@ def main():
             _nid = None
         if _nid is not None:
             cmd += ["--node-id", str(_nid)]
+
+        # Kernel ifindex -> ingress_iface one-hot slot, resolved HERE and passed
+        # down, by the same function that fills ingress_port_t2/_t3 for P2 and
+        # P3 (common.ingress_port_slots). The loader used to seed one entry --
+        # the attach interface, slot 1, always -- which is right only on a node
+        # whose first model port is the one being attached to. P1 reads this map
+        # exactly as P2 and P3 do, so it needs the same table, not a guess.
+        try:
+            from common import ingress_port_slots
+            from model_meta import load_class_semantics
+            from node_config import NodeConfig
+            _sem = load_class_semantics(model_path, shape["n_out"])
+            _cfg = NodeConfig.resolve(_sem.logical_ports)
+            _slots = ingress_port_slots(_cfg, _sem.logical_ports)
+        except Exception as e:
+            _slots = {}
+            print(f"[AOT] WARNING: could not resolve the ingress-port table "
+                  f"({type(e).__name__}: {e}); the ingress_iface feature will "
+                  f"contribute nothing to any decision")
+        if _slots:
+            cmd += ["--ingress-port",
+                    ",".join(f"{ifx}={slot}" for ifx, slot in sorted(_slots.items()))]
+            for ifx, slot in sorted(_slots.items()):
+                print(f"[AOT] ingress_port: ifindex {ifx} -> one-hot slot {slot}")
+            if ifindex not in _slots:
+                print(f"[AOT] NOTE: the attach interface (ifindex {ifindex}) is not "
+                      f"one of this node's model ports, so packets arriving on it "
+                      f"set no ingress_iface bit -- which is what the feature means.")
+        else:
+            print("[AOT] WARNING: no ingress port resolved on this node, so the "
+                  "ingress_iface one-hot contributes nothing")
         rc = subprocess.run(cmd, cwd=POC_DIR).returncode
         if rc != 0:
             sys.exit(f"[AOT] loader_aot live attach failed (rc={rc})")

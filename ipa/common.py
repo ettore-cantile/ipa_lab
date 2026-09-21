@@ -24,7 +24,16 @@ import socket
 import ctypes
 import threading
 import time
-from bcc import BPF
+# BPF is used HERE only as the type annotation on attach_xdp/detach_xdp: it is
+# never called in this module. Everything else -- the map installers, the MAC
+# resolution, the node/ingress tables -- is pure userspace logic, and it is
+# where the conventions that the datapath depends on are decided. Importing bcc
+# unconditionally made that logic untestable anywhere without a kernel, root
+# and BCC, which is exactly the layer that most needs a test that runs.
+try:
+    from bcc import BPF
+except ImportError:
+    BPF = None
 
 # Default ingress interface, overridable by $IPA_IFACE. Not a lab constant:
 # every entry point also takes --iface, and this only names the interface a
@@ -276,6 +285,38 @@ def install_mac_per_port(b, table_name: str, node_cfg, logical_ports: list = Non
 # Use install_mac_per_port(b, table, node_cfg, logical_ports).
 
 
+def ingress_port_slots(node_cfg, logical_ports: list = None) -> dict:
+    """{ifindex del kernel: slot del one-hot, 1-based} -- la convenzione, sola.
+
+    Estratta perche' due percorsi di deploy devono concordare su di essa: le
+    pipeline BCC, che scrivono la mappa da Python, e il deploy AOT di P1, che
+    la scrive dal loader in C. Due implementazioni della stessa convenzione
+    sono due occasioni di divergere in silenzio, e questa e' una convenzione
+    che quando sbaglia non rompe nulla: fa solo contribuire zero a una feature
+    addestrata.
+
+    Lo slot e' il RANGO della porta fra quelle che il MODELLO puo' scegliere,
+    non il numero di porta. Con porte [0, 2, 7] gli slot sono [1, 2, 3], e
+    restano quelli anche se una di esse manca su questo nodo: la colonna di
+    pesi che lo slot seleziona e' la stessa su ogni nodo, quindi il rango non
+    puo' dipendere da quali interfacce un nodo abbia. Una porta che il modello
+    puo' scegliere ma il nodo non realizza resta semplicemente non mappata.
+
+    Il mapping NON si deduce ordinando gli ifindex: si passa per il nome
+    dell'interfaccia (NodeConfig: porta logica -> nome) e poi per
+    socket.if_nametoindex (nome -> ifindex). Gli ifindex li assegna il kernel
+    e il loro ordine non dice nulla sull'ordine delle porte.
+    """
+    ports = list(logical_ports) if logical_ports is not None \
+        else sorted(node_cfg.port_to_iface)
+    out = {}
+    for logical_idx, port in enumerate(sorted(ports), start=1):
+        ifx = node_cfg.ifindex_of(port)
+        if ifx is not None:
+            out[int(ifx)] = logical_idx
+    return out
+
+
 def install_ingress_port_table(b, map_name: str, node_cfg,
                                logical_ports: list = None) -> dict:
     """Fill `map_name` with kernel ifindex -> LOGICAL PORT, 1-based.
@@ -295,15 +336,9 @@ def install_ingress_port_table(b, map_name: str, node_cfg,
     Values are 1-based because the datapath's guard is `>= 1 && <= size`, so a
     missing entry (0) reads as "not one of my ports". Returns what was written.
     """
-    ports = list(logical_ports) if logical_ports is not None \
-        else sorted(node_cfg.port_to_iface)
-    written = {}
-    for logical_idx, port in enumerate(sorted(ports), start=1):
-        ifx = node_cfg.ifindex_of(port)
-        if ifx is None:
-            continue
+    written = ingress_port_slots(node_cfg, logical_ports)
+    for ifx, logical_idx in written.items():
         b[map_name][ctypes.c_uint32(int(ifx))] = ctypes.c_uint32(logical_idx)
-        written[int(ifx)] = logical_idx
 
     if not written:
         print(f"[ingress] WARNING: {map_name} is empty -- no logical port "
