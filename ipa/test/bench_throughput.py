@@ -4842,9 +4842,21 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
 # quello di `--mode rates`: qualunque pipeline vi aggiunge lavoro, mai lo
 # toglie, quindi questo numero e' un limite SUPERIORE per tutte.
 #
-# IL NOME. Il risultato NON e' "il throughput della pipeline" e nemmeno "il
-# throughput della macchina": e' il tetto del generatore e del veth su questo
-# banco -- `generator/veth ceiling`. Il resto del file usa quel nome.
+# IL NOME, corretto dopo il primo run vero. Non e' il tetto del GENERATORE:
+# e' il tetto del PERCORSO DI RICEZIONE -- veth RX, NAPI su un core, e il
+# consumatore piu' economico possibile.
+#
+# La differenza non e' terminologica, la dice la misura. Senza nessuna
+# pipeline, `resp` -- cioe' `veth_xmit` che risponde NET_XMIT_DROP perche' il
+# ring RX del peer e' pieno -- e' restato fra il 29 e il 49%. Ricostruendo
+# l'offerto (TX + respinti) pktgen metteva sul filo ~5,5 Mpps e il ricevitore
+# ne accettava ~3,4: il mittente aveva margine, il ricevitore no.
+#
+# Chiamarlo "generator ceiling" avrebbe attribuito al generatore un limite che
+# e' del lato che riceve, ed e' esattamente l'errore di attribuzione che
+# questa modalita' esiste per non fare. Il risultato NON e' "il throughput
+# della pipeline", NON e' "il throughput della macchina", e NON e' "quanto
+# sa generare pktgen": e' quanto questo percorso di ricezione sa assorbire.
 
 # Il contatore: incrementa e basta. Il verdetto `%(action)s` e' l'unica cosa
 # che cambia fra le due varianti.
@@ -4894,7 +4906,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
     verdict = "XDP_DROP" if rx_action == "drop" else "XDP_PASS"
 
     print(f"\n{YELLOW}{'=' * 78}{NC}")
-    print(f"{YELLOW} GENERATOR CEILING TEST{NC}")
+    print(f"{YELLOW} RECEIVE-PATH CEILING TEST{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
     info("generator mode: NESSUNA pipeline DUT caricata")
     info(f"ricevitore: solo contatore RX minimale ({verdict})")
@@ -4932,8 +4944,8 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                         window_s=window_s, warmup_s=warmup_s).attach()
 
         hdr = (f"  {'giro':>4s} {'target':>9s} {'TX':>10s} {'RX':>10s} "
-               f"{'TX Mpps':>8s} {'RX Mpps':>8s} {'resa':>6s} "
-               f"{'loss':>7s} {'resp':>7s} {'stato':>22s}")
+               f"{'offerti':>8s} {'TX Mpps':>8s} {'RX Mpps':>8s} "
+               f"{'resa':>6s} {'loss':>7s} {'resp':>7s} {'stato':>22s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
 
@@ -4977,6 +4989,12 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 rx = _percpu_sum(b["gen_rx"])
                 tx_mpps = tx / secs / 1e6
                 rx_mpps = rx / secs / 1e6
+                # Quanto il generatore metteva DAVVERO sul filo: i trasmessi
+                # piu' quelli che `veth_xmit` ha respinto perche' il ring RX
+                # del peer era pieno. E' la cifra che dice se a fermarsi sia
+                # stato il mittente o il ricevitore, e senza di essa `resp`
+                # resta una percentuale che nessuno converte.
+                offerti_mpps = (tx + errors) / secs / 1e6
                 # La resa si calcola sui RATE, non sui conteggi: e' l'unica
                 # forma indipendente dalla durata della finestra. Sotto il
                 # clamp i due modi coincidono; sopra, la finestra si allunga
@@ -5004,6 +5022,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                     round=rnd, frames=frame, window_s=round(secs, 4),
                     TX=tx, RX=rx, tx_mpps=round(tx_mpps, 4),
                     rx_mpps=round(rx_mpps, 4),
+                    offered_mpps=round(offerti_mpps, 4),
                     expected_packets=expected_nominale,
                     expected_chiesto=expected_chiesto,
                     window_capped=int(capped),
@@ -5022,8 +5041,9 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 # durata bersaglio.
                 segno = "*" if capped else " "
                 print(f"  {rnd:4d} {rate/1e6:7.2f}M{segno} {tx:10d} {rx:10d} "
-                      f"{tx_mpps:8.3f} {rx_mpps:8.3f} {resa:5.0f}% "
-                      f"{loss:6.2f}% {resp:6.2f}% {col}{stato:>22s}{NC}")
+                      f"{offerti_mpps:8.3f} {tx_mpps:8.3f} {rx_mpps:8.3f} "
+                      f"{resa:5.0f}% {loss:6.2f}% {resp:6.2f}% "
+                      f"{col}{stato:>22s}{NC}")
 
         gen.detach()
         pg_reset()
@@ -5044,11 +5064,11 @@ def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
         warn("nessun punto misurato")
         return
     print(f"\n{YELLOW}{'=' * 78}{NC}")
-    print(f"{YELLOW} Generator ceiling summary{NC}")
+    print(f"{YELLOW} Receive-path ceiling summary{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
-    hdr = (f"  {'target':>8s} {'TX Mpps':>9s} {'RX Mpps':>9s} "
-           f"{'min RX':>8s} {'max RX':>8s} {'TX/target':>10s} "
-           f"{'loss':>7s} {'giri':>5s}")
+    hdr = (f"  {'target':>8s} {'offerti':>9s} {'TX Mpps':>9s} "
+           f"{'RX Mpps':>9s} {'min RX':>8s} {'max RX':>8s} "
+           f"{'TX/target':>10s} {'loss':>7s} {'giri':>5s}")
     print(f"\n{hdr}")
     print("  " + "-" * (len(hdr) - 2))
 
@@ -5062,6 +5082,7 @@ def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
         rs = per_rate[t]
         rxs = [x["rx_mpps"] for x in rs]
         txm = _median([x["tx_mpps"] for x in rs]) or 0.0
+        offm = _median([x.get("offered_mpps") for x in rs]) or 0.0
         rxm = _median(rxs) or 0.0
         resa = _median([x["tx_achievement"] for x in rs]) or 0.0
         loss = _median([x["loss_percent"] for x in rs]) or 0.0
@@ -5071,8 +5092,9 @@ def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
             best_tx, best_tx_at = txm, t
         rmark = GREEN if resa >= 0.99 else (YELLOW if resa >= 0.7 else RED)
         lmark = GREEN if loss <= threshold else RED
-        print(f"  {t:7.2f}M {txm:9.3f} {rxm:9.3f} {min(rxs):8.3f} "
-              f"{max(rxs):8.3f} {rmark}{resa * 100:9.0f}%{NC} "
+        print(f"  {t:7.2f}M {offm:9.3f} {txm:9.3f} {rxm:9.3f} "
+              f"{min(rxs):8.3f} {max(rxs):8.3f} "
+              f"{rmark}{resa * 100:9.0f}%{NC} "
               f"{lmark}{loss:6.2f}%{NC} {len(rs):5d}")
 
     print(f"\n  {YELLOW}Maximum achieved RX rate: {best_rx:.2f} Mpps{NC} "
@@ -5113,7 +5135,7 @@ def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
               f"oppure resta sotto "
               f"{MAX_WINDOW_PKTS / WINDOW_S / 1e6:.2f} Mpps di target.{NC}")
     elif resa_top >= 0.99 and loss_top <= threshold:
-        warn(f"generator ceiling not reached; highest tested target "
+        warn(f"receive-path ceiling not reached; highest tested target "
              f"({top:.2f} Mpps) is still achievable. Increase --rates to "
              f"determine a higher ceiling.")
     else:
@@ -5130,7 +5152,12 @@ def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
             print(f"  {GREY}Il generatore smette di seguire il target da "
                   f"{primo:.2f} Mpps in su.{NC}")
 
-    print(f"\n  {GREY}TX = pacchetti che pktgen dichiara trasmessi. "
+    print(f"\n  {GREY}`offerti` = (TX + respinti) / finestra, cioe' quanto "
+          f"il generatore metteva davvero sul filo. TX = quanti ne ha "
+          f"accettati il veth. La differenza fra le due colonne e' la "
+          f"backpressure del RICEVITORE: se `offerti` supera stabilmente TX, "
+          f"a fermarsi non e' il mittente.{NC}")
+    print(f"  {GREY}TX = pacchetti che pktgen dichiara trasmessi. "
           f"RX = pacchetti contati all'ingresso del lato DUT. "
           f"`resp` = respinti da veth_xmit a coda piena: sono carico offerto "
           f"e MAI trasmesso, quindi restano fuori da TX e da loss.{NC}")
@@ -5170,7 +5197,7 @@ def _confronto_con_rates(out_dir, ceiling_rx):
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} Confronto con --mode rates (letto da {path}){NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
-    print(f"\n  Generator control:")
+    print(f"\n  Receive-path control (nessuna pipeline):")
     print(f"      maximum achieved RX = {ceiling_rx:.2f} Mpps")
     print(f"\n  Pipeline benchmark (massimo RX senza perdita del DUT):")
     for m in sorted(per, key=lambda k: -per[k]):
