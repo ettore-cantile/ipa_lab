@@ -4665,6 +4665,12 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                     offered = tx + errors
                     persi_coda = max(0, tx - hit)
                     persi_dopo = max(0, hit - rx)
+                    # HIT > TX: il DUT ha elaborato piu' di quanto il
+                    # generatore dichiari per questa finestra. Non e' una
+                    # perdita negativa da tagliare a zero, e' la coda della
+                    # finestra PRECEDENTE che non aveva finito di atterrare:
+                    # DRAIN_S non basta a questo rate. La riga resta, marcata.
+                    residui = max(0, hit - tx)
                     loss = (round(100.0 * (persi_coda + persi_dopo) / offered, 3)
                             if offered else 0.0)
                     resp = (round(100.0 * errors / offered, 3)
@@ -4675,7 +4681,7 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                         tx=tx, hit=hit, rx=rx, gen_errors=errors,
                         offered_tx=offered, tx_minus_hit=persi_coda,
                         hit_minus_rx=persi_dopo, respinti_pct=resp,
-                        loss_dut_pct=loss,
+                        loss_dut_pct=loss, residui_finestra=residui,
                         rx_pps=int(rx / secs), tx_pps=int(tx / secs),
                         rx_mbps=round(rx * frame * 8 / secs / 1e6, 2),
                         samples=st["pipe"]["n"] if st["pipe"] else 0)
@@ -4688,6 +4694,12 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                         row[f"{nome}_n"] = v["n"]
                     raw.append(row)
 
+                    if residui:
+                        warn(f"rate {rate/1e6:.2f} Mpps {m}: HIT ({hit}) > TX "
+                             f"({tx}) di {residui} pacchetti -- residui della "
+                             f"finestra precedente, il drenaggio non basta a "
+                             f"questo rate. La riga non e' confrontabile con "
+                             f"le altre.")
                     mark = (GREEN if loss <= threshold else
                             (RED if loss > 1 else YELLOW))
                     print(f"  {rate/1e6:7.2f}M {m:11s} {tx:9d} {hit:9d} "
@@ -4727,7 +4739,7 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
     # sostenibile[m] = (rate OTTENUTO, rate chiesto) del punto piu' alto senza
     # perdita del DUT. Si tiene l'ottenuto perche' e' l'unico dei due che il
     # DUT ha davvero visto.
-    sostenibile, resa_min = {}, {}
+    sostenibile, resa_min, ottenuti = {}, {}, {}
     for (m, rate) in sorted(per, key=lambda k: (k[0], k[1])):
         rs = per[(m, rate)]
         loss = _median([x["loss_dut_pct"] for x in rs])
@@ -4740,6 +4752,7 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
         if ok and rxp > sostenibile.get(m, (0, 0))[0]:
             sostenibile[m] = (int(rxp), rate)
         resa_min[m] = min(resa_min.get(m, 999.0), resa)
+        ottenuti.setdefault(m, []).append((rate, rxp))
         mark = GREEN if ok else RED
         rmark = GREEN if resa >= 90 else (YELLOW if resa >= 70 else RED)
         print(f"  {rate/1e6:7.2f}M {int(rxp)/1e6:8.2f}M "
@@ -4764,6 +4777,22 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
     # La resa: quanto di cio' che si e' chiesto e' davvero arrivato. Se resta
     # bassa a OGNI rate, compreso il piu' basso, allora il tetto e' del
     # generatore e nessun punto di questo sweep ha messo il DUT sotto sforzo.
+    # Il consegnato cresce col chiesto? Se no, non e' una funzione del carico
+    # offerto: e' rumore del generatore, e allora il `sostenibile` qui sopra e'
+    # il massimo fra punti rumorosi, cioe' il piu' fortunato dei sei.
+    non_mono = []
+    for m, coppie in ottenuti.items():
+        v = [rx for _, rx in sorted(coppie)]
+        if len(v) > 1 and not all(v[i] <= v[i + 1] for i in range(len(v) - 1)):
+            non_mono.append(m)
+    if non_mono:
+        warn(f"il rate CONSEGNATO non cresce col rate chiesto su: "
+             f"{', '.join(sorted(non_mono))}. Non e' quindi una funzione del "
+             f"carico offerto ma rumore del generatore, e il `sostenibile` "
+             f"qui sopra e' il massimo fra punti rumorosi -- il piu' "
+             f"fortunato, non una soglia. Vale come \"il DUT ha retto almeno "
+             f"questo\", non come capacita' misurata.")
+
     peggiore = max(resa_min.values()) if resa_min else 0.0
     if peggiore < 90.0:
         warn(f"il generatore non ha mai consegnato piu' del {peggiore:.0f}% di "
@@ -4790,6 +4819,313 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
           f"percentili nel CSV.{NC}")
     print(f"  {GREY}Build STRUMENTATA: due bpf_ktime_get_ns e due scritture "
           f"per pacchetto che il datapath di produzione non fa.{NC}")
+
+
+# ==========================================================================
+# MODALITA' GENERATOR: il tetto del banco, misurato senza il banco sotto test
+# ==========================================================================
+# E' un CONTROLLO, non una misura del datapath. Risponde a una domanda sola:
+#
+#     quanti pacchetti al secondo riesce davvero a consegnare
+#     pktgen -> veth -> lato DUT, su questa macchina?
+#
+# Serve a leggere `--mode rates`. Li' nessuna pipeline ha mai perso un
+# pacchetto fino a 4 Mpps CHIESTI, ma il consegnato si fermava fra 1,3 e 1,8
+# Mpps: senza questo controllo non si puo' dire se quel tetto sia del
+# generatore o delle pipeline. Qui le pipeline non ci sono proprio, quindi
+# tutto cio' che resta e' generatore e veth.
+#
+# ISOLAMENTO. Non si costruisce il NetnsFabric, non si compila nessuna
+# pipeline, non si registra nessun modello, non si scrive nessuna mac_table.
+# Si crea la sola coppia veth d'ingresso e le si attacca un contatore di nove
+# istruzioni. Il percorso misurato e' percio' un SOTTOINSIEME stretto di
+# quello di `--mode rates`: qualunque pipeline vi aggiunge lavoro, mai lo
+# toglie, quindi questo numero e' un limite SUPERIORE per tutte.
+#
+# IL NOME. Il risultato NON e' "il throughput della pipeline" e nemmeno "il
+# throughput della macchina": e' il tetto del generatore e del veth su questo
+# banco -- `generator/veth ceiling`. Il resto del file usa quel nome.
+
+# Il contatore: incrementa e basta. Il verdetto `%(action)s` e' l'unica cosa
+# che cambia fra le due varianti.
+GEN_COUNTER_SRC = """
+#include <uapi/linux/bpf.h>
+BPF_PERCPU_ARRAY(gen_rx, __u64, 1);
+int xdp_gen_count(struct xdp_md *ctx) {
+    int k = 0;
+    __u64 *v = gen_rx.lookup(&k);
+    if (v) *v += 1;
+    return %(action)s;
+}
+"""
+
+# Perche' il default e' XDP_DROP e non XDP_PASS.
+#
+# XDP_PASS consegna il pacchetto allo STACK DI RETE: allocazione dell'skb,
+# netif_receive_skb, e da li' in su. E' lavoro che nel percorso vero non c'e'
+# -- in `--mode rates` il pacchetto viene rediretto, mai passato allo stack --
+# e costa piu' dell'inferenza di qualunque pipeline. Misurare il tetto con
+# XDP_PASS darebbe quindi un numero PIU' BASSO di quello che le pipeline
+# vedono, cioe' un "limite superiore" sotto ai valori che dovrebbe limitare:
+# inutilizzabile come controllo.
+#
+# XDP_DROP libera il pacchetto subito ed e' la stessa scelta gia' fatta per
+# attach_rx_counter, per la stessa ragione. Chi vuole comunque misurare col
+# passaggio allo stack ha `--rx-action pass`, e sa che sta misurando un'altra
+# cosa.
+GEN_RX_ACTIONS = ("drop", "pass")
+
+
+def _pct(a, b):
+    return (100.0 * a / b) if b else 0.0
+
+
+def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
+                  plan=None, threaded_napi=True, xmit_mode="start_xmit",
+                  window_s=WINDOW_S, warmup_s=DEFAULT_WARMUP_S,
+                  threshold=DEFAULT_LOSS_THRESHOLD, clone=0, burst=0,
+                  rx_action="drop"):
+    """pktgen -> veth -> contatore. Nessuna pipeline, nessuna inferenza."""
+    from bcc import BPF
+    from common import attach_xdp
+
+    plan = plan or plan_cpus(threads=threads)
+    rates = list(rates or [int(r * 1e6) for r in DEFAULT_RATES_MPPS])
+    verdict = "XDP_DROP" if rx_action == "drop" else "XDP_PASS"
+
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} GENERATOR CEILING TEST{NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+    info("generator mode: NESSUNA pipeline DUT caricata")
+    info(f"ricevitore: solo contatore RX minimale ({verdict})")
+    info("percorso misurato: pktgen -> veth -> contatore RX")
+    if rx_action == "pass":
+        warn("--rx-action pass: il pacchetto va allo STACK DI RETE, che nel "
+             "percorso vero non viene mai attraversato. Il tetto che ne esce "
+             "e' piu' basso di quello che le pipeline vedono, e non e' un "
+             "limite superiore per loro.")
+
+    n_gen, n_dut = len(plan.gen), len(plan.dut)
+    rx_dev, tx_dev, _ = make_shared_tg_link(n_gen, max(n_dut, n_gen))
+    info(f"coppia veth {rx_dev} (lato DUT, porta il contatore) <- {tx_dev} "
+         f"(lato generatore)")
+
+    b = BPF(text=GEN_COUNTER_SRC % {"action": verdict})
+    fn = b.load_func("xdp_gen_count", BPF.XDP)
+    napi_devs, raw = [], []
+    try:
+        attach_xdp(b, fn, rx_dev)
+        info(f"contatore agganciato a {rx_dev}: il conteggio avviene "
+             f"ALL'INGRESSO del lato DUT, nello stesso punto in cui "
+             f"`--mode rates` mette il dispatcher della pipeline")
+        if threaded_napi:
+            napi_devs = [rx_dev]
+            if enable_threaded_napi(napi_devs, plan):
+                info("NAPI in thread: generatore e ricevitore su core separati")
+            else:
+                napi_devs = []
+                warn("nessun thread NAPI pinnato: generatore e ricevitore "
+                     "restano sullo stesso core")
+
+        gen = Generator([tx_dev], plan, xmit_mode=xmit_mode,
+                        topology="shared", clone=clone, burst=burst,
+                        window_s=window_s, warmup_s=warmup_s).attach()
+
+        hdr = (f"  {'giro':>4s} {'target':>8s} {'TX':>10s} {'RX':>10s} "
+               f"{'TX Mpps':>8s} {'RX Mpps':>8s} {'resa':>6s} "
+               f"{'loss':>7s} {'resp':>7s} {'stato':>22s}")
+        print(f"\n{hdr}")
+        print("  " + "-" * (len(hdr) - 2))
+
+        for rnd in range(1, rounds + 1):
+            for rate in rates:
+                delay = gen.delay_for(rate)
+                cnt = gen.window_count(rate)
+                # Quanti se ne sono CHIESTI davvero. Non `rate * window_s`:
+                # window_count taglia agli estremi, quindi ai rate bassi il
+                # conteggio chiesto non e' il prodotto nominale, e dividere
+                # per il prodotto darebbe una resa sopra il 100%.
+                expected = cnt * gen.n_inst
+                gen.warmup(frame, delay)
+                time.sleep(DRAIN_S)
+                b["gen_rx"].clear()
+                try:
+                    run = gen.run(frame, cnt, delay)
+                except PktgenEmptyRun as e:
+                    warn(f"giro {rnd} target {rate/1e6:.2f} Mpps: punto "
+                         f"scartato -- {e}")
+                    continue
+                time.sleep(DRAIN_S)
+
+                tx = run[0]
+                errors = getattr(run, "errors", 0)
+                secs = (getattr(run, "window", 0.0) or run[2]) or 1e-9
+                rx = _percpu_sum(b["gen_rx"])
+                tx_mpps = tx / secs / 1e6
+                rx_mpps = rx / secs / 1e6
+                resa = _pct(tx, expected)
+                loss = _pct(max(0, tx - rx), tx)
+                resp = _pct(errors, tx + errors)
+
+                # Lo stato dice DOVE si e' fermato, non quanto e' andato bene.
+                if loss > threshold:
+                    stato, col = "RX_LOSS", RED
+                elif resa < 99.0:
+                    stato, col = "GENERATOR_BACKPRESSURE", YELLOW
+                else:
+                    stato, col = "OK", GREEN
+
+                raw.append(dict(
+                    mode="generator", rate_target_mpps=round(rate / 1e6, 3),
+                    round=rnd, frames=frame, window_s=round(secs, 4),
+                    TX=tx, RX=rx, tx_mpps=round(tx_mpps, 4),
+                    rx_mpps=round(rx_mpps, 4), expected_packets=expected,
+                    tx_achievement=round(resa / 100.0, 4),
+                    loss_percent=round(loss, 4),
+                    resp_percent=round(resp, 4), gen_errors=errors,
+                    threads=gen.n_inst,
+                    cpu_generator=",".join(str(c) for c in plan.gen),
+                    cpu_dut=",".join(str(c) for c in plan.dut),
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    commit=_cmd_line(["git", "-C", SHARED_DIR, "rev-parse",
+                                      "--short", "HEAD"]),
+                    rx_action=verdict, status=stato))
+                print(f"  {rnd:4d} {rate/1e6:7.2f}M {tx:10d} {rx:10d} "
+                      f"{tx_mpps:8.3f} {rx_mpps:8.3f} {resa:5.0f}% "
+                      f"{loss:6.2f}% {resp:6.2f}% {col}{stato:>22s}{NC}")
+
+        gen.detach()
+        pg_reset()
+    finally:
+        if napi_devs:
+            disable_threaded_napi(napi_devs)
+        _detach(rx_dev)
+        del_tg_links(1)
+        del b
+
+    _report_generator(raw, rates, threshold)
+    return raw
+
+
+def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
+    """Mediane per target, il tetto osservato, e cosa NON dice."""
+    if not raw:
+        warn("nessun punto misurato")
+        return
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} Generator ceiling summary{NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+    hdr = (f"  {'target':>8s} {'TX Mpps':>9s} {'RX Mpps':>9s} "
+           f"{'min RX':>8s} {'max RX':>8s} {'TX/target':>10s} "
+           f"{'loss':>7s} {'giri':>5s}")
+    print(f"\n{hdr}")
+    print("  " + "-" * (len(hdr) - 2))
+
+    per_rate = {}
+    for r in raw:
+        per_rate.setdefault(r["rate_target_mpps"], []).append(r)
+
+    best_rx = best_tx = 0.0
+    best_rx_at = best_tx_at = None
+    for t in sorted(per_rate):
+        rs = per_rate[t]
+        rxs = [x["rx_mpps"] for x in rs]
+        txm = _median([x["tx_mpps"] for x in rs]) or 0.0
+        rxm = _median(rxs) or 0.0
+        resa = _median([x["tx_achievement"] for x in rs]) or 0.0
+        loss = _median([x["loss_percent"] for x in rs]) or 0.0
+        if rxm > best_rx:
+            best_rx, best_rx_at = rxm, t
+        if txm > best_tx:
+            best_tx, best_tx_at = txm, t
+        rmark = GREEN if resa >= 0.99 else (YELLOW if resa >= 0.7 else RED)
+        lmark = GREEN if loss <= threshold else RED
+        print(f"  {t:7.2f}M {txm:9.3f} {rxm:9.3f} {min(rxs):8.3f} "
+              f"{max(rxs):8.3f} {rmark}{resa * 100:9.0f}%{NC} "
+              f"{lmark}{loss:6.2f}%{NC} {len(rs):5d}")
+
+    print(f"\n  {YELLOW}Maximum achieved RX rate: {best_rx:.2f} Mpps{NC} "
+          f"{GREY}(al target {best_rx_at:.2f} Mpps){NC}")
+    print(f"  {YELLOW}Maximum achieved TX rate: {best_tx:.2f} Mpps{NC} "
+          f"{GREY}(al target {best_tx_at:.2f} Mpps){NC}")
+    print(f"  {GREY}E' il massimo OSSERVATO in questo test, non il limite "
+          f"assoluto della macchina: fuori da questo intervallo di target "
+          f"non e' stato misurato niente.{NC}")
+
+    # Il tetto e' stato raggiunto? Lo dice l'ultimo target provato.
+    top = max(per_rate)
+    rs = per_rate[top]
+    resa_top = _median([x["tx_achievement"] for x in rs]) or 0.0
+    loss_top = _median([x["loss_percent"] for x in rs]) or 0.0
+    print("")
+    if resa_top >= 0.99 and loss_top <= threshold:
+        warn(f"generator ceiling not reached; highest tested target "
+             f"({top:.2f} Mpps) is still achievable. Increase --rates to "
+             f"determine a higher ceiling.")
+    else:
+        dove = ("perdita sul lato RX" if loss_top > threshold
+                else "backpressure del generatore")
+        print(f"  {GREEN}Saturazione osservata{NC}: al target piu' alto "
+              f"({top:.2f} Mpps) la resa e' {resa_top * 100:.0f}% e la perdita "
+              f"{loss_top:.2f}% -- {dove}.")
+        # Dove comincia: il primo target in cui la resa scende sotto il 99%.
+        primo = next((t for t in sorted(per_rate)
+                      if (_median([x["tx_achievement"]
+                                   for x in per_rate[t]]) or 0) < 0.99), None)
+        if primo is not None:
+            print(f"  {GREY}Il generatore smette di seguire il target da "
+                  f"{primo:.2f} Mpps in su.{NC}")
+
+    print(f"\n  {GREY}TX = pacchetti che pktgen dichiara trasmessi. "
+          f"RX = pacchetti contati all'ingresso del lato DUT. "
+          f"`resp` = respinti da veth_xmit a coda piena: sono carico offerto "
+          f"e MAI trasmesso, quindi restano fuori da TX e da loss.{NC}")
+    print(f"  {GREY}TX < RX non e' possibile per costruzione; TX > RX e' "
+          f"perdita del veth o del ricevitore -- NON di una pipeline, che in "
+          f"questa modalita' non esiste.{NC}")
+
+
+def _confronto_con_rates(out_dir, ceiling_rx):
+    """Accosta il tetto ai valori gia' misurati da --mode rates, se ci sono.
+
+    Legge `rates_raw.csv` e basta: nessuna classifica, nessun vincitore,
+    nessun ricalcolo. Serve a vedere se le cifre delle pipeline stanno sotto
+    il tetto -- cioe' se sono compatibili con l'ipotesi che a limitarle sia il
+    generatore e non se stesse."""
+    if not out_dir:
+        return
+    path = os.path.join(out_dir, "rates_raw.csv")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            righe = list(csv.DictReader(f))
+    except OSError:
+        return
+    per = {}
+    for r in righe:
+        try:
+            if float(r.get("loss_dut_pct") or 0) > DEFAULT_LOSS_THRESHOLD:
+                continue
+            m, v = r["method"], float(r["rx_pps"]) / 1e6
+        except (KeyError, ValueError):
+            continue
+        per[m] = max(per.get(m, 0.0), v)
+    if not per:
+        return
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} Confronto con --mode rates (letto da {path}){NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+    print(f"\n  Generator control:")
+    print(f"      maximum achieved RX = {ceiling_rx:.2f} Mpps")
+    print(f"\n  Pipeline benchmark (massimo RX senza perdita del DUT):")
+    for m in sorted(per, key=lambda k: -per[k]):
+        print(f"      {m:11s} >= {per[m]:.2f} Mpps")
+    print(f"\n  {GREY}Nessuna classifica e nessun vincitore: le due colonne "
+          f"servono a una cosa sola, vedere se i valori delle pipeline sono "
+          f"COMPATIBILI con il tetto del generatore. Se ci stanno tutti "
+          f"sotto e nessuna pipeline perdeva, allora a limitarle era il "
+          f"generatore e il loro ginocchio non e' stato raggiunto.{NC}")
 
 
 def check_validity(rows):
@@ -5437,6 +5773,22 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
 
 
 # ==========================================================================
+def _rates_from(a):
+    """La lista dei rate in pps, da --rates o dal default. Una funzione sola
+    perche' `rates` e `generator` devono accettare esattamente la stessa
+    sintassi: confrontarli a liste diverse non avrebbe senso."""
+    if not a.rates:
+        return [int(r * 1e6) for r in DEFAULT_RATES_MPPS]
+    try:
+        rates = [int(float(x) * 1e6) for x in a.rates.split(",") if x.strip()]
+    except ValueError:
+        sys.exit(f"--rates: attesi numeri in Mpps separati da virgola, "
+                 f"ricevuto {a.rates!r}")
+    if not rates or min(rates) <= 0:
+        sys.exit("--rates: servono rate positivi")
+    return sorted(rates)
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("USO")[0].strip(),
@@ -5445,7 +5797,14 @@ def main():
     p.add_argument("--rates", default=None, metavar="LISTA",
                    help="modalita' rates: rate offerti in Mpps, separati da "
                         "virgola (default: 0.1,0.2,0.4,0.6,0.8,1,1.2,1.5,2)")
-    p.add_argument("--mode", choices=("compare", "saturate", "rates"),
+    p.add_argument("--rx-action", choices=GEN_RX_ACTIONS, default="drop",
+                   help="modalita' generator: cosa fa il contatore RX col "
+                        "pacchetto. drop (default) lo libera subito ed e' il "
+                        "solo modo di ottenere un limite SUPERIORE; pass lo "
+                        "consegna allo stack, che nel percorso vero non viene "
+                        "mai attraversato.")
+    p.add_argument("--mode", choices=("compare", "saturate", "rates",
+                                      "generator"),
                    default="saturate",
                    help="compare: stesso rate offerto per tutte le pipeline, "
                         "e' il confronto. saturate (default): rate crescente "
@@ -5659,18 +6018,29 @@ def main():
         # deve uscire 0 solo perche' il CSV e' stato scritto.
         return rc
 
+    if a.mode == "generator":
+        # Nessuna pipeline viene caricata: tutte le chiamate a build_pipeline
+        # e _load_instrumented stanno dentro le ALTRE modalita', e questo ramo
+        # ritorna prima di raggiungerle.
+        raw = run_generator(
+            frame=frames[0] if frames else 64, rates=sorted(_rates_from(a)),
+            rounds=a.rounds, threads=plan.threads, plan=plan,
+            threaded_napi=not a.no_threaded_napi, xmit_mode=a.xmit_mode,
+            window_s=a.duration, warmup_s=a.warmup,
+            threshold=a.loss_threshold, clone=a.clone_skb, burst=a.burst,
+            rx_action=a.rx_action)
+        if raw:
+            _confronto_con_rates(a.out, max(r["rx_mpps"] for r in raw))
+        if a.out and raw:
+            os.makedirs(a.out, exist_ok=True)
+            _write_csv(os.path.join(a.out, "generator_ceiling.csv"), raw)
+            write_env(a.out, env_finale())
+            _give_back(a.out)
+        _closing_note(plan)
+        return rc
+
     if a.mode == "rates":
-        if a.rates:
-            try:
-                rates = [int(float(x) * 1e6)
-                         for x in a.rates.split(",") if x.strip()]
-            except ValueError:
-                sys.exit(f"--rates: attesi numeri in Mpps separati da "
-                         f"virgola, ricevuto {a.rates!r}")
-            if not rates or min(rates) <= 0:
-                sys.exit("--rates: servono rate positivi")
-        else:
-            rates = [int(r * 1e6) for r in DEFAULT_RATES_MPPS]
+        rates = _rates_from(a)
         raw = run_rates(
             methods, model_path, frame=frames[0] if frames else 64,
             rates=sorted(rates), rounds=a.rounds, threads=plan.threads,
