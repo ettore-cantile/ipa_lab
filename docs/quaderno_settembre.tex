@@ -1791,6 +1791,119 @@ Su Germany50, dove la differenza è fra 614 e 1\,071 istruzioni a parità di
 velocità, è una scelta legittima in entrambe le direzioni. Su una rete dieci
 volte più grande non lo è più.
 
+\section{Congelare quali porte esistono}
+
+La sezione precedente congela \emph{dove} il nodo si trova. Questa congela
+\emph{quante interfacce ha}, che è una cosa diversa e si presta a un equivoco
+che vale la pena togliere di mezzo subito.
+
+Il modello riserva sei colonne per \texttt{link\_state} perché sei è il grado
+del nodo \textbf{più connesso} della rete. Ma su Germany50 i gradi vanno da 2 a
+5, la media è 3,52, e \textbf{nessun nodo arriva a sei}. Su un nodo di grado 3
+le tre colonne restanti non sono link caduti: dietro non c'è alcuna
+interfaccia. Valgono zero adesso, varranno zero sempre.
+
+\begin{lezione}
+Non si congela il \textbf{valore} della feature, si congela la sua
+\textbf{struttura}.
+
+Se un link sia su o giù resta letto a runtime, esattamente come prima. Quello
+che diventa noto alla compilazione è \emph{quali posizioni possono esistere}.
+\end{lezione}
+
+Il generatore prende l'insieme delle porte presenti e non emette affatto le
+colonne che restano fuori. Il termine che sparisce è
+$\texttt{link\_state}[i] \cdot w[j][i]$ con $\texttt{link\_state}[i]$ nullo: la
+somma è fra interi a 64 bit, quindi togliere un addendo nullo non cambia un
+bit. Gli offset dei pesi non si spostano, l'ordine delle feature non cambia,
+$n_{\text{in}}$ resta quello del modello.
+
+\subsection*{Quanto costa una colonna che non serve}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{porte presenti} & 2 & 3 & 4 & 5 & 6 \\
+\midrule
+istruzioni eBPF & \textbf{546} & 564 & 582 & 598 & 614 \\
+latenza         & 54 & 47 & 58 & 49 & 53 ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le istruzioni scendono in modo lineare e pulito: gli scarti sono $+18$, $+18$,
+$+16$, $+16$, cioè \textbf{17 istruzioni per porta}. Un nodo di grado 2 porta
+l'\textbf{11,1\,\%} di programma in meno di uno di grado 6.
+
+La latenza non si muove. Non è nemmeno monotona, e l'escursione è del 23\,\% su
+un valore intorno ai 50 ns.
+
+\begin{lezione}
+Fra grado 6 e grado 2 spariscono \textbf{sedici} moltiplicazioni-accumulo, che
+a 3,2\,GHz valgono all'incirca 5 ns. Il rumore di questo banco è il doppio.
+
+L'effetto c'è nel codice ed è sotto la risoluzione della misura: la riduzione
+di dimensione è dimostrata, il guadagno di tempo \textbf{no}.
+\end{lezione}
+
+\subsection*{Un'aspettativa smentita}
+
+Mi aspettavo il contrario, e vale la pena dire perché. Nel caso del nodo il
+tempo non cambia per un motivo chiaro: lo switch ha 52 casi ma ne esegue
+\emph{uno}, quindi quelle 208 assegnazioni sono codice mai eseguito.
+\texttt{link\_state} è invece un vettore \textbf{denso}: quelle
+moltiplicazioni vengono eseguite davvero, a ogni pacchetto. Sembrava dovesse
+seguirne un guadagno visibile.
+
+Il ragionamento è corretto ma la conclusione no: sono sedici operazioni su
+circa 979 istruzioni per pacchetto. Il meccanismo è reale, la sua ampiezza è
+trascurabile.
+
+\subsection*{Il controllo, che è servito davvero}
+
+Il confronto è fra due programmi che differiscono \emph{solo} per questo: il
+nodo è congelato in entrambi. Ottanta casi --- dieci valori di TTL per otto
+configurazioni di link realizzabili --- danno la stessa classe in tutti.
+
+Ma quel numero, da solo, non dimostra niente. Se quelle colonne non spostassero
+mai la decisione, «le due versioni concordano» sarebbe vero anche per una
+specializzazione \textbf{sbagliata}. Serve un controllo al contrario: accendere
+uno slot che sul nodo non esiste, e pretendere che a quel punto le due
+divergano.
+
+Al primo tentativo quel controllo è rimasto \textbf{muto}. Non per un difetto
+del codice: una colonna di \texttt{link\_state} contribuisce $1 \cdot w$ a un
+accumulatore che ne somma 65, e su quei pesi non ribaltava mai l'argmax. È una
+proprietà dei \emph{pesi}, non della specializzazione. Cercando fra più semi
+del generatore di pesi il controllo morde --- 29 divergenze --- e solo a quel
+punto l'ottanta su ottanta diventa una prova.
+
+\begin{lezione}
+Un test che passa anche quando la sua ipotesi è violata non sta verificando
+l'ipotesi. Il primo run era \textbf{inconcludente}, non positivo, e il banco
+adesso fallisce invece di annotarlo in giallo.
+\end{lezione}
+
+\subsection*{Il controllo sull'asse}
+
+Le altre tre pipeline non specializzano nulla, quindi lungo questo asse devono
+restare ferme --- e lo sono: 1\,071, 14\,985 e 12\,349 istruzioni su tutti e
+cinque i punti, con 319 pesi ovunque. L'asse di per sé non costa niente, quindi
+la pendenza della riga specializzata viene da lì e da nient'altro.
+
+Vale anche il contrario: a sei porte il programma generato è \textbf{identico
+byte per byte} a quello non specializzato. I 457 punti di distacco che a
+Germany50 separano le due P1 sono quindi interamente la one-hot del nodo, e
+niente affatto le porte.
+
+\subsection*{Quello che resta da misurare}
+
+L'incrocio con la sparsità. Con pesi quasi tutti nulli il compilatore cancella
+già per conto suo parte di quelle moltiplicazioni, e i due effetti potrebbero
+non sommarsi --- è esattamente quello che succede fra nodo congelato e
+sparsità, dove al 90\,\% di zeri il divario sparisce.
+
 \section{Due larghezze, due risposte opposte}
 
 Questa coppia di figure è il risultato che preferisco di tutta l'analisi, perché

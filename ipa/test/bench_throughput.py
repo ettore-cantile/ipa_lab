@@ -2080,33 +2080,74 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
 # lo stesso anchor usato per il timestamp.
 LAT_DECLS_SRC = r"""
 BPF_PERCPU_ARRAY(ts_in, __u64, 1);
+/* T2: l'ultimo istante in cui il pacchetto e' ancora della pipeline, subito
+ * prima del redirect. Vive nella stessa cella per-CPU di ts_in e per lo stesso
+ * motivo: fra la scrittura e la lettura non si cambia core.
+ *
+ * Qui si SCRIVE e basta -- una ktime e una update, niente accumulo. I conti si
+ * fanno in xdp_lat_count, che gira sul programma d'uscita e non sul percorso
+ * misurato: mettere li' le somme tiene la pipeline al costo piu' basso
+ * possibile, che e' il punto di tutta la misura. */
+BPF_PERCPU_ARRAY(ts_mid, __u64, 1);
 /* 0 = quanti, 1 = somma ns, 2 = minimo, 3 = massimo */
-BPF_PERCPU_ARRAY(lat_acc, __u64, 4);
+BPF_PERCPU_ARRAY(lat_acc, __u64, 4);      /* T3 - T1: end-to-end */
+BPF_PERCPU_ARRAY(pipe_acc, __u64, 4);     /* T2 - T1: la pipeline */
+BPF_PERCPU_ARRAY(xport_acc, __u64, 4);    /* T3 - T2: redirect + veth + NAPI */
+/* Pacchetti arrivati all'uscita, CONTATI SEMPRE -- anche quando i timestamp
+ * non ci sono. Senza questo, RX sarebbe "quanti ne ho cronometrati", e un
+ * pacchetto arrivato ma non misurabile sarebbe finito in HIT-RX come se la
+ * pipeline l'avesse perso. */
+BPF_PERCPU_ARRAY(rx_n, __u64, 1);
 /* Istogramma logaritmico: la cella i raccoglie [2^i, 2^(i+1)) ns. Serve per i
  * PERCENTILI, perche' media e massimo su una VM non dicono niente -- misurato:
  * media ~2000 ns con minimo 250 e massimo 10,6 ms, cioe' un singolo valore
  * enorme che trascina la media. */
 BPF_PERCPU_ARRAY(lat_hist, __u64, LAT_BUCKETS);   /* log2: [2^i, 2^(i+1)) */
+BPF_PERCPU_ARRAY(pipe_hist, __u64, LAT_BUCKETS);
+BPF_PERCPU_ARRAY(xport_hist, __u64, LAT_BUCKETS);
+"""
+
+# Un accumulo (quanti / somma / min / max) piu' l'istogramma log2, scritto una
+# volta come macro perche' le tre misure devono essere trattate IDENTICAMENTE:
+# tre copie a mano avrebbero potuto divergere su un dettaglio, e una differenza
+# fra T3-T1 e T2-T1 dovuta al modo di contarle sarebbe indistinguibile da una
+# differenza vera.
+LAT_ACCUM_MACRO = r"""
+#define IPA_ACCUM(ACC, HIST, D) do {                                  \
+    __u64 _d = (D);                                                   \
+    __u32 _bk = bpf_log2l(_d);                                        \
+    if (_bk >= LAT_BUCKETS) _bk = LAT_BUCKETS - 1;                    \
+    int _bi = (int)_bk;                                               \
+    __u64 *_hb = HIST.lookup(&_bi); if (_hb) *_hb += 1;               \
+    int _k = 0;                                                       \
+    __u64 *_n = ACC.lookup(&_k); if (_n) *_n += 1;                    \
+    _k = 1; __u64 *_sm = ACC.lookup(&_k); if (_sm) *_sm += _d;        \
+    _k = 2; __u64 *_mn = ACC.lookup(&_k);                             \
+    if (_mn && (*_mn == 0 || _d < *_mn)) *_mn = _d;                   \
+    _k = 3; __u64 *_mx = ACC.lookup(&_k); if (_mx && _d > *_mx) *_mx = _d; \
+} while (0)
 """
 
 LAT_COUNTER_SRC = r"""
 int xdp_lat_count(struct xdp_md *ctx) {
     int z = 0;
     __u64 now = bpf_ktime_get_ns();
+
+    /* Arrivato: contato comunque, timestamp o no. */
+    __u64 *rn = rx_n.lookup(&z); if (rn) *rn += 1;
+
     __u64 *t0 = ts_in.lookup(&z);
-    if (t0 && *t0 && now > *t0) {
-        __u64 d = now - *t0;
-        __u32 bk = bpf_log2l(d);
-        if (bk >= LAT_BUCKETS) bk = LAT_BUCKETS - 1;
-        int bi = (int)bk;
-        __u64 *hb = lat_hist.lookup(&bi); if (hb) *hb += 1;
-        int k = 0;
-        __u64 *n = lat_acc.lookup(&k); if (n) *n += 1;
-        k = 1; __u64 *sm = lat_acc.lookup(&k); if (sm) *sm += d;
-        k = 2; __u64 *mn = lat_acc.lookup(&k);
-        if (mn && (*mn == 0 || d < *mn)) *mn = d;
-        k = 3; __u64 *mx = lat_acc.lookup(&k); if (mx && d > *mx) *mx = d;
-    }
+    __u64 *t1 = ts_mid.lookup(&z);
+    __u64 a = t0 ? *t0 : 0;
+    __u64 m = t1 ? *t1 : 0;
+
+    /* T3 - T1: end-to-end sul percorso reale. */
+    if (a && now > a) IPA_ACCUM(lat_acc, lat_hist, now - a);
+    /* T2 - T1: la pipeline soltanto. */
+    if (a && m && m > a) IPA_ACCUM(pipe_acc, pipe_hist, m - a);
+    /* T3 - T2: quello che viene DOPO la pipeline. */
+    if (m && now > m) IPA_ACCUM(xport_acc, xport_hist, now - m);
+
     return XDP_DROP;
 }
 """
@@ -2115,6 +2156,22 @@ int xdp_lat_count(struct xdp_md *ctx) {
 # programma ha il pacchetto in mano.
 LAT_STAMP = ("\n    { int _lz = 0; __u64 _lt = bpf_ktime_get_ns();\n"
              "      ts_in.update(&_lz, &_lt); }\n")
+
+# T2: l'ultimo istante della pipeline. Va inserito PRIMA della riga del
+# redirect, quindi dopo la riscrittura dei MAC e dopo ogni contatore -- cioe'
+# dopo l'ultima operazione che la pipeline fa sul pacchetto.
+#
+# L'ancora e' `return bpf_redirect(`, che compare ESATTAMENTE UNA VOLTA nel
+# sorgente generato di tutte e quattro le pipeline (verificato: baseline, P1,
+# template, modular). Il conteggio viene asserito prima di sostituire, cosi'
+# una pipeline che domani ne avesse due fa fallire la build strumentata invece
+# di misurare meta' dei pacchetti.
+#
+# Il pacchetto non viene toccato: si scrive solo una cella per-CPU.
+LAT_STAMP_MID = ("{ int _mz = 0; __u64 _mt = bpf_ktime_get_ns();\n"
+                 "          ts_mid.update(&_mz, &_mt); }\n"
+                 "        ")
+LAT_REDIRECT_ANCHOR = "return bpf_redirect("
 
 # Istogramma LOGARITMICO, 40 celle: la cella i raccoglie [2^i, 2^(i+1)) ns,
 # quindi si copre da 1 ns a ~18 minuti.
@@ -2168,9 +2225,58 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
             f"non trovo il punto d'ingresso '{anchor}' nel sorgente di "
             f"{method} (trovato {src.count(anchor)} volte). E' cambiata la "
             f"firma del dispatcher?")
+    n_red = src.count(LAT_REDIRECT_ANCHOR)
+    if n_red != 1:
+        raise RuntimeError(
+            f"il sorgente di {method} ha {n_red} siti di redirect, non 1: "
+            f"T2 andrebbe messo in {n_red} punti e la misura coprirebbe solo "
+            f"una parte dei pacchetti. Rivedi LAT_STAMP_MID prima di usare "
+            f"questa modalita'.")
+    # Le DICHIARAZIONI vanno prima di ogni funzione che le usa. Con il solo T1
+    # bastava metterle davanti al dispatcher, perche' il marcatore stava li'.
+    # T2 sta al redirect, e in `modular` il redirect e' dentro
+    # ml_argmax_forward, che nel sorgente viene PRIMA del dispatcher: ancorarle
+    # al dispatcher le avrebbe messe dopo il loro primo uso, e clang si sarebbe
+    # fermato su `ts_mid undeclared` -- lo stesso inciampo gia' descritto sopra
+    # per ts_in, in un punto diverso.
+    #
+    # Si ancorano quindi alla PRIMA funzione XDP del sorgente, che viene dopo
+    # gli #include e i tipi del kernel (che servono) e prima di qualunque
+    # corpo di funzione (che le usa).
+    # NB: niente parentesi chiusa nel pattern. `ml_argmax_forward` di P3 ha
+    # la firma spezzata su piu' righe -- `int f(struct xdp_md *ctx, void
+    # *data, void *data_end,` -- e un pattern che pretendeva `)` la
+    # saltava, ancorando le dichiarazioni al dispatcher, che in quel
+    # sorgente viene DOPO il redirect. Cioe' esattamente il difetto che
+    # questo blocco esiste per evitare.
+    first_fn = re.search(r"^int \w+\(struct xdp_md ", src, re.M)
+    if not first_fn:
+        raise RuntimeError(
+            f"nessuna funzione XDP nel sorgente di {method}: non so dove "
+            f"mettere le dichiarazioni della strumentazione.")
     defines = f"#define LAT_BUCKETS {LAT_BUCKETS}\n"
-    src = src.replace(anchor,
-                      defines + LAT_DECLS_SRC + "\n" + anchor + LAT_STAMP)
+    head = defines + LAT_DECLS_SRC + LAT_ACCUM_MACRO + "\n"
+    src = src[:first_fn.start()] + head + src[first_fn.start():]
+
+    # T1 all'ingresso, T2 al redirect.
+    src = src.replace(anchor, anchor + LAT_STAMP, 1)
+    src = src.replace(LAT_REDIRECT_ANCHOR,
+                      LAT_STAMP_MID + LAT_REDIRECT_ANCHOR, 1)
+
+    # Controllo finale: ogni mappa della strumentazione dev'essere dichiarata
+    # prima del suo primo uso. E' il difetto che questa funzione ha gia' avuto
+    # due volte, quindi non si lascia scoprire a clang.
+    for m in ("ts_in", "ts_mid", "lat_acc", "pipe_acc", "xport_acc",
+              "lat_hist", "pipe_hist", "xport_hist", "rx_n"):
+        decl = src.find(f"BPF_PERCPU_ARRAY({m},")
+        uso = min((p for p in (src.find(f"{m}."), src.find(f"IPA_ACCUM({m}"),
+                               src.find(f", {m},")) if p >= 0), default=-1)
+        if decl < 0 or (uso >= 0 and uso < decl):
+            raise RuntimeError(
+                f"{method}: la mappa `{m}` verrebbe usata (offset {uso}) prima "
+                f"di essere dichiarata (offset {decl}). clang si fermerebbe "
+                f"con 'undeclared identifier'.")
+
     return src + "\n" + LAT_COUNTER_SRC, weights, scale
 
 
@@ -2252,8 +2358,13 @@ def _map_extra_ingress(setup, ifindexes):
         ing[ct.c_uint32(idx)] = ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
 
 
-def _read_lat(b):
+def _read_lat(b, acc="lat_acc", hist="lat_hist"):
     """Statistiche di latenza, sommando le celle per-CPU.
+
+    `acc`/`hist` scelgono QUALE delle tre misure leggere: end-to-end
+    (lat_*), pipeline (pipe_*) o trasporto (xport_*). Sono la stessa
+    struttura, riempita dalla stessa macro, quindi si leggono con lo stesso
+    codice -- ed e' il motivo per cui la macro esiste.
 
     Restituisce un dizionario con min, p50, p90, p99, media, max e quanti
     campioni hanno sforato l'istogramma. I percentili vengono dai bucket;
@@ -2262,7 +2373,7 @@ def _read_lat(b):
     La MEDIA e' riportata ma non va usata per concludere: su questa VM un
     singolo valore da 10 ms fra 100 000 campioni la sposta di piu' di quanto la
     differenza fra due pipeline. I percentili no."""
-    acc = b["lat_acc"]
+    acc = b[acc]
     n = sum(int(v) for v in acc[ct.c_int(0)])
     if not n:
         return None
@@ -2270,7 +2381,7 @@ def _read_lat(b):
     mins = [int(v) for v in acc[ct.c_int(2)] if int(v) > 0]
     maxs = [int(v) for v in acc[ct.c_int(3)]]
 
-    hist = b["lat_hist"]
+    hist = b[hist]
     buckets = [sum(int(v) for v in hist[ct.c_int(i)])
                for i in range(LAT_BUCKETS)]
     over = buckets[-1]          # oltre 2^39 ns: praticamente mai
@@ -2294,6 +2405,32 @@ def _read_lat(b):
                 lat_p50_ns=pct(0.50), lat_p90_ns=pct(0.90),
                 lat_p99_ns=pct(0.99), lat_avg_ns=tot // n,
                 lat_max_ns=max(maxs), over=over)
+
+
+# Le tre misure, con i nomi che il report usa.
+LAT_TRIPLE = (("pipe", "pipe_acc", "pipe_hist"),      # T2 - T1
+              ("e2e", "lat_acc", "lat_hist"),         # T3 - T1
+              ("xport", "xport_acc", "xport_hist"))   # T3 - T2
+
+
+def _read_lat_all(b):
+    """Le tre latenze piu' RX vero, in un colpo.
+
+    RX viene da `rx_n`, non dal numero di campioni cronometrati: un pacchetto
+    arrivato ma senza timestamp valido e' arrivato lo stesso, e contarlo fra i
+    persi attribuirebbe alla pipeline una perdita del banco."""
+    out = {"rx": sum(int(v) for v in b["rx_n"][ct.c_int(0)])}
+    for nome, acc, hist in LAT_TRIPLE:
+        st = _read_lat(b, acc, hist)
+        out[nome] = st
+    return out
+
+
+def _clear_lat(b):
+    for _, acc, hist in LAT_TRIPLE:
+        b[acc].clear()
+        b[hist].clear()
+    b["rx_n"].clear()
 
 
 def run_latency(method, model_path, frames, delays, count, threads,
@@ -4335,6 +4472,269 @@ def run_compare(methods, model_path, frames, offered_pps=None,
 VERDICT = []
 
 
+# ==========================================================================
+# RATE SWEEP: dove il sistema smette di stare dietro, e chi dei tre e' il collo
+# ==========================================================================
+# La domanda a cui questa modalita' risponde NON e' "quanti Mpps fa la
+# pipeline". A massima spinta il generatore e il veth sono saturi, e il numero
+# che esce descrive loro. La domanda e': fino a che rate offerto TX, HIT e RX
+# restano allineati?
+#
+# Sotto quel rate il sistema non perde, e le tre latenze descrivono il
+# percorso vero. Sopra, il massimo osservato non e' un throughput di pipeline:
+# e' il tetto del banco, e va detto invece che citato.
+DEFAULT_RATES_MPPS = (0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0)
+
+
+def _sane(st):
+    """Le tre statistiche in forma stampabile, anche quando mancano."""
+    if not st:
+        return dict(n=0, min=None, p50=None, p90=None, p99=None)
+    return dict(n=st["n"], min=st["lat_min_ns"], p50=st["lat_p50_ns"],
+                p90=st["lat_p90_ns"], p99=st["lat_p99_ns"])
+
+
+def _median(vals):
+    import statistics as _s
+    vals = [v for v in vals if v is not None]
+    return _s.median(vals) if vals else None
+
+
+def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
+              threads=1, plan=None, threaded_napi=True,
+              xmit_mode="start_xmit", threshold=DEFAULT_LOSS_THRESHOLD,
+              window_s=WINDOW_S, warmup_s=DEFAULT_WARMUP_S,
+              topology="shared", clone=0, burst=0):
+    """Tutte le pipeline, stesso fabric e stesso generatore, a rate crescente.
+
+    Usa le build STRUMENTATE: sono le uniche che portano T1, T2 e T3, quindi i
+    numeri di throughput qui sono un limite INFERIORE di quelli di produzione.
+    Il confronto fra pipeline resta valido perche' tutte pagano la stessa
+    strumentazione.
+    """
+    from netns_fabric import NetnsFabric
+    from common import attach_xdp
+
+    plan = plan or plan_cpus(threads=threads)
+    sem, n_out = class_semantics()
+    rates = list(rates or [int(r * 1e6) for r in DEFAULT_RATES_MPPS])
+    raw = []
+
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Fase 1: compilo e carico le pipeline strumentate "
+              f"(nessuna misura in corso){NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        loaded, lat_fns = {}, {}
+        for m in methods:
+            try:
+                setup, lat_fn = _load_instrumented(m, model_path, fab, sem)
+                loaded[m], lat_fns[m] = setup, lat_fn
+                info(f"{m}: caricata (T1, T2, T3)")
+            except Exception as e:
+                warn(f"{m}: non caricata, la salto -- {type(e).__name__}: {e}")
+        if not loaded:
+            warn("nessuna pipeline caricata")
+            return []
+
+        ing = build_ingress(fab, plan, topology, False)
+        for setup in loaded.values():
+            _map_extra_ingress(setup, ing.ifindexes)
+        gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
+        gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
+                        topology=ing.topology, clone=clone, burst=burst,
+                        window_s=window_s, warmup_s=warmup_s).attach()
+
+        def use(method):
+            """Questa pipeline sull'ingresso, e il SUO contatore sulle uscite.
+
+            attach_xdp sostituisce senza staccare: staccare smonterebbe la
+            NAPI e con lei il modo a thread, cioe' la separazione fra le CPU
+            che rende comparabili i punti."""
+            setup = loaded[method]
+            with _quiet():
+                for peer in fab.peer_of.values():
+                    attach_xdp(setup["b"], lat_fns[method], peer)
+                for dev in ing.dut_devs:
+                    attach_xdp(setup["b"], setup["disp"], dev)
+            return setup
+
+        use(next(iter(loaded)))
+        napi_devs = []
+        if threaded_napi:
+            napi_devs = list(ing.dut_devs)
+            if enable_threaded_napi(napi_devs, plan):
+                info("NAPI in thread: generatore e DUT su core separati")
+            else:
+                napi_devs = []
+                warn("nessun thread NAPI pinnato: generatore e pipeline "
+                     "restano sullo stesso core")
+
+        # sonda: una pipeline che non fa HIT non sta facendo inferenza
+        alive = []
+        for m in list(loaded):
+            setup = use(m)
+            _zero_counters(setup, setup["b"]["rx_n"], n_out)
+            _clear_lat(setup["b"])
+            try:
+                gen.run(frame, 1000, gen.delay_for(100_000))
+            except PktgenEmptyRun:
+                pass
+            time.sleep(DRAIN_S)
+            if _read_u64(setup["pkt_stats"], 0) == 0:
+                warn(f"{m}: la sonda non produce HIT -- la escludo invece di "
+                     f"misurarle il costo di non fare inferenza")
+                continue
+            alive.append(m)
+        if not alive:
+            warn("nessuna pipeline ha superato la sonda")
+            gen.detach(); ing.cleanup()
+            return []
+
+        print(f"\n{YELLOW} Fase 2: sweep -- {len(rates)} rate x "
+              f"{len(alive)} pipeline x {rounds} round, frame {frame} B{NC}")
+        hdr = (f"  {'rate':>8s} {'pipeline':11s} {'TX':>9s} {'HIT':>9s} "
+               f"{'RX':>9s} {'TX-HIT':>8s} {'HIT-RX':>8s} {'resp':>7s} "
+               f"{'perdita':>8s} {'pipe':>7s} {'e2e':>7s} {'xport':>7s}")
+        print(f"\n{hdr}")
+        print("  " + "-" * (len(hdr) - 2))
+
+        for rnd in range(rounds):
+            # Ordine alternato: se una pipeline soffrisse solo per essere
+            # sempre la prima (cache fredda) o sempre l'ultima (macchina
+            # scaldata), invertendo l'ordine la differenza si vede.
+            seq = alive if rnd % 2 == 0 else list(reversed(alive))
+            for rate in rates:
+                delay = gen.delay_for(rate)
+                cnt = gen.window_count(rate)
+                for m in seq:
+                    setup = use(m)
+                    b = setup["b"]
+                    gen.warmup(frame, delay)
+                    time.sleep(DRAIN_S)
+                    _zero_counters(setup, b["rx_n"], n_out)
+                    _clear_lat(b)
+                    try:
+                        run = gen.run(frame, cnt, delay)
+                    except PktgenEmptyRun as e:
+                        warn(f"rate {rate/1e6:.2f} Mpps {m}: punto scartato "
+                             f"-- {e}")
+                        continue
+                    time.sleep(DRAIN_S)
+
+                    tx = run[0]
+                    errors = getattr(run, "errors", 0)
+                    secs = (getattr(run, "window", 0.0) or run[2]) or 1e-9
+                    hit = _read_u64(setup["pkt_stats"], 0)
+                    st = _read_lat_all(b)
+                    rx = st["rx"]
+                    offered = tx + errors
+                    persi_coda = max(0, tx - hit)
+                    persi_dopo = max(0, hit - rx)
+                    loss = (round(100.0 * (persi_coda + persi_dopo) / offered, 3)
+                            if offered else 0.0)
+                    resp = (round(100.0 * errors / offered, 3)
+                            if offered else 0.0)
+                    row = dict(
+                        round=rnd, method=m, frame=frame,
+                        rate_req_pps=rate, delay_ns=delay, secs=round(secs, 3),
+                        tx=tx, hit=hit, rx=rx, gen_errors=errors,
+                        offered_tx=offered, tx_minus_hit=persi_coda,
+                        hit_minus_rx=persi_dopo, respinti_pct=resp,
+                        loss_dut_pct=loss,
+                        rx_pps=int(rx / secs), tx_pps=int(tx / secs),
+                        rx_mbps=round(rx * frame * 8 / secs / 1e6, 2),
+                        samples=st["pipe"]["n"] if st["pipe"] else 0)
+                    for nome in ("pipe", "e2e", "xport"):
+                        v = _sane(st[nome])
+                        row[f"{nome}_min_ns"] = v["min"]
+                        row[f"{nome}_p50_ns"] = v["p50"]
+                        row[f"{nome}_p90_ns"] = v["p90"]
+                        row[f"{nome}_p99_ns"] = v["p99"]
+                        row[f"{nome}_n"] = v["n"]
+                    raw.append(row)
+
+                    mark = (GREEN if loss <= threshold else
+                            (RED if loss > 1 else YELLOW))
+                    print(f"  {rate/1e6:7.2f}M {m:11s} {tx:9d} {hit:9d} "
+                          f"{rx:9d} {persi_coda:8d} {persi_dopo:8d} "
+                          f"{resp:6.2f}% {mark}{loss:7.3f}%{NC} "
+                          f"{_fmt_ns(row['pipe_min_ns']):>7s} "
+                          f"{_fmt_ns(row['e2e_min_ns']):>7s} "
+                          f"{_fmt_ns(row['xport_min_ns']):>7s}")
+
+        gen.detach()
+        pg_reset()
+        if napi_devs:
+            disable_threaded_napi(napi_devs)
+        ing.cleanup()
+
+    _report_rates(raw, threshold)
+    return raw
+
+
+def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
+    """Mediana fra i round, e il rate sostenibile per ciascuna pipeline."""
+    if not raw:
+        return
+    per = {}
+    for r in raw:
+        per.setdefault((r["method"], r["rate_req_pps"]), []).append(r)
+
+    print(f"\n{YELLOW}{'=' * 78}{NC}")
+    print(f"{YELLOW} Mediana fra i round{NC}")
+    print(f"{YELLOW}{'=' * 78}{NC}")
+    hdr = (f"  {'rate':>8s} {'pipeline':11s} {'RX pps':>10s} "
+           f"{'perdita':>8s} {'pipe T2-T1':>11s} {'e2e T3-T1':>10s} "
+           f"{'xport T3-T2':>12s} {'round':>6s}")
+    print(f"\n{hdr}")
+    print("  " + "-" * (len(hdr) - 2))
+
+    sostenibile = {}
+    for (m, rate) in sorted(per, key=lambda k: (k[0], k[1])):
+        rs = per[(m, rate)]
+        loss = _median([x["loss_dut_pct"] for x in rs])
+        rxp = _median([x["rx_pps"] for x in rs])
+        pipe = _median([x["pipe_min_ns"] for x in rs])
+        e2e = _median([x["e2e_min_ns"] for x in rs])
+        xp = _median([x["xport_min_ns"] for x in rs])
+        ok = loss is not None and loss <= threshold
+        if ok:
+            sostenibile[m] = max(sostenibile.get(m, 0), rate)
+        mark = GREEN if ok else RED
+        print(f"  {rate/1e6:7.2f}M {m:11s} {int(rxp or 0):10d} "
+              f"{mark}{loss if loss is not None else 0:7.3f}%{NC} "
+              f"{_fmt_ns(pipe):>11s} {_fmt_ns(e2e):>10s} "
+              f"{_fmt_ns(xp):>12s} {len(rs):6d}")
+
+    print(f"\n{YELLOW} Throughput SOSTENIBILE (TX, HIT e RX allineati, "
+          f"perdita <= {threshold}%){NC}")
+    print("  " + "-" * 60)
+    metodi = sorted({r["method"] for r in raw})
+    for m in metodi:
+        v = sostenibile.get(m)
+        if v:
+            print(f"    {m:11s} {GREEN}{v/1e6:.2f} Mpps{NC}")
+        else:
+            print(f"    {m:11s} {RED}nessun rate provato e' sostenibile{NC} "
+                  f"{GREY}(gia' il piu' basso perde: abbassa --rates){NC}")
+    top = max((r["rate_req_pps"] for r in raw), default=0)
+    if sostenibile and max(sostenibile.values()) >= top:
+        warn(f"il rate piu' alto provato ({top/1e6:.2f} Mpps) e' ancora "
+             f"sostenibile: il massimo non e' stato raggiunto, e il "
+             f"sostenibile riportato e' un LIMITE INFERIORE. Alza --rates.")
+    print(f"\n  {GREY}Il massimo Mpps osservato NON e' il throughput della "
+          f"pipeline se TX > HIT o HIT > RX: in quella zona il numero "
+          f"descrive il generatore o il veth. La riga da citare e' il "
+          f"sostenibile.{NC}")
+    print(f"  {GREY}pipe = T2-T1, la pipeline sul percorso reale. "
+          f"e2e = T3-T1. xport = T3-T2, cioe' redirect + veth + NAPI. "
+          f"Sono MINIMI: la mediana fra i round sta nella colonna, i "
+          f"percentili nel CSV.{NC}")
+    print(f"  {GREY}Build STRUMENTATA: due bpf_ktime_get_ns e due scritture "
+          f"per pacchetto che il datapath di produzione non fa.{NC}")
+
+
 def check_validity(rows):
     """La baseline deve essere la piu' veloce. Se non lo e', il run e' sporco.
 
@@ -4985,7 +5385,10 @@ def main():
         description=__doc__.split("USO")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--method", choices=list(METHODS) + ["all"], default="all")
-    p.add_argument("--mode", choices=("compare", "saturate"),
+    p.add_argument("--rates", default=None, metavar="LISTA",
+                   help="modalita' rates: rate offerti in Mpps, separati da "
+                        "virgola (default: 0.1,0.2,0.4,0.6,0.8,1,1.2,1.5,2)")
+    p.add_argument("--mode", choices=("compare", "saturate", "rates"),
                    default="saturate",
                    help="compare: stesso rate offerto per tutte le pipeline, "
                         "e' il confronto. saturate (default): rate crescente "
@@ -5197,6 +5600,33 @@ def main():
         # Il codice di uscita e' quello del controllo: un run in cui la
         # baseline non e' la piu' veloce, o in cui la dispersione sfonda, non
         # deve uscire 0 solo perche' il CSV e' stato scritto.
+        return rc
+
+    if a.mode == "rates":
+        if a.rates:
+            try:
+                rates = [int(float(x) * 1e6)
+                         for x in a.rates.split(",") if x.strip()]
+            except ValueError:
+                sys.exit(f"--rates: attesi numeri in Mpps separati da "
+                         f"virgola, ricevuto {a.rates!r}")
+            if not rates or min(rates) <= 0:
+                sys.exit("--rates: servono rate positivi")
+        else:
+            rates = [int(r * 1e6) for r in DEFAULT_RATES_MPPS]
+        raw = run_rates(
+            methods, model_path, frame=frames[0] if frames else 64,
+            rates=sorted(rates), rounds=a.rounds, threads=plan.threads,
+            plan=plan, threaded_napi=not a.no_threaded_napi,
+            xmit_mode=a.xmit_mode, threshold=a.loss_threshold,
+            window_s=a.duration, warmup_s=a.warmup, topology=a.gen_topology,
+            clone=a.clone_skb, burst=a.burst)
+        if a.out and raw:
+            os.makedirs(a.out, exist_ok=True)
+            _write_csv(os.path.join(a.out, "rates_raw.csv"), raw)
+            write_env(a.out, env_finale())
+            _give_back(a.out)
+        _closing_note(plan)
         return rc
 
     if a.mode == "compare":

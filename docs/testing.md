@@ -183,25 +183,51 @@ che a quel punto divergano. Senza, il test sarebbe compatibile con una
 specializzazione sbagliata — se quelle colonne non spostano mai l'argmax,
 «concordano» è vero comunque.
 
-Il primo run reale (2026-09-21, porte `{0,1,4}`) è finito esattamente lì:
+Il primo run (2026-09-21, porte `{0,1,4}`) è finito esattamente lì — 80/80 ma
+controllo muto — cioè **inconcludente**, non positivo: sul seme di default
+quelle colonne non spostavano mai l'argmax. Non è il codice, sono i **pesi**:
+una colonna di `link_state` contribuisce `1 × w` a un accumulatore che ne somma
+65. Il controllo ora prova più semi del pool e **fallisce** se nessuno morde;
+il seme diverso vale solo per il controllo, la misura resta sul pool di sempre.
+Con il seme 123 morde, e l'esito è:
 
 ```
 80/80 casi identici (ttl 2-11 x 8 pattern realizzabili).
-controllo negativo muto: nemmeno accendendo uno slot assente le due divergono.
+controllo negativo: accendendo uno slot assente le due divergono in 29 casi
+(pool seed 123) -- la condizione "slot assenti a 0" e' portante.
 ```
 
-Cioè **inconcludente**, non positivo. La causa non è il codice ma i pesi: una
-colonna di `link_state` contribuisce `1 × w` a un accumulatore che ne somma 65,
-e può non ribaltare l'argmax. Il controllo ora prova più semi del pool
-(42, 1, 2, 3, 7, 123, 999) e **fallisce** se nessuno morde, invece di stampare
-una nota. Il seme diverso vale solo per il controllo: la misura resta sul pool
-di sempre, o l'asse cambierebbe due cose insieme.
+### Risultati dell'asse `degree` (2026-09-21, 4 vCPU, modello 65-4-4-7)
 
-> Stato: **nessuna misura di costo raccolta.** Il generatore è verificato sul C
-> prodotto (conteggio dei termini, invarianza degli offset, non-regressione
-> byte per byte contro HEAD); istruzioni, JIT e latenza non sono ancora state
-> misurate, e l'interazione con l'asse `sparsity` nemmeno. La correttezza in
-> kernel è verificata solo a metà, finché il controllo negativo non morde.
+| porte presenti | `p1_static` istruzioni | latenza |
+|---|---|---|
+| 2 | 546 | 54,0 ns |
+| 3 | 564 | 47,0 ns |
+| 4 | 582 | 58,0 ns |
+| 5 | 598 | 49,0 ns |
+| 6 | 614 | 53,0 ns |
+
+**Istruzioni: 17 per porta**, lineare (delta +18, +18, +16, +16). Grado 2 contro
+grado 6: **−11,1 %**.
+
+**Latenza: nessuna tendenza.** Non monotona, escursione del 23 % su ~50 ns.
+Fra grado 6 e grado 2 spariscono 16 moltiplicazioni-accumulo, ~5 ns a 3,2 GHz:
+**sotto il rumore di questo banco**, non risolvibile qui.
+
+> Era stato previsto il contrario — che, essendo `link_state` denso e non una
+> one-hot, togliere colonne avrebbe spostato la latenza dove congelare il nodo
+> non la sposta. La misura dice di no, a questa risoluzione. Resta vero il
+> meccanismo (quelle moltiplicazioni vengono davvero eseguite), ma sono 16 su
+> ~979 istruzioni.
+
+**Il controllo è riuscito**: `hardcoded` 1 071, `template` 14 985 e `modular`
+12 349 su **tutti e cinque i punti**, con 319 pesi ovunque. L'asse di per sé non
+costa nulla, quindi la pendenza della colonna `p1_static` viene da
+`static_ports` e da nient'altro.
+
+> Ancora da misurare: l'interazione con l'asse `sparsity`. Con pesi molto
+> sparsi clang cancella già parte di quel lavoro, e i due effetti potrebbero
+> non sommarsi — come successo in C6 fra nodo congelato e sparsità.
 
 ### Verifier standalone (equivalente al gate di dispatch)
 

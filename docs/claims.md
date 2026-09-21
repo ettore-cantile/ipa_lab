@@ -91,7 +91,7 @@ scheda lo dice invece di nasconderlo.
 
 ---
 
-### A6 — Non generare le colonne delle porte assenti non cambia la decisione ⏳
+### A6 — Non generare le colonne delle porte assenti non cambia la decisione ✅
 
 | | |
 |---|---|
@@ -101,9 +101,9 @@ scheda lo dice invece di nasconderlo.
 | **Metrica** | La classe scelta e il valore di ritorno XDP, su tutti i pattern di link realizzabili × TTL 2-11. |
 | **Condizione dichiarata** | L'equivalenza vale finché gli slot senza interfaccia valgono 0. È garantito da `link_state_monitor`: `carrier_state()` ritorna 0 per un'interfaccia inesistente, al seed e a ogni poll. **Non** vale sotto `verify_prog_run._seed_link_state`, che semina 1 ovunque — il test azzera esplicitamente gli slot assenti nel riferimento. |
 | **Controllo negativo** | Accendendo uno slot assente le due build **devono** divergere. Un test che passa anche così non starebbe verificando la condizione: se quelle colonne non spostano mai l'argmax, «le due concordano» è vero anche per una specializzazione sbagliata. |
-| **Risultato, primo run (2026-09-21)** | **Inconcludente.** 80/80 casi identici (TTL 2-11 × 8 pattern realizzabili, porte {0,1,4}) **ma controllo negativo muto**: su quei pesi nemmeno accendere uno slot assente cambia la decisione. Il 80/80 non è quindi una prova, ed è registrato qui come tale. |
-| **Perché era muto** | Una colonna di `link_state` contribuisce `1 × w` a un accumulatore che somma 65 colonne: può benissimo non ribaltare l'argmax. È una proprietà dei **pesi**, non del codice. Il controllo ora cerca fra più semi del pool (42, 1, 2, 3, 7, 123, 999) e, se nessuno morde, **fallisce** invece di annotare. |
-| **Stato** | Da rieseguire con il controllo che cerca. |
+| **Risultato** | **80/80** casi identici (TTL 2-11 × 8 pattern realizzabili, porte {0,1,4}), e **controllo negativo che morde**: accendendo uno slot assente le due build divergono in **29** casi. |
+| **Il primo run era inconcludente** | 80/80 ma controllo negativo **muto**: sul seme di default quelle colonne non spostavano mai l'argmax, quindi l'80/80 sarebbe stato vero anche per una specializzazione sbagliata. Una colonna di `link_state` contribuisce `1 × w` a un accumulatore che ne somma 65 — proprietà dei **pesi**, non del codice. Il controllo ora cerca fra più semi del pool e **fallisce** se nessuno morde: ha trovato il seme 123. |
+| **Conclusione** | Non generare le colonne delle porte assenti cambia il codice, non la decisione. È il prerequisito di ogni numero dell'asse `degree`. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --verify-ports` (o `--ports 0,1,4`) |
 
 ---
@@ -235,7 +235,7 @@ il progetto chiamava P1.
 
 ---
 
-### C7 — Quanto costa generare colonne che il nodo non può mai usare ⏳
+### C7 — Quanto costa generare colonne che il nodo non può mai usare ✅
 
 | | |
 |---|---|
@@ -246,8 +246,12 @@ il progetto chiamava P1.
 | **Controllo** | `hardcoded`, `template` e `modular` non specializzano: sull'asse devono restare **piatte**. Una pendenza lì vorrebbe dire che l'asse stesso costa qualcosa, e invaliderebbe la lettura della colonna `p1_static`. |
 | **Quantità attesa a livello di sorgente** | Su 65-4-4-7 (nₕ₁ = 4) ogni porta assente toglie **4** moltiplicazioni-accumulo più una lettura e una dichiarazione. Grado 3 su 6: 12 MAC su 24. Verificato contando i termini nel C generato, **non** in kernel. |
 | **Interazione con la sparsità** | Da misurare insieme all'asse `sparsity`: con pesi molto sparsi clang cancella già parte di quel lavoro da solo, e i due effetti potrebbero non sommarsi — è quanto successo in C6 fra nodo congelato e sparsità. |
-| **Risultato** | **Da misurare** — nessun numero di istruzioni, JIT o latenza è stato raccolto. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis degree --out results/` |
+| **Risultato, istruzioni** | Lineare e netto: 546 / 564 / 582 / 598 / 614 per grado 2–6, cioè **17 istruzioni per porta** (delta +18, +18, +16, +16). Un nodo di grado 2 porta l'**11,1 %** di istruzioni in meno di uno di grado 6. |
+| **Risultato, latenza** | **Nessuna tendenza.** 54 / 47 / 58 / 49 / 53 ns: non monotona, escursione del 23 % su un valore di ~50 ns. L'effetto atteso — 16 moltiplicazioni-accumulo fra grado 6 e grado 2, ~5 ns a 3,2 GHz — sta **sotto il rumore di questo banco** e non è risolvibile qui. |
+| **Controllo, riuscito** | `hardcoded` 1 071, `template` 14 985, `modular` 12 349 **su tutti e cinque i punti**, e 319 pesi ovunque. L'asse di per sé non costa nulla: ogni pendenza nella colonna `p1_static` viene da `static_ports`. |
+| **Conclusione** | Stesso esito di C6, per una ragione diversa. Lì lo switch a N casi ne eseguiva uno solo; qui le moltiplicazioni sono davvero eseguite, ma sono **16 su ~979 istruzioni** e il banco non le distingue dal rumore. La specializzazione delle porte è una riduzione di dimensione dimostrata e un guadagno di tempo **non dimostrato**. |
+| **Previsione smentita** | Era stato previsto che, essendo `link_state` un vettore denso e non una one-hot, togliere colonne avrebbe spostato la latenza. La misura dice di no, a questa risoluzione. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis degree --out results/` (i byte JIT sono nel CSV, non nella tabella a schermo) |
 
 ---
 
