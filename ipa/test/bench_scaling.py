@@ -1520,11 +1520,172 @@ KEEP = {
 }
 
 STYLE = {
+    "baseline":  dict(color="#7f8c8d", marker="x", label="baseline (0 MAC)"),
     "p1_static": dict(color="#8e44ad", marker="D", label="P1 specializzata"),
     "hardcoded": dict(color="#c0392b", marker="o", label="P1.5 hardcoded"),
     "template": dict(color="#2980b9", marker="s", label="P2 template"),
     "modular": dict(color="#27ae60", marker="^", label="P3 modular"),
 }
+
+
+# Un marcatore per ASSE, non per pipeline: nella figura della campagna il
+# colore dice gia' quale pipeline e', e serve poter vedere se i quattro assi
+# cadono sulla stessa retta oppure no -- che e' l'intera domanda.
+CAMPAIGN_MARKERS = {
+    "iv_dense":   ("o", "IV densa"),
+    "iv_onehot":  ("s", "IV one-hot"),
+    "width_camp": ("D", "larghezza"),
+    "depth_camp": ("^", "profondita'"),
+}
+
+
+def _fit(xs, ys):
+    """Minimi quadrati a mano: (pendenza, intercetta, r2).
+
+    Senza numpy di proposito -- sono quattro righe e questo file gira anche
+    dove c'e' solo matplotlib."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    m = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    q = my - m * mx
+    sst = sum((y - my) ** 2 for y in ys)
+    ssr = sum((y - (m * x + q)) ** 2 for x, y in zip(xs, ys))
+    return m, q, (1.0 - ssr / sst) if sst else 1.0
+
+
+def plot_campaign(in_dir, fmt):
+    """MAC contro latenza, i quattro assi della campagna sovrapposti.
+
+    Disegna la stessa figura due volte, con le MAC NOMINALI e con quelle
+    ESEGUITE. Non e' ridondanza: una feature one-hot occupa `size` colonne
+    della matrice dei pesi ma nel datapath ne attiva una sola, quindi le
+    nominali sovrastimano -- e di quanto dipende da quanta one-hot c'e'
+    nell'ingresso, cioe' cambia da asse ad asse. Il risultato e' che con le
+    nominali i quattro assi NON stanno sulla stessa retta e con le eseguite
+    si'. Mettere solo la seconda vorrebbe dire chiedere al lettore di fidarsi.
+
+    La baseline non entra in nessuna retta: ha 0 MAC su ogni cella, quindi e'
+    una nuvola verticale a x = 0. Va disegnata come pavimento -- il costo del
+    framework XDP che ogni pipeline paga prima di moltiplicare qualunque
+    cosa -- e non come un punto da interpolare."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    path = os.path.join(in_dir, CAMPAIGN_CSV)
+    if not os.path.exists(path):
+        print(f"  {GREY}salto la campagna: {path} non c'e'{NC}")
+        return 0
+    with open(path, encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("lat_ns")]
+    if not rows:
+        print(f"  {GREY}salto la campagna: CSV vuoto{NC}")
+        return 0
+    if "macs_eff" not in rows[0]:
+        print(f"  {GREY}salto la campagna: manca la colonna macs_eff "
+              f"(rimisura per averla){NC}")
+        return 0
+
+    made = 0
+    for col, nome, unita, stem in (
+            ("macs_eff", "MAC eseguite per pacchetto", "ns/MAC",
+             "campaign_macs_eff_latenza"),
+            ("macs", "MAC nominali per pacchetto (n_in x h1 + ...)", "ns/MAC",
+             "campaign_macs_nominali_latenza"),
+            ("insns", "istruzioni eBPF (xlated)", "ns/istruzione",
+             "campaign_insns_latenza")):
+        fig, ax = plt.subplots(figsize=(6.4, 4.0))
+        print(f"\n  {YELLOW}{nome}{NC}")
+        for pipe in PIPELINES:
+            px, py = [], []
+            for r in rows:
+                if r["pipeline"] != pipe:
+                    continue
+                mk = CAMPAIGN_MARKERS.get(r["axis"], ("o", r["axis"]))[0]
+                x, y = float(r[col]), float(r["lat_ns"])
+                px.append(x)
+                py.append(y)
+                ax.plot([x], [y], marker=mk, markersize=6, linestyle="none",
+                        color=STYLE[pipe]["color"], alpha=0.9)
+            f = _fit(px, py)
+            if not f:
+                # x costante su tutte le celle: non c'e' nessuna retta da
+                # stimare. E' il caso di P3 sulle istruzioni -- 12349 ovunque,
+                # perche' non ricompila mai -- ed e' un RISULTATO, non un
+                # dato mancante. Senza questa voce la figura mostrerebbe una
+                # nuvola di punti senza nome in legenda.
+                if px:
+                    ax.plot([], [], marker=STYLE[pipe]["marker"],
+                            linestyle="none", color=STYLE[pipe]["color"],
+                            label=f"{STYLE[pipe]['label']}: x costante "
+                                  f"({px[0]:.0f}), nessuna pendenza")
+                    print(f"    {STYLE[pipe]['label']:22s} x costante a "
+                          f"{px[0]:.0f}: {GREY}la latenza varia "
+                          f"{min(py):.0f}-{max(py):.0f} ns a parita' di x{NC}")
+                continue
+            m, q, r2 = f
+            xs = [min(px), max(px)]
+            ax.plot(xs, [m * x + q for x in xs], linewidth=1.4,
+                    color=STYLE[pipe]["color"],
+                    label=f"{STYLE[pipe]['label']}: {m:.3f} {unita}  "
+                          f"(r2 {r2:.2f})")
+            # Il residuo medio PER ASSE: se un asse non sta sulla retta lo si
+            # legge qui invece di indovinarlo dalla figura. Su `depth` ci si
+            # aspetta che non ci stia -- P2 ricompila e P3 aggiunge una tail
+            # call a ogni layer, e ne' l'una ne' l'altra e' una MAC.
+            fuori = []
+            for axe in CAMPAIGN_MARKERS:
+                res = [abs(float(r["lat_ns"]) - (m * float(r[col]) + q))
+                       for r in rows
+                       if r["pipeline"] == pipe and r["axis"] == axe
+                       and r.get("lat_ns")]
+                if res:
+                    fuori.append((sum(res) / len(res), axe))
+            fuori.sort(reverse=True)
+            detta = "  ".join(f"{a} {v:.0f}ns" for v, a in fuori)
+            print(f"    {STYLE[pipe]['label']:22s} {m:.3f} {unita}  "
+                  f"r2 {r2:.2f}   {GREY}residuo medio: {detta}{NC}")
+
+        # Il pavimento: la baseline, che di MAC ne fa zero.
+        base = [float(r["lat_ns"]) for r in rows if r["pipeline"] == "baseline"]
+        if base:
+            lo, hi = min(base), max(base)
+            ax.axhspan(lo, hi, color=STYLE["baseline"]["color"], alpha=0.18)
+            ax.axhline(sum(base) / len(base), linewidth=1.0, linestyle=":",
+                       color=STYLE["baseline"]["color"])
+            print(f"    {'baseline (0 MAC)':22s} pavimento {lo:.0f}-{hi:.0f} ns "
+                  f"{GREY}(framework XDP, nessuna inferenza){NC}")
+
+        ax.set_xlabel(nome)
+        ax.set_ylabel("latenza (ns/pacchetto, minimo)")
+        ax.grid(True, linewidth=0.4, alpha=0.4)
+        ax.set_ylim(bottom=0)
+        prima = ax.legend(frameon=False, fontsize=7.5, loc="upper left")
+        # Seconda legenda, per i marcatori: quale asse e' quale punto. Senza,
+        # la figura mostra una nuvola e non si puo' dire se un asse devia.
+        ax.add_artist(prima)
+        ax.legend(handles=[Line2D([], [], marker=mk, linestyle="none",
+                                  color="#555555", markersize=6, label=lab)
+                           for mk, lab in CAMPAIGN_MARKERS.values()],
+                  fontsize=7.5, loc="lower right", title="asse",
+                  title_fontsize=7.5,
+                  # Riquadro opaco e non trasparente: qui sotto passano le
+                  # rette di P1, e senza sfondo le voci diventano illeggibili.
+                  frameon=True, framealpha=0.95, edgecolor="none",
+                  facecolor="white")
+        fig.tight_layout()
+        out = os.path.join(in_dir, stem + "." + fmt)
+        fig.savefig(out, dpi=160)
+        plt.close(fig)
+        print(f"  {GREEN}scritto{NC} {out}")
+        made += 1
+    return made
 
 
 def plot_axis(axis, in_dir, fmt, draw_all=False):
@@ -1668,6 +1829,7 @@ def main():
         n = sum(plot_axis(ax, a.plot, a.format, a.all_plots)
                 for ax in LEGACY_AXES)
         n += plot_duel(a.plot, a.format)
+        n += plot_campaign(a.plot, a.format)
         print(f"\n{GREEN}{n} grafici{NC} in {a.plot}")
         return 0
 
