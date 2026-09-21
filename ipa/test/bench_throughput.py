@@ -2107,28 +2107,33 @@ BPF_PERCPU_ARRAY(pipe_hist, __u64, LAT_BUCKETS);
 BPF_PERCPU_ARRAY(xport_hist, __u64, LAT_BUCKETS);
 """
 
-# Un accumulo (quanti / somma / min / max) piu' l'istogramma log2, scritto una
-# volta come macro perche' le tre misure devono essere trattate IDENTICAMENTE:
-# tre copie a mano avrebbero potuto divergere su un dettaglio, e una differenza
-# fra T3-T1 e T2-T1 dovuta al modo di contarle sarebbe indistinguibile da una
-# differenza vera.
-LAT_ACCUM_MACRO = r"""
-#define IPA_ACCUM(ACC, HIST, D) do {                                  \
-    __u64 _d = (D);                                                   \
-    __u32 _bk = bpf_log2l(_d);                                        \
-    if (_bk >= LAT_BUCKETS) _bk = LAT_BUCKETS - 1;                    \
-    int _bi = (int)_bk;                                               \
-    __u64 *_hb = HIST.lookup(&_bi); if (_hb) *_hb += 1;               \
-    int _k = 0;                                                       \
-    __u64 *_n = ACC.lookup(&_k); if (_n) *_n += 1;                    \
-    _k = 1; __u64 *_sm = ACC.lookup(&_k); if (_sm) *_sm += _d;        \
-    _k = 2; __u64 *_mn = ACC.lookup(&_k);                             \
-    if (_mn && (*_mn == 0 || _d < *_mn)) *_mn = _d;                   \
-    _k = 3; __u64 *_mx = ACC.lookup(&_k); if (_mx && _d > *_mx) *_mx = _d; \
-} while (0)
-"""
+# Un accumulo (quanti / somma / min / max) piu' l'istogramma log2.
+#
+# Scritto come TEMPLATE PYTHON e non come macro C per un motivo preciso: BCC
+# riscrive gli accessi alle mappe sull'AST, prima del preprocessore, e su
+# `ACC.lookup(&k)` dentro una macro si ferma con
+#
+#     error: cannot use map function inside a macro
+#
+# Generarlo da qui conserva la proprieta' che serviva -- le tre misure trattate
+# in modo identico, perche' vengono dallo stesso testo -- spostandola dalla
+# compilazione alla generazione.
+def _lat_accum(acc, hist, delta):
+    return f"""
+    {{ __u64 _d = {delta};
+      __u32 _bk = bpf_log2l(_d);
+      if (_bk >= LAT_BUCKETS) _bk = LAT_BUCKETS - 1;
+      int _bi = (int)_bk;
+      __u64 *_hb = {hist}.lookup(&_bi); if (_hb) *_hb += 1;
+      int _k = 0;
+      __u64 *_n = {acc}.lookup(&_k); if (_n) *_n += 1;
+      _k = 1; __u64 *_sm = {acc}.lookup(&_k); if (_sm) *_sm += _d;
+      _k = 2; __u64 *_mn = {acc}.lookup(&_k);
+      if (_mn && (*_mn == 0 || _d < *_mn)) *_mn = _d;
+      _k = 3; __u64 *_mx = {acc}.lookup(&_k); if (_mx && _d > *_mx) *_mx = _d; }}"""
 
-LAT_COUNTER_SRC = r"""
+
+LAT_COUNTER_SRC = """
 int xdp_lat_count(struct xdp_md *ctx) {
     int z = 0;
     __u64 now = bpf_ktime_get_ns();
@@ -2142,15 +2147,19 @@ int xdp_lat_count(struct xdp_md *ctx) {
     __u64 m = t1 ? *t1 : 0;
 
     /* T3 - T1: end-to-end sul percorso reale. */
-    if (a && now > a) IPA_ACCUM(lat_acc, lat_hist, now - a);
+    if (a && now > a) %(e2e)s
+
     /* T2 - T1: la pipeline soltanto. */
-    if (a && m && m > a) IPA_ACCUM(pipe_acc, pipe_hist, m - a);
+    if (a && m && m > a) %(pipe)s
+
     /* T3 - T2: quello che viene DOPO la pipeline. */
-    if (m && now > m) IPA_ACCUM(xport_acc, xport_hist, now - m);
+    if (m && now > m) %(xport)s
 
     return XDP_DROP;
 }
-"""
+""" % {"e2e": _lat_accum("lat_acc", "lat_hist", "now - a"),
+       "pipe": _lat_accum("pipe_acc", "pipe_hist", "m - a"),
+       "xport": _lat_accum("xport_acc", "xport_hist", "now - m")}
 
 # Iniettata subito dopo la graffa del dispatcher: il primo istante in cui il
 # programma ha il pacchetto in mano.
@@ -2249,14 +2258,40 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
     # saltava, ancorando le dichiarazioni al dispatcher, che in quel
     # sorgente viene DOPO il redirect. Cioe' esattamente il difetto che
     # questo blocco esiste per evitare.
-    first_fn = re.search(r"^int \w+\(struct xdp_md ", src, re.M)
-    if not first_fn:
-        raise RuntimeError(
-            f"nessuna funzione XDP nel sorgente di {method}: non so dove "
-            f"mettere le dichiarazioni della strumentazione.")
+    # DOPO L'ULTIMO #include, e non "prima della prima funzione XDP".
+    #
+    # Il secondo tentativo era quello, e su P3 rompeva: ml_argmax_forward e'
+    # preceduta da `static inline __attribute__((always_inline))` su riga
+    # propria, quindi inserire davanti all'`int` separava i qualificatori dalla
+    # funzione -- clang usciva con "'inline' can only appear on functions" e
+    # poi con "cannot call non-static helper function", che e' la stessa causa
+    # vista due volte.
+    #
+    # Gli #include stanno tutti in cima e nessuno e' dentro un #ifdef
+    # (verificato su tutte e quattro le pipeline): dopo l'ultimo ci sono i tipi
+    # del kernel, che servono, e non c'e' ancora nessuna dichiarazione da
+    # spezzare.
+    #
+    # "l'ultimo #include" non basta: il sorgente di P2 e' dispatcher + leaf
+    # CONCATENATI, e il leaf porta i propri #include -- che stanno quindi dopo
+    # il punto in cui il dispatcher usa gia' le mappe. Serve l'ultimo #include
+    # che PRECEDE il primo uso, cioe' il piu' a sinistra fra l'ingresso e il
+    # redirect.
+    primo_uso = min(p for p in (src.find(anchor),
+                                src.find(LAT_REDIRECT_ANCHOR)) if p >= 0)
+    incs = [m for m in re.finditer(r"^#include .*$", src, re.M)
+            if m.end() < primo_uso]
+    if incs:
+        at = incs[-1].end() + 1
+    else:
+        first_fn = re.search(r"^int \w+\(struct xdp_md ", src, re.M)
+        if not first_fn:
+            raise RuntimeError(
+                f"nessuna funzione XDP nel sorgente di {method}: non so dove "
+                f"mettere le dichiarazioni della strumentazione.")
+        at = first_fn.start()
     defines = f"#define LAT_BUCKETS {LAT_BUCKETS}\n"
-    head = defines + LAT_DECLS_SRC + LAT_ACCUM_MACRO + "\n"
-    src = src[:first_fn.start()] + head + src[first_fn.start():]
+    src = src[:at] + defines + LAT_DECLS_SRC + "\n" + src[at:]
 
     # T1 all'ingresso, T2 al redirect.
     src = src.replace(anchor, anchor + LAT_STAMP, 1)
@@ -2269,8 +2304,7 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
     for m in ("ts_in", "ts_mid", "lat_acc", "pipe_acc", "xport_acc",
               "lat_hist", "pipe_hist", "xport_hist", "rx_n"):
         decl = src.find(f"BPF_PERCPU_ARRAY({m},")
-        uso = min((p for p in (src.find(f"{m}."), src.find(f"IPA_ACCUM({m}"),
-                               src.find(f", {m},")) if p >= 0), default=-1)
+        uso = src.find(f"{m}.")
         if decl < 0 or (uso >= 0 and uso < decl):
             raise RuntimeError(
                 f"{method}: la mappa `{m}` verrebbe usata (offset {uso}) prima "
