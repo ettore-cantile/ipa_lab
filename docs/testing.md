@@ -78,26 +78,109 @@ Cosa verifica in più oltre al dispatch:
 - **Reroute su guasto**: per ogni TTL e interfaccia `k`, esegue P1 con tutti i link up e poi con
   `link_state[k]=0`, e conferma che l'argmax cambia uscita in almeno un caso.
 
-> ⚠️ **`ingress_iface`: le tre pipeline NON concordano, e in laboratorio la feature è
-> inerte.** P1 traduce l'ifindex del kernel in porta logica tramite `ifindex_table`
-> (default `[2..7]`); P2/P3 usano l'ifindex **grezzo** con clamp `[1, n_interfaces]`.
+> **`ingress_iface`: le tre pipeline ora concordano** (risolto il 2026-09-21).
+> Tutte e tre traducono l'ifindex del kernel in porta logica attraverso una mappa
+> letta a runtime — `ingress_port`, `ingress_port_t2`, `ingress_port_t3` — riempita
+> dal control plane con un'unica funzione, `common.ingress_port_slots`.
 >
-> - Sotto `BPF_PROG_TEST_RUN` il sandbox espone `ingress_ifindex = 1`
->   (`verify_prog_run.TEST_RUN_DEFAULT_INGRESS_IFINDEX`): P1 non lo mappa → `_iface=0`,
->   P2/P3 lo accettano → colonna 0 della one-hot attiva. Il riferimento Python modella
->   correttamente le due semantiche con `ref_ifindex = 0 if pipeline == 1 else 1`, ed è
->   per questo che i `ref_val` stampati per P1 differiscono da quelli di P2/P3 pur
->   restando la stessa classe. **Non è un bug della suite** — è la suite che documenta
->   una divergenza reale fra le pipeline.
-> - Su un nodo vero gli ifindex sono 201/209/217/223: non stanno né in `[2..7]`
->   né in `[1,6]`, quindi **tutte e tre** azzerano la feature. 6 dei 65 input sono
->   costantemente nulli e il modello non sa mai da quale porta è entrato il pacchetto.
+> Com'era, e perché non si vedeva: P1 traduceva con una tabella compilata
+> (`ifindex_table`, default `[2..7]`, cioè l'assunzione `eth0 == ifindex 2`); P2/P3
+> usavano l'ifindex **grezzo** con clamp `[1, n_interfaces]`. Per lo stesso pacchetto
+> sceglievano colonne di pesi diverse. E su un nodo vero gli ifindex non stanno in
+> nessuno dei due intervalli, quindi **tutte e tre** azzeravano la feature: 6 dei 65
+> input costantemente nulli, in silenzio, con la suite verde perché nessuno
+> controllava che quella feature contribuisse qualcosa.
 >
-> Ne segue un limite di validità esterna da dichiarare: la suite misura una
-> configurazione dell'input vector che **in produzione non si verifica**. Sistemarlo
-> significa risolvere gli ifindex reali all'avvio (`socket.if_nametoindex`) e dare a
-> P2/P3 una mappa ifindex→porta; cambia l'output dell'inferenza e va rifatto anche il
-> riferimento, quindi non è stato fatto.
+> - La convenzione: chiave = ifindex del kernel, valore = slot del one-hot,
+>   **1-based**, dove lo slot è il RANGO della porta fra quelle che il modello può
+>   scegliere (`ClassSemantics.logical_ports`). L'1-based non è estetica: la guardia
+>   nel datapath è `>= 1 && <= size`, quindi l'assenza (0) si legge da sola come
+>   “non è una mia porta”. Il mapping non si deduce ordinando gli ifindex: passa per
+>   il nome dell'interfaccia (`NodeConfig`) e poi per `socket.if_nametoindex`.
+> - Verificato su kernel il 2026-09-21, cinque veth con ifindex 5/7/9/11/13. Le tre
+>   mappe contengono le stesse cinque coppie (`5→1, 7→2, 9→3, 11→4, 13→5`), lette
+>   con `bpftool map dump`. Gli ifindex a passo 2 sono anche la prova del difetto
+>   vecchio: la tabella compilata `[2..7]` qui avrebbe azzeccato **una** porta su
+>   cinque, e per giunta la colonna sbagliata.
+> - Sotto `BPF_PROG_TEST_RUN` resta vero che il sandbox espone `ingress_ifindex = 1`
+>   (`verify_prog_run.TEST_RUN_DEFAULT_INGRESS_IFINDEX`) e che quel runner non scrive
+>   la mappa: nessuna porta risolve e il one-hot resta vuoto **per tutte e tre**. Il
+>   riferimento dice la stessa cosa (`ref_ingress_port = 0`), quindi le due parti
+>   confrontano lo stesso vettore. Il limite di validità esterna sopravvive in questa
+>   forma ridotta: la suite misura una configurazione in cui quella feature è spenta,
+>   e chi cita quei numeri deve dirlo.
+
+### P1 specializzata: le porte presenti sul nodo
+
+`static_ports` dice al generatore di P1 **quali colonne di `link_state`
+esistono davvero** su questo nodo. Un nodo di grado 3 su 6 ha
+`link_state[3..5]` permanentemente a zero — quelle interfacce non esistono,
+non sono link caduti — e quelle colonne non vengono generate affatto.
+
+Non è congelare il valore della feature: `link_state[i]` resta letto dalla
+mappa a runtime per ogni porta che esiste, e un link esistente può essere su o
+giù come prima. Si congela la **struttura**: quali posizioni possono esistere.
+
+**Chi lo può usare.** Solo la P1 specializzata. Il generatore rifiuta
+`static_ports` senza `static_node`:
+
+```
+static_ports requires static_node: freezing WHICH ports exist is part of
+specialising P1 to one node, and it is the node that makes that knowledge
+legitimate.
+```
+
+`hardcoded` (P1.5) serve l'intera rete da un binario solo e **resta identica a
+prima, byte per byte** — verificato confrontando il C generato con quello del
+file a HEAD.
+
+**Perché è esatto.** Saltare la colonna *i* toglie dall'accumulatore il termine
+`link_state[i] * w[j][offset+i]`. È esatto, non approssimato, a una condizione:
+che `link_state[i]` sia 0 su questo nodo. Lo è per costruzione —
+`link_state_monitor.carrier_state()` ritorna 0 per un'interfaccia che non
+esiste, al seed e a ogni poll — e `default_ifaces()` risolve gli slot con le
+stesse variabili d'ambiente di `NodeConfig.resolve`, quindi lo slot *i* è la
+porta logica *i*. La somma è in `long long`: togliere un addendo nullo non
+cambia un bit.
+
+`n_in`, gli offset dei pesi e l'ordine delle feature **non cambiano**: si
+saltano solo dei termini, e ogni colonna viva conserva esattamente il peso che
+aveva.
+
+> ⚠️ La condizione è del **deployment**, non del datapath. Un banco che semina
+> tutti gli slot a 1 — come `verify_prog_run._seed_link_state` — fa divergere
+> la versione specializzata, e ha ragione lui. Chi confronta le due versioni
+> deve azzerare gli slot assenti nel riferimento.
+
+**Che cosa sparisce.** Su 65-4-4-7 (nₕ₁ = 4), per ogni porta assente: una
+dichiarazione, una lettura di mappa e **4 moltiplicazioni-accumulo**, una per
+neurone, eseguite a ogni pacchetto. Grado 3 su 6: 12 MAC su 24. È la differenza
+sostanziale dal nodo congelato, dove lo switch a 52 casi ne esegue comunque uno.
+
+**Non tocca**: `queue_occupancy`, che è un vettore denso come `link_state` ma
+indicizzato per **coda**, non per porta — il filtro si applica solo alle feature
+con `dim_key == "n_interfaces"`. Né P2, né P3, né il formato del modello, né il
+mapping delle classi.
+
+**Come si rigira.**
+
+```bash
+# correttezza: la specializzata decide come quella a larghezza piena
+sudo python3 ipa/test/bench_scaling.py --verify-ports
+sudo python3 ipa/test/bench_scaling.py --verify-ports --ports 0,1,4
+
+# costo, al variare del grado del nodo (2..6)
+sudo python3 ipa/test/bench_scaling.py --axis degree --out results/
+```
+
+Sull'asse `degree` cambia **solo** quante colonne P1 genera: modello, forma e
+pesi sono identici punto per punto, e le altre tre pipeline devono restare
+piatte. Una loro pendenza vorrebbe dire che l'asse stesso costa qualcosa.
+
+> Stato: **nessuna misura raccolta.** Il generatore è verificato sul C prodotto
+> (conteggio dei termini, invarianza degli offset, non-regressione contro
+> HEAD); istruzioni, JIT e latenza non sono ancora state misurate, e
+> l'interazione con l'asse `sparsity` nemmeno.
 
 ### Verifier standalone (equivalente al gate di dispatch)
 
@@ -1269,13 +1352,13 @@ parità di condizioni, e il costo per pacchetto in regime senza perdite.
   classe kernel vs riferimento Python (10/10 e 5/5 PASS).
 - **Azione uniforme (`mac_table`)**: `argmax → mac_table[classe] → bpf_redirect`.
 - **Nessun `ctx_in` custom**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox vale 1.
-  P1 lo traduce attraverso la propria `ifindex_table` (default `[2..7]`), che **non** mappa 1
-  → `_iface=0`. P2/P3 invece usano l'ifindex **grezzo** come indice one-hot e `1` cade dentro
-  il clamp `[1,sz]` → contribuiscono la colonna 0. **Le due semantiche divergono**, e non solo
-  in sandbox: su un nodo reale `eth0` ha ifindex 2, quindi P1 sceglie la colonna 0 e P2/P3 la
-  colonna 1 per lo stesso pacchetto. Non è ancora stato uniformato — su questo modello sposta
-  solo argmax quasi pari (la classe 0 domina), ma va allineato prima di trarre conclusioni
-  sull'equivalenza delle tre pipeline. Vedi il commento in `verify_prog_run.py` (`ref_ifindex`).
+  Le tre pipeline lo risolvono ora nello stesso modo — lookup nella mappa `ingress_port*`,
+  guardia `>= 1 && <= size` — e quel runner non scrive la mappa, quindi il one-hot
+  `ingress_iface` resta vuoto **per tutte e tre** invece di divergere come prima. Il
+  riferimento dice la stessa cosa (`ref_ingress_port = 0`). La divergenza che questa riga
+  documentava (P1 con `ifindex_table` compilata, P2/P3 con l'ifindex grezzo) è stata
+  risolta il 2026-09-21; vedi il blocco su `ingress_iface` nella sezione 2 e il commento
+  in `verify_prog_run.py`.
 - **P2/P3 non caricano in un container minimale**: il nodo applica il cap storico di 4096 istruzioni per
   programma, e `arch_generic_2layer` ne conta 9 318 compilato nel container (`bpf: Program too
   large`). Le misure di questa tabella vengono da `BPF_PROG_TEST_RUN` **sull'host**, dove il

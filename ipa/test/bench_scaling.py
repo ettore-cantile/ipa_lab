@@ -262,6 +262,28 @@ AXES = {
         "note": "stesso budget di pesi speso in modi diversi: una layer largo "
                 "contro molti stretti",
     },
+    # Quante delle n_interfaces porte esistono DAVVERO sul nodo. Non e' una
+    # topologia nuova: e' la cella di sempre (52 nodi, 4-4, descrittore
+    # default) con `static_ports` che varia, quindi n_in, la forma e i PESI
+    # restano identici punto per punto -- cambia solo quante colonne di
+    # link_state P1 specializzata genera.
+    #
+    # Le altre tre pipeline non specializzano, quindi sull'asse restano
+    # piatte: e' il controllo che dice che l'asse di per se' non costa nulla,
+    # e che qualunque pendenza nella colonna p1_static viene da static_ports.
+    #
+    # Su Germany50 i gradi reali vanno da 2 a 5 (88 link, 50 nodi, grado medio
+    # 3,52) e nessun nodo arriva a 6: il modello riserva 6 colonne perche' e'
+    # il massimo della rete, non il grado di chi lo esegue.
+    "degree": {
+        "xlabel": "porte realmente presenti sul nodo (su 6 colonne link_state)",
+        "kind": "num",
+        "values": [2, 3, 4, 5, 6],
+        "cell": lambda v: dict(n_nodes=52, dims=(4, 4),
+                               static_ports=set(range(v))),
+        "note": "stesso modello, stessi pesi, stesse colonne di peso: cambia "
+                "solo quante di esse la P1 specializzata genera",
+    },
     "sparsity": {
         "xlabel": "frazione di pesi esattamente zero",
         "kind": "num",
@@ -274,7 +296,11 @@ AXES = {
 
 def cell_of(axis, v):
     """Fill an axis cell out with the defaults the worker expects."""
-    c = dict(n_nodes=52, dims=(4, 4), descriptor=DEFAULT_DESCRIPTOR, sparsity=0.0)
+    # static_ports=None = "tutte le colonne", cioe' il comportamento storico:
+    # ogni asse diverso da `degree` produce lo stesso C di prima e i CSV gia'
+    # raccolti restano confrontabili.
+    c = dict(n_nodes=52, dims=(4, 4), descriptor=DEFAULT_DESCRIPTOR,
+             sparsity=0.0, static_ports=None)
     c.update(AXES[axis]["cell"](v))
     return c
 
@@ -379,6 +405,11 @@ def _totals(b, progs):
 
 
 def _bench_p1(cell, repeat, trials, static_node=None):
+    # La stessa cella descrive entrambe le pipeline; solo quella specializzata
+    # sfrutta static_ports. Non e' una convenzione da ricordare: il generatore
+    # RIFIUTA static_ports senza static_node, quindi e' la forma che la
+    # chiamata deve avere perche' `hardcoded` resti quello di sempre.
+    ports = cell.get("static_ports") if static_node is not None else None
     from bcc import BPF
     from ebpf_program import build_combined_hardcoded_source
     from verify_prog_run import build_frame_sparse, _seed_link_state
@@ -400,7 +431,7 @@ def _bench_p1(cell, repeat, trials, static_node=None):
         src = build_combined_hardcoded_source(
             models=[(0, weights, SCALE)],
             features=shape["features"], n_out=n_out, hidden_dims=tuple(dims),
-            static_node=static_node)
+            static_node=static_node, static_ports=ports)
         bb = BPF(text=src)
         m = bb.load_func("model_0", BPF.XDP)
         d = bb.load_func("ipa_switch_hardcoded", BPF.XDP)
@@ -776,7 +807,9 @@ def _build_p1(cell, static_node):
     weights = make_weights(nw, cell["sparsity"])
     src = build_combined_hardcoded_source(
         models=[(0, weights, SCALE)], features=shape["features"],
-        n_out=n_out, hidden_dims=tuple(dims), static_node=static_node)
+        n_out=n_out, hidden_dims=tuple(dims), static_node=static_node,
+        static_ports=(cell.get("static_ports")
+                      if static_node is not None else None))
     b = BPF(text=src)
     model_fn = b.load_func("model_0", BPF.XDP)
     disp_fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
@@ -866,6 +899,94 @@ def verify_static(node=None):
         return 1
     print(f"  {GREEN}{n}/{n} casi identici{NC} (ttl 2-11 x 8 pattern di link).")
     print(f"  {GREY}Congelare il nodo cambia il codice, non la decisione.{NC}")
+    return 0
+
+
+def verify_ports(ports=None, node=None):
+    """La P1 che NON genera le colonne delle porte assenti deve decidere
+    esattamente come la stessa P1 che le genera, purche' quegli slot valgano 0.
+
+    E' il gemello di verify_static, e per la stessa ragione: togliere colonne
+    dal primo layer produce un programma piu' piccolo che calcola un modello
+    diverso, se la colonna tolta non era davvero nulla. Lo sweep misura costo,
+    non correttezza, e non se ne accorgerebbe.
+
+    Le due build differiscono SOLO per static_ports -- il nodo e' congelato in
+    entrambe -- cosi' una divergenza e' attribuibile a questa modifica e a
+    nient'altro.
+
+    Il controllo negativo in fondo e' cio' che rende credibile il resto: se si
+    accende uno slot assente le due DEVONO divergere. Un test che passa anche
+    quando la condizione e' violata non sta verificando la condizione.
+    """
+    node = STATIC_NODE if node is None else node
+    n_if = N_INTERFACES
+    ports = {0, 1, 4} if ports is None else set(ports)
+    assenti = sorted(set(range(n_if)) - ports)
+
+    cell = dict(cell_of("nodes", 52), static_ports=ports)
+    b_s, fd_s, shape = _build_p1(cell, static_node=node)
+    b_f, fd_f, _ = _build_p1(dict(cell, static_ports=None), static_node=node)
+
+    n_in, n_out = shape["n_in"], shape["n_out"]
+    print(f"{YELLOW}{'=' * 70}{NC}")
+    print(f"{YELLOW} P1 con le sole porte {sorted(ports)} generate, contro P1 "
+          f"a larghezza piena{NC}")
+    print(f"{GREY} slot senza interfaccia su questo nodo: {assenti} "
+          f"-- strutturalmente 0, non link caduti{NC}")
+    print(f"{YELLOW}{'=' * 70}{NC}\n")
+
+    def mask(v):
+        """Il riferimento vede 0 dove il nodo non ha interfaccia.
+
+        E' la condizione sotto cui l'equivalenza vale, e va imposta qui
+        esplicitamente perche' _seed_link_state semina 1 su ogni slot."""
+        return tuple(0 if i in assenti else x for i, x in enumerate(v))
+
+    casi = sorted({(ttl, mask([(p >> i) & 1 for i in range(n_if)]))
+                   for ttl in range(2, 12) for p in range(1 << n_if)})
+
+    bad = 0
+    for ttl, links in casi:
+        r_s = _decide(b_s, fd_s, n_in, n_out, ttl, links)
+        r_f = _decide(b_f, fd_f, n_in, n_out, ttl, links)
+        if r_s != r_f:
+            bad += 1
+            if bad <= 6:
+                ls = "".join(map(str, links))
+                print(f"  {RED}DIVERGE{NC} ttl={ttl:2d} link={ls}: "
+                      f"specializzata retval={r_s[0]} classe={r_s[1]}, "
+                      f"piena retval={r_f[0]} classe={r_f[1]}")
+
+    n = len(casi)
+    if bad:
+        print(f"\n  {RED}{bad}/{n} casi divergono{NC} -- le colonne eliminate "
+              f"NON erano nulle.")
+        print(f"  {GREY}Finche' questo non passa, ogni numero della colonna "
+              f"p1_static sull'asse degree misura un modello diverso.{NC}")
+        return 1
+    print(f"  {GREEN}{n}/{n} casi identici{NC} (ttl 2-11 x "
+          f"{1 << len(ports)} pattern realizzabili).")
+
+    # --- controllo negativo -------------------------------------------------
+    if assenti:
+        visto = 0
+        for ttl in range(2, 12):
+            for i in assenti:
+                links = tuple(1 if k == i else 0 for k in range(n_if))
+                if _decide(b_s, fd_s, n_in, n_out, ttl, links) != \
+                   _decide(b_f, fd_f, n_in, n_out, ttl, links):
+                    visto += 1
+        if visto:
+            print(f"  {GREEN}controllo negativo{NC}: accendendo uno slot "
+                  f"assente le due divergono in {visto} casi -- la condizione "
+                  f"\"slot assenti a 0\" e' portante, non decorativa.")
+        else:
+            print(f"  {YELLOW}controllo negativo muto{NC}: nemmeno accendendo "
+                  f"uno slot assente le due divergono. Su questi pesi quelle "
+                  f"colonne non spostano l'argmax, quindi il test sopra non "
+                  f"dimostra molto e va rifatto con altri pesi.")
+    print(f"  {GREY}Togliere le colonne cambia il codice, non la decisione.{NC}")
     return 0
 
 
@@ -1134,6 +1255,12 @@ def main():
     p.add_argument("--verify", action="store_true",
                    help="non misurare: verifica che la P1 specializzata decida "
                         "come la P1.5 con lo stesso nodo installato")
+    p.add_argument("--verify-ports", action="store_true", dest="verify_ports",
+                   help="non misurare: verifica che la P1 che non genera le "
+                        "porte assenti decida come quella a larghezza piena")
+    p.add_argument("--ports", default=None,
+                   help="porte presenti per --verify-ports, es. '0,1,4' "
+                        "(default 0,1,4)")
     p.add_argument("--all-plots", action="store_true",
                    help="disegna tutte le combinazioni metrica x asse, non "
                         "solo quelle che portano un risultato")
@@ -1160,6 +1287,12 @@ def main():
     if a.verify:
         os.chdir(SHARED_DIR)
         return verify_static()
+
+    if a.verify_ports:
+        os.chdir(SHARED_DIR)
+        sel = ({int(x) for x in a.ports.split(",") if x.strip()}
+               if a.ports else None)
+        return verify_ports(sel)
 
     # Resolved BEFORE the chdir: a relative --out is relative to where the
     # USER ran the command, not to ipa/. Resolving it after the chdir put

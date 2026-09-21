@@ -538,21 +538,79 @@ def _gen_feature_scalar(feat, offset, n_in, fc1_w, n_h1):
     return preamble, term
 
 
-def _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1):
+def _live_slots(feat, size, static_ports):
+    """Le colonne che questo nodo puo' davvero vedere diverse da zero.
+
+    `static_ports=None` -> tutte, cioe' il comportamento storico: sorgente C
+    identico byte per byte. Un insieme -> solo quelle colonne, e SOLO per le
+    feature indicizzate per INTERFACCIA.
+
+    Il filtro e' ristretto a `dim_key == "n_interfaces"` di proposito:
+    `queue_occupancy` e' un vettore denso come `link_state` ma e' indicizzato
+    per CODA, non per porta. Applicargli un insieme di porte vorrebbe dire
+    tagliare colonne di un altro spazio di indici -- lo stesso errore che
+    questo progetto ha gia' pagato confondendo classi e porte.
+    """
+    if static_ports is None:
+        return list(range(size))
+    if _model_meta.FEATURE_CATALOG[feat["type"]].get("dim_key") != "n_interfaces":
+        return list(range(size))
+    live = sorted(i for i in static_ports if 0 <= i < size)
+    if not live:
+        raise ValueError(
+            f"static_ports={sorted(static_ports)} leaves feature "
+            f"{feat['type']!r} (width {size}) with no live column. A node with "
+            f"no interface at all cannot forward, and a program whose whole "
+            f"link_state contributes nothing should be refused here rather "
+            f"than compiled and deployed looking healthy.")
+    return live
+
+
+def _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1,
+                              static_ports=None):
+    """Vettore denso letto da mappa, opzionalmente ristretto alle porte presenti.
+
+    EQUIVALENZA. Saltare la colonna i toglie dall'accumulatore il termine
+    `v[i] * w[j][offset+i]`. E' esatto -- non approssimato -- a una condizione
+    sola: che `v[i]` sia 0 su questo nodo. Per `link_state` lo e' per
+    costruzione, non per assunzione: `link_state_monitor.carrier_state()`
+    ritorna 0 per un'interfaccia che non esiste, sia al seed
+    (`init_link_state_up`) sia a ogni poll (`update_link_state`), e
+    `default_ifaces()` risolve gli slot con le STESSE variabili d'ambiente di
+    `NodeConfig.resolve` -- quindi lo slot i e' la porta logica i. La somma e'
+    in `long long`, dove togliere un addendo nullo non cambia un bit.
+
+    La condizione e' del DEPLOYMENT, non del datapath: un banco che semina
+    tutti gli slot a 1 (`verify_prog_run._seed_link_state`) fa divergere la
+    versione specializzata, e ha ragione lui. Chi confronta le due versioni
+    deve azzerare gli slot assenti nel riferimento.
+
+    Gli offset dei pesi NON cambiano: `n_in`, `offset` e l'ordine delle feature
+    restano quelli del modello; si saltano solo dei termini.
+    """
     prefix, map_name = _DENSEVEC_SOURCE[feat["type"]]
     size = feat["size"]
+    live = _live_slots(feat, size, static_ports)
+    if len(live) == size:
+        head = (f"    /* feature '{feat['type']}': {size} values read with ONE "
+                f"lookup from {map_name} */")
+    else:
+        dead = [i for i in range(size) if i not in live]
+        head = (f"    /* feature '{feat['type']}': {len(live)} of {size} slots "
+                f"exist on this node ({live}); slots {dead} have no interface "
+                f"behind them, are structurally 0, and are not generated. */")
     lines = [
-        f"    /* feature '{feat['type']}': {size} values read with ONE lookup from {map_name} */",
-        "    long long " + ", ".join(f"{prefix}{i}=0LL" for i in range(size)) + ";",
+        head,
+        "    long long " + ", ".join(f"{prefix}{i}=0LL" for i in live) + ";",
         f"    {{ int _z=0; struct {map_name}_vec *_p = {map_name}.lookup(&_z);",
         "      if (_p) {",
     ]
-    for i in range(size):
+    for i in live:
         lines.append(f"        {prefix}{i}=(long long)_p->v[{i}];")
     lines.append("      } }")
     def term(j):
         return " + ".join(
-            f"{prefix}{i} * {_lit(fc1_w[j * n_in + offset + i])}LL" for i in range(size))
+            f"{prefix}{i} * {_lit(fc1_w[j * n_in + offset + i])}LL" for i in live)
     return lines, term
 
 
@@ -656,14 +714,16 @@ def _gen_feature_onehot_node(feat, offset, n_in, fc1_w, n_h1,
     return lines, term
 
 
-def _gen_feature(feat, offset, n_in, fc1_w, n_h1, static_node=None):
+def _gen_feature(feat, offset, n_in, fc1_w, n_h1, static_node=None,
+                 static_ports=None):
     """Dispatch to the right per-kind generator for one descriptor entry."""
     t = feat["type"]
     kind = _model_meta.FEATURE_CATALOG[t]["kind"]
     if kind == "scalar":
         return _gen_feature_scalar(feat, offset, n_in, fc1_w, n_h1)
     if kind == "dense_vector_map":
-        return _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1)
+        return _gen_feature_dense_vector(feat, offset, n_in, fc1_w, n_h1,
+                                         static_ports=static_ports)
     if kind == "onehot":
         if t == "ingress_iface":
             return _gen_feature_onehot_iface(feat, offset, n_in, fc1_w, n_h1)
@@ -689,6 +749,7 @@ def generate_ebpf_hardcoded(
     n_out: int = None,
     semantics=None,
     static_node: int = None,
+    static_ports=None,
 ) -> str:
     """
     Generate an eBPF XDP program, function name `model_<model_id>`, for
@@ -767,6 +828,23 @@ def generate_ebpf_hardcoded(
             f"{'-'.join(map(str, layer_sizes))}, got {len(weights_int8)}")
 
     w = weights_int8
+    # static_ports appartiene alla SOLA P1 specializzata, ed e' una regola del
+    # generatore, non una convenzione del banco.
+    #
+    # P1.5 esiste per misurare che cosa costa NON sapere una cosa a compile
+    # time, e serve l'intera rete da un binario solo. Se potesse ricevere le
+    # porte congelate tenendo il nodo a runtime sarebbe una quinta pipeline
+    # senza nome, e la colonna `hardcoded` di ogni sweep smetterebbe di essere
+    # confrontabile con quelle gia' pubblicate -- in silenzio, perche' lo
+    # sweep misura il costo e non sa che cosa e' stato compilato dentro.
+    if static_ports is not None and static_node is None:
+        raise ValueError(
+            "static_ports requires static_node: freezing WHICH ports exist is "
+            "part of specialising P1 to one node, and it is the node that "
+            "makes that knowledge legitimate. P1.5 (static_node=None) serves "
+            "the whole network from one binary and keeps the model's full "
+            "feature width.")
+
     layers = []            # [(W, B)] one entry per layer, input -> output
     off = 0
     for i in range(1, len(layer_sizes)):
@@ -789,7 +867,8 @@ def generate_ebpf_hardcoded(
     offset = 0
     for feat in features:
         pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1,
-                                 static_node=static_node)
+                                 static_node=static_node,
+                                 static_ports=static_ports)
         fc1_lines.extend(pre)
         term_fns.append(term)
         offset += feat["size"]
@@ -883,6 +962,7 @@ def build_combined_hardcoded_source(
     n_out: int = None,
     semantics=None,
     static_node: int = None,
+    static_ports=None,
 ) -> str:
     """
     models: list of (model_id, weights_int8, scale) tuples,
@@ -946,7 +1026,8 @@ def build_combined_hardcoded_source(
         src += "\n" + generate_ebpf_hardcoded(
             weights_int8, scale, model_id, include_header=False,
             hidden_dims=hidden_dims, features=features, n_out=n_out,
-            semantics=semantics, static_node=static_node)
+            semantics=semantics, static_node=static_node,
+            static_ports=static_ports)
     return src
 
 

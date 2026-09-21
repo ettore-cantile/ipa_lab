@@ -91,6 +91,21 @@ scheda lo dice invece di nasconderlo.
 
 ---
 
+### A6 — Non generare le colonne delle porte assenti non cambia la decisione ⏳
+
+| | |
+|---|---|
+| **Ipotesi** | Un nodo di grado 3 ha `link_state[3..5]` permanentemente a zero: quelle interfacce **non esistono**, non sono link caduti. Togliere quelle colonne dal primo layer di P1 deve essere esatto, non approssimato — ma se una colonna tolta non fosse davvero nulla, il programma sarebbe più piccolo e calcolerebbe un altro modello, e nessuna misura di costo se ne accorgerebbe. |
+| **Variabile modificata** | `static_ports`: quali colonne di `link_state` P1 genera. Il nodo è congelato in **entrambe** le build, quindi la differenza è attribuibile a questa sola modifica. |
+| **Variabili fisse** | Pesi, descrittore, topologia, `n_in`, offset dei pesi, indice del nodo. |
+| **Metrica** | La classe scelta e il valore di ritorno XDP, su tutti i pattern di link realizzabili × TTL 2-11. |
+| **Condizione dichiarata** | L'equivalenza vale finché gli slot senza interfaccia valgono 0. È garantito da `link_state_monitor`: `carrier_state()` ritorna 0 per un'interfaccia inesistente, al seed e a ogni poll. **Non** vale sotto `verify_prog_run._seed_link_state`, che semina 1 ovunque — il test azzera esplicitamente gli slot assenti nel riferimento. |
+| **Controllo negativo** | Accendendo uno slot assente le due build **devono** divergere. Un test che passa anche così non starebbe verificando la condizione. |
+| **Risultato** | **Da misurare** — il test esiste e non è ancora stato eseguito su kernel. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --verify-ports` (o `--ports 0,1,4`) |
+
+---
+
 ## B. Il costo della flessibilità
 
 Questa è la sezione che risponde all'esempio del relatore. La scala ha **quattro**
@@ -215,6 +230,22 @@ il progetto chiamava P1.
 | **Conclusione** | La dimensione crolla, il tempo no, **per la stessa ragione**: lo switch ha N casi ma ne esegue uno, quindi a runtime è un salto indicizzato. Non è un'ottimizzazione di velocità: è ciò che rende la hardcoded praticabile su una rete grande. |
 | **Contro-risultato** | Con pesi sparsi il vantaggio **si annulla** (216 contro 224 al 90% di zeri): sparsità e nodo congelato sono due strade alla stessa riduzione e non si sommano. E il costo di aggiornamento **non cala** (stesso avvio di clang), mentre i binari da installare passano da uno a N. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis nodes --out result/`; figura `duel_p1_vs_p15.pdf` |
+
+---
+
+### C7 — Quanto costa generare colonne che il nodo non può mai usare ⏳
+
+| | |
+|---|---|
+| **Ipotesi** | Il one-hot del nodo ha N casi ma ne esegue **uno**: congelarlo riduce la dimensione, non il tempo (vedi C6). `link_state` è un vettore **denso**: il datapath esegue una moltiplicazione-accumulo per ogni coppia (interfaccia, neurone), a ogni pacchetto. Non generare le colonne assenti dovrebbe quindi togliere lavoro vero, non solo codice morto. |
+| **Variabile modificata** | Il numero di porte realmente presenti, 2–6, via `static_ports`. |
+| **Variabili fisse** | Modello 65-4-4-7, 52 nodi, descrittore default, e **gli stessi identici pesi** — `n_in` non cambia, quindi la cella prende lo stesso prefisso del pool. |
+| **Metrica** | Istruzioni xlated, byte JIT, latenza, memoria delle mappe. |
+| **Controllo** | `hardcoded`, `template` e `modular` non specializzano: sull'asse devono restare **piatte**. Una pendenza lì vorrebbe dire che l'asse stesso costa qualcosa, e invaliderebbe la lettura della colonna `p1_static`. |
+| **Quantità attesa a livello di sorgente** | Su 65-4-4-7 (nₕ₁ = 4) ogni porta assente toglie **4** moltiplicazioni-accumulo più una lettura e una dichiarazione. Grado 3 su 6: 12 MAC su 24. Verificato contando i termini nel C generato, **non** in kernel. |
+| **Interazione con la sparsità** | Da misurare insieme all'asse `sparsity`: con pesi molto sparsi clang cancella già parte di quel lavoro da solo, e i due effetti potrebbero non sommarsi — è quanto successo in C6 fra nodo congelato e sparsità. |
+| **Risultato** | **Da misurare** — nessun numero di istruzioni, JIT o latenza è stato raccolto. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis degree --out results/` |
 
 ---
 
