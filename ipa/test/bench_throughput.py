@@ -4986,6 +4986,21 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 tx = run[0]
                 errors = getattr(run, "errors", 0)
                 secs = (getattr(run, "window", 0.0) or run[2]) or 1e-9
+                # Hanno consegnato TUTTE le istanze? In questa modalita' il
+                # conteggio chiesto e' esatto e pktgen manda esattamente
+                # quello, quindi un TX inferiore vuol dire che un thread
+                # generatore non ha lavorato. La finestra che ne esce e'
+                # corta, i rate che se ne ricavano sono un conteggio diviso
+                # un intervallo sbagliato, e la perdita che ne segue e' della
+                # strumentazione -- non del percorso.
+                if tx < expected_chiesto:
+                    warn(f"giro {rnd} target {rate/1e6:.2f} Mpps: punto "
+                         f"scartato -- {tx} trasmessi su {expected_chiesto} "
+                         f"chiesti ({100.0 * tx / expected_chiesto:.0f}%), "
+                         f"cioe' {gen.n_inst - round(gen.n_inst * tx / expected_chiesto)}"
+                         f" istanza/e del generatore non ha consegnato. La "
+                         f"finestra ({secs:.3f}s) non descrive questo rate.")
+                    continue
                 rx = _percpu_sum(b["gen_rx"])
                 tx_mpps = tx / secs / 1e6
                 rx_mpps = rx / secs / 1e6
