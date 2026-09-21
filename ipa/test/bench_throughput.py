@@ -4931,7 +4931,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                         topology="shared", clone=clone, burst=burst,
                         window_s=window_s, warmup_s=warmup_s).attach()
 
-        hdr = (f"  {'giro':>4s} {'target':>8s} {'TX':>10s} {'RX':>10s} "
+        hdr = (f"  {'giro':>4s} {'target':>9s} {'TX':>10s} {'RX':>10s} "
                f"{'TX Mpps':>8s} {'RX Mpps':>8s} {'resa':>6s} "
                f"{'loss':>7s} {'resp':>7s} {'stato':>22s}")
         print(f"\n{hdr}")
@@ -4941,11 +4941,25 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
             for rate in rates:
                 delay = gen.delay_for(rate)
                 cnt = gen.window_count(rate)
-                # Quanti se ne sono CHIESTI davvero. Non `rate * window_s`:
-                # window_count taglia agli estremi, quindi ai rate bassi il
-                # conteggio chiesto non e' il prodotto nominale, e dividere
-                # per il prodotto darebbe una resa sopra il 100%.
-                expected = cnt * gen.n_inst
+                # DUE aspettative, e servono tutte e due.
+                #
+                #   nominale  quanti ne implica il TARGET nella finestra
+                #             bersaglio. E' il numero rispetto a cui ha senso
+                #             chiedersi se il generatore ha tenuto il passo.
+                #   chiesto   quanti se ne sono davvero ordinati a pktgen,
+                #             cioe' il nominale dopo il clamp di
+                #             window_count a MAX_WINDOW_PKTS.
+                #
+                # Confondere i due e' stato il difetto: `resa` girava sul
+                # CHIESTO, e pktgen manda esattamente quello, quindi usciva
+                # 100% a ogni target sopra MAX_WINDOW_PKTS / window_s
+                # (13,3 Mpps con i valori di default). A 100 Mpps chiesti e
+                # 3,4 consegnati la riga diceva "OK, resa 100%".
+                expected_nominale = int(rate * gen.window_s)
+                expected_chiesto = cnt * gen.n_inst
+                # Il punto e' stato troncato dal clamp? Allora la finestra non
+                # e' quella bersaglio, e va detto sulla riga.
+                capped = expected_chiesto < expected_nominale
                 gen.warmup(frame, delay)
                 time.sleep(DRAIN_S)
                 b["gen_rx"].clear()
@@ -4963,15 +4977,25 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 rx = _percpu_sum(b["gen_rx"])
                 tx_mpps = tx / secs / 1e6
                 rx_mpps = rx / secs / 1e6
-                resa = _pct(tx, expected)
+                # La resa si calcola sui RATE, non sui conteggi: e' l'unica
+                # forma indipendente dalla durata della finestra. Sotto il
+                # clamp i due modi coincidono; sopra, la finestra si allunga
+                # (4 milioni di pacchetti a 3,4 Mpps durano 1,18 s invece di
+                # 0,3) e solo il rapporto fra i rate resta interpretabile.
+                target_mpps = rate / 1e6
+                resa = 100.0 * tx_mpps / target_mpps if target_mpps else 0.0
                 loss = _pct(max(0, tx - rx), tx)
                 resp = _pct(errors, tx + errors)
 
                 # Lo stato dice DOVE si e' fermato, non quanto e' andato bene.
+                # In ordine di gravita': una perdita batte una resa bassa, che
+                # batte una finestra troncata.
                 if loss > threshold:
                     stato, col = "RX_LOSS", RED
                 elif resa < 99.0:
                     stato, col = "GENERATOR_BACKPRESSURE", YELLOW
+                elif capped:
+                    stato, col = "CAP_WINDOW", YELLOW
                 else:
                     stato, col = "OK", GREEN
 
@@ -4979,7 +5003,10 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                     mode="generator", rate_target_mpps=round(rate / 1e6, 3),
                     round=rnd, frames=frame, window_s=round(secs, 4),
                     TX=tx, RX=rx, tx_mpps=round(tx_mpps, 4),
-                    rx_mpps=round(rx_mpps, 4), expected_packets=expected,
+                    rx_mpps=round(rx_mpps, 4),
+                    expected_packets=expected_nominale,
+                    expected_chiesto=expected_chiesto,
+                    window_capped=int(capped),
                     tx_achievement=round(resa / 100.0, 4),
                     loss_percent=round(loss, 4),
                     resp_percent=round(resp, 4), gen_errors=errors,
@@ -4990,7 +5017,11 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                     commit=_cmd_line(["git", "-C", SHARED_DIR, "rev-parse",
                                       "--short", "HEAD"]),
                     rx_action=verdict, status=stato))
-                print(f"  {rnd:4d} {rate/1e6:7.2f}M {tx:10d} {rx:10d} "
+                # L'asterisco sul target segnala la finestra troncata: la
+                # riga resta leggibile, ma non ha offerto il target per la
+                # durata bersaglio.
+                segno = "*" if capped else " "
+                print(f"  {rnd:4d} {rate/1e6:7.2f}M{segno} {tx:10d} {rx:10d} "
                       f"{tx_mpps:8.3f} {rx_mpps:8.3f} {resa:5.0f}% "
                       f"{loss:6.2f}% {resp:6.2f}% {col}{stato:>22s}{NC}")
 
@@ -5057,8 +5088,31 @@ def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
     rs = per_rate[top]
     resa_top = _median([x["tx_achievement"] for x in rs]) or 0.0
     loss_top = _median([x["loss_percent"] for x in rs]) or 0.0
+    top_capped = any(x.get("window_capped") for x in rs)
     print("")
-    if resa_top >= 0.99 and loss_top <= threshold:
+    if top_capped:
+        # Il target piu' alto e' stato troncato da MAX_WINDOW_PKTS: la
+        # finestra e' durata piu' del bersaglio e il target non e' stato
+        # offerto per intero. La resa sui rate resta valida -- ed e' quella
+        # stampata -- ma "ceiling raggiunto o no" su questo punto non si
+        # decide, e dirlo sarebbe concludere da una misura troncata.
+        n_cap = sum(1 for t in per_rate
+                    if any(x.get("window_capped") for x in per_rate[t]))
+        warn(f"il target piu' alto ({top:.2f} Mpps) e' stato TRONCATO dal "
+             f"tetto di {MAX_WINDOW_PKTS} pacchetti per finestra "
+             f"(MAX_WINDOW_PKTS): sopra "
+             f"{MAX_WINDOW_PKTS / WINDOW_S / 1e6:.2f} Mpps di target il banco "
+             f"chiede sempre lo stesso numero di pacchetti e la finestra si "
+             f"allunga. {n_cap} target su {len(per_rate)} sono in questa "
+             f"condizione (marcati `*`).")
+        print(f"  {GREY}La resa stampata resta valida -- e' il rapporto fra i "
+              f"RATE, che non dipende dalla durata della finestra -- ma su un "
+              f"punto troncato non si puo' dire se il tetto sia stato "
+              f"raggiunto: quel target non e' mai stato offerto per la "
+              f"durata bersaglio. Per provarlo davvero alza --duration, "
+              f"oppure resta sotto "
+              f"{MAX_WINDOW_PKTS / WINDOW_S / 1e6:.2f} Mpps di target.{NC}")
+    elif resa_top >= 0.99 and loss_top <= threshold:
         warn(f"generator ceiling not reached; highest tested target "
              f"({top:.2f} Mpps) is still achievable. Increase --rates to "
              f"determine a higher ceiling.")
