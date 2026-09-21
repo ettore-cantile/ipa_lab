@@ -100,8 +100,10 @@ scheda lo dice invece di nasconderlo.
 | **Variabili fisse** | Pesi, descrittore, topologia, `n_in`, offset dei pesi, indice del nodo. |
 | **Metrica** | La classe scelta e il valore di ritorno XDP, su tutti i pattern di link realizzabili × TTL 2-11. |
 | **Condizione dichiarata** | L'equivalenza vale finché gli slot senza interfaccia valgono 0. È garantito da `link_state_monitor`: `carrier_state()` ritorna 0 per un'interfaccia inesistente, al seed e a ogni poll. **Non** vale sotto `verify_prog_run._seed_link_state`, che semina 1 ovunque — il test azzera esplicitamente gli slot assenti nel riferimento. |
-| **Controllo negativo** | Accendendo uno slot assente le due build **devono** divergere. Un test che passa anche così non starebbe verificando la condizione. |
-| **Risultato** | **Da misurare** — il test esiste e non è ancora stato eseguito su kernel. |
+| **Controllo negativo** | Accendendo uno slot assente le due build **devono** divergere. Un test che passa anche così non starebbe verificando la condizione: se quelle colonne non spostano mai l'argmax, «le due concordano» è vero anche per una specializzazione sbagliata. |
+| **Risultato, primo run (2026-09-21)** | **Inconcludente.** 80/80 casi identici (TTL 2-11 × 8 pattern realizzabili, porte {0,1,4}) **ma controllo negativo muto**: su quei pesi nemmeno accendere uno slot assente cambia la decisione. Il 80/80 non è quindi una prova, ed è registrato qui come tale. |
+| **Perché era muto** | Una colonna di `link_state` contribuisce `1 × w` a un accumulatore che somma 65 colonne: può benissimo non ribaltare l'argmax. È una proprietà dei **pesi**, non del codice. Il controllo ora cerca fra più semi del pool (42, 1, 2, 3, 7, 123, 999) e, se nessuno morde, **fallisce** invece di annotare. |
+| **Stato** | Da rieseguire con il controllo che cerca. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --verify-ports` (o `--ports 0,1,4`) |
 
 ---

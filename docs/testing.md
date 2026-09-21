@@ -177,10 +177,31 @@ Sull'asse `degree` cambia **solo** quante colonne P1 genera: modello, forma e
 pesi sono identici punto per punto, e le altre tre pipeline devono restare
 piatte. Una loro pendenza vorrebbe dire che l'asse stesso costa qualcosa.
 
-> Stato: **nessuna misura raccolta.** Il generatore è verificato sul C prodotto
-> (conteggio dei termini, invarianza degli offset, non-regressione contro
-> HEAD); istruzioni, JIT e latenza non sono ancora state misurate, e
-> l'interazione con l'asse `sparsity` nemmeno.
+**Il controllo negativo, e perché c'è.** `--verify-ports` non si limita a
+verificare che le due build concordino: accende uno slot **assente** e pretende
+che a quel punto divergano. Senza, il test sarebbe compatibile con una
+specializzazione sbagliata — se quelle colonne non spostano mai l'argmax,
+«concordano» è vero comunque.
+
+Il primo run reale (2026-09-21, porte `{0,1,4}`) è finito esattamente lì:
+
+```
+80/80 casi identici (ttl 2-11 x 8 pattern realizzabili).
+controllo negativo muto: nemmeno accendendo uno slot assente le due divergono.
+```
+
+Cioè **inconcludente**, non positivo. La causa non è il codice ma i pesi: una
+colonna di `link_state` contribuisce `1 × w` a un accumulatore che ne somma 65,
+e può non ribaltare l'argmax. Il controllo ora prova più semi del pool
+(42, 1, 2, 3, 7, 123, 999) e **fallisce** se nessuno morde, invece di stampare
+una nota. Il seme diverso vale solo per il controllo: la misura resta sul pool
+di sempre, o l'asse cambierebbe due cose insieme.
+
+> Stato: **nessuna misura di costo raccolta.** Il generatore è verificato sul C
+> prodotto (conteggio dei termini, invarianza degli offset, non-regressione
+> byte per byte contro HEAD); istruzioni, JIT e latenza non sono ancora state
+> misurate, e l'interazione con l'asse `sparsity` nemmeno. La correttezza in
+> kernel è verificata solo a metà, finché il controllo negativo non morde.
 
 ### Verifier standalone (equivalente al gate di dispatch)
 

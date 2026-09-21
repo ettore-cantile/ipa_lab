@@ -279,8 +279,10 @@ AXES = {
         "xlabel": "porte realmente presenti sul nodo (su 6 colonne link_state)",
         "kind": "num",
         "values": [2, 3, 4, 5, 6],
+        # LISTA, non set: la cella viaggia in JSON verso il sottoprocesso che
+        # isola ogni misura, e un set non e' serializzabile.
         "cell": lambda v: dict(n_nodes=52, dims=(4, 4),
-                               static_ports=set(range(v))),
+                               static_ports=list(range(v))),
         "note": "stesso modello, stessi pesi, stesse colonne di peso: cambia "
                 "solo quante di esse la P1 specializzata genera",
     },
@@ -804,7 +806,9 @@ def _build_p1(cell, static_node):
     shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    weights = make_weights(nw, cell["sparsity"])
+    # `seed` esiste solo per il controllo negativo di verify_ports: la misura
+    # usa sempre il pool di default, altrimenti l'asse cambierebbe due cose.
+    weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
     src = build_combined_hardcoded_source(
         models=[(0, weights, SCALE)], features=shape["features"],
         n_out=n_out, hidden_dims=tuple(dims), static_node=static_node,
@@ -924,7 +928,7 @@ def verify_ports(ports=None, node=None):
     ports = {0, 1, 4} if ports is None else set(ports)
     assenti = sorted(set(range(n_if)) - ports)
 
-    cell = dict(cell_of("nodes", 52), static_ports=ports)
+    cell = dict(cell_of("nodes", 52), static_ports=sorted(ports))
     b_s, fd_s, shape = _build_p1(cell, static_node=node)
     b_f, fd_f, _ = _build_p1(dict(cell, static_ports=None), static_node=node)
 
@@ -969,25 +973,57 @@ def verify_ports(ports=None, node=None):
           f"{1 << len(ports)} pattern realizzabili).")
 
     # --- controllo negativo -------------------------------------------------
-    if assenti:
-        visto = 0
+    # Senza questo, il blocco sopra e' compatibile con un test che non prova
+    # nulla: se su questi pesi le colonne assenti non spostano mai l'argmax,
+    # allora "le due build concordano" e' vero anche per una build sbagliata.
+    #
+    # Il primo run reale e' finito esattamente li': 80/80 e controllo muto. La
+    # causa e' che una colonna di link_state contribuisce `1 * w` contro un
+    # accumulatore che somma 65 colonne, quindi puo' benissimo non ribaltare
+    # l'argmax. Non e' una proprieta' del codice ma dei PESI, e allora i pesi
+    # si cercano: il seme del pool e' un parametro di make_weights, e cambiarlo
+    # per il CONTROLLO non tocca la misura, che resta sul seme di sempre.
+    if not assenti:
+        print(f"  {GREY}Nessuno slot assente: controllo negativo non "
+              f"applicabile.{NC}")
+        return 0
+
+    def morde(seed):
+        """Su questi pesi, accendere uno slot assente cambia la decisione?"""
+        c = dict(cell, seed=seed)
+        bs, fs, sh = _build_p1(c, static_node=node)
+        bf, ff, _ = _build_p1(dict(c, static_ports=None), static_node=node)
+        ni, no = sh["n_in"], sh["n_out"]
+        n = 0
         for ttl in range(2, 12):
             for i in assenti:
                 links = tuple(1 if k == i else 0 for k in range(n_if))
-                if _decide(b_s, fd_s, n_in, n_out, ttl, links) != \
-                   _decide(b_f, fd_f, n_in, n_out, ttl, links):
-                    visto += 1
+                if _decide(bs, fs, ni, no, ttl, links) != \
+                   _decide(bf, ff, ni, no, ttl, links):
+                    n += 1
+        return n
+
+    semi = [42, 1, 2, 3, 7, 123, 999]
+    for seed in semi:
+        visto = morde(seed)
         if visto:
+            extra = "" if seed == 42 else f" (pool seed {seed})"
             print(f"  {GREEN}controllo negativo{NC}: accendendo uno slot "
-                  f"assente le due divergono in {visto} casi -- la condizione "
-                  f"\"slot assenti a 0\" e' portante, non decorativa.")
-        else:
-            print(f"  {YELLOW}controllo negativo muto{NC}: nemmeno accendendo "
-                  f"uno slot assente le due divergono. Su questi pesi quelle "
-                  f"colonne non spostano l'argmax, quindi il test sopra non "
-                  f"dimostra molto e va rifatto con altri pesi.")
-    print(f"  {GREY}Togliere le colonne cambia il codice, non la decisione.{NC}")
-    return 0
+                  f"assente le due divergono in {visto} casi{extra} -- la "
+                  f"condizione \"slot assenti a 0\" e' portante, non "
+                  f"decorativa.")
+            print(f"  {GREY}Togliere le colonne cambia il codice, non la "
+                  f"decisione.{NC}")
+            return 0
+
+    print(f"\n  {RED}controllo negativo MUTO su {len(semi)} insiemi di pesi{NC}: "
+          f"nemmeno accendendo uno slot assente le due build divergono mai.")
+    print(f"  {GREY}Il {n}/{n} qui sopra e' quindi compatibile anche con una "
+          f"specializzazione sbagliata, e non va citato come prova finche' "
+          f"questo non morde. Prova un descrittore con meno colonne (dove "
+          f"link_state pesa di piu' sull'accumulatore) o un modello piu' "
+          f"stretto.{NC}")
+    return 1
 
 
 def run_axis(axis, repeat, trials, out_dir):
