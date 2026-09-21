@@ -293,7 +293,93 @@ AXES = {
         "cell": lambda v: dict(n_nodes=52, dims=(4, 4), sparsity=v),
         "note": "stessa forma, pesi diversi: P1 li compila come letterali, P2/P3 li leggono da mappa",
     },
+
+    # ======================================================================
+    # LA CAMPAGNA: le stesse architetture che il throughput bench deve poi
+    # rimisurare sotto traffico. `campaign: True` le tiene fuori da
+    # `--axis all` (gli assi storici restano quelli, e i loro CSV pure) e le
+    # manda tutte in UN file, results/model_scaling_test_suite.csv.
+    #
+    # Modello di riferimento 65-4-4-7: e' il primo punto di `width_camp`.
+    # ======================================================================
+
+    # A, versione che una pendenza ce l'ha davvero.
+    #
+    # n_in = n_interfaces + n_queues + 1, con le due tenute uguali. Ogni
+    # colonna e' letta da una mappa e moltiplicata per h1 pesi, quindi le MAC
+    # nominali e quelle eseguite coincidono. Il soffitto e' 17 e non si supera:
+    # IPA_MAX_IFACES e IPA_MAX_QUEUES valgono 8, MAX_FEAT vale 4 e
+    # _validate_feature_types rifiuta i duplicati, quindi non si possono
+    # impilare piu' letture dense di queste.
+    "iv_dense": {
+        "xlabel": "colonne d'ingresso, tutte dense (n_in)",
+        "kind": "num",
+        "values": [5, 9, 13, 17],
+        "cell": lambda v: dict(n_nodes=52, dims=(8, 8), descriptor="iv_dense",
+                               n_interfaces=(v - 1) // 2,
+                               n_queues=(v - 1) // 2),
+        "campaign": True,
+        "note": "n_in = 2k+1 con link_state(k) + queue_occupancy(k) + ttl; "
+                "ogni colonna costa h1 moltiplicazioni. Tetto duro a 17",
+    },
+
+    # A come richiesta: n_in 16/32/65 a width, depth e n_out fermi.
+    #
+    # Sopra le 17 colonne dense la larghezza PUO' venire solo da una one-hot, e
+    # una one-hot non costa: FEAT_INGRESS_IF indicizza una colonna e fa h1
+    # addizioni, qualunque sia `size`. Previsione, verificabile sul CSV: insns
+    # e pesi salgono, `macs` sale, `macs_eff` no, e la latenza nemmeno. Lo
+    # stesso lo dice gia' result/scaling_nodes.csv, dove n_in va da 23 a 113 e
+    # le quattro latenze restano ferme.
+    #
+    # n_nodes resta 52 e `node` non e' nel descrittore: questo asse muove il
+    # VETTORE D'INGRESSO, non la rete. L'asse `nodes` misura l'altra cosa e
+    # resta separato.
+    "iv_onehot": {
+        "xlabel": "colonne d'ingresso, larghezza nella one-hot (n_in)",
+        "kind": "num",
+        "values": [16, 32, 65],
+        "cell": lambda v: dict(n_nodes=52, dims=(8, 8), descriptor="iv_onehot",
+                               n_interfaces=v - 5, n_queues=4),
+        "campaign": True,
+        "note": "n_in = k+5 con ingress_iface(k) + ttl + queue_occupancy(4); "
+                "la one-hot costa h1 addizioni comunque sia larga",
+    },
+
+    # B. 4 e' il riferimento 65-4-4-7. 16 e 32 sfondano T2_MAX_H1/H2 e
+    # ML1_MAX_H1, quindi su template e modular escono RIFIUTATO senza essere
+    # misurati: i soffitti non si toccano, e una riga misurata la' sarebbe un
+    # programma che risponde XDP_PASS.
+    "width_camp": {
+        "xlabel": "neuroni per hidden layer (campagna)",
+        "kind": "num",
+        "values": [4, 8, 16, 32],
+        "cell": lambda v: dict(n_nodes=52, dims=(v, v)),
+        "campaign": True,
+        "note": "65-v-v-7; sopra 8 solo P1 e p1_static, che non hanno soffitti "
+                "di larghezza",
+    },
+
+    # C. Profondita' a width 8, che e' il massimo che P2 e P3 reggono. L'asse
+    # `depth` storico usa width 4 e arriva a 6: questo e' piu' stretto e piu'
+    # largo, e proprio per questo puo' finire contro il budget di complessita'
+    # del verificatore di P3 sui punti in fondo. Un rifiuto la' e' un dato.
+    "depth_camp": {
+        "xlabel": "hidden layer, width 8 (campagna)",
+        "kind": "num",
+        "values": [1, 2, 3, 4],
+        "cell": lambda v: dict(n_nodes=52, dims=tuple([8] * v)),
+        "campaign": True,
+        "note": "65-8...8-7; P2 ricompila a ogni punto, P3 no -- e a width 8 "
+                "il verificatore di P3 puo' dire di no",
+    },
 }
+
+# Gli assi della campagna, nell'ordine in cui vanno letti.
+CAMPAIGN_AXES = [k for k, v in AXES.items() if v.get("campaign")]
+# Gli storici: quelli che `--axis all` ha sempre percorso.
+LEGACY_AXES = [k for k, v in AXES.items() if not v.get("campaign")]
+CAMPAIGN_CSV = "model_scaling_test_suite.csv"
 
 
 def cell_of(axis, v):
@@ -302,7 +388,8 @@ def cell_of(axis, v):
     # ogni asse diverso da `degree` produce lo stesso C di prima e i CSV gia'
     # raccolti restano confrontabili.
     c = dict(n_nodes=52, dims=(4, 4), descriptor=DEFAULT_DESCRIPTOR,
-             sparsity=0.0, static_ports=None)
+             sparsity=0.0, static_ports=None,
+             n_interfaces=N_INTERFACES, n_queues=N_QUEUES)
     c.update(AXES[axis]["cell"](v))
     return c
 
@@ -328,23 +415,133 @@ ISOPARAM_DIMS = {
 }
 
 
-def topology(n_nodes):
-    return {"n_interfaces": N_INTERFACES, "n_nodes": n_nodes,
-            "n_queues": N_QUEUES}
+# Descrittori in piu', vivi solo qui: gli assi IV della campagna hanno bisogno
+# di comporre il vettore d'ingresso in due modi che bench_depth_vs_width non
+# cura. FEATURE_SETS resta intatto, cosi' l'asse `descriptor` continua a
+# spazzare esattamente i quattro di prima.
+#
+#   iv_dense   link_state + queue_occupancy + ttl: OGNI colonna e' una lettura
+#              densa, quindi costa n_in*h1 moltiplicazioni. Soffitto duro a
+#              n_in = 8 + 8 + 1 = 17, vedi IV_DENSE_MAX.
+#   iv_onehot  ingress_iface + ttl + queue_occupancy: la larghezza sta nella
+#              one-hot, che nel kernel costa h1 ADDIZIONI qualunque sia la sua
+#              taglia (l'arm FEAT_INGRESS_IF indicizza una colonna sola). Qui
+#              n_in arriva a 128 ma la latenza non deve muoversi -- ed e' il
+#              motivo per cui i due assi esistono entrambi.
+IV_FEATURE_SETS = {
+    "iv_dense":  ["link_state", "queue_occupancy", "ttl"],
+    "iv_onehot": ["ingress_iface", "ttl", "queue_occupancy"],
+}
+DESCRIPTORS = dict(FEATURE_SETS, **IV_FEATURE_SETS)
 
 
-def build_shape(n_nodes, hidden_dims, descriptor=DEFAULT_DESCRIPTOR):
+# I soffitti COMPILATI, ricopiati qui per poterli controllare senza caricare
+# nulla. Non sono manopole: cambiarli invalida ogni CSV gia' raccolto, e
+# ebpf_modular.py avverte che sono scogliere e non pendenze. Stanno qui perche'
+# una cella che li sfonda va segnata RIFIUTATA *senza misurarla*: P3 non
+# fallisce il caricamento, risponde XDP_PASS a runtime
+#   if (n_out == 0 || n_out > ML1_MAX_H1) return XDP_PASS;
+# e una misura su quel programma e' una latenza vera di un programma che non
+# calcola niente -- il modo peggiore di rompersi.
+P2_MAX_H   = 8      # T2_MAX_H1 / T2_MAX_H2   in ebpf_template_arch.py
+P3_MAX_H1  = 8      # ML1_MAX_H1              in ebpf_modular.py
+P3_MAX_H   = 8      # MLH_MAX_H               in ebpf_modular.py
+MAX_N_IN   = 128    # MAX_N_IN / ML_MAX_N_IN  in entrambe
+MAX_FEAT   = 4      # MAX_FEAT / ML_MAX_FEAT  in entrambe
+# 8 (link_state) + 8 (queue_occupancy) + 1 (ttl): il piu' largo vettore
+# d'ingresso che si possa fare di sole colonne che costano aritmetica.
+IV_DENSE_MAX = 17
+
+
+def topology(n_nodes, n_interfaces=N_INTERFACES, n_queues=N_QUEUES):
+    return {"n_interfaces": n_interfaces, "n_nodes": n_nodes,
+            "n_queues": n_queues}
+
+
+def build_shape(n_nodes, hidden_dims, descriptor=DEFAULT_DESCRIPTOR,
+                n_interfaces=N_INTERFACES, n_queues=N_QUEUES):
     """Resolve the feature descriptor for this topology. n_out is DECLARED,
     never derived from the interface count -- see class_semantics.py."""
     import model_meta as mm
-    meta = {"features": FEATURE_SETS[descriptor], "n_out": N_OUT,
+    meta = {"features": DESCRIPTORS[descriptor], "n_out": N_OUT,
             "hidden_dims": list(hidden_dims)}
-    return mm.derive_shape(meta, topology_config=topology(n_nodes))
+    return mm.derive_shape(
+        meta, topology_config=topology(n_nodes, n_interfaces, n_queues))
+
+
+def shape_of(cell):
+    """La forma di UNA cella. `.get` e non `[]`: verify_static e verify_ports
+    si costruiscono la cella a mano e non conoscono le chiavi nuove."""
+    return build_shape(cell["n_nodes"], cell["dims"],
+                       cell.get("descriptor", DEFAULT_DESCRIPTOR),
+                       cell.get("n_interfaces", N_INTERFACES),
+                       cell.get("n_queues", N_QUEUES))
 
 
 def weight_count(n_in, dims, n_out):
     sizes = [n_in] + list(dims) + [n_out]
     return sum(sizes[i - 1] * sizes[i] + sizes[i] for i in range(1, len(sizes)))
+
+
+def mac_count(n_in, dims, n_out):
+    """MAC NOMINALI: il prodotto riga per colonna di ogni layer, come lo
+    conterebbe chiunque guardando la forma. Senza i bias, che sono addizioni."""
+    sizes = [n_in] + list(dims) + [n_out]
+    return sum(sizes[i - 1] * sizes[i] for i in range(1, len(sizes)))
+
+
+def mac_count_eff(shape, dims, n_out):
+    """MAC REALMENTE ESEGUITE, che sul primo layer non sono le nominali.
+
+    Una feature one-hot occupa `size` colonne della matrice dei pesi, ma nel
+    datapath ne attiva UNA: l'arm FEAT_NODE_ID / FEAT_INGRESS_IF fa h1
+    addizioni e basta, senza guardare `size`. Contarla come size*h1 MAC e' il
+    modo in cui un grafico "MAC contro latenza" finisce per mostrare una retta
+    piatta e sembrare rotto.
+
+    Le colonne dense (link_state, queue_occupancy) e lo scalare ttl contano per
+    quello che sono. I layer dopo il primo sono densi per costruzione."""
+    import model_meta as mm
+    h1 = dims[0] if dims else n_out
+    primo = 0
+    for f in shape["features"]:
+        kind = mm.FEATURE_CATALOG[f["type"]]["kind"]
+        primo += h1 if kind == "onehot" else int(f["size"]) * h1
+    resto = list(dims) + [n_out]
+    return primo + sum(resto[i - 1] * resto[i] for i in range(1, len(resto)))
+
+
+def ceiling_refusal(pipeline, shape, dims):
+    """Perche' questa cella non si puo' misurare su questa pipeline, o None.
+
+    Gira nel PADRE, prima di aprire il sottoprocesso, cosi' la cella non viene
+    ne' compilata ne' cronometrata. P1 e p1_static non compaiono: srotolano il
+    modello nel C e non hanno soffitti di larghezza -- se sfondano lo fanno
+    sullo stack da 512 byte, che e' un crash del figlio e va gia' nella colonna
+    CRASH."""
+    n_in, n_out = shape["n_in"], shape["n_out"]
+    if pipeline not in ("template", "modular"):
+        return None
+    n_feat = len(shape["features"])
+    if n_feat > MAX_FEAT:
+        return f"{n_feat} feature > MAX_FEAT={MAX_FEAT}"
+    if n_in > MAX_N_IN:
+        return f"n_in={n_in} > MAX_N_IN={MAX_N_IN}"
+    if pipeline == "template":
+        oltre = [d for d in dims if d > P2_MAX_H]
+        if oltre:
+            return f"hidden {oltre} > T2_MAX_H1/H2={P2_MAX_H}"
+        if n_out > P2_MAX_H:
+            return f"n_out={n_out} > T2_MAX_H2={P2_MAX_H}"
+    else:
+        if dims and dims[0] > P3_MAX_H1:
+            return f"h1={dims[0]} > ML1_MAX_H1={P3_MAX_H1}"
+        oltre = [d for d in dims[1:] if d > P3_MAX_H]
+        if oltre:
+            return f"hidden {oltre} > MLH_MAX_H={P3_MAX_H}"
+        if n_out > P3_MAX_H:
+            return f"n_out={n_out} > MLH_MAX_H={P3_MAX_H}"
+    return None
 
 
 # ==========================================================================
@@ -367,6 +564,47 @@ def _sample(disp_fd, frame, repeat, trials):
         samples.append(ns)
     samples.sort()
     return samples[0], samples[len(samples) // 2], samples[-1], retval
+
+
+# Ripetizioni del conteggio lookup. 200 = TEST_RUN_MAX_CHUNK, e il frame
+# parte da TTL 255 apposta: BPF_PROG_TEST_RUN non ripristina il buffer fra una
+# ripetizione e l'altra e il datapath decrementa il TTL, quindi con un TTL
+# basso le ripetizioni dopo la quarta prendono il ramo di scadenza -- che fa
+# UN LOOKUP IN MENO (niente cls_stats su un non-forward). E' lo stesso
+# inciampo documentato in _count_lookups_defaults; qui il TTL non arriva mai a
+# 1 (255 - 200 = 55).
+LOOKUP_REPEAT = 200
+LOOKUP_TTL = 255
+
+
+def _instrumented(raw):
+    """La stessa sorgente, con ogni `.lookup()` contato."""
+    from common import instrument_map_lookups
+    return "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
+
+
+def _lookups_safe(build, n_in, n_out):
+    """Lookup di mappa per pacchetto, o None se non si riesce a misurarli.
+
+    `build` restituisce (oggetto BPF, fd del dispatcher) dalla sorgente
+    strumentata. Un fallimento qui non deve perdere la cella: la latenza e le
+    istruzioni sono gia' state misurate sulla build PULITA, e questa e' una
+    colonna in piu'. La strumentazione gonfia il programma, e su P2 puo'
+    benissimo sfondare il limite di taglia -- allora la colonna resta vuota e
+    lo si vede, invece di far sparire la riga."""
+    from verify_prog_run import build_frame_sparse, prog_test_run
+    try:
+        bb, disp_fd = build()
+        frame = build_frame_sparse(model_id=0, ttl=LOOKUP_TTL, scale=SCALE,
+                                   n_in=n_in, n_out=n_out)
+        ctr = bb["lookup_ctr"]
+        ctr[ct.c_int(0)] = ctr.Leaf()        # per-CPU, azzerato ovunque
+        prog_test_run(disp_fd, frame, repeat=LOOKUP_REPEAT)
+        return sum(int(v) for v in ctr[ct.c_int(0)]) / float(LOOKUP_REPEAT)
+    except Exception as e:
+        print(f"[lookups] non misurabile: {type(e).__name__}: {str(e)[:90]}",
+              file=sys.stderr)
+        return None
 
 
 def _totals(b, progs):
@@ -417,13 +655,13 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     from verify_prog_run import build_frame_sparse, _seed_link_state
 
     dims = cell["dims"]
-    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
+    shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     weights = make_weights(nw, cell["sparsity"])
     sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
-    def _load():
+    def _load(strumentata=False):
         # Codegen is INSIDE the timed region on purpose. For P1 the weights
         # are C literals, so installing a model is generating C and running
         # clang over it -- there is no separate "load the weights" step to
@@ -434,7 +672,7 @@ def _bench_p1(cell, repeat, trials, static_node=None):
             models=[(0, weights, SCALE)],
             features=shape["features"], n_out=n_out, hidden_dims=tuple(dims),
             static_node=static_node, static_ports=ports)
-        bb = BPF(text=src)
+        bb = BPF(text=_instrumented(src) if strumentata else src)
         m = bb.load_func("model_0", BPF.XDP)
         d = bb.load_func("ipa_switch_hardcoded", BPF.XDP)
         bb["model_progs"][ct.c_int(0)] = ct.c_int(m.fd)
@@ -446,6 +684,15 @@ def _bench_p1(cell, repeat, trials, static_node=None):
 
     insns, jited, mb, per_prog, maps = _totals(
         b, {"ipa_switch_hardcoded": disp_fn.fd, "model_0": model_fn.fd})
+    lookups = None
+    if cell.get("lookups"):
+        def _ins():
+            # link_state va seminata anche qui: senza, la feature densa legge
+            # una mappa vuota e il percorso non e' quello misurato sopra.
+            bb, _m, dd = _load(True)
+            _seed_link_state(bb, 1)
+            return bb, dd.fd
+        lookups = _lookups_safe(_ins, n_in, n_out)
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
@@ -456,7 +703,8 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
                 lat_max=hi, mpps=mpps, retval=retval, per_prog=per_prog,
-                n_maps=len(maps), sparsity_real=sparsity_real)
+                n_maps=len(maps), sparsity_real=sparsity_real,
+                lookups=lookups)
 
 
 def _bench_p2(cell, repeat, trials):
@@ -484,7 +732,7 @@ def _bench_p2(cell, repeat, trials):
                                     load_arch_weights)
     from verify_prog_run import build_frame_sparse, _seed_link_state
 
-    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
+    shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     weights = make_weights(nw, cell["sparsity"])
@@ -499,8 +747,8 @@ def _bench_p2(cell, repeat, trials):
     src = ("#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER
            + "\n" + build_arch_leaf(n_hidden))
 
-    def _load():
-        bb = BPF(text=src)
+    def _load(strumentata=False):
+        bb = BPF(text=_instrumented(src) if strumentata else src)
         d = bb.load_func("ipa_switch_template", BPF.XDP)
         leaf = bb.load_func("arch_generic_2layer", BPF.XDP)
         bb["arch_progs"][ct.c_int(0)] = ct.c_int(leaf.fd)
@@ -521,6 +769,17 @@ def _bench_p2(cell, repeat, trials):
     insns, jited, mb, per_prog, maps = _totals(
         b, {"ipa_switch_template": disp_fn.fd,
             "arch_generic_2layer": leaf_fn.fd})
+    lookups = None
+    if cell.get("lookups"):
+        def _ins():
+            bb, dd, _leaf = _load(True)
+            load_arch_weights(bb, weights, model_id=0, scale=SCALE,
+                              n_h1=n_h1, n_h2=n_h2, n_hidden=n_hidden,
+                              features=shape["features"], n_in=n_in,
+                              semantics=shape.get("semantics"))
+            _seed_link_state(bb, 1)
+            return bb, dd.fd
+        lookups = _lookups_safe(_ins, n_in, n_out)
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
@@ -531,7 +790,8 @@ def _bench_p2(cell, repeat, trials):
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
                 lat_max=hi, mpps=mpps, retval=retval, per_prog=per_prog,
-                n_maps=len(maps), sparsity_real=sparsity_real)
+                n_maps=len(maps), sparsity_real=sparsity_real,
+                lookups=lookups)
 
 
 def _bench_p3(cell, repeat, trials):
@@ -540,7 +800,7 @@ def _bench_p3(cell, repeat, trials):
     from verify_prog_run import build_frame_sparse, _seed_link_state
 
     dims = cell["dims"]
-    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
+    shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     weights = make_weights(nw, cell["sparsity"])
@@ -549,8 +809,9 @@ def _bench_p3(cell, repeat, trials):
     sizes = [n_in] + list(dims) + [n_out]
     layer_dims = [(sizes[i - 1], sizes[i]) for i in range(1, len(sizes))]
 
-    def _load():
-        bb = BPF(text=EBPF_MODULAR_FULL)
+    def _load(strumentata=False):
+        bb = BPF(text=_instrumented(EBPF_MODULAR_FULL) if strumentata
+                 else EBPF_MODULAR_FULL)
         d = bb.load_func("modular_dispatcher", BPF.XDP)
         first = bb.load_func("layer_first", BPF.XDP)
         hidden = bb.load_func("layer_hidden", BPF.XDP)
@@ -573,6 +834,17 @@ def _bench_p3(cell, repeat, trials):
         b, {"modular_dispatcher": disp_fn.fd,
             "layer_first": first_fn.fd,
             "layer_hidden": hidden_fn.fd})
+    lookups = None
+    if cell.get("lookups"):
+        def _ins():
+            bb, dd, _f, _h = _load(True)
+            load_modular_weights(bb, weights, model_id=0, scale=SCALE,
+                                 layer_dims=layer_dims,
+                                 features=shape["features"],
+                                 semantics=shape.get("semantics"))
+            _seed_link_state(bb, 1)
+            return bb, dd.fd
+        lookups = _lookups_safe(_ins, n_in, n_out)
     frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
                                n_in=n_in, n_out=n_out)
     lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
@@ -585,7 +857,8 @@ def _bench_p3(cell, repeat, trials):
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=len(layer_dims),
                 nw=nw, n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
                 lat_max=hi, mpps=mpps, retval=retval, per_prog=per_prog,
-                n_maps=len(maps), sparsity_real=sparsity_real)
+                n_maps=len(maps), sparsity_real=sparsity_real,
+                lookups=lookups)
 
 
 def _bench_p1_static(cell, repeat, trials):
@@ -595,7 +868,53 @@ def _bench_p1_static(cell, repeat, trials):
     return _bench_p1(cell, repeat, trials, static_node=STATIC_NODE)
 
 
-_BENCH = {"p1_static": _bench_p1_static, "hardcoded": _bench_p1,
+def _bench_baseline(cell, repeat, trials):
+    """Il pavimento: parse, decremento del TTL, redirect. Nessuna inferenza.
+
+    Non dipende dalla cella, ed e' esattamente il punto: da' al grafico
+    "MAC contro latenza" il suo punto a MAC = 0, cioe' quanto del numero di
+    una pipeline e' framework XDP e non modello. Rimisurato a ogni cella
+    apposta: la sua dispersione lungo l'asse dice quanto rumore aveva la
+    macchina mentre le altre quattro venivano misurate.
+
+    Non passa da setup_baseline() perche' quella chiama load_weights() su un
+    .pt, e qui i modelli sono sintetici. Il programma e' lo stesso: la
+    baseline non legge pesi."""
+    from bcc import BPF
+    from verify_prog_run import (EBPF_BASELINE, _install_mac_table,
+                                 build_frame_sparse)
+    shape = shape_of(cell)
+    n_in, n_out = shape["n_in"], shape["n_out"]
+
+    def _load(strumentata=False):
+        bb = BPF(text=_instrumented(EBPF_BASELINE) if strumentata
+                 else EBPF_BASELINE)
+        d = bb.load_func("xdp_baseline", BPF.XDP)
+        _install_mac_table(bb, "mac_table")
+        return bb, d
+
+    (b, disp_fn), build_ms = _timed(_load)
+    insns, jited, mb, per_prog, maps = _totals(b, {"xdp_baseline": disp_fn.fd})
+    lookups = None
+    if cell.get("lookups"):
+        lookups = _lookups_safe(
+            lambda: (lambda t: (t[0], t[1].fd))(_load(True)), n_in, n_out)
+    frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
+                               n_in=n_in, n_out=n_out)
+    lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    mpps = (1000.0 / lo) if lo else 0.0
+    # update_ms = 0 e non build_ms: qui non c'e' nessun modello da installare,
+    # e confondere "compilare una volta" con "cambiare modello" e' l'errore
+    # contro cui il docstring del modulo mette in guardia per P1.
+    return dict(insns=insns, jited=jited, map_bytes=mb, tail=0, nw=0,
+                n_in=n_in, build_ms=build_ms, update_ms=0.0, lat_ns=lo,
+                lat_p50=med, lat_max=hi, mpps=mpps, retval=retval,
+                per_prog=per_prog, n_maps=len(maps), sparsity_real=0.0,
+                lookups=lookups)
+
+
+_BENCH = {"baseline": _bench_baseline,
+          "p1_static": _bench_p1_static, "hardcoded": _bench_p1,
           "template": _bench_p2, "modular": _bench_p3}
 
 
@@ -803,7 +1122,7 @@ def _build_p1(cell, static_node):
     from verify_prog_run import _install_mac_table
 
     dims = cell["dims"]
-    shape = build_shape(cell["n_nodes"], dims, cell["descriptor"])
+    shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
     # `seed` esiste solo per il controllo negativo di verify_ports: la misura
@@ -1026,7 +1345,18 @@ def verify_ports(ports=None, node=None):
     return 1
 
 
-def run_axis(axis, repeat, trials, out_dir):
+def _write_csv(path, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    _give_back(path)
+    print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
+
+
+def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
+    """Un asse. Restituisce le righe; `write=False` le lascia al chiamante,
+    che e' come i quattro assi della campagna finiscono in un CSV solo."""
     spec = AXES[axis]
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} asse x: {spec['xlabel']}{NC}")
@@ -1040,23 +1370,45 @@ def run_axis(axis, repeat, trials, out_dir):
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
 
+    # La baseline e' il pavimento del confronto MAC-contro-latenza, quindi
+    # entra negli assi della campagna. Gli assi storici restano a quattro
+    # pipeline, cosi' i loro CSV conservano le stesse righe di prima.
+    pipelines = (("baseline",) + PIPELINES) if spec.get("campaign") else PIPELINES
+
     for v in spec["values"]:
         cell = cell_of(axis, v)
+        cell["lookups"] = lookups     # viaggia in JSON fino al worker
         dims = cell["dims"]
         # Computed here, not read back from the result: a cell that was
         # skipped or that crashed has no n_in to report, and printing "?-4-7"
         # made a structural note look like a broken measurement.
-        n_in = build_shape(cell["n_nodes"], dims, cell["descriptor"])["n_in"]
+        shape = shape_of(cell)
+        n_in = shape["n_in"]
         shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{N_OUT}"
-        for pipe in PIPELINES:
-            r = bench_cell(pipe, cell, repeat, trials)
+        # Descrittive della cella, uguali per tutte le pipeline: la forma non
+        # cambia a seconda di chi la esegue. `macs` e `macs_eff` divergono
+        # quando l'ingresso ha one-hot -- vedi mac_count_eff.
+        forma = dict(n_out=N_OUT, depth=len(dims),
+                     width=(max(dims) if dims else 0),
+                     macs=mac_count(n_in, dims, N_OUT),
+                     macs_eff=mac_count_eff(shape, dims, N_OUT))
+        for pipe in pipelines:
+            # Fuori dai soffitti compilati NON si misura. P3 non rifiuta il
+            # caricamento, risponde XDP_PASS a runtime: la misura uscirebbe
+            # come una latenza plausibile di un programma che non calcola.
+            oltre = ceiling_refusal(pipe, shape, dims)
+            if oltre:
+                r = {"ok": False, "refused": True,
+                     "detail": f"soffitto compilato: {oltre}"}
+            else:
+                r = bench_cell(pipe, cell, repeat, trials)
             if r.get("ok"):
                 print(f"  {str(v):>5s} {pipe:11s} {shape_str:>16s} {r['nw']:6d} "
                       f"{r['insns']:7d} {r['lat_ns']:7.1f} "
                       f"{r['update_ms']:10.2f} {r['build_ms']:9.1f} "
                       f"{r['map_bytes']:8d} {r['tail']:4d}")
                 rows.append(dict(axis=axis, x=v, pipeline=pipe,
-                                 shape=shape_str, **{
+                                 shape=shape_str, **forma, **{
                                      k: r[k] for k in
                                      ("nw", "n_in", "insns", "jited",
                                       "map_bytes", "n_maps", "tail",
@@ -1069,7 +1421,7 @@ def run_axis(axis, repeat, trials, out_dir):
                                       # sample of the pool's, not equal to it.
                                       # Recorded so the x label can be checked
                                       # rather than trusted.
-                                      "sparsity_real")}))
+                                      "sparsity_real", "lookups")}))
             else:
                 if r.get("skipped"):
                     mark = f"{GREY}n/d{NC}"
@@ -1082,17 +1434,11 @@ def run_axis(axis, repeat, trials, out_dir):
 
     _warn_contaminated(rows)
 
-    if out_dir:
+    if out_dir and write:
         os.makedirs(out_dir, exist_ok=True)
         _give_back(out_dir)
-        path = os.path.join(out_dir, f"scaling_{axis}.csv")
         if rows:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                w.writeheader()
-                w.writerows(rows)
-            _give_back(path)
-            print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
+            _write_csv(os.path.join(out_dir, f"scaling_{axis}.csv"), rows)
         else:
             print(f"\n  {RED}nessuna riga da scrivere per {axis}{NC}")
     return rows
@@ -1278,11 +1624,20 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("USAGE")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--axis", choices=list(AXES) + ["all"], default="all")
+    p.add_argument("--axis", choices=list(AXES) + ["all", "campaign"],
+                   default="all",
+                   help="`all` = i sette assi storici; `campaign` = le "
+                        "architetture della campagna, tutte in "
+                        + CAMPAIGN_CSV)
     p.add_argument("--repeat", type=int, default=100000,
                    help="ripetizioni dentro una singola BPF_PROG_TEST_RUN")
     p.add_argument("--trials", type=int, default=7,
                    help="misure indipendenti per cella; si tiene il minimo")
+    p.add_argument("--lookups", action="store_true",
+                   help="misura anche le letture di mappa per pacchetto. "
+                        "Spento di default: e' una SECONDA compilazione per "
+                        "cella (su P1 ~1,5 s di clang in piu' ognuna), e la "
+                        "build strumentata non e' quella cronometrata")
     p.add_argument("--out", default=os.path.join(SHARED_DIR, "..", "results"),
                    help="dove scrivere i CSV")
     p.add_argument("--plot", metavar="DIR", default=None,
@@ -1310,7 +1665,8 @@ def main():
         import importlib.util
         if importlib.util.find_spec("matplotlib") is None:
             sys.exit("serve matplotlib per i grafici: pip install matplotlib")
-        n = sum(plot_axis(ax, a.plot, a.format, a.all_plots) for ax in AXES)
+        n = sum(plot_axis(ax, a.plot, a.format, a.all_plots)
+                for ax in LEGACY_AXES)
         n += plot_duel(a.plot, a.format)
         print(f"\n{GREEN}{n} grafici{NC} in {a.plot}")
         return 0
@@ -1336,9 +1692,27 @@ def main():
     # that meant it to go.
     out_dir = os.path.abspath(a.out)
     os.chdir(SHARED_DIR)
-    axes = list(AXES) if a.axis == "all" else [a.axis]
+    if a.axis == "all":
+        axes = LEGACY_AXES          # invariato: i sette assi di sempre
+    elif a.axis == "campaign":
+        axes = CAMPAIGN_AXES
+    else:
+        axes = [a.axis]
+
+    # Gli assi della campagna confluiscono in un file solo, perche' sono
+    # quattro tagli della STESSA domanda e un grafico MAC-contro-latenza li
+    # vuole tutti insieme. Gli altri continuano a scrivere scaling_<asse>.csv.
+    campagna = []
     for ax in axes:
-        run_axis(ax, a.repeat, a.trials, out_dir)
+        e_campagna = bool(AXES[ax].get("campaign"))
+        righe = run_axis(ax, a.repeat, a.trials, out_dir,
+                         write=not e_campagna, lookups=a.lookups)
+        if e_campagna:
+            campagna += righe
+    if campagna and out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        _give_back(out_dir)
+        _write_csv(os.path.join(out_dir, CAMPAIGN_CSV), campagna)
 
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(" Grafici (non serve root, basta matplotlib):")
