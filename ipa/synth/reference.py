@@ -5,28 +5,40 @@ Two independent references, both driven by the same flat weight list the eBPF
 pipelines consume:
 
   forward_float  the model as PyTorch would compute it (pure Python, so it runs
-                 without torch; `torch_forward` cross-checks it when torch is
-                 available).
+                 without torch; test_synth cross-checks it against torch when
+                 torch is available).
   forward_int8   bit-for-bit what the datapath computes.
 
-Why forward_int8 replicates a scheme that is not textbook-correct
------------------------------------------------------------------
-The project's quantisation is symmetric with no zero point, and uses ONE global
-scale for every parameter: w_int8 = clamp(round(w_float * s), -128, 127). The
-inference never divides by s, because argmax is invariant under a positive
-scaling of all logits.
+The int8 scheme, and why every bias is rescaled
+-----------------------------------------------
+Quantisation is symmetric with no zero point and ONE global scale for every
+parameter: w_int8 = clamp(round(w_float * s), -128, 127). The inference never
+divides by s, because argmax is invariant under a positive scaling of all
+logits -- provided every term of an accumulator carries the same power of s.
 
-That invariance is only exact if every term in an accumulator carries the same
-power of s. It does not: at layer L the products carry s**L while the bias
-carries s**1, so biases are progressively under-weighted with depth. This is a
-real property of the existing scheme, not of this module. forward_int8
-reproduces it deliberately -- the point of a reference is to agree with the
-datapath, and a "corrected" reference would disagree with all three pipelines.
-`bias_scale_report` quantifies the distortion so it can be stated rather than
-discovered.
+At layer l (0-based) the products carry s**(l+1): the input carries s**0 and
+every layer multiplies by one more quantised weight. A stored bias carries
+s**1. The pipelines therefore multiply the bias of layer l by s**l (P1:
+ebpf_program._gen_dense_layer, bias_mul=scale**li), and so does forward_int8.
+With no column divided (col_scales all 1) the integer logits are then EXACTLY
+s**L times the logits of the dequantised model, whose weights are w_int8/s.
+
+`scale` is therefore a required argument. It used to default to 1 -- the right
+multiplier for a model of scale 1 and the wrong one for every other -- and
+generate.py called forward_int8 without it: until 2026-09-23 expected.json held
+the logits of an unscaled-bias scheme that no pipeline runs (float/int8
+agreement 0.789 on ipa_like, 0.986 with the datapath's scheme). Two
+implementations can each be consistent and still disagree with each other, so
+test_synth now checks forward_int8 against the C that P1 compiles, logit for
+logit (test/p1_c_eval.py), and against the dequantised model.
 """
 
 from typing import List, Sequence, Tuple
+
+# Written into expected.json by generate.py and required by load_scenario: a
+# scenario whose int8 expectations were computed under any other scheme is
+# refused instead of being compared against the datapath.
+INT8_SCHEME = "bias_l*scale^l"
 
 
 def trunc_div(a: int, b: int) -> int:
@@ -101,8 +113,12 @@ def forward_float(weights_float: Sequence[float], layer_dims, x: Sequence[float]
 # ---------------------------------------------------------------------------
 def forward_int8(weights_int8: Sequence[int], layer_dims, x_int: Sequence[int],
                  col_scales: Sequence[int] = None,
-                 activation: str = "relu", scale: int = 1) -> List[int]:
+                 activation: str = "relu", *, scale: int) -> List[int]:
     """Integer forward identical to the eBPF programs.
+
+    `scale` is the model's global quantisation scale, keyword-only and without
+    a default: the bias of layer l is multiplied by scale**l, and no value of
+    it is right for every model (see the module docstring).
 
     `x_int` holds what the datapath reads: raw integers, NOT pre-divided.
     `col_scales` gives the per-column divisor applied to the PRODUCT (see
@@ -115,6 +131,9 @@ def forward_int8(weights_int8: Sequence[int], layer_dims, x_int: Sequence[int],
     """
     if activation != "relu":
         raise ValueError(f"unsupported activation {activation!r}")
+    if scale is None or int(scale) != scale or int(scale) < 1:
+        raise ValueError(f"scale must be a positive integer, got {scale!r}")
+    scale = int(scale)
     n_in0 = layer_dims[0][0]
     if col_scales is None:
         col_scales = [1] * n_in0
@@ -132,7 +151,8 @@ def forward_int8(weights_int8: Sequence[int], layer_dims, x_int: Sequence[int],
         for j in range(n_out):
             # Bias in the accumulator's units: layer li's products carry
             # scale**(li+1), a stored bias carries scale**1, so the bias is
-            # multiplied by scale**li. See the module docstring.
+            # multiplied by scale**li -- the literal P1 compiles. See the
+            # module docstring.
             acc = _s8(b[j]) * (scale ** li)
             base = j * n_in
             for i in range(n_in):
@@ -183,19 +203,17 @@ def quantize(weights_float: Sequence[float], scale: int = None):
     return out, scale, clamped
 
 
-def bias_scale_report(layer_dims) -> List[str]:
-    """How badly the shared-scale scheme under-weights each layer's bias.
+def bias_scale_report(layer_dims, scale: int) -> List[str]:
+    """The multiplier each layer's bias gets, as a number.
 
-    At layer L (1-based) the products carry scale**L and the bias scale**1, so
-    the bias is effectively divided by scale**(L-1) relative to the products.
-    Reported so the distortion is a stated property rather than a surprise.
+    Layer l (0-based) accumulates products carrying scale**(l+1); a stored bias
+    carries scale**1 and is multiplied by scale**l to match. Printed so the
+    multipliers compiled into the datapath (`bias_mul` in ebpf_program) can be
+    checked against a value rather than taken on trust.
     """
     lines = []
     for li in range(len(layer_dims)):
-        power = li  # bias under-weighted by scale**li
-        if power == 0:
-            lines.append("  layer 1: bias and products both carry scale^1 -- consistent")
-        else:
-            lines.append(f"  layer {li + 1}: bias under-weighted by scale^{power} "
-                         f"relative to the products")
+        mul = scale ** li
+        lines.append(f"  layer {li + 1}: products carry scale^{li + 1}, "
+                     f"bias x scale^{li} = x{mul}")
     return lines

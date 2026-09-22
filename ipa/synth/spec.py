@@ -196,15 +196,20 @@ class ModelSpec:
     max_abs: float = 5.0           # target max|w|; see the note below
 
     # max_abs exists because the int8 scale is derived from it:
-    # scale = int(127 / max|w|). Textbook initialisation (1/sqrt(fan_in)) gives
-    # max|w| ~ 0.5 on a 4-wide layer, hence scale ~ 263 -- and since this
-    # project's quantisation under-weights layer-L biases by scale**(L-1), a
-    # large scale wrecks the model: measured float/int8 argmax agreement drops
-    # to 0.2%, against 71.3% for the supplied checkpoint (max|w| = 5.1,
-    # scale = 24). A synthetic model with an unrepresentative dynamic range
-    # therefore tests the pipelines on a model no trainer would produce.
-    # The default matches the checkpoint's magnitude; set it explicitly to
-    # study the quantisation scheme itself rather than the pipelines.
+    # scale = int(127 / max|w|), and the scale is the quantisation step.
+    # Textbook initialisation (1/sqrt(fan_in)) gives max|w| ~ 0.5 on a 4-wide
+    # layer, hence scale ~254: a step ten times finer than the supplied
+    # checkpoint's (max|w| = 5.1, scale = 24). Measured on ipa_like, 1000
+    # inputs: float/int8 argmax agreement 100.0% at max_abs 0.5, 98.6% at 5.0.
+    # The default matches the checkpoint's magnitude, so the pipelines are
+    # tested with the quantisation error the real model has; set it
+    # explicitly to study the quantisation itself.
+    #
+    # This comment used to say the opposite -- that a large scale wrecks the
+    # model, below 1% agreement. That was the old synth reference, which left
+    # the bias of layer l unscaled, a scheme no pipeline runs (see
+    # synth/reference.py). Under the datapath's scheme a larger scale only
+    # makes the step finer.
 
     ACTIVATIONS = ("relu",)        # the datapath implements ReLU only
     QUANT = ("int8", "float")

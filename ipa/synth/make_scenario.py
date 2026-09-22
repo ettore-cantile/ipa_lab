@@ -95,8 +95,8 @@ def main():
         print(f"  float/int8 argmax agreement : {100*man['quant_agreement']:.2f}%")
         print(f"  classes float / int8        : {man['classes_float']} / "
               f"{man['classes_int8']}")
-        print("  bias scaling under this scheme:")
-        for line in ref.bias_scale_report(m.layer_dims):
+        print("  bias multipliers (the literals P1 compiles):")
+        for line in ref.bias_scale_report(m.layer_dims, man['scale_factor']):
             print(line)
         print(f"  torch state_dict written    : {man['torch']}")
         print(f"  -> {outdir}")

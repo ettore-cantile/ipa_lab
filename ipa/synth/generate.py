@@ -14,7 +14,11 @@ and poc_aot/gen_full_c all take `weights.json` / `weights_float.json` as-is:
   weights.json        [int8]
   model.pt            PyTorch state_dict, when torch is available
   inputs.json         {seed, n, vectors:[[int]], float_vectors:[[float]], ...}
-  expected.json       per-vector float logits/class and int8 logits/class
+  expected.json       per-vector float logits/class and int8 logits/class.
+                      The int8 side is the datapath's scheme (bias of layer l
+                      times scale**l), named in `int8_scheme`; load_scenario
+                      refuses a file that does not declare it, because until
+                      2026-09-23 this file was written with the bias unscaled.
 """
 
 import json
@@ -66,8 +70,7 @@ def make_weights(mspec: ModelSpec) -> List[float]:
 
     # Global rescale to the declared dynamic range. The per-layer 1/sqrt(fan_in)
     # above sets the RELATIVE balance between layers; this sets the ABSOLUTE
-    # magnitude, which determines the int8 scale and therefore how badly the
-    # shared-scale scheme distorts the biases. See ModelSpec.max_abs.
+    # magnitude, which determines the int8 scale. See ModelSpec.max_abs.
     peak = max((abs(x) for x in w), default=0.0)
     if peak > 0 and mspec.weight_init != "ones":
         k = mspec.max_abs / peak
@@ -252,7 +255,8 @@ def generate_scenario(mspec: ModelSpec, outdir: str, n_inputs: int = 1000,
     exp_float, exp_int8 = [], []
     for xi, xf in zip(ints, floats):
         lf = ref.forward_float(wf, dims, xf, mspec.activation)
-        li = ref.forward_int8(wi, dims, xi, col_scales, mspec.activation)
+        li = ref.forward_int8(wi, dims, xi, col_scales, mspec.activation,
+                              scale=scale)
         exp_float.append({"logits": lf, "cls": ref.argmax(lf)})
         exp_int8.append({"logits": li, "cls": ref.argmax(li)})
 
@@ -276,7 +280,8 @@ def generate_scenario(mspec: ModelSpec, outdir: str, n_inputs: int = 1000,
                        "n_in": fset.n_in, "col_scales": col_scales,
                        "vectors": ints, "float_vectors": floats,
                        "per_feature": stats})
-    _w("expected.json", {"float": exp_float, "int8": exp_int8,
+    _w("expected.json", {"int8_scheme": ref.INT8_SCHEME, "scale_factor": scale,
+                         "float": exp_float, "int8": exp_int8,
                          "quant_agreement": agree / n_inputs})
 
     torch_ok = None
@@ -302,15 +307,32 @@ def generate_scenario(mspec: ModelSpec, outdir: str, n_inputs: int = 1000,
 
 def load_scenario(outdir: str):
     """Read back a generated scenario: (ModelSpec, weights_float, weights_int8,
-    scale, inputs_int, inputs_float, expected)."""
+    scale, inputs, expected).
+
+    Refuses an expected.json that does not declare the int8 scheme the
+    datapath runs. Files written before 2026-09-23 have no `int8_scheme`: their
+    int8 logits leave the bias unscaled, and comparing a pipeline against them
+    would report a datapath defect that is really a stale reference."""
     def _r(name):
         with open(os.path.join(outdir, name)) as f:
             return json.load(f)
     mj = _r("model.json")
     mspec = ModelSpec.from_json(mj)
     wfj = _r("weights_float.json")
+    expected = _r("expected.json")
+    scheme = expected.get("int8_scheme")
+    if scheme != ref.INT8_SCHEME:
+        raise ValueError(
+            f"{outdir}: expected.json declares int8_scheme={scheme!r}, the "
+            f"reference and the datapath use {ref.INT8_SCHEME!r}. It was "
+            f"generated with an older reference; regenerate it: python3 "
+            f"ipa/synth/make_scenario.py --preset all")
+    if expected.get("scale_factor") != wfj["scale_factor"]:
+        raise ValueError(f"{outdir}: expected.json was computed with scale "
+                         f"{expected.get('scale_factor')}, weights_float.json "
+                         f"declares {wfj['scale_factor']}")
     return (mspec, wfj["weights"], _r("weights.json"), wfj["scale_factor"],
-            _r("inputs.json"), _r("expected.json"))
+            _r("inputs.json"), expected)
 
 
 # ---------------------------------------------------------------------------

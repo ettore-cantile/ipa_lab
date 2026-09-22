@@ -16,12 +16,22 @@ What is actually checked
                   agrees with model_meta.resolve_descriptor's convention, and a
                   reloaded scenario reproduces the same layout.
   quantisation    the scale matches extract_weights' formula exactly, the
-                  scheme is symmetric with zero_point 0, and dequantisation
-                  error is bounded by the step size.
+                  scheme is symmetric with zero_point 0, dequantisation error
+                  is bounded by the step size, and with no column divided the
+                  int8 logits are EXACTLY scale**L times the dequantised
+                  model's (exact rational arithmetic, independent of both
+                  forward passes).
   independence    no generated artefact contains the checkpoint's weights or
                   filename, and the generated weights differ from it.
   determinism     same seed -> byte-identical artefacts; different seed ->
                   different weights.
+  reference vs C  synth.reference.forward_int8 against the C that P1
+                  compiles, logit for logit: a hand-computed case, then every
+                  preset through P1.5 and P1 with the node frozen. The C is
+                  evaluated from its text by p1_c_eval (C integer rules, no
+                  kernel), so two implementations that are each consistent
+                  cannot drift apart unnoticed -- which is what happened to
+                  the bias scaling until 2026-09-23.
 
     python3 ipa/test/test_synth.py
     sudo python3 ipa/test/test_synth.py --kernel
@@ -30,9 +40,11 @@ What is actually checked
 import argparse
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
+from fractions import Fraction
 
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 SHARED_DIR = os.path.dirname(_TEST_DIR)
@@ -144,6 +156,19 @@ def t_weight_roundtrip():
           f"torch forward == pure-Python float reference (max |d| = {worst:.2e})")
 
 
+def _exact_forward(weights, dims, x):
+    """ReLU MLP in exact rational arithmetic: the dequantised model as
+    mathematics defines it, with no rounding anywhere."""
+    acts = [Fraction(v) for v in x]
+    layers = ref.split_layers(weights, dims)
+    for li, (w, b) in enumerate(layers):
+        n_in, n_out = dims[li]
+        nxt = [b[j] + sum(acts[i] * w[j * n_in + i] for i in range(n_in))
+               for j in range(n_out)]
+        acts = nxt if li == len(layers) - 1 else [max(Fraction(0), a) for a in nxt]
+    return acts
+
+
 def t_quantisation():
     print(f"\n{YELLOW}[4] Quantisation: scale and zero point{NC}")
     m = preset("ipa_like")
@@ -168,9 +193,33 @@ def t_quantisation():
     mj = m.to_json()
     check(mj["quant"]["zero_point"] == 0 and mj["quant"]["symmetric"] is True,
           "descriptor declares the scheme (symmetric, zero_point 0)")
-    info("bias scaling under this scheme:")
-    for line in ref.bias_scale_report(m.layer_dims):
+    info("bias multipliers under this scheme:")
+    for line in ref.bias_scale_report(m.layer_dims, scale):
         print(f"    {line.strip()}")
+
+    # The identity the scheme exists for. With no column divided, the integer
+    # network computes EXACTLY scale**L times what the dequantised network
+    # (weights w_int8 / scale) computes -- if and only if every bias carries
+    # the right power of the scale. Checked against an exact rational forward
+    # written here, not against either forward pass under test.
+    fset = FeatureSet([FeatureSpec("bin", "binary", size=5),
+                       FeatureSpec("oh", "onehot", size=4),
+                       FeatureSpec("i", "integer", lo=0, hi=15)])
+    dims = [(fset.n_in, 4), (4, 4), (4, 3)]
+    n_w = sum(a * b + b for a, b in dims)
+    ints, _, _ = make_inputs(fset, 40, seed=11)
+    rng = random.Random(5)
+    bad = tried = 0
+    for sc in (3, 24, 127):
+        wq = [rng.randint(-128, 127) for _ in range(n_w)]
+        for xi in ints:
+            tried += 1
+            exact = _exact_forward([Fraction(v, sc) for v in wq], dims, xi)
+            got = ref.forward_int8(wq, dims, xi, [1] * fset.n_in, scale=sc)
+            if got != [v * sc ** len(dims) for v in exact]:
+                bad += 1
+    check(bad == 0, f"int8 logits == scale^L x dequantised logits, exactly "
+                    f"({tried - bad}/{tried}; scales 3, 24, 127; 3 layers)")
 
 
 def t_artifacts_and_determinism(root):
@@ -202,14 +251,38 @@ def t_artifacts_and_determinism(root):
     check(mspec.features.offsets() == m.features.offsets(),
           f"reloaded column offsets match {m.features.offsets()}")
 
-    # expectations reproduce from the artefacts alone
+    # Expectations reproduce from the artefacts alone. On its own this is
+    # circular -- the same function wrote them, and it passed while that
+    # function and the datapath disagreed on every bias past layer 1. [8]
+    # checks the function against the C.
     cs = inputs["col_scales"]
     bad = 0
     for xi, e in zip(inputs["vectors"], expected["int8"]):
-        if ref.argmax(ref.forward_int8(wi, mspec.layer_dims, xi, cs)) != e["cls"]:
+        li = ref.forward_int8(wi, mspec.layer_dims, xi, cs, scale=scale)
+        if li != e["logits"] or ref.argmax(li) != e["cls"]:
             bad += 1
-    check(bad == 0, f"expected.json reproducible from artefacts ({bad} mismatches)")
+    check(bad == 0, f"expected.json int8 logits reproducible from artefacts "
+                    f"({bad} mismatches)")
+    check(expected.get("int8_scheme") == ref.INT8_SCHEME,
+          f"expected.json declares the datapath's int8 scheme "
+          f"({expected.get('int8_scheme')!r})")
     info(f"float/int8 argmax agreement: {100*expected['quant_agreement']:.1f}%")
+
+    # A scenario written by the old reference must be refused, not compared.
+    d3 = os.path.join(root, "mixed_stale")
+    shutil.copytree(d1, d3)
+    with open(os.path.join(d3, "expected.json")) as f:
+        stale = json.load(f)
+    del stale["int8_scheme"]
+    with open(os.path.join(d3, "expected.json"), "w") as f:
+        json.dump(stale, f)
+    try:
+        load_scenario(d3)
+        refused = False
+    except ValueError:
+        refused = True
+    check(refused, "load_scenario refuses an expected.json without int8_scheme "
+                   "(written before 2026-09-23)")
 
 
 def t_descriptor_convention():
@@ -266,9 +339,179 @@ def t_independence(root):
 
 
 # ---------------------------------------------------------------------------
+def _datapath_state(feats, xi):
+    """What P1 must read to build the input vector `xi`: dense-map contents,
+    packet TTL, logical ingress port (0 = none) and node index (None = none).
+
+    The inverse of verify_synth_kernel.vettore_intero. A vector the datapath
+    cannot build -- two ingress ports hot, a non-binary one-hot -- is refused
+    rather than approximated: comparing on it would test nothing real."""
+    import model_meta as mm
+    maps, ttl, port, node, o = {}, 64, 0, None, 0
+    for f in feats:
+        t, n = f["type"], f["size"]
+        seg, cat = xi[o:o + n], mm.FEATURE_CATALOG[t]
+        if cat["kind"] == "scalar":
+            ttl = seg[0]
+        elif cat["kind"] == "dense_vector_map":
+            maps[cat["map"]] = list(seg)
+        else:
+            hot = [i for i, v in enumerate(seg) if v]
+            if len(hot) > 1 or any(v not in (0, 1) for v in seg):
+                raise ValueError(f"{t}: {seg} is not a one-hot P1 can build")
+            if t == "ingress_iface":
+                port = hot[0] + 1 if hot else 0
+            elif t == "node":
+                node = hot[0] if hot else None
+            else:
+                raise ValueError(f"no datapath source for one-hot {t!r}")
+        o += n
+    return maps, ttl, port, node
+
+
+def _corners(feats, xi):
+    """Inputs a packet can carry and the sampler never draws: TTL 255, no
+    ingress port, every link down, no node configured, a queue reading with
+    the top bit of its u32 set (a sign-extension bug would flip it)."""
+    out, o = [], 0
+    for f in feats:
+        t, n = f["type"], f["size"]
+        v = list(xi)
+        if t == "ttl":
+            v[o] = 255
+        elif t in ("ingress_iface", "link_state", "node"):
+            v[o:o + n] = [0] * n
+        elif t == "queue_occupancy":
+            v[o:o + n] = [2 ** 32 - 1] * n
+        else:
+            v = None
+        if v is not None:
+            out.append(v)
+        o += n
+    return out
+
+
+def t_reference_vs_p1_source(root):
+    """synth.reference against the C that P1 compiles -- no kernel needed."""
+    print(f"\n{YELLOW}[8] Python reference == the C that P1 compiles "
+          f"(evaluated from the source, no kernel){NC}")
+    try:
+        from ebpf_program import build_combined_hardcoded_source
+        from class_semantics import ClassSemantics
+        from p1_c_eval import P1Program
+        from verify_synth_kernel import descrittore
+    except Exception as e:
+        # Pure Python, all in the repo: failing to import is a failure, not a
+        # skip -- a check that quietly does not run is how this gap stayed open.
+        fail(f"P1 generator or evaluator not importable "
+             f"({type(e).__name__}: {e})")
+        return
+
+    def p1_source(wi, scale, feats, hidden, n_out, static_node=None):
+        # The class dispatch after the argmax is not evaluated, so any valid
+        # semantics will do; this one is stated rather than defaulted, which
+        # keeps the generator from printing its reference-layout warning.
+        sem = ClassSemantics.forward_then_drop(n_out - 1, drop_class=n_out - 1,
+                                               n_out=n_out)
+        return build_combined_hardcoded_source(
+            [(0, wi, scale)], hidden_dims=tuple(hidden), features=feats,
+            n_out=n_out, semantics=sem, static_node=static_node)
+
+    # (a) The minimal case, by hand. One input, one hidden neuron, two
+    # outputs; scale 10, weights W1=[1] b1=[0] | W2=[3, 0] b2=[0, 1].
+    #   h    = relu(1*1 + 0)             = 1
+    #   out0 = 1*3 + 0 * 10**1           = 3
+    #   out1 = 1*0 + 1 * 10**1           = 10   -> class 1
+    # Float view, weights / 10: out = [0.03, 0.1], times 10**2 = [3, 10].
+    wi, s, dims = [1, 0, 3, 0, 0, 1], 10, [(1, 1), (1, 2)]
+    hand = [3, 10]
+    src = p1_source(wi, s, [{"type": "link_state", "size": 1, "scale": 1}], [1], 2)
+    c = P1Program(src).run(64, {"link_state": [1]})
+    r = ref.forward_int8(wi, dims, [1], [1], scale=s)
+    check(r == hand and c["logits"] == hand and c["cls"] == ref.argmax(r) == 1,
+          f"minimal case: by hand {hand}, reference {r}, P1 C {c['logits']} "
+          f"(class {c['cls']})")
+    lf = ref.forward_float([v / s for v in wi], dims, [1.0])
+    check(all(abs(a * s ** 2 - b) < 1e-9 for a, b in zip(lf, hand)),
+          f"minimal case: float logits {[round(v, 6) for v in lf]} x scale^2 "
+          f"== {hand}")
+    # The comparison must be able to fail, from either side.
+    old = ref.forward_int8(wi, dims, [1], [1], scale=1)
+    check(old == [3, 1] and old != c["logits"],
+          "negative control, Python side: the call generate.py made until "
+          "2026-09-23 (no scale, bias not rescaled) gives [3, 1] and is caught")
+    lit = "h1_0 * 0LL + 10LL;"
+    if src.count(lit) == 1:
+        cb = P1Program(src.replace(lit, "h1_0 * 0LL + 1LL;")).run(
+            64, {"link_state": [1]})
+        check(cb["logits"] == [3, 1] and cb["logits"] != r,
+              "negative control, C side: a generator emitting the unscaled bias "
+              "literal gives [3, 1] and is caught")
+    else:
+        fail(f"negative control, C side: {lit!r} not found once in the "
+             f"generated source -- the generator's output changed")
+
+    # (b) Every preset. The scenario's own vectors, their corners, through
+    # P1.5 (node read from the node_id map) and P1 with the node frozen at the
+    # first and last column. Logits must be IDENTICAL, not just the argmax.
+    kif = 7          # any ifindex: P1 must resolve it through ingress_port
+    for name in PRESETS:
+        d = os.path.join(root, f"p1src_{name}")
+        generate_scenario(preset(name), d, n_inputs=100)
+        mspec, wf, wi, scale, inputs, expected = load_scenario(d)
+        feats = descrittore(mspec.to_json())
+        types = {f["type"] for f in feats}
+        dims, cs = mspec.layer_dims, inputs["col_scales"]
+        width = next((f["size"] for f in feats if f["type"] == "node"), 0)
+        offset = {f["type"]: sum(g["size"] for g in feats[:i])
+                  for i, f in enumerate(feats)}
+        base = list(inputs["vectors"])
+        vectors = base + [v for x in base[:10] for v in _corners(feats, x)]
+        builds = [("P1.5", None)]
+        if width:
+            builds += [(f"P1 node={k}", k) for k in sorted({0, width - 1})]
+
+        tried = bad = stored = 0
+        example = None
+        for label, frozen in builds:
+            prog = P1Program(p1_source(wi, scale, feats, mspec.hidden,
+                                       mspec.n_out, static_node=frozen))
+            for vi, xi in enumerate(vectors):
+                if frozen is not None:
+                    xi = list(xi)
+                    xi[offset["node"]:offset["node"] + width] = [
+                        1 if k == frozen else 0 for k in range(width)]
+                maps, ttl, port, node = _datapath_state(feats, xi)
+                if "ingress_iface" in types:
+                    maps["ingress_port"] = {kif: port} if port else {}
+                if frozen is None and "node" in types:
+                    maps["node_id"] = {0: node} if node is not None else {}
+                got = prog.run(ttl, maps, ingress_ifindex=kif)
+                want = ref.forward_int8(wi, dims, xi, cs, scale=scale)
+                tried += 1
+                if got["logits"] != want or got["cls"] != ref.argmax(want):
+                    bad += 1
+                    example = example or (label, xi, want, got["logits"])
+                # expected.json itself, straight against the C, on the
+                # vectors it was written for
+                if frozen is None and vi < len(base):
+                    stored += got["logits"] == expected["int8"][vi]["logits"]
+        check(bad == 0 and stored == len(base),
+              f"{name:<9} {mspec.shape_str:<18} scale={scale:<3} "
+              f"{tried - bad}/{tried} identical logits "
+              f"({', '.join(l for l, _ in builds)}); expected.json == C on "
+              f"{stored}/{len(base)}")
+        if example:
+            label, xi, want, have = example
+            info(f"  first mismatch ({label}): x={xi} reference={want} C={have}")
+    info("not covered here: clang, the verifier, the JIT, the packet path "
+         "around the inference -- sudo python3 ipa/test/verify_synth_kernel.py --all")
+
+
+# ---------------------------------------------------------------------------
 def t_kernel(root):
     """Run one synthetic scenario through the real pipelines."""
-    print(f"\n{YELLOW}[8] Synthetic model through P1 / P2 / P3 (needs BCC + root){NC}")
+    print(f"\n{YELLOW}[9] Synthetic model through P1 / P2 / P3 (needs BCC + root){NC}")
     try:
         from bcc import BPF
     except Exception as e:
@@ -337,6 +580,7 @@ def main():
         t_artifacts_and_determinism(root)
         t_descriptor_convention()
         t_independence(root)
+        t_reference_vs_p1_source(root)
         if args.kernel:
             t_kernel(root)
     finally:

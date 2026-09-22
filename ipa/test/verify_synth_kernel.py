@@ -262,15 +262,23 @@ def via_float(wf, layer_dims, x_int, scales):
     return ref.argmax(ref.forward_float(wf, layer_dims, x_f))
 
 
+def logit_int8_python(wi, layer_dims, x_int, scales, scale):
+    from synth import reference as ref
+    return ref.forward_int8(wi, layer_dims, x_int, scales, scale=scale)
+
+
 def via_int8_python(wi, layer_dims, x_int, scales, scale):
     """Il riferimento intero puro Python, dal pacchetto `synth`.
 
-    E' la STESSA funzione che ha prodotto `expected.json`, quindi questa via e'
-    la verita' di riferimento del modello sintetico, non una seconda opinione.
-    La seconda opinione la da' `via_int8_verify` qui sotto."""
+    E' la STESSA funzione, con la stessa `scale`, che ha prodotto
+    `expected.json`, quindi questa via e' la verita' di riferimento del modello
+    sintetico, non una seconda opinione. Con la stessa `scale` solo dal
+    2026-09-23: prima generate.py la chiamava senza, e `expected.json` teneva
+    i logit di uno schema con il bias non riscalato che nessuna pipeline
+    esegue (`load_scenario` ora rifiuta quei file). La seconda opinione la da'
+    `via_int8_verify` qui sotto."""
     from synth import reference as ref
-    return ref.argmax(ref.forward_int8(wi, layer_dims, x_int, scales,
-                                       scale=scale))
+    return ref.argmax(logit_int8_python(wi, layer_dims, x_int, scales, scale))
 
 
 def via_int8_verify(wi, feats, model, caso, node_index, scale):
@@ -289,6 +297,27 @@ def via_int8_verify(wi, feats, model, caso, node_index, scale):
         caso["mappe"], ingress_port=caso["porta"], scale=scale,
         node_index=node_index)
     return cls
+
+
+# La chiave sotto cui la via kernel scrive `ingress_port`:
+# TEST_RUN_DEFAULT_INGRESS_IFINDEX di verify_prog_run, che qui non si puo'
+# importare perche' importa bcc. Per il sorgente valutato il numero in se' non
+# conta; conta che la chiave letta sia quella scritta, come nel kernel.
+_KIF_SORGENTE = 1
+
+
+def via_sorgente_c(prog, caso, feats):
+    """Il C che P1 compila, valutato dal TESTO con p1_c_eval: logit e classe.
+
+    Gli stessi ingressi della via kernel -- mappe dense, TTL, porta scritta in
+    `ingress_port` anche quando vale 0 -- senza clang, verificatore e JIT. E'
+    la riga che --dry-run puo' dire sull'implementazione: prima, senza kernel,
+    si confrontavano solo le due vie Python, e un generatore che emetteva un
+    moltiplicatore diverso dal riferimento passava inosservato."""
+    maps = dict(caso["mappe"])
+    if any(f["type"] == "ingress_iface" for f in feats):
+        maps["ingress_port"] = {_KIF_SORGENTE: int(caso["porta"])}
+    return prog.run(caso["ttl"], maps, ingress_ifindex=_KIF_SORGENTE)
 
 
 def via_ebpf(setup, caso, model, scale):
@@ -337,23 +366,33 @@ def via_ebpf(setup, caso, model, scale):
 
 
 # ==========================================================================
-def costruisci_p1(model, wi, feats, node_index):
-    """P1 compilata sui pesi sintetici, con il descrittore dello scenario."""
-    from bcc import BPF
-    from ebpf_program import build_combined_hardcoded_source
-    from verify_prog_run import _install_mac_table
-    import model_meta as mm
+def sorgente_p1(model, wi, feats, node_index):
+    """Il sorgente di P1 sui pesi sintetici, con il descrittore dello scenario.
 
+    Una funzione sola per le due vie che lo usano: il kernel lo compila,
+    --dry-run lo valuta dal testo. Devono guardare lo STESSO sorgente, o il
+    confronto senza kernel proverebbe un altro programma."""
+    from ebpf_program import build_combined_hardcoded_source
     n_out = int(model["arch"]["n_out"])
     scale = int(model["quant"]["scale_factor"])
     topo = topologia(feats)
-    src = build_combined_hardcoded_source(
+    return build_combined_hardcoded_source(
         [(0, wi, scale, None)],
         n_interfaces=topo["n_interfaces"], n_nodes=topo["n_nodes"],
         hidden_dims=tuple(int(h) for h in model["arch"]["hidden"]),
         features=feats, n_out=n_out,
         static_node=node_index)
-    b = BPF(text=src)
+
+
+def costruisci_p1(model, wi, feats, node_index):
+    """P1 compilata sui pesi sintetici, con il descrittore dello scenario."""
+    from bcc import BPF
+    from verify_prog_run import _install_mac_table
+    import model_meta as mm
+
+    n_out = int(model["arch"]["n_out"])
+    scale = int(model["quant"]["scale_factor"])
+    b = BPF(text=sorgente_p1(model, wi, feats, node_index))
     model_fn = b.load_func("model_0", BPF.XDP)
     disp = b.load_func("ipa_switch_hardcoded", BPF.XDP)
     b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
@@ -426,20 +465,31 @@ def confronta(d, n, seed, node_index, dry=False):
             info(f"la feature `{t}` usa scala {dich}, diversa dal default del "
                  f"catalogo ({cat}): il datapath deve seguire il modello")
 
-    setup = None
+    setup = prog = None
     if not dry:
         setup = costruisci_p1(model, wi, feats, node_index)
         ok(f"P1 compilata e caricata sui pesi sintetici "
            f"(nodo congelato: {node_index})")
+    else:
+        from p1_c_eval import P1Program
+        prog = P1Program(sorgente_p1(model, wi, feats, node_index))
+        ok(f"P1 generata sui pesi sintetici e letta da p1_c_eval "
+           f"(nodo congelato: {node_index})")
 
     casi = campioni(feats, n, seed)
-    acc_qf = acc_impl = acc_tot = acc_ref = acc_cat = 0
+    acc_qf = acc_impl = acc_tot = acc_ref = acc_cat = acc_src = 0
     esempi = []
     for c in casi:
         x = vettore_intero(feats, c, node_index, scale)
         c_float = via_float(wf, layer_dims, x, scales)
         c_int8 = via_int8_python(wi, layer_dims, x, scales, scale)
         if dry:
+            acc_qf += (c_float == c_int8)
+            atteso = logit_int8_python(wi, layer_dims, x, scales, scale)
+            dal_c = via_sorgente_c(prog, c, feats)
+            acc_src += (dal_c["logits"] == atteso and dal_c["cls"] == c_int8)
+            if dal_c["logits"] != atteso and len(esempi) < 5:
+                esempi.append((c, atteso, dal_c["logits"]))
             continue
         c_ref = via_int8_verify(wi, feats, model, c, node_index, scale)
         c_bpf = via_ebpf(setup, c, model, scale)
@@ -460,25 +510,25 @@ def confronta(d, n, seed, node_index, dry=False):
             esempi.append((c, c_int8, c_bpf))
 
     if dry:
-        # Senza kernel resta il confronto fra le due vie Python, che e' quello
-        # che questo script puo' verificare ovunque.
-        acc_qf = sum(
-            via_float(wf, layer_dims,
-                      vettore_intero(feats, c, node_index, scale), scales)
-            == via_int8_python(wi, layer_dims,
-                               vettore_intero(feats, c, node_index, scale),
-                               scales, scale)
-            for c in casi)
+        # Senza kernel restano le due vie Python e il C di P1 valutato dal
+        # sorgente: quello che questo script puo' verificare ovunque.
         n = len(casi)
         print()
         print(f"  float vs int8 (Python): accordo {100.0*acc_qf/n:.2f}%, "
               f"disaccordo {100.0*(n-acc_qf)/n:.2f}%  su {n} ingressi")
-        note("questa percentuale NON e' `quant_agreement` di expected.json: "
-             "li' gli ingressi sono campionati liberamente, qui solo fra "
-             "quelli che il datapath sa esprimere. Due distribuzioni diverse, "
-             "due numeri diversi, nessuna contraddizione.")
-        note("modalita' --dry-run: il kernel non e' stato interrogato")
-        return True
+        if acc_src == n:
+            ok(f"int8 (Python) vs C di P1 (sorgente valutato): {n}/{n} "
+               f"ingressi con logit identici")
+        else:
+            fail(f"int8 (Python) vs C di P1 (sorgente valutato): logit "
+                 f"diversi su {n - acc_src}/{n}. Il riferimento e il "
+                 f"generatore non calcolano la stessa formula.")
+            for c, a, b in esempi:
+                note(f"  ttl={c['ttl']} porta={c['porta']} mappe={c['mappe']} "
+                     f"-> python={a} C={b}")
+        note("modalita' --dry-run: il kernel non e' stato interrogato; il C "
+             "e' valutato dal testo, senza clang, verificatore e JIT")
+        return acc_src == n
 
     n = len(casi)
     print()
@@ -589,9 +639,10 @@ def main():
     p.add_argument("--node", type=int, default=7,
                    help="indice del nodo congelato nel programma")
     p.add_argument("--dry-run", action="store_true",
-                   help="solo le due vie Python (float contro int8): non serve "
-                        "ne' Linux ne' root, e verifica la costruzione degli "
-                        "ingressi prima di portare il test su una macchina vera")
+                   help="le due vie Python (float contro int8) e il C di P1 "
+                        "valutato dal sorgente (p1_c_eval): non serve ne' "
+                        "Linux ne' root, e verifica ingressi e formula prima "
+                        "di portare il test su una macchina vera")
     a = p.parse_args()
 
     if not a.dry_run:
@@ -629,11 +680,19 @@ def main():
     print(f"\n{YELLOW}{'=' * 74}{NC}")
     buoni = sum(1 for v in esiti.values() if v)
     if a.dry_run:
-        print(f" {buoni}/{len(esiti)} scenari percorsi in --dry-run: "
-              f"costruzione degli ingressi e vie Python verificate.")
+        print(f" {buoni}/{len(esiti)} scenari in --dry-run con logit identici "
+              f"fra riferimento Python e C di P1 valutato dal sorgente.")
         print(f" {RED}Il kernel NON e' stato interrogato{NC}: "
               f"l'equivalenza con eBPF resta da dimostrare, rilancia senza "
               f"--dry-run su Linux.")
+        note(" L'accordo float/int8 stampato sopra NON e' `quant_agreement` "
+             "di expected.json e non va confrontato con lui: li' gli ingressi "
+             "sono campionati liberamente, qui solo fra quelli che il datapath "
+             "sa esprimere. Ma fino al 2026-09-23 la distanza fra i due numeri "
+             "(0,789 contro 97,7% su ipa_like) veniva quasi tutta da un'altra "
+             "causa: expected.json era calcolato con il bias NON riscalato, "
+             "uno schema che nessuna pipeline esegue. Rigenerato, ipa_like "
+             "vale 0,986.")
     else:
         print(f" {buoni}/{len(esiti)} scenari con equivalenza numerica esatta "
               f"fra riferimento intero ed eBPF")

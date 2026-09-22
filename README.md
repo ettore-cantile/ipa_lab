@@ -119,7 +119,9 @@ ipa_lab/
 │   └── test/                        #    engine tests, topology-agnostic
 │       ├── test_suite.py            #      core/pktstats/extract/quant/robust/kernel
 │       ├── test_class_semantics.py  #      53 checks, five class layouts, none Germany50
-│       ├── test_synth.py            #      36 checks on generated models
+│       ├── test_synth.py            #      50 checks on generated models, incl.
+│       │                            #        synth reference == P1's generated C
+│       ├── p1_c_eval.py             #      evaluates P1's C from its text (no kernel)
 │       ├── verify_prog_run.py       #      per-pipeline kernel verifier (BPF_PROG_TEST_RUN)
 │       ├── verify_multi_model.py    #      concurrent multi-model registration
 │       └── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost
