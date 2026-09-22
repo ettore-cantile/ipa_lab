@@ -32,6 +32,11 @@ What is actually checked
                   kernel), so two implementations that are each consistent
                   cannot drift apart unnoticed -- which is what happened to
                   the bias scaling until 2026-09-23.
+  P2/P3 scale     the control planes write each feature's DECLARED scale into
+                  feat_ent.scale (ttl 16 stays 16), and refuse one that does
+                  not fit the byte instead of truncating it. Whether the
+                  kernel then divides by it is verify_synth_kernel's job
+                  (--pipeline p2|p3, with its negative control).
 
     python3 ipa/test/test_synth.py
     sudo python3 ipa/test/test_synth.py --kernel
@@ -508,10 +513,50 @@ def t_reference_vs_p1_source(root):
          "around the inference -- sudo python3 ipa/test/verify_synth_kernel.py --all")
 
 
+class _FakeTable(dict):
+    """A BCC table stand-in keyed by the ctypes key's value: enough for the
+    control plane's `bpf_obj[name][c_uint8(k)] = struct` writes."""
+
+    def __setitem__(self, k, v):
+        super().__setitem__(getattr(k, "value", k), v)
+
+
+def t_p2p3_scale_control_plane():
+    """What the P2/P3 control planes write into feat_ent.scale -- no kernel."""
+    print(f"\n{YELLOW}[9] P2/P3 control plane writes the declared scale "
+          f"into feat_ent (no kernel){NC}")
+    try:
+        import ebpf_template_arch as A
+        import ebpf_modular as M
+        from verify_synth_kernel import descrittore
+    except Exception as e:
+        fail(f"P2/P3 control planes not importable ({type(e).__name__}: {e})")
+        return
+    feats = descrittore(preset("ipa_ttl16").to_json())
+    n_in = sum(f["size"] for f in feats)
+    want = [f["scale"] for f in feats]
+    for label, load in (("P2", A.load_model_desc), ("P3", M.load_model_desc)):
+        obj = {"model_desc": _FakeTable()}
+        load(obj, feats, n_in, model_id=0)
+        d = obj["model_desc"][0]
+        got = [d.feats[i].scale for i in range(d.n_feat)]
+        check(got == want and 16 in got,
+              f"{label}: feat_ent.scale == declared {want} (ttl 16, not the "
+              f"compiled 30)")
+        big = [dict(f, scale=300) if f["type"] == "ttl" else f for f in feats]
+        try:
+            load({"model_desc": _FakeTable()}, big, n_in, model_id=0)
+            refused = False
+        except ValueError:
+            refused = True
+        check(refused, f"{label}: a scale of 300 is refused, not written as "
+                       f"255 (feat_ent.scale is one byte)")
+
+
 # ---------------------------------------------------------------------------
 def t_kernel(root):
     """Run one synthetic scenario through the real pipelines."""
-    print(f"\n{YELLOW}[9] Synthetic model through P1 / P2 / P3 (needs BCC + root){NC}")
+    print(f"\n{YELLOW}[10] Synthetic model through P1 / P2 / P3 (needs BCC + root){NC}")
     try:
         from bcc import BPF
     except Exception as e:
@@ -555,7 +600,8 @@ def t_kernel(root):
     # un'opzione che non e' mai esistita, e la distinzione andava quindi presa
     # sulla fiducia. Adesso il test c'e' e si chiama per nome.
     info("equivalenza NUMERICA sui pesi sintetici (float / int8 Python / eBPF): "
-         "sudo python3 ipa/test/verify_synth_kernel.py --all")
+         "sudo python3 ipa/test/verify_synth_kernel.py --all "
+         "[--pipeline p2|p3]")
     info("  ...oppure, senza kernel, le sole vie Python: "
          "python3 ipa/test/verify_synth_kernel.py --all --dry-run")
 
@@ -581,6 +627,7 @@ def main():
         t_descriptor_convention()
         t_independence(root)
         t_reference_vs_p1_source(root)
+        t_p2p3_scale_control_plane()
         if args.kernel:
             t_kernel(root)
     finally:

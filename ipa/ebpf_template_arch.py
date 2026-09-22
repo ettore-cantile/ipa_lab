@@ -1403,11 +1403,23 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
                     ("_p0", c_uint8), ("_p1", c_uint8),
                     ("feats", FeatEnt * T2_MAX_FEAT)]
 
+    # feat_ent.scale is ONE byte. It used to be written as min(255, scale):
+    # a model trained on ttl/300 would have run with ttl/255, silently. 0 is
+    # kept -- it means "not declared" and the datapath falls back to its
+    # compiled default -- anything else outside the byte is refused.
+    for e in ents:
+        sc = int(e.get("scale", 0) or 0)
+        if not 0 <= sc <= 255:
+            raise ValueError(
+                f"feature code {e['code']}: scale {sc} does not fit "
+                f"feat_ent.scale (one byte, 0..255). Refused rather than "
+                f"truncated: the datapath would divide by another number.")
+
     d = ModelDesc(n_feat=len(ents), n_in=n_in)
     for i, e in enumerate(ents):
         d.feats[i] = FeatEnt(code=e["code"], size=e["size"],
                              col_off=e["col_off"],
-                             scale=min(255, int(e.get("scale", 0) or 0)))
+                             scale=int(e.get("scale", 0) or 0))
     bpf_obj["model_desc"][c_uint8(model_id)] = d
     print(f"[Pipeline2] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
           f"feats={[(e['code'], e['size'], e['col_off'], e.get('scale'))

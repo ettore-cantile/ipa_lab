@@ -375,6 +375,13 @@ def preset(name: str, seed: int = 20260916) -> ModelSpec:
         "sparse": lambda: ModelSpec(
             "sparse", ipa_feature_set(6, 52, 30), n_out=7, hidden=[4, 4],
             weight_init="sparse", seed=seed),
+        # the reference SHAPE with a TTL trained on ttl/16: the only preset
+        # P2 accepts (its control plane requires the configured model's n_out,
+        # 7) whose scale is not the compiled default 30 -- without it no
+        # scenario proves that P2 divides by the scale in feat_ent
+        "ipa_ttl16": lambda: ModelSpec(
+            "ipa_ttl16", ipa_feature_set(6, 52, 16), n_out=7, hidden=[4, 4],
+            seed=seed),
         # fully predictable, for hand-checkable smoke tests
         "ones": lambda: ModelSpec(
             "ones", ipa_feature_set(3, 4, 8), n_out=3, hidden=[2],
@@ -385,4 +392,5 @@ def preset(name: str, seed: int = 20260916) -> ModelSpec:
     return P[name]()
 
 
-PRESETS = ("ipa_like", "small", "large", "deep", "mixed", "sparse", "ones")
+PRESETS = ("ipa_like", "small", "large", "deep", "mixed", "sparse", "ones",
+           "ipa_ttl16")

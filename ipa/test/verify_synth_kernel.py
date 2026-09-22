@@ -66,7 +66,30 @@ USO
     # tutti gli scenari depositati, pipeline P1
     sudo python3 ipa/test/verify_synth_kernel.py --all
 
+    # P2 (template) o P3 (modulare): gli scenari che la pipeline non accetta
+    # sono contati a parte come NON APPLICABILI, con il motivo
+    sudo python3 ipa/test/verify_synth_kernel.py --all --pipeline p2
+    sudo python3 ipa/test/verify_synth_kernel.py --all --pipeline p3
+
 Serve Linux, root e BCC.
+
+--------------------------------------------------------------------------
+LA SCALA DEL TTL, E COME SI DIMOSTRA CHE P2/P3 LA LEGGONO
+--------------------------------------------------------------------------
+P1 compila la scala come letterale. P2 e P3 la leggono a runtime dal campo
+`scale` di `struct feat_ent`, e con 0 ricadono sul #define 30. Un 100% su un
+modello con ttl/16 NON basta a dire che il campo viene letto, per due ragioni
+misurabili, e lo script le misura entrambe:
+
+  1. la scala deve CAMBIARE le decisioni. Per ogni scenario si conta K, i
+     casi in cui il riferimento a scala dichiarata e quello a 30 scelgono
+     classi diverse. Con K = 0 (`ones`, `large`) un 100% e' compatibile anche
+     con un datapath che usa sempre 30, e lo script lo dice.
+  2. controllo negativo, P2/P3 nel kernel: si riscrive `feat_ent.scale` a 30
+     e si ripetono gli stessi pacchetti. L'eBPF deve seguire il riferimento a
+     30 su tutti e staccarsi da quello dichiarato esattamente sui K previsti.
+     Cambia solo quel byte: se le decisioni si spostano, e' quel byte che il
+     kernel sta leggendo.
 """
 import os
 import sys
@@ -365,6 +388,139 @@ def via_ebpf(setup, caso, model, scale):
     return -1
 
 
+class NonApplicabile(Exception):
+    """Lo scenario non entra nei limiti della pipeline scelta. Non e' un
+    fallimento del datapath: e' un modello che quella pipeline rifiuta, e il
+    riepilogo lo conta a parte invece di mescolarlo agli esiti."""
+
+
+def fuori_limiti(pipeline, model):
+    """Perche' `pipeline` non puo' eseguire questo modello, oppure None.
+
+    Solo i limiti leggibili senza caricare niente, con i numeri presi dai
+    moduli e non riscritti qui. Il resto lo rifiutano i loader, e anche quel
+    rifiuto diventa NonApplicabile."""
+    hidden = [int(h) for h in model["arch"]["hidden"]]
+    n_in, n_out = int(model["arch"]["n_in"]), int(model["arch"]["n_out"])
+    if pipeline == "p2":
+        import ebpf_template_arch as A
+        n_ref = A.reference_widths()[1]
+        if n_out != n_ref:
+            return (f"n_out={n_out}: il piano di controllo di P2 accetta solo "
+                    f"l'n_out del modello configurato ({n_ref}), vedi "
+                    f"load_arch_weights")
+        if not hidden:
+            return "P2 ha bisogno di almeno uno strato nascosto"
+        if any(h != hidden[1] for h in hidden[2:]):
+            return (f"strati nascosti {hidden}: in P2 quelli oltre il secondo "
+                    f"sono n_h2 -> n_h2")
+        n_h1 = hidden[0]
+        n_h2 = hidden[1] if len(hidden) > 1 else hidden[0]
+        if n_h1 > A.T2_MAX_H1 or n_h2 > A.T2_MAX_H2:
+            return (f"strati nascosti {hidden} oltre T2_MAX_H1/T2_MAX_H2 "
+                    f"({A.T2_MAX_H1}/{A.T2_MAX_H2})")
+        nw = A.arch_weight_count(n_h1, n_h2, n_in, n_out, n_hidden=len(hidden))
+        if nw > A.MAX_WEIGHT_ENTRIES:
+            return f"{nw} pesi oltre MAX_WEIGHT_ENTRIES={A.MAX_WEIGHT_ENTRIES}"
+    elif pipeline == "p3":
+        import ebpf_modular as M
+        dims = dims_strati(model)
+        if dims[0][1] > M.ML1_MAX_H1 or any(max(a, b) > M.MLH_MAX_H
+                                            for a, b in dims[1:]):
+            return (f"strati {dims} oltre ML1_MAX_H1/MLH_MAX_H "
+                    f"({M.ML1_MAX_H1}/{M.MLH_MAX_H})")
+        nw = sum(a * b + b for a, b in dims)
+        if nw > M.MAX_LAYER_WEIGHT_ENTRIES:
+            return (f"{nw} pesi oltre MAX_LAYER_WEIGHT_ENTRIES="
+                    f"{M.MAX_LAYER_WEIGHT_ENTRIES}")
+    return None
+
+
+def costruisci_p2(model, wi, feats, node_index):
+    """P2 sui pesi sintetici: dispatcher + foglia compilata per la profondita'
+    dello scenario, pesi e descrittore nelle mappe. Lo stesso montaggio di
+    verify_prog_run.setup_template, con la forma dello scenario al posto di
+    quella del checkpoint. Il nodo viene dalla mappa `node_id_t2`: P2 non lo
+    congela mai."""
+    from bcc import BPF
+    from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
+                                    build_arch_leaf, load_arch_weights,
+                                    load_model_desc)
+    from verify_prog_run import _install_mac_table
+    import model_meta as mm
+
+    hidden = [int(h) for h in model["arch"]["hidden"]]
+    n_in, n_out = int(model["arch"]["n_in"]), int(model["arch"]["n_out"])
+    scale = int(model["quant"]["scale_factor"])
+    n_h1 = hidden[0]
+    n_h2 = hidden[1] if len(hidden) > 1 else hidden[0]
+    semantics = mm.descriptor_semantics_or_reference(n_out, "verify:synth")
+    b = BPF(text="#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER
+            + "\n" + build_arch_leaf(len(hidden)))
+    disp = b.load_func("ipa_switch_template", BPF.XDP)
+    leaf = b.load_func("arch_generic_2layer", BPF.XDP)
+    b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf.fd)
+    try:
+        load_arch_weights(b, wi, model_id=0, scale=scale, n_h1=n_h1, n_h2=n_h2,
+                          features=feats, n_in=n_in, semantics=semantics,
+                          n_hidden=len(hidden))
+    except ValueError as e:
+        raise NonApplicabile(f"load_arch_weights: {e}")
+    _install_mac_table(b, "mac_table_t2", semantics=semantics)
+    b["node_id_t2"][ct.c_uint32(0)] = ct.c_uint32(node_index)
+    return {"b": b, "disp": disp, "fn": leaf, "scale": scale,
+            "cls_stats": b["cls_stats_t2"], "pkt_stats": b["pkt_stats_t2"],
+            "ingress_port": b["ingress_port_t2"],
+            "ricarica_desc": lambda f: load_model_desc(b, f, n_in, model_id=0)}
+
+
+def costruisci_p3(model, wi, feats, node_index):
+    """P3 sui pesi sintetici: dispatcher, layer_first, layer_hidden e la
+    catena di tail call completa, come verify_prog_run.setup_modular ma con
+    gli strati dello scenario. Il nodo viene dalla mappa `node_id_t3`."""
+    from bcc import BPF
+    from ebpf_modular import (EBPF_MODULAR_FULL, LAYER_CHAIN_SIZE,
+                              load_modular_weights, load_model_desc)
+    from verify_prog_run import _install_mac_table
+    import model_meta as mm
+
+    n_in, n_out = int(model["arch"]["n_in"]), int(model["arch"]["n_out"])
+    scale = int(model["quant"]["scale_factor"])
+    semantics = mm.descriptor_semantics_or_reference(n_out, "verify:synth")
+    b = BPF(text=EBPF_MODULAR_FULL)
+    disp = b.load_func("modular_dispatcher", BPF.XDP)
+    first = b.load_func("layer_first", BPF.XDP)
+    hidden_fn = b.load_func("layer_hidden", BPF.XDP)
+    b["layer_chain"][ct.c_int(0)] = ct.c_int(first.fd)
+    for i in range(1, LAYER_CHAIN_SIZE):
+        b["layer_chain"][ct.c_int(i)] = ct.c_int(hidden_fn.fd)
+    try:
+        load_modular_weights(b, wi, model_id=0, scale=scale,
+                             layer_dims=dims_strati(model), features=feats,
+                             semantics=semantics)
+    except ValueError as e:
+        raise NonApplicabile(f"load_modular_weights: {e}")
+    _install_mac_table(b, "mac_table_t3", semantics=semantics)
+    b["node_id_t3"][ct.c_uint32(0)] = ct.c_uint32(node_index)
+    return {"b": b, "disp": disp, "fn": first, "fn_hidden": hidden_fn,
+            "scale": scale,
+            "cls_stats": b["cls_stats_t3"], "pkt_stats": b["pkt_stats_t3"],
+            "ingress_port": b["ingress_port_t3"],
+            "ricarica_desc": lambda f: load_model_desc(b, f, n_in, model_id=0)}
+
+
+def scale_colonne_default(model):
+    """I divisori per colonna che il datapath userebbe se ignorasse la scala
+    dichiarata: quelli del catalogo (ttl 30, tutto il resto 1). E' il
+    riferimento del controllo negativo."""
+    import model_meta as mm
+    out = []
+    for f in model["descriptor"]:
+        t = NOMI.get(f["name"], f["name"])
+        out.extend([int(mm.feature_scale(t))] * int(f["size"]))
+    return out
+
+
 # ==========================================================================
 def sorgente_p1(model, wi, feats, node_index):
     """Il sorgente di P1 sui pesi sintetici, con il descrittore dello scenario.
@@ -410,7 +566,11 @@ def costruisci_p1(model, wi, feats, node_index):
     return setup
 
 
-def confronta(d, n, seed, node_index, dry=False):
+def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
+    """Un scenario, una pipeline. Ritorna {"esito": True/False/None,
+    "scala_provata": bool}; None vuol dire NON APPLICABILE, e scala_provata
+    che lo scenario ha una scala diversa dal default che cambia almeno una
+    decisione, e che (nel kernel, P2/P3) il controllo negativo l'ha vista."""
     nome = os.path.basename(os.path.abspath(d))
     model, wi, wf = carica_scenario(d)
     feats = descrittore(model)
@@ -465,18 +625,50 @@ def confronta(d, n, seed, node_index, dry=False):
             info(f"la feature `{t}` usa scala {dich}, diversa dal default del "
                  f"catalogo ({cat}): il datapath deve seguire il modello")
 
+    casi = campioni(feats, n, seed)
+    scales_def = scale_colonne_default(model)
+    # K: quante decisioni la scala dichiarata sposta rispetto al default. E'
+    # la misura di quanto questo scenario METTE ALLA PROVA la scala: con K = 0
+    # un datapath che la ignorasse passerebbe lo stesso.
+    k_scala = 0
+    if fuori_default:
+        k_scala = sum(
+            via_int8_python(wi, layer_dims, x, scales, scale)
+            != via_int8_python(wi, layer_dims, x, scales_def, scale)
+            for x in (vettore_intero(feats, c, node_index, scale) for c in casi))
+        if k_scala:
+            ok(f"la scala dichiarata sposta {k_scala}/{len(casi)} decisioni "
+               f"rispetto al default: questo scenario la mette alla prova")
+        else:
+            info(f"la scala dichiarata sposta 0/{len(casi)} decisioni: con "
+                 f"questi pesi un 100% NON prova che il datapath la applichi")
+
+    if pipeline != "p1":
+        motivo = fuori_limiti(pipeline, model)
+        if motivo:
+            info(f"{pipeline.upper()} NON APPLICABILE: {motivo}")
+            return {"esito": None, "scala_provata": False}
+
     setup = prog = None
     if not dry:
-        setup = costruisci_p1(model, wi, feats, node_index)
-        ok(f"P1 compilata e caricata sui pesi sintetici "
-           f"(nodo congelato: {node_index})")
+        costruisci = {"p1": costruisci_p1, "p2": costruisci_p2,
+                      "p3": costruisci_p3}[pipeline]
+        try:
+            setup = costruisci(model, wi, feats, node_index)
+        except NonApplicabile as e:
+            info(f"{pipeline.upper()} NON APPLICABILE: {e}")
+            return {"esito": None, "scala_provata": False}
+        dove = "congelato" if pipeline == "p1" else "dalla mappa node_id"
+        ok(f"{pipeline.upper()} compilata e caricata sui pesi sintetici "
+           f"(nodo {node_index}, {dove})")
     else:
         from p1_c_eval import P1Program
         prog = P1Program(sorgente_p1(model, wi, feats, node_index))
         ok(f"P1 generata sui pesi sintetici e letta da p1_c_eval "
            f"(nodo congelato: {node_index})")
-
-    casi = campioni(feats, n, seed)
+        if pipeline != "p1":
+            note(f"{pipeline.upper()} non si valuta senza kernel: in --dry-run "
+                 f"restano le vie Python e il C di P1")
     acc_qf = acc_impl = acc_tot = acc_ref = acc_cat = acc_src = 0
     esempi = []
     for c in casi:
@@ -528,7 +720,7 @@ def confronta(d, n, seed, node_index, dry=False):
                      f"-> python={a} C={b}")
         note("modalita' --dry-run: il kernel non e' stato interrogato; il C "
              "e' valutato dal testo, senza clang, verificatore e JIT")
-        return acc_src == n
+        return {"esito": acc_src == n, "scala_provata": k_scala > 0}
 
     n = len(casi)
     print()
@@ -579,7 +771,53 @@ def confronta(d, n, seed, node_index, dry=False):
         note(f"il {100.0*(n-acc_qf)/n:.1f}% di disaccordo float/int8 e' "
              f"quantizzazione: proprieta' del modello e della scala, non un "
              f"difetto")
-    return acc_impl == n and acc_ref == n
+
+    # IL CONTROLLO NEGATIVO (P2/P3). Si riscrive SOLO il byte `scale` di
+    # feat_ent al default e si ripetono gli stessi pacchetti. Se il kernel
+    # legge quel byte, le decisioni si spostano esattamente sui K casi in cui
+    # le due scale non concordano; se non lo leggesse, non si sposterebbe
+    # niente. P1 la scala la compila come letterale, e non ha un byte da
+    # riscrivere: per P1 la prova e' la riga "implementazione" qui sopra.
+    controllo = True
+    scala_provata = False
+    if pipeline != "p1" and fuori_default:
+        if not k_scala:
+            info("controllo negativo non eseguito: K = 0, non distinguerebbe "
+                 "niente")
+        else:
+            import model_meta as _mm2
+            feats_def = [dict(f, scale=int(_mm2.feature_scale(f["type"])))
+                         for f in feats]
+            setup["ricarica_desc"](feats_def)
+            segue_def = stacca = 0
+            for c in casi:
+                x = vettore_intero(feats, c, node_index, scale)
+                c_bpf = via_ebpf(setup, c, model, scale)
+                segue_def += (c_bpf == via_int8_python(wi, layer_dims, x,
+                                                       scales_def, scale))
+                stacca += (c_bpf != via_int8_python(wi, layer_dims, x,
+                                                    scales, scale))
+            setup["ricarica_desc"](feats)
+            if segue_def == n and stacca == k_scala:
+                scala_provata = True
+                ok(f"controllo negativo: con feat_ent.scale riscritto al "
+                   f"default l'eBPF segue il riferimento al default su "
+                   f"{n}/{n} e si stacca da quello dichiarato esattamente sui "
+                   f"{k_scala} casi previsti -- il kernel legge quel byte")
+            else:
+                controllo = False
+                fail(f"controllo negativo: con feat_ent.scale al default "
+                     f"l'eBPF segue quel riferimento su {segue_def}/{n} e si "
+                     f"stacca dal dichiarato su {stacca} casi (attesi "
+                     f"{n}/{n} e {k_scala}). Il datapath non divide per il "
+                     f"byte che il piano di controllo scrive.")
+    elif pipeline == "p1" and fuori_default and k_scala and acc_impl == n:
+        scala_provata = True
+    esito = acc_impl == n and acc_ref == n and controllo
+    # "Provata" solo se tutto il resto regge: un datapath che usa sempre il
+    # default passa il controllo negativo e fallisce la riga implementazione,
+    # e non ha dimostrato di seguire nessuna scala.
+    return {"esito": esito, "scala_provata": scala_provata and esito}
 
 
 # ==========================================================================
@@ -612,6 +850,18 @@ def scenari(base_richiesta=None, n_inputs=64):
                       if os.path.isdir(os.path.join(base_richiesta, d)))
         if dirs:
             note(f"scenari gia' presenti in {base_richiesta}")
+            # Una cartella generata prima che un preset esistesse non lo ha:
+            # prenderla com'e' vorrebbe dire saltarlo senza dirlo.
+            presenti = {os.path.basename(x) for x in dirs}
+            mancanti = [p for p in PRESETS if p not in presenti]
+            if mancanti:
+                base = tempfile.mkdtemp(prefix="ipa_synth_scen_")
+                info(f"preset assenti da quella cartella: {mancanti}; li "
+                     f"genero in {base}")
+                for nome in mancanti:
+                    d = os.path.join(base, nome)
+                    generate_scenario(preset(nome), d, n_inputs=n_inputs)
+                    dirs.append(d)
             return dirs
 
     base = tempfile.mkdtemp(prefix="ipa_synth_scen_")
@@ -637,7 +887,10 @@ def main():
                    help="quanti ingressi per scenario (default 200)")
     p.add_argument("--seed", type=int, default=20260918)
     p.add_argument("--node", type=int, default=7,
-                   help="indice del nodo congelato nel programma")
+                   help="indice del nodo (P1: congelato nel programma; "
+                        "P2/P3: scritto nella mappa node_id)")
+    p.add_argument("--pipeline", choices=("p1", "p2", "p3"), default="p1",
+                   help="quale pipeline mettere a confronto (default p1)")
     p.add_argument("--dry-run", action="store_true",
                    help="le due vie Python (float contro int8) e il C di P1 "
                         "valutato dal sorgente (p1_c_eval): non serve ne' "
@@ -665,22 +918,30 @@ def main():
         p.error("serve --scenario DIR oppure --all")
 
     print(f"{YELLOW}{'=' * 74}{NC}")
-    print(" Confronto a tre vie su modelli SINTETICI: float / int8 Python / eBPF")
+    print(f" Confronto a tre vie su modelli SINTETICI: float / int8 Python / "
+          f"eBPF -- pipeline {a.pipeline.upper()}")
     print(f"{YELLOW}{'=' * 74}{NC}")
 
-    esiti = {}
+    esiti, provata = {}, []
     for d in dirs:
         try:
-            esiti[os.path.basename(d)] = confronta(d, a.n, a.seed, a.node,
-                                                  dry=a.dry_run)
+            r = confronta(d, a.n, a.seed, a.node, dry=a.dry_run,
+                          pipeline=a.pipeline)
+            esiti[os.path.basename(d)] = r["esito"]
+            if r["scala_provata"]:
+                provata.append(os.path.basename(d))
         except Exception as e:
             fail(f"{os.path.basename(d)}: {type(e).__name__}: {e}")
             esiti[os.path.basename(d)] = False
 
     print(f"\n{YELLOW}{'=' * 74}{NC}")
     buoni = sum(1 for v in esiti.values() if v)
+    na = sum(1 for v in esiti.values() if v is None)
+    if na:
+        print(f" {na} scenari NON APPLICABILI a {a.pipeline.upper()} (il "
+              f"motivo e' nel dettaglio sopra): non contano come esiti")
     if a.dry_run:
-        print(f" {buoni}/{len(esiti)} scenari in --dry-run con logit identici "
+        print(f" {buoni}/{len(esiti) - na} scenari in --dry-run con logit identici "
               f"fra riferimento Python e C di P1 valutato dal sorgente.")
         print(f" {RED}Il kernel NON e' stato interrogato{NC}: "
               f"l'equivalenza con eBPF resta da dimostrare, rilancia senza "
@@ -694,12 +955,20 @@ def main():
              "uno schema che nessuna pipeline esegue. Rigenerato, ipa_like "
              "vale 0,986.")
     else:
-        print(f" {buoni}/{len(esiti)} scenari con equivalenza numerica esatta "
-              f"fra riferimento intero ed eBPF")
+        print(f" {buoni}/{len(esiti) - na} scenari con equivalenza numerica "
+              f"esatta fra riferimento intero ed eBPF")
+    if provata:
+        print(f" scala diversa dal default messa alla prova"
+              f"{' e vista dal kernel' if not a.dry_run and a.pipeline != 'p1' else ''}"
+              f": {', '.join(provata)}")
+    else:
+        print(f" {RED}nessuno scenario ha messo alla prova una scala diversa "
+              f"dal default{NC}: questo run non dice niente su di essa")
     for nome, v in esiti.items():
-        print(f"   {'OK ' if v else 'NO '} {nome}")
+        stato = "N/A" if v is None else ("OK " if v else "NO ")
+        print(f"   {stato} {nome}")
     print(f"{YELLOW}{'=' * 74}{NC}")
-    return 0 if buoni == len(esiti) else 1
+    return 0 if all(v is not False for v in esiti.values()) else 1
 
 
 if __name__ == "__main__":
