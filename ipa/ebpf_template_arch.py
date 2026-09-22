@@ -1269,18 +1269,20 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     # Class semantics. Required, not derived: inferring DROP as n_out-1 is the
     # assumption this parameter exists to remove. With no argument the shared
     # resolver reads the descriptor and announces any fallback.
+    #
+    # The semantics ARE this model's output width. This used to be checked
+    # against reference_widths()[1] -- the configured checkpoint's n_out, 7 --
+    # so P2 refused every model with another class count although the datapath
+    # reads n_out from arch_registry and only bounds it by MAX_N_OUT
+    # (semantics.validate() enforces the same ceiling here). P3 never had the
+    # restriction; the two are now alike.
     if semantics is None:
         from model_meta import descriptor_semantics_or_reference
         semantics = descriptor_semantics_or_reference(reference_widths()[1],
                                                      "Pipeline2")
     semantics.validate()
-
-
-    if semantics.n_out != reference_widths()[1]:
-        raise ValueError(
-            f"class semantics declare n_out={semantics.n_out} but the "
-            f"descriptor's output width is {reference_widths()[1]}. Descriptor "
-            f"and model must agree before either reaches the datapath.")
+    check_class_action_shared(bpf_obj, "class_action_t2", "arch_registry",
+                              model_id, semantics)
 
     # n_hidden MUST match the depth the leaf was compiled for: the datapath
     # reads a fixed number of blocks out of this flat vector, so a mismatch
@@ -1424,6 +1426,45 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
     print(f"[Pipeline2] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
           f"feats={[(e['code'], e['size'], e['col_off'], e.get('scale'))
                     for e in ents]}")
+
+
+def check_class_action_shared(bpf_obj, map_name: str, registry_name: str,
+                              model_id: int, semantics) -> None:
+    """Refuse a registration that would rewrite another model's class actions.
+
+    class_action_t2 / class_action_t3 is ONE table for every model_id: the
+    datapath indexes it by class only. Registering a model whose semantics
+    differ (another n_out, another DROP class, other ports) therefore changes
+    what every already-registered model's classes mean -- silently, on the
+    next packet. While P2 only accepted the configured n_out the collision was
+    unlikely; it is not any more, and a per-model table is a datapath change.
+    Until then this says so, BEFORE anything is written.
+
+    Re-registering the SAME model_id is allowed: that is an update, and the
+    model being replaced is the only one whose classes change."""
+    from ctypes import c_uint32
+    try:
+        others = sorted(int(getattr(k, "value", k))
+                        for k in bpf_obj[registry_name].keys())
+    except Exception:
+        return                      # no readable registry: nothing registered
+    others = [m for m in others if m != int(model_id)]
+    if not others:
+        return
+    tbl = bpf_obj[map_name]
+    want = semantics.action_table()
+    have = []
+    for cid in range(len(want)):
+        e = tbl[c_uint32(cid)]
+        have.append((int(e.action), int(e.port)))
+    if have != want:
+        raise ValueError(
+            f"{map_name} is shared by every model_id, and model(s) {others} "
+            f"are registered with other class semantics. Registering "
+            f"model_id={model_id} (n_out={semantics.n_out}, "
+            f"drop_class={semantics.drop_class}) would change what their "
+            f"classes mean. Register models with the same semantics in one "
+            f"program, or load a separate program.")
 
 
 def load_class_action(bpf_obj, map_name: str, semantics) -> None:

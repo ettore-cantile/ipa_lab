@@ -1074,6 +1074,9 @@ def load_modular_weights(
             f"class semantics declare n_out={semantics.n_out} but the last "
             f"layer outputs {layer_dims[-1][1]}. Descriptor and model must "
             f"agree before either reaches the datapath.")
+    from ebpf_template_arch import check_class_action_shared
+    check_class_action_shared(bpf_obj, "class_action_t3", "layer_registry",
+                              model_id, semantics)
 
     n_layers = len(layer_dims)
     if n_layers == 0 or n_layers > LAYER_CHAIN_SIZE:

@@ -404,11 +404,10 @@ def fuori_limiti(pipeline, model):
     n_in, n_out = int(model["arch"]["n_in"]), int(model["arch"]["n_out"])
     if pipeline == "p2":
         import ebpf_template_arch as A
-        n_ref = A.reference_widths()[1]
-        if n_out != n_ref:
-            return (f"n_out={n_out}: il piano di controllo di P2 accetta solo "
-                    f"l'n_out del modello configurato ({n_ref}), vedi "
-                    f"load_arch_weights")
+        # Fino al 2026-09-23 qui c'era "n_out diverso da quello del modello
+        # configurato (7)": il piano di controllo di P2 lo rifiutava. Il
+        # datapath no -- legge n_out da arch_registry -- e il vincolo e' stato
+        # tolto; resta il tetto MAX_N_OUT, controllato da semantics.validate().
         if not hidden:
             return "P2 ha bisogno di almeno uno strato nascosto"
         if any(h != hidden[1] for h in hidden[2:]):

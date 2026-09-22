@@ -520,11 +520,14 @@ class _FakeTable(dict):
     def __setitem__(self, k, v):
         super().__setitem__(getattr(k, "value", k), v)
 
+    def __getitem__(self, k):
+        return super().__getitem__(getattr(k, "value", k))
+
 
 def t_p2p3_scale_control_plane():
     """What the P2/P3 control planes write into feat_ent.scale -- no kernel."""
-    print(f"\n{YELLOW}[9] P2/P3 control plane writes the declared scale "
-          f"into feat_ent (no kernel){NC}")
+    print(f"\n{YELLOW}[9] P2/P3 control plane: declared scale in feat_ent, "
+          f"shared class_action (no kernel){NC}")
     try:
         import ebpf_template_arch as A
         import ebpf_modular as M
@@ -551,6 +554,28 @@ def t_p2p3_scale_control_plane():
             refused = True
         check(refused, f"{label}: a scale of 300 is refused, not written as "
                        f"255 (feat_ent.scale is one byte)")
+
+    # class_action_t2/_t3 is ONE table for every model_id. Registering a model
+    # with other semantics must be refused while another model is registered,
+    # and allowed when it only replaces itself.
+    from class_semantics import ClassSemantics
+    sem7 = ClassSemantics.forward_then_drop(5, drop_class=5, n_out=7)
+    sem4 = ClassSemantics.forward_then_drop(3, drop_class=3, n_out=4)
+    obj = {"arch_registry": _FakeTable({0: "model 0"}),
+           "class_action_t2": _FakeTable()}
+    A.load_class_action(obj, "class_action_t2", sem7)
+    outcomes = []
+    for mid, sem in ((1, sem7), (1, sem4), (0, sem4)):
+        try:
+            A.check_class_action_shared(obj, "class_action_t2", "arch_registry",
+                                        mid, sem)
+            outcomes.append("ok")
+        except ValueError:
+            outcomes.append("refused")
+    check(outcomes == ["ok", "refused", "ok"],
+          f"shared class_action: same semantics ok, other semantics refused "
+          f"while model 0 is registered, re-registering model 0 ok "
+          f"({outcomes})")
 
 
 # ---------------------------------------------------------------------------

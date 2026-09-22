@@ -375,10 +375,11 @@ def preset(name: str, seed: int = 20260916) -> ModelSpec:
         "sparse": lambda: ModelSpec(
             "sparse", ipa_feature_set(6, 52, 30), n_out=7, hidden=[4, 4],
             weight_init="sparse", seed=seed),
-        # the reference SHAPE with a TTL trained on ttl/16: the only preset
-        # P2 accepts (its control plane requires the configured model's n_out,
-        # 7) whose scale is not the compiled default 30 -- without it no
-        # scenario proves that P2 divides by the scale in feat_ent
+        # the reference SHAPE with a TTL trained on ttl/16: a scale that is
+        # not the compiled default 30, on the checkpoint's own shape, so the
+        # scale is tested even where nothing else about the model changes.
+        # (Until 2026-09-23 P2 accepted only n_out=7, and this was the only
+        # preset that tested the scale there.)
         "ipa_ttl16": lambda: ModelSpec(
             "ipa_ttl16", ipa_feature_set(6, 52, 16), n_out=7, hidden=[4, 4],
             seed=seed),
