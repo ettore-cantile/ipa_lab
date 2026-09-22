@@ -612,7 +612,7 @@ matrice intera, per guardare, non per pubblicare.
 
 | # | figura | deduzione |
 |---|---|---|
-| 0 | `scaling_nodes_insns_log` | **La taglia della rete entra nel programma solo in P1.5** (746 → 1 692 istruzioni fra 10 e 100 nodi). Congelando l'indice del nodo la dipendenza **sparisce**: `p1_static` resta fra 611 e 640 a ogni taglia. Scala logaritmica, altrimenti le due curve P1 restano schiacciate contro le 14 628 di P2 e il confronto fra loro — che è il punto della figura — non si vede. |
+| 0 | `scaling_nodes_insns_log` | **La taglia della rete entra nel programma solo in P1.5** (746 → 1 692 istruzioni fra 10 e 100 nodi). Congelando l'indice del nodo la dipendenza **sparisce**: `p1_static` resta fra 611 e 640 a ogni taglia. Scala logaritmica, altrimenti le due curve P1 restano schiacciate contro le 14 985 di P2 e il confronto fra loro — che è il punto della figura — non si vede. |
 | 1 | `scaling_depth_insns` | **P2 cresce di ~780 istruzioni per layer, P3 di zero.** P3 srotola *un* layer denso generico e ci rientra per tail call, quindi la profondità non entra nel programma. P2 deve srotolarli tutti: la sua genericità è sulle larghezze, non sulla profondità. |
 | 2 | `scaling_depth_latenza` | **E P3 lo paga in tempo: ~70 ns per layer**, contro i ~36 di P2. Sono le sue tail call (da 2 a 7 hop). La stessa scelta di progetto spiega entrambe le figure: P3 è più piccolo *perché* riusa un pezzo, ed è più lento *perché* riusarlo costa un salto e delle letture ogni volta. |
 | 3 | `scaling_depth_update` | **Due ordini di grandezza sull'aggiornamento del modello**: P1 ~1 400 ms (rigenera C e chiama clang), P2 e P3 ~7 ms (scritture in mappa). Asse logaritmico, altrimenti le due curve basse si schiacciano sullo zero. È la metrica che decide se una pipeline è usabile in una rete che cambia. |
@@ -819,56 +819,70 @@ Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo.
 | Tail call / pacchetto | 0 | 1 | 1 | **3** |
 | Map lookup / pacchetto (reali) | 3.0 | 6.0 | 11.0 | **29.0** |
 | Memoria mappe (byte) | 280 | 2 356 | 10 416 | 19 508 |
-| **Latenza min (ns/pkt)** | **23.0** | **49.0** | **177.0** | **278.0** |
-| ...p50 | 24.0 | 55.0 | 190.0 | 289.0 |
-| ...max | 30.0 | 82.0 | 246.0 | 484.0 |
-| ...spread (max−min)/min | 30% | 67% | 39% | 74% |
-| Throughput teorico (Mpps, da min) | 43.478 | 20.408 | 5.650 | 3.597 |
+| **Latenza min (ns/pkt)** | **28.0** | **71.0** | **276.0** | **453.0** |
+| ...p50 | 29.0 | 75.0 | 278.0 | 460.0 |
+| ...max | 36.0 | 93.0 | 295.0 | 494.0 |
+| ...spread (max−min)/min | 29% | 31% | **7%** | **9%** |
+| Throughput teorico (Mpps, da min) | 35.714 | 14.085 | 3.623 | 2.208 |
 
-> **Le latenze sono state rimisurate il 2026-09-21**, e sono scese su tutte e
-> quattro. Il run precedente (2026-09-18) dava 35.0 / 70.0 / 286.0 / 444.0.
+> **Misurate il 2026-09-22.** I due run precedenti davano 35.0 / 70.0 / 286.0
+> / 444.0 (18 settembre) e 23.0 / 49.0 / 177.0 / 278.0 (21 settembre).
 >
 > Non è cambiato il codice, ed è verificabile: **istruzioni, byte jited, tail
-> call, map lookup e memoria delle mappe sono identici fra i due run**, cifra
-> per cifra. A muoversi è solo la colonna del tempo, e si muove di un fattore
-> quasi uniforme (0.66 / 0.70 / 0.62 / 0.63). È lo stato della macchina, non
-> una modifica al datapath.
+> call, letture di tabella e memoria sono identiche in tutti e tre i run**,
+> cifra per cifra. A muoversi è solo la colonna del tempo.
+>
+> Da notare lo **spread**: 7% su template e 9% su modular, contro 39% e 74%
+> del run precedente. Le due pipeline grandi sono diventate le misure più
+> stabili della tabella, non le più rumorose. Le due piccole restano intorno
+> al 30%, che è il comportamento atteso: più il programma è breve, più pesa
+> in proporzione il rumore del sistema.
 >
 > Conseguenza pratica: **le latenze assolute di questa tabella non sono
 > trasferibili**; i rapporti fra pipeline sì. L'host è un processore ibrido a
 > core prestazionali ed efficienti e il guest non vede la frequenza — vedi la
 > nota sulla non-misurabilità del throughput assoluto su questa VM.
 
-#### Quanto vale davvero un nanosecondo assoluto
+#### Il difetto del frame riusato, e la riproducibilità che ne è seguita
 
-La prova più stretta non viene da due giorni diversi ma da **due sweep dello
-stesso giorno**. Il modello 65-4-4-7 compare sia come punto a 6 porte dell'asse
-`degree` sia come primo punto di `width_camp` nella campagna:
+Fino al 21 settembre `_sample()` misurava **riusando un solo pacchetto** per
+tutte le ripetizioni. `BPF_PROG_TEST_RUN` non ripristina il buffer fra una
+ripetizione e l'altra, e il datapath decrementa il TTL: dopo una quarantina di
+esecuzioni restava inchiodato a 1, e da lì in poi ogni ripetizione prendeva il
+ramo `if (ip->ttl <= 1) return XDP_PASS`.
 
-| Pipeline | insns `degree` | insns campagna | ns `degree` | ns campagna | rapporto |
-|---|---:|---:|---:|---:|---:|
-| p1_static | 614 | 614 | 53 | 29 | 0.547 |
-| hardcoded | 1 071 | 1 071 | 62 | 37 | 0.597 |
-| template | 14 985 | 14 985 | 266 | 149 | 0.560 |
-| modular | 12 349 | 12 349 | 430 | 240 | 0.558 |
+Quel ramo sta **dopo** l'inferenza — il modello girava comunque, ed è il
+motivo per cui le curve scalavano in modo regolare e il difetto non si vedeva
+— ma saltava la coda di inoltro: decremento del TTL, checksum, `pkt_stats`,
+`cls_stats`, `mac_table`, `bpf_redirect`.
 
-**Le istruzioni sono identiche al bit**: è lo stesso identico programma. La
-latenza cambia di un fattore **0.56, uniforme su tutte e quattro**. Non è
-rumore casuale — un rumore non è uniforme — è la frequenza effettiva a cui la
-macchina stava girando nei due momenti.
+**Riguardava tutti e undici gli assi**, non solo la campagna: `_sample` è una
+sola e la chiamano tutti e quattro i worker.
 
-Due conseguenze operative:
+La correzione è `prog_test_run_bench`, la stessa funzione che usa
+`test_suite`: rinfresca il frame ogni 200 esecuzioni partendo da TTL 255
+(255 − 200 = 55), quindi nessuna ripetizione arriva alla scadenza.
 
-1. **Non si citano nanosecondi assoluti** senza dire da quale sweep vengono.
-   L'incertezza è di quasi un fattore due.
-2. **I confronti valgono solo dentro un singolo sweep.** Il fit `macs_eff`
-   della campagna è valido perché i suoi quattro assi sono misurati nella
-   stessa invocazione; accostarlo a numeri di un'altra invocazione no.
+**Come si vede che era il difetto giusto.** Il modello 65-4-4-7 compare in due
+sweep indipendenti — come punto a 6 porte dell'asse `degree` e come primo
+punto di `width_camp` nella campagna. Le istruzioni sono identiche al bit in
+entrambi, quindi è lo stesso identico programma:
 
-Per contrasto, T₂−T₁ sul percorso reale (`bench_throughput --mode rates`) si è
-riprodotto entro 1–2 ns su **quattro campagne di giorni diversi**. La misura
-sul datapath reale è, contro ogni aspettativa, più stabile di quella in
-`BPF_PROG_TEST_RUN`.
+| Pipeline | ns `degree` | ns campagna | scarto prima | scarto dopo |
+|---|---:|---:|---:|---:|
+| p1_static | 58 | 59 | −45% | **+2%** |
+| hardcoded | 69 | 79 | −40% | **+14%** |
+| template | 268 | 271 | −44% | **+1%** |
+| modular | 436 | 428 | −44% | **−2%** |
+
+Prima della correzione i due sweep divergevano di un fattore uniforme 1.8;
+adesso concordano entro il 2% su tre righe su quattro. La correzione non ha
+solo alzato i valori: ha reso **confrontabili sweep diversi**, che è la
+proprietà che serve per citare un numero.
+
+Resta vero che le cifre assolute dipendono dallo stato della macchina — l'host
+è un processore ibrido e il guest non vede la frequenza — quindi vale ancora
+la regola di citare i **rapporti** fra pipeline e non i nanosecondi nudi.
 
 ### Campagna sulle architetture — `bench_scaling.py --axis campaign`
 
@@ -887,13 +901,21 @@ Un solo CSV: `results/model_scaling_test_suite.csv`.
 
 | Pipeline | ns / MAC **eseguita** | r² | ns / MAC nominale | r² |
 |---|---:|---:|---:|---:|
-| p1_static | 0.207 | **0.97** | 0.054 | 0.69 |
-| hardcoded | 0.224 | **0.95** | 0.061 | 0.75 |
-| template | 0.485 | 0.74 | 0.084 | 0.29 |
-| modular | 0.874 | **0.90** | 0.083 | **0.11** |
+| p1_static | 0.324 | **0.99** | 0.081 | 0.65 |
+| hardcoded | 0.349 | **0.92** | 0.100 | 0.79 |
+| template | 0.812 | 0.71 | 0.153 | 0.34 |
+| modular | 1.462 | **0.91** | 0.123 | **0.09** |
 
-Con le MAC nominali il modello non spiega niente per P3 (r² 0.11). Con quelle
-eseguite i quattro assi collassano sulla stessa retta.
+Con le MAC nominali il modello non spiega niente per P3 (r² 0.09). Con quelle
+eseguite i quattro assi collassano sulla stessa retta, e p1_static arriva a
+r² 0.99.
+
+**Il rapporto è la cifra da citare**: 1.462 / 0.324 = **4.5×** fra pesi
+compilati come letterali e pesi letti da una tabella. È il prezzo della
+genericità espresso in una costante invece che in un aneddoto. Il pavimento
+della baseline, che di moltiplicazioni ne esegue zero, sta fra 16 e 30 ns: è
+il costo del framework XDP che ogni pipeline paga prima di moltiplicare
+qualunque cosa.
 
 **Perché.** Una feature one-hot occupa `size` colonne nella matrice dei pesi ma
 nel datapath ne attiva **una**: l'arm `FEAT_INGRESS_IF` / `FEAT_NODE_ID` fa h1
@@ -905,12 +927,20 @@ Il sintomo, sull'asse `iv_onehot`:
 
 | n_in | pesi | p1_static | hardcoded | template | modular |
 |---:|---:|---:|---:|---:|---:|
-| 16 | 271 | 48 ns | 47 ns | 141 ns | 288 ns |
-| 32 | 399 | 48 ns | 46 ns | 151 ns | 278 ns |
-| 65 | 663 | 52 ns | 48 ns | 146 ns | 283 ns |
+| 16 | 271 | 88 ns | 89 ns | 254 ns | 507 ns |
+| 32 | 399 | 89 ns | 89 ns | 249 ns | 487 ns |
+| 65 | 663 | 88 ns | 109 ns | 318 ns | 509 ns |
 
-n_in ×4, pesi ×2.4, latenza ferma. Le istruzioni di P1 intanto vanno da 1146 a
-1702: la taglia statica cresce, il percorso eseguito no.
+n_in ×4, pesi ×2.4. **p1_static 88/89/88 e modular 507/487/509 sono piatte**,
+e le istruzioni di P1 intanto vanno da 1146 a 1702: la taglia statica cresce,
+il percorso eseguito no.
+
+Due righe però si muovono al punto più largo: `hardcoded` +22% e `template`
++28% a n_in 65. Su `hardcoded` una spiegazione c'è — lo switch generato ha più
+casi, quindi più codice e più pressione sulla cache istruzioni, anche se ne
+esegue uno solo. Su `template` no, e con uno spread del 30% su misure di
+questo ordine è compatibile con il rumore. **La colonna piatta resta quella di
+p1_static e modular**; le altre due vanno citate con la riserva.
 
 **I due muri, entrambi dichiarati.** Larghezza 16 e 32 su P2/P3 sfondano
 `T2_MAX_H1`/`ML1_MAX_H1` = 8, e P3 non rifiuta il caricamento — risponde
@@ -925,19 +955,22 @@ possono avere.
 
 | Pipeline | `test_suite` | campagna | scarto |
 |---|---:|---:|---:|
-| baseline | 23 ns | 9 ns | −61% |
-| hardcoded | 49 ns | 37 ns | −24% |
-| template | 177 ns | 149 ns | −16% |
-| modular | 278 ns | 240 ns | −14% |
+| baseline | 28 ns | 30 ns | +7% |
+| hardcoded | 71 ns | 79 ns | +11% |
+| template | 276 ns | 271 ns | −2% |
+| modular | 453 ns | 428 ns | −6% |
 
-**Non è una costante.** La campagna riusa un frame solo per 100 000
-ripetizioni; il TTL si inchioda a 1 e ogni esecuzione successiva prende
-`if (ip->ttl <= 1) return XDP_PASS`. Quel ramo sta *dopo* l'inferenza — il
-modello gira, ed è perché le curve scalano — ma salta la coda di inoltro
-(decremento, checksum, `pkt_stats`, `cls_stats`, `mac_table`,
-`bpf_redirect`). `test_suite` rinfresca il frame ogni 200 esecuzioni e quella
-coda la paga sempre. **La campagna misura l'inferenza, `test_suite` misura
-inferenza + inoltro**: non vanno messe sulla stessa curva.
+**I due banchi convergono**, entro ±11% e senza segno sistematico. Prima della
+correzione del frame lo scarto era −61 / −24 / −16 / −14 %, cioè grande e
+tutto nello stesso verso: era la coda di inoltro che la campagna saltava.
+
+Lo scarto residuo su `hardcoded` non è rumore e ha una causa nota: `test_suite`
+usa i pesi veri del modello addestrato (1 026 istruzioni), la campagna pesi
+sintetici a sparsità nulla (1 071). Sono due programmi diversi, quindi 71
+contro 79 è quello che ci si aspetta.
+
+**Conseguenza per la tesi**: le due misure sono ora la stessa grandezza —
+inferenza più inoltro, sul percorso completo — e si possono accostare.
 
 Figure: `results/campaign_macs_eff_latenza.pdf`,
 `campaign_macs_nominali_latenza.pdf`, `campaign_insns_latenza.pdf`.
@@ -987,8 +1020,8 @@ Correttezza, stesso run:
 
 ### Il risultato principale: la dimensione non predice la velocità
 
-**P3 ha il 18% di istruzioni in meno di P2 ed è il 61% più lento** (12 031 contro
-14 628 istruzioni; 421 contro 262 ns). Le due righe che lo spiegano sono al centro
+**P3 ha il 18% di istruzioni in meno di P2 ed è il 65% più lento** (12 349 contro
+14 985 istruzioni; 448 contro 271 ns). Le due righe che lo spiegano sono al centro
 della tabella:
 
 - **3 tail call** contro 1;
@@ -1027,6 +1060,10 @@ le letture di mappa che ricostruiscono il contesto (`scratch_meta`, `scratch_act
 > |---|---:|---:|
 > | P2, strato d'uscita | `MAX_N_OUT` 32 × `T2_MAX_H2` 8 = 256 MAC | 7 × 4 = 28 |
 > | P3, vettore code | `IPA_MAX_QUEUES` 8 | 0 (nessuna feature coda dichiarata) |
+>
+> *(Numeri di questa bisezione, su uno stato del codice precedente alla scala
+> per-feature a runtime: oggi la stessa configurazione conta 12 349 invece di
+> 12 031. Il confronto interno regge, è la stessa build in entrambe le colonne.)*
 >
 > Con `IPA_MAX_QUEUES=1` P3 misura 8 674 istruzioni invece di 12 031, cioè il 41% in
 > meno di P2 invece del 18%, **a parità di latenza** (419 contro 421 ns). Il numero

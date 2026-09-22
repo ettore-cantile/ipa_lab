@@ -2328,8 +2328,9 @@ cella \textsc{rifiutato} senza misurarla.
 \textbf{Larghezza 32 su Pipeline 1.} Qui il soffitto non c'è, ma il programma
 srotolato sfonda lo stack eBPF da 512~byte e il backend LLVM di BCC aborta il
 \emph{processo}. Ogni cella gira nel proprio sottoprocesso apposta: la cella
-esce \textsc{crash} e lo sweep continua. Larghezza 16 invece si misura, ed è un
-punto che Pipeline~2 e 3 non possono avere.
+esce \textsc{crash} e lo sweep continua. Larghezza 16 invece si misura ---
+199~ns per \texttt{p1\_static} e 223 per \texttt{hardcoded} --- ed è un punto
+che Pipeline~2 e 3 non possono avere.
 
 % ------------------------------------------------------------------
 \section{Il problema: le MAC nominali non predicono la latenza}
@@ -2347,15 +2348,15 @@ delle ascisse:
 \toprule
 \textbf{Pipeline} & \textbf{ns per MAC nominale} & \textbf{$r^2$} \\
 \midrule
-p1\_static & 0,054 & 0,69 \\
-hardcoded  & 0,061 & 0,75 \\
-template   & 0,084 & 0,29 \\
-modular    & 0,083 & \textbf{0,11} \\
+p1\_static & 0,081 & 0,65 \\
+hardcoded  & 0,100 & 0,79 \\
+template   & 0,153 & 0,34 \\
+modular    & 0,123 & \textbf{0,09} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Per Pipeline~3 il modello spiega l'11\% della varianza: i punti sono una nuvola.
+Per Pipeline~3 il modello spiega il 9\% della varianza: i punti sono una nuvola.
 
 Il sintomo più chiaro sta sull'asse \texttt{iv\_onehot}, dove il vettore
 d'ingresso quadruplica:
@@ -2367,16 +2368,24 @@ d'ingresso quadruplica:
 $n_{in}$ & \textbf{pesi} & \textbf{p1\_static} & \textbf{hardcoded} &
 \textbf{template} & \textbf{modular} \\
 \midrule
-16 & 271 & 48 ns & 47 ns & 141 ns & 288 ns \\
-32 & 399 & 48 ns & 46 ns & 151 ns & 278 ns \\
-65 & 663 & 52 ns & 48 ns & 146 ns & 283 ns \\
+16 & 271 & 88 ns & 89 ns & 254 ns & 507 ns \\
+32 & 399 & 89 ns & 89 ns & 249 ns & 487 ns \\
+65 & 663 & 88 ns & 109 ns & 318 ns & 509 ns \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-$n_{in}$ per quattro, pesi per 2,4, e la latenza \textbf{non si muove}. Le
-istruzioni di Pipeline~1 intanto salgono da 1146 a 1702: la taglia statica
-cresce, il percorso eseguito no.
+$n_{in}$ per quattro, pesi per 2,4, e su \texttt{p1\_static} (88/89/88) e
+\texttt{modular} (507/487/509) la latenza \textbf{non si muove}. Le istruzioni
+di Pipeline~1 intanto salgono da 1146 a 1702: la taglia statica cresce, il
+percorso eseguito no.
+
+Due righe però si alzano al punto più largo: \texttt{hardcoded} del 22\% e
+\texttt{template} del 28\%. Sulla prima una spiegazione c'è --- lo
+\emph{switch} generato ha più casi, quindi più codice e più pressione sulla
+cache delle istruzioni, anche se ne esegue uno solo. Sulla seconda no, e con
+misure di questo ordine è compatibile con il rumore. Le righe da citare come
+piatte sono le altre due.
 
 \section{La soluzione: contare le MAC che vengono eseguite}
 
@@ -2414,46 +2423,44 @@ seconda sull'asse delle ascisse:
 \textbf{Pipeline} & \textbf{ns/MAC} & \textbf{$r^2$} &
 \textbf{ns/MAC} & \textbf{$r^2$} \\
 \midrule
-p1\_static & 0,207 & \textbf{0,97} & 0,054 & 0,69 \\
-hardcoded  & 0,224 & \textbf{0,95} & 0,061 & 0,75 \\
-template   & 0,485 & 0,74          & 0,084 & 0,29 \\
-modular    & 0,874 & \textbf{0,90} & 0,083 & 0,11 \\
+p1\_static & 0,324 & \textbf{0,99} & 0,081 & 0,65 \\
+hardcoded  & 0,349 & \textbf{0,92} & 0,100 & 0,79 \\
+template   & 0,812 & 0,71          & 0,153 & 0,34 \\
+modular    & 1,462 & \textbf{0,91} & 0,123 & 0,09 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Per Pipeline~3 si passa da $r^2 = 0{,}11$ a $r^2 = 0{,}90$. Quattro assi
-costruiti in modi diversi collassano sulla stessa retta, una per pipeline.
+Per Pipeline~3 si passa da $r^2 = 0{,}09$ a $r^2 = 0{,}91$, e
+\texttt{p1\_static} arriva a $0{,}99$. Quattro assi costruiti in modi diversi
+collassano sulla stessa retta, una per pipeline.
 
 \begin{lezione}
 \textbf{Il costo per MAC eseguita è una proprietà misurabile della pipeline}:
-circa 0,21~ns quando i pesi sono compilati come letterali, circa 0,87~ns quando
-vengono letti da una mappa. Un fattore $4\times$, ed è il prezzo della
+circa 0,32~ns quando i pesi sono compilati come letterali, circa 1,46~ns quando
+vengono letti da una tabella. Un fattore $4{,}5\times$, ed è il prezzo della
 genericità espresso in una costante invece che in un aneddoto.
 \end{lezione}
 
-Il pavimento della \texttt{baseline}, che di MAC ne esegue zero, sta fra 8 e
-13~ns: è il costo del framework XDP che ogni pipeline paga prima di
+Il pavimento della \texttt{baseline}, che di MAC ne esegue zero, sta fra 16 e
+30~ns: è il costo del framework XDP che ogni pipeline paga prima di
 moltiplicare qualunque cosa.
 
 \begin{prima}[Un residuo che ha una spiegazione]
-Il residuo medio di Pipeline~3 è più alto sull'asse della profondità (19~ns)
-che sugli altri. È atteso: ogni strato in più è anche una \emph{tail call}, e
-una tail call non è una MAC. Sull'asse delle istruzioni, invece, Pipeline~3 non
-ha nemmeno una pendenza da stimare --- il suo conteggio è 12\,349 su ogni
-cella, perché non ricompila mai, mentre la latenza varia da 218 a 444~ns. Il
-suo costo non sta nella taglia del codice.
+Il residuo medio di Pipeline~3 è più alto sugli assi della larghezza (34~ns) e
+della profondità (29~ns) che sugli altri. È atteso: ogni strato in più è anche
+una \emph{tail call}, e una tail call non è una MAC. Sull'asse delle
+istruzioni, invece, Pipeline~3 non ha nemmeno una pendenza da stimare --- il
+suo conteggio è 12\,349 su ogni cella, perché non ricompila mai, mentre la
+latenza varia da 386 a 759~ns. Il suo costo non sta nella taglia del codice.
 \end{prima}
 
 % ------------------------------------------------------------------
-\section{I due banchi non misurano la stessa cosa}
+\section{Un difetto del banco, trovato dalla calibrazione}
 
-Resta da chiudere il cerchio. I due banchi a
-\texttt{BPF\_PROG\_TEST\_RUN} misurano lo stesso programma, e il banco sul
-percorso reale misura $T_2-T_1$. Danno lo stesso numero? No, e la differenza
-non è una costante.
-
-Sullo stesso modello 65-4-4-7:
+Resta da chiudere il cerchio. I due banchi a \texttt{BPF\_PROG\_TEST\_RUN}
+misurano lo stesso programma: devono dare lo stesso numero. Per settimane non
+l'hanno fatto, e lo scarto non era nemmeno costante:
 
 \begin{center}
 \small
@@ -2470,36 +2477,100 @@ modular    & 278 ns & 240 ns & $-14\%$ \\
 \end{tabular}
 \end{center}
 
-La causa è il frame. La campagna riusa un solo pacchetto per centomila
-ripetizioni e \texttt{BPF\_PROG\_TEST\_RUN} non ripristina il buffer fra una e
-l'altra: il datapath decrementa il TTL, che dopo poche decine di ripetizioni
-resta inchiodato a~1, e da lì in poi ogni esecuzione prende il ramo
-\texttt{if (ip->ttl <= 1) return XDP\_PASS}. Quel ramo sta \emph{dopo}
-l'inferenza --- il modello gira lo stesso, ed è il motivo per cui le curve
-scalano correttamente --- ma salta la coda di inoltro: decremento, checksum,
+\emph{(misure del 21 settembre, prima della correzione descritta qui sotto.)}
+
+\subsection*{La causa: un pacchetto riusato centomila volte}
+
+Il banco parametrico misurava riusando \textbf{un solo pacchetto} per tutte
+le ripetizioni. E il kernel, dentro
+\texttt{BPF\_PROG\_TEST\_RUN}, non ripristina il buffer fra una ripetizione e
+l'altra. Il datapath decrementa il TTL, che dopo una quarantina
+di esecuzioni restava inchiodato a~1: da lì in poi ogni ripetizione prendeva il
+ramo
+
+\begin{lstlisting}[language=C]
+if (ip->ttl <= 1) { /* ... */ return XDP_PASS; }
+\end{lstlisting}
+
+Quel ramo sta \textbf{dopo} l'inferenza. Il modello girava comunque --- ed è
+esattamente il motivo per cui il difetto non si vedeva: le curve scalavano in
+modo regolare con la larghezza e con la profondità, come ci si aspetta da una
+misura sana. Ma saltava la coda di inoltro: decremento del TTL, checksum,
 \texttt{pkt\_stats}, \texttt{cls\_stats}, \texttt{mac\_table},
-\texttt{bpf\_redirect}. \texttt{test\_suite} rinfresca il frame ogni 200
-esecuzioni e quella coda la paga sempre.
+\texttt{bpf\_redirect}.
 
 \begin{lezione}
-La campagna misura \textbf{l'inferenza}; \texttt{test\_suite} misura
-\textbf{inferenza più inoltro}. Sono due grandezze diverse, non la stessa con
-uno scostamento. Non vanno messe sulla stessa curva, e lo scarto è massimo
-sulla \texttt{baseline} ($-61\%$) proprio perché per lei la coda di inoltro
-\emph{è} quasi tutto il programma.
+Il difetto riguardava \textbf{tutti e undici gli assi}, non solo la campagna:
+la funzione che campiona è una sola e la chiamano tutti e quattro i
+misuratori. Ogni latenza prodotta dal banco parametrico prima del 22 settembre
+misurava «parse più inferenza», non «tutto il percorso».
 \end{lezione}
+
+\subsection*{La correzione, e la prova che era quella giusta}
+
+Si usa \texttt{prog\_test\_run\_bench}, la stessa funzione di
+\texttt{test\_suite}: rinfresca il frame ogni 200 esecuzioni partendo da
+TTL~255. Il conto che chiude il buco è $255 - 200 = 55$, quindi nessuna
+ripetizione arriva alla scadenza.
+
+Rimisurato tutto, nella stessa sessione:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Pipeline} & \textbf{\texttt{test\_suite}} & \textbf{campagna} &
+\textbf{scarto} \\
+\midrule
+baseline   &  28 ns &  30 ns & $+7\%$ \\
+hardcoded  &  71 ns &  79 ns & $+11\%$ \\
+template   & 276 ns & 271 ns & $-2\%$ \\
+modular    & 453 ns & 428 ns & $-6\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Convergono}, entro l'$11\%$ e senza segno sistematico. Lo scarto che
+resta su \texttt{hardcoded} non è rumore e ha una causa nota:
+\texttt{test\_suite} usa i pesi veri del modello addestrato (1026 istruzioni),
+il banco parametrico pesi sintetici a sparsità nulla (1071). Sono due
+programmi diversi, quindi 71 contro 79 è ciò che ci si attende.
+
+\begin{prima}[L'effetto collaterale, più importante del claim]
+La stessa correzione ha reso \textbf{confrontabili sweep diversi}. Il modello
+65-4-4-7 compare sia come punto a 6 porte dell'asse \texttt{degree} sia come
+primo punto della campagna, con istruzioni identiche al bit --- è lo stesso
+identico programma. Prima i due sweep divergevano di un fattore uniforme 1,8;
+adesso concordano entro il $2\%$ su tre righe su quattro:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+& \textbf{asse \texttt{degree}} & \textbf{campagna} & \textbf{scarto} \\
+\midrule
+p1\_static &  58 ns &  59 ns & $+2\%$ \\
+hardcoded  &  69 ns &  79 ns & $+14\%$ \\
+template   & 268 ns & 271 ns & $+1\%$ \\
+modular    & 436 ns & 428 ns & $-2\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Era l'incoerenza più grave del banco, e si è chiusa insieme a questa.
+\end{prima}
 
 \begin{prima}[Una validazione che non cercavamo]
 Le istruzioni sullo stesso modello, contate dai due banchi: \texttt{baseline}
 155 e 155, \texttt{template} 14\,985 e 14\,985, \texttt{modular} 12\,349 e
 12\,349. Identiche. L'unica che diverge è \texttt{hardcoded}, 1026 contro 1071,
-e diverge nella direzione giusta: \texttt{test\_suite} usa i pesi veri del
-modello addestrato, la campagna pesi sintetici a sparsità nulla. I pesi veri
-hanno qualche zero, clang cancella quelle moltiplicazioni, 45 istruzioni in
-meno. È lo stesso effetto che l'asse \texttt{sparsity} misura apposta.
+e diverge nella direzione giusta: i pesi veri hanno qualche zero, clang
+cancella quelle moltiplicazioni, 45 istruzioni in meno. È lo stesso effetto
+che l'asse \texttt{sparsity} misura apposta. E che i conteggi non si siano
+mossi di un'unità prima e dopo la correzione è la prova che questa ha toccato
+solo il cronometro, non i programmi.
 \end{prima}
 
-% ------------------------------------------------------------------
 \section{Che cosa questi numeri non dicono}
 
 \begin{itemize}[leftmargin=1.2em]

@@ -122,7 +122,7 @@ il progetto chiamava P1.
 | **Variabile modificata** | Quanto è noto alla compilazione: P1 specializzata (pesi + nodo) → P1.5 (pesi) → P2 (soffitti) → P3 (anche la profondità). |
 | **Variabili fisse** | Modello 65-4-4-7, topologia Germany50, descrittore, stessa macchina, stesso run. |
 | **Metrica** | Latenza minima su 7 trial, istruzioni eBPF, tail call, letture di mappa. |
-| **Risultato** | 54 → 57 → 249 → 436 ns. Istruzioni 614 → 1 071 → 14 628 → 12 031. Tail call 1, 1, 1, 3. Letture di mappa 6 (P1.5), 11 (P2), 29 (P3). |
+| **Risultato** | 58 → 69 → 268 → 436 ns. Istruzioni 614 → 1 071 → 14 985 → 12 349. Salti fra programmi 1, 1, 1, 3. Letture di tabella 6 (P1.5), 11 (P2), 29 (P3). |
 | **Conclusione** | **La flessibilità costa circa 8× in latenza** fra i due estremi, e il costo non è aritmetico: è in letture di mappa e salti fra programmi. |
 | **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` e `sudo python3 ipa/test/bench_scaling.py --out results/` |
 
@@ -164,8 +164,8 @@ il progetto chiamava P1.
 | **Variabile modificata** | La pipeline (P2 contro P3). |
 | **Variabili fisse** | Modello, topologia, run. |
 | **Metrica** | Istruzioni contro latenza, con tail call e letture di mappa come variabili esplicative. |
-| **Risultato** | P3 ha il **18% di istruzioni in meno** di P2 ed è il **61% più lento** (12 031 contro 14 628; 421 contro 262 ns). Le righe che lo spiegano: 3 tail call contro 1, 29 letture di mappa contro 11. |
-| **Prova di rinforzo** | Lo stesso codice, cambiando un solo `#define` (`IPA_MAX_QUEUES` 1→8), misura 8 674 **o** 12 031 istruzioni — il 39% di differenza — **a parità di latenza** (419 contro 421 ns). Una metrica che si sposta del 39% senza che cambi nulla di ciò che gira non è una misura di costo. |
+| **Risultato** | P3 ha il **18% di istruzioni in meno** di P2 ed è il **65% più lento** (12 349 contro 14 985; 448 contro 271 ns). Le righe che lo spiegano: 3 salti fra programmi contro 1, 29 letture di tabella contro 11. |
+| **Prova di rinforzo** | Lo stesso codice, cambiando un solo `#define` (`IPA_MAX_QUEUES` 1→8), misura 8 674 **o** 12 031 istruzioni — il 39% di differenza — **a parità di latenza** (419 contro 421 ns). Una metrica che si sposta del 39% senza che cambi nulla di ciò che gira non è una misura di costo. ⚠️ Questi quattro numeri vengono da quella bisezione, eseguita su uno stato del codice **precedente** alla scala per-feature a runtime (che ha aggiunto +318 istruzioni a P3): per questo dicono 12 031 dove il banco oggi dice 12 349. Il confronto interno regge — è la stessa build in entrambe le colonne — e la conclusione non dipende dai valori assoluti. |
 | **Conclusione** | `xlated` misura quanto è **grande** il programma caricato, non quanto **lavora**. In questo regime dominano letture di mappa e salti. |
 | **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` |
 
@@ -177,7 +177,7 @@ il progetto chiamava P1.
 | **Variabile modificata** | Due assi separati: numero di nodi (10→100, cioè l'ingresso da 23 a 113) e neuroni per hidden layer (2→8). |
 | **Variabili fisse** | Su ciascun asse, tutto il resto. |
 | **Metrica** | Latenza minima su 7 trial. |
-| **Risultato** | Nodi: P2 244→249 ns, P3 421→449 ns, piatte. Neuroni: P2 228→311 ns, P3 395→572 ns, in salita su tutte e quattro. |
+| **Risultato** | Nodi (ingresso da 23 a 113): P2 269→266 ns, P3 448→422 ns, **piatte**; p1_static 57→59, hardcoded 64→67 mentre le sue istruzioni vanno da 746 a 1 692. Neuroni (2→8): P2 250→314 ns, P3 401→530 ns, in salita su tutte e quattro. |
 | **Conclusione** | Una one-hot ha un solo uno, quindi il datapath legge **una colonna di pesi** qualunque sia la sua larghezza. Un layer denso più largo legge più pesi per pacchetto. **La rete può crescere quanto vuole, il modello no.** |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis nodes --out results/` e `--axis width` |
 
@@ -188,9 +188,9 @@ il progetto chiamava P1.
 | **Ipotesi** | Se i pesi sono letterali nel C, il compilatore può cancellare i prodotti per zero: la dimensione del programma dipende dai **valori**, non solo dalla forma. |
 | **Variabile modificata** | La frazione di pesi esattamente zero: 0, 25, 50, 75, 90%. |
 | **Variabili fisse** | Forma 65-4-4-7, descrittore, topologia. I pesi sono un prefisso di un pool fisso, quindi una configurazione più grande **estende** la più piccola. |
-| **Metrica** | Istruzioni eBPF e byte di codice nativo. |
-| **Risultato** | P1.5: 1 071 → 224 istruzioni (4,8×). P1 specializzata: 614 → 216. P2: 14 628 a **tutte** le sparsità. P3: 12 031 a tutte. |
-| **Conclusione** | Al 90% di zeri P1 sta **sotto il baseline** (155 istruzioni), cioè il programma che inferisce è più piccolo di quello che non inferisce. Per P2 e P3 uno zero è un byte in mappa come un altro. |
+| **Metrica** | Istruzioni eBPF, byte di codice nativo e latenza. |
+| **Risultato** | P1.5: 1 071 → 224 istruzioni (4,8×) e 68 → 40 ns. P1 specializzata: 614 → 216 e 60 → 31 ns. P2: 14 985 istruzioni e 274→268 ns a **tutte** le sparsità. P3: 12 349 e 432→427 a tutte. |
+| **Conclusione** | Al 90% di zeri P1 si avvicina al baseline senza scendervi sotto: 216 istruzioni contro 155. Per P2 e P3 uno zero è un byte in tabella come un altro, e non si muovono. È inoltre **l'unico asse su cui scendono insieme dimensione e tempo**: sull'asse delle porte le istruzioni calavano e la latenza no. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis sparsity --out results/` |
 
 ### C4 — In P1 i pesi decidono se il programma si carica ✅
@@ -263,10 +263,10 @@ il progetto chiamava P1.
 | **Variabile modificata** | Quattro assi indipendenti: colonne d'ingresso dense (n_in 5→17), colonne d'ingresso one-hot (n_in 16→65), larghezza (4→32), profondita' (1→4 strati). |
 | **Variabili fisse** | Su ciascun asse, tutto il resto. Stessa metodologia di `test_suite`: `BPF_PROG_TEST_RUN`, minimo su N prove. |
 | **Metrica** | Pendenza e r² della retta ai minimi quadrati sui quattro assi **insieme**, con MAC nominali e con MAC eseguite. |
-| **Risultato** | Nominali: 0,054 / 0,061 / 0,084 / 0,083 ns/MAC con r² **0,69 / 0,75 / 0,29 / 0,11**. Eseguite: 0,207 / 0,224 / 0,485 / 0,874 ns/MAC con r² **0,97 / 0,95 / 0,74 / 0,90**. |
-| **Conclusione** | L'ipotesi e' falsa con le MAC nominali: per P3 il modello spiega l'11% della varianza. Una feature one-hot occupa `size` colonne nella matrice dei pesi ma nel datapath ne attiva **una** — l'arm `FEAT_INGRESS_IF` fa h1 addizioni e non guarda `size`. Contando le MAC **eseguite**, quattro assi costruiti in modi diversi collassano sulla stessa retta, una per pipeline. Il costo per MAC eseguita e' **~0,21 ns con i pesi compilati e ~0,87 ns con i pesi letti da mappa**: un fattore 4, ed e' il prezzo della genericita' espresso in una costante. |
-| **Controprova** | Sull'asse one-hot n_in va da 16 a 65 e i pesi da 271 a 663, ma la latenza resta 48/48/52 ns su P1 e 288/278/283 su P3. Le istruzioni di P1 intanto vanno da 1146 a 1702: la taglia statica cresce, il percorso eseguito no. |
-| **Limite dichiarato** | ⚠️ Il residuo di P3 e' piu' alto sull'asse della profondita' (19 ns): ogni strato in piu' e' anche una tail call, e una tail call non e' una MAC. Sull'asse delle istruzioni P3 non ha nemmeno una pendenza — 12 349 su ogni cella, latenza da 218 a 444 ns: il suo costo non sta nella taglia del codice. |
+| **Risultato** | Nominali: 0,081 / 0,100 / 0,153 / 0,123 ns/MAC con r² **0,65 / 0,79 / 0,34 / 0,09**. Eseguite: 0,324 / 0,349 / 0,812 / 1,462 ns/MAC con r² **0,99 / 0,92 / 0,71 / 0,91**. |
+| **Conclusione** | L'ipotesi e' falsa con le MAC nominali: per P3 il modello spiega l'11% della varianza. Una feature one-hot occupa `size` colonne nella matrice dei pesi ma nel datapath ne attiva **una** — l'arm `FEAT_INGRESS_IF` fa h1 addizioni e non guarda `size`. Contando le MAC **eseguite**, quattro assi costruiti in modi diversi collassano sulla stessa retta, una per pipeline. Il costo per MAC eseguita e' **~0,32 ns con i pesi compilati e ~1,46 ns con i pesi letti da tabella**: un fattore **4,5**, ed e' il prezzo della genericita' espresso in una costante. |
+| **Controprova** | Sull'asse one-hot n_in va da 16 a 65 e i pesi da 271 a 663, ma la latenza resta 88/89/88 ns su p1_static e 507/487/509 su P3. Le istruzioni di P1 intanto vanno da 1146 a 1702: la taglia statica cresce, il percorso eseguito no. ⚠️ `hardcoded` (+22%) e `template` (+28%) si muovono al punto piu' largo: su `hardcoded` e' plausibile la pressione sulla cache istruzioni, su `template` e' compatibile col rumore. Le righe piatte da citare sono p1_static e modular. |
+| **Limite dichiarato** | ⚠️ Il residuo di P3 e' piu' alto sugli assi larghezza (34 ns) e profondita' (29 ns): ogni strato in piu' e' anche una tail call, e una tail call non e' una MAC. Sull'asse delle istruzioni P3 non ha nemmeno una pendenza — 12 349 su ogni cella, latenza da 386 a 759 ns: il suo costo non sta nella taglia del codice. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis campaign --out results/`, poi `--plot results/` |
 
 ---
@@ -346,8 +346,8 @@ solo su P1.
 |---|---:|---:|---:|---:|---:|---|
 | P1 specializzata | 902 | 889 | 840 | 1 029 | 972 | piatta |
 | P1.5 hardcoded | 1 774 | 1 638 | 1 723 | 1 748 | 1 627 | piatta |
-| P2 template | 14 140 | 14 628 | 16 141 | 16 390 | **17 207** | **+22%** |
-| P3 modular | 12 031 | 12 031 | 12 031 | 12 031 | 12 031 | **identica** |
+| P2 template | 14 668 | 14 985 | 16 663 | 16 867 | **17 828** | **+22%** |
+| P3 modular | 12 349 | 12 349 | 12 349 | 12 349 | 12 349 | **identica** |
 
 | | |
 |---|---|
@@ -363,7 +363,7 @@ solo su P1.
 | **Ipotesi** | Il costo di un layer in più non è aritmetico: è un costo fisso di transizione. |
 | **Variabile modificata** | Il numero di layer, su tre assi indipendenti (`depth` a parametri crescenti, `isoparam` a parametri fermi, i tier di D1). |
 | **Metrica** | Latenza per layer aggiunto, e tail call. |
-| **Risultato** | P3: **+71 ns per layer** sull'asse `depth`, e la sua riga di istruzioni non si muove — il costo è interamente nelle tail call, che vanno da 2 a 7. P2: **+36 ns e +780 istruzioni per layer**, cioè srotolamento. P1: 15-40 ns per layer secondo D1, visibile solo sopra un certo budget. |
+| **Risultato** | P3 sull'asse `depth_camp` (1→4 strati da 8): **386 → 759 ns**, cioè ~124 ns per strato, con le istruzioni ferme a 12 349 e le tail call da 2 a 5 — il costo è interamente nei salti e nelle letture. P2: **243 → 456 ns e 14 668 → 16 867 istruzioni**, cioè ricompila e srotola. P1 specializzata: 77 → 136 ns, ~20 per strato. |
 | **Conclusione** | Tre meccanismi distinti per lo stesso sintomo. In P3 si vede allo stato puro: **dimensione costante, tempo crescente** è la firma di un costo di transizione e non di calcolo. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis depth --out results/` |
 
@@ -392,16 +392,19 @@ trasporto.
 | **Conclusione** | L'ipotesi e' falsa: la perdita e' **controspinta del trasporto**. Un solo numero di "perdita" avrebbe attribuito alla pipeline un difetto del banco. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 --threads 2 --rates 0.5,1,1.5,2,2.5,3 --out results/` |
 
-### E2 — Fra i due banchi c'e' un addendo costante ❌ **Previsione smentita**
+### E2 — I due banchi misurano la stessa grandezza ✅ *(dopo una correzione)*
 
 | | |
 |---|---|
-| **Ipotesi** | Lo scarto fra il banco a traffico vero e `test_suite` e' un **addendo comune** (allocazione, copia dell'headroom), quindi sottraendo la baseline si elimina il banco. |
-| **Su cosa si basava** | Un run a frame 512 B in cui lo scarto valeva 1 113 / 1 162 / 1 264 / 1 322 ns: variava del 19% mentre le pipeline variavano di quattordici volte. |
-| **Che cosa l'ha smentita** | La calibrazione fra `test_suite` e la campagna sullo stesso 65-4-4-7: 23→9, 49→37, 177→149, 278→240 ns. Lo scarto e' **−14 / −12 / −28 / −38 ns**, cioe' −61% / −24% / −16% / −14%. Non e' costante ne' in assoluto ne' in rapporto. |
-| **Perche'** | La campagna riusa un frame solo per 100 000 ripetizioni e `BPF_PROG_TEST_RUN` non ripristina il buffer: il TTL si inchioda a 1 e ogni esecuzione successiva prende `if (ip->ttl <= 1) return XDP_PASS`. Quel ramo sta **dopo** l'inferenza — il modello gira, ed e' perche' le curve scalano correttamente — ma salta la coda di inoltro: decremento, checksum, `pkt_stats`, `cls_stats`, `mac_table`, `bpf_redirect`. |
-| **Conclusione** | I due banchi misurano **grandezze diverse**, non la stessa con uno scostamento: la campagna misura l'inferenza, `test_suite` misura inferenza + inoltro. Lo scarto e' massimo sulla baseline (−61%) proprio perche' per lei la coda di inoltro *e'* quasi tutto il programma. **Non vanno messi sulla stessa curva.** |
-| **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` e `sudo python3 ipa/test/bench_scaling.py --axis campaign --out results/`, poi confrontare la riga `width_camp` x=4 |
+| **Ipotesi** | `test_suite` e il banco parametrico, che usano entrambi `BPF_PROG_TEST_RUN` sullo stesso programma, devono dare lo stesso numero. |
+| **Che cosa diceva la misura prima** | No, e con uno scarto che non era nemmeno costante: −61 / −24 / −16 / −14 % su baseline, hardcoded, template, modular. Il claim era stato marcato **previsione smentita**. |
+| **La causa, trovata** | Non l'ipotesi: la misura. `_sample()` misurava **riusando un solo pacchetto** per tutte le ripetizioni, e `BPF_PROG_TEST_RUN` non ripristina il buffer fra una e l'altra. Il datapath decrementa il TTL, che dopo ~40 esecuzioni restava inchiodato a 1: da lì in poi ogni ripetizione prendeva `if (ip->ttl <= 1) return XDP_PASS`. Quel ramo sta **dopo** l'inferenza — il modello girava, ed è il motivo per cui le curve scalavano in modo regolare e il difetto non si vedeva — ma saltava la coda di inoltro: decremento, checksum, `pkt_stats`, `cls_stats`, `mac_table`, `bpf_redirect`. |
+| **Portata del difetto** | **Tutti e undici gli assi**, non solo la campagna: `_sample` è una sola e la chiamano tutti e quattro i worker. Ogni latenza prodotta dal banco parametrico prima del 22/09/2026 misurava «parse + inferenza», non «tutto il percorso». |
+| **La correzione** | `prog_test_run_bench`, la stessa funzione che usa `test_suite`: rinfresca il frame ogni 200 esecuzioni partendo da TTL 255 (255 − 200 = 55), quindi nessuna ripetizione arriva alla scadenza. |
+| **Risultato dopo** | baseline 28 contro 30 ns (+7%), hardcoded 71 contro 79 (+11%), template 276 contro 271 (−2%), modular 453 contro 428 (−6%). **Concordano entro ±11%, senza segno sistematico.** |
+| **Conclusione** | Ipotesi **vera**. I due banchi misurano la stessa grandezza e si possono accostare. Lo scarto residuo su `hardcoded` ha una causa nota e non è rumore: `test_suite` usa i pesi veri del modello (1 026 istruzioni), il banco parametrico pesi sintetici a sparsità nulla (1 071) — sono due programmi diversi. |
+| **Effetto collaterale, più importante del claim** | La correzione ha reso **confrontabili sweep diversi**. Il modello 65-4-4-7 compare sia sull'asse `degree` sia nella campagna, con istruzioni identiche al bit: prima i due sweep divergevano di un fattore uniforme 1,8, adesso concordano entro il 2% su tre righe su quattro. Era l'incoerenza più grave del banco e si è chiusa insieme a questa. |
+| **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` e `sudo python3 ipa/test/bench_scaling.py --axis campaign --out results/` **nella stessa sessione**, poi confrontare la riga `width_camp` x=4. Sessioni diverse non sono confrontabili: le cifre assolute dipendono dallo stato della macchina. |
 
 ### E3 — Il costo della pipeline si separa da quello del trasporto ✅
 
