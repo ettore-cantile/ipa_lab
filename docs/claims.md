@@ -124,7 +124,7 @@ il progetto chiamava P1.
 | **Metrica** | Latenza minima su 7 trial, istruzioni eBPF, tail call, letture di mappa. |
 | **Risultato** | 54 → 57 → 249 → 436 ns. Istruzioni 614 → 1 071 → 14 628 → 12 031. Tail call 1, 1, 1, 3. Letture di mappa 6 (P1.5), 11 (P2), 29 (P3). |
 | **Conclusione** | **La flessibilità costa circa 8× in latenza** fra i due estremi, e il costo non è aritmetico: è in letture di mappa e salti fra programmi. |
-| **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` e `sudo python3 ipa/test/bench_scaling.py --out result/` |
+| **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` e `sudo python3 ipa/test/bench_scaling.py --out results/` |
 
 ### B2 — Il costo di aggiornare il modello differisce di due ordini di grandezza ✅
 
@@ -137,7 +137,7 @@ il progetto chiamava P1.
 | **Risultato** | P1 e P1.5 fra 1 162 e 1 690 ms (rigenerano C e chiamano clang); P2 e P3 fra 5 e 14 ms (scritture in mappa). |
 | **Conclusione** | Circa 200×. È la metrica che decide se una pipeline è usabile in una rete che cambia. |
 | **Nota metodologica** | `build_ms` e `update_ms` **non vanno confusi**: per P2/P3 il primo è una compilazione pagata una volta all'avvio del nodo, il secondo è il costo per modello. Metterli sullo stesso asse farebbe sembrare P2/P3 più costose di P1, cioè il rovescio della verità. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --out result/`; figura `scaling_depth_update.pdf` |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --out results/`; figura `scaling_depth_update.pdf` |
 
 ### B3 — L'AOT toglie il compilatore dal nodo senza costo per pacchetto ✅
 
@@ -179,7 +179,7 @@ il progetto chiamava P1.
 | **Metrica** | Latenza minima su 7 trial. |
 | **Risultato** | Nodi: P2 244→249 ns, P3 421→449 ns, piatte. Neuroni: P2 228→311 ns, P3 395→572 ns, in salita su tutte e quattro. |
 | **Conclusione** | Una one-hot ha un solo uno, quindi il datapath legge **una colonna di pesi** qualunque sia la sua larghezza. Un layer denso più largo legge più pesi per pacchetto. **La rete può crescere quanto vuole, il modello no.** |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis nodes --out result/` e `--axis width` |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis nodes --out results/` e `--axis width` |
 
 ### C3 — In P1 il conteggio istruzioni dipende dai valori dei pesi ✅
 
@@ -191,7 +191,7 @@ il progetto chiamava P1.
 | **Metrica** | Istruzioni eBPF e byte di codice nativo. |
 | **Risultato** | P1.5: 1 071 → 224 istruzioni (4,8×). P1 specializzata: 614 → 216. P2: 14 628 a **tutte** le sparsità. P3: 12 031 a tutte. |
 | **Conclusione** | Al 90% di zeri P1 sta **sotto il baseline** (155 istruzioni), cioè il programma che inferisce è più piccolo di quello che non inferisce. Per P2 e P3 uno zero è un byte in mappa come un altro. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis sparsity --out result/` |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis sparsity --out results/` |
 
 ### C4 — In P1 i pesi decidono se il programma si carica ✅
 
@@ -231,7 +231,7 @@ il progetto chiamava P1.
 | **Controllo** | Sull'asse descrittore, dove il vettore d'ingresso **non contiene** la feature `node`, le due P1 sono **identiche alla cifra** (599/599, 575/575); dove la contiene, divergono. Il divario è tutto lì. |
 | **Conclusione** | La dimensione crolla, il tempo no, **per la stessa ragione**: lo switch ha N casi ma ne esegue uno, quindi a runtime è un salto indicizzato. Non è un'ottimizzazione di velocità: è ciò che rende la hardcoded praticabile su una rete grande. |
 | **Contro-risultato** | Con pesi sparsi il vantaggio **si annulla** (216 contro 224 al 90% di zeri): sparsità e nodo congelato sono due strade alla stessa riduzione e non si sommano. E il costo di aggiornamento **non cala** (stesso avvio di clang), mentre i binari da installare passano da uno a N. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis nodes --out result/`; figura `duel_p1_vs_p15.pdf` |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis nodes --out results/`; figura `duel_p1_vs_p15.pdf` |
 
 ---
 
@@ -252,6 +252,22 @@ il progetto chiamava P1.
 | **Conclusione** | Stesso esito di C6, per una ragione diversa. Lì lo switch a N casi ne eseguiva uno solo; qui le moltiplicazioni sono davvero eseguite, ma sono **16 su ~979 istruzioni** e il banco non le distingue dal rumore. La specializzazione delle porte è una riduzione di dimensione dimostrata e un guadagno di tempo **non dimostrato**. |
 | **Previsione smentita** | Era stato previsto che, essendo `link_state` un vettore denso e non una one-hot, togliere colonne avrebbe spostato la latenza. La misura dice di no, a questa risoluzione. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis degree --out results/` (i byte JIT sono nel CSV, non nella tabella a schermo) |
+
+---
+
+### C8 — Il costo per MAC **eseguita** e' una costante della pipeline ✅
+
+| | |
+|---|---|
+| **Ipotesi** | La latenza si predice dalle MAC contate sulla forma del modello (n_in × h1, ecc.). |
+| **Variabile modificata** | Quattro assi indipendenti: colonne d'ingresso dense (n_in 5→17), colonne d'ingresso one-hot (n_in 16→65), larghezza (4→32), profondita' (1→4 strati). |
+| **Variabili fisse** | Su ciascun asse, tutto il resto. Stessa metodologia di `test_suite`: `BPF_PROG_TEST_RUN`, minimo su N prove. |
+| **Metrica** | Pendenza e r² della retta ai minimi quadrati sui quattro assi **insieme**, con MAC nominali e con MAC eseguite. |
+| **Risultato** | Nominali: 0,054 / 0,061 / 0,084 / 0,083 ns/MAC con r² **0,69 / 0,75 / 0,29 / 0,11**. Eseguite: 0,207 / 0,224 / 0,485 / 0,874 ns/MAC con r² **0,97 / 0,95 / 0,74 / 0,90**. |
+| **Conclusione** | L'ipotesi e' falsa con le MAC nominali: per P3 il modello spiega l'11% della varianza. Una feature one-hot occupa `size` colonne nella matrice dei pesi ma nel datapath ne attiva **una** — l'arm `FEAT_INGRESS_IF` fa h1 addizioni e non guarda `size`. Contando le MAC **eseguite**, quattro assi costruiti in modi diversi collassano sulla stessa retta, una per pipeline. Il costo per MAC eseguita e' **~0,21 ns con i pesi compilati e ~0,87 ns con i pesi letti da mappa**: un fattore 4, ed e' il prezzo della genericita' espresso in una costante. |
+| **Controprova** | Sull'asse one-hot n_in va da 16 a 65 e i pesi da 271 a 663, ma la latenza resta 48/48/52 ns su P1 e 288/278/283 su P3. Le istruzioni di P1 intanto vanno da 1146 a 1702: la taglia statica cresce, il percorso eseguito no. |
+| **Limite dichiarato** | ⚠️ Il residuo di P3 e' piu' alto sull'asse della profondita' (19 ns): ogni strato in piu' e' anche una tail call, e una tail call non e' una MAC. Sull'asse delle istruzioni P3 non ha nemmeno una pendenza — 12 349 su ogni cella, latenza da 218 a 444 ns: il suo costo non sta nella taglia del codice. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis campaign --out results/`, poi `--plot results/` |
 
 ---
 
@@ -338,7 +354,7 @@ solo su P1.
 | **Conclusione** | A questo budget le due P1 **non distinguono** larga da profonda: la dispersione lungo l'asse (68-95 ns) è più grande di qualunque tendenza. Per P2 e P3 invece la profondità costa, molto, e **per due ragioni diverse**: P2 deve srotolare ogni layer, quindi cresce in dimensione *e* in tempo; P3 riusa lo stesso layer — la sua riga di istruzioni è identica a tutti e cinque i punti — e paga **una tail call per layer**. |
 | **Il risultato utile** | Chi sceglie l'architettura deve sapere **su quale pipeline girerà**. Su una hardcoded a ~600 pesi la profondità è quasi gratis; su P2 o P3 la stessa scelta costa il 58-84% di latenza a parità di parametri. |
 | **Limite dichiarato** | ⚠️ «Nessuna tendenza» per le due P1 significa **sotto il rumore di questo run**, non «nessun effetto». La dispersione è ±20% e la serie non è monotona (78, 80, 68, 95, 81). D1 mostra che a 1 200 pesi l'effetto su P1 c'è ed è grande: qui il budget è la metà e la profondità arriva a 5 invece che a 8. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis isoparam --out result/` |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis isoparam --out results/` |
 
 ### D3 — Perché la profondità costa, quando costa ✅
 
@@ -349,51 +365,71 @@ solo su P1.
 | **Metrica** | Latenza per layer aggiunto, e tail call. |
 | **Risultato** | P3: **+71 ns per layer** sull'asse `depth`, e la sua riga di istruzioni non si muove — il costo è interamente nelle tail call, che vanno da 2 a 7. P2: **+36 ns e +780 istruzioni per layer**, cioè srotolamento. P1: 15-40 ns per layer secondo D1, visibile solo sopra un certo budget. |
 | **Conclusione** | Tre meccanismi distinti per lo stesso sintomo. In P3 si vede allo stato puro: **dimensione costante, tempo crescente** è la firma di un costo di transizione e non di calcolo. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis depth --out result/` |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis depth --out results/` |
 
-## E. Traffico vero: throughput end-to-end e latenza
+## E. Traffico vero: il percorso reale, separato in due
 
-Questa sezione risponde alla riserva che la sezione E dichiarava aperta: fino a
-qui ogni cifra in Mpps era `1/latenza` sotto `BPF_PROG_TEST_RUN`. Ora c'e' un
-generatore che manda pacchetti veri e un contatore che li conta all'arrivo.
+Fino alla sezione D ogni cifra in ns veniva da `BPF_PROG_TEST_RUN`. Qui c'e' un
+generatore che manda pacchetti veri, un contatore che li conta all'arrivo, e
+**tre marcature temporali** che separano il costo della pipeline da quello del
+trasporto.
+
+| Marca | Dove | Delimita |
+|---|---|---|
+| T1 | ingresso del dispatcher | prima che il pacchetto sia guardato |
+| T2 | subito prima di `bpf_redirect` | dopo parse, inferenza, scelta classe |
+| T3 | ingresso del contatore, altro capo | dopo redirect, veth, NAPI |
 
 ### E1 — Il datapath non perde pacchetti; a perdere e' il trasporto ✅
 
 | | |
 |---|---|
 | **Ipotesi** | Le perdite osservate su un banco `veth` sono della pipeline. |
-| **Variabile modificata** | Il punto di conteggio: trasmessi (TX), elaborati dal programma (HIT), arrivati a destinazione (RX), piu' i rifiutati da `veth_xmit`. |
+| **Variabile modificata** | Il punto di conteggio: trasmessi (TX), elaborati (HIT), arrivati (RX), piu' i rifiutati da `veth_xmit`. |
 | **Variabili fisse** | Modello, topologia, taglia del frame, durata della finestra. |
 | **Metrica** | `TX − HIT`, `HIT − RX`, e i rifiutati contati a parte. |
-| **Risultato** | In **tutte** le configurazioni misurate `TX = HIT = RX` e `HIT − RX = 0`. Ogni pacchetto mancante all'appello e' stato rifiutato da `veth_xmit` a coda piena, cioe' non e' mai entrato nel DUT. |
-| **Conclusione** | L'ipotesi e' falsa: la perdita e' **controspinta del trasporto**, prova che il nodo e' saturo, non che sbagli. Un solo numero di "perdita" avrebbe attribuito alla pipeline un difetto del banco. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --mode saturate --frames 64,512,1514 --threads 1 --duration 2.0 --repeat 5 --no-threaded-napi --out result/ndr/` |
+| **Risultato** | Sweep a sei rate da 0,5 a 3,0 Mpps, cinque pipeline, tre giri: **perdita 0,000% su ogni riga**. Ogni pacchetto mancante all'appello e' stato rifiutato da `veth_xmit` a coda piena, cioe' non e' mai entrato nel nodo. |
+| **Conclusione** | L'ipotesi e' falsa: la perdita e' **controspinta del trasporto**. Un solo numero di "perdita" avrebbe attribuito alla pipeline un difetto del banco. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 --threads 2 --rates 0.5,1,1.5,2,2.5,3 --out results/` |
 
-### E2 — Fra i due banchi c'e' un addendo costante, non un fattore ✅
-
-| | |
-|---|---|
-| **Ipotesi** | Le cifre del banco con traffico vero e quelle di `test_suite` non sono riconciliabili. |
-| **Variabile modificata** | Il banco: `BPF_PROG_TEST_RUN` contro `pktgen` + `veth` + XDP nativo, stesse pipeline. |
-| **Variabili fisse** | Modello 65-4-4-7, frame 512 B, stessa macchina. |
-| **Metrica** | Mpps e ns/pacchetto, per pipeline. |
-| **Risultato** | 34,48 / 13,70 / 3,82 / 2,38 Mpps contro 0,876 / 0,810 / 0,655 / 0,574. In nanosecondi la differenza vale **1 113, 1 162, 1 264, 1 322 ns**: varia del 19% mentre le pipeline variano di quattordici volte. |
-| **Conclusione** | La differenza e' un **addendo comune** — allocazione per pacchetto, copia dell'headroom, generatore sullo stesso core — non un fattore. Sottraendo la baseline si elimina il banco e resta la pipeline: +93 / +385 / +601 ns contro +44 / +233 / +392 di `test_suite`, stesso ordine, rapporti fra 1,5 e 2,1. |
-| **Limite dichiarato** | ⚠️ Il throughput assoluto non e' della pipeline: in softirq il tetto e' il generatore, a core separati e' la coda del `veth` (256 descrittori, non configurabile su questo kernel). Si riporta come **limite inferiore**. |
-| **Come rigirarlo** | Come E1, piu' `sudo python3 ipa/test/test_suite.py --only kernel` |
-
-### E3 — Il costo dell'inferenza si ritrova anche nella latenza end-to-end ✅
+### E2 — Fra i due banchi c'e' un addendo costante ❌ **Previsione smentita**
 
 | | |
 |---|---|
-| **Ipotesi** | Il costo dedotto dal throughput e quello misurato come latenza sono la stessa cosa. |
-| **Variabile modificata** | Come si stima il costo: `1/pps` in regime senza perdite contro marcatura temporale arrivo → ripartenza. |
-| **Variabili fisse** | Modello, frame 512 B, rate di 50 kpps per la latenza (nessuna coda). |
-| **Metrica** | ns/pacchetto sopra la baseline, su tre run indipendenti per ciascuna via. |
-| **Risultato** | Latenza minima: P1 ~101, P1.5 ~96, P2 ~288, P3 ~478 ns. Da throughput: 82, 116, 430, 673 ns. |
-| **Conclusione** | Ipotesi vera per P1 e P1.5, **falsa per P2 e P3**: li' il costo sotto carico continuo supera del 40-50% il minimo. Il minimo e' il cammino piu' fortunato; sotto traffico, salti fra programmi e letture di mappa si pagano. Per dimensionare un nodo vale la cifra da throughput. |
-| **Limite dichiarato** | ⚠️ Solo il **minimo** e' esatto: i percentili vengono da un istogramma `bpf_log2l`, risoluzione un fattore 2, e nei run tutte e cinque le pipeline cadono negli stessi due bucket. `p50` e `p99` non separano niente. |
-| **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --latency --frames 512 --rounds 5 --repeat 5 --threads 1 --duration 2.0 --out result/lat/` |
+| **Ipotesi** | Lo scarto fra il banco a traffico vero e `test_suite` e' un **addendo comune** (allocazione, copia dell'headroom), quindi sottraendo la baseline si elimina il banco. |
+| **Su cosa si basava** | Un run a frame 512 B in cui lo scarto valeva 1 113 / 1 162 / 1 264 / 1 322 ns: variava del 19% mentre le pipeline variavano di quattordici volte. |
+| **Che cosa l'ha smentita** | La calibrazione fra `test_suite` e la campagna sullo stesso 65-4-4-7: 23→9, 49→37, 177→149, 278→240 ns. Lo scarto e' **−14 / −12 / −28 / −38 ns**, cioe' −61% / −24% / −16% / −14%. Non e' costante ne' in assoluto ne' in rapporto. |
+| **Perche'** | La campagna riusa un frame solo per 100 000 ripetizioni e `BPF_PROG_TEST_RUN` non ripristina il buffer: il TTL si inchioda a 1 e ogni esecuzione successiva prende `if (ip->ttl <= 1) return XDP_PASS`. Quel ramo sta **dopo** l'inferenza — il modello gira, ed e' perche' le curve scalano correttamente — ma salta la coda di inoltro: decremento, checksum, `pkt_stats`, `cls_stats`, `mac_table`, `bpf_redirect`. |
+| **Conclusione** | I due banchi misurano **grandezze diverse**, non la stessa con uno scostamento: la campagna misura l'inferenza, `test_suite` misura inferenza + inoltro. Lo scarto e' massimo sulla baseline (−61%) proprio perche' per lei la coda di inoltro *e'* quasi tutto il programma. **Non vanno messi sulla stessa curva.** |
+| **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` e `sudo python3 ipa/test/bench_scaling.py --axis campaign --out results/`, poi confrontare la riga `width_camp` x=4 |
+
+### E3 — Il costo della pipeline si separa da quello del trasporto ✅
+
+| | |
+|---|---|
+| **Ipotesi** | La latenza da arrivo a partenza tiene insieme due costi che si possono separare, e il secondo non dipende dalla pipeline. |
+| **Variabile modificata** | Dove si prende il tempo: una marcatura sola (ingresso→uscita) contro tre (T1, T2, T3). |
+| **Variabili fisse** | Modello, frame 64 B, generatore e nodo su core disgiunti, NAPI in thread. |
+| **Metrica** | T2−T1, T3−T2, T3−T1, minimo per finestra, mediana fra tre giri. |
+| **Risultato** | T2−T1: **27 / 50 / 57 / 183 / 271 ns** (baseline, p1_static, hardcoded, template, modular). T3−T2: **195–219 ns per tutte e cinque**, senza correlazione con il lavoro svolto. T3−T1: 224 / 268 / 275 / 405 / 509 ns. |
+| **Conclusione** | Ipotesi vera. Il trasporto e' un costo comune di circa 200 ns che copriva quasi del tutto una baseline da 27 ns. La separazione **corregge al ribasso** la cifra della genericita': il costo di P2 sopra la baseline era stimato ~200 ns da un confronto fra latenze end-to-end, ed e' **156 ns**. P3 costa altri 88 ns sopra P2. |
+| **Riproducibilita'** | Quattro sweep indipendenti, giorni diversi: scarti di 1–2 ns. E' la misura piu' stabile del progetto. Piatta anche sul rate: 27 ns a 0,5 Mpps e 27 ns a 3,0 Mpps. |
+| **Limite dichiarato** | ⚠️ Build **strumentata**: due letture dell'orologio e due scritture per pacchetto che il datapath di produzione non fa. Se qualcosa, T2−T1 e' gonfiato. |
+| **Come rigirarlo** | Come E1. |
+
+### E4 — Il tetto misurato e' la via di ricezione, non l'inferenza ✅
+
+| | |
+|---|---|
+| **Ipotesi** | Il throughput osservato nello sweep e' una capacita' del nodo. |
+| **Variabile modificata** | La presenza della pipeline: `--mode generator` carica lo **stesso percorso senza nessuna inferenza**, solo un contatore che scarta. |
+| **Variabili fisse** | Generatore, code, veth, pinning dei core, taglia del frame. |
+| **Metrica** | Offerti (TX + respinti), accettati, respinti da `veth_xmit`, perdita. |
+| **Risultato** | Il generatore offre stabilmente ~5,1 Mpps; il veth ne accetta ~3,4; il 29–39% viene **rifiutato all'ingresso**. Perdita 0,00% su tutte e 29 le righe: RX identico a TX. Massimo osservato **3,73 Mpps**. |
+| **Conclusione** | L'ipotesi e' falsa. Le pipeline, che nello sweep stavano fra 1,07 e 1,39 Mpps consegnati con perdita nulla, avevano ancora **circa 2× di margine**: il loro ginocchio non e' mai stato raggiunto. Ogni cifra in Mpps di questo progetto va citata come limite inferiore. |
+| **Controprova** | Il budget per pacchetto fra tetto di ricezione (3,41 Mpps = 293 ns) e baseline sotto traffico (1,82 Mpps = 549 ns) differisce di 256 ns; la somma T2−T1 + T3−T2 della baseline, misurata indipendentemente, vale 224 ns. Concordano entro il 14%. |
+| **Limite dichiarato** | ⚠️ Una coda piu' grande **non** alzerebbe il tetto: il disavanzo e' stazionario (~1,7 Mpps per tutta la finestra, mezzo milione di pacchetti), e una coda assorbe picchi, non uno squilibrio di rate. La profondita' compra latenza, non banda. Alzarla gonfierebbe T3−T2. |
+| **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --mode generator --frames 64 --rounds 5 --threads 2 --rates 8,10,12,15,20,25 --out results/` — **da lanciare da solo**: in coda a `--mode rates` la stessa misura ha dato 1,26 Mpps invece di 3,73. |
 
 ---
 

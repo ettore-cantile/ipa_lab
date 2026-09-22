@@ -64,6 +64,10 @@ WHAT IS MEASURED
              one-sided (an interrupt can only slow a trial down), so the
              smallest sample is the best estimate of the interference-free
              cost. Same reasoning as bench_depth_vs_width.py and hyperfine.
+             Ogni misura e' spezzata in chunk da 200 esecuzioni con un frame
+             NUOVO per chunk (prog_test_run_bench, la stessa di test_suite):
+             senza, il TTL si inchioda a 1 e le ripetizioni successive
+             saltano la coda di inoltro. Vedi _sample.
   update_ms  cost of INSTALLING A NEW MODEL on a node already running. This
              is the metric where the three pipelines differ in KIND rather
              than degree, and the two must not be confused:
@@ -209,14 +213,14 @@ def make_weights(nw, sparsity, seed=42):
 # gradient that does not exist).
 AXES = {
     "nodes": {
-        "xlabel": "nodi della rete (larghezza della one-hot `node`)",
+        "xlabel": "nodi della rete (larghezza della colonna che identifica il nodo)",
         "kind": "num",
         "values": [10, 25, 52, 75, 100],
         "cell": lambda v: dict(n_nodes=v, dims=(4, 4)),
         "note": "n_in = 13 + n_nodes; il modello resta 4-4, cambia solo l'ingresso",
     },
     "depth": {
-        "xlabel": "numero di hidden layer",
+        "xlabel": "numero di strati nascosti",
         "kind": "num",
         "values": [1, 2, 3, 4, 5, 6],
         "cell": lambda v: dict(n_nodes=52, dims=tuple([4] * v)),
@@ -224,7 +228,7 @@ AXES = {
                 "la ricompilazione E' il confronto",
     },
     "width": {
-        "xlabel": "neuroni per hidden layer",
+        "xlabel": "neuroni per strato nascosto",
         "kind": "num",
         "values": [2, 4, 6, 8],
         "cell": lambda v: dict(n_nodes=52, dims=(v, v)),
@@ -255,7 +259,7 @@ AXES = {
     # The achieved weight count is printed per cell (the `pesi` column), so
     # "comparable" is something the reader checks rather than takes on trust.
     "isoparam": {
-        "xlabel": "hidden layer, a parita' di parametri (~592 pesi)",
+        "xlabel": "strati nascosti, a parita' di pesi (~592)",
         "kind": "num",
         "values": [1, 2, 3, 4, 5],
         "cell": lambda v: dict(n_nodes=52, dims=ISOPARAM_DIMS[v]),
@@ -276,7 +280,7 @@ AXES = {
     # 3,52) e nessun nodo arriva a 6: il modello riserva 6 colonne perche' e'
     # il massimo della rete, non il grado di chi lo esegue.
     "degree": {
-        "xlabel": "porte realmente presenti sul nodo (su 6 colonne link_state)",
+        "xlabel": "porte realmente presenti sul nodo (su 6 previste)",
         "kind": "num",
         "values": [2, 3, 4, 5, 6],
         # LISTA, non set: la cella viaggia in JSON verso il sottoprocesso che
@@ -312,7 +316,7 @@ AXES = {
     # _validate_feature_types rifiuta i duplicati, quindi non si possono
     # impilare piu' letture dense di queste.
     "iv_dense": {
-        "xlabel": "colonne d'ingresso, tutte dense (n_in)",
+        "xlabel": "colonne d'ingresso, tutte moltiplicate davvero",
         "kind": "num",
         "values": [5, 9, 13, 17],
         "cell": lambda v: dict(n_nodes=52, dims=(8, 8), descriptor="iv_dense",
@@ -336,7 +340,7 @@ AXES = {
     # VETTORE D'INGRESSO, non la rete. L'asse `nodes` misura l'altra cosa e
     # resta separato.
     "iv_onehot": {
-        "xlabel": "colonne d'ingresso, larghezza nella one-hot (n_in)",
+        "xlabel": "colonne d'ingresso, larghezza in una colonna singola",
         "kind": "num",
         "values": [16, 32, 65],
         "cell": lambda v: dict(n_nodes=52, dims=(8, 8), descriptor="iv_onehot",
@@ -351,7 +355,7 @@ AXES = {
     # misurati: i soffitti non si toccano, e una riga misurata la' sarebbe un
     # programma che risponde XDP_PASS.
     "width_camp": {
-        "xlabel": "neuroni per hidden layer (campagna)",
+        "xlabel": "neuroni per strato nascosto (campagna)",
         "kind": "num",
         "values": [4, 8, 16, 32],
         "cell": lambda v: dict(n_nodes=52, dims=(v, v)),
@@ -365,7 +369,7 @@ AXES = {
     # largo, e proprio per questo puo' finire contro il budget di complessita'
     # del verificatore di P3 sui punti in fondo. Un rifiuto la' e' un dato.
     "depth_camp": {
-        "xlabel": "hidden layer, width 8 (campagna)",
+        "xlabel": "strati nascosti, 8 neuroni ciascuno (campagna)",
         "kind": "num",
         "values": [1, 2, 3, 4],
         "cell": lambda v: dict(n_nodes=52, dims=tuple([8] * v)),
@@ -553,14 +557,39 @@ def _timed(fn):
     return out, (time.perf_counter() - t0) * 1000.0
 
 
-def _sample(disp_fd, frame, repeat, trials):
+def _sample(disp_fd, mk_frame, repeat, trials):
     """MIN of `trials` independent measurements; see the module docstring on
-    why min rather than mean. Returns (min, p50, max, retval)."""
-    from verify_prog_run import prog_test_run
-    prog_test_run(disp_fd, frame, repeat=repeat)      # warm the icache
+    why min rather than mean. Returns (min, p50, max, retval).
+
+    Prende una FABBRICA di frame, non un frame, e il motivo e' un difetto che
+    questa funzione si e' portata dietro a lungo.
+
+    Riusava UN pacchetto per tutte le ripetizioni. Ma BPF_PROG_TEST_RUN non
+    ripristina il buffer fra una ripetizione e l'altra, e il datapath
+    decrementa il TTL: dopo una quarantina di esecuzioni restava inchiodato a
+    1, e da li' in poi ogni ripetizione prendeva il ramo
+    `if (ip->ttl <= 1) return XDP_PASS`.
+
+    Quel ramo sta DOPO l'inferenza, quindi il modello girava lo stesso -- ed
+    e' il motivo per cui le curve scalavano in modo regolare invece di
+    risultare piatte, cioe' per cui il difetto non si vedeva. Ma saltava la
+    coda di inoltro: decremento del TTL, checksum, pkt_stats, cls_stats,
+    mac_table, bpf_redirect. Le cifre dicevano "parse + inferenza", non
+    "tutto il percorso", e non erano confrontabili con quelle di test_suite.
+
+    Il difetto riguardava tutti gli assi, non uno: `_sample` e' una sola.
+
+    `prog_test_run_bench` e' la stessa funzione che usa test_suite: rinfresca
+    il frame ogni TEST_RUN_MAX_CHUNK = 200 esecuzioni, e la fabbrica lo
+    consegna con BENCH_TTL = 255. 255 - 200 = 55, quindi nessuna ripetizione
+    arriva alla scadenza. `repeat` resta un bersaglio: la funzione lo limita a
+    TEST_RUN_MAX_CHUNKS chunk, perche' oltre quel punto il minimo delle medie
+    non migliora piu' e le syscall in piu' sono solo tempo di parete."""
+    from verify_prog_run import prog_test_run_bench
+    prog_test_run_bench(disp_fd, mk_frame, 1000, max_chunks=2)   # scalda
     samples, retval = [], None
     for _ in range(trials):
-        retval, ns = prog_test_run(disp_fd, frame, repeat=repeat)
+        retval, ns = prog_test_run_bench(disp_fd, mk_frame, repeat)
         samples.append(ns)
     samples.sort()
     return samples[0], samples[len(samples) // 2], samples[-1], retval
@@ -693,9 +722,14 @@ def _bench_p1(cell, repeat, trials, static_node=None):
             _seed_link_state(bb, 1)
             return bb, dd.fd
         lookups = _lookups_safe(_ins, n_in, n_out)
-    frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
-                               n_in=n_in, n_out=n_out)
-    lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
+    from verify_prog_run import BENCH_TTL
+
+    def mk_frame():
+        return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
+                                  n_in=n_in, n_out=n_out)
+
+    lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
     # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
     # loop over one buffer, not a rate anything sustained. It is reported
     # because it is the unit the question is usually asked in.
@@ -780,9 +814,14 @@ def _bench_p2(cell, repeat, trials):
             _seed_link_state(bb, 1)
             return bb, dd.fd
         lookups = _lookups_safe(_ins, n_in, n_out)
-    frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
-                               n_in=n_in, n_out=n_out)
-    lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
+    from verify_prog_run import BENCH_TTL
+
+    def mk_frame():
+        return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
+                                  n_in=n_in, n_out=n_out)
+
+    lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
     # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
     # loop over one buffer, not a rate anything sustained. It is reported
     # because it is the unit the question is usually asked in.
@@ -845,9 +884,14 @@ def _bench_p3(cell, repeat, trials):
             _seed_link_state(bb, 1)
             return bb, dd.fd
         lookups = _lookups_safe(_ins, n_in, n_out)
-    frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
-                               n_in=n_in, n_out=n_out)
-    lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
+    from verify_prog_run import BENCH_TTL
+
+    def mk_frame():
+        return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
+                                  n_in=n_in, n_out=n_out)
+
+    lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
     # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
     # loop over one buffer, not a rate anything sustained. It is reported
     # because it is the unit the question is usually asked in.
@@ -899,9 +943,14 @@ def _bench_baseline(cell, repeat, trials):
     if cell.get("lookups"):
         lookups = _lookups_safe(
             lambda: (lambda t: (t[0], t[1].fd))(_load(True)), n_in, n_out)
-    frame = build_frame_sparse(model_id=0, ttl=42, scale=SCALE,
-                               n_in=n_in, n_out=n_out)
-    lo, med, hi, retval = _sample(disp_fn.fd, frame, repeat, trials)
+    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
+    from verify_prog_run import BENCH_TTL
+
+    def mk_frame():
+        return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
+                                  n_in=n_in, n_out=n_out)
+
+    lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
     mpps = (1000.0 / lo) if lo else 0.0
     # update_ms = 0 e non build_ms: qui non c'e' nessun modello da installare,
     # e confondere "compilare una volta" con "cambiare modello" e' l'errore
@@ -991,7 +1040,7 @@ DUEL_PANELS = [
      "la dipendenza dalla taglia della rete sparisce"),
     ("nodes", "jited", "nodi della rete", "codice nativo (byte)",
      "e nel codice generato il divario e' anche piu' largo"),
-    ("width", "lat_ns", "neuroni per hidden layer", "latenza (ns/pacchetto)",
+    ("width", "lat_ns", "neuroni per strato nascosto", "latenza (ns/pacchetto)",
      "la velocita', invece, si muove appena"),
     ("sparsity", "insns", "frazione di pesi a zero", "istruzioni eBPF",
      "e con pesi sparsi il vantaggio si annulla"),
@@ -1403,12 +1452,19 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
             else:
                 r = bench_cell(pipe, cell, repeat, trials)
             if r.get("ok"):
+                # La baseline non moltiplica niente: `forma` descrive la
+                # cella, non quello che questa pipeline esegue.
+                if pipe == "baseline":
+                    r = dict(r)
+                    forma_riga = dict(forma, macs=0, macs_eff=0)
+                else:
+                    forma_riga = forma
                 print(f"  {str(v):>5s} {pipe:11s} {shape_str:>16s} {r['nw']:6d} "
                       f"{r['insns']:7d} {r['lat_ns']:7.1f} "
                       f"{r['update_ms']:10.2f} {r['build_ms']:9.1f} "
                       f"{r['map_bytes']:8d} {r['tail']:4d}")
                 rows.append(dict(axis=axis, x=v, pipeline=pipe,
-                                 shape=shape_str, **forma, **{
+                                 shape=shape_str, **forma_riga, **{
                                      k: r[k] for k in
                                      ("nw", "n_in", "insns", "jited",
                                       "map_bytes", "n_maps", "tail",
@@ -1462,7 +1518,7 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
 # default. --all-plots draws the whole matrix, for looking rather than for
 # publishing.
 PLOTS = [
-    ("insns", "istruzioni eBPF (xlated)", "scaling_{axis}_insns", False),
+    ("insns", "istruzioni del programma", "scaling_{axis}_insns", False),
     # The log twin exists for one figure only. P1 runs at ~10^3 instructions
     # and P2/P3 at ~10^4, so on a LINEAR axis P1's curve is pinned to the
     # bottom and its collapse with sparser weights -- 1 071 to 224, the
@@ -1470,13 +1526,13 @@ PLOTS = [
     # plain, but P2's rise with depth (1.3x) flattens out. Neither scale
     # serves both readings, so each figure takes the one that shows what it
     # is about.
-    ("insns", "istruzioni eBPF (xlated, scala log)", "scaling_{axis}_insns_log", True),
+    ("insns", "istruzioni del programma (scala log)", "scaling_{axis}_insns_log", True),
     ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latenza", False),
     ("lat_ns", "latenza (ns/pacchetto, scala log)", "scaling_{axis}_latenza_log", True),
-    ("mpps", "throughput teorico (Mpps = 1/latenza)", "scaling_{axis}_mpps", False),
+    ("mpps", "pacchetti al secondo teorici (1 / latenza)", "scaling_{axis}_mpps", False),
     ("update_ms", "installare un modello nuovo (ms)", "scaling_{axis}_update", True),
     ("build_ms", "compilare il programma, una volta (ms)", "scaling_{axis}_build", False),
-    ("map_bytes", "memoria delle mappe (byte)", "scaling_{axis}_mappe", False),
+    ("map_bytes", "memoria delle tabelle (byte)", "scaling_{axis}_mappe", False),
 ]
 
 # (axis, metric) -> the one-line reading that figure supports. Keeping the
@@ -1598,7 +1654,7 @@ def plot_campaign(in_dir, fmt):
              "campaign_macs_eff_latenza"),
             ("macs", "MAC nominali per pacchetto (n_in x h1 + ...)", "ns/MAC",
              "campaign_macs_nominali_latenza"),
-            ("insns", "istruzioni eBPF (xlated)", "ns/istruzione",
+            ("insns", "istruzioni del programma", "ns/istruzione",
              "campaign_insns_latenza")):
         fig, ax = plt.subplots(figsize=(6.4, 4.0))
         print(f"\n  {YELLOW}{nome}{NC}")
@@ -1791,7 +1847,9 @@ def main():
                         "architetture della campagna, tutte in "
                         + CAMPAIGN_CSV)
     p.add_argument("--repeat", type=int, default=100000,
-                   help="ripetizioni dentro una singola BPF_PROG_TEST_RUN")
+                   help="ripetizioni bersaglio per misura; vengono spezzate "
+                        "in chunk da 200 con un frame nuovo ciascuno, e "
+                        "limitate a TEST_RUN_MAX_CHUNKS chunk")
     p.add_argument("--trials", type=int, default=7,
                    help="misure indipendenti per cella; si tiene il minimo")
     p.add_argument("--lookups", action="store_true",

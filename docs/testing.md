@@ -568,9 +568,9 @@ l'indice del nodo no. Rinominarla nei CSV romperebbe ogni misura già presa, qui
 distinzione vive nelle etichette delle figure.
 
 ```bash
-sudo python3 ipa/test/bench_scaling.py --out result/    # misura (Linux + BCC + root)
-python3 ipa/test/bench_scaling.py --plot result/        # grafici (basta matplotlib)
-python3 ipa/test/bench_scaling.py --axis width --out result/   # un asse solo
+sudo python3 ipa/test/bench_scaling.py --out results/    # misura (Linux + BCC + root)
+python3 ipa/test/bench_scaling.py --plot results/        # grafici (basta matplotlib)
+python3 ipa/test/bench_scaling.py --axis width --out results/   # un asse solo
 ```
 
 **Cinque assi, una variabile ciascuno.** Tutto il resto è bloccato, così una curva si
@@ -819,11 +819,130 @@ Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo.
 | Tail call / pacchetto | 0 | 1 | 1 | **3** |
 | Map lookup / pacchetto (reali) | 3.0 | 6.0 | 11.0 | **29.0** |
 | Memoria mappe (byte) | 280 | 2 356 | 10 416 | 19 508 |
-| **Latenza min (ns/pkt)** | **35.0** | **70.0** | **286.0** | **444.0** |
-| ...p50 | 37.0 | 74.0 | 299.0 | 475.0 |
-| ...max | 41.0 | 100.0 | 353.0 | 556.0 |
-| ...spread (max−min)/min | 17% | 43% | 23% | 25% |
-| Throughput teorico (Mpps, da min) | 28.571 | 14.286 | 3.497 | 2.252 |
+| **Latenza min (ns/pkt)** | **23.0** | **49.0** | **177.0** | **278.0** |
+| ...p50 | 24.0 | 55.0 | 190.0 | 289.0 |
+| ...max | 30.0 | 82.0 | 246.0 | 484.0 |
+| ...spread (max−min)/min | 30% | 67% | 39% | 74% |
+| Throughput teorico (Mpps, da min) | 43.478 | 20.408 | 5.650 | 3.597 |
+
+> **Le latenze sono state rimisurate il 2026-09-21**, e sono scese su tutte e
+> quattro. Il run precedente (2026-09-18) dava 35.0 / 70.0 / 286.0 / 444.0.
+>
+> Non è cambiato il codice, ed è verificabile: **istruzioni, byte jited, tail
+> call, map lookup e memoria delle mappe sono identici fra i due run**, cifra
+> per cifra. A muoversi è solo la colonna del tempo, e si muove di un fattore
+> quasi uniforme (0.66 / 0.70 / 0.62 / 0.63). È lo stato della macchina, non
+> una modifica al datapath.
+>
+> Conseguenza pratica: **le latenze assolute di questa tabella non sono
+> trasferibili**; i rapporti fra pipeline sì. L'host è un processore ibrido a
+> core prestazionali ed efficienti e il guest non vede la frequenza — vedi la
+> nota sulla non-misurabilità del throughput assoluto su questa VM.
+
+#### Quanto vale davvero un nanosecondo assoluto
+
+La prova più stretta non viene da due giorni diversi ma da **due sweep dello
+stesso giorno**. Il modello 65-4-4-7 compare sia come punto a 6 porte dell'asse
+`degree` sia come primo punto di `width_camp` nella campagna:
+
+| Pipeline | insns `degree` | insns campagna | ns `degree` | ns campagna | rapporto |
+|---|---:|---:|---:|---:|---:|
+| p1_static | 614 | 614 | 53 | 29 | 0.547 |
+| hardcoded | 1 071 | 1 071 | 62 | 37 | 0.597 |
+| template | 14 985 | 14 985 | 266 | 149 | 0.560 |
+| modular | 12 349 | 12 349 | 430 | 240 | 0.558 |
+
+**Le istruzioni sono identiche al bit**: è lo stesso identico programma. La
+latenza cambia di un fattore **0.56, uniforme su tutte e quattro**. Non è
+rumore casuale — un rumore non è uniforme — è la frequenza effettiva a cui la
+macchina stava girando nei due momenti.
+
+Due conseguenze operative:
+
+1. **Non si citano nanosecondi assoluti** senza dire da quale sweep vengono.
+   L'incertezza è di quasi un fattore due.
+2. **I confronti valgono solo dentro un singolo sweep.** Il fit `macs_eff`
+   della campagna è valido perché i suoi quattro assi sono misurati nella
+   stessa invocazione; accostarlo a numeri di un'altra invocazione no.
+
+Per contrasto, T₂−T₁ sul percorso reale (`bench_throughput --mode rates`) si è
+riprodotto entro 1–2 ns su **quattro campagne di giorni diversi**. La misura
+sul datapath reale è, contro ogni aspettativa, più stabile di quella in
+`BPF_PROG_TEST_RUN`.
+
+### Campagna sulle architetture — `bench_scaling.py --axis campaign`
+
+Undici architetture su quattro assi, stessa metodologia della tabella qui sopra
+(`BPF_PROG_TEST_RUN`, minimo su N prove), cinque pipeline inclusa la baseline.
+Un solo CSV: `results/model_scaling_test_suite.csv`.
+
+| Asse | Valori | Cosa muove |
+|---|---|---|
+| `iv_dense` | n_in 5, 9, 13, 17 | colonne d'ingresso **dense**: ognuna letta da mappa e moltiplicata |
+| `iv_onehot` | n_in 16, 32, 65 | colonne d'ingresso in una **one-hot** |
+| `width_camp` | 65-v-v-7, v = 4, 8, 16, 32 | neuroni per strato nascosto |
+| `depth_camp` | 65-8…8-7, 1–4 strati | profondità a larghezza 8 |
+
+**Il risultato.** Retta ai minimi quadrati sui quattro assi insieme:
+
+| Pipeline | ns / MAC **eseguita** | r² | ns / MAC nominale | r² |
+|---|---:|---:|---:|---:|
+| p1_static | 0.207 | **0.97** | 0.054 | 0.69 |
+| hardcoded | 0.224 | **0.95** | 0.061 | 0.75 |
+| template | 0.485 | 0.74 | 0.084 | 0.29 |
+| modular | 0.874 | **0.90** | 0.083 | **0.11** |
+
+Con le MAC nominali il modello non spiega niente per P3 (r² 0.11). Con quelle
+eseguite i quattro assi collassano sulla stessa retta.
+
+**Perché.** Una feature one-hot occupa `size` colonne nella matrice dei pesi ma
+nel datapath ne attiva **una**: l'arm `FEAT_INGRESS_IF` / `FEAT_NODE_ID` fa h1
+addizioni e non guarda `size`. Contarla come `size × h1` MAC sovrastima, e di
+quanto dipende da quanta one-hot c'è nell'ingresso — cioè cambia da asse ad
+asse. La colonna `macs_eff` la conta per quello che esegue.
+
+Il sintomo, sull'asse `iv_onehot`:
+
+| n_in | pesi | p1_static | hardcoded | template | modular |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 271 | 48 ns | 47 ns | 141 ns | 288 ns |
+| 32 | 399 | 48 ns | 46 ns | 151 ns | 278 ns |
+| 65 | 663 | 52 ns | 48 ns | 146 ns | 283 ns |
+
+n_in ×4, pesi ×2.4, latenza ferma. Le istruzioni di P1 intanto vanno da 1146 a
+1702: la taglia statica cresce, il percorso eseguito no.
+
+**I due muri, entrambi dichiarati.** Larghezza 16 e 32 su P2/P3 sfondano
+`T2_MAX_H1`/`ML1_MAX_H1` = 8, e P3 non rifiuta il caricamento — risponde
+`XDP_PASS` a runtime, quindi una misura lì sarebbe una latenza vera di un
+programma che non calcola. Il banco controlla i soffitti **prima** di compilare
+e segna `RIFIUTATO` senza misurare. Larghezza 32 su P1 sfonda invece lo stack
+eBPF da 512 byte: abort del processo, cella `CRASH`, sweep che continua.
+Larghezza 16 su P1 si misura (120 e 132 ns) ed è un punto che P2 e P3 non
+possono avere.
+
+**Calibrazione contro la suite kernel.** Stesso modello 65-4-4-7:
+
+| Pipeline | `test_suite` | campagna | scarto |
+|---|---:|---:|---:|
+| baseline | 23 ns | 9 ns | −61% |
+| hardcoded | 49 ns | 37 ns | −24% |
+| template | 177 ns | 149 ns | −16% |
+| modular | 278 ns | 240 ns | −14% |
+
+**Non è una costante.** La campagna riusa un frame solo per 100 000
+ripetizioni; il TTL si inchioda a 1 e ogni esecuzione successiva prende
+`if (ip->ttl <= 1) return XDP_PASS`. Quel ramo sta *dopo* l'inferenza — il
+modello gira, ed è perché le curve scalano — ma salta la coda di inoltro
+(decremento, checksum, `pkt_stats`, `cls_stats`, `mac_table`,
+`bpf_redirect`). `test_suite` rinfresca il frame ogni 200 esecuzioni e quella
+coda la paga sempre. **La campagna misura l'inferenza, `test_suite` misura
+inferenza + inoltro**: non vanno messe sulla stessa curva.
+
+Figure: `results/campaign_macs_eff_latenza.pdf`,
+`campaign_macs_nominali_latenza.pdf`, `campaign_insns_latenza.pdf`.
+
+---
 
 > **Rimisurata il 2026-09-18**, dopo che la scala per-feature e' passata dal
 > `#define` al descrittore a runtime (vedi il capitolo sui modelli sintetici nel

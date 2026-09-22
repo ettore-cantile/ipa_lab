@@ -1497,7 +1497,7 @@ Tre accortezze che hanno cambiato i risultati, non solo la forma:
 \section{Profondità: chi paga in spazio e chi in tempo}
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_depth_insns.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_depth_insns.pdf}
 \end{center}
 
 \begin{lezione}
@@ -1512,7 +1512,7 @@ perché è un programma solo.
 Ma la storia non finisce lì:
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_depth_latenza.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_depth_latenza.pdf}
 \end{center}
 
 \begin{lezione}
@@ -1528,7 +1528,7 @@ a due numeri.
 \section{Aggiornare il modello: due ordini di grandezza}
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_depth_update.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_depth_update.pdf}
 \end{center}
 
 Attenzione alla scala verticale: è \textbf{logaritmica}. Su scala lineare le due
@@ -1555,7 +1555,7 @@ stretti. Tutte stanno dentro i soffitti compilati, quindi tutte e quattro le
 pipeline possono eseguirle tutte.
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_isoparam_latenza.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_isoparam_latenza.pdf}
 \end{center}
 
 \begin{lezione}
@@ -1570,7 +1570,7 @@ pipeline su cui finisce.
 E i due che perdono, perdono per ragioni diverse:
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_isoparam_insns.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_isoparam_insns.pdf}
 \end{center}
 
 P2 cresce anche in dimensione (dal 14\,140 al 17\,207): deve srotolare ogni
@@ -1649,7 +1649,7 @@ della tabella. Restano quattro numeri costanti, che il compilatore può piegare
 dentro al conto.
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_nodes_insns_log.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_nodes_insns_log.pdf}
 \end{center}
 
 \begin{lezione}
@@ -1695,7 +1695,7 @@ non da qualcos'altro che è cambiato per caso? Si prende un vettore d'ingresso c
 la feature \emph{non} la contiene:
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_descriptor_insns.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_descriptor_insns.pdf}
 \end{center}
 
 Nelle due composizioni senza la feature \texttt{node} le due P1 sono
@@ -1731,7 +1731,7 @@ compilatore cancella lo switch da solo e non resta niente da congelare.
 \subsection*{Le quattro risposte in una figura}
 
 \begin{center}
-\includegraphics[width=\textwidth]{../result/duel_p1_vs_p15.pdf}
+\includegraphics[width=\textwidth]{../results/duel_p1_vs_p15.pdf}
 \end{center}
 
 Qui ci sono solo le due P1: in tutte le altre figure P2 e P3 stanno un ordine di
@@ -1910,7 +1910,7 @@ Questa coppia di figure è il risultato che preferisco di tutta l'analisi, perch
 la risposta non è quella che verrebbe da indovinare.
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_nodes_insns.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_nodes_insns.pdf}
 \end{center}
 
 La taglia della \emph{rete} entra nel programma solo in P1, che passa da 746 a
@@ -1921,7 +1921,7 @@ nomina mai la forma del modello.
 E a runtime?
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_nodes_latenza.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_nodes_latenza.pdf}
 \end{center}
 
 \textbf{Piatte tutte e tre.} Cento nodi costano quanto dieci. Il motivo è
@@ -1931,7 +1931,7 @@ sola colonna di pesi} qualunque sia la larghezza del vettore.
 Allargare i layer \emph{nascosti}, invece:
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_width_latenza.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_width_latenza.pdf}
 \end{center}
 
 \begin{lezione}
@@ -1945,7 +1945,7 @@ pipeline, perché ogni neurone in più sono pesi in più letti per ogni pacchett
 \section{I pesi contano, ma solo per una delle tre}
 
 \begin{center}
-\includegraphics[width=0.92\textwidth]{../result/scaling_sparsity_insns_log.pdf}
+\includegraphics[width=0.92\textwidth]{../results/scaling_sparsity_insns_log.pdf}
 \end{center}
 
 Stessa identica forma in tutti e cinque i punti: cambia solo \emph{quanti} pesi
@@ -2025,577 +2025,503 @@ del verificatore.
 \end{itemize}
 
 % ==================================================================
-\chapter{Il tempo fra arrivo e partenza}
+\chapter{Misurare: tre banchi, tre domande}
+% ==================================================================
 
-\section{La domanda}
+\section{La domanda, e perché non è una sola}
 
-Fin qui ogni numero di velocità di questo quaderno viene dalla stessa misura:
-si chiede al kernel di eseguire il programma centomila volte su un pacchetto
-che sta in memoria, e si divide il tempo. È una misura onesta e ripetibile, ma
-risponde a una domanda sola: \emph{quanto dura il programma}.
+Fino a qui il costo di una pipeline è stato contato in istruzioni eBPF. È una
+misura onesta ma statica: dice quanto è grande il programma caricato, non
+quanto tempo impiega un pacchetto ad attraversarlo. E le due cose divergono,
+perché Pipeline~1 srotola uno \emph{switch} da 52 casi di cui ne esegue
+esattamente uno.
 
-La domanda che restava aperta è un'altra: se un generatore manda pacchetti veri
-su un collegamento vero, e dall'altra parte c'è il nodo con la pipeline
-attaccata, \textbf{quanti pacchetti al secondo regge}, quanti se ne perdono, e
-quanto tempo passa fra quando il pacchetto arriva e quando riparte.
+La domanda vera è: \emph{quanto costa, in nanosecondi, far passare un
+pacchetto attraverso l'inferenza?} E subito dietro ne arriva una seconda, che
+sembra la stessa e non lo è: \emph{quanti pacchetti al secondo regge il nodo?}
 
-Quest'ultima è la grandezza che conta davvero. Non è la durata del programma:
-è la durata del programma \emph{più} tutto quello che sta intorno.
+Sono due domande diverse e vanno misurate da banchi diversi. Confonderle è
+l'errore che questo capitolo racconta per primo, perché lo abbiamo commesso.
 
-\section{Due banchi che misurano due cose diverse}
-
-Questa distinzione ha creato più confusione di qualunque altra cosa in questo
-lavoro, quindi vale la pena spiegarla senza tecnicismi.
-
-\begin{prima}[L'analogia]
-\texttt{test\_suite} cronometra un atleta sul tapis roulant, in laboratorio.
-Ottieni la sua velocità pura, misurata benissimo, sempre uguale.
-
-\texttt{bench\_throughput} lo cronometra su una strada vera, con il traffico.
-Scopri quanto ci mette davvero ad arrivare --- ma una parte di quel tempo è la
-strada, non l'atleta.
-
-Servono \textbf{tutte e due}. La prima dice quale pipeline è più veloce. La
-seconda dice se il sistema regge. Nessuna delle due risponde alla domanda
-dell'altra.
-\end{prima}
-
-In concreto:
+\section{Tre banchi, e che cosa misura ciascuno}
 
 \begin{center}
 \small
-\begin{tabular}{@{}p{4.2cm}p{4.6cm}p{4.6cm}@{}}
+\begin{tabular}{@{}p{3.3cm}p{5.3cm}p{5.3cm}@{}}
 \toprule
- & \textbf{test\_suite} & \textbf{bench\_throughput} \\
+\textbf{Banco} & \textbf{Che cosa attraversa il pacchetto} &
+\textbf{A che domanda risponde} \\
 \midrule
-Chi fabbrica i pacchetti & nessuno: ce n'è uno solo, in memoria, riusato &
-  un generatore di traffico (\texttt{pktgen}), pacchetti veri \\[3pt]
-Dove gira il programma & dentro una chiamata di sistema &
-  sull'interfaccia, dove girerebbe davvero \\[3pt]
-Il pacchetto viene consegnato? & no, non esce mai &
-  sì, attraversa il collegamento ed esce dall'altra parte \\[3pt]
-Che cosa finisce nella cifra & solo il programma &
-  programma $+$ driver $+$ code $+$ schedulatore \\[3pt]
-Cifra tipica (baseline) & 29 ns, cioè 34,5 Mpps &
-  1\,142 ns, 0,88 Mpps misurati \\[3pt]
-Serve per & confrontare le pipeline fra loro &
-  dire se il sistema sta in piedi sotto carico \\[3pt]
-Riproducibile? & sì, è deterministico &
-  la latenza sì; la portata solo come \emph{differenza}
-  rispetto alla baseline (\S\ref{sec:confronto-mpps}) \\
+\texttt{test\_suite}\newline{\footnotesize(\texttt{BPF\_PROG\_TEST\_RUN})} &
+Solo il programma eBPF, invocato dal kernel in un ciclo. Nessuna scheda,
+nessuna coda, nessun NAPI. &
+Quanto costa il programma \emph{isolato}, nel modo più pulito che il kernel
+permetta. \\
+\addlinespace
+\texttt{bench\_throughput}\newline{\footnotesize(\texttt{-{}-mode rates})} &
+Il percorso vero: \texttt{pktgen} $\to$ veth $\to$ XDP nativo $\to$ inferenza
+$\to$ \texttt{bpf\_redirect} $\to$ veth $\to$ NAPI. &
+Quanto costa sotto traffico reale, e quanto di quel costo è la pipeline e
+quanto il trasporto. \\
+\addlinespace
+\texttt{bench\_throughput}\newline{\footnotesize(\texttt{-{}-mode generator})} &
+Lo stesso percorso \textbf{senza nessuna pipeline}: solo un contatore che
+scarta. &
+Qual è il tetto della via di ricezione, cioè quanto reggerebbe il banco anche
+se l'inferenza costasse zero. \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \begin{lezione}
-I 34,5 Mpps della baseline non sono un throughput: sono il reciproco della
-durata di una funzione. Un pacchetto che non viene mai consegnato non ha un
-throughput.
+I tre risultati vanno tenuti concettualmente separati e non vanno moltiplicati
+fra loro. In particolare \textbf{latenza $\times$ pacchetti al secondo non è il
+throughput reale}, e un limite osservato nella portata non è, di per sé, un
+limite del modello.
 \end{lezione}
 
-Il rapporto fra le due colonne --- $29$ ns contro $1\,142$ --- non è un difetto
-del secondo banco. È la risposta alla domanda \emph{quanto costa la rete intorno
-al programma}, e su questa macchina la risposta è: quasi quaranta volte il
-programma stesso. Il conto, e il motivo per cui il confronto fra pipeline
-sopravvive lo stesso, stanno in \S\ref{sec:confronto-mpps}.
+% ------------------------------------------------------------------
+\section{Il problema: un numero solo teneva insieme due costi}
 
-\section{L'architettura del banco, e che cosa si misura dove}
+La prima versione del banco sul percorso reale misurava una cosa sola: il tempo
+fra l'ingresso del programma XDP e la sua uscita, e lo chiamava «latenza della
+pipeline». Non lo era. Dentro quella cifra c'erano due costi che non si
+sommano per caso ma per costruzione:
 
-Prima dei numeri conviene avere in testa il disegno, perché ogni cifra di questo
-capitolo è presa in un punto preciso di questa catena.
-
-\begin{center}
-\begin{tikzpicture}[
-  node distance=6mm,
-  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=11mm,
-              minimum width=24mm,inner sep=4pt,font=\small,align=center},
-  dut/.style={box,fill=white,draw=accent,thick,minimum width=30mm},
-  arr/.style={-{Stealth[length=5pt]},draw=soft,thick},
-  cpu/.style={font=\scriptsize\itshape,color=soft},
-  pt/.style={font=\scriptsize\bfseries,color=accent}
-]
-\node[box] (tg) {\texttt{pktgen}\\ generatore};
-\node[dut,right=20mm of tg] (dut) {pipeline XDP\\ inferenza +\\ \texttt{bpf\_redirect}};
-\node[box,right=20mm of dut] (rx) {contatore\\ \texttt{XDP\_DROP}};
-
-\draw[arr] (tg) -- node[above,font=\scriptsize,color=soft]{\texttt{veth}}
-                  node[below,font=\scriptsize,color=soft]{\texttt{ipainp}$\to$\texttt{ipain}} (dut);
-\draw[arr] (dut) -- node[above,font=\scriptsize,color=soft]{\texttt{veth}}
-                   node[below,font=\scriptsize,color=soft]{\texttt{ipa0}$\to$\texttt{ipa0p}} (rx);
-
-\node[cpu,above=2mm of tg] {CPU 1};
-\node[cpu,above=2mm of dut] {CPU 2--3};
-
-\node[pt,below=9mm of tg] (ptx) {TX};
-\node[pt,below=9mm of dut] (phit) {HIT};
-\node[pt,below=9mm of rx] (prx) {RX};
-\draw[densely dotted,draw=soft] (tg) -- (ptx);
-\draw[densely dotted,draw=soft] (dut) -- (phit);
-\draw[densely dotted,draw=soft] (rx) -- (prx);
-\end{tikzpicture}
-\end{center}
-
-Tre soggetti e tre punti di conteggio. I soggetti:
-
-\begin{itemize}
-\item \textbf{Il generatore (TG)} è \texttt{pktgen}, che vive \emph{dentro} il
-      kernel: non è un programma che apre una socket, è un thread del kernel che
-      fabbrica pacchetti e li consegna direttamente al dispositivo. È il motivo
-      per cui arriva a centinaia di migliaia di pacchetti al secondo da un core
-      solo, dove un mittente in spazio utente si fermerebbe molto prima.
-\item \textbf{Il nodo sotto prova (DUT)} è la pipeline eBPF agganciata a XDP
-      sull'interfaccia d'ingresso. Fa l'inferenza, sceglie la classe, e chiama
-      \texttt{bpf\_redirect} verso l'interfaccia d'uscita corrispondente.
-\item \textbf{Il destinatario} è un secondo programma XDP, minuscolo, che
-      incrementa un contatore e restituisce \texttt{XDP\_DROP}. Conta senza
-      consegnare, così il numero misura la consegna del datapath e non il costo
-      di passare il pacchetto allo stack di rete.
+\begin{itemize}[leftmargin=1.2em]
+  \item l'inferenza vera e propria --- lettura delle feature, moltiplicazioni,
+        argmax, scelta della classe;
+  \item il \emph{trasporto} --- il \texttt{bpf\_redirect}, la consegna all'altro
+        capo del veth, il risveglio di NAPI dall'altra parte.
 \end{itemize}
 
-I tre punti di conteggio, e perché non basta uno solo:
+Il secondo non dipende dalla pipeline: è lo stesso per tutte e cinque. Ma
+essendo dell'ordine dei 200~ns, sommato a una baseline da 27~ns la copriva
+quasi del tutto. La tabella che ne usciva diceva «baseline 202~ns», e chiunque
+la leggesse concludeva che il \emph{parsing} di un pacchetto costa 202~ns. Non
+è vero: ne costa 27.
+
+\section{La soluzione: tre marcature temporali}
+
+Tre chiamate a \texttt{bpf\_ktime\_get\_ns()}, in celle per-CPU, in tre punti
+precisi del datapath:
 
 \begin{center}
 \small
 \begin{tabular}{@{}llp{7.6cm}@{}}
 \toprule
-\textbf{Punto} & \textbf{Chi lo conta} & \textbf{Che cosa dice} \\
+\textbf{Marca} & \textbf{Dove} & \textbf{Che cosa delimita} \\
 \midrule
-TX  & \texttt{pktgen} & quanti pacchetti sono stati \emph{accettati} dal
-      dispositivo. I rifiutati a coda piena finiscono in un contatore separato
-      (\texttt{errors}) e sono carico offerto, non consegnato. \\
-HIT & la pipeline    & quanti pacchetti il programma ha davvero elaborato.
-      \textbf{TX $-$ HIT} sono quelli entrati e mai arrivati all'inferenza. \\
-RX  & il contatore   & quanti sono arrivati a destinazione.
-      \textbf{HIT $-$ RX} sono quelli elaborati e non usciti: \texttt{redirect}
-      fallito, oppure la classe scelta era \textsc{drop}. \\
+$T_1$ & ingresso del dispatcher & prima che il pacchetto sia guardato \\
+$T_2$ & subito prima di \texttt{bpf\_redirect} & dopo parse, inferenza e scelta
+        della classe \\
+$T_3$ & ingresso del contatore, dall'altra parte & dopo redirect, veth e NAPI \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Un solo numero di ``perdita'' confonderebbe tre cause che chiedono tre rimedi
-diversi. In tutte le misure di questo capitolo \textbf{HIT $-$ RX vale zero e
-TX $=$ HIT}: la pipeline non ha mai perso un pacchetto che le sia stato
-consegnato. Tutto ciò che manca all'appello è stato \emph{rifiutato all'ingresso}
-dal \texttt{veth}, cioè è controspinta --- la prova che il nodo è saturo, non
-che sbagli.
-
-\begin{prima}[Dove finisce il tempo, e dove si misura]
-La latenza è marcata \textbf{dentro} la pipeline: un timestamp quando il
-pacchetto entra nel programma, uno quando il programma d'uscita lo vede. Copre
-quindi inferenza \emph{più} il tragitto fino all'altra interfaccia, non il
-tempo che il pacchetto passa in coda prima di essere elaborato.
-
-La portata, invece, si misura \textbf{agli estremi}: pacchetti contati
-all'uscita, diviso la durata della finestra. Dentro quel numero c'è tutto,
-compreso ciò che non è la pipeline.
-\end{prima}
-
-
-\section{Il banco}
-
-Generatore e nodo sotto prova stanno sulla stessa macchina virtuale, collegati
-da una coppia \texttt{veth}. Non è l'ideale --- su un banco vero sarebbero due
-macchine e un cavo --- ma è quello che c'è, e le sue conseguenze sono note e
-dichiarate:
-
-\begin{itemize}
-\item \texttt{veth} rifiuta \texttt{clone\_skb} e \texttt{burst}, le due
-      manopole con cui \texttt{pktgen} normalmente riusa il buffer: consegna
-      l'\texttt{skb} alla ricezione del peer, dove XDP lo riscrive, quindi non
-      può condividerlo. Si paga un'allocazione per pacchetto.
-\item XDP pretende 256 byte di spazio davanti al pacchetto
-      (\texttt{XDP\_PACKET\_HEADROOM}); gli \texttt{skb} di \texttt{pktgen} ne
-      hanno 64 (\texttt{NET\_SKB\_PAD}). Quindi il kernel \textbf{copia ogni
-      pacchetto} prima di eseguire il programma.
-\item Senza precauzioni, generatore e nodo finiscono sullo stesso core e si
-      contendono la CPU: si misura lo schedulatore. La NAPI in modalità
-      thread --- si accende scrivendo \texttt{1} in
-      \texttt{/sys/class/net/<dev>/threaded} --- sposta la ricezione in un
-      thread del kernel che si può fissare su un core diverso. È l'unico modo, su
-      questa macchina, per separare le due metà del banco.
-\end{itemize}
-
-Una trappola che è costata tempo: la NAPI in modalità thread va abilitata
-\emph{dopo} aver attaccato il primo programma XDP. \texttt{veth} usa la NAPI
-solo quando un programma è attaccato, quindi prima non c'è niente da mettere in
-un thread, e la richiesta viene rifiutata con \texttt{Operation not supported}.
-Per lo stesso motivo fra una pipeline e l'altra il programma si
-\textbf{sostituisce}, non si stacca: staccarlo smonterebbe la NAPI e con lei la
-modalità thread.
-
-\section{Tre cose che rendevano il confronto ingiusto}
-
-La prima versione del banco misurava una pipeline alla volta, da capo. Il
-risultato è stato una riga in cui la \textbf{baseline} --- che non fa
-inferenza, cioè fa strettamente meno lavoro di tutte le altre --- risultava il
-26\% più lenta di una pipeline che ne fa di più. Un risultato del genere non è
-un dato: è la prova che il banco stava misurando altro.
-
-Le cause erano tre, e ognuna bastava da sola:
-
-\begin{enumerate}
-\item \textbf{Ogni metodo ricostruiva il fabric.} Interfacce nuove, indici
-      nuovi, e lo stato del generatore che non sopravvive al giro.
-\item \textbf{Ogni metodo chiamava il compilatore subito prima di misurare.}
-      Le pipeline generiche bruciano secondi di CPU che la baseline non brucia,
-      e la misura partiva su una macchina in stati diversi.
-\item \textbf{I metodi giravano in sequenza, una volta ciascuno.} Qualunque
-      deriva della macchina --- frequenza, pagine, un processo che si sveglia
-      --- si mappava sull'\emph{ordine} dei metodi, premiando chi capitava per
-      primo.
-\end{enumerate}
-
-La correzione, nella stessa struttura:
-
-\begin{enumerate}
-\item \textbf{Un fabric solo}, costruito una volta e usato da tutti.
-\item \textbf{Prima si compila e si carica tutto}, poi si misura. Durante le
-      misure nessun compilatore gira.
-\item \textbf{Si misura a giri}: in ogni giro tutti i metodi, e di ogni metodo
-      si tiene la mediana fra i giri. Una deriva colpisce allora tutti allo
-      stesso modo.
-\end{enumerate}
-
-E poi un controllo che il banco fa su sé stesso, perché una misura che si
-autocertifica vale più di una che va interpretata:
-
-\begin{prima}[Il controllo di validità]
-La baseline deve risultare la più veloce, entro il 10\%. Non è un'ipotesi da
-verificare: è una \textbf{condizione logica}. La baseline esegue un
-sottoinsieme stretto del lavoro di ogni altra pipeline, quindi non può
-consegnare meno. Se il banco dice il contrario, il banco ha torto, non la
-pipeline --- e il run va buttato.
-
-La tolleranza del 10\% c'è perché due pipeline entrambe limitate dal generatore
-non sono distinguibili, e un'inversione dentro il rumore non è contaminazione:
-è l'informazione che il throughput non le separa.
-\end{prima}
-
-\section{Misurare arrivo $\to$ partenza}
-
-Il tempo che interessa è quello fra l'ingresso del pacchetto e il momento in cui
-riparte. Si prende con due marcature temporali dentro il programma, prima e dopo
-il blocco che decide, e si accumula la differenza in un istogramma.
-
-Due dettagli non ovvi, entrambi scoperti sbagliando:
-
-\begin{itemize}
-\item \textbf{Il contatore deve stare nello stesso oggetto BPF della pipeline.}
-      Due oggetti separati non possono condividere una mappa senza appoggiarla
-      al filesystem BPF. Quindi lo strumento viene \emph{iniettato nel sorgente}
-      della pipeline prima di compilarla, con le dichiarazioni inserite prima
-      del blocco che le usa --- al primo tentativo erano in fondo, e non
-      compilava.
-\item \textbf{L'istogramma deve essere logaritmico.} Il primo tentativo aveva
-      256 celle da 16 ns, scelte per distinguere 228 da 243 da 267 ns: le
-      differenze fra pipeline sono di quell'ordine. Sbagliato per la ragione
-      opposta --- quella finestra copre 4 $\mu$s, e sotto carico la coda sta
-      molto più in alto, quindi i percentili venivano riportati come
-      ``$>4\,\mu$s'', cioè non riportati. Con \texttt{bpf\_log2l} e 40 celle si
-      copre tutto; la distinzione fine fra pipeline sta nel \textbf{minimo}, che
-      è esatto e non passa dall'istogramma.
-\end{itemize}
-
-\section{Il risultato: la latenza}
-
-Cinque pipeline, tre giri, frame da 64 byte, NAPI in thread attiva, controllo di
-validità superato.
+Da cui tre grandezze, non più una:
 
 \begin{center}
 \small
-\begin{tabular}{@{}lrrr@{}}
+\begin{tabular}{@{}ll@{}}
 \toprule
-\textbf{Pipeline} & \textbf{minimo (ns)} & \textbf{sopra baseline} &
-\textbf{fra i tre giri} \\
-\midrule
-baseline   & 202 & ---            & 202 / 206 / 202 \\
-p1\_static & 234 & $+32$          & 234 / 236 / 234 \\
-hardcoded  & 256 & $+54$          & 254 / 259 / 256 \\
-template   & 400 & $+198$         & 404 / 400 / 399 \\
-modular    & 492 & $+290$         & 487 / 493 / 492 \\
+$T_2 - T_1$ & il costo della \textbf{pipeline}: è questo il numero del modello \\
+$T_3 - T_2$ & il costo del \textbf{trasporto}: redirect, veth, NAPI \\
+$T_3 - T_1$ & la latenza \textbf{da arrivo a partenza} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-L'ordine è quello atteso e la stabilità è la cosa notevole: \textbf{pochi
-nanosecondi di variazione} su misure ripetute a distanza di minuti. Con
-generatore e nodo su core separati, la differenza è attribuibile alla pipeline
-e non alla macchina.
+Che la separazione funzioni si può verificare senza fidarsi: il redirect è
+sincrono e avviene sullo stesso core, quindi una cella per-CPU sopravvive alla
+catena di \emph{tail call} e al redirect stesso. E il controllo decisivo è che
+$T_3 - T_2$ \emph{non deve} dipendere dalla pipeline. Non ne dipende.
 
-Si legge anche il costo della genericità in nanosecondi, non più solo in
-istruzioni: \textbf{leggere il descrittore a runtime costa circa 200 ns per
-pacchetto}, e passare ai salti fra programmi ne costa altri 90.
+\section{Il risultato: la pipeline costa da 27 a 271 nanosecondi}
+\label{sec:confronto-mpps}
 
-\section{Il risultato che non regge: la portata}
-
-La stessa tabella riporta anche i pacchetti al secondo, e quei numeri
-\textbf{non sono un risultato}. La dispersione fra i tre giri, a pieno rate:
+Cinque pipeline, sei rate da 0,5 a 3,0 Mpps, tre giri, frame da 64~byte,
+generatore su due core e nodo su un terzo, NAPI in thread. Mediana fra i giri:
 
 \begin{center}
 \small
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-\textbf{Pipeline} & \textbf{giro 1} & \textbf{giro 2} & \textbf{giro 3} &
-\textbf{dispersione} \\
+\textbf{Pipeline} & \textbf{$T_2-T_1$} & \textbf{sopra baseline} &
+\textbf{$T_3-T_2$} & \textbf{$T_3-T_1$} \\
 \midrule
-p1\_static & 2,18 M & 2,07 M & 2,04 M & $\pm 7\%$ \\
-modular    & 1,24 M & 1,42 M & 1,21 M & $\pm 17\%$ \\
-baseline   & 1,71 M & 2,10 M & 2,47 M & $\pm 44\%$ \\
-template   & 1,60 M & 1,65 M & 1,02 M & $\pm 62\%$ \\
-hardcoded  & 2,78 M & 1,17 M & 1,46 M & $\mathbf{\pm 137\%}$ \\
+baseline    &  27 ns & ---     & 195 ns & 224 ns \\
+p1\_static  &  50 ns & $+23$   & 213 ns & 268 ns \\
+hardcoded   &  57 ns & $+30$   & 212 ns & 275 ns \\
+template    & 183 ns & $+156$  & 210 ns & 405 ns \\
+modular     & 271 ns & $+244$  & 219 ns & 509 ns \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-La conseguenza si vede a occhio nel riepilogo: la mediana di \texttt{hardcoded}
-(1,46 M) finisce \emph{sotto} quella di \texttt{template} (1,60 M), quando
-\texttt{hardcoded} fa molto meno lavoro. Non è un'inversione: è la mediana di
-tre misure che variano di 2,4 volte.
+Due cose vanno dette su questa tabella.
 
-Il banco adesso lo dice da solo. Ogni riga porta la dispersione fra i giri, e
-oltre il 25\% la riga viene marcata e il controllo di validità fallisce, con un
-messaggio che distingue le due metà: \emph{la portata di queste righe non è un
-risultato; la latenza delle stesse righe è un'altra misura, con un'altra
-dispersione}.
+La prima è la \textbf{stabilità}. Questi valori si sono riprodotti identici su
+quattro sweep indipendenti, a giorni diversi, con scarti di uno o due
+nanosecondi. È la misura più stabile dell'intero progetto. E sono piatti sul
+rate: \texttt{baseline} fa 27~ns a 0,5~Mpps e 27~ns a 3,0~Mpps. Il costo della
+pipeline non degrada sotto carico nell'intervallo esplorato.
+
+La seconda è che la colonna $T_3-T_2$ sta fra 195 e 219~ns \emph{per tutte e
+cinque}, senza correlazione con il lavoro che la pipeline fa. È la prova che le
+due metà misurano cose diverse: se la separazione fosse mal fatta, il costo
+dell'inferenza colerebbe nel trasporto.
+
+\begin{prima}[Una cifra che era gonfiata]
+La versione precedente di questo capitolo concludeva che «leggere il
+descrittore a runtime costa circa 200~ns per pacchetto». Quel numero veniva da
+una differenza fra due latenze \emph{da arrivo a partenza} ($400-202$), ognuna
+delle quali conteneva il proprio trasporto. Con $T_2-T_1$ la stessa differenza
+è \textbf{156~ns} ($183-27$). Il costo della genericità di Pipeline~2 resta
+grande, ma era sovrastimato del 27\%.
+\end{prima}
+
+Passare dal descrittore letto a runtime alla catena di \emph{tail call} di
+Pipeline~3 costa altri 88~ns ($271-183$).
+
+% ------------------------------------------------------------------
+\section{Il problema della portata: il generatore non consegnava}
+
+La stessa campagna riporta anche i pacchetti al secondo, e per lungo tempo
+quella colonna è stata letta come «throughput della pipeline». Non lo è, e
+adesso il banco lo dice da solo.
+
+Lo sweep a sei rate ha dato \textbf{perdita dello 0,000\% ovunque}: nessuna
+pipeline ha perso un pacchetto, nemmeno al rate più alto. Ma la
+\emph{resa} --- il rapporto fra quello che si è chiesto a \texttt{pktgen} e
+quello che ha davvero consegnato --- non ha mai superato il 68\%, e al rate più
+basso era 65\%:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+\textbf{chiesto} & \textbf{consegnato} & \textbf{resa} & \textbf{perdita} \\
+\midrule
+0,50 Mpps & 0,33 Mpps & 65\% & 0,000\% \\
+1,00 Mpps & 0,64 Mpps & 64\% & 0,000\% \\
+2,00 Mpps & 1,00 Mpps & 50\% & 0,000\% \\
+3,00 Mpps & 1,27 Mpps & 42\% & 0,000\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\emph{(riga \texttt{baseline}; le altre quattro hanno lo stesso andamento.)}
+
+Una resa bassa non è perdita del nodo: è carico che non è mai partito. La causa
+si legge in un'altra colonna, i \emph{respinti}: il \texttt{ptr\_ring} del veth
+è fissato a \texttt{VETH\_RING\_SIZE} descrittori e \texttt{veth\_xmit}
+risponde \texttt{NET\_XMIT\_DROP} appena è pieno. \texttt{pktgen} ritenta, il
+tempo di parete si allunga, e il rate consegnato crolla.
 
 \begin{lezione}
-Sullo stesso identico run, la latenza minima di una pipeline varia dell'1\% fra
-i giri e la sua portata del 137\%. Sono due misure con due affidabilità diverse,
-e vanno riportate come tali --- non lasciate in una tabella che il lettore
-prende per buona tutta insieme.
+Con perdita nulla ovunque, il «throughput sostenibile» di quello sweep non è
+una capacità del nodo: è un \textbf{limite inferiore} fissato dal generatore.
+Il banco ora lo stampa come tale, con due avvertimenti espliciti, e il numero
+va citato come $\geq$.
 \end{lezione}
 
-\section{Un tentativo che non ha funzionato}
+\section{La soluzione: un test di controllo senza pipeline}
 
-Il conto che ha fatto partire il tentativo è questo: a circa 550 kpps per core
-il costo per pacchetto è $\approx 1800$ ns, e l'inferenza ne spiega 60. Tutto il
-resto non è il datapath: è il \emph{modo} in cui i pacchetti vengono fabbricati
---- un'allocazione per pacchetto più una copia per l'headroom.
+Per sapere se a fermarsi fosse il nodo o il banco serviva un termine di
+paragone: lo stesso percorso, lo stesso generatore, le stesse code, ma
+\textbf{senza nessuna inferenza} --- solo un programma XDP che conta e scarta.
+È la modalità \texttt{-{}-mode generator}.
 
-Esiste una tecnica nota per togliere entrambi: \texttt{BPF\_PROG\_TEST\_RUN} in
-modalità \emph{live frames} (\texttt{BPF\_F\_TEST\_XDP\_LIVE\_FRAMES}, kernel
-$\ge$ 5.18). Il kernel prende i frame da una \texttt{page\_pool}, esegue il
-programma, e se il verdetto è \texttt{XDP\_REDIRECT} li \textbf{trasmette
-davvero}. Niente \texttt{skb}, niente copia. È quello che usa
-\texttt{xdp-trafficgen} per generare a doppia cifra di Mpps da un core solo.
+Cinque giri, sei bersagli da 8 a 25~Mpps:
 
-Implementato e misurato, su kernel 7.0. Il risultato:
+\begin{center}
+\small
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+\textbf{bersaglio} & \textbf{offerti} & \textbf{accettati} &
+\textbf{respinti} & \textbf{perdita} \\
+\midrule
+ 8 Mpps & 4,76 Mpps & 3,15 Mpps & 33\% & 0,00\% \\
+12 Mpps & 5,12 Mpps & 3,39 Mpps & 34\% & 0,00\% \\
+20 Mpps & 5,25 Mpps & 3,40 Mpps & 35\% & 0,00\% \\
+25 Mpps & 5,46 Mpps & 3,74 Mpps & 33\% & 0,00\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il generatore mette stabilmente circa 5~Mpps sul filo. Il veth ne accetta 3,4.
+Un terzo viene rifiutato \emph{all'ingresso}. E di quello che entra non si
+perde niente: \texttt{RX} è identico a \texttt{TX} su tutte e 29 le righe.
+
+\textbf{Il tetto della via di ricezione è 3,7~Mpps}, e non ha niente a che
+vedere con l'inferenza.
+
+\begin{prima}[Perché una coda più grande non servirebbe]
+Il disavanzo fra offerto e accettato è circa 1,7~Mpps e dura per tutta la
+finestra: sono mezzo milione di pacchetti da assorbire. Una coda assorbe
+picchi, non uno squilibrio di rate che persiste. Per ingoiare una finestra sola
+servirebbero mezzo milione di descrittori, e alla fine sarebbe piena comunque.
+La profondità della coda compra latenza, non banda: il throughput stazionario
+lo decide il drenaggio, che qui è un thread NAPI su un core. Ingrandire il ring
+convertirebbe i rifiuti in attesa in coda, gonfiando $T_3-T_2$ e rovinando la
+misura più stabile che abbiamo.
+\end{prima}
+
+Conseguenza: le cinque pipeline, che nello sweep stavano fra 1,1 e 1,4~Mpps
+consegnati con perdita nulla, avevano ancora circa $2\times$ di margine prima di
+toccare il tetto del banco. Il loro ginocchio non è mai stato raggiunto.
+
+\begin{prima}[Un controllo incrociato che torna]
+Il budget per pacchetto del tetto di ricezione (3,41~Mpps $=$ 293~ns) e quello
+della \texttt{baseline} sotto traffico (1,82~Mpps $=$ 549~ns) differiscono di
+256~ns. La somma $T_2-T_1$ più $T_3-T_2$ della \texttt{baseline}, misurata in
+modo del tutto indipendente, vale 224~ns. Le due strade concordano entro il
+14\%.
+\end{prima}
+
+% ------------------------------------------------------------------
+\section{La campagna sulle architetture}
+
+I numeri fin qui riguardano \emph{un} modello, il 65-4-4-7 depositato. Ma la
+domanda che interessa a chi deve scegliere un'architettura è un'altra:
+\emph{come cresce il costo quando il modello cresce?}
+
+Per rispondere servono più modelli misurati con la stessa metodologia, ed è la
+campagna: quattro assi, un solo parametro che si muove per asse, tutti dentro
+\texttt{BPF\_PROG\_TEST\_RUN} con il minimo su sette prove.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{7.1cm}@{}}
+\toprule
+\textbf{Asse} & \textbf{Valori} & \textbf{Che cosa muove} \\
+\midrule
+\texttt{iv\_dense}   & $n_{in}$ 5, 9, 13, 17 &
+  colonne d'ingresso tutte \emph{dense}: ognuna è letta da una mappa e
+  moltiplicata \\
+\texttt{iv\_onehot}  & $n_{in}$ 16, 32, 65 &
+  colonne d'ingresso in una \emph{one-hot} \\
+\texttt{width\_camp} & 65-$v$-$v$-7, $v$ 4, 8, 16, 32 &
+  neuroni per strato nascosto \\
+\texttt{depth\_camp} & 65-8$\ldots$8-7, 1--4 strati &
+  profondità, a larghezza fissa 8 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{Due muri, entrambi dichiarati}
+
+Due punti della campagna non si possono misurare, e il banco lo dice invece di
+inventare un numero.
+
+\textbf{Larghezza 16 e 32 su Pipeline 2 e 3.} I soffitti sono compilati:
+\texttt{T2\_MAX\_H1}, \texttt{T2\_MAX\_H2}, \texttt{ML1\_MAX\_H1} e
+\texttt{MLH\_MAX\_H} valgono tutti 8. E Pipeline~3 non rifiuta il caricamento:
+risponde \texttt{XDP\_PASS} a runtime. Una cella a larghezza 16 \emph{si
+caricherebbe, girerebbe, e restituirebbe una latenza} --- di un programma che
+non calcola niente. È il modo peggiore di rompersi, perché il numero è
+plausibile. Il banco controlla i soffitti \emph{prima} di compilare e segna la
+cella \textsc{rifiutato} senza misurarla.
+
+\textbf{Larghezza 32 su Pipeline 1.} Qui il soffitto non c'è, ma il programma
+srotolato sfonda lo stack eBPF da 512~byte e il backend LLVM di BCC aborta il
+\emph{processo}. Ogni cella gira nel proprio sottoprocesso apposta: la cella
+esce \textsc{crash} e lo sweep continua. Larghezza 16 invece si misura, ed è un
+punto che Pipeline~2 e 3 non possono avere.
+
+% ------------------------------------------------------------------
+\section{Il problema: le MAC nominali non predicono la latenza}
+
+Il modo naturale di mettere in relazione complessità e tempo è contare le
+moltiplicazioni-accumulo dalla forma del modello: $n_{in} \times h_1$ per il
+primo strato, e così via. Fatto così, non funziona.
+
+Retta ai minimi quadrati sui quattro assi insieme, con le MAC nominali sull'asse
+delle ascisse:
 
 \begin{center}
 \small
 \begin{tabular}{@{}lrr@{}}
 \toprule
- & \textbf{1 thread} & \textbf{4 thread} \\
+\textbf{Pipeline} & \textbf{ns per MAC nominale} & \textbf{$r^2$} \\
 \midrule
-frame chiesti   & 2\,000\,000 & 2\,000\,000 \\
-scartati dal redirect & 813\,189 & 1\,988\,176 \\
-partiti         & 1\,186\,811 & 11\,824 \\
-arrivati        & 1\,186\,816 & 3\,184 \\
-\midrule
-\textbf{consegnati} & \textbf{1,44 Mpps} & \textbf{0,05 Mpps} \\
+p1\_static & 0,054 & 0,69 \\
+hardcoded  & 0,061 & 0,75 \\
+template   & 0,084 & 0,29 \\
+modular    & 0,083 & \textbf{0,11} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Contro i \textbf{2,10 Mpps} che lo stesso banco consegna con \texttt{pktgen}. Il
-generatore ``veloce'' consegna \textbf{meno} di quello lento, e con quattro
-thread crolla di trenta volte.
+Per Pipeline~3 il modello spiega l'11\% della varianza: i punti sono una nuvola.
 
-La spiegazione sta nella colonna degli scartati. I frame non muoiono nel nodo:
-muoiono al \texttt{redirect}, perché la coda della \texttt{veth} è piena. Il
-generatore in modalità live non ha alcun freno --- infila frame in un anello a
-ritmo di syscall, e nessuno gli dice di rallentare --- mentre dall'altra parte
-un solo thread NAPI li drena. Con quattro thread che spingono nello stesso
-anello, il 99,4\% muore prima di partire.
+Il sintomo più chiaro sta sull'asse \texttt{iv\_onehot}, dove il vettore
+d'ingresso quadruplica:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+$n_{in}$ & \textbf{pesi} & \textbf{p1\_static} & \textbf{hardcoded} &
+\textbf{template} & \textbf{modular} \\
+\midrule
+16 & 271 & 48 ns & 47 ns & 141 ns & 288 ns \\
+32 & 399 & 48 ns & 46 ns & 151 ns & 278 ns \\
+65 & 663 & 52 ns & 48 ns & 146 ns & 283 ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$n_{in}$ per quattro, pesi per 2,4, e la latenza \textbf{non si muove}. Le
+istruzioni di Pipeline~1 intanto salgono da 1146 a 1702: la taglia statica
+cresce, il percorso eseguito no.
+
+\section{La soluzione: contare le MAC che vengono eseguite}
+
+La causa è nel datapath, ed è una riga sola. Il ramo che tratta una feature
+one-hot è questo:
+
+\begin{lstlisting}[language=C]
+} else if (code == FEAT_INGRESS_IF) {
+    if (_raw_iface >= 1 && _raw_iface <= sz) {
+        __u32 c = coff + (_raw_iface - 1);
+        for (int j = 0; j < ML1_MAX_H1; j++)
+            out[j] += LW_W(LW, woff + j * n_in + c);
+    }
+}
+\end{lstlisting}
+
+Una one-hot occupa \texttt{sz} colonne nella matrice dei pesi, ma nel datapath
+ne attiva \emph{una}: il costo è $h_1$ addizioni, e non dipende da
+\texttt{sz}. Contarla come $sz \times h_1$ moltiplicazioni sovrastima, e
+sovrastima di quanto dipende da quanta one-hot c'è nell'ingresso --- cioè
+cambia da asse ad asse. Ecco perché i quattro assi non cadevano sulla stessa
+retta.
+
+Il banco calcola quindi due colonne: \texttt{macs}, nominali, e
+\texttt{macs\_eff}, che conta le one-hot per quello che eseguono. Con la
+seconda sull'asse delle ascisse:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{\textbf{MAC eseguite}} &
+  \multicolumn{2}{c}{\textbf{MAC nominali}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+\textbf{Pipeline} & \textbf{ns/MAC} & \textbf{$r^2$} &
+\textbf{ns/MAC} & \textbf{$r^2$} \\
+\midrule
+p1\_static & 0,207 & \textbf{0,97} & 0,054 & 0,69 \\
+hardcoded  & 0,224 & \textbf{0,95} & 0,061 & 0,75 \\
+template   & 0,485 & 0,74          & 0,084 & 0,29 \\
+modular    & 0,874 & \textbf{0,90} & 0,083 & 0,11 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Per Pipeline~3 si passa da $r^2 = 0{,}11$ a $r^2 = 0{,}90$. Quattro assi
+costruiti in modi diversi collassano sulla stessa retta, una per pipeline.
 
 \begin{lezione}
-Il collo di bottiglia non era l'allocazione degli \texttt{skb}: era il lato
-\emph{ricezione} della \texttt{veth} su un core solo, e nessun generatore lo
-sposta. Rendere il produttore più veloce di un consumatore che non può
-accelerare non produce throughput: produce scarti.
+\textbf{Il costo per MAC eseguita è una proprietà misurabile della pipeline}:
+circa 0,21~ns quando i pesi sono compilati come letterali, circa 0,87~ns quando
+vengono letti da una mappa. Un fattore $4\times$, ed è il prezzo della
+genericità espresso in una costante invece che in un aneddoto.
 \end{lezione}
 
-Il codice è stato rimosso. Quello che resta è il numero: \textbf{su questo banco
-il tetto è $\approx$ 1,4--2,1 Mpps, ed è una proprietà del collegamento
-virtuale, non di IPA.} È anche la ragione per cui i 34,5 Mpps stimati dalla
-durata del programma non saranno mai misurabili qui: mancherebbe un tetto di
-oltre quindici volte, e il tetto non è il programma.
+Il pavimento della \texttt{baseline}, che di MAC ne esegue zero, sta fra 8 e
+13~ns: è il costo del framework XDP che ogni pipeline paga prima di
+moltiplicare qualunque cosa.
 
-\subsection*{La cosa utile venuta fuori per sbaglio}
-
-Il generatore a frame XDP costruisce il pacchetto byte per byte, mentre
-\texttt{pktgen} scrive la propria intestazione sopra il primo byte di payload
---- che nel formato IPA è \texttt{model\_id}, da cui il valore 190 che compare
-nei registri. Sono quindi due sorgenti di traffico \textbf{completamente
-diverse}: pacchetti diversi, cammino diverso nel kernel, allocatore diverso.
-
-La latenza minima della baseline misurata con le due:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lr@{}}
-\toprule
-\texttt{pktgen}, skb, copia per headroom & 202 ns \\
-frame XDP da \texttt{page\_pool}, nessuna copia & 201 ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Un nanosecondo di differenza. La misura di latenza \textbf{non dipende da come
-sono fatti i pacchetti}, e questa è la conferma più forte che abbiamo che la
-tabella della latenza misura la pipeline e non il banco. Un esperimento fallito
-ha prodotto il controllo che all'esperimento riuscito mancava.
-
-\section{Le stesse pipeline, quaranta volte più lente}
-\label{sec:confronto-mpps}
-
-Fin qui il quaderno ha riportato due famiglie di numeri senza mai metterle nella
-stessa unità di misura, e questo ha nascosto la cosa più interessante. Adesso
-sono entrambi in \textbf{milioni di pacchetti al secondo}.
-
-A sinistra \texttt{test\_suite}, che esegue il programma centomila volte sullo
-stesso pacchetto in memoria e divide il tempo. A destra il banco con
-\texttt{pktgen}: traffico vero, frame da 512 byte, perdita $0{,}00\%$,
-generatore e nodo sullo stesso core (modalità \emph{softirq}), controllo di
-validità superato.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-\textbf{Pipeline} & \textbf{\texttt{test\_suite}} & \textbf{banco} &
-\textbf{rapporto} \\
-\midrule
-baseline      & 34,48 Mpps & 0,876 Mpps & $39{,}4\times$ \\
-P1 hardcoded  & 13,70 Mpps & 0,810 Mpps & $16{,}9\times$ \\
-P2 template   &  3,82 Mpps & 0,655 Mpps & $5{,}8\times$ \\
-P3 modular    &  2,38 Mpps & 0,574 Mpps & $4{,}1\times$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Quaranta volte, per la baseline. La prima reazione è che una delle due misure
-sia sbagliata. Non lo è nessuna delle due: misurano due cose diverse, e il modo
-per vederlo è girare la tabella in nanosecondi per pacchetto.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-\textbf{Pipeline} & \textbf{\texttt{test\_suite}} & \textbf{banco} &
-\textbf{differenza} \\
-\midrule
-baseline      &  29 ns & 1\,142 ns & $+1\,113$ ns \\
-P1 hardcoded  &  73 ns & 1\,235 ns & $+1\,162$ ns \\
-P2 template   & 262 ns & 1\,526 ns & $+1\,264$ ns \\
-P3 modular    & 421 ns & 1\,743 ns & $+1\,322$ ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\begin{lezione}
-La differenza non è un fattore: è un \textbf{addendo}, e vale fra 1\,113 e
-1\,322 nanosecondi --- varia del 19\% mentre le pipeline variano di quattordici
-volte. Non è rumore e non è un difetto della misura: è il costo di tutto ciò che
-sta \emph{intorno} al programma, ed è quasi lo stesso per chiunque lo attraversi.
-\end{lezione}
-
-Quel migliaio di nanosecondi ha tre voci identificabili, tutte già incontrate:
-
-\begin{enumerate}
-\item \textbf{Un'allocazione per pacchetto.} Su \texttt{veth} il kernel rifiuta
-      \texttt{clone\_skb}: il buffer non si può riusare, perché
-      viene consegnato al peer, dove XDP lo riscrive. \texttt{test\_suite} riusa
-      sempre lo stesso.
-\item \textbf{Una copia per l'headroom.} XDP pretende 256 byte davanti al
-      pacchetto, gli \texttt{skb} di \texttt{pktgen} ne riservano 64: il kernel
-      copia ogni pacchetto prima di eseguire il programma.
-\item \textbf{Il generatore stesso.} In modalità \emph{softirq} la ricezione
-      gira sulla CPU che ha trasmesso, quindi il tempo per pacchetto è
-      \emph{generazione più elaborazione}, non elaborazione soltanto.
-\end{enumerate}
-
-Nessuna delle tre è il datapath. Tutte e tre sparirebbero con due macchine e una
-scheda di rete vera --- che è esattamente il motivo per cui le cifre assolute di
-questo banco non vanno citate come prestazioni del sistema.
-
-\section{Perché il confronto regge lo stesso}
-
-Se l'addendo è comune, allora \emph{sottrarlo} restituisce il costo della sola
-inferenza. È il conto che rende utile un banco altrimenti saturo:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-\textbf{Sopra la baseline} & \textbf{\texttt{test\_suite}} & \textbf{banco} &
-\textbf{rapporto} \\
-\midrule
-P1 hardcoded & $+44$ ns  & $+93$ ns  & $2{,}1\times$ \\
-P2 template  & $+233$ ns & $+385$ ns & $1{,}7\times$ \\
-P3 modular   & $+392$ ns & $+601$ ns & $1{,}5\times$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-L'ordine è identico, le distanze sono dello stesso ordine di grandezza, e i
-rapporti stanno fra $1{,}5$ e $2{,}1$ --- cioè sotto traffico vero l'inferenza
-costa circa il doppio di quanto costi in laboratorio. È un risultato in sé, e ha
-una spiegazione: il ciclo caldo di \texttt{test\_suite} tiene pesi e codice in
-cache e ammortizza i salti fra programmi, mentre sotto traffico continuo ogni
-pacchetto porta con sé pressione di cache. Le pipeline che usano salti e letture
-di mappa --- P2 e P3 --- sono quelle che pagano di più questa differenza, ed è
-coerente con il fatto che il rapporto \emph{scende} al crescere del lavoro: chi
-fa già molto lavoro utile ammortizza meglio l'overhead fisso.
-
-\begin{prima}[Che cosa vuol dire ``saturo'' qui]
-In questo banco il collo di bottiglia non è mai la pipeline. In modalità
-\emph{softirq} il tetto è il generatore, che condivide il core; a core separati
-il tetto è la coda del \texttt{veth}, fissa a 256 descrittori. In entrambi i casi
-il nodo sotto prova \textbf{non arriva a saturare}, e infatti la perdita
-osservata è zero.
-
-Questo toglie un risultato e ne lascia un altro. Toglie la \emph{portata
-massima}: il numero in Mpps è il tetto del banco, non della pipeline, e va
-riportato come limite inferiore. Lascia il \emph{costo per pacchetto}: siccome
-non ci sono code di mezzo, $1/\text{pps}$ è il tempo del percorso completo, e la
-baseline percorre la stessa strada meno l'inferenza. La sottrazione elimina il
-banco e lascia la pipeline.
+\begin{prima}[Un residuo che ha una spiegazione]
+Il residuo medio di Pipeline~3 è più alto sull'asse della profondità (19~ns)
+che sugli altri. È atteso: ogni strato in più è anche una \emph{tail call}, e
+una tail call non è una MAC. Sull'asse delle istruzioni, invece, Pipeline~3 non
+ha nemmeno una pendenza da stimare --- il suo conteggio è 12\,349 su ogni
+cella, perché non ricompila mai, mentre la latenza varia da 218 a 444~ns. Il
+suo costo non sta nella taglia del codice.
 \end{prima}
 
-Le percentuali dicono la stessa cosa da un'altra angolazione. Rispetto alla
-baseline, P3 vale il $6{,}9\%$ sotto \texttt{test\_suite} e il $65{,}5\%$ sul
-banco: l'overhead comune \textbf{comprime} le differenze, e le comprime tanto
-più quanto è grande rispetto al lavoro utile. Per questo un banco così non serve
-a dire ``P3 è quindici volte più lenta della baseline'' --- quella cifra è di
-\texttt{test\_suite} --- ma serve a dire che l'ordine e le distanze in
-nanosecondi si ritrovano anche quando i pacchetti sono veri. Le due misure non
-si contraddicono: una isola il programma, l'altra lo pesa dentro un sistema.
+% ------------------------------------------------------------------
+\section{I due banchi non misurano la stessa cosa}
+
+Resta da chiudere il cerchio. I due banchi a
+\texttt{BPF\_PROG\_TEST\_RUN} misurano lo stesso programma, e il banco sul
+percorso reale misura $T_2-T_1$. Danno lo stesso numero? No, e la differenza
+non è una costante.
+
+Sullo stesso modello 65-4-4-7:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Pipeline} & \textbf{\texttt{test\_suite}} & \textbf{campagna} &
+\textbf{scarto} \\
+\midrule
+baseline   &  23 ns &   9 ns & $-61\%$ \\
+hardcoded  &  49 ns &  37 ns & $-24\%$ \\
+template   & 177 ns & 149 ns & $-16\%$ \\
+modular    & 278 ns & 240 ns & $-14\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La causa è il frame. La campagna riusa un solo pacchetto per centomila
+ripetizioni e \texttt{BPF\_PROG\_TEST\_RUN} non ripristina il buffer fra una e
+l'altra: il datapath decrementa il TTL, che dopo poche decine di ripetizioni
+resta inchiodato a~1, e da lì in poi ogni esecuzione prende il ramo
+\texttt{if (ip->ttl <= 1) return XDP\_PASS}. Quel ramo sta \emph{dopo}
+l'inferenza --- il modello gira lo stesso, ed è il motivo per cui le curve
+scalano correttamente --- ma salta la coda di inoltro: decremento, checksum,
+\texttt{pkt\_stats}, \texttt{cls\_stats}, \texttt{mac\_table},
+\texttt{bpf\_redirect}. \texttt{test\_suite} rinfresca il frame ogni 200
+esecuzioni e quella coda la paga sempre.
 
 \begin{lezione}
-Un banco saturo non è un banco inutile: è un banco in cui vanno citate le
-\emph{differenze} e non i \emph{valori}. La regola pratica che ne è uscita: se
-il collo di bottiglia dichiarato è il generatore o il trasporto, la colonna in
-Mpps si riporta con il ``maggiore o uguale'' e il confronto si fa sulla colonna
-in nanosecondi, dopo aver sottratto la baseline.
+La campagna misura \textbf{l'inferenza}; \texttt{test\_suite} misura
+\textbf{inferenza più inoltro}. Sono due grandezze diverse, non la stessa con
+uno scostamento. Non vanno messe sulla stessa curva, e lo scarto è massimo
+sulla \texttt{baseline} ($-61\%$) proprio perché per lei la coda di inoltro
+\emph{è} quasi tutto il programma.
 \end{lezione}
 
+\begin{prima}[Una validazione che non cercavamo]
+Le istruzioni sullo stesso modello, contate dai due banchi: \texttt{baseline}
+155 e 155, \texttt{template} 14\,985 e 14\,985, \texttt{modular} 12\,349 e
+12\,349. Identiche. L'unica che diverge è \texttt{hardcoded}, 1026 contro 1071,
+e diverge nella direzione giusta: \texttt{test\_suite} usa i pesi veri del
+modello addestrato, la campagna pesi sintetici a sparsità nulla. I pesi veri
+hanno qualche zero, clang cancella quelle moltiplicazioni, 45 istruzioni in
+meno. È lo stesso effetto che l'asse \texttt{sparsity} misura apposta.
+\end{prima}
 
+% ------------------------------------------------------------------
 \section{Che cosa questi numeri non dicono}
 
-\begin{itemize}
-\item \textbf{Non sono prestazioni di sistema.} Generatore e nodo condividono
-      memoria, cache e schedulatore. Su hardware vero le cifre assolute sarebbero
-      altre; i \emph{rapporti} fra pipeline sono la parte che sopravvive.
-\item \textbf{La portata non separa le pipeline veloci.} Baseline, p1\_static e
-      hardcoded sono limitate dal generatore, non da sé stesse. Fra loro
-      il throughput non dice niente: la latenza sì.
-\item \textbf{Il secondo salto conta.} Ogni pacchetto rediretto attraversa
-      un'altra \texttt{veth} e un altro programma XDP --- il contatore in
-      uscita. Su un nodo vero il redirect andrebbe su una scheda di rete. Quel
-      costo sta dentro la cifra ed è dichiarato, non sottratto.
-\item \textbf{Una sola taglia di frame è stata misurata a fondo} (64 byte). Lo
-      sweep su 512 e 1514 è impostato ma non ancora eseguito con il banco equo.
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{Le cifre assolute valgono per questo percorso, non per una
+        NIC.} Generatore, nodo e contatore stanno sulla stessa macchina
+        virtuale; il veth e la copia di \emph{headroom} --- \texttt{pktgen}
+        riserva 64~byte, XDP su veth ne pretende 256 --- restano dentro ogni
+        numero. I \emph{rapporti} fra pipeline sono la parte che sopravvive a
+        un cambio di macchina.
+  \item \textbf{Il throughput assoluto non è misurabile qui.} L'host è un
+        processore ibrido a core prestazionali ed efficienti, e il guest non
+        vede la frequenza. Su quale tipo di core cade il thread del generatore
+        non lo decidiamo noi, e la dispersione fra giri identici arriva a un
+        fattore quattro.
+  \item \textbf{La build strumentata non è quella di produzione.} Le misure di
+        $T_1$, $T_2$, $T_3$ aggiungono due letture dell'orologio e due
+        scritture per pacchetto. Se qualcosa, quindi, $T_2-T_1$ è leggermente
+        gonfiato.
+  \item \textbf{Il ginocchio delle pipeline non è stato trovato.} Con perdita
+        nulla a ogni rate provato, ogni cifra di throughput è un limite
+        inferiore. Per trovarlo servirebbe un generatore che consegni più di
+        quanto la via di ricezione accetti, e su quattro CPU non c'è.
 \end{itemize}
 
 % ==================================================================
@@ -2653,13 +2579,16 @@ in nanosecondi, dopo aver sottratto la baseline.
       tentativo di alzarlo cambiando generatore lo ha \emph{abbassato}: il collo
       di bottiglia è il lato ricezione, non la fabbricazione dei pacchetti.
       Oltre questa cifra servono due macchine e un cavo, non un'altra manopola.
-\item \textbf{La portata assoluta resta non citabile; la sua \emph{differenza}
-      no.} A core separati la dispersione fra i giri arriva al 137\% e il
-      pavimento è la coda del collegamento virtuale; a core condivisi il tetto
-      è il generatore. In nessuna delle due configurazioni il nodo satura,
-      quindi il numero in Mpps va riportato come limite inferiore. Quello che
-      si cita è il costo per pacchetto \emph{dopo aver sottratto la baseline}:
-      vedi \S\ref{sec:confronto-mpps}.
+\item \textbf{La portata assoluta resta non citabile; il costo per
+      pacchetto sì.} Il test di controllo senza pipeline ha stabilito che la
+      via di ricezione accetta 3,7~Mpps su circa 5 offerti: un terzo dei
+      pacchetti viene rifiutato dalla coda del collegamento virtuale prima di
+      arrivare al nodo. Le pipeline, che con perdita nulla stavano fra 1,1 e
+      1,4~Mpps, avevano quindi ancora circa $2\times$ di margine e il loro
+      ginocchio non è stato raggiunto: ogni cifra in Mpps va riportata come
+      limite inferiore. Quello che si cita è $T_2-T_1$, il costo della
+      pipeline sul percorso reale, che è stabile al nanosecondo su quattro
+      campagne indipendenti: vedi \S\ref{sec:confronto-mpps}.
 \item \textbf{Lo sweep sulle taglie di frame} è stato eseguito su 64, 512 e
       1514 byte. Il costo dell'inferenza non dipende dalla lunghezza del frame,
       come atteso; a 1514 byte comincia a pesare la copia dell'headroom. La
@@ -2825,18 +2754,29 @@ sudo python3 ipa/test/netns_fabric.py --cleanup
 
 \section{Analisi parametrica: come cresce il costo}
 
-Sei assi, tre pipeline, una cella per punto, ognuna in un processo separato
-perché un programma caricato non contamini il successivo.
+Sette assi storici più i quattro della campagna sulle architetture. Una
+cella per punto, ognuna in un processo separato perché un programma caricato
+non contamini il successivo --- e perché un modello troppo largo sfonda lo
+stack eBPF con un abort che ucciderebbe l'intero sweep.
 
 \begin{lstlisting}
-# tutti gli assi
+# i sette assi storici
 sudo python3 ipa/test/bench_scaling.py
 
-# un asse alla volta: nodes, depth, width, descriptor, isoparam, sparsity
+# uno alla volta: nodes, depth, width, descriptor,
+#                 isoparam, degree, sparsity
 sudo python3 ipa/test/bench_scaling.py --axis nodes
 sudo python3 ipa/test/bench_scaling.py --axis depth --trials 15
 
-# salva i CSV (uno per asse)
+# LA CAMPAGNA sulle architetture: iv_dense, iv_onehot,
+# width_camp, depth_camp -- tutti in un CSV solo
+sudo python3 ipa/test/bench_scaling.py --axis campaign --out results/
+
+# con anche le letture di mappa per pacchetto (raddoppia
+# le compilazioni: e' una seconda build strumentata)
+sudo python3 ipa/test/bench_scaling.py --axis campaign --lookups --out results/
+
+# salva i CSV (uno per asse storico)
 sudo python3 ipa/test/bench_scaling.py --out results/
 
 # i grafici dai CSV: non serve root, e non rimisura niente
@@ -2851,32 +2791,36 @@ sudo python3 ipa/test/bench_depth_vs_width.py
 sudo python3 ipa/test/bench_depth_vs_width.py --descriptor no_onehot
 \end{lstlisting}
 
-\section{Throughput e latenza end-to-end}
+\section{Throughput e latenza sul percorso reale}
 
-Il banco con generatore e nodo sotto prova. \textbf{La forma da citare è quella
-con \texttt{--latency}}: un fabric solo, tutto compilato prima di misurare, e
-misura a giri con la mediana fra i giri.
+Il banco con generatore e nodo sotto prova. \textbf{La forma da citare è
+\texttt{-{}-mode rates}}: misura le tre latenze $T_1$, $T_2$, $T_3$ su una
+scala di rate offerti, con la mediana fra i giri.
 
 \begin{lstlisting}
 sudo modprobe pktgen
 
-# il confronto equo: latenza arrivo->partenza + portata, tutte le pipeline
-sudo python3 ipa/test/bench_throughput.py --latency --rounds 5 --out result/
+# il confronto: T1/T2/T3 su sei rate, tutte le pipeline
+sudo python3 ipa/test/bench_throughput.py --mode rates \
+     --frames 64 --rounds 3 --threads 2 \
+     --rates 0.5,1,1.5,2,2.5,3 --out results/
 
-# piu' taglie di frame
-sudo python3 ipa/test/bench_throughput.py --latency \
-     --frames 64,512,1514 --rounds 5 --out result/
-
-# piu' giri se la dispersione fra i giri sfonda il 25%
-sudo python3 ipa/test/bench_throughput.py --latency --rounds 7 --out result/
+# il TEST DI CONTROLLO: stesso percorso, NESSUNA pipeline.
+# Da lanciare DA SOLO, mai in coda al comando sopra: una
+# macchina ancora calda ha dato 1,26 Mpps contro 3,73.
+sudo python3 ipa/test/bench_throughput.py --mode generator \
+     --frames 64 --rounds 5 --threads 2 \
+     --rates 8,10,12,15,20,25 --out results/
 
 # se un run si interrompe e lascia il generatore configurato
 sudo python3 ipa/test/bench_throughput.py --cleanup
 \end{lstlisting}
 
-Scrive due file: \texttt{latency.csv} con la mediana fra i giri e
-\texttt{latency\_raw.csv} con ogni singolo giro. Il secondo serve a leggere la
-dispersione, che è ciò che dice se la mediana significa qualcosa.
+\texttt{-{}-mode rates} scrive \texttt{rates\_raw.csv}, una riga per
+(rate, pipeline, giro), e \texttt{env.csv} con le condizioni della macchina.
+\texttt{-{}-mode generator} scrive \texttt{generator\_ceiling.csv}. Le righe
+grezze servono a leggere la dispersione, che è ciò che dice se la mediana
+significa qualcosa.
 
 \begin{prima}[Come si legge l'uscita]
 Due verdetti, in fondo al run, e vanno letti separatamente:
@@ -2884,9 +2828,14 @@ Due verdetti, in fondo al run, e vanno letti separatamente:
 \textbf{Controllo di validità} --- la baseline deve essere la più veloce entro
 il 10\%. Se non lo è, il run misura il carico della macchina e va buttato.
 
-\textbf{Latenza: quanto è riproducibile} --- se il minimo varia meno del 5\% fra
-i giri, è la cifra da citare. Vale anche quando la portata è inutilizzabile:
-sono due misure con due affidabilità diverse.
+\textbf{Le tre latenze} --- $T_2-T_1$ è la pipeline ed è la cifra da
+citare; $T_3-T_2$ è il trasporto e deve risultare uguale per tutte e cinque,
+altrimenti la separazione non ha funzionato. Valgono anche quando la portata è
+inutilizzabile: sono misure con affidabilità diverse.
+
+\textbf{Resa e respinti} --- se la resa resta bassa a ogni rate, il tetto è del
+generatore e non del nodo, e il banco lo dice con un avvertimento esplicito. In
+quel caso il throughput va citato come limite inferiore.
 \end{prima}
 
 \section{Costi specifici}
