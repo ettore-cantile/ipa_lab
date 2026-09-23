@@ -2161,10 +2161,14 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
             f"(min-max {med['spread_pct']}%)")
     # Due avvisi che riguardano la MISURA e non il datapath: se scattano, la
     # riga resta ma va letta sapendo che la finestra non era pulita.
-    if med.get("gen_skew_pct", 0) > 20.0:
+    # Non sulle sonde da un pacchetto (count 1): li' sfasamento e scarto sono
+    # l'avvio di pktgen diviso per quasi niente, e riempivano l'inizio di ogni
+    # run di avvisi senza significato.
+    sonda = count < MIN_WINDOW_PKTS // max(1, gen.n_inst if gen else 1)
+    if med.get("gen_skew_pct", 0) > 20.0 and not sonda:
         warn(f"thread del generatore sfasati del {med['gen_skew_pct']}%: non "
              f"hanno lavorato nella stessa finestra")
-    if med.get("gen_rate_mismatch_pct", 0) > 25.0:
+    if med.get("gen_rate_mismatch_pct", 0) > 25.0 and not sonda:
         warn(f"TX/durata e somma dei pps per istanza differiscono del "
              f"{med['gen_rate_mismatch_pct']}%: uso TX diviso la durata "
              f"globale, che e' la lettura che non gonfia")
