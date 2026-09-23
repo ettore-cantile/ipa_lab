@@ -120,6 +120,7 @@ import json
 import time
 import random
 import argparse
+import signal
 import subprocess
 import ctypes as ct
 
@@ -1003,14 +1004,48 @@ def _worker(pipeline, spec_json):
     return 0
 
 
+# Tetto di tempo per UNA cella. Una cella normale dura da qualche secondo a un
+# paio di minuti (compilazione + prove); senza tetto, un sottoprocesso bloccato
+# fermava l'intera campagna per sempre senza dire niente. Allo scadere si uccide
+# il gruppo di processi della cella -- worker, loader AOT, compilatori -- e la
+# cella esce TIMEOUT. Si alza con IPA_CELL_TIMEOUT_S.
+CELL_TIMEOUT_S = int(os.environ.get("IPA_CELL_TIMEOUT_S", "900"))
+
+
 def bench_cell(pipeline, cell, repeat, trials):
     """One cell, isolated. A fatal LLVM abort or a verifier refusal kills only
-    the child."""
+    the child; so does a hang, after CELL_TIMEOUT_S."""
     spec = dict(cell, dims=list(cell["dims"]), repeat=repeat, trials=trials)
-    proc = subprocess.run(
+    # Una sessione propria: il loader AOT e clang sono figli del worker, e al
+    # timeout vanno uccisi con lui -- altrimenti tengono aperta la pipe e
+    # l'attesa dell'uscita non finisce comunque.
+    proc = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--_worker", pipeline,
          json.dumps(spec)],
-        capture_output=True, text=True)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True)
+    try:
+        out, err_txt = proc.communicate(timeout=CELL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return {"ok": False, "skipped": False,
+                "detail": f"TIMEOUT dopo {CELL_TIMEOUT_S}s: cella uccisa "
+                          f"(worker e figli)"}
+
+    rc = proc.returncode
+
+    class _R:
+        pass
+    proc = _R()
+    proc.stdout, proc.stderr = out or "", err_txt or ""
+    proc.returncode = rc
     last = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else None
     if last:
         try:
@@ -1447,7 +1482,16 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
                 r = {"ok": False, "refused": True,
                      "detail": f"soffitto compilato: {oltre}"}
             else:
+                # Una riga PRIMA della cella: e' cio' che dice, in un run di
+                # ore, che il banco sta andando avanti e su quale cella.
+                t_cella = time.time()
+                print(f"  {GREY}[{time.strftime('%H:%M:%S')}] {axis} x={v} "
+                      f"{pipe} ...{NC}", flush=True)
                 r = bench_cell(pipe, cell, repeat, trials)
+                r = dict(r, _secs=round(time.time() - t_cella, 1))
+                if not r.get("ok"):
+                    print(f"  {GREY}    ... {r.get('detail', 'fallita')} "
+                          f"({r['_secs']} s){NC}", flush=True)
             if r.get("ok"):
                 # La baseline non moltiplica niente: `forma` descrive la
                 # cella, non quello che questa pipeline esegue.
@@ -1835,6 +1879,13 @@ def plot_axis(axis, in_dir, fmt, draw_all=False):
 
 # ==========================================================================
 def main():
+    # Riga per riga anche dentro `| tee`: senza, Python accumula l'uscita a
+    # blocchi e un run di ore sembra fermo.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(
         description=__doc__.split("USAGE")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
