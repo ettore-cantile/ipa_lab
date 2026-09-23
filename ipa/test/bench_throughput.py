@@ -423,6 +423,45 @@ CPU_BUSY_PCT = 90.0
 # nodo non va mai (i due coincidono entro il rumore, claims.md B3).
 METHODS = ("baseline", "p1_static", "hardcoded", "template", "modular")
 
+# IL TETTO DI SOLA RICEZIONE, NELLA STESSA SESSIONE DELLE PIPELINE.
+#
+# `--mode generator` misura lo stesso tetto (pktgen -> veth -> contatore che
+# scarta), ma in un run a parte. Fra un run e l'altro questa VM si sposta di
+# circa il 10%: misurato il 2026-09-23, sola ricezione 4,32 e poi 3,92 Mpps,
+# baseline 3,98 e poi 4,01 -- il rapporto fra le due usciva 0,92 o 1,02 a
+# seconda di quali run si accostavano. `rxonly` e' lo stesso contatore
+# caricato come un metodo di `--mode compare`: stessi giri, stesso generatore,
+# stessa finestra, e il rapporto con le pipeline diventa una misura.
+#
+# Fa strettamente MENO lavoro della baseline: niente parse, niente TTL, niente
+# redirect, niente veth d'uscita. Non e' una pipeline, quindi resta fuori dal
+# controllo "la baseline e' la piu' veloce" e ne ha uno suo: se consegna MENO
+# della baseline oltre la tolleranza, la sessione non e' confrontabile.
+RX_ONLY = "rxonly"
+RXONLY_SRC = """
+#include <uapi/linux/bpf.h>
+BPF_ARRAY(pkt_stats, __u64, 3);
+BPF_ARRAY(cls_stats, __u64, 8);
+int xdp_rxonly(struct xdp_md *ctx) {
+    int k = 0;
+    __u64 *v = pkt_stats.lookup(&k);
+    if (v) __sync_fetch_and_add(v, 1);
+    return XDP_DROP;
+}
+"""
+
+
+def setup_rxonly():
+    """Il contatore d'ingresso con la forma di un setup di pipeline. RX e' il
+    suo HIT (`rx_is_hit`): il pacchetto non arriva mai al contatore d'uscita,
+    per costruzione."""
+    from bcc import BPF
+    b = BPF(text=RXONLY_SRC)
+    fn = b.load_func("xdp_rxonly", BPF.XDP)
+    return {"b": b, "fn": fn, "disp": fn, "pipeline": 0, "rx_is_hit": True,
+            "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
+            "progs": {"xdp_rxonly": fn.fd}}
+
 # Il nodo che la P1 specializzata si porta dentro. Lo stesso che installa
 # test_fabric, cosi' le due misure parlano dello stesso nodo.
 STATIC_NODE = 7
@@ -2166,7 +2205,8 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
             return dict(hit=_read_u64(setup["pkt_stats"], 0),
                         miss=_read_u64(setup["pkt_stats"], 1),
                         drop=_read_u64(setup["pkt_stats"], 2),
-                        rx=_percpu_sum(rx_tab))
+                        rx=(_read_u64(setup["pkt_stats"], 0)
+                            if setup.get("rx_is_hit") else _percpu_sum(rx_tab)))
         run = gen.steady(frame, delay, probe)
         devs = gen.names
         tx, tx_pps, elapsed = run
@@ -2206,7 +2246,7 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         hit = _read_u64(setup["pkt_stats"], 0)
         miss = _read_u64(setup["pkt_stats"], 1)
         drop = _read_u64(setup["pkt_stats"], 2)
-        rx = _percpu_sum(rx_tab)
+        rx = (hit if setup.get("rx_is_hit") else _percpu_sum(rx_tab))
         # La finestra dei contatori e' quella del blocco su pgctrl (GenRun.window),
         # non la durata che pktgen attribuisce al thread piu' lungo.
         secs = getattr(run, "window", 0.0) or elapsed
@@ -3834,6 +3874,8 @@ def build_pipeline(method, model_path, fab, sem):
     import verify_prog_run as V
     import test_fabric as TF
 
+    if method == RX_ONLY:
+        return setup_rxonly()
     if method == "baseline":
         setup = V.setup_baseline(0, model_path)
     elif method == "p1_static":
@@ -4879,7 +4921,7 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                f"{'resp':>7s} {'dopo':>7s} {'perdita':>8s} {'collo':>18s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
-        ordine = {m: i for i, m in enumerate(METHODS)}
+        ordine = {m: i for i, m in enumerate((RX_ONLY,) + tuple(METHODS))}
         ordine_fase = {"saturazione": 0, "confronto": 1}
         keys = sorted({(r["method"], r["frame"], r["phase"]) for r in raw},
                       key=lambda k: (ordine.get(k[0], 99), k[1],
@@ -4941,6 +4983,58 @@ def run_compare(methods, model_path, frames, offered_pps=None,
     return raw, summary
 
 
+# I FAIL di _rxonly_verdict. Lista propria, non VERDICT: check_validity, che
+# gira dopo, svuota VERDICT per primo. main() li riaggiunge dopo di lui.
+RXONLY_FAILS = []
+
+
+def _rxonly_verdict(sat, cmp_, threshold):
+    """Le pipeline rispetto al tetto di sola ricezione misurato INSIEME a loro.
+
+    Per taglia di frame: quota del tetto, costo per pacchetto sopra il tetto
+    (1/RX - 1/RX_rxonly), e il controllo che il contatore -- che fa
+    strettamente meno lavoro di tutte -- non consegni meno della baseline."""
+    RXONLY_FAILS.clear()
+    for frame in sorted({r["frame"] for r in sat}):
+        top = next((r for r in sat if r["frame"] == frame
+                    and r["method"] == RX_ONLY), None)
+        if top is None or not top["rx_pps"]:
+            continue
+        cap = top["rx_pps"]
+        print(f"\n  {YELLOW}Rispetto al tetto di sola ricezione ({RX_ONLY}, "
+              f"{frame}B, stessa sessione): {cap} pps{NC}")
+        for r in sat:
+            if r["frame"] != frame or r["method"] == RX_ONLY or not r["rx_pps"]:
+                continue
+            extra = 1e9 / r["rx_pps"] - 1e9 / cap
+            print(f"    {r['method']:10s} {r['rx_pps']:9d} pps  "
+                  f"{100.0 * r['rx_pps'] / cap:5.1f}% del tetto  "
+                  f"{extra:+7.1f} ns/pacchetto")
+        base = next((r for r in sat if r["frame"] == frame
+                     and r["method"] == "baseline"), None)
+        if base is not None and base["rx_pps"] > cap * (1 + VALID_TOL):
+            RXONLY_FAILS.append(("FAIL", f"{frame}B: {RX_ONLY} {cap} pps "
+                                         f"sotto la baseline "
+                                         f"{base['rx_pps']}: la sessione "
+                                         f"misura la macchina"))
+            print(f"  {RED}[FAIL]{NC} {RX_ONLY} ({cap}) consegna meno della "
+                  f"baseline ({base['rx_pps']}) oltre il {VALID_TOL:.0%}: fa "
+                  f"strettamente meno lavoro, quindi la sessione misura la "
+                  f"macchina, non i programmi.")
+        elif base is not None and base["rx_pps"] > cap:
+            print(f"  {GREY}La baseline supera {RX_ONLY} entro il "
+                  f"{VALID_TOL:.0%}: indistinguibili, cioe' il redirect e il "
+                  f"veth d'uscita non si vedono nel throughput.{NC}")
+    cont = [r for r in cmp_ if r["method"] == RX_ONLY
+            and r["respinti_pct"] > threshold]
+    for r in cont:
+        note(f"fase confronto -- anche {RX_ONLY} respinge il "
+             f"{r['respinti_pct']:.2f}% a questo rate ({r['frame']}B): una "
+             f"parte dei respinti sotto capacita' e' del trasporto (coda del "
+             f"veth, risveglio del thread NAPI), non delle pipeline. La parte "
+             f"delle pipeline e' quella SOPRA questa cifra.")
+
+
 def _compare_verdict(summary, offered_pps, threshold):
     """Che cosa si puo' dire della tabella, deciso sui numeri e non scritto
     prima di averli.
@@ -4950,6 +5044,7 @@ def _compare_verdict(summary, offered_pps, threshold):
     sono del programma XDP". Il 2026-09-23 erano false tutte e due."""
     sat = [r for r in summary if r["phase"] == "saturazione"]
     cmp_ = [r for r in summary if r["phase"] == "confronto"]
+    _rxonly_verdict(sat, cmp_, threshold)
     if sat:
         piene = [r for r in sat if r["respinti_pct"] > threshold]
         vuote = [r for r in sat if r["respinti_pct"] <= threshold]
@@ -6503,10 +6598,22 @@ def _rates_from(a):
 
 
 def main():
+    # Riga per riga anche quando l'uscita va in una pipe (| tee, | grep): senza,
+    # Python la bufferizza a blocchi da 8 KB e un run di minuti non mostra
+    # niente finche' il blocco non si riempie.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(
         description=__doc__.split("USO")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--method", choices=list(METHODS) + ["all"], default="all")
+    p.add_argument("--method", choices=list(METHODS) + [RX_ONLY, "all"],
+                   default="all",
+                   help=f"all = le cinque pipeline; in --mode compare anche "
+                        f"{RX_ONLY}, il tetto di sola ricezione misurato nella "
+                        f"stessa sessione.")
     p.add_argument("--rates", default=None, metavar="LISTA",
                    help="modalita' rates: rate offerti in Mpps, separati da "
                         "virgola (default: 0.1,0.2,0.4,0.6,0.8,1,1.2,1.5,2)")
@@ -6688,6 +6795,11 @@ def main():
         # farebbe scartare punti buoni.
         a.loss_threshold = 0.0 if a.latency else DEFAULT_LOSS_THRESHOLD
     methods = list(METHODS) if a.method == "all" else [a.method]
+    if a.mode == "compare" and not a.latency and a.method == "all":
+        methods = [RX_ONLY] + methods
+    if RX_ONLY in methods and (a.latency or a.mode != "compare"):
+        sys.exit(f"{RX_ONLY} esiste solo in --mode compare; da solo, lo stesso "
+                 f"tetto lo misura --mode generator.")
 
     # Le condizioni si leggono PRIMA di misurare e si stampano subito: se
     # il run viene interrotto a meta' resta comunque scritto su che
@@ -6792,8 +6904,13 @@ def main():
         # Il controllo "la baseline e' la piu' veloce" ha senso solo dove
         # l'RX e' una capacita', cioe' a massima spinta: nella fase confronto
         # tutte consegnano lo stesso rate per costruzione.
+        # rxonly resta fuori: non e' una pipeline, e ha il suo controllo in
+        # _rxonly_verdict.
         rc |= check_validity([r for r in rows
-                              if r.get("phase") == "saturazione"] or rows)
+                              if r.get("phase") == "saturazione"
+                              and r.get("method") != RX_ONLY] or rows)
+        VERDICT.extend(RXONLY_FAILS)
+        rc |= int(bool(RXONLY_FAILS))
         if a.out and (rows or raw):
             os.makedirs(a.out, exist_ok=True)
             if rows:
