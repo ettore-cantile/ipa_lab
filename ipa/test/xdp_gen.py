@@ -248,6 +248,15 @@ class XdpGen:
         self.fn = self.b.load_func("xdp_gen", BPF.XDP)
         self.last_run = None
         self._frame = None
+        self.base_ttl = 32
+
+    def set_ttl(self, ttl):
+        """Il TTL del frame di base (quello senza --ttl-mix). Serve a
+        --per-class, dove ogni classe ha il suo (link_state, ttl)."""
+        if not 1 <= int(ttl) <= 255:
+            raise ValueError(f"ttl {ttl}")
+        self.base_ttl = int(ttl)
+        self._frame = None
 
     @property
     def names(self):
@@ -288,7 +297,7 @@ class XdpGen:
         if self._frame is not None and self._frame[0] == frame_size:
             return self._frame[1]
         data = build_frame(frame_size, self.src_mac, self.dst_mac,
-                           dst_ip=self.dst_ip)
+                           dst_ip=self.dst_ip, ttl=self.base_ttl)
         hdr = self.b["gen_hdr"]
         v = hdr.Leaf()
         ct.memmove(ct.byref(v), data[:HDR_COPY], HDR_COPY)

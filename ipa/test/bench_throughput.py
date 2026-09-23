@@ -2046,7 +2046,10 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         # di pacchetti -- misurato il 2026-09-18: `512 ... RX 2 169 116 ...
         # 100.00%`. Ed essendo il gradino piu' basso, mandava a vuoto tutta la
         # ricerca del rate a perdita nulla.
-        if r["rx"] == 0 and r.get("offered_tx", 0) > 0:
+        # Eccezione: RX 0 con DROP > 0 e HIT 0 e' la classe DROP (--per-class),
+        # dove nessun pacchetto deve uscire. Li' la finestra e' buona.
+        classe_drop = r.get("drop", 0) > 0 and r.get("hit", 0) == 0
+        if r["rx"] == 0 and r.get("offered_tx", 0) > 0 and not classe_drop:
             dove = (f"{r['hit']} elaborati e 0 contati in uscita"
                     if r["hit"] > 0 else
                     f"{r['offered_tx']} offerti e il programma non e' mai "
@@ -4725,7 +4728,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 topology="shared", xmit_mode="start_xmit",
                 threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
                 warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0,
-                generator="pktgen", egress_cpu=None, ttl_mix=None):
+                generator="pktgen", egress_cpu=None, ttl_mix=None,
+                scenario=None):
     """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate.
 
     generator="xdp": frame XDP grezzi (xdp_gen.XdpGen, BPF_PROG_TEST_RUN in
@@ -4822,6 +4826,22 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                      f"pinnato su cpu{egress_cpu}; 1/RX contiene anche la "
                      f"ricezione a valle")
 
+        if scenario is not None:
+            # Una classe per sessione: lo stato dei link che la produce su
+            # tutte le pipeline, e il TTL corrispondente nel frame.
+            from common import write_vector_map
+            s_cls, s_ls, s_ttl, s_act = scenario
+            for m, setup in loaded.items():
+                if setup.get("rx_is_hit") or m == "baseline":
+                    continue            # non leggono link_state
+                try:
+                    write_vector_map(setup["b"], "link_state", s_ls)
+                except Exception as e:
+                    warn(f"{m}: link_state non scritto ({e})")
+            gen.set_ttl(s_ttl)
+            info(f"scenario: classe {s_cls} ({s_act}), link_state={s_ls}, "
+                 f"ttl={s_ttl}")
+
         # --- sonda per pipeline: si misura inferenza o XDP_PASS?
         alive = []
         for m in list(loaded):
@@ -4830,7 +4850,10 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                               repeat=1, burst=gen.burst, xmit_mode=xmit_mode,
                               gen=gen, warmup=False, threshold=threshold,
                               plan=plan, steady=False)
-            if p is None or p["hit"] == 0:
+            # HIT o DROP: in tutti e due i casi il modello ha deciso. MISS no:
+            # e' anche l'esito di un model_id non registrato, cioe' proprio
+            # il caso che la sonda esiste per escludere.
+            if p is None or p["hit"] + p.get("drop", 0) == 0:
                 warn(f"{m}: la sonda non produce HIT -- la escludo dal "
                      f"confronto invece di misurarle il costo di non fare "
                      f"inferenza")
@@ -5063,11 +5086,62 @@ def _read_any(table, key):
         return int(getattr(v, "value", v))
 
 
+# {pipeline: [conteggio per classe]} dell'ultimo run di run_compare.
+LAST_CLASS_MIX = {}
+
+
+def _class_scenarios(model_path):
+    """[(classe, link_state, ttl, azione)] per ogni classe che il modello
+    raggiunge con qualche stato dei link, cercate come fa test_fabric (il
+    TTL da solo non sposta l'argmax di questo modello). Le UNUSED restano
+    fuori: non sono traffico, e il loro esito non e' contato come
+    elaborazione in tutte le pipeline."""
+    import verify_prog_run as V
+    import test_fabric as TF
+    sem, n_out = class_semantics()
+    weights, scale = V.load_weights(model_path)
+    cases = TF._cases_covering_classes(
+        V, weights, scale, 0, n_out, ingress_port=TF.FABRIC_INGRESS_SLOT,
+        node_index=TF.FABRIC_NODE_INDEX)
+    out = []
+    for c in sorted(cases):
+        act = sem.action_of(c)
+        if act == "UNUSED":
+            continue
+        ls, ttl = cases[c]
+        out.append((c, list(ls), int(ttl), act))
+    return out
+
+
+def _per_class_table(per, frames):
+    """Costo del nodo (ns, 1e9 / elaborati) per pipeline e classe decisa."""
+    classi = sorted(per)
+    metodi = [m for m in (RX_ONLY,) + tuple(METHODS)
+              if any(m in per[c] for c in classi)]
+    for frame in frames:
+        print(f"\n{YELLOW}{'=' * 78}{NC}")
+        print(f"{YELLOW} Costo del nodo per classe decisa, {frame}B "
+              f"(ns/pacchetto = 1e9 / elaborati, saturazione){NC}")
+        print(f"{YELLOW}{'=' * 78}{NC}")
+        print("  " + f"{'pipeline':10s}" + "".join(
+            f"{f'c{c} {per[c][None]}':>13s}" for c in classi))
+        for m in metodi:
+            celle = []
+            for c in classi:
+                r = per[c].get(m, {}).get(frame)
+                celle.append(f"{r:13.1f}" if r else f"{'-':>13s}")
+            print(f"  {m:10s}" + "".join(celle))
+        print(f"  {GREY}La baseline inoltra sempre sulla classe 0 e rxonly "
+              f"scarta all'ingresso: nelle loro righe la colonna non cambia "
+              f"cosa fanno, solo quando.{NC}")
+
+
 def _class_mix_report(loaded, n_out, sem):
     """Le classi decise da ogni pipeline su tutto il run: la prova di COSA ha
     esercitato il traffico. Con un pacchetto sempre uguale esce una classe
     sola, e va letto come limite della misura, non come un risultato."""
     righe = []
+    LAST_CLASS_MIX.clear()
     for m, setup in loaded.items():
         if setup.get("rx_is_hit"):
             continue
@@ -5080,6 +5154,7 @@ def _class_mix_report(loaded, n_out, sem):
         if not tot:
             continue
         miss, drop = _read_any(ps, 1), _read_any(ps, 2)
+        LAST_CLASS_MIX[m] = cls
         dist = " ".join(f"{c}:{100.0 * v / tot:4.1f}%"
                         for c, v in enumerate(cls) if v)
         righe.append((m, len([v for v in cls if v]), dist, miss, drop))
@@ -6840,6 +6915,12 @@ def main():
                         "BPF_PROG_TEST_RUN live frames (ipa/test/xdp_gen.py), "
                         "come da una NIC con XDP nativo; niente cadenza, "
                         "quindi solo la fase saturazione.")
+    m.add_argument("--per-class", action="store_true",
+                   help="solo --mode compare --generator xdp: una sessione "
+                        "per ogni classe che il modello raggiunge (stato dei "
+                        "link e TTL cercati come in test_fabric), poi il "
+                        "costo del nodo per pipeline e classe. Mostra quanto "
+                        "costano inoltro e DROP.")
     m.add_argument("--ttl-mix", default=None, metavar="LISTA",
                    help="solo con --generator xdp: TTL a giro, es. '2-33' o "
                         "'2,8,16,32'. Il TTL e' una feature del modello, "
@@ -6909,6 +6990,10 @@ def main():
         sys.exit("--generator xdp: solo --mode compare a finestra steady")
     if a.egress_cpu is not None and (a.latency or a.mode != "compare"):
         sys.exit("--egress-cpu: solo --mode compare")
+    if a.per_class and (a.generator != "xdp" or a.mode != "compare"
+                        or a.ttl_mix):
+        sys.exit("--per-class: solo --mode compare --generator xdp, senza "
+                 "--ttl-mix (il TTL lo decide la classe)")
     if a.ttl_mix and a.generator != "xdp":
         sys.exit("--ttl-mix: solo con --generator xdp (pktgen scrive un TTL "
                  "fisso)")
@@ -7069,6 +7154,9 @@ def main():
         _closing_note(plan)
         return rc
 
+    if a.mode == "compare" and a.per_class:
+        return _run_per_class(a, methods, model_path, frames, plan, env_finale)
+
     if a.mode == "compare":
         raw, rows = run_compare(
             methods, model_path, frames, offered_pps=a.offered_pps,
@@ -7129,6 +7217,66 @@ def main():
         write_report(a.out, rows, env_finale(), a.loss_threshold)
         _give_back(a.out)
 
+    _closing_note(plan)
+    return rc
+
+
+def _run_per_class(a, methods, model_path, frames, plan, env_finale):
+    """Una sessione di confronto per classe; poi la tabella dei costi."""
+    scen = _class_scenarios(model_path)
+    if not scen:
+        sys.exit("nessuna classe raggiungibile trovata")
+    info("classi da misurare: " + ", ".join(
+        f"{c} ({act}, ttl {ttl}, link {''.join(map(str, ls))})"
+        for c, ls, ttl, act in scen))
+    per, tutti_raw, tutte_rows, rc = {}, [], [], 0
+    for sc in scen:
+        c, _, _, act = sc
+        print(f"\n{YELLOW}{'#' * 78}{NC}\n{YELLOW} CLASSE {c} ({act}){NC}"
+              f"\n{YELLOW}{'#' * 78}{NC}")
+        raw, rows = run_compare(
+            methods, model_path, frames, threads=plan.threads,
+            threshold=a.loss_threshold, repeat=a.repeat, rounds=a.rounds,
+            plan=plan, topology=a.gen_topology, xmit_mode=a.xmit_mode,
+            threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
+            window_s=a.duration, warmup_s=a.warmup, generator="xdp",
+            egress_cpu=a.egress_cpu, scenario=sc)
+        # La classe decisa davvero, contro quella voluta.
+        for m, cls in LAST_CLASS_MIX.items():
+            if m == "baseline" or not sum(cls):
+                continue
+            dom = max(range(len(cls)), key=cls.__getitem__)
+            quota = 100.0 * cls[dom] / sum(cls)
+            if dom != c or quota < 99.0:
+                warn(f"classe {c}: {m} ha deciso la classe {dom} al "
+                     f"{quota:.1f}% -- la sua cella misura un'altra classe")
+                rc = 1
+        per[c] = {None: {"FORWARD": "FWD"}.get(act, act)}
+        for r in rows:
+            if r.get("phase") != "saturazione":
+                continue
+            node = r.get("proc_pps") or r.get("hit_pps") or r["rx_pps"]
+            if node:
+                per[c].setdefault(r["method"], {})[r["frame"]] = 1e9 / node
+            r.update(scenario_class=c, scenario_action=act)
+        for r in raw:
+            r.update(scenario_class=c, scenario_action=act)
+        # "La baseline e' la piu' veloce" vale solo dove tutte inoltrano:
+        # nella classe DROP una pipeline non fa redirect e puo' costare
+        # legittimamente meno della baseline, che inoltra sempre.
+        if act == "FORWARD":
+            rc |= check_validity([r for r in rows
+                                  if r.get("phase") == "saturazione"
+                                  and r.get("method") != RX_ONLY] or rows)
+        tutti_raw += raw
+        tutte_rows += rows
+    _per_class_table(per, frames)
+    if a.out and tutte_rows:
+        os.makedirs(a.out, exist_ok=True)
+        _write_csv(os.path.join(a.out, "per_class.csv"), tutte_rows)
+        _write_csv(os.path.join(a.out, "per_class_raw.csv"), tutti_raw)
+        write_env(a.out, env_finale())
+        _give_back(a.out)
     _closing_note(plan)
     return rc
 
