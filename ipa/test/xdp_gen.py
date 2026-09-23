@@ -356,8 +356,14 @@ class XdpGen:
         secs = tb - ta
         dut = {k: db[k] - da.get(k, 0) for k in db}
         offered = sum(gb[c] - ga.get(c, 0) for c in self.cpus)
-        hit = dut.get("hit")
-        errors = max(0, offered - hit) if hit is not None else 0
+        # Accettati = tutto cio' che il programma del DUT ha elaborato, con
+        # qualunque esito (HIT, MISS, DROP): i respinti sono il resto dei
+        # tentativi. La controprova e' in `xmit_ethtool`.
+        if "hit" in dut:
+            done = dut["hit"] + dut.get("miss", 0) + dut.get("drop", 0)
+            errors = max(0, offered - done)
+        else:
+            errors = 0
         per_dev = [dict(dev=f"xdpgen@cpu{c}", tx=gb[c] - ga.get(c, 0),
                         pps=int((gb[c] - ga.get(c, 0)) / secs),
                         secs=round(secs, 4), errors=0) for c in self.cpus]

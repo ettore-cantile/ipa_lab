@@ -4714,8 +4714,14 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 repeat=DEFAULT_REPEAT, rounds=DEFAULT_ROUNDS, plan=None,
                 topology="shared", xmit_mode="start_xmit",
                 threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
-                warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0):
-    """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate."""
+                warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0,
+                generator="pktgen"):
+    """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate.
+
+    generator="xdp": frame XDP grezzi (xdp_gen.XdpGen, BPF_PROG_TEST_RUN in
+    modalita' live frames) invece degli skb di pktgen -- niente copia di
+    headroom sul lato DUT, come da una NIC con XDP nativo. Senza cadenza:
+    solo la fase `saturazione`."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
     import statistics as stats
@@ -4749,9 +4755,13 @@ def run_compare(methods, model_path, frames, offered_pps=None,
         for setup in loaded.values():
             _map_extra_ingress(setup, ing.ifindexes)
         gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
-        gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
-                        topology=ing.topology, clone=clone, burst=burst,
-                        window_s=window_s, warmup_s=warmup_s).attach()
+        if generator == "xdp":
+            from xdp_gen import XdpGen
+            gen = XdpGen(gen_devs[0], plan, window_s=window_s).attach()
+        else:
+            gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
+                            topology=ing.topology, clone=clone, burst=burst,
+                            window_s=window_s, warmup_s=warmup_s).attach()
         diag = Diag(devs=ing.dut_devs, plan=plan, enabled=diag_enabled)
 
         def use(method):
@@ -4820,7 +4830,10 @@ def run_compare(methods, model_path, frames, offered_pps=None,
         # programma XDP" differenze che erano della coda d'ingresso.
         frame0 = frames[0] if frames else 64
         full_count = gen.window_count(gen.rate_estimate or 3_000_000)
-        if not offered_pps:
+        if generator == "xdp":
+            # Il generatore XDP non ha cadenza: la fase confronto non esiste.
+            offered_pps = None
+        elif not offered_pps:
             print(f"\n{YELLOW} Calibrazione del rate comune (una volta, poi "
                   f"congelato){NC}")
             delivered = {}
@@ -4846,11 +4859,13 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                  f"pps. Che a questo carico nessuna perda non e' assunto: lo "
                  f"verifica la fase `confronto`.")
 
-        phases = (("saturazione", 0), ("confronto", offered_pps))
+        phases = (("saturazione", 0),) if not offered_pps else \
+            (("saturazione", 0), ("confronto", offered_pps))
         print(f"\n{YELLOW}{'=' * 78}{NC}")
-        print(f"{YELLOW} Fase 2: {rounds} giri x {len(alive)} pipeline x 2 "
-              f"(massima spinta; {offered_pps} pps offerti), frame "
-              f"{frames}{NC}")
+        print(f"{YELLOW} Fase 2: {rounds} giri x {len(alive)} pipeline x "
+              f"{len(phases)} (massima spinta"
+              + (f"; {offered_pps} pps offerti" if offered_pps else "")
+              + f"), frame {frames}, generatore {generator}{NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
         hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} "
                f"{'fase':11s} {'chiesto':>9s} {'offerti':>9s} "
@@ -6241,6 +6256,7 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("xmit_mode", a.xmit_mode)
         add("finestra_s", a.duration)
         add("finestra_modo", getattr(a, "window", WINDOW_MODE))
+        add("generatore", getattr(a, "generator", "pktgen"))
         add("warmup_s", a.warmup)
         add("ripetizioni_per_punto", a.repeat)
         add("giri", a.rounds)
@@ -6697,6 +6713,14 @@ def main():
                         "Senza, lo decide una calibrazione: 90%% di quanto il "
                         "piu' lento consegna a massima spinta. Che a quel "
                         "rate nessuna perda lo verifica la fase stessa.")
+    m.add_argument("--generator", choices=("pktgen", "xdp"),
+                   default="pktgen",
+                   help="solo --mode compare. pktgen (default): skb, che il "
+                        "veth copia per dare a XDP l'headroom -- costo del "
+                        "trasporto sul DUT. xdp: frame XDP grezzi da "
+                        "BPF_PROG_TEST_RUN live frames (ipa/test/xdp_gen.py), "
+                        "come da una NIC con XDP nativo; niente cadenza, "
+                        "quindi solo la fase saturazione.")
     m.add_argument("--window", choices=("steady", "count"), default="steady",
                    help="steady (default): rate letti a differenza mentre "
                         "tutte le istanze pktgen trasmettono, poi stop. "
@@ -6749,6 +6773,9 @@ def main():
     a = p.parse_args()
     global WINDOW_MODE
     WINDOW_MODE = a.window
+    if a.generator == "xdp" and (a.latency or a.mode != "compare"
+                                 or a.window != "steady"):
+        sys.exit("--generator xdp: solo --mode compare a finestra steady")
 
     if sys.platform != "linux":
         sys.exit(f"serve Linux, non {sys.platform}")
@@ -6904,7 +6931,7 @@ def main():
             topology=a.gen_topology, xmit_mode=a.xmit_mode,
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
-            burst=a.burst)
+            burst=a.burst, generator=a.generator)
         # Il controllo "la baseline e' la piu' veloce" ha senso solo dove
         # l'RX e' una capacita', cioe' a massima spinta: nella fase confronto
         # tutte consegnano lo stesso rate per costruzione.
