@@ -114,6 +114,8 @@ scheda lo dice invece di nasconderlo.
 
 ## B. Il costo della flessibilità
 
+> **Rimisura del 2026-09-23** (sezioni B, C, D). `bench_scaling` e `test_suite` sono stati rifatti con P1 e P1.5 come **oggetto AOT** (quello dei nodi). In quella sessione la macchina era circa il **35–40% più veloce** della precedente su **tutte** le pipeline, anche P2 e P3 che non sono cambiate: è lo stato dell'host (CPU ibrida), non dei programmi. I **rapporti** fra pipeline e le istruzioni restano invariati; le cifre assolute di sessioni diverse non si confrontano. Le schede riportano la rimisura in una riga propria.
+
 Questa è la sezione che risponde all'esempio del relatore. La scala ha **quattro**
 gradini, non tre: si è aggiunta una P1 pienamente specializzata sotto quella che
 il progetto chiamava P1.
@@ -128,9 +130,10 @@ il progetto chiamava P1.
 | **Metrica** | Latenza minima su 7 trial, istruzioni eBPF, tail call, letture di mappa. |
 | **Risultato** | 58 → 69 → 268 → 436 ns. Istruzioni 614 → 1 071 → 14 985 → 12 349. Salti fra programmi 1, 1, 1, 3. Letture di tabella 6 (P1.5), 11 (P2), 29 (P3). |
 | **Conclusione** | **La flessibilità costa circa 8× in latenza** fra i due estremi, e il costo non è aritmetico: è in letture di mappa e salti fra programmi. |
+| **Rimisurato (2026-09-23)** | `test_suite`, P1.5 AOT: baseline **17**, P1.5 **50**, P2 **180**, P3 **278 ns**; istruzioni 155 / 1 011 / 14 985 / 12 349; letture 3 / 6 / 11 / 29; salti 0 / 1 / 1 / 3. Campagna (65-4-4-7, pesi sintetici): 17 / **36** (P1 statica) / 42 / 173 / 258 ns. Fra gli estremi ancora circa **7×**; P3 il 54% più lento di P2 con il 18% di istruzioni in meno. Conclusione invariata. |
 | **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` e `sudo python3 ipa/test/bench_scaling.py --out results/` |
 
-### B2 — Il costo di aggiornare il modello differisce di due ordini di grandezza ✅
+### B2 — Il costo di aggiornare il modello differisce di due ordini di grandezza ⚠️ *(superato dalla rimisura AOT)*
 
 | | |
 |---|---|
@@ -141,6 +144,7 @@ il progetto chiamava P1.
 | **Risultato** | P1 e P1.5 fra 1 162 e 1 690 ms (rigenerano C e chiamano clang); P2 e P3 fra 5 e 14 ms (scritture in mappa). |
 | **Conclusione** | Circa 200×. È la metrica che decide se una pipeline è usabile in una rete che cambia. |
 | **Nota metodologica** | `build_ms` e `update_ms` **non vanno confusi**: per P2/P3 il primo è una compilazione pagata una volta all'avvio del nodo, il secondo è il costo per modello. Metterli sullo stesso asse farebbe sembrare P2/P3 più costose di P1, cioè il rovescio della verità. |
+| **Rimisurato (2026-09-23) — la conclusione cambia** ⚠️ | Con P1 come oggetto AOT, `update_ms` e' il solo caricamento sul nodo: **P1 e P1.5 5–8 ms** (un picco a 31 ms), **P2 e P3 4–10 ms**. Anche contando generazione del C, clang e caricamento (`build_ms`), P1 sta a **70–140 ms**. Il divario di circa 200× **non esiste piu'**: il ~1,5 s era il costo di **BCC** (che analizza gli header del kernel a ogni compilazione), non del compilatore. P2 e P3 pagano BCC una volta, all'avvio del nodo (1,3–1,8 s). Resta vera solo la differenza qualitativa: P1 richiede un compilatore per ogni modello nuovo (fuori dal nodo), P2 e P3 no. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --out results/`; figura `scaling_depth_update.pdf` |
 
 ### B3 — L'AOT toglie il compilatore dal nodo senza costo per pacchetto ✅
@@ -274,6 +278,7 @@ il progetto chiamava P1.
 | **Conclusione** | L'ipotesi e' falsa con le MAC nominali: per P3 il modello spiega l'11% della varianza. Una feature one-hot occupa `size` colonne nella matrice dei pesi ma nel datapath ne attiva **una** — l'arm `FEAT_INGRESS_IF` fa h1 addizioni e non guarda `size`. Contando le MAC **eseguite**, quattro assi costruiti in modi diversi collassano sulla stessa retta, una per pipeline. Il costo per MAC eseguita e' **~0,32 ns con i pesi compilati e ~1,46 ns con i pesi letti da tabella**: un fattore **4,5**, ed e' il prezzo della genericita' espresso in una costante. |
 | **Controprova** | Sull'asse one-hot n_in va da 16 a 65 e i pesi da 271 a 663, ma la latenza resta 88/89/88 ns su p1_static e 507/487/509 su P3. Le istruzioni di P1 intanto vanno da 1146 a 1702: la taglia statica cresce, il percorso eseguito no. ⚠️ `hardcoded` (+22%) e `template` (+28%) si muovono al punto piu' largo: su `hardcoded` e' plausibile la pressione sulla cache istruzioni, su `template` e' compatibile col rumore. Le righe piatte da citare sono p1_static e modular. |
 | **Limite dichiarato** | ⚠️ Il residuo di P3 e' piu' alto sugli assi larghezza (34 ns) e profondita' (29 ns): ogni strato in piu' e' anche una tail call, e una tail call non e' una MAC. Sull'asse delle istruzioni P3 non ha nemmeno una pendenza — 12 349 su ogni cella, latenza da 386 a 759 ns: il suo costo non sta nella taglia del codice. |
+| **Rimisurato (2026-09-23)** | P1 come oggetto AOT. Eseguite: **0,174 / 0,231 / 0,451 / 0,909 ns/MAC**, r² **0,87 / 0,95 / 0,69 / 0,92**. Nominali: 0,017 / 0,061 / 0,066 / 0,086, r² **0,11 / 0,70 / 0,19 / 0,11**. Conclusione invariata (P3: r² da 0,11 a 0,92); rapporto P3/P1 5,2× (era 4,5×). Asse one-hot: latenza piatta su **tutte e quattro** (59/58/59, 58/58/59, 152/151/150, 292/296/284 ns); le salite di P1.5 e P2 al punto piu' largo nella misura precedente erano rumore. Pavimento baseline 16–24 ns; residuo P3 larghezza 24 ns, profondita' 14 ns; P3 238–455 ns a 12 349 istruzioni. **Nuovo**: a larghezza 16 `p1_static` AOT **non compila** (4 errori di clang; con BCC si misurava a 199 ns), `hardcoded` si' (141 ns); causa da leggere. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_scaling.py --axis campaign --out results/`, poi `--plot results/` |
 
 ---
