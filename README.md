@@ -118,13 +118,18 @@ ipa_lab/
 │   │                                #       generated output, not tracked)
 │   └── test/                        #    engine tests, topology-agnostic
 │       ├── test_suite.py            #      core/pktstats/extract/quant/robust/kernel
-│       ├── test_class_semantics.py  #      53 checks, five class layouts, none Germany50
-│       ├── test_synth.py            #      56 checks on generated models, incl.
+│       ├── test_class_semantics.py  #      69 checks, five class layouts, none Germany50
+│       ├── test_synth.py            #      59 checks on generated models, incl.
 │       │                            #        synth reference == P1's generated C
 │       ├── p1_c_eval.py             #      evaluates P1's C from its text (no kernel)
 │       ├── verify_prog_run.py       #      per-pipeline kernel verifier (BPF_PROG_TEST_RUN)
 │       ├── verify_multi_model.py    #      concurrent multi-model registration
-│       └── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost
+│       ├── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost,
+│       │                            #        scaling (BPF_PROG_TEST_RUN)
+│       ├── bench_throughput.py      #      real traffic on veth: node cost per packet
+│       │                            #        (--mode compare --generator xdp --egress-cpu 0)
+│       ├── xdp_gen.py               #      XDP live-frames generator (no skb, no copy)
+│       └── test_steady_window.py    #      steady measurement window, no kernel needed
 │
 ├── topologies/                      # 3. SCENARIO DATA — one directory per network
 │   └── germany50/                   #    the network the checked-in model was trained on
@@ -134,7 +139,8 @@ ipa_lab/
 │
 └── docs/
     ├── testing.md                   # Test guide + measured results
-    ├── metodologia_test.tex/.pdf    # How this class of model is tested in the literature
+    ├── claims.md                    # Every claim, its evidence and how to re-run it
+    ├── quaderno_settembre.tex/.pdf  # Lab notebook: what was measured, and why
     └── tesi_ipa.tex                 # Thesis text
 ```
 

@@ -20,6 +20,8 @@
 \usepackage[hidelinks]{hyperref}
 
 \usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
 
 \definecolor{accent}{HTML}{1F3A5F}
 \definecolor{soft}{HTML}{6B7C93}
@@ -1379,8 +1381,8 @@ rende veloce --- il compilatore può far sparire le moltiplicazioni per zero e
 trasformare in scorrimenti quelle per potenze di due --- ma ha un prezzo: ogni
 volta che il modello cambia, bisogna \textbf{rieseguire il compilatore sul nodo}.
 
-Misurato in questa esecuzione: \textbf{1\,242 ms}. Più di un secondo in cui quel
-nodo non sta aggiornando niente.
+Misurato: \textbf{741 ms} nella sessione più recente, 1\,242 ms in una
+precedente. In quel tempo il nodo non sta aggiornando niente.
 
 L'alternativa è compilare \emph{prima}, su una macchina qualunque, e spedire al
 nodo l'oggetto già pronto. Al momento del deploy il nodo apre il file e lo carica,
@@ -1392,24 +1394,26 @@ senza compilatore:
 \toprule
 & \textbf{con compilatore sul nodo} & \textbf{oggetto precompilato} \\
 \midrule
-costo di messa in servizio & 1\,242 ms & 37 ms \\
-istruzioni & 1\,026 & 979 \\
-latenza per pacchetto & 73 ns & 74 ns \\
+costo di messa in servizio & 741 ms & 9--10 ms \\
+istruzioni & 1\,026 & 1\,011 \\
+latenza per pacchetto & 44 ns & 46 ns \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \begin{lezione}
-Due ordini di grandezza sul costo di aggiornamento, e \textbf{nessun costo per
-pacchetto}: 74 ns contro 73 ns è la stessa cifra, dentro il rumore misurato
-sopra. La riduzione fatta dal compilatore sui pesi letterali resta dentro
-l'oggetto.
+Quasi due ordini di grandezza sul costo di aggiornamento, e \textbf{nessun
+costo per pacchetto}: 46 ns contro 44 ns è la stessa cifra, dentro il rumore
+misurato sopra. La riduzione fatta dal compilatore sui pesi letterali resta
+dentro l'oggetto.
 \end{lezione}
 
-Una cautela sul numero 37: il costo di caricamento varia molto fra esecuzioni
---- sono stati osservati 4,7, 6,2, 20,7 e 37,2 ms per lo stesso oggetto. Quello
-che regge è l'\emph{ordine di grandezza} rispetto al secondo e un quarto del
-compilatore, non la cifra precisa.
+Una cautela sui numeri. La versione precedente di questa tabella riportava
+74 contro 73~ns: il 74 misurava un altro percorso (il pacchetto scadeva dopo poche
+decine di esecuzioni, vedi capitolo \ref{ch:altre}). E il costo di caricamento
+varia fra esecuzioni --- sono stati osservati da 4,7 a 37,2~ms per lo stesso
+oggetto. Quello che regge è l'\emph{ordine di grandezza} rispetto al compilatore,
+non la cifra precisa.
 
 Vale solo quando i modelli sono noti in anticipo, che è l'ipotesi sotto cui P1
 esiste.
@@ -2025,261 +2029,21 @@ del verificatore.
 \end{itemize}
 
 % ==================================================================
-\chapter{Misurare: tre banchi, tre domande}
+\chapter{Il costo del programma, misurato da solo}
+\label{ch:programma}
 % ==================================================================
 
-\section{La domanda, e perché non è una sola}
+Prima di mettere un programma in una rete conviene sapere quanto costa da solo.
+Qui lo strumento è \texttt{BPF\_PROG\_TEST\_RUN}: il kernel esegue il programma
+su un pacchetto preparato, in un ciclo, senza schede di rete, code o altri
+programmi di mezzo. È come cronometrare un cassiere mentre batte sempre lo
+stesso scontrino: misura il gesto, non la fila. La fila è l'argomento del
+capitolo \ref{ch:reale}.
 
-Fino a qui il costo di una pipeline è stato contato in istruzioni eBPF. È una
-misura onesta ma statica: dice quanto è grande il programma caricato, non
-quanto tempo impiega un pacchetto ad attraversarlo. E le due cose divergono,
-perché Pipeline~1 srotola uno \emph{switch} da 52 casi di cui ne esegue
-esattamente uno.
-
-La domanda vera è: \emph{quanto costa, in nanosecondi, far passare un
-pacchetto attraverso l'inferenza?} E subito dietro ne arriva una seconda, che
-sembra la stessa e non lo è: \emph{quanti pacchetti al secondo regge il nodo?}
-
-Sono due domande diverse e vanno misurate da banchi diversi. Confonderle è
-l'errore che questo capitolo racconta per primo, perché lo abbiamo commesso.
-
-\section{Tre banchi, e che cosa misura ciascuno}
-
-\begin{center}
-\small
-\begin{tabular}{@{}p{3.3cm}p{5.3cm}p{5.3cm}@{}}
-\toprule
-\textbf{Banco} & \textbf{Che cosa attraversa il pacchetto} &
-\textbf{A che domanda risponde} \\
-\midrule
-\texttt{test\_suite}\newline{\footnotesize(\texttt{BPF\_PROG\_TEST\_RUN})} &
-Solo il programma eBPF, invocato dal kernel in un ciclo. Nessuna scheda,
-nessuna coda, nessun NAPI. &
-Quanto costa il programma \emph{isolato}, nel modo più pulito che il kernel
-permetta. \\
-\addlinespace
-\texttt{bench\_throughput}\newline{\footnotesize(\texttt{-{}-mode rates})} &
-Il percorso vero: \texttt{pktgen} $\to$ veth $\to$ XDP nativo $\to$ inferenza
-$\to$ \texttt{bpf\_redirect} $\to$ veth $\to$ NAPI. &
-Quanto costa sotto traffico reale, e quanto di quel costo è la pipeline e
-quanto il trasporto. \\
-\addlinespace
-\texttt{bench\_throughput}\newline{\footnotesize(\texttt{-{}-mode generator})} &
-Lo stesso percorso \textbf{senza nessuna pipeline}: solo un contatore che
-scarta. &
-Qual è il tetto della via di ricezione, cioè quanto reggerebbe il banco anche
-se l'inferenza costasse zero. \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\begin{lezione}
-I tre risultati vanno tenuti concettualmente separati e non vanno moltiplicati
-fra loro. In particolare \textbf{latenza $\times$ pacchetti al secondo non è il
-throughput reale}, e un limite osservato nella portata non è, di per sé, un
-limite del modello.
-\end{lezione}
-
-% ------------------------------------------------------------------
-\section{Il problema: un numero solo teneva insieme due costi}
-
-La prima versione del banco sul percorso reale misurava una cosa sola: il tempo
-fra l'ingresso del programma XDP e la sua uscita, e lo chiamava «latenza della
-pipeline». Non lo era. Dentro quella cifra c'erano due costi che non si
-sommano per caso ma per costruzione:
-
-\begin{itemize}[leftmargin=1.2em]
-  \item l'inferenza vera e propria --- lettura delle feature, moltiplicazioni,
-        argmax, scelta della classe;
-  \item il \emph{trasporto} --- il \texttt{bpf\_redirect}, la consegna all'altro
-        capo del veth, il risveglio di NAPI dall'altra parte.
-\end{itemize}
-
-Il secondo non dipende dalla pipeline: è lo stesso per tutte e cinque. Ma
-essendo dell'ordine dei 200~ns, sommato a una baseline da 27~ns la copriva
-quasi del tutto. La tabella che ne usciva diceva «baseline 202~ns», e chiunque
-la leggesse concludeva che il \emph{parsing} di un pacchetto costa 202~ns. Non
-è vero: ne costa 27.
-
-\section{La soluzione: tre marcature temporali}
-
-Tre chiamate a \texttt{bpf\_ktime\_get\_ns()}, in celle per-CPU, in tre punti
-precisi del datapath:
-
-\begin{center}
-\small
-\begin{tabular}{@{}llp{7.6cm}@{}}
-\toprule
-\textbf{Marca} & \textbf{Dove} & \textbf{Che cosa delimita} \\
-\midrule
-$T_1$ & ingresso del dispatcher & prima che il pacchetto sia guardato \\
-$T_2$ & subito prima di \texttt{bpf\_redirect} & dopo parse, inferenza e scelta
-        della classe \\
-$T_3$ & ingresso del contatore, dall'altra parte & dopo redirect, veth e NAPI \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Da cui tre grandezze, non più una:
-
-\begin{center}
-\small
-\begin{tabular}{@{}ll@{}}
-\toprule
-$T_2 - T_1$ & il costo della \textbf{pipeline}: è questo il numero del modello \\
-$T_3 - T_2$ & il costo del \textbf{trasporto}: redirect, veth, NAPI \\
-$T_3 - T_1$ & la latenza \textbf{da arrivo a partenza} \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Che la separazione funzioni si può verificare senza fidarsi: il redirect è
-sincrono e avviene sullo stesso core, quindi una cella per-CPU sopravvive alla
-catena di \emph{tail call} e al redirect stesso. E il controllo decisivo è che
-$T_3 - T_2$ \emph{non deve} dipendere dalla pipeline. Non ne dipende.
-
-\section{Il risultato: la pipeline costa da 27 a 271 nanosecondi}
-\label{sec:confronto-mpps}
-
-Cinque pipeline, sei rate da 0,5 a 3,0 Mpps, tre giri, frame da 64~byte,
-generatore su due core e nodo su un terzo, NAPI in thread. Mediana fra i giri:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-\textbf{Pipeline} & \textbf{$T_2-T_1$} & \textbf{sopra baseline} &
-\textbf{$T_3-T_2$} & \textbf{$T_3-T_1$} \\
-\midrule
-baseline    &  27 ns & ---     & 195 ns & 224 ns \\
-p1\_static  &  50 ns & $+23$   & 213 ns & 268 ns \\
-hardcoded   &  57 ns & $+30$   & 212 ns & 275 ns \\
-template    & 183 ns & $+156$  & 210 ns & 405 ns \\
-modular     & 271 ns & $+244$  & 219 ns & 509 ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Due cose vanno dette su questa tabella.
-
-La prima è la \textbf{stabilità}. Questi valori si sono riprodotti identici su
-quattro sweep indipendenti, a giorni diversi, con scarti di uno o due
-nanosecondi. È la misura più stabile dell'intero progetto. E sono piatti sul
-rate: \texttt{baseline} fa 27~ns a 0,5~Mpps e 27~ns a 3,0~Mpps. Il costo della
-pipeline non degrada sotto carico nell'intervallo esplorato.
-
-La seconda è che la colonna $T_3-T_2$ sta fra 195 e 219~ns \emph{per tutte e
-cinque}, senza correlazione con il lavoro che la pipeline fa. È la prova che le
-due metà misurano cose diverse: se la separazione fosse mal fatta, il costo
-dell'inferenza colerebbe nel trasporto.
-
-\begin{prima}[Una cifra che era gonfiata]
-La versione precedente di questo capitolo concludeva che «leggere il
-descrittore a runtime costa circa 200~ns per pacchetto». Quel numero veniva da
-una differenza fra due latenze \emph{da arrivo a partenza} ($400-202$), ognuna
-delle quali conteneva il proprio trasporto. Con $T_2-T_1$ la stessa differenza
-è \textbf{156~ns} ($183-27$). Il costo della genericità di Pipeline~2 resta
-grande, ma era sovrastimato del 27\%.
-\end{prima}
-
-Passare dal descrittore letto a runtime alla catena di \emph{tail call} di
-Pipeline~3 costa altri 88~ns ($271-183$).
-
-% ------------------------------------------------------------------
-\section{Il problema della portata: il generatore non consegnava}
-
-La stessa campagna riporta anche i pacchetti al secondo, e per lungo tempo
-quella colonna è stata letta come «throughput della pipeline». Non lo è, e
-adesso il banco lo dice da solo.
-
-Lo sweep a sei rate ha dato \textbf{perdita dello 0,000\% ovunque}: nessuna
-pipeline ha perso un pacchetto, nemmeno al rate più alto. Ma la
-\emph{resa} --- il rapporto fra quello che si è chiesto a \texttt{pktgen} e
-quello che ha davvero consegnato --- non ha mai superato il 68\%, e al rate più
-basso era 65\%:
-
-\begin{center}
-\small
-\begin{tabular}{@{}rrrr@{}}
-\toprule
-\textbf{chiesto} & \textbf{consegnato} & \textbf{resa} & \textbf{perdita} \\
-\midrule
-0,50 Mpps & 0,33 Mpps & 65\% & 0,000\% \\
-1,00 Mpps & 0,64 Mpps & 64\% & 0,000\% \\
-2,00 Mpps & 1,00 Mpps & 50\% & 0,000\% \\
-3,00 Mpps & 1,27 Mpps & 42\% & 0,000\% \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\emph{(riga \texttt{baseline}; le altre quattro hanno lo stesso andamento.)}
-
-Una resa bassa non è perdita del nodo: è carico che non è mai partito. La causa
-si legge in un'altra colonna, i \emph{respinti}: il \texttt{ptr\_ring} del veth
-è fissato a \texttt{VETH\_RING\_SIZE} descrittori e \texttt{veth\_xmit}
-risponde \texttt{NET\_XMIT\_DROP} appena è pieno. \texttt{pktgen} ritenta, il
-tempo di parete si allunga, e il rate consegnato crolla.
-
-\begin{lezione}
-Con perdita nulla ovunque, il «throughput sostenibile» di quello sweep non è
-una capacità del nodo: è un \textbf{limite inferiore} fissato dal generatore.
-Il banco ora lo stampa come tale, con due avvertimenti espliciti, e il numero
-va citato come $\geq$.
-\end{lezione}
-
-\section{La soluzione: un test di controllo senza pipeline}
-
-Per sapere se a fermarsi fosse il nodo o il banco serviva un termine di
-paragone: lo stesso percorso, lo stesso generatore, le stesse code, ma
-\textbf{senza nessuna inferenza} --- solo un programma XDP che conta e scarta.
-È la modalità \texttt{-{}-mode generator}.
-
-Cinque giri, sei bersagli da 8 a 25~Mpps:
-
-\begin{center}
-\small
-\begin{tabular}{@{}rrrrr@{}}
-\toprule
-\textbf{bersaglio} & \textbf{offerti} & \textbf{accettati} &
-\textbf{respinti} & \textbf{perdita} \\
-\midrule
- 8 Mpps & 4,76 Mpps & 3,15 Mpps & 33\% & 0,00\% \\
-12 Mpps & 5,12 Mpps & 3,39 Mpps & 34\% & 0,00\% \\
-20 Mpps & 5,25 Mpps & 3,40 Mpps & 35\% & 0,00\% \\
-25 Mpps & 5,46 Mpps & 3,74 Mpps & 33\% & 0,00\% \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Il generatore mette stabilmente circa 5~Mpps sul filo. Il veth ne accetta 3,4.
-Un terzo viene rifiutato \emph{all'ingresso}. E di quello che entra non si
-perde niente: \texttt{RX} è identico a \texttt{TX} su tutte e 29 le righe.
-
-\textbf{Il tetto della via di ricezione è 3,7~Mpps}, e non ha niente a che
-vedere con l'inferenza.
-
-\begin{prima}[Perché una coda più grande non servirebbe]
-Il disavanzo fra offerto e accettato è circa 1,7~Mpps e dura per tutta la
-finestra: sono mezzo milione di pacchetti da assorbire. Una coda assorbe
-picchi, non uno squilibrio di rate che persiste. Per ingoiare una finestra sola
-servirebbero mezzo milione di descrittori, e alla fine sarebbe piena comunque.
-La profondità della coda compra latenza, non banda: il throughput stazionario
-lo decide il drenaggio, che qui è un thread NAPI su un core. Ingrandire il ring
-convertirebbe i rifiuti in attesa in coda, gonfiando $T_3-T_2$ e rovinando la
-misura più stabile che abbiamo.
-\end{prima}
-
-Conseguenza: le cinque pipeline, che nello sweep stavano fra 1,1 e 1,4~Mpps
-consegnati con perdita nulla, avevano ancora circa $2\times$ di margine prima di
-toccare il tetto del banco. Il loro ginocchio non è mai stato raggiunto.
-
-\begin{prima}[Un controllo incrociato che torna]
-Il budget per pacchetto del tetto di ricezione (3,41~Mpps $=$ 293~ns) e quello
-della \texttt{baseline} sotto traffico (1,82~Mpps $=$ 549~ns) differiscono di
-256~ns. La somma $T_2-T_1$ più $T_3-T_2$ della \texttt{baseline}, misurata in
-modo del tutto indipendente, vale 224~ns. Le due strade concordano entro il
-14\%.
-\end{prima}
+Questo capitolo è rimasto com'era, perché le sue misure non sono toccate dai
+difetti trovati sul test reale. Una sola precisazione: qui P1 è misurata con il
+build BCC; l'oggetto AOT che va sui nodi costa uguale entro il rumore (46 contro
+44~ns, capitolo \ref{ch:altre}).
 
 % ------------------------------------------------------------------
 \section{La campagna sulle architetture}
@@ -2571,29 +2335,772 @@ mossi di un'unità prima e dopo la correzione è la prova che questa ha toccato
 solo il cronometro, non i programmi.
 \end{prima}
 
-\section{Che cosa questi numeri non dicono}
 
-\begin{itemize}[leftmargin=1.2em]
-  \item \textbf{Le cifre assolute valgono per questo percorso, non per una
-        NIC.} Generatore, nodo e contatore stanno sulla stessa macchina
-        virtuale; il veth e la copia di \emph{headroom} --- \texttt{pktgen}
-        riserva 64~byte, XDP su veth ne pretende 256 --- restano dentro ogni
-        numero. I \emph{rapporti} fra pipeline sono la parte che sopravvive a
-        un cambio di macchina.
-  \item \textbf{Il throughput assoluto non è misurabile qui.} L'host è un
-        processore ibrido a core prestazionali ed efficienti, e il guest non
-        vede la frequenza. Su quale tipo di core cade il thread del generatore
-        non lo decidiamo noi, e la dispersione fra giri identici arriva a un
-        fattore quattro.
-  \item \textbf{La build strumentata non è quella di produzione.} Le misure di
-        $T_1$, $T_2$, $T_3$ aggiungono due letture dell'orologio e due
-        scritture per pacchetto. Se qualcosa, quindi, $T_2-T_1$ è leggermente
-        gonfiato.
-  \item \textbf{Il ginocchio delle pipeline non è stato trovato.} Con perdita
-        nulla a ogni rate provato, ogni cifra di throughput è un limite
-        inferiore. Per trovarlo servirebbe un generatore che consegni più di
-        quanto la via di ricezione accetti, e su quattro CPU non c'è.
+% ==================================================================
+\chapter{Il test reale: quanto costa un pacchetto al nodo}
+\label{ch:reale}
+% ==================================================================
+
+Questo capitolo è stato riscritto da capo il 23 settembre. La versione
+precedente conteneva conclusioni che le misure successive hanno smentito, e
+correggerle una per una avrebbe reso il testo illeggibile. In fondo al capitolo
+c'è una tabella che mette le cifre vecchie accanto a quelle nuove.
+
+\section{La domanda, in parole semplici}
+
+Un nodo della rete riceve pacchetti, per ognuno esegue la rete neurale, decide
+da quale porta farlo uscire, e lo spedisce. La domanda è: \textbf{quanto tempo
+spende il nodo su ogni pacchetto}, dal momento in cui lo prende al momento in
+cui lo ha consegnato all'uscita?
+
+\begin{prima}[Un'immagine per tutto il capitolo: la cassa del supermercato]
+Il nodo è un \textbf{cassiere}. I pacchetti sono i \textbf{clienti}. Il
+generatore di traffico è la porta da cui entrano i clienti, e il collegamento
+virtuale fra generatore e nodo è il \textbf{nastro} su cui i clienti aspettano:
+ha 256 posti, e quando è pieno chi arriva viene mandato via.
+
+La domanda del capitolo è \emph{quanti secondi spende il cassiere per ogni
+cliente}. Il modo più semplice di saperlo è far arrivare più clienti di quanti
+il cassiere riesca a servire, così che il nastro non sia mai vuoto, e contare
+quanti ne serve in un secondo. Se ne serve 5 milioni al secondo, spende
+$1/5\,000\,000$ di secondo a cliente, cioè 200 nanosecondi.
+\end{prima}
+
+Il numero che cerchiamo è quindi il \textbf{costo per pacchetto in
+nanosecondi} (ns; un nanosecondo è un miliardesimo di secondo). Si ottiene così:
+\[
+  \text{costo per pacchetto} \;=\; \frac{1\ \text{secondo}}{\text{pacchetti elaborati in un secondo}} .
+\]
+Quando il nodo lavora senza sosta, e sul banco lo si fa apposta, questo numero
+è esattamente il tempo che il nodo spende su ciascun pacchetto.
+
+\section{Com'è fatto il banco}
+
+Tutto sta su una sola macchina virtuale con quattro processori (CPU). Per non
+misurare una cosa per un'altra, ogni parte ha il suo processore:
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=5mm,
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=11mm,
+              text width=22mm,align=center,inner sep=4pt,font=\small},
+  dut/.style={box,fill=accent!12,draw=accent,thick},
+  arr/.style={-{Stealth[length=5pt]},draw=soft,thick},
+  lab/.style={font=\scriptsize\color{soft},align=center}
+]
+\node[box] (g) {generatore\\\footnotesize(CPU 1 e 2)};
+\node[box,right=10mm of g,text width=16mm] (c1) {coda\\\footnotesize 256 posti};
+\node[dut,right=10mm of c1] (n) {\textbf{nodo}\\\footnotesize programma XDP\\(CPU 3)};
+\node[box,right=10mm of n,text width=16mm] (c2) {coda\\\footnotesize d'uscita};
+\node[box,right=10mm of c2] (r) {nodo successivo\\\footnotesize(contatore, CPU 0)};
+\draw[arr] (g) -- (c1);
+\draw[arr] (c1) -- (n);
+\draw[arr] (n) -- (c2);
+\draw[arr] (c2) -- (r);
+\node[lab,below=2mm of c1] {se è piena:\\\textbf{respinto}};
+\node[lab,above=2mm of n] {ciò che misuriamo};
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{Il generatore} crea pacchetti uguali a quelli veri: stesso formato,
+        stesso header IPA, stesso modello da eseguire.
+  \item \textbf{La coda d'ingresso} è quella di un \emph{veth}, il cavo virtuale di
+        Linux. Ha 256 posti e la sua dimensione non si può cambiare.
+  \item \textbf{Il nodo} è una delle pipeline (baseline, P1, P1.5, P2, P3) caricata
+        in XDP sul processore 3. È l'unica cosa che si vuole misurare.
+  \item \textbf{Il nodo successivo} è un programma che conta i pacchetti arrivati e
+        li butta. Rappresenta chi riceve il pacchetto dopo di noi.
 \end{itemize}
+
+Oltre alle cinque pipeline il banco misura, nella stessa sessione, un sesto
+programma di riferimento: \textbf{\texttt{rxonly}}, che prende il pacchetto dalla
+coda e lo butta senza guardarlo. Non fa niente, quindi dice quanto costa
+\emph{soltanto ricevere}: è il pavimento sotto il quale nessuna pipeline può
+scendere.
+
+\section{Le cinque trappole}
+
+Arrivare a un numero affidabile ha richiesto di trovare e togliere cinque
+difetti di misura. Nessuno riguardava le pipeline: tutti facevano sembrare il
+nodo diverso da com'è. Vengono raccontati nell'ordine in cui sono stati
+scoperti, perché ognuno era nascosto dal precedente.
+
+\subsection*{Trappola 1 --- Il cronometro partiva prima dei clienti}
+
+Il generatore del kernel, \texttt{pktgen}, si avvia con un comando che
+\emph{blocca} finché la trasmissione non è finita. Il banco misurava la durata
+di quel blocco e ci divideva i pacchetti. Ma il blocco non dura quanto la
+trasmissione: \texttt{pktgen} aspetta sempre 125 millisecondi fissi prima di
+partire, i suoi thread si accorgono del via con fino a 100~ms di ritardo, e alla
+fine controlla ogni 100~ms se hanno finito. In tutto, fino a circa
+\textbf{225~ms di tempo morto} su finestre di misura da 300~ms.
+
+È come cronometrare un cassiere facendo partire il cronometro quando si apre il
+negozio invece che quando entra il primo cliente: il cassiere sembra più lento
+di quello che è, e di una quantità che cambia ogni volta.
+
+\textbf{La firma nei dati} era evidente, una volta saputo dove guardare: nello
+stesso run, tre giri diversi davano 1\,240\,424, 1\,238\,514 e 1\,240\,533
+pacchetti al secondo. Tre numeri quasi identici, perché erano sempre lo stesso
+conteggio diviso lo stesso tempo morto, arrotondato a passi da 100~ms.
+
+\textbf{Il rimedio} è la \emph{finestra stazionaria}. Si aspetta che tutti i
+thread del generatore stiano trasmettendo, si lascia assestare la coda, si
+leggono i contatori, si aspettano 300~ms, si rileggono, e solo allora si ferma
+il generatore. Il rate è la differenza fra le due letture divisa per il tempo
+fra le due letture. L'avvio e la chiusura restano fuori per costruzione.
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.82\textwidth, height=5.2cm,
+  ybar, bar width=14pt,
+  ylabel={milioni di pacchetti/s},
+  symbolic x coords={giro 1,giro 2,giro 3},
+  xtick=data, ymin=0, ymax=4.2,
+  legend style={at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,font=\small},
+  nodes near coords, every node near coord/.append style={font=\scriptsize},
+  nodes near coords align={vertical},
+  axis line style={draw=rule}, tick style={draw=rule},
+  ymajorgrids, grid style={draw=rule!60},
+]
+\addplot[fill=bad!60,draw=bad] coordinates {(giro 1,1.575) (giro 2,2.156) (giro 3,2.338)};
+\addplot[fill=good!60,draw=good] coordinates {(giro 1,3.370) (giro 2,3.409) (giro 3,3.452)};
+\legend{cronometro vecchio (tempo morto incluso),finestra stazionaria}
+\end{axis}
+\end{tikzpicture}\\[-2pt]
+{\footnotesize\color{soft} Stessa pipeline (P1.5), stessi parametri, due run uno dopo l'altro. Con il cronometro
+vecchio i giri variano del 48\%, con la finestra stazionaria del 2\%.}
+\end{center}
+
+\subsection*{Trappola 2 --- Il cronometro che si fermava a metà lettura}
+
+Anche con la finestra stazionaria, al primo run vero una finestra ha dato 5,33
+milioni di pacchetti al secondo mentre tutte le altre ne davano 3,4. La causa
+sta nella macchina: l'host può sospendere la macchina virtuale per qualche
+decina di millisecondi quando vuole. Se lo fa proprio mentre il banco legge i
+contatori, i contatori vanno avanti e l'orologio della misura no.
+
+\textbf{Il rimedio}: ogni lettura (generatore più nodo) deve durare meno di
+3~ms; se dura di più viene rifatta, e le si attribuisce l'istante a metà. Un
+test senza kernel, con un generatore simulato che riproduce i tempi di
+\texttt{pktgen}, lo verifica: simulando una sospensione di 150~ms dentro una
+lettura, il rate esce giusto entro il 2\%. Togliendo la rilettura, esce sbagliato
+del 20\%.
+
+\subsection*{Trappola 3 --- I clienti mandati via non erano contati}
+
+Quando la coda d'ingresso è piena, il collegamento virtuale rifiuta il pacchetto
+(«respinto»). Una parte del banco contava solo i pacchetti \emph{entrati}, e così
+scriveva «perdita 0,00\%» anche quando metà del traffico veniva respinto.
+
+Ma un pacchetto respinto è un pacchetto che il nodo non ha preso, perché non
+svuotava la coda abbastanza in fretta: \textbf{è una perdita del nodo}, non del
+generatore. Ora il banco li conta sempre e li mostra separati:
+\begin{itemize}
+  \item \textbf{respinti} --- mai entrati, la coda era piena;
+  \item \textbf{persi dopo l'ingresso} --- entrati ma non usciti.
+\end{itemize}
+Questa seconda colonna è rimasta fra lo 0,00 e lo 0,07\% in tutti i run: di ciò
+che le pipeline prendono, non perdono praticamente niente.
+
+\subsection*{Trappola 4 --- Il generatore faceva lavorare il nodo}
+
+\texttt{pktgen} crea i pacchetti come li crea lo stack di rete di Linux: in una
+struttura chiamata \emph{skb}. Il programma XDP però vuole il pacchetto
+«grezzo», con 256 byte liberi davanti; \texttt{pktgen} ne lascia 64. Per ogni
+pacchetto, quindi, il collegamento virtuale deve \textbf{copiarlo} in un'altra
+zona di memoria prima di darlo al nodo. E quella copia la paga il processore
+del nodo.
+
+Su una scheda di rete vera con XDP nativo quella copia non esiste: il driver
+consegna il pacchetto già grezzo. Stavamo misurando un costo del banco come se
+fosse del nodo.
+
+\textbf{Il rimedio} è un secondo generatore, scritto apposta
+(\texttt{ipa/test/xdp\_gen.py}). Usa una funzione del kernel
+(\texttt{BPF\_PROG\_TEST\_RUN} in modalità \emph{live frames}) che crea pacchetti
+già grezzi e li spinge nel collegamento: niente skb, niente copia. I pacchetti
+sono identici a quelli di \texttt{pktgen}, byte per byte nei campi che le
+pipeline leggono.
+
+Il risultato sul solo \texttt{rxonly}, cioè sul costo di ricevere:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{pacchetti al secondo} & \textbf{costo per pacchetto} \\
+\midrule
+con \texttt{pktgen} (skb + copia) & 4,6--4,8 milioni & circa 210 ns \\
+con frame grezzi                 & 17,5--20,2 milioni & circa 50 ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Circa tre quarti del costo di ricezione misurato con \texttt{pktgen} erano la
+copia.
+
+\begin{prima}[Un difetto del generatore nuovo, trovato e tolto]
+Al primo run il generatore nuovo dava numeri molto dispersi (fino a $\pm$88\%) e
+un fatto strano: più il generatore riusciva a offrire, più il nodo sembrava
+veloce, come se fossero legati. La causa: il kernel ricicla le pagine di memoria
+dei pacchetti da una riserva che, con le impostazioni di default, ne tiene solo
+64 e viene ricreata ogni 65\,536 pacchetti. Le pipeline tengono in circolo molti
+più pacchetti di così, e la riserva si svuotava. Portando la riserva al massimo
+consentito (256) e le chiamate a un milione di pacchetti, la dispersione è
+scesa a pochi punti percentuali.
+
+C'era anche un errore mio: i primi pacchetti erano lunghi 60 byte invece di 64,
+perché avevo tolto 4 byte di troppo. L'header IPA ne vuole 21 e ne restavano
+18: le pipeline scartavano il pacchetto come malformato. Se ne è accorta la
+\emph{sonda} che il banco esegue prima di misurare, e che esclude una pipeline
+che non riconosce il pacchetto invece di misurarle un lavoro che non fa.
+\end{prima}
+
+\subsection*{Trappola 5 --- Il nodo successivo lavorava sul processore del nodo}
+
+Nel banco il nodo successivo, cioè il contatore d'uscita, girava sullo stesso
+processore del nodo. Ogni pacchetto inoltrato costava quindi al processore 3
+anche la \emph{ricezione dall'altra parte}: come se il cassiere, dopo ogni
+cliente, dovesse anche imbustargli la spesa.
+
+\textbf{Il rimedio}: il contatore d'uscita gira ora su un altro processore
+(opzione \texttt{-{}-egress-cpu 0}). Sul processore del nodo resta solo il lavoro
+del nodo: prendere il pacchetto dalla coda, eseguire la rete, decidere,
+accodarlo sull'uscita.
+
+Il nodo successivo, su un processore che fa anche altro, a volte non tiene il
+passo e perde qualche pacchetto (dallo 0,2 al 4,5\%). Il nodo quei pacchetti li ha
+comunque elaborati, quindi il costo si calcola dai \textbf{pacchetti elaborati}
+dal programma (qualunque sia la decisione), non da quelli arrivati dall'altra
+parte.
+
+\begin{prima}[Perché con \texttt{pktgen} questo non funziona]
+Separando l'uscita con \texttt{pktgen} il nodo è diventato \emph{più lento}
+(da 4,0 a 2,2 milioni al secondo), invece che più veloce. L'ipotesi, non
+verificabile dal repository: con \texttt{pktgen} il nodo successivo resta spesso
+senza lavoro e si addormenta, e ogni volta il nodo deve svegliarlo da un altro
+processore, cosa che su una macchina virtuale costa molto. Con i frame grezzi il
+nodo successivo non si addormenta mai. Per questo la misura del costo del nodo
+si fa \textbf{solo} con il generatore nuovo.
+\end{prima}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=6.4cm,
+  ybar, bar width=7pt,
+  ylabel={ns per pacchetto},
+  symbolic x coords={solo ricezione,baseline,P1 statica,P1.5,P2,P3},
+  xtick=data, ymin=0, ymax=640,
+  x tick label style={font=\small},
+  legend style={at={(0.5,1.03)},anchor=south,legend columns=3,draw=none,font=\scriptsize},
+  axis line style={draw=rule}, tick style={draw=rule},
+  ymajorgrids, grid style={draw=rule!60},
+]
+\addplot[fill=soft!45,draw=soft] coordinates
+  {(solo ricezione,209.7) (baseline,249.9) (P1 statica,269.0) (P1.5,285.4) (P2,451.6) (P3,580.8)};
+\addplot[fill=accent!35,draw=accent] coordinates
+  {(solo ricezione,50.5) (baseline,219.3) (P1 statica,269.6) (P1.5,271.2) (P2,432.4) (P3,544.4)};
+\addplot[fill=good!60,draw=good] coordinates
+  {(solo ricezione,51.7) (baseline,117.0) (P1 statica,169.9) (P1.5,168.1) (P2,335.0) (P3,493.0)};
+\legend{\texttt{pktgen},frame grezzi,frame grezzi + uscita separata}
+\end{axis}
+\end{tikzpicture}\\[-2pt]
+{\footnotesize\color{soft} Costo per pacchetto sul processore del nodo, 64 byte, a
+saturazione. Da sinistra a destra in ogni gruppo si tolgono le due contaminazioni: la
+copia del generatore e il nodo successivo. La terza barra è il costo del nodo.}
+\end{center}
+
+\section{Il risultato: quanto costa un pacchetto}
+
+Con le cinque trappole tolte, il costo per pacchetto sul processore del nodo,
+dalla presa del pacchetto alla consegna sull'uscita, è questo (5 giri, pacchetti
+da 64 byte, controllo di validità superato):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Pipeline} & \textbf{costo per pacchetto} & \textbf{sopra la baseline} &
+\textbf{pacchetti/s per CPU} \\
+\midrule
+baseline (nessuna rete)  & 117 ns & ---      & 8,5 milioni \\
+P1 statica               & 170 ns & $+53$ ns & 5,9 milioni \\
+P1.5 (hardcoded)         & 168 ns & $+51$ ns & 6,0 milioni \\
+P2 (template)            & 335 ns & $+218$ ns & 3,0 milioni \\
+P3 (modular)             & 493 ns & $+376$ ns & 2,0 milioni \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+La \textbf{baseline} riceve, legge l'intestazione, decrementa il TTL e inoltra:
+117~ns. Tutto ciò che le pipeline aggiungono sopra è \textbf{il costo della rete
+neurale}: circa 50~ns quando i pesi sono scritti nel programma (P1, P1.5), circa
+220~ns quando la forma della rete è letta da una tabella (P2), circa 375~ns quando
+anche la profondità lo è (P3). Una rete configurabile a runtime costa quindi fra
+3 e 4 volte la baseline; una compilata, 1,4 volte.
+\end{lezione}
+
+\subsection*{Il programma, e tutto il resto}
+
+Il capitolo precedente misurava il solo programma, con tre marcature di tempo
+dentro il datapath ($T_2-T_1$: dall'ingresso del programma all'istante prima di
+inoltrare). Mettendo le due misure una accanto all'altra si vede quanto del costo
+del nodo è il programma e quanto è ricezione e inoltro:
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.9\textwidth, height=6.2cm,
+  xbar stacked, bar width=11pt,
+  xlabel={ns per pacchetto},
+  symbolic y coords={P3,P2,P1.5,P1 statica,baseline},
+  ytick=data, xmin=0, xmax=540,
+  legend style={at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,font=\small},
+  axis line style={draw=rule}, tick style={draw=rule},
+  xmajorgrids, grid style={draw=rule!60},
+  nodes near coords={\pgfmathprintnumber{\pgfplotspointmeta}},
+  every node near coord/.append style={font=\scriptsize,color=black},
+]
+\addplot[fill=accent!55,draw=accent] coordinates
+  {(27,baseline) (50,P1 statica) (57,P1.5) (183,P2) (271,P3)};
+\addplot[fill=soft!35,draw=soft] coordinates
+  {(90,baseline) (120,P1 statica) (111,P1.5) (152,P2) (222,P3)};
+\legend{{il programma ($T_2-T_1$, minimo)},{ricezione e inoltro (il resto)}}
+\end{axis}
+\end{tikzpicture}
+\end{center}
+
+La parte «resto» cresce con la complessità della pipeline (da 90 a 222~ns). Non è
+un errore: $T_2-T_1$ è il \emph{minimo} osservato, il caso più fortunato, mentre il
+costo del nodo è la \emph{media} sotto carico continuo, dove letture di tabella e
+salti fra programmi costano di più perché la memoria veloce del processore è
+contesa. \textbf{Per dimensionare un nodo vale il costo del nodo}; per capire dove
+va il tempo dentro il programma vale $T_2-T_1$.
+
+\section{Quanto è solido questo numero}
+
+Un numero misurato una volta sola su una macchina virtuale non vale molto. Lo
+stesso costo è stato misurato cambiando, una alla volta, le condizioni che
+potevano spostarlo.
+
+\subsection*{Da una sessione all'altra}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Pipeline} & \textbf{sessione 1} & \textbf{sessione 2} & \textbf{sessione 3}
+& \textbf{sessione 4} \\
+\midrule
+baseline   & 117 & 121 & 121 & 122 \\
+P1 statica & 170 & 164 & 169 & 165 \\
+P1.5       & 168 & 169 & 171 & 169 \\
+P2         & 335 & 341 & 347 & 312 \\
+P3         & 493 & 493 & 497 & 466 \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize\color{soft} ns per pacchetto, 64 byte. Quattro sessioni dello stesso giorno con
+condizioni diverse (pacchetto fisso, TTL variabile, taglie diverse, classe 0).}
+\end{center}
+
+Le differenze stanno entro circa il $\pm$5\%. E la parte che conta di più, cioè
+quanto le pipeline costano \emph{sopra la baseline}, si ripete anche con il
+generatore vecchio: P2 +202, +213, +215, +218~ns in quattro run; P3 +331, +325,
++364, +376~ns.
+
+\subsection*{Con pacchetti di taglia diversa}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.9\textwidth, height=5.6cm,
+  ybar, bar width=8pt,
+  ylabel={ns per pacchetto},
+  symbolic x coords={baseline,P1 statica,P1.5,P2,P3},
+  xtick=data, ymin=0, ymax=600,
+  legend style={at={(0.5,1.03)},anchor=south,legend columns=3,draw=none,font=\small},
+  axis line style={draw=rule}, tick style={draw=rule},
+  ymajorgrids, grid style={draw=rule!60},
+]
+\addplot[fill=accent!25,draw=accent] coordinates
+  {(baseline,121.4) (P1 statica,168.6) (P1.5,170.5) (P2,346.5) (P3,496.8)};
+\addplot[fill=accent!55,draw=accent] coordinates
+  {(baseline,122.3) (P1 statica,170.9) (P1.5,175.6) (P2,345.0) (P3,520.3)};
+\addplot[fill=accent!85,draw=accent] coordinates
+  {(baseline,123.0) (P1 statica,169.1) (P1.5,176.7) (P2,348.1) (P3,511.9)};
+\legend{64 byte,512 byte,1514 byte}
+\end{axis}
+\end{tikzpicture}
+\end{center}
+
+Il costo non cambia con la taglia del pacchetto. È quello che succede su una
+scheda di rete vera con XDP nativo: il nodo guarda solo l'intestazione, che è
+lunga uguale in un pacchetto piccolo e in uno grande. Quindi il costo è
+\emph{per pacchetto}, e il traffico in bit al secondo cresce con la taglia.
+
+\subsection*{Con decisioni diverse}
+
+Un pacchetto sempre uguale fa decidere alla rete sempre la stessa cosa: una sola
+porta d'uscita, sempre la stessa voce di tabella. Per vedere se il costo cambia
+con la decisione, il banco (opzione \texttt{-{}-per-class}) cerca per ogni classe
+che il modello sa produrre uno stato dei collegamenti che la faccia scegliere, lo
+imposta su tutte le pipeline e misura. Alla fine controlla che ogni pipeline
+abbia davvero deciso la classe voluta: lo hanno fatto tutte, in tutte e sei le
+classi.
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=6cm,
+  ybar, bar width=5pt,
+  ylabel={ns per pacchetto},
+  symbolic x coords={baseline,P1 statica,P1.5,P2,P3},
+  xtick=data, ymin=0, ymax=600,
+  legend style={at={(0.5,1.03)},anchor=south,legend columns=6,draw=none,font=\scriptsize},
+  axis line style={draw=rule}, tick style={draw=rule},
+  ymajorgrids, grid style={draw=rule!60},
+]
+\addplot[fill=accent!15,draw=accent] coordinates
+  {(baseline,122.1) (P1 statica,164.9) (P1.5,168.7) (P2,311.9) (P3,465.8)};
+\addplot[fill=accent!30,draw=accent] coordinates
+  {(baseline,132.2) (P1 statica,171.2) (P1.5,173.1) (P2,307.2) (P3,501.9)};
+\addplot[fill=accent!45,draw=accent] coordinates
+  {(baseline,147.4) (P1 statica,169.1) (P1.5,175.1) (P2,313.6) (P3,484.9)};
+\addplot[fill=accent!60,draw=accent] coordinates
+  {(baseline,116.8) (P1 statica,174.9) (P1.5,167.9) (P2,310.5) (P3,490.5)};
+\addplot[fill=accent!80,draw=accent] coordinates
+  {(baseline,124.3) (P1 statica,176.4) (P1.5,177.3) (P2,325.4) (P3,524.6)};
+\addplot[fill=bad!55,draw=bad] coordinates
+  {(baseline,120.6) (P1 statica,170.1) (P1.5,182.0) (P2,283.5) (P3,442.3)};
+\legend{classe 0,classe 1,classe 2,classe 3,classe 4,classe 5 (scarta)}
+\end{axis}
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{La porta d'uscita non conta}: le cinque classi che inoltrano costano
+        uguale entro circa il 10\%, che è il rumore fra sessioni (la baseline, che
+        fa sempre la stessa identica cosa, oscilla fra 117 e 147~ns).
+  \item \textbf{Scartare non costa sensibilmente meno che inoltrare}. Il pacchetto
+        scartato non viene accodato sull'uscita, ma il processore del nodo deve
+        restituire la sua pagina di memoria al generatore, cosa che per un pacchetto
+        inoltrato fa il nodo successivo. È un effetto del banco, non della
+        pipeline.
+  \item \textbf{Il TTL non cambia niente}: variandolo da 2 a 33 a ogni pacchetto, il
+        costo resta lo stesso e la rete decide sempre la stessa classe. Questo
+        modello decide in base al nodo e allo stato dei collegamenti, non al TTL (lo
+        si sapeva già dal test di consegna). Che il generatore scriva davvero il TTL
+        è provato: con TTL~1 i pacchetti scaduti compaiono fra gli scartati.
+\end{itemize}
+
+\begin{lezione}
+Il costo del nodo dipende dalla \textbf{pipeline} e da niente altro di ciò che è
+stato variato: né dalla sessione, né dalla taglia del pacchetto, né dalla classe
+decisa, né dalla porta d'uscita, né dal TTL.
+\end{lezione}
+
+\section{Quello che su questa macchina non si può risolvere}
+
+\subsection*{I respinti anche quando il nodo non è pieno}
+
+Offrendo a tutte le pipeline 1,55 milioni di pacchetti al secondo, cioè meno di
+quanti ciascuna ne regga, una piccola parte viene comunque respinta: dall'1 al 3,5\%
+per le più leggere, fino al 10\% per P3. Anche \texttt{rxonly}, che non fa
+niente, ne respinge l'1--2\%.
+
+La causa è il risveglio. Quando la coda si svuota il processore del nodo si
+addormenta; quando arriva un pacchetto va svegliato, e su una macchina virtuale
+il risveglio passa dall'host e può richiedere centinaia di microsecondi. Nel
+frattempo 256 posti si riempiono in 170 microsecondi.
+
+Tre rimedi provati, tutti e tre esclusi:
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.6cm}p{8.4cm}@{}}
+\toprule
+\textbf{Tentativo} & \textbf{Esito} \\
+\midrule
+allargare la coda & il kernel della macchina non lo permette
+                    (\texttt{ethtool -G} non supportato sul veth) \\
+tenere il thread del nodo sempre sveglio (\emph{busy poll}) & non disponibile su
+                    questo kernel (il valore 2 di \texttt{threaded} viene rifiutato
+                    anche con il thread presente) \\
+tenere sveglio il processore con un ciclo a priorità minima & \textbf{peggiora
+                    tutto}: la capacità di \texttt{rxonly} scende da 4,6 a 2,7 milioni
+                    al secondo e i respinti salgono dall'1 al 35\%; rallenta anche il
+                    generatore, cioè l'intera macchina \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Resta un limite dichiarato del banco. Non tocca il costo del nodo, che si misura a
+coda sempre piena, e \texttt{rxonly} ne misura l'entità in ogni sessione: ciò che
+una pipeline respinge \emph{oltre} quella soglia è suo.
+
+\section{Che cosa questo numero non dice}
+
+\begin{itemize}
+  \item \textbf{È una macchina virtuale.} Il processore è ibrido (core veloci e core
+        lenti) e la macchina virtuale non sa su quale gira. I \emph{rapporti} fra le
+        pipeline sono solidi; le cifre assolute valgono per questa macchina.
+  \item \textbf{«Ricevere» e «inoltrare» sono quelli di un cavo virtuale.} Prendere il
+        pacchetto dalla coda del veth non è prenderlo dalla memoria di una scheda di
+        rete, e accodarlo sul veth successivo non è scrivere un descrittore di
+        trasmissione. Su hardware vero questi due estremi costano cifre diverse.
+  \item \textbf{Un modello solo.} Tutte le misure di questo capitolo usano il modello
+        depositato (65-4-4-7). Come il costo cresce con modelli più grandi lo dice la
+        campagna del capitolo precedente, ma a livello di solo programma: su traffico
+        vero non è stato misurato.
+\end{itemize}
+
+\section{Le cifre vecchie e quelle nuove}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.9cm}p{4.3cm}p{4.9cm}@{}}
+\toprule
+\textbf{Si diceva} & \textbf{Oggi} & \textbf{Perché è cambiato} \\
+\midrule
+le pipeline consegnano 1,1--1,4 milioni al secondo, «limite inferiore» &
+  il nodo regge da 2,0 (P3) a 5,9 (P1) milioni al secondo per processore &
+  cronometro con tempo morto (trappola 1) e copia del generatore (trappola 4) \\
+\addlinespace
+tetto della via di ricezione 3,7 milioni al secondo &
+  4,8 con \texttt{pktgen}, 19,8 con frame grezzi &
+  stesso cronometro; e la copia era tre quarti del costo di ricezione \\
+\addlinespace
+le pipeline hanno ancora «circa 2$\times$» di margine &
+  \textbf{smentito}: il nodo era già saturo &
+  il tetto era misurato su un percorso senza inoltro, e con il cronometro sbagliato \\
+\addlinespace
+perdita 0,000\% su ogni riga &
+  respinti dall'1 al 94\% a seconda del carico; persi dopo l'ingresso 0,00--0,07\% &
+  i respinti sono perdita del nodo (trappola 3) \\
+\addlinespace
+«il datapath non perde, perde il trasporto» &
+  vera solo la metà: dopo l'ingresso non si perde niente &
+  un respinto è un pacchetto che il nodo non ha preso \\
+\addlinespace
+$T_2-T_1$ = 27 / 50 / 57 / 183 / 271 ns &
+  \textbf{invariato} &
+  è una misura con l'orologio del kernel, non tocca nessuna trappola \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ==================================================================
+\chapter{Le altre correzioni di settembre}
+\label{ch:altre}
+% ==================================================================
+
+Il test reale non è stata l'unica cosa sistemata nell'ultima settimana. Questo
+capitolo racconta le altre, una sezione ciascuna, con lo stesso schema: che cosa
+non andava, perché contava, che cosa è stato fatto, e come si è verificato che
+fosse davvero a posto.
+
+\section{Il P1 che va sui nodi non inoltrava}
+
+\textbf{Il contesto.} P1 si può costruire in due modi. Con \emph{BCC}, che compila
+il programma sul nodo al momento del caricamento (serve un compilatore sul nodo,
+e ci vuole più di mezzo secondo). Oppure \emph{AOT} (\emph{ahead of time}): si
+compila prima, su un'altra macchina, e al nodo si spedisce l'oggetto già pronto,
+che un piccolo caricatore in C apre e attacca. È la versione AOT quella che va
+davvero sui nodi.
+
+\textbf{Il difetto.} Il caricatore AOT riempiva la tabella delle uscite (quale
+interfaccia corrisponde a ogni porta) con l'interfaccia numero 1 per tutte le
+porte. L'interfaccia 1, su Linux, è \emph{loopback}: il collegamento interno della
+macchina con sé stessa. Ogni pacchetto che la rete decideva di inoltrare veniva
+mandato lì e perso. Nessun test se ne accorgeva, perché i test di consegna
+provavano la versione BCC, non quella che va sui nodi.
+
+\textbf{La correzione.} Il caricatore ora lascia le tabelle vuote e le «appunta»
+nel file system del kernel; il pannello di controllo in Python le riempie con le
+interfacce vere del nodo e avvia il controllo dello stato dei collegamenti, poi
+dice al caricatore di attaccare il programma. Il caricatore stacca tutto e pulisce
+quando riceve lo stop.
+
+\textbf{La prova.} Il test di consegna ha ora una variante che usa esattamente il
+percorso di deploy: \textbf{11 casi su 11}, con ogni classe consegnata
+sull'interfaccia giusta e lo scarto contato.
+
+\section{Tutti i test di P1 usano ora l'oggetto AOT}
+
+Una volta sistemato il deploy, restava un'incoerenza: i test e le misure di P1
+giravano ancora sulla versione BCC, che sui nodi non va mai. Ora \textbf{ogni}
+test e ogni banco che tocca P1 o P1.5 usa l'oggetto AOT, attraverso un modulo
+solo (\texttt{ipa/p1\_aot.py}): la prova di consegna, le prove sul kernel, i
+modelli sintetici, la semantica delle classi, l'analisi parametrica, i banchi su
+traffico vero.
+
+Risultati sulla macchina virtuale, tutti verdi:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Prova} & \textbf{esito} \\
+\midrule
+consegna su rete di veth (tutte le pipeline) & 29/29 \\
+semantica delle classi, dentro il kernel & 72/72 \\
+modelli generati, dentro il kernel & 62/62 \\
+equivalenza numerica sui modelli sintetici & 8/8 scenari, 300/300 ingressi ciascuno \\
+P1 statica contro P1.5: stessa decisione & 80/80 casi \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Il cronometro del caricatore AOT}
+
+\textbf{Il difetto.} La cifra «74~ns per l'AOT contro 73~ns per BCC», usata per dire
+che l'AOT non costa niente in più, era sbagliata. Il caricatore misurava
+eseguendo il programma un milione di volte \emph{sullo stesso pacchetto}, e il
+kernel non rimette a posto il pacchetto fra un'esecuzione e l'altra. Il programma
+decrementa il TTL: dopo poche decine di giri il TTL scadeva, e da lì in poi si
+misurava il ramo corto «pacchetto scaduto», non l'inoltro. È lo stesso difetto
+che il capitolo precedente racconta per il banco parametrico.
+
+\textbf{La correzione.} Pacchetti nuovi ogni 200 esecuzioni, partendo da TTL 255,
+come nel resto dei banchi.
+
+\textbf{Il risultato rimisurato}, stessa sessione:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{BCC} & \textbf{AOT} \\
+\midrule
+istruzioni & 1\,026 & 1\,011 \\
+costo del programma & 44 ns & 46 ns \\
+aggiornare il modello sul nodo & 741 ms & 9--10 ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La conclusione di prima regge, ma adesso poggia su un numero giusto: l'oggetto AOT
+costa quanto il build BCC per pacchetto, e toglie dal nodo quasi tutto il costo
+dell'aggiornamento.
+
+\section{Due implementazioni che devono dare lo stesso numero}
+
+\textbf{Il rischio.} Il progetto ha un \emph{riferimento}: il calcolo della rete
+scritto in Python, con gli stessi numeri interi del kernel, usato dai test per
+sapere quale decisione aspettarsi. Se il riferimento e il codice generato per il
+kernel sbagliano \emph{allo stesso modo}, ogni test passa. Se sbagliano in modo
+diverso, ma ognuno è coerente con sé stesso, i test di ciascuno passano lo stesso.
+
+\textbf{Il difetto trovato.} Il riferimento usato per i modelli sintetici non
+moltiplicava il bias per la scala giusta (lo schema intero è: il bias dello strato
+$l$ va moltiplicato per $s^l$). Sul modello depositato non si vedeva.
+
+\textbf{La correzione.} La scala è ora un argomento obbligatorio del riferimento, e
+ogni file di risposte attese dichiara lo schema e la scala con cui è stato
+calcolato: un file vecchio viene rifiutato invece di essere usato. In più c'è un
+controllo nuovo che confronta direttamente \textbf{il riferimento Python con il
+codice C generato per P1}, letto e valutato come testo, logit per logit, sul
+modello minimo e su tutti i modelli sintetici. Per provare che il controllo sa
+fallire, lo si è fatto girare su codice alterato apposta: si accorge
+dell'alterazione.
+
+\section{La scala delle feature in P2 e P3}
+
+Il TTL entra nella rete diviso per una costante scelta durante l'addestramento.
+Era già stato corretto che questa costante venga dal modello e non sia fissata a
+30 nel codice. Mancava la prova \emph{nel kernel} per P2 e P3. Ora c'è, con un
+controllo negativo: su un modello addestrato con scala 16, se si altera la scala
+scritta nella tabella del nodo le decisioni cambiano (41 casi su 300 nel modello
+\texttt{ipa\_ttl16}, 89 nel modello \texttt{small}); con la scala giusta tornano
+identiche al riferimento. Quindi la scala viene davvero letta e usata.
+
+Due correzioni vicine, sullo stesso tema:
+\begin{itemize}
+  \item P2 rifiutava un modello con un numero di classi d'uscita diverso da quello
+        configurato; ora il numero viene dalla semantica dichiarata del modello.
+  \item In P2 e P3 la tabella che traduce la classe in azione è una sola per tutti
+        i modelli caricati. Ora il caricamento di un secondo modello con una
+        semantica diversa viene rifiutato, invece di sovrascrivere in silenzio
+        quella del primo.
+\end{itemize}
+
+\section{Pulizia del repository}
+
+Tolto ciò che non corrispondeva più al codice:
+\begin{itemize}
+  \item \texttt{ipa/test/diag\_fabric\_divergence.py}: diagnosi di un difetto del
+        riferimento già chiuso; i casi scritti nel codice erano quelli del
+        riferimento difettoso;
+  \item la vecchia funzione di latenza del banco di throughput, che nessuno
+        chiamava più.
+\end{itemize}
+Sono stati invece \emph{tenuti}, dopo averli controllati, tre script che
+sembravano superati:
+\begin{itemize}
+  \item \texttt{diag\_p3\_bisect.py}: serve a rifare una misura citata sui limiti
+        del verificatore;
+  \item \texttt{test\_ipa.py}: è l'unico che invia traffico con più modelli verso
+        un nodo vero;
+  \item \texttt{bench\_tailcall\_overhead.py}: misura un costo che nessun altro
+        isola.
+\end{itemize}
+Il README è stato riallineato ai conteggi reali dei test e ai file che esistono.
+
+% ==================================================================
+\chapter{I numeri di oggi, in una pagina}
+\label{ch:numeri}
+% ==================================================================
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}rrrrr@{}}
+\toprule
+& \textbf{baseline} & \textbf{P1 statica} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Il nodo su traffico vero (capitolo \ref{ch:reale})}} \\
+costo per pacchetto        & 117 ns & 170 ns & 168 ns & 335 ns & 493 ns \\
+pacchetti al secondo per processore & 8,5 M & 5,9 M & 6,0 M & 3,0 M & 2,0 M \\
+costo della rete (sopra la baseline) & --- & 53 ns & 51 ns & 218 ns & 376 ns \\
+\addlinespace
+\multicolumn{6}{@{}l}{\emph{Il solo programma}} \\
+$T_2-T_1$ sul percorso vero (minimo) & 27 ns & 50 ns & 57 ns & 183 ns & 271 ns \\
+\texttt{BPF\_PROG\_TEST\_RUN}         & 30 ns & 59 ns & 79 ns & 271 ns & 428 ns \\
+istruzioni del programma             & 155 & 614 & 1\,071 & 14\,985 & 12\,349 \\
+\addlinespace
+\multicolumn{6}{@{}l}{\emph{Cambiare modello su un nodo in servizio}} \\
+tempo                                & --- & \multicolumn{2}{c}{9--10 ms (AOT)} & \multicolumn{2}{c}{5--14 ms} \\
+serve un compilatore sul nodo?       & --- & \multicolumn{2}{c}{no (compilato prima)} & \multicolumn{2}{c}{no} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+In tre righe:
+\begin{enumerate}
+  \item \textbf{Scrivere i pesi nel programma costa circa 50~ns per pacchetto;
+        leggerli da una tabella circa 220--380~ns.} È il prezzo della
+        configurabilità, e non dipende dal traffico.
+  \item \textbf{Con l'oggetto precompilato, cambiare modello costa lo stesso ordine
+        di tempo per tutte le pipeline} (millisecondi). Il vantaggio residuo di P2 e
+        P3 è non dover ricompilare altrove: un modello nuovo si carica scrivendo una
+        tabella.
+  \item \textbf{Congelare anche il nodo (P1 statica) non porta un vantaggio misurabile}
+        rispetto a P1.5: 170 contro 168~ns sul nodo, 80 decisioni su 80 identiche.
+\end{enumerate}
+\end{lezione}
+
+\begin{prima}[Da dove vengono i numeri della tabella]
+Le righe del nodo: \texttt{bench\_throughput -{}-mode compare -{}-generator xdp
+-{}-egress-cpu 0}, 23 settembre, cinque giri. $T_2-T_1$: la campagna con tre
+marcature di tempo (\texttt{claims.md}, E3). \texttt{BPF\_PROG\_TEST\_RUN} e
+istruzioni: la campagna parametrica, dove P1 è misurata con il build BCC, che
+costa quanto l'AOT entro il rumore (44 contro 46~ns). Aggiornamento del modello:
+AOT dal caricatore, P2 e P3 dall'analisi parametrica.
+\end{prima}
 
 % ==================================================================
 \chapter{Quel che resta}
@@ -2639,38 +3146,33 @@ solo il cronometro, non i programmi.
       leggere il descrittore a runtime;
 \item \textbf{dichiarata l'inaffidabilità della portata} su questo banco: ogni
       riga porta la propria dispersione fra i giri, e sopra il 25\% il numero
-      viene marcato invece che riportato come se fosse un risultato.
+      viene marcato invece che riportato come se fosse un risultato;
+\item \textbf{il costo del nodo misurato}, dalla ricezione all'inoltro, dopo aver
+      tolto cinque difetti di misura (capitolo \ref{ch:reale}): 117 / 170 / 168 /
+      335 / 493~ns, stabile fra sessioni, taglie di pacchetto e classi decise;
+\item \textbf{P1 AOT consegna davvero} sui nodi, e tutti i test di P1 usano ora
+      l'oggetto che va in produzione (capitolo \ref{ch:altre}).
 \end{itemize}
 
 \section{Aperto}
 
 \begin{itemize}
-\item \textbf{Il tetto del banco è il collegamento virtuale, non IPA.} La
-      \texttt{veth} consegna 1,4--2,1 Mpps con un core in ricezione, e il
-      tentativo di alzarlo cambiando generatore lo ha \emph{abbassato}: il collo
-      di bottiglia è il lato ricezione, non la fabbricazione dei pacchetti.
-      Oltre questa cifra servono due macchine e un cavo, non un'altra manopola.
-\item \textbf{La portata assoluta resta non citabile; il costo per
-      pacchetto sì.} Il test di controllo senza pipeline ha stabilito che la
-      via di ricezione accetta 3,7~Mpps su circa 5 offerti: un terzo dei
-      pacchetti viene rifiutato dalla coda del collegamento virtuale prima di
-      arrivare al nodo. Le pipeline, che con perdita nulla stavano fra 1,1 e
-      1,4~Mpps, avevano quindi ancora circa $2\times$ di margine e il loro
-      ginocchio non è stato raggiunto: ogni cifra in Mpps va riportata come
-      limite inferiore. Quello che si cita è $T_2-T_1$, il costo della
-      pipeline sul percorso reale, che è stabile al nanosecondo su quattro
-      campagne indipendenti: vedi \S\ref{sec:confronto-mpps}.
-\item \textbf{Lo sweep sulle taglie di frame} è stato eseguito su 64, 512 e
-      1514 byte. Il costo dell'inferenza non dipende dalla lunghezza del frame,
-      come atteso; a 1514 byte comincia a pesare la copia dell'headroom. La
-      taglia con la dispersione minore, e quindi quella di riferimento, è
-      \textbf{512 byte}.
+\item \textbf{I respinti sotto capacità.} Anche senza nessuna rete neurale, una
+      piccola parte dei pacchetti (1--2\%) viene respinta dalla coda del
+      collegamento virtuale quando il nodo non è pieno: il risveglio del
+      processore del nodo passa dall'host. Coda non allargabile, \emph{busy poll}
+      non disponibile, e tenere sveglio il processore peggiora la macchina. Resta
+      un limite dichiarato, misurato in ogni sessione da \texttt{rxonly}.
+\item \textbf{Architetture diverse su traffico vero}: il costo del nodo è misurato
+      su un modello solo. Come cresce con modelli più grandi è misurato solo a
+      livello di programma (capitolo \ref{ch:programma}).
+\item \textbf{Scartare contro inoltrare}: sul banco scartare non costa meno che
+      inoltrare, perché la restituzione della pagina di memoria ricade sul nodo.
+      Su una scheda di rete vera il conto sarebbe diverso, e qui non si misura.
 \item \textbf{Versione intermedia fra P1 e P2}: esiste ed è stata misurata
       (\texttt{hardcoded}, pesi nel codice e nodo letto da mappa). Il risultato
-      è negativo in senso utile: su questo banco \textbf{non si distingue da
-      P1}. Le due variano fra un run e l'altro più di quanto distino fra loro, e
-      il loro ordine reciproco si inverte. Separarle richiede un banco con meno
-      rumore, non un'altra misura qui.
+      è negativo in senso utile: \textbf{non si distingue da P1}, né sul solo
+      programma né sul costo del nodo (168 contro 170~ns).
 \item \textbf{Hardware vero}: la scheda di rete di questa macchina virtuale è
       emulata e non supporta XDP native. I numeri assoluti restano non citabili
       come prestazioni di sistema.
@@ -2862,51 +3364,59 @@ sudo python3 ipa/test/bench_depth_vs_width.py
 sudo python3 ipa/test/bench_depth_vs_width.py --descriptor no_onehot
 \end{lstlisting}
 
-\section{Throughput e latenza sul percorso reale}
+\section{Il test reale: il costo del nodo}
 
-Il banco con generatore e nodo sotto prova. \textbf{La forma da citare è
-\texttt{-{}-mode rates}}: misura le tre latenze $T_1$, $T_2$, $T_3$ su una
-scala di rate offerti, con la mediana fra i giri.
+Il banco con generatore e nodo sotto prova (capitolo \ref{ch:reale}). \textbf{La
+forma da citare} è quella con il generatore a frame grezzi e l'uscita su un altro
+processore: misura il costo del nodo dalla ricezione all'inoltro, per tutte le
+pipeline più \texttt{rxonly}, nella stessa sessione.
 
 \begin{lstlisting}
 sudo modprobe pktgen
 
-# il confronto: T1/T2/T3 su sei rate, tutte le pipeline
-sudo python3 ipa/test/bench_throughput.py --mode rates \
-     --frames 64 --rounds 3 --threads 2 \
-     --rates 0.5,1,1.5,2,2.5,3 --out results/
+# IL COSTO DEL NODO (la cifra da citare)
+sudo python3 ipa/test/bench_throughput.py --mode compare \
+     --generator xdp --egress-cpu 0 --rounds 5 \
+     --out results/nodo 2>&1 | tee results/nodo.log
 
-# il TEST DI CONTROLLO: stesso percorso, NESSUNA pipeline.
-# Da lanciare DA SOLO, mai in coda al comando sopra: una
-# macchina ancora calda ha dato 1,26 Mpps contro 3,73.
-sudo python3 ipa/test/bench_throughput.py --mode generator \
-     --frames 64 --rounds 5 --threads 2 \
-     --rates 8,10,12,15,20,25 --out results/
+# lo stesso, per ogni classe che il modello sa decidere
+sudo python3 ipa/test/bench_throughput.py --mode compare \
+     --generator xdp --egress-cpu 0 --per-class --rounds 3 \
+     --out results/nodo_classi
+
+# lo stesso, su tre taglie di pacchetto
+sudo python3 ipa/test/bench_throughput.py --mode compare \
+     --generator xdp --egress-cpu 0 --frames 64,512,1514 --rounds 5
+
+# con pktgen: anche la fase a carico fisso (respinti sotto capacita')
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 5
+
+# le tre marcature di tempo T1/T2/T3 su una scala di rate
+sudo python3 ipa/test/bench_throughput.py --mode rates \
+     --frames 64 --rounds 3 --threads 2 --rates 0.5,1,1.5,2
+
+# il generatore a frame grezzi contro pktgen, stesso ricevitore
+sudo python3 ipa/test/xdp_gen.py --rounds 3
+
+# la finestra di misura, verificata senza kernel (nessun root)
+python3 ipa/test/test_steady_window.py
 
 # se un run si interrompe e lascia il generatore configurato
 sudo python3 ipa/test/bench_throughput.py --cleanup
 \end{lstlisting}
 
-\texttt{-{}-mode rates} scrive \texttt{rates\_raw.csv}, una riga per
-(rate, pipeline, giro), e \texttt{env.csv} con le condizioni della macchina.
-\texttt{-{}-mode generator} scrive \texttt{generator\_ceiling.csv}. Le righe
-grezze servono a leggere la dispersione, che è ciò che dice se la mediana
-significa qualcosa.
-
 \begin{prima}[Come si legge l'uscita]
-Due verdetti, in fondo al run, e vanno letti separatamente:
+\textbf{Costo per pacchetto sulla CPU del DUT} --- la tabella che conta: RX,
+elaborati, ns per pacchetto, differenza con la baseline, percentuale del tetto di
+sola ricezione. Il costo si legge dagli \emph{elaborati}, non da RX.
 
-\textbf{Controllo di validità} --- la baseline deve essere la più veloce entro
-il 10\%. Se non lo è, il run misura il carico della macchina e va buttato.
+\textbf{Controllo di validità} --- la baseline deve essere la più veloce entro il
+10\% (nelle classi che inoltrano), e \texttt{rxonly} non deve essere più lento
+della baseline. Se una delle due cose non vale, il run misura la macchina e va
+rifatto.
 
-\textbf{Le tre latenze} --- $T_2-T_1$ è la pipeline ed è la cifra da
-citare; $T_3-T_2$ è il trasporto e deve risultare uguale per tutte e cinque,
-altrimenti la separazione non ha funzionato. Valgono anche quando la portata è
-inutilizzabile: sono misure con affidabilità diverse.
-
-\textbf{Resa e respinti} --- se la resa resta bassa a ogni rate, il tetto è del
-generatore e non del nodo, e il banco lo dice con un avvertimento esplicito. In
-quel caso il throughput va citato come limite inferiore.
+\textbf{Dispersione} --- sopra il 25\% fra i giri la riga viene marcata: quel
+numero non è un risultato. Se succede, chiudere il resto sull'host e rilanciare.
 \end{prima}
 
 \section{Costi specifici}
@@ -2941,11 +3451,10 @@ make -C ipa/poc_aot clean
 \section{Diagnostica, quando qualcosa non torna}
 
 \begin{lstlisting}
-# due pipeline decidono diversamente: su quale ingresso?
-sudo python3 ipa/test/diag_fabric_divergence.py
-sudo python3 ipa/test/diag_fabric_divergence.py --link-state 100001 --ttl 28
+# che cosa decide il modello, al variare di ogni ingresso
+python3 ipa/test/diag_model_decisions.py
 
-# da quale commit P3 ha smesso di caricarsi
+# da quale commit P3 ha smesso di caricarsi; i tetti del verificatore
 sudo python3 ipa/test/diag_p3_bisect.py --rev <commit> --rev HEAD
 \end{lstlisting}
 
@@ -2961,8 +3470,8 @@ Partendo da zero su una macchina nuova:
       davvero?
 \item \texttt{sudo python3 ipa/test/bench\_scaling.py --verify} --- le tre
       pipeline concordano?
-\item \texttt{sudo python3 ipa/test/bench\_throughput.py --latency}\\
-      --- quanto tempo passa fra arrivo e partenza?
+\item \texttt{sudo python3 ipa/test/bench\_throughput.py --mode compare}\\
+      \texttt{--generator xdp --egress-cpu 0} --- quanto costa un pacchetto al nodo?
 \end{enumerate}
 
 I primi quattro rispondono \emph{sì} o \emph{no}. Solo il quinto produce un

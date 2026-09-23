@@ -1118,7 +1118,7 @@ def pg_run_and_read(devs):
 # IL GENERATORE COME OGGETTO: configurato una volta, riusato per ogni punto
 # ==========================================================================
 # Prima la configurazione di pktgen era sparsa fra measure_point, _fair_sweep e
-# run_latency, ognuno con la sua idea di quanti thread usare (uno) e su quale
+# il vecchio run_latency (rimosso), ognuno con la sua idea di quanti thread usare (uno) e su quale
 # CPU (la 0). Metterla in un oggetto solo serve a tre cose concrete:
 #
 #   1. i thread e le CPU si decidono UNA volta, dal CpuPlan, e valgono per
@@ -2899,119 +2899,6 @@ def _clear_lat(b):
         b[acc].clear()
         b[hist].clear()
     b["rx_n"].clear()
-
-
-def run_latency(method, model_path, frames, delays, count, threads,
-                threaded_napi=True, plan=None, xmit_mode="start_xmit"):
-    """Latenza arrivo -> ripartenza, a piu' dimensioni di frame e piu' rate.
-
-    Percorso storico, tenuto perche' e' quello citato nel quaderno. La
-    differenza rispetto a prima e' che il generatore passa dal CpuPlan: anche
-    qui i thread pktgen stanno sulle CPU dichiarate e non piu' sulla 0."""
-    from netns_fabric import NetnsFabric
-    from common import attach_xdp
-
-    print(f"\n{YELLOW}{'=' * 78}{NC}")
-    print(f"{YELLOW} {method} -- latenza arrivo->ripartenza E throughput "
-          f"(build strumentata){NC}")
-    print(f"{YELLOW}{'=' * 78}{NC}")
-
-    plan = plan or plan_cpus(threads=threads)
-    sem, n_out = class_semantics()
-    rows = []
-    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
-        setup, lat_fn = _load_instrumented(method, model_path, fab, sem)
-        b = setup["b"]
-        for peer in fab.peer_of.values():
-            try:
-                attach_xdp(b, lat_fn, peer)
-            except Exception as e:
-                warn(f"contatore latenza non agganciato a {peer}: {e}")
-        attach_xdp(b, setup["disp"], fab.ingress)
-        info("un oggetto BPF solo: ingresso e uscita condividono le mappe")
-
-        napi_devs = []
-        if threaded_napi:
-            napi_devs = [fab.ingress]
-            if enable_threaded_napi(napi_devs, plan):
-                info("NAPI in thread: generatore e DUT su core separati")
-
-        gen = Generator([fab.ingress_peer], plan, xmit_mode=xmit_mode,
-                        topology="shared").attach()
-
-        # Throughput E latenza nella stessa riga, perche' vengono dallo
-        # STESSO pacchetto: il programma d'uscita conta e cronometra insieme,
-        # quindi `campioni` e' esattamente RX. Riportarli separati avrebbe
-        # significato due run e due stati della macchina per due numeri che
-        # descrivono lo stesso evento.
-        hdr = (f"  {'frame':>5s} {'delay':>6s} {'TX':>8s} {'RX':>8s} "
-               f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
-               f"{'min':>6s} {'p50<':>7s} {'p90<':>7s} {'p99<':>8s}")
-        print(f"\n{hdr}")
-        print("  " + "-" * (len(hdr) - 2))
-        for frame in frames:
-            for delay in delays:
-                gen.warmup(frame, delay)
-                b["lat_acc"].clear()
-                b["lat_hist"].clear()
-                try:
-                    tx, tx_pps, secs = gen.run(frame, count, delay)
-                except PktgenEmptyRun as e:
-                    warn(f"punto scartato: {e}")
-                    continue
-                st = _read_lat(b)
-                if st is None:
-                    warn(f"frame {frame} delay {delay}: nessun campione -- il "
-                         f"pacchetto non e' arrivato all'uscita")
-                    continue
-
-                rx = st["n"]
-                secs = secs or 1e-9
-                rx_pps = int(rx / secs)
-                # Il throughput sul filo conta il frame intero, non il payload.
-                mbps = round(rx * frame * 8 / secs / 1e6, 1)
-                # RX > TX non e' una perdita negativa: sono pacchetti
-                # arrivati all'uscita che questo punto non ha trasmesso --
-                # residui in volo dal punto precedente, o traffico del kernel.
-                # Misurato: 100 256 contati su 100 000 inviati dopo un punto
-                # scartato. Riportarlo come -0,26% dava un numero senza senso.
-                excess = max(0, rx - tx)
-                loss = round(100.0 * max(0, tx - rx) / tx, 3) if tx else 0.0
-
-                def _f(v):
-                    return f"{v:5d}n" if v is not None else "  >4us"
-                mark = GREEN if loss <= 0.1 else (RED if loss > 1 else YELLOW)
-                tag = f" {GREY}+{excess}{NC}" if excess else ""
-                print(f"  {frame:5d} {delay:6d} {tx:8d} {rx:8d} "
-                      f"{rx_pps:9d} {mbps:7.1f} {mark}{loss:7.2f}%{NC}{tag} "
-                      f"{_f(st['lat_min_ns'])} {_f(st['lat_p50_ns'])} "
-                      f"{_f(st['lat_p90_ns'])} {_f(st['lat_p99_ns'])}")
-                rows.append(dict(method=method, frame=frame, delay=delay,
-                                 tx=tx, rx=rx, tx_pps=tx_pps, rx_pps=rx_pps,
-                                 rx_mbps=mbps, loss_pct=loss,
-                                 excess_rx=excess, samples=rx,
-                                 gen_threads=gen.n_inst, **{
-                                     k: st[k] for k in
-                                     ("lat_min_ns", "lat_p50_ns",
-                                      "lat_p90_ns", "lat_p99_ns",
-                                      "lat_avg_ns", "lat_max_ns")},
-                                 over_4us=st["over"]))
-        gen.detach()
-        pg_reset()
-        if napi_devs:
-            disable_threaded_napi(napi_devs)
-    print(f"\n  {GREY}Latenza dal primo istante in cui il programma ha il "
-          f"pacchetto al momento in cui e' uscito. Include la trasmissione, "
-          f"che test_suite non misura, e la scrittura del timestamp, che il "
-          f"datapath di produzione non fa.{NC}")
-    print(f"  {GREY}Leggi il MINIMO e i percentili. La media resta nel CSV "
-          f"per completezza, ma su questa VM un singolo campione da "
-          f"millisecondi la sposta piu' della differenza fra due pipeline.{NC}")
-    print(f"  {GREY}Il throughput qui e' della build STRUMENTATA, che paga una "
-          f"scrittura di mappa per pacchetto in piu': e' quindi un limite "
-          f"INFERIORE di quello di produzione, non lo stesso numero. Per il "
-          f"throughput da citare usa il run senza --latency.{NC}")
-    return rows
 
 
 # ==========================================================================
