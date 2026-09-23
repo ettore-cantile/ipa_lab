@@ -19,13 +19,29 @@
 // match test_suite (ipa_switch_hardcoded + model_0).
 //
 // Build: cc -O2 loader_aot.c -o loader_aot -lbpf
-// Run  : sudo ./loader_aot <literal.o>                 (bench: TEST_RUN)
-//        sudo ./loader_aot <literal.o> --attach <ifidx> [--xdp-mode native|generic|auto] [--node-id N]
-//              [--ingress-port IFINDEX=SLOT,...]  (ifindex del kernel -> slot del one-hot
-//              ingress_iface; senza di essa la feature non contribuisce nulla)
-//              (LIVE deploy: attach
-//              xdp_dispatch to the interface, stay resident until Ctrl-C, then
-//              detach -- the AOT alternative to method4_hardcoded's BCC attach)
+// Run  : sudo ./loader_aot <literal.o> [--node-id N]   (bench: TEST_RUN)
+//        sudo ./loader_aot <literal.o> --attach <ifidx> --pin-dir /sys/fs/bpf/<dir>
+//              [--xdp-mode native|generic|auto]
+//              (LIVE deploy, driven by method4_hardcoded_aot.py over stdin/stdout)
+//
+// LIVE DEPLOY PROTOCOL. The loader does NOT seed the datapath maps in deploy
+// mode: mac_table, link_state, ingress_port and node_id are node facts, and
+// the Python control plane that P2 and P3 already use owns them. So:
+//
+//   loader  -> load the .o, wire model_progs, pin every map under --pin-dir,
+//              print "READY <dir>"
+//   python  -> open the pinned maps (pinned_maps.PinnedObject), install
+//              mac_table / ingress_port / node_id, start the link_state
+//              monitor and the ARP refresh, then write "ATTACH"
+//   loader  -> attach xdp_dispatch, print "ATTACHED <mode>"
+//   python  -> "DETACH", or EOF on stdin (the control plane died), or a
+//              SIGINT/SIGTERM -> the loader detaches, unpins and exits
+//
+// Until 2026-09-23 the deploy seeded mac_table here with ifindex 1 and zero
+// MACs for every logical port, and nothing ever replaced it: every FORWARD
+// decision was bpf_redirect()ed to ifindex 1, which is `lo` in every netns.
+// The program is attached only AFTER the control plane has written the maps,
+// so no packet ever sees them empty.
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -38,6 +54,8 @@
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include "nn_aot_meta.h"   // GENERATED: class semantics (see gen_full_c.py)
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
@@ -112,6 +130,50 @@ static int parse_ingress_ports(const char *spec) {
 /* Set by SIGINT/SIGTERM so the live-attach deploy mode can detach cleanly. */
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+/* bpffs directory the deploy pins the object's maps into (--pin-dir). */
+static const char *g_pin_dir = NULL;
+
+/* One line from stdin, read with read(2) rather than stdio: the control plane
+ * talks to this process over a pipe, and a stdio buffer could hold the very
+ * line this loop waits for. Returns its length, or -1 on EOF, on an error, or
+ * on a stop signal -- all three mean "the control plane is gone, stand down".
+ * The signal handler is installed WITHOUT SA_RESTART, so a Ctrl-C interrupts
+ * the read instead of leaving it blocked. */
+static int read_line(char *buf, int cap) {
+    int n = 0;
+    for (;;) {
+        char c;
+        ssize_t r = read(STDIN_FILENO, &c, 1);
+        if (r == 1) {
+            if (c == '\n') break;
+            if (n < cap - 1) buf[n++] = c;
+            continue;
+        }
+        if (r < 0 && errno == EINTR && !g_stop) continue;
+        return -1;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+/* Remove what a previous run left pinned under `dir`: a crash or a kill -9
+ * skips the unpin at the end of the deploy, and bpf_object__pin_maps() refuses
+ * to pin over an existing file. Only the names THIS object would pin are
+ * touched. libbpf turns '.' into '_' in pin paths (bpffs forbids periods), so
+ * the same is done here; the directory itself is refused if it has one. */
+static void unlink_stale_pins(struct bpf_object *obj, const char *dir) {
+    struct bpf_map *m;
+    bpf_object__for_each_map(m, obj) {
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, bpf_map__name(m));
+        if (n < 0 || n >= (int)sizeof(path)) continue;
+        for (char *p = path + strlen(dir) + 1; *p; p++)
+            if (*p == '.') *p = '_';
+        if (unlink(path) == 0)
+            fprintf(stderr, "removed stale pin %s\n", path);
+    }
+}
 
 static double now_ms(void) {
     struct timespec ts;
@@ -282,6 +344,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ingress-port") && i + 1 < argc) {
             if (parse_ingress_ports(argv[++i])) return 2;
         }
+        else if (!strcmp(argv[i], "--pin-dir") && i + 1 < argc) g_pin_dir = argv[++i];
         else if (!strcmp(argv[i], "--xdp-mode") && i + 1 < argc) {
             mode_name = argv[++i];
             if (!strcmp(mode_name, "native"))       xdp_flags = XDP_FLAGS_DRV_MODE;
@@ -313,12 +376,54 @@ int main(int argc, char **argv) {
         fprintf(stderr, "prog_array update\n"); goto err;
     }
 
-    if (seed_maps(obj)) goto err;
-
-    // --- LIVE DEPLOY mode: attach xdp_dispatch to a real interface and stay
-    // resident (the AOT alternative to BCC's method4_hardcoded live attach).
+    // --- LIVE DEPLOY mode: pin, hand the maps to the control plane, attach
+    // only when it says so, stay resident. See the protocol at the top.
     // Requires libbpf >= 0.7 for bpf_xdp_attach/detach. ---
     if (g_attach_ifindex >= 0) {
+        int rc = 1;
+        char line[64];
+        if (!g_pin_dir || !*g_pin_dir) {
+            fprintf(stderr, "--attach needs --pin-dir: the maps are filled by "
+                            "the Python control plane through bpffs, not by this "
+                            "loader (see the header of loader_aot.c)\n");
+            goto err;
+        }
+        if (strchr(g_pin_dir, '.')) {
+            fprintf(stderr, "--pin-dir %s: bpffs paths cannot contain '.'\n",
+                    g_pin_dir);
+            goto err;
+        }
+        if (g_node_id >= 0 || g_n_ingress > 0) {
+            fprintf(stderr, "--node-id / --ingress-port are bench-mode options. "
+                            "In deploy the control plane writes node_id and "
+                            "ingress_port itself -- one resolver, not two.\n");
+            goto err;
+        }
+        if (mkdir(g_pin_dir, 0700) && errno != EEXIST) {
+            fprintf(stderr, "mkdir %s: %s\n", g_pin_dir, strerror(errno));
+            goto err;
+        }
+        unlink_stale_pins(obj, g_pin_dir);
+        if (bpf_object__pin_maps(obj, g_pin_dir)) {
+            fprintf(stderr, "pinning the maps under %s failed: %s. Is it on "
+                            "bpffs? (mount -t bpf bpf /sys/fs/bpf)\n",
+                    g_pin_dir, strerror(errno));
+            goto err;
+        }
+        {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = on_signal;       /* no SA_RESTART: see read_line() */
+            sigaction(SIGINT,  &sa, NULL);
+            sigaction(SIGTERM, &sa, NULL);
+        }
+        printf("READY %s\n", g_pin_dir);
+        fflush(stdout);
+        if (read_line(line, sizeof(line)) < 0 || strcmp(line, "ATTACH")) {
+            fprintf(stderr, "the control plane did not confirm the maps "
+                            "(no ATTACH on stdin): not attaching\n");
+            goto unpin;
+        }
         if (bpf_xdp_attach(g_attach_ifindex, disp_fd, xdp_flags, NULL)) {
             fprintf(stderr, "bpf_xdp_attach(ifindex=%d, mode=%s) failed: %s\n",
                     g_attach_ifindex, mode_name, strerror(errno));
@@ -329,7 +434,7 @@ int main(int argc, char **argv) {
                         "and most physical drivers do).\n"
                         "  To deploy on the generic path instead, say so "
                         "explicitly: --xdp-mode generic\n");
-            goto err;
+            goto unpin;
         }
         /* Trust the kernel, not the flags we passed: with --xdp-mode auto the
          * kernel chooses, and every number from this run describes whichever
@@ -349,28 +454,37 @@ int main(int argc, char **argv) {
                        mode_name, actual, actual);
             else
                 printf("[deploy] XDP attach mode in effect: %s\n", actual);
+            printf("ATTACHED %s\n", actual);
         }
-        signal(SIGINT,  on_signal);
-        signal(SIGTERM, on_signal);
         printf("================================================================\n");
         printf(" AOT-literal LIVE deploy (Pipeline 1) -- NO clang on this node\n");
         printf("================================================================\n");
         printf("[deploy] open+load (verify+JIT): %.3f ms  "
                "(BCC recompile of the same model: ~1.3 s, reference not measured here)\n",
                t2 - t0);
-        printf("[deploy] xdp_dispatch attached to ifindex %d. Ctrl-C to detach.\n",
-               g_attach_ifindex);
-        /* Flush now: when stdout is a pipe rather than a
-         * TTY) C stdio is fully buffered, so without this the messages above
-         * would sit in the buffer -- invisible -- while the loader blocks in
-         * pause(), making a working, attached deploy look like a hang. */
+        printf("[deploy] xdp_dispatch attached to ifindex %d, maps pinned under "
+               "%s. Ctrl-C to detach.\n", g_attach_ifindex, g_pin_dir);
+        /* Flush now: when stdout is a pipe rather than a TTY, C stdio is
+         * fully buffered, and the control plane is waiting for ATTACHED. */
         fflush(stdout);
-        while (!g_stop) pause();
+        while (!g_stop) {
+            if (read_line(line, sizeof(line)) < 0 || !strcmp(line, "DETACH"))
+                break;
+        }
         bpf_xdp_detach(g_attach_ifindex, xdp_flags, NULL);
-        printf("\n[deploy] detached from ifindex %d.\n", g_attach_ifindex);
+        printf("[deploy] detached from ifindex %d.\n", g_attach_ifindex);
+        fflush(stdout);
+        rc = 0;
+unpin:
+        bpf_object__unpin_maps(obj, g_pin_dir);
+        rmdir(g_pin_dir);
         bpf_object__close(obj);
-        return 0;
+        return rc;
     }
+
+    // Bench mode only: seed the maps the TEST_RUN reads. In deploy the
+    // control plane does this, see above.
+    if (seed_maps(obj)) goto err;
 
     long insn_disp = prog_insns(disp_fd), insn_model = prog_insns(model_fd);
     long insn_total = insn_disp + insn_model;   // matches test_suite (disp + model)

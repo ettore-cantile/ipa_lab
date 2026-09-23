@@ -405,6 +405,8 @@ def t_reference_vs_p1_source(root):
         from class_semantics import ClassSemantics
         from p1_c_eval import P1Program
         from verify_synth_kernel import descrittore
+        sys.path.insert(0, os.path.join(SHARED_DIR, "poc_aot"))
+        from gen_full_c import _emit_arch
     except Exception as e:
         # Pure Python, all in the repo: failing to import is a failure, not a
         # skip -- a check that quietly does not run is how this gap stayed open.
@@ -422,6 +424,16 @@ def t_reference_vs_p1_source(root):
             [(0, wi, scale)], hidden_dims=tuple(hidden), features=feats,
             n_out=n_out, semantics=sem, static_node=static_node)
 
+    def aot_program(wi, scale, feats, hidden, n_out):
+        # The AOT object is what P1 actually DEPLOYS, and gen_full_c is a
+        # second generator, separate from ebpf_program: it kept the catalogue
+        # TTL scale for days after the BCC one was fixed. Checked the same way.
+        sem = ClassSemantics.forward_then_drop(n_out - 1, drop_class=n_out - 1,
+                                               n_out=n_out)
+        shape = {"features": feats, "n_out": n_out, "hidden_dims": list(hidden),
+                 "n_in": sum(f["size"] for f in feats)}
+        return P1Program(_emit_arch(shape, wi, scale, sem), func="xdp_model")
+
     # (a) The minimal case, by hand. One input, one hidden neuron, two
     # outputs; scale 10, weights W1=[1] b1=[0] | W2=[3, 0] b2=[0, 1].
     #   h    = relu(1*1 + 0)             = 1
@@ -433,9 +445,12 @@ def t_reference_vs_p1_source(root):
     src = p1_source(wi, s, [{"type": "link_state", "size": 1, "scale": 1}], [1], 2)
     c = P1Program(src).run(64, {"link_state": [1]})
     r = ref.forward_int8(wi, dims, [1], [1], scale=s)
-    check(r == hand and c["logits"] == hand and c["cls"] == ref.argmax(r) == 1,
-          f"minimal case: by hand {hand}, reference {r}, P1 C {c['logits']} "
-          f"(class {c['cls']})")
+    ca = aot_program(wi, s, [{"type": "link_state", "size": 1, "scale": 1}],
+                     [1], 2).run(64, {"link_state": [1]})
+    check(r == hand and c["logits"] == hand and c["cls"] == ref.argmax(r) == 1
+          and ca["logits"] == hand and ca["cls"] == 1,
+          f"minimal case: by hand {hand}, reference {r}, P1 C {c['logits']}, "
+          f"AOT C {ca['logits']} (class {c['cls']}/{ca['cls']})")
     lf = ref.forward_float([v / s for v in wi], dims, [1.0])
     check(all(abs(a * s ** 2 - b) < 1e-9 for a, b in zip(lf, hand)),
           f"minimal case: float logits {[round(v, 6) for v in lf]} x scale^2 "
@@ -457,8 +472,9 @@ def t_reference_vs_p1_source(root):
              f"generated source -- the generator's output changed")
 
     # (b) Every preset. The scenario's own vectors, their corners, through
-    # P1.5 (node read from the node_id map) and P1 with the node frozen at the
-    # first and last column. Logits must be IDENTICAL, not just the argmax.
+    # P1.5 (node read from the node_id map), P1 with the node frozen at the
+    # first and last column, and the AOT object (node from its node_id map).
+    # Logits must be IDENTICAL, not just the argmax.
     kif = 7          # any ifindex: P1 must resolve it through ingress_port
     for name in PRESETS:
         d = os.path.join(root, f"p1src_{name}")
@@ -475,12 +491,15 @@ def t_reference_vs_p1_source(root):
         builds = [("P1.5", None)]
         if width:
             builds += [(f"P1 node={k}", k) for k in sorted({0, width - 1})]
+        builds += [("AOT", None)]
 
         tried = bad = stored = 0
         example = None
         for label, frozen in builds:
-            prog = P1Program(p1_source(wi, scale, feats, mspec.hidden,
-                                       mspec.n_out, static_node=frozen))
+            prog = (aot_program(wi, scale, feats, mspec.hidden, mspec.n_out)
+                    if label == "AOT" else
+                    P1Program(p1_source(wi, scale, feats, mspec.hidden,
+                                        mspec.n_out, static_node=frozen)))
             for vi, xi in enumerate(vectors):
                 if frozen is not None:
                     xi = list(xi)
@@ -499,7 +518,7 @@ def t_reference_vs_p1_source(root):
                     example = example or (label, xi, want, got["logits"])
                 # expected.json itself, straight against the C, on the
                 # vectors it was written for
-                if frozen is None and vi < len(base):
+                if label == "P1.5" and vi < len(base):
                     stored += got["logits"] == expected["int8"][vi]["logits"]
         check(bad == 0 and stored == len(base),
               f"{name:<9} {mspec.shape_str:<18} scale={scale:<3} "

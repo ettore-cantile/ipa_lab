@@ -80,7 +80,11 @@ def _feat_scalar(feat, offset, n_in, fc1_w, n_h1):
     would collapse 10..30 onto 0 or 1); see model_meta.DEFAULT_TTL_SCALE.
     """
     var, expr = _SCALAR_SOURCE[feat["type"]]
-    scale = _model_meta.feature_scale(feat["type"])
+    # The scale the descriptor declares for THIS feature, not the catalogue's
+    # default for its type -- the same rule as ebpf_program's generator. This
+    # read feature_scale(type) after the BCC path had been fixed, so the AOT
+    # object -- P1's only deploy path -- ran a ttl/16 model with ttl/30.
+    scale = _model_meta.feature_scale_of(feat)
     pre = [f"    __u32 {var} = {expr};   /* feature '{feat['type']}' (scalar) */"]
     def term(j):
         prod = f"(__s64){var} * {_lit(fc1_w[j * n_in + offset])}LL"
@@ -226,6 +230,10 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None) -> list:
     n_hidden = len(sizes) - 2
 
     L = []; A = L.append
+    # Same opening comment as ebpf_program's model function: test/p1_c_eval
+    # finds the inference section of either backend by it.
+    A("    /* Input vector built locally, features: "
+      + ", ".join(f"{f['type']}[{f['size']}]" for f in features) + " */")
 
     # --- fc1: build the IV feature by feature, in descriptor order ---
     fc1_w, fc1_b = layers[0]
@@ -279,7 +287,7 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None) -> list:
     # the same semantics, or the AOT object and the BCC build disagree.
     # The previous `best_cls >= n_out - 1` hardcoded both that DROP is the last
     # class and that a class index is a port index. Neither holds.
-    A("    /* class -> action -> logical port (from the model descriptor) */")
+    A("    /* --- class -> action -> logical port (from the model descriptor) --- */")
     A("    __u32 _port = 0xffffffffU;")
     A("    switch (best_cls) {")
     for cid in range(n_out):
@@ -288,15 +296,24 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None) -> list:
             A(f"    case {cid}: _port = {spec.port}U; break;"
               f"   /* FORWARD -> logical port {spec.port} */")
         elif spec.action == "DROP":
+            # The class was decided: record it, as the BCC build does, so a
+            # DROP is distinguishable from a program that never reached argmax
+            # and the two P1 backends report the same counters.
             A(f"    case {cid}: {{   /* DROP (declared) */")
             A("        __u32 di = 2; __u64 *dv = bpf_map_lookup_elem(&pkt_stats, &di);")
             A("        if (dv) __sync_fetch_and_add(dv, 1);")
+            A(f"        __u32 dc = {cid}U;")
+            A("        __u64 *dcv = bpf_map_lookup_elem(&cls_stats, &dc);")
+            A("        if (dcv) __sync_fetch_and_add(dcv, 1);")
             A("        return XDP_DROP;")
             A("    }")
         else:
             A(f"    case {cid}: {{   /* UNUSED */")
             A("        __u32 ui = 1; __u64 *uv = bpf_map_lookup_elem(&pkt_stats, &ui);")
             A("        if (uv) __sync_fetch_and_add(uv, 1);")
+            A(f"        __u32 uc = {cid}U;")
+            A("        __u64 *ucv = bpf_map_lookup_elem(&cls_stats, &uc);")
+            A("        if (ucv) __sync_fetch_and_add(ucv, 1);")
             A("        return XDP_PASS;")
             A("    }")
     A("    default: {   /* argmax outside [0, n_out) */")
@@ -462,39 +479,25 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
     tail-call + double-parse), descriptor-driven. Real int8 weights from
     model_path; the descriptor is resolved from `meta`/`topology_config`
     (defaults reproduce the 65-4-4-7 program byte-for-byte)."""
-    from extract_weights import extract_weights_int8
     shape = _resolve_shape(model_path, meta, topology_config)
     sizes = _layer_sizes(shape)
     n_weights = _weight_count(sizes)
-    # Pass the RESOLVED topology through, exactly like the BCC path
-    # (ebpf_program.load_and_generate) does. Without this the extractor built
-    # a FastRerouteMLP with its own hardcoded 6/52/4 defaults, so any
-    # topology_config other than the historical one produced weights for the
-    # wrong shape -- caught below as a count mismatch at best, and silently
-    # mis-sliced when the counts happened to coincide.
-    tcfg = shape["topology_config"]
-    kw = {"n_interfaces": tcfg["n_interfaces"],
-          "n_nodes":      tcfg["n_nodes"],
-          "hidden_dim":   int(shape["hidden_dims"][0]) if shape["hidden_dims"] else 0}
-    w = (extract_weights_int8(model_path, **kw) if model_path
-         else extract_weights_int8(**kw))
+    # Weights AND scale from the same function the BCC build uses
+    # (ebpf_program.load_and_generate), so the two P1 backends cannot compile
+    # different numbers. The scale used to be read from ipa/weights_float.json
+    # whatever the checkpoint: right for the checked-in model, which lives
+    # there, and wrong for any other -- load_and_generate reads the file next
+    # to the checkpoint, or derives it from the .pt.
+    from ebpf_program import load_and_generate
+    _meta = meta if meta is not None else (
+        _model_meta.load_model_meta(model_path) if model_path
+        else dict(_model_meta.DEFAULT_META))
+    _, w, scale = load_and_generate(
+        model_path or _model_meta.default_checkpoint(), meta=_meta,
+        topology_config=shape["topology_config"])
     if len(w) != n_weights:
         raise SystemExit(f"expected {n_weights} weights for "
                          f"{'-'.join(map(str, sizes))}, got {len(w)}")
-    # The int8 scale is needed to put each layer's bias in the accumulator's
-    # units (see below). Read from weights_float.json, the same source
-    # load_arch_weights uses, so the AOT object and the BCC build agree.
-    scale = 1
-    try:
-        import json as _json
-        _wf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "weights_float.json")
-        with open(_wf) as _f:
-            scale = int(_json.load(_f).get("scale_factor", 1))
-    except Exception as _e:
-        print(f"[gen_full_c] WARNING: scale_factor unavailable ({_e}); "
-              f"biases will not be rescaled, which makes this object disagree "
-              f"with the BCC build. Regenerate weights_float.json.")
     # Class semantics: declared, not inferred. With no argument the shared
     # resolver reads the descriptor and announces any fallback, so the AOT
     # object and the BCC build resolve it identically.

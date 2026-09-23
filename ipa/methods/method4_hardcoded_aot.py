@@ -49,8 +49,13 @@ numbers are machine- and toolchain-dependent; re-measure rather than quoting
 these.
 
 What this script does:
-    0. with --iface: LIVE DEPLOY -- attach the prebuilt .o to that interface
-       and stay resident (this is the real production path, see below).
+    0. with --iface: LIVE DEPLOY -- the loader loads the prebuilt .o and pins
+       its maps in bpffs; THIS process fills them with the control plane P2
+       and P3 use (mac_table from NodeConfig, ingress_port, node_id, the
+       link_state monitor, the ARP refresh); only then does the loader attach.
+       Until 2026-09-23 the loader seeded mac_table itself with ifindex 1 and
+       zero MACs, so every FORWARD decision was redirected to `lo`. See
+       _live_deploy and the protocol at the top of poc_aot/loader_aot.c.
     Without --iface, runs the bench instead:
     1. load topology_config.json (authoritative network dimensions), verify
        N_IN consistency with the checkpoint,
@@ -100,6 +105,7 @@ from model_meta import (
     load_topology_config,
     derive_shape,
     verify_shape_vs_checkpoint,
+    load_class_semantics,
 )
 
 def _resolve_cli_path(path):
@@ -111,6 +117,111 @@ def _resolve_cli_path(path):
 def _run(cmd, **kw):
     p = subprocess.run(cmd, capture_output=True, text=True, **kw)
     return p.returncode, p.stdout, p.stderr
+
+
+def _live_deploy(cmd, pin_dir, semantics, n_nodes=None):
+    """Run the loader in deploy mode and be its control plane.
+
+    Protocol (see the top of poc_aot/loader_aot.c): the loader pins the maps
+    and prints READY; this fills them and writes ATTACH; the loader attaches
+    and prints ATTACHED; DETACH, EOF on its stdin or a signal makes it detach
+    and unpin. The program is therefore attached only once the maps hold this
+    node's facts -- no packet ever sees an empty mac_table.
+
+    The functions are the ones method5_template / method6_modular call on a
+    BCC object; pinned_maps.PinnedObject gives the pinned maps the same
+    interface. One control plane for every pipeline, instead of a second one
+    written in C that nobody kept in step -- which is what the loader's own
+    seeding had become.
+    """
+    import ctypes
+    import threading
+    from pinned_maps import PinnedObject, FwdAction
+    from common import (install_mac_per_port, install_ingress_port_table,
+                        install_node_id, start_mac_refresh_thread)
+    from link_state_monitor import init_link_state_up, start_monitor_thread
+    from node_config import NodeConfig
+
+    proc = subprocess.Popen(cmd, cwd=POC_DIR, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def expect(word):
+        """Echo the loader's stdout up to the line that starts with `word`."""
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            if line.startswith(word):
+                return line.split()[1:]
+        raise RuntimeError(f"loader_aot exited (rc={proc.wait()}) before "
+                           f"printing {word}")
+
+    stop_monitor = None
+    rc = None
+    try:
+        expect("READY")
+        b = PinnedObject(pin_dir, leaf_types={"mac_table": FwdAction,
+                                              "link_state": "u32vec",
+                                              "queue_state": "u32vec"})
+        print("[AOT] class semantics:")
+        print(semantics.summary())
+        node_cfg = NodeConfig.resolve(semantics.logical_ports)
+        print(node_cfg.summary())
+        for _p in node_cfg.validate(semantics.logical_ports, strict=False):
+            print(f"[AOT] NOTE: {_p}")
+        mac_info = install_mac_per_port(b, "mac_table", node_cfg,
+                                        semantics.logical_ports)
+        if "ingress_port" in b:
+            install_ingress_port_table(b, "ingress_port", node_cfg,
+                                       semantics.logical_ports)
+        if "node_id" in b:
+            install_node_id(b, "node_id", node_cfg, n_nodes=n_nodes)
+        if "link_state" in b:
+            init_link_state_up(b)
+            stop_monitor = start_monitor_thread(b, interval=0.5)
+            print("[AOT] link_state seeded (present interfaces up, absent "
+                  "slots 0); carrier monitor running")
+        if "queue_state" in b:
+            print("[AOT] NOTE: queue_state is left to queue_state_monitor.py, "
+                  "as in the P2/P3 deploys")
+        if mac_info["pending"]:
+            start_mac_refresh_thread(b, "mac_table", mac_info["pending"],
+                                     interval=5.0)
+
+        proc.stdin.write("ATTACH\n")
+        proc.stdin.flush()
+        expect("ATTACHED")
+        threading.Thread(target=lambda: [sys.stdout.write(l) for l in proc.stdout],
+                         daemon=True).start()
+
+        stats = b["pkt_stats"]
+        print(f"\n{'TRUE HIT':<22} | {'MISS':<22} | {'DROP':<20}")
+        print("-" * 70)
+        while proc.poll() is None:
+            time.sleep(1)
+            try:
+                v = [int.from_bytes(stats[ctypes.c_uint32(i)], "little")
+                     for i in range(3)]
+                print(f"\r{v[0]:<22} | {v[1]:<22} | {v[2]:<20}",
+                      end="", flush=True)
+            except Exception:
+                pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if stop_monitor is not None:
+            stop_monitor.set()
+        try:
+            proc.stdin.write("DETACH\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass    # Ctrl-C reached the loader too, and it already left
+        try:
+            rc = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            rc = proc.wait()
+    if rc != 0:
+        sys.exit(f"\n[AOT] loader_aot exited with rc={rc}")
+    print("\n[AOT] detached, pins removed.")
 
 
 def main():
@@ -140,6 +251,10 @@ def main():
              "before the sk_buff exists -- the path a real deployment takes. "
              "generic runs in netif_receive_skb, after it. auto lets the kernel "
              "pick, which means it may silently give you generic.")
+    ap.add_argument(
+        "--pin-root", default="/sys/fs/bpf",
+        help="bpffs directory under which the live deploy pins its maps "
+             "(ipa_p1_<iface>), for the control plane to fill before attach")
     args = ap.parse_args()
     args.model = _resolve_cli_path(args.model)
 
@@ -168,11 +283,16 @@ def main():
     print(f"[AOT] shape={shape['n_in']}-{'-'.join(map(str, shape['hidden_dims']))}-{shape['n_out']}  "
           f"descriptor=[{feats_str}]")
 
+    # Class semantics, resolved ONCE: the generated switch and the control
+    # plane that fills mac_table must agree on which class forwards where.
+    semantics = load_class_semantics(model_path, shape["n_out"])
+
     # Descriptor-driven generator: pass the resolved meta + topology so a custom
     # descriptor produces the matching program (default -> byte-identical 65-4-4-7).
     from gen_full_c import generate_arch_literal_c
     c_src = generate_arch_literal_c(
-        model_path if args.model else None, meta=meta, topology_config=topo_cfg)
+        model_path if args.model else None, meta=meta, topology_config=topo_cfg,
+        semantics=semantics)
     c_path = os.path.join(POC_DIR, "nn_aot_arch.bpf.c")
     o_path = os.path.join(POC_DIR, "nn_aot_arch.o")
     with open(c_path, "w") as f:
@@ -296,62 +416,20 @@ def main():
             print("[AOT] built loader_aot (DYNAMIC -- libbpf.so required at runtime)")
 
     if args.iface:
-        # LIVE DEPLOY: attach the prebuilt .o to a real interface and stay
-        # resident (no clang on this node). Runs the loader in --attach mode
-        # with inherited stdio so output streams and Ctrl-C detaches.
         import socket
         try:
             ifindex = socket.if_nametoindex(args.iface)
         except OSError:
             sys.exit(f"[AOT] interface {args.iface!r} not found")
-        print(f"[AOT] LIVE deploy: attaching prebuilt .o to {args.iface} "
-              f"(ifindex={ifindex}); no clang on this node. Ctrl-C to detach.\n")
+        # bpffs forbids '.' in a path, and a VLAN interface has one (eth0.100).
+        pin_dir = os.path.join(args.pin_root,
+                               "ipa_p1_" + args.iface.replace(".", "_"))
+        print(f"[AOT] LIVE deploy: prebuilt .o on {args.iface} "
+              f"(ifindex={ifindex}), maps pinned under {pin_dir}; no clang on "
+              f"this node. Ctrl-C to detach.\n")
         cmd = [loader_bin, o_path, "--attach", str(ifindex),
-               "--xdp-mode", args.xdp_mode]
-        # The node index, resolved the same way the BCC pipelines resolve it.
-        # Passed explicitly rather than left to the loader's own $IPA_NODE_ID
-        # read, so one resolver decides for every deploy path.
-        try:
-            from common import resolve_node_index
-            _nid = resolve_node_index()
-        except Exception:
-            _nid = None
-        if _nid is not None:
-            cmd += ["--node-id", str(_nid)]
-
-        # Kernel ifindex -> ingress_iface one-hot slot, resolved HERE and passed
-        # down, by the same function that fills ingress_port_t2/_t3 for P2 and
-        # P3 (common.ingress_port_slots). The loader used to seed one entry --
-        # the attach interface, slot 1, always -- which is right only on a node
-        # whose first model port is the one being attached to. P1 reads this map
-        # exactly as P2 and P3 do, so it needs the same table, not a guess.
-        try:
-            from common import ingress_port_slots
-            from model_meta import load_class_semantics
-            from node_config import NodeConfig
-            _sem = load_class_semantics(model_path, shape["n_out"])
-            _cfg = NodeConfig.resolve(_sem.logical_ports)
-            _slots = ingress_port_slots(_cfg, _sem.logical_ports)
-        except Exception as e:
-            _slots = {}
-            print(f"[AOT] WARNING: could not resolve the ingress-port table "
-                  f"({type(e).__name__}: {e}); the ingress_iface feature will "
-                  f"contribute nothing to any decision")
-        if _slots:
-            cmd += ["--ingress-port",
-                    ",".join(f"{ifx}={slot}" for ifx, slot in sorted(_slots.items()))]
-            for ifx, slot in sorted(_slots.items()):
-                print(f"[AOT] ingress_port: ifindex {ifx} -> one-hot slot {slot}")
-            if ifindex not in _slots:
-                print(f"[AOT] NOTE: the attach interface (ifindex {ifindex}) is not "
-                      f"one of this node's model ports, so packets arriving on it "
-                      f"set no ingress_iface bit -- which is what the feature means.")
-        else:
-            print("[AOT] WARNING: no ingress port resolved on this node, so the "
-                  "ingress_iface one-hot contributes nothing")
-        rc = subprocess.run(cmd, cwd=POC_DIR).returncode
-        if rc != 0:
-            sys.exit(f"[AOT] loader_aot live attach failed (rc={rc})")
+               "--xdp-mode", args.xdp_mode, "--pin-dir", pin_dir]
+        _live_deploy(cmd, pin_dir, semantics, n_nodes=topo_cfg.get("n_nodes"))
         return
 
     print("[AOT] running loader_aot on the prebuilt .o ...\n")

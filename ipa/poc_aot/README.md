@@ -28,7 +28,7 @@ apples-to-apples with `test_suite --kernel` hardcoded.
 | file | role |
 |---|---|
 | `gen_full_c.py` | emits `nn_aot_arch.bpf.c` (dispatcher + tail-call + model, weights as literals) from the real 65-4-4-7 weights |
-| `loader_aot.c` | libbpf loader: times the runtime open+load (deploy cost), populates `model_progs`, seeds `link_state`/`mac_table`, and `BPF_PROG_TEST_RUN`s the dispatcher (perf) |
+| `loader_aot.c` | libbpf loader. Bench: times the runtime open+load (deploy cost), populates `model_progs`, seeds `link_state`/`mac_table`, and `BPF_PROG_TEST_RUN`s the dispatcher (perf). Deploy (`--attach --pin-dir`): seeds nothing, pins the maps for the Python control plane and attaches only after it confirms -- protocol at the top of the file |
 | `Makefile` | compiles the `.bpf.c` **once** and builds the loader |
 
 Usually you don't run these by hand — `ipa/methods/method4_hardcoded_aot.py`

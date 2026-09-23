@@ -292,8 +292,19 @@ sudo python3 ipa/execute_pipeline.py --method hardcoded --verify-only
 sudo ip link set dev eth1 xdp off
 ```
 
-Tutte e tre stampano `HIT | MISS | DROP` dal vivo. Popolano `mac_table` (classe → ifindex +
-MAC) e `link_state` da sole all'avvio; non serve un setup separato.
+Tutte e tre stampano `HIT | MISS | DROP` dal vivo. Popolano `mac_table` (porta logica →
+ifindex + MAC, da `NodeConfig`), `ingress_port`, `node_id` e `link_state` all'avvio, con lo
+**stesso** piano di controllo Python; non serve un setup separato.
+
+> **Fino al 2026-09-23 questo era falso per `hardcoded`.** Il deploy AOT non eseguiva il piano
+> di controllo: `loader_aot` scriveva `mac_table` da solo, con **ifindex 1 e MAC a zero** per
+> ogni porta logica, e nessun monitor toccava `link_state`. Ogni decisione FORWARD veniva
+> rediretta a `lo` (ifindex 1 in ogni netns): in modalita' native `lo` non accetta redirect
+> XDP e il pacchetto si perde, in generic rientra nello stack locale. Mai sulla porta scelta
+> dal modello. Adesso il loader pinna le mappe in bpffs, `method4_hardcoded_aot.py` le riempie
+> con le funzioni di P2/P3 (`pinned_maps.PinnedObject` da' alle mappe pinnate l'interfaccia di
+> un oggetto BCC), e **solo dopo** il loader attacca: il protocollo e' in testa a
+> `ipa/poc_aot/loader_aot.c`.
 
 ### AOT-literal deploy / bench (P1) — unico backend hardcoded per il deploy
 
@@ -310,12 +321,21 @@ sudo ip link set dev eth1 xdp off
 sudo python3 ipa/execute_pipeline.py --method hardcoded --iface eth1
 ```
 
-**Verificato end-to-end** su nodo `frankfurt` (che NON ha clang, cc né `libbpf.so`
-usabile per il link): il loader fully-static carica il `.o` prebuilt e attacca il programma
-XDP; `ip link show dev eth1` mostra `prog/xdp id ... name xdp_dispatch ... jited`, cioè il
-dispatcher AOT agganciato e JIT-compilato. Il comando di deploy resta resident (loop
-`pause()`) finché non lo si interrompe con Ctrl-C, che stacca l'XDP. La correttezza
-dell'inferenza è coperta separatamente da `test_suite --only kernel` (5/5 PASS per TTL).
+**Verificato sul nodo `frankfurt`** (che NON ha clang, cc né `libbpf.so` usabile per il
+link): il loader fully-static carica il `.o` prebuilt e attacca il programma XDP; `ip link
+show dev eth1` mostra `prog/xdp id ... name xdp_dispatch ... jited`. **Questo prova il
+caricamento, l'attach e il JIT, non l'inoltro**: con il `mac_table` che il loader scriveva
+allora (ifindex 1) ogni FORWARD finiva su `lo`, e nessuna prova guardava su quale
+interfaccia usciva il pacchetto. La correttezza dell'inferenza la coprono `test_suite --only
+kernel` (sul build BCC) e `test_synth` [8] (sul C AOT valutato dal sorgente, senza kernel);
+l'inoltro del deploy AOT su un datapath reale **non e' ancora verificato** dopo la
+correzione del 2026-09-23.
+
+Protocollo del deploy (dal 2026-09-23): `loader_aot --attach IFX --pin-dir
+/sys/fs/bpf/ipa_p1_<iface>` carica, collega `model_progs`, pinna le mappe e stampa `READY`;
+il processo Python riempie le mappe e scrive `ATTACH`; il loader attacca e stampa
+`ATTACHED`; Ctrl-C, `DETACH` o la morte del processo Python (EOF su stdin) lo fanno
+staccare e togliere i pin. `--node-id` e `--ingress-port` restano opzioni del solo bench.
 
 Il modello AOT è **build offline** (macchina con clang) → deploy del `.o` prebuilt sul nodo
 (nessun clang). Su un nodo senza clang, se `nn_aot_arch.o` è già presente viene riusato.
