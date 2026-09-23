@@ -64,6 +64,13 @@ CALL_FRAMES = 1 << 16
 
 PKTGEN_MAGIC = 0xBE9BE955      # net/core/pktgen.c: primo byte 0xBE = model_id
 
+# sizeof(struct ipa_hdr) nelle pipeline (verify_prog_run.EBPF_BASELINE e
+# compagne): 10 byte fissi + 4 feature x 2 + 1 + 2 output. Un payload piu'
+# corto fa fallire il loro controllo sui limiti, e il pacchetto va in XDP_PASS
+# senza essere contato: e' cio' che e' successo al primo run, con frame da 60
+# byte invece di 64 (vedi build_frame).
+IPA_HDR_LEN = 21
+
 
 class _AttrTestRun(ct.Structure):
     """union bpf_attr, ramo `test` (BPF_PROG_TEST_RUN), fino a batch_size."""
@@ -107,17 +114,24 @@ def build_frame(frame_size, src_mac, dst_mac="02:00:00:00:00:02",
                 src_ip="10.0.0.1", dst_ip="10.0.0.2", sport=1234, dport=9999,
                 ttl=32):
     """Il frame che pktgen manda con i parametri del banco (pg_set_params):
-    stessa lunghezza (pkt_size meno i 4 byte di FCS), stessi indirizzi e
-    porte, TTL 32 come pktgen, checksum UDP a zero come pktgen senza
-    UDPCSUM, e in testa al payload il suo header -- magic 0xBE9BE955 poi
-    seq/tv a zero, che le pipeline non leggono."""
-    length = frame_size - 4
+    stessa lunghezza, stessi indirizzi e porte, TTL 32 come pktgen, checksum
+    UDP a zero come pktgen senza UDPCSUM, e in testa al payload il suo header
+    -- magic 0xBE9BE955 poi seq/tv a zero.
+
+    LA LUNGHEZZA E' `frame_size`, non frame_size - 4. Il `pkt_size` di pktgen
+    e' gia' senza FCS (fill_packet_ipv4: datalen = pkt_size - 14 - 20 - 8), e
+    il minimo e' ETH_ZLEN = 60. La prima versione toglieva 4 byte: a 64 il
+    payload restava di 18 byte, meno dei 21 di struct ipa_hdr, e tutte le
+    pipeline scartavano il frame in XDP_PASS (misurato 2026-09-23: sonda a HIT
+    0 per le cinque, rxonly -- che non fa parse -- unica a passare)."""
+    length = frame_size
     mac = lambda m: bytes(int(x, 16) for x in m.split(":"))   # noqa: E731
     eth = mac(dst_mac) + mac(src_mac) + b"\x08\x00"
     payload_len = length - 14 - 20 - 8
-    if payload_len < 16:
-        raise ValueError(f"frame {frame_size}B: troppo corto per l'header "
-                         f"di pktgen")
+    if payload_len < max(16, IPA_HDR_LEN):
+        raise ValueError(f"frame {frame_size}B: payload di {payload_len} "
+                         f"byte, servono {max(16, IPA_HDR_LEN)} (header di "
+                         f"pktgen / struct ipa_hdr)")
     payload = struct.pack("!IIII", PKTGEN_MAGIC, 0, 0, 0)
     payload += b"\0" * (payload_len - len(payload))
     udp = struct.pack("!HHHH", sport, dport, 8 + payload_len, 0)
@@ -367,8 +381,8 @@ class XdpGen:
         per_dev = [dict(dev=f"xdpgen@cpu{c}", tx=gb[c] - ga.get(c, 0),
                         pps=int((gb[c] - ga.get(c, 0)) / secs),
                         secs=round(secs, 4), errors=0) for c in self.cpus]
-        run = BT.GenRun(offered - errors, int(offered / secs), secs,
-                        per_dev=per_dev, wall=secs, errors=errors)
+        run = BT.GenRun(offered - errors, int((offered - errors) / secs),
+                        secs, per_dev=per_dev, wall=secs, errors=errors)
         run.steady = True
         run.dut = dut
         run.start_offset_ms = None
