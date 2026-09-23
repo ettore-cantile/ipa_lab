@@ -180,7 +180,8 @@ check("respinti = 20% dell'offerto entro 1 punto",
       f"{100 * r.errors / (r.tx + r.errors):.2f}%")
 check("RX delta = TX delta entro la coda in volo",
       abs(r.dut["rx"] - r.tx) <= 2 * lag + 2, f"rx {r.dut['rx']} tx {r.tx}")
-check("durata = finestra chiesta entro 10 ms", abs(r.secs - 0.3) < 0.01, f"{r.secs:.4f}s")
+check("durata >= finestra chiesta, entro 50 ms", 0.3 - 0.005 <= r.secs < 0.35,
+      f"{r.secs:.4f}s, lettura {r.read_ms} ms")
 check("stop scritto una volta", len(STOPS) == 1, f"{len(STOPS)}")
 check("skew e mismatch nulli", r.skew_pct == 0.0 and r.rate_mismatch_pct < 1.0,
       f"skew {r.skew_pct} mismatch {r.rate_mismatch_pct}")
@@ -274,6 +275,26 @@ check("loss_pct (totale) ~ 20%", abs(row["loss_pct"] - 20.0) < 1.0, f"{row['loss
 check("loss_dut_pct ~ 0 (entro la coda in volo)", row["loss_dut_pct"] < 0.1, f"{row['loss_dut_pct']}")
 check("rx_pps = capacita' vera entro 2%",
       abs(row["rx_pps"] - true_acc) / true_acc < 0.02, f"{row['rx_pps']}")
+
+# ---- 7. a process stall in the middle of a reading must not date it wrong
+print("7. sospensione di 150 ms dentro la seconda lettura: la lettura si rifa'")
+FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.2)
+g = make_gen("steady")
+calls = {"n": 0}
+
+
+def stalling_probe():
+    calls["n"] += 1
+    if calls["n"] == 2:            # the first reading of the SECOND snapshot
+        time.sleep(0.15)
+    return probe()
+
+
+r = g.steady(64, 0, stalling_probe)
+rate = r.tx / r.secs
+check("TX/s = rate vero entro 2% nonostante la sospensione",
+      abs(rate - true_acc) / true_acc < 0.02,
+      f"{rate:.0f}, letture {calls['n']}")
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)

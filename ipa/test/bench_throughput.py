@@ -251,7 +251,18 @@ WINDOW_MODE = "steady"
 # differenze diviso l'intervallo fra le due letture. Avvio, sfasamento e coda
 # finale restano fuori per costruzione, e la durata non dipende piu' da una
 # stima del rate.
-STEADY_SETTLE_S = 0.05          # dopo che tutte le istanze sono partite
+STEADY_SETTLE_S = 0.10          # dopo che tutte le istanze sono partite
+# Una LETTURA (contatori pktgen + contatori del DUT) deve essere istantanea
+# rispetto alla finestra: l'istante che le si attribuisce e' quello preso
+# attorno a lei, e se il processo viene sospeso a meta' lettura i contatori
+# vanno avanti mentre l'orologio della finestra no. Misurato il 2026-09-23 al
+# primo run vero: una finestra di calibrazione a 5,33 Mpps consegnati contro
+# 3,37-3,45 in tutte le finestre dopo, stessa pipeline, stesso rate -- la
+# firma di una sospensione di ~170 ms subito dopo la seconda marcatura. Una
+# lettura piu' lunga di STEADY_READ_MAX_S si rifa' (fino a STEADY_READ_TRIES
+# volte); l'istante e' il punto medio fra prima e dopo.
+STEADY_READ_MAX_S = 0.003
+STEADY_READ_TRIES = 50
 STEADY_START_TIMEOUT_S = 1.0    # per vederle partire: HZ/10 + 125 ms, largo
 # Il count di SICUREZZA: finito, cosi' che se lo stop non arrivasse (processo
 # ucciso fra start e stop) pktgen si ferma da solo in pochi secondi invece di
@@ -981,6 +992,7 @@ class GenRun(tuple):
         self.steady = False
         self.dut = None
         self.start_offset_ms = None
+        self.read_ms = None
         # La finestra dei contatori non e' la durata che un thread si
         # attribuisce: a thread sfasati i due intervalli non coincidono, e
         # dividere RX per la durata del thread piu' lungo dava rate piu' alti
@@ -1299,6 +1311,14 @@ class Generator:
         seconds = self.warmup_s if seconds is None else seconds
         if seconds <= 0:
             return None
+        if self.window_mode == "steady":
+            # La finestra stazionaria scarta gia' da se' l'avvio: misura solo
+            # dopo che tutte le istanze trasmettono e la coda si e' assestata
+            # (STEADY_SETTLE_S), e la coda della finestra prima si e' svuotata
+            # durante lo stop. Un warm-up a conteggio costava invece un blocco
+            # intero su `pgctrl start` -- ~0,35 s di cui ~0,25 di tempo morto
+            # di pktgen -- a OGNI punto.
+            return None
         if delay > 0:
             rate = (1e9 / delay) * self.n_inst
         else:
@@ -1361,6 +1381,27 @@ class Generator:
                                  int(st.group(1)) if st else 0)
         return out
 
+    def _snapshot(self, probe):
+        """(istante, contatori pktgen, contatori DUT, durata della lettura).
+
+        Rifatta finche' la lettura non dura meno di STEADY_READ_MAX_S: una
+        lettura interrotta da una sospensione del processo attribuirebbe ai
+        contatori un istante sbagliato di tutta la sospensione."""
+        best = None
+        for _ in range(STEADY_READ_TRIES):
+            t0 = time.monotonic()
+            g = self._gen_counters()
+            d = probe() if probe else {}
+            t1 = time.monotonic()
+            if t1 - t0 <= STEADY_READ_MAX_S:
+                return (t0 + t1) / 2.0, g, d, t1 - t0
+            best = t1 - t0 if best is None else min(best, t1 - t0)
+        raise PktgenEmptyRun(
+            f"finestra stazionaria: nessuna lettura dei contatori sotto "
+            f"{STEADY_READ_MAX_S * 1000:.0f} ms in {STEADY_READ_TRIES} "
+            f"tentativi (la piu' breve {best * 1000:.1f} ms): la macchina "
+            f"sospende il processo, la finestra non si puo' datare")
+
     def steady(self, frame, delay, probe=None, seconds=None):
         """Una finestra STAZIONARIA: i rate sono differenze fra due letture
         fatte mentre TUTTE le istanze trasmettono.
@@ -1407,13 +1448,9 @@ class Generator:
                         + (f"; start: {failed[0]}" if failed else "") + ")")
                 time.sleep(0.005)
             time.sleep(STEADY_SETTLE_S)
-            ta = time.monotonic()
-            ga = self._gen_counters()
-            da = probe() if probe else {}
+            ta, ga, da, ra = self._snapshot(probe)
             time.sleep(max(0.0, ta + seconds - time.monotonic()))
-            tb = time.monotonic()
-            gb = self._gen_counters()
-            db = probe() if probe else {}
+            tb, gb, db, rb = self._snapshot(probe)
             fermi = sorted(names - self._running())
         finally:
             pg_stop()
@@ -1445,6 +1482,7 @@ class Generator:
                      per_dev=per_dev, wall=secs, errors=errors)
         run.steady = True
         run.dut = {k: db[k] - da.get(k, 0) for k in db}
+        run.read_ms = round(1000.0 * max(ra, rb), 2)
         starts = [g[2] for g in gb.values() if g[2]]
         run.start_offset_ms = (round((max(starts) - min(starts)) / 1000.0, 1)
                                if len(starts) > 1 else 0.0)
