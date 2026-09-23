@@ -387,7 +387,23 @@ trasporto.
 | T2 | subito prima di `bpf_redirect` | dopo parse, inferenza, scelta classe |
 | T3 | ingresso del contatore, altro capo | dopo redirect, veth, NAPI |
 
-### E1 — Il datapath non perde pacchetti; a perdere e' il trasporto ✅
+> **Revisione 2026-09-23 — le cifre in pps di questa sezione vanno rimisurate.**
+> Fino a questa data `bench_throughput` divideva i pacchetti per la durata del
+> blocco su `pgctrl start`, che oltre alla trasmissione contiene il tempo morto
+> di pktgen (T_RUN raccolto entro 100 ms, 125 ms di attesa fissa, controllo di
+> fine ogni 100 ms): fino a ~225 ms su finestre da 0,3 s. Firma nei dati:
+> `--mode compare`, hardcoded, tre giri con RX 1 240 424 / 1 238 514 / 1 240 533
+> pps — lo stesso conteggio diviso lo stesso blocco quantizzato (~0,443 s). Ogni
+> **rate** di E1 ed E4 ne e' affetto, di una quantita' che non dipende dalla
+> pipeline e non e' costante fra le righe. **Le latenze di E3 no**: vengono da
+> `bpf_ktime_get_ns`, non da un conteggio diviso una durata. Il banco misura ora
+> a **finestra stazionaria** (`--window steady`, default: contatori letti a
+> differenza mentre tutte le istanze trasmettono, poi `stop`); `--window count`
+> riproduce il vecchio divisore per il confronto. La meccanica di pktgen citata
+> e' del sorgente del kernel: NON VERIFICABILE DAL REPOSITORY; la verifica e' il
+> confronto `steady`/`count` sullo stesso punto, sulla VM.
+
+### E1 — Il datapath non perde pacchetti; a perdere e' il trasporto ⏳ ⚠️
 
 | | |
 |---|---|
@@ -397,6 +413,7 @@ trasporto.
 | **Metrica** | `TX − HIT`, `HIT − RX`, e i rifiutati contati a parte. |
 | **Risultato** | Sweep a sei rate da 0,5 a 3,0 Mpps, cinque pipeline, tre giri: **perdita 0,000% su ogni riga**. Ogni pacchetto mancante all'appello e' stato rifiutato da `veth_xmit` a coda piena, cioe' non e' mai entrato nel nodo. |
 | **Conclusione** | L'ipotesi e' falsa: la perdita e' **controspinta del trasporto**. Un solo numero di "perdita" avrebbe attribuito alla pipeline un difetto del banco. |
+| **Revisione 2026-09-23** | ⚠️ Regge solo la meta' stretta: **dopo** l'ingresso (TX−HIT, HIT−RX) la pipeline non perde niente. "Controspinta del trasporto" per i respinti e' troppo: `veth_xmit` rifiuta perche' la coda d'ingresso **del nodo** e' piena, cioe' il nodo non la svuota in tempo — per il costo della pipeline o per il ritardo di risveglio del thread NAPI, e questo sweep non separa le due cause. Un rate con respinti non e' un rate che il nodo regge. Il banco ora decide il "sostenibile" sulla perdita **totale** (respinti compresi) e stampa accanto quella dopo l'ingresso. Le cifre in pps dello sweep sono inoltre affette dal divisore sbagliato (nota in testa alla sezione). |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 --threads 2 --rates 0.5,1,1.5,2,2.5,3 --out results/` |
 
 ### E2 — I due banchi misurano la stessa grandezza ✅ *(dopo una correzione)*
@@ -427,7 +444,7 @@ trasporto.
 | **Limite dichiarato** | ⚠️ Build **strumentata**: due letture dell'orologio e due scritture per pacchetto che il datapath di produzione non fa. Se qualcosa, T2−T1 e' gonfiato. |
 | **Come rigirarlo** | Come E1. |
 
-### E4 — Il tetto misurato e' la via di ricezione, non l'inferenza ✅
+### E4 — Il tetto misurato e' la via di ricezione, non l'inferenza ⏳ ⚠️
 
 | | |
 |---|---|
@@ -440,6 +457,7 @@ trasporto.
 | **Controprova** | Il budget per pacchetto fra tetto di ricezione (3,41 Mpps = 293 ns) e baseline sotto traffico (1,82 Mpps = 549 ns) differisce di 256 ns; la somma T2−T1 + T3−T2 della baseline, misurata indipendentemente, vale 224 ns. Concordano entro il 14%. |
 | **Limite dichiarato** | ⚠️ Una coda piu' grande **non** alzerebbe il tetto: il disavanzo e' stazionario (~1,7 Mpps per tutta la finestra, mezzo milione di pacchetti), e una coda assorbe picchi, non uno squilibrio di rate. La profondita' compra latenza, non banda. Alzarla gonfierebbe T3−T2. |
 | **Come rigirarlo** | `sudo python3 ipa/test/bench_throughput.py --mode generator --frames 64 --rounds 5 --threads 2 --rates 8,10,12,15,20,25 --out results/` — **da lanciare da solo**: in coda a `--mode rates` la stessa misura ha dato 1,26 Mpps invece di 3,73. |
+| **Revisione 2026-09-23** | ⚠️ Il "circa 2× di margine" **non si ricava** da queste misure. (1) `--mode generator` non e' "lo stesso percorso senza inferenza": il contatore scarta **all'ingresso**, quindi mancano il redirect, il secondo veth e il contatore d'uscita che le pipeline attraversano. Il suo tetto e' un limite superiore del solo ingresso, non del percorso delle pipeline. (2) La baseline **sul percorso vero** stava a ~1,82 Mpps (la controprova stessa lo usa): le pipeline a 1,07–1,39 Mpps erano quindi al 60–75% della baseline, non a meta' di un tetto raggiungibile. (3) "Perdita nulla" escludeva i respinti (vedi E1). (4) Tutte le cifre in pps hanno il divisore sbagliato (nota in testa alla sezione). La controprova in ns (256 contro 224) confronta due differenze di rate misurate cosi', e va rifatta. Resta vero solo che ogni cifra in Mpps del progetto e' un limite inferiore — ora per un motivo in piu'. |
 
 ---
 

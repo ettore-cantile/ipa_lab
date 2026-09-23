@@ -153,6 +153,7 @@ import time
 import argparse
 import subprocess
 import statistics
+import threading
 import ctypes as ct
 
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -216,10 +217,56 @@ DEFAULT_ROUNDS = 3
 # vera e non quella sperata. Una finestra uscita corta viene ricalibrata una
 # volta sola: vedi Generator.window_count.
 #
-# Uno schema alternativo -- `count 0` e `stop` scritto da un thread dopo T
-# secondi -- darebbe la durata esatta, ma se lo stop fallisce pktgen trasmette
-# per sempre e il run si pianta. Scartato per quello.
+# QUESTO SCHEMA (count fisso, durata riletta) E' ORA QUELLO DI RISERVA
+# (--window count). Il default e' la finestra STAZIONARIA, vedi sotto e
+# Generator.steady. Il timore che la teneva fuori -- se lo `stop` non arriva
+# pktgen trasmette per sempre -- e' chiuso da un count di sicurezza finito.
 WINDOW_S = 0.30
+
+# Come si misura una finestra: "steady" (default) o "count" (storico). Lo
+# fissa main() da --window; Generator lo legge alla costruzione.
+WINDOW_MODE = "steady"
+
+# LA FINESTRA STAZIONARIA, e perche' esiste.
+#
+# `pgctrl start` blocca per un tempo che NON e' il tempo di trasmissione.
+# In net/core/pktgen.c, pktgen_run_all_threads alza T_RUN sui thread senza
+# svegliarli -- ognuno se ne accorge al suo prossimo risveglio, entro HZ/10,
+# cioe' fino a 100 ms dopo -- poi dorme 125 ms fissi, poi controlla ogni
+# 100 ms (msleep_interruptible) se i thread hanno finito. Il blocco dura
+# quindi la trasmissione PIU' un tempo morto fra ~25 e ~225 ms, e i thread
+# partono sfasati fino a 100 ms fra loro.
+#
+# Diviso per quel blocco (GenRun.window), RX esce sottostimato di una quantita'
+# che non dipende dalla pipeline. Misurato il 2026-09-23 (compare, hardcoded):
+# TX = RX = 549 532 in tutti e tre i giri, RX pps 1 240 424 / 1 238 514 /
+# 1 240 533 -- lo stesso conteggio diviso lo stesso blocco quantizzato di
+# ~0,443 s, per una trasmissione chiesta da 0,3 s. Lo "sfasamento del 75%" e
+# lo "scarto del 99,8%" fra le due letture del rate, che il banco segnalava a
+# ogni run, sono lo stesso tempo morto visto da due lati.
+#
+# La finestra stazionaria non divide per il blocco: aspetta che TUTTE le
+# istanze stiano trasmettendo, lascia assestare la coda, legge i contatori
+# (pktgen e DUT), aspetta WINDOW_S, li rilegge, e ferma pktgen. Rate =
+# differenze diviso l'intervallo fra le due letture. Avvio, sfasamento e coda
+# finale restano fuori per costruzione, e la durata non dipende piu' da una
+# stima del rate.
+STEADY_SETTLE_S = 0.05          # dopo che tutte le istanze sono partite
+STEADY_START_TIMEOUT_S = 1.0    # per vederle partire: HZ/10 + 125 ms, largo
+# Il count di SICUREZZA: finito, cosi' che se lo stop non arrivasse (processo
+# ucciso fra start e stop) pktgen si ferma da solo in pochi secondi invece di
+# trasmettere per sempre. E' dimensionato su un rate per istanza che un veth
+# non raggiunge, quindi nel percorso normale lo stop arriva prima; se non
+# arriva prima, l'istanza risulta ferma alla seconda lettura e la finestra
+# viene scartata, non usata.
+STEADY_SAFETY_S = 3.0
+STEADY_MAX_PPS_PER_INST = 10_000_000
+# Pacchetti che alle due letture possono essere legittimamente "in volo" fra
+# TX e HIT: il ptr_ring del veth (256) piu' un giro di NAPI (64), con margine.
+# Una differenza HIT - TX sotto questa soglia e' la coda, non un residuo della
+# finestra precedente.
+STEADY_INFLIGHT = 512
+_STARTED_RE = re.compile(r"started:\s*(\d+)us")
 
 # Warm-up: una finestra buttata via PRIMA della misura. La prima raffica paga
 # cache fredde, la prima allocazione delle code e l'avvio dei thread, e non
@@ -929,6 +976,11 @@ class GenRun(tuple):
         self.per_dev = per_dev or []
         self.wall = wall
         self.errors = errors
+        # Solo per le finestre stazionarie (Generator.steady): le differenze
+        # dei contatori del DUT, e quanto sono partite sfasate le istanze.
+        self.steady = False
+        self.dut = None
+        self.start_offset_ms = None
         # La finestra dei contatori non e' la durata che un thread si
         # attribuisce: a thread sfasati i due intervalli non coincidono, e
         # dividere RX per la durata del thread piu' lungo dava rate piu' alti
@@ -1056,8 +1108,9 @@ class Generator:
     def __init__(self, devs, plan, xmit_mode="start_xmit", topology="shared",
                  clone=0, burst=0, dst_ip="10.0.0.2",
                  dst_mac="02:00:00:00:00:02", window_s=WINDOW_S,
-                 warmup_s=DEFAULT_WARMUP_S):
+                 warmup_s=DEFAULT_WARMUP_S, window_mode=None):
         self.devs = [devs] if isinstance(devs, str) else list(devs)
+        self.window_mode = window_mode or WINDOW_MODE
         self.plan = plan
         self.xmit_mode = xmit_mode
         self.topology = topology
@@ -1264,6 +1317,10 @@ class Generator:
         fila vogliono dire che il rate non e' stabile, e allora il problema non
         e' il conteggio."""
         seconds = self.window_s if seconds is None else seconds
+        if self.window_mode == "steady":
+            # La durata e' quella chiesta per costruzione: niente da
+            # ricalibrare.
+            return self.steady(frame, delay, seconds=seconds)
         rate = expect_pps or self.rate_estimate or 1_000_000
         r = self.run(frame, self.window_count(rate, seconds), delay)
         if r.secs < seconds * WINDOW_SHORT_FRACTION and r.secs > 0:
@@ -1271,6 +1328,128 @@ class Generator:
             r2 = self.run(frame, self.window_count(better, seconds), delay)
             return r2
         return r
+
+    # -- la finestra stazionaria (vedi STEADY_SETTLE_S) --------------------
+    def _running(self):
+        """Le istanze che pktgen dichiara in trasmissione ADESSO: la riga
+        `Running:` dei file kpktgend_<cpu>."""
+        out = set()
+        for cpu in {i["cpu"] for i in self.instances}:
+            try:
+                with open(pg_thread_path(cpu)) as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if line.startswith("Running:"):
+                    out.update(line.split(":", 1)[1].split())
+        return out
+
+    def _gen_counters(self):
+        """{istanza: (pkts-sofar, errors, started_us)} letti a trasmissione in
+        corso: la sezione `Current:` del file del device si aggiorna dal
+        vivo."""
+        out = {}
+        for inst in self.instances:
+            with open(pg_dev_path(inst["name"])) as f:
+                text = f.read()
+            m = _SOFAR_RE.search(text)
+            errs = _ERR_RE.findall(text)
+            st = _STARTED_RE.search(text)
+            out[inst["name"]] = (int(m.group(1)) if m else 0,
+                                 int(errs[-1]) if errs else 0,
+                                 int(st.group(1)) if st else 0)
+        return out
+
+    def steady(self, frame, delay, probe=None, seconds=None):
+        """Una finestra STAZIONARIA: i rate sono differenze fra due letture
+        fatte mentre TUTTE le istanze trasmettono.
+
+        `probe()` legge contatori CUMULATIVI del DUT (dict nome -> intero).
+        Si chiama alle due letture subito dopo pktgen, nello stesso ordine:
+        lo sfasamento fra le due letture e' lo stesso all'inizio e alla fine
+        e nelle differenze si annulla. Nessun contatore va azzerato.
+
+        Ritorna un GenRun (tx, pps, secs) con `steady` vero, `dut` (le
+        differenze di `probe`) e `start_offset_ms` (sfasamento di partenza
+        fra le istanze: diagnostica, non entra nei rate)."""
+        seconds = self.window_s if seconds is None else seconds
+        self.ensure()
+        per_inst = (1e9 / delay) if delay else STEADY_MAX_PPS_PER_INST
+        safety = max(1000, int(per_inst * (STEADY_START_TIMEOUT_S
+                                           + STEADY_SETTLE_S + seconds
+                                           + STEADY_SAFETY_S)))
+        for inst in self.instances:
+            pg_set_params(inst["name"], frame, safety, delay,
+                          dst_ip=self.dst_ip, dst_mac=self.dst_mac,
+                          queue_map=inst["queue_map"])
+        failed = []
+
+        def _start():
+            # `start` blocca fino alla fine: gira in un thread, e il thread
+            # principale legge i contatori nel frattempo.
+            try:
+                pg_write(f"{PKTGEN_DIR}/pgctrl", "start")
+            except Exception as e:          # riportata dal thread principale
+                failed.append(e)
+
+        names = set(self.names)
+        th = threading.Thread(target=_start, name="pgctrl-start", daemon=True)
+        t0 = time.monotonic()
+        th.start()
+        try:
+            while not names <= self._running():
+                if failed or time.monotonic() - t0 > STEADY_START_TIMEOUT_S:
+                    raise PktgenEmptyRun(
+                        f"finestra stazionaria: non tutte le istanze sono "
+                        f"partite entro {STEADY_START_TIMEOUT_S}s (in "
+                        f"trasmissione: {sorted(self._running())}"
+                        + (f"; start: {failed[0]}" if failed else "") + ")")
+                time.sleep(0.005)
+            time.sleep(STEADY_SETTLE_S)
+            ta = time.monotonic()
+            ga = self._gen_counters()
+            da = probe() if probe else {}
+            time.sleep(max(0.0, ta + seconds - time.monotonic()))
+            tb = time.monotonic()
+            gb = self._gen_counters()
+            db = probe() if probe else {}
+            fermi = sorted(names - self._running())
+        finally:
+            pg_stop()
+            th.join(timeout=5.0)
+        if th.is_alive():
+            raise RuntimeError("pktgen: `start` non e' tornato dopo `stop`")
+        if failed:
+            raise RuntimeError(f"pktgen start: {failed[0]}")
+        if fermi:
+            raise PktgenEmptyRun(
+                f"finestra stazionaria: {fermi} fermi prima della seconda "
+                f"lettura (count di sicurezza esaurito?): la finestra non e' "
+                f"tutta a regime, scartata")
+        secs = tb - ta
+        per_dev, tx, errors = [], 0, 0
+        for inst in self.instances:
+            n = inst["name"]
+            d_tx = gb[n][0] - ga[n][0]
+            d_err = gb[n][1] - ga[n][1]
+            tx += d_tx
+            errors += d_err
+            per_dev.append(dict(dev=n, tx=d_tx, pps=int(d_tx / secs),
+                                secs=round(secs, 4), errors=d_err))
+        if tx == 0:
+            raise PktgenEmptyRun(
+                f"finestra stazionaria: nessun pacchetto trasmesso fra le due "
+                f"letture ({self.names})")
+        run = GenRun(tx, sum(d["pps"] for d in per_dev), secs,
+                     per_dev=per_dev, wall=secs, errors=errors)
+        run.steady = True
+        run.dut = {k: db[k] - da.get(k, 0) for k in db}
+        starts = [g[2] for g in gb.values() if g[2]]
+        run.start_offset_ms = (round((max(starts) - min(starts)) / 1000.0, 1)
+                               if len(starts) > 1 else 0.0)
+        self.last_run = run
+        return run
 
     def calibrate(self, frame=64, seconds=None):
         """Quanto offre questo generatore a delay 0, misurato e non assunto.
@@ -1741,7 +1920,8 @@ def _agg(values):
 def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                   tg_devs=None, repeat=DEFAULT_REPEAT, burst=0,
                   xmit_mode="start_xmit", gen=None, warmup=True,
-                  threshold=DEFAULT_LOSS_THRESHOLD, plan=None, diag=None):
+                  threshold=DEFAULT_LOSS_THRESHOLD, plan=None, diag=None,
+                  steady=True):
     """`repeat` finestre dello stesso punto; ritorna la mediana per rx_pps,
     portandosi dietro la perdita PEGGIORE e la dispersione fra le finestre.
 
@@ -1767,7 +1947,8 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     for _ in range(max(1, repeat)):
         try:
             r = _measure_once(setup, rx_tab, fab, frame, delay, count,
-                              n_out, clone, tg_devs, burst, xmit_mode, gen)
+                              n_out, clone, tg_devs, burst, xmit_mode, gen,
+                              steady=steady)
         except PktgenEmptyRun as e:
             warn(f"misura scartata: {e}")
             continue
@@ -1928,7 +2109,8 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
 
 
 def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
-                  tg_devs=None, burst=0, xmit_mode="start_xmit", gen=None):
+                  tg_devs=None, burst=0, xmit_mode="start_xmit", gen=None,
+                  steady=True):
     """One (frame size, offered rate) point. Returns a dict of counters.
 
     `count` is per generator instance, so the offered load scales with the
@@ -1938,43 +2120,59 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     e si cambiano solo i parametri del punto. Senza, si ricade sul percorso
     storico -- aggiungi, configura, misura -- che serve ai chiamanti che non
     hanno un Generator."""
-    # PRIMA di azzerare: la coda della finestra precedente (warm-up o
-    # ripetizione) deve essere atterrata, altrimenti i suoi pacchetti finiscono
-    # nei contatori di questa. E' cosi' che si ottiene RX > HIT.
-    time.sleep(DRAIN_S)
-    _zero_counters(setup, rx_tab, n_out)
-    if gen is not None:
-        run = gen.run(frame, count, delay)
+    if gen is not None and steady and gen.window_mode == "steady":
+        # Finestra stazionaria: i contatori si leggono a differenza mentre
+        # tutte le istanze trasmettono, quindi niente azzeramento, niente
+        # drenaggio e niente controllo sul count (vedi Generator.steady).
+        def probe():
+            return dict(hit=_read_u64(setup["pkt_stats"], 0),
+                        miss=_read_u64(setup["pkt_stats"], 1),
+                        drop=_read_u64(setup["pkt_stats"], 2),
+                        rx=_percpu_sum(rx_tab))
+        run = gen.steady(frame, delay, probe)
         devs = gen.names
+        tx, tx_pps, elapsed = run
+        d = run.dut
+        hit, miss, drop, rx = d["hit"], d["miss"], d["drop"], d["rx"]
+        secs = run.window if run.window > 0 else 1e-9
     else:
-        devs = tg_devs or [fab.ingress_peer]
-        pg_clear_threads(len(devs))
-        for i, dev in enumerate(devs):
-            pg_configure(dev, frame, count, delay,
-                         dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02",
-                         clone=clone, thread=i, burst=burst,
-                         xmit_mode=xmit_mode)
-        run = pg_run_and_read(devs)
-    tx, tx_pps, elapsed = run
-    # Una finestra troncata non e' un punto di misura. Il `count` chiesto e'
-    # per istanza, quindi il totale atteso e' count * numero di istanze.
-    atteso = count * (gen.n_inst if gen is not None else len(devs))
-    if atteso and tx < atteso * WINDOW_MIN_TX_FRACTION:
-        raise PktgenEmptyRun(
-            f"finestra troncata: {tx} trasmessi su {atteso} chiesti "
-            f"({100.0 * tx / atteso:.1f}%) in {elapsed:.2f}s")
-    # DOPO la trasmissione: `pgctrl start` ritorna quando il GENERATORE ha
-    # finito, non quando il DUT ha drenato. Senza questa pausa la coda ancora
-    # in volo non e' contata in RX e diventa "perdita" della pipeline.
-    time.sleep(DRAIN_S)
-    hit = _read_u64(setup["pkt_stats"], 0)
-    miss = _read_u64(setup["pkt_stats"], 1)
-    drop = _read_u64(setup["pkt_stats"], 2)
-    rx = _percpu_sum(rx_tab)
-    # La finestra dei contatori e' quella del blocco su pgctrl (GenRun.window),
-    # non la durata che pktgen attribuisce al thread piu' lungo.
-    secs = getattr(run, "window", 0.0) or elapsed
-    secs = secs if secs > 0 else 1e-9
+        # PRIMA di azzerare: la coda della finestra precedente (warm-up o
+        # ripetizione) deve essere atterrata, altrimenti i suoi pacchetti finiscono
+        # nei contatori di questa. E' cosi' che si ottiene RX > HIT.
+        time.sleep(DRAIN_S)
+        _zero_counters(setup, rx_tab, n_out)
+        if gen is not None:
+            run = gen.run(frame, count, delay)
+            devs = gen.names
+        else:
+            devs = tg_devs or [fab.ingress_peer]
+            pg_clear_threads(len(devs))
+            for i, dev in enumerate(devs):
+                pg_configure(dev, frame, count, delay,
+                             dst_ip="10.0.0.2", dst_mac="02:00:00:00:00:02",
+                             clone=clone, thread=i, burst=burst,
+                             xmit_mode=xmit_mode)
+            run = pg_run_and_read(devs)
+        tx, tx_pps, elapsed = run
+        # Una finestra troncata non e' un punto di misura. Il `count` chiesto e'
+        # per istanza, quindi il totale atteso e' count * numero di istanze.
+        atteso = count * (gen.n_inst if gen is not None else len(devs))
+        if atteso and tx < atteso * WINDOW_MIN_TX_FRACTION:
+            raise PktgenEmptyRun(
+                f"finestra troncata: {tx} trasmessi su {atteso} chiesti "
+                f"({100.0 * tx / atteso:.1f}%) in {elapsed:.2f}s")
+        # DOPO la trasmissione: `pgctrl start` ritorna quando il GENERATORE ha
+        # finito, non quando il DUT ha drenato. Senza questa pausa la coda ancora
+        # in volo non e' contata in RX e diventa "perdita" della pipeline.
+        time.sleep(DRAIN_S)
+        hit = _read_u64(setup["pkt_stats"], 0)
+        miss = _read_u64(setup["pkt_stats"], 1)
+        drop = _read_u64(setup["pkt_stats"], 2)
+        rx = _percpu_sum(rx_tab)
+        # La finestra dei contatori e' quella del blocco su pgctrl (GenRun.window),
+        # non la durata che pktgen attribuisce al thread piu' lungo.
+        secs = getattr(run, "window", 0.0) or elapsed
+        secs = secs if secs > 0 else 1e-9
     # Il rate OFFERTO e' quello che pktgen ha chiesto al kernel; quello
     # AGGREGATO e' il totale diviso la durata globale. Il secondo e' la cifra
     # da usare: sommare i pps per-istanza li somma su finestre che non
@@ -1993,6 +2191,9 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 tx=tx, tx_pps=run.tx_pps_aggregate or int(tx / secs),
                 tx_pps_sum=tx_pps, offered_pps=offered,
                 gen_threads=len(devs),
+                window_mode=("steady" if getattr(run, "steady", False)
+                             else "count"),
+                gen_start_offset_ms=getattr(run, "start_offset_ms", None),
                 gen_skew_pct=getattr(run, "skew_pct", 0.0),
                 # Coerenza fra le due letture del rate offerto. Vedi GenRun:
                 # se TX/durata-globale e la somma dei pps per istanza non si
@@ -2833,7 +3034,7 @@ def run_fair(methods, model_path, frames, delays, count, threads,
         print(f"{YELLOW}{'=' * 78}{NC}")
         hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} "
                f"{'fase':12s} "
-               f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
+               f"{'RX pps':>9s} {'Mb/s':>7s} {'resp':>7s} {'perdita':>8s} "
                f"{'min':>6s} {'p50<':>7s} {'p99<':>8s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
@@ -2881,6 +3082,7 @@ def run_fair(methods, model_path, frames, delays, count, threads,
                         print(f"  {rnd:4d} {m:10s} {frame:5d} "
                               f"{r['phase']:12s} "
                               f"{r['rx_pps']:9d} {r['rx_mbps']:7.1f} "
+                              f"{r.get('respinti_pct', 0.0):6.2f}% "
                               f"{r['loss_pct']:7.2f}% "
                               f"{_fmt_ns(r['lat_min_ns'])} "
                               f"{_fmt_bucket(r['lat_p50_ns'])} "
@@ -3045,7 +3247,15 @@ def _one_fair_point(b, fab, frame, delay, count, gen=None):
     b["lat_acc"].clear()
     b["lat_hist"].clear()
     try:
-        if gen is not None:
+        if gen is not None and gen.window_mode == "steady":
+            # RX da `rx_n`, che il contatore d'uscita incrementa sempre: e' il
+            # conteggio vero, non quello dei soli pacchetti cronometrati.
+            run = gen.steady(frame, delay, lambda: {
+                "rx": sum(int(v) for v in b["rx_n"][ct.c_int(0)])})
+            tx, tx_pps, secs = run
+            threads = gen.n_inst
+            skew = run.skew_pct
+        elif gen is not None:
             run = gen.run(frame, count, delay)
             tx, tx_pps, secs = run
             threads = gen.n_inst
@@ -3062,7 +3272,8 @@ def _one_fair_point(b, fab, frame, delay, count, gen=None):
     # Stessa regola di `_measure_once`: una finestra che ha trasmesso una
     # frazione dei pacchetti chiesti e' un run troncato, non un punto.
     atteso = count * (gen.n_inst if gen is not None else 1)
-    if atteso and tx < atteso * WINDOW_MIN_TX_FRACTION:
+    if (not getattr(run, "steady", False) and atteso
+            and tx < atteso * WINDOW_MIN_TX_FRACTION):
         warn(f"punto scartato: finestra troncata, {tx} trasmessi su {atteso} "
              f"chiesti ({100.0 * tx / atteso:.1f}%) in {secs:.2f}s")
         return None
@@ -3073,14 +3284,34 @@ def _one_fair_point(b, fab, frame, delay, count, gen=None):
     st = _read_lat(b)
     if st is None:
         return None
-    rx, secs = st["n"], (secs or 1e-9)
+    rx = run.dut["rx"] if getattr(run, "steady", False) else st["n"]
+    secs = secs or 1e-9
+    # I RESPINTI SONO PERDITA. Questo percorso contava solo TX - RX, cioe'
+    # ignorava i pacchetti che `veth_xmit` rifiuta a coda d'ingresso piena --
+    # lo stesso difetto gia' corretto in _measure_once il 2026-09-18 e rimasto
+    # qui. Effetto misurato il 2026-09-23: `--latency` riportava hardcoded a
+    # 2 518 151 pps con "perdita 0,00%" a massima spinta, e la fase
+    # zero-perdite ne era la copia, marcata "il generatore ha saturato prima
+    # della pipeline"; a massima spinta, nella stessa sessione, --mode compare
+    # contava il 57% di respinti.
+    errors = getattr(run, "errors", 0)
+    offered_tx = tx + errors
     return dict(frame=frame, delay=delay, tx=tx, rx=rx, tx_pps=tx_pps,
                 rx_pps=int(rx / secs),
                 rx_mbps=round(rx * frame * 8 / secs / 1e6, 1),
                 secs=round(secs, 3), gen_threads=threads,
                 gen_skew_pct=skew,
+                window_mode=("steady" if getattr(run, "steady", False)
+                             else "count"),
                 offered_pps=(int(1e9 / delay) * threads if delay else None),
-                loss_pct=round(100.0 * max(0, tx - rx) / tx, 3) if tx else 0.0,
+                gen_errors=errors, offered_tx=offered_tx,
+                offered_real_pps=int(offered_tx / secs),
+                loss_pct=(round(100.0 * max(0, offered_tx - rx) / offered_tx, 3)
+                          if offered_tx else 0.0),
+                respinti_pct=(round(100.0 * errors / offered_tx, 3)
+                              if offered_tx else 0.0),
+                loss_dut_pct=(round(100.0 * max(0, tx - rx) / offered_tx, 3)
+                              if offered_tx else 0.0),
                 excess_rx=max(0, rx - tx),
                 **{k: st[k] for k in ("lat_min_ns", "lat_p50_ns", "lat_p90_ns",
                                       "lat_p99_ns", "lat_avg_ns",
@@ -3161,7 +3392,7 @@ def summarise_fair(raw, methods):
     print(f"{YELLOW} Riepilogo: mediana fra i giri{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
     hdr = (f"  {'pipeline':10s} {'frame':>5s} {'fase':12s} {'giri':>4s} "
-           f"{'RX pps':>9s} {'Mb/s':>7s} {'perdita':>8s} "
+           f"{'RX pps':>9s} {'Mb/s':>7s} {'resp':>7s} {'perdita':>8s} "
            f"{'min':>6s} {'p50<':>7s} {'p99<':>8s} {'collo':>18s}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
@@ -3170,8 +3401,8 @@ def summarise_fair(raw, methods):
                == (m, frame, phase)]
         delay = int(stats.median([r["delay"] for r in pts]))
         med = {k: stats.median([r[k] for r in pts if r[k] is not None] or [0])
-               for k in ("rx_pps", "rx_mbps", "loss_pct", "lat_min_ns",
-                         "lat_p50_ns", "lat_p99_ns")}
+               for k in ("rx_pps", "rx_mbps", "loss_pct", "respinti_pct",
+                         "lat_min_ns", "lat_p50_ns", "lat_p99_ns")}
         # Dispersione FRA I GIRI, non dentro un punto. E' la cosa che dice se
         # la mediana significa qualcosa: misurato, hardcoded a pieno rate ha
         # dato 2,78 / 1,17 / 1,46 Mpps in tre giri -- 137% -- e la sua mediana
@@ -3206,6 +3437,7 @@ def summarise_fair(raw, methods):
         end = NC if col else ""
         print(f"  {col}{m:10s} {frame:5d} {phase:12s}{end} {len(pts):4d} "
               f"{int(med['rx_pps']):9d} {med['rx_mbps']:7.1f} "
+              f"{med['respinti_pct']:6.2f}% "
               f"{med['loss_pct']:7.2f}% "
               f"{int(med['lat_min_ns']):5d}n "
               f"<{int(med['lat_p50_ns']):5d}n "
@@ -3775,7 +4007,7 @@ def run_method(method, model_path, frames, delays, count, out_rows,
         probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
                               repeat=1, burst=burst, xmit_mode=xmit_mode,
                               gen=gen, warmup=False, threshold=threshold,
-                              plan=plan)
+                              plan=plan, steady=False)
         if probe is None:
             # Il fabric viene ricostruito per ogni pipeline, quindi il device
             # d'ingresso ha lo STESSO NOME ma un altro ifindex. `ensure`
@@ -3796,7 +4028,7 @@ def run_method(method, model_path, frames, delays, count, out_rows,
             probe = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, clone,
                                   repeat=1, burst=burst, xmit_mode=xmit_mode,
                                   gen=gen, warmup=False, threshold=threshold,
-                                  plan=plan)
+                                  plan=plan, steady=False)
         if probe is None:
             warn("la sonda non ha trasmesso nulla nemmeno dopo il riaggancio: "
                  "pktgen non e' partito.")
@@ -4466,7 +4698,7 @@ def run_compare(methods, model_path, frames, offered_pps=None,
             p = measure_point(setup, rx_tab, fab, 64, 0, 1, n_out, gen.clone,
                               repeat=1, burst=gen.burst, xmit_mode=xmit_mode,
                               gen=gen, warmup=False, threshold=threshold,
-                              plan=plan)
+                              plan=plan, steady=False)
             if p is None or p["hit"] == 0:
                 warn(f"{m}: la sonda non produce HIT -- la escludo dal "
                      f"confronto invece di misurarle il costo di non fare "
@@ -4479,25 +4711,40 @@ def run_compare(methods, model_path, frames, offered_pps=None,
             ing.cleanup()
             return [], []
 
-        # --- il rate comune
+        # --- DUE FASI per pipeline, a ogni giro, perche' rispondono a due
+        #     domande diverse:
+        #
+        #   saturazione  delay 0. Il DUT e' in sovraccarico (respinti > 0) e
+        #                l'RX e' la sua CAPACITA' su questo percorso: e' la
+        #                fase che separa le pipeline, perche' chi fa piu'
+        #                lavoro per pacchetto ne consegna meno.
+        #   confronto    lo stesso rate offerto a tutte, sotto la capacita'
+        #                del piu' lento. Se nessuna perde, l'RX e' uguale per
+        #                costruzione e la fase dice "tutte reggono questo
+        #                carico"; se qualcuna perde, lo dice riga per riga.
+        #
+        # Prima c'era solo la seconda, con il rate al 90% di UNA finestra a
+        # massima spinta e la nota "sotto questo carico nessuna pipeline e' in
+        # sovraccarico" stampata senza controllarla. Misurato il 2026-09-23:
+        # hardcoded a 1 831 777 pps offerti, respinti fra l'11 e il 30% in
+        # tutti e tre i giri -- la nota era falsa, e la tabella attribuiva "al
+        # programma XDP" differenze che erano della coda d'ingresso.
         frame0 = frames[0] if frames else 64
+        full_count = gen.window_count(gen.rate_estimate or 3_000_000)
         if not offered_pps:
             print(f"\n{YELLOW} Calibrazione del rate comune (una volta, poi "
                   f"congelato){NC}")
             delivered = {}
             for m in alive:
                 setup = use(m)
-                gen.warmup(frame0, 0)
-                r = measure_point(setup, rx_tab, fab, frame0, 0,
-                                  gen.window_count(gen.rate_estimate
-                                                   or 3_000_000),
+                r = measure_point(setup, rx_tab, fab, frame0, 0, full_count,
                                   n_out, gen.clone, repeat=1,
                                   burst=gen.burst, xmit_mode=xmit_mode,
                                   gen=gen, threshold=threshold, plan=plan)
                 if r is not None:
                     delivered[m] = r["rx_pps"]
                     info(f"{m}: {r['rx_pps']} pps consegnati a massima spinta "
-                         f"(perdita {r['loss_worst']:.2f}%)")
+                         f"(respinti {r.get('respinti_pct', 0.0):.2f}%)")
             if not delivered:
                 warn("calibrazione fallita: nessun rate consegnato")
                 gen.detach()
@@ -4505,40 +4752,60 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 return [], []
             slowest = min(delivered, key=delivered.get)
             offered_pps = int(0.9 * delivered[slowest])
-            note(f"rate comune = 90% del piu' lento ({slowest}): "
-                 f"{offered_pps} pps. Sotto questo carico nessuna pipeline e' "
-                 f"in sovraccarico, quindi le differenze non sono lunghezze "
-                 f"di coda.")
+            note(f"rate comune = 90% di quanto il piu' lento ({slowest}) ha "
+                 f"consegnato in UNA finestra a massima spinta: {offered_pps} "
+                 f"pps. Che a questo carico nessuna perda non e' assunto: lo "
+                 f"verifica la fase `confronto`.")
 
-        # --- la misura vera: stessi parametri per tutti, a giri
+        phases = (("saturazione", 0), ("confronto", offered_pps))
         print(f"\n{YELLOW}{'=' * 78}{NC}")
-        print(f"{YELLOW} Fase 2: {rounds} giri x {len(alive)} pipeline a "
-              f"{offered_pps} pps offerti, frame {frames}{NC}")
+        print(f"{YELLOW} Fase 2: {rounds} giri x {len(alive)} pipeline x 2 "
+              f"(massima spinta; {offered_pps} pps offerti), frame "
+              f"{frames}{NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
         hdr = (f"  {'giro':>4s} {'pipeline':10s} {'frame':>5s} "
-               f"{'offerto':>9s} {'TX':>9s} {'RX':>9s} {'persi':>8s} "
-               f"{'RX pps':>9s} {'Mb/s':>8s} {'perdita':>8s} {'collo':>18s}")
+               f"{'fase':11s} {'chiesto':>9s} {'offerti':>9s} "
+               f"{'RX pps':>9s} {'resp':>7s} {'dopo':>7s} {'perdita':>8s} "
+               f"{'collo':>18s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         for rnd in range(1, rounds + 1):
             for m in alive:
                 setup = use(m)
                 for frame in frames:
-                    r = _point_at_rate(setup, rx_tab, fab, frame, offered_pps,
-                                       n_out, gen, repeat, threshold, plan,
-                                       diag, xmit_mode)
-                    if r is None:
-                        continue
-                    r.update(method=m, round=rnd, phase="confronto")
-                    raw.append(r)
-                    mark = GREEN if r["loss_worst"] <= threshold else (
-                        RED if r["loss_worst"] > 1 else YELLOW)
-                    print(f"  {rnd:4d} {m:10s} {frame:5d} {offered_pps:9d} "
-                          f"{r['tx']:9d} {r['rx']:9d} "
-                          f"{max(0, r['tx'] - r['rx']):8d} "
-                          f"{r['rx_pps']:9d} {r['rx_mbps']:8.1f} "
-                          f"{mark}{r['loss_worst']:7.2f}%{NC} "
-                          f"{r.get('bottleneck', ''):>18s}")
+                    for phase, rate in phases:
+                        if rate:
+                            r = _point_at_rate(setup, rx_tab, fab, frame, rate,
+                                               n_out, gen, repeat, threshold,
+                                               plan, diag, xmit_mode)
+                        else:
+                            r = measure_point(setup, rx_tab, fab, frame, 0,
+                                              full_count, n_out, gen.clone,
+                                              repeat=repeat, burst=gen.burst,
+                                              xmit_mode=xmit_mode, gen=gen,
+                                              threshold=threshold, plan=plan,
+                                              diag=diag)
+                            if r is not None:
+                                r.update(offered_pps=None, threads=gen.n_inst,
+                                         clone_skb=gen.clone)
+                        if r is None:
+                            continue
+                        r.update(method=m, round=rnd, phase=phase)
+                        raw.append(r)
+                        if rate:
+                            mark = GREEN if r["loss_worst"] <= threshold else (
+                                RED if r["loss_worst"] > 1 else YELLOW)
+                        else:
+                            mark = ""       # a massima spinta si perde apposta
+                        print(f"  {rnd:4d} {m:10s} {frame:5d} {phase:11s} "
+                              f"{(str(rate) if rate else 'max'):>9s} "
+                              f"{r.get('offered_real_pps', 0):9d} "
+                              f"{r['rx_pps']:9d} "
+                              f"{r.get('respinti_pct', 0.0):6.2f}% "
+                              f"{r.get('loss_dut_pct', 0.0):6.2f}% "
+                              f"{mark}{r['loss_worst']:7.2f}%"
+                              f"{NC if mark else ''} "
+                              f"{r.get('bottleneck', ''):>18s}")
 
         if diag_enabled:
             diag.start()
@@ -4561,28 +4828,34 @@ def run_compare(methods, model_path, frames, offered_pps=None,
     summary = []
     if raw:
         print(f"\n{YELLOW}{'=' * 78}{NC}")
-        print(f"{YELLOW} Riepilogo confronto: mediana fra i giri, stesso "
-              f"carico per tutti{NC}")
+        print(f"{YELLOW} Riepilogo confronto: mediana fra i giri, per "
+              f"pipeline e fase{NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
-        hdr = (f"  {'pipeline':10s} {'frame':>5s} {'giri':>4s} "
-               f"{'offerto':>9s} {'RX pps':>9s} {'min':>9s} {'max':>9s} "
-               f"{'std':>8s} {'perdita':>8s} {'collo':>18s}")
+        hdr = (f"  {'pipeline':10s} {'frame':>5s} {'fase':11s} {'giri':>4s} "
+               f"{'offerti':>9s} {'RX pps':>9s} {'min':>9s} {'max':>9s} "
+               f"{'resp':>7s} {'dopo':>7s} {'perdita':>8s} {'collo':>18s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         ordine = {m: i for i, m in enumerate(METHODS)}
-        keys = sorted({(r["method"], r["frame"]) for r in raw},
-                      key=lambda k: (ordine.get(k[0], 99), k[1]))
-        for m, frame in keys:
-            pts = [r for r in raw
-                   if r["method"] == m and r["frame"] == frame]
+        ordine_fase = {"saturazione": 0, "confronto": 1}
+        keys = sorted({(r["method"], r["frame"], r["phase"]) for r in raw},
+                      key=lambda k: (ordine.get(k[0], 99), k[1],
+                                     ordine_fase.get(k[2], 9)))
+        for m, frame, phase in keys:
+            pts = [r for r in raw if (r["method"], r["frame"], r["phase"])
+                   == (m, frame, phase)]
             pps = [r["rx_pps"] for r in pts]
             a = _agg(pps)
             loss = stats.median([r["loss_worst"] for r in pts])
             tags = [r.get("bottleneck") for r in pts if r.get("bottleneck")]
             tag = max(set(tags), key=tags.count) if tags else BN_UNKNOWN
             spread = (100.0 * (a["max"] - a["min"]) / a["min"]) if a["min"] else 0
-            row = dict(method=m, frame=frame, phase="confronto",
-                       rounds=len(pts), offered_pps=offered_pps,
+            row = dict(method=m, frame=frame, phase=phase,
+                       rounds=len(pts),
+                       offered_pps=(offered_pps if phase == "confronto"
+                                    else None),
+                       offered_real_pps=int(stats.median(
+                           [r.get("offered_real_pps", 0) for r in pts])),
                        rx_pps=int(stats.median(pps)), rx_pps_mean=a["mean"],
                        rx_pps_min=a["min"], rx_pps_max=a["max"],
                        rx_pps_std=a["std"], rx_pps_cv_pct=a["cv_pct"],
@@ -4591,6 +4864,10 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        # e' la convenzione usata ovunque altrove nel banco, e
                        # un giro pulito su tre non e' un rate pulito.
                        loss_worst=round(max(r["loss_worst"] for r in pts), 3),
+                       respinti_pct=round(stats.median(
+                           [r.get("respinti_pct", 0.0) for r in pts]), 3),
+                       loss_dut_pct=round(stats.median(
+                           [r.get("loss_dut_pct", 0.0) for r in pts]), 3),
                        # I conteggi, non solo i rate: "quanti pacchetti sono
                        # arrivati" e' una domanda a cui un pps non risponde,
                        # e senza offerti/persi la perdita non e' verificabile
@@ -4606,18 +4883,71 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        rx_mbps=round(stats.median([r["rx_mbps"]
                                                    for r in pts]), 2),
                        secs=round(stats.median([r["secs"] for r in pts]), 3),
+                       window_mode=pts[0].get("window_mode", "count"),
                        pps_spread_pct=round(spread, 1),
                        unreliable=spread > MAX_SPREAD_PCT,
                        threads=len(plan.gen), bottleneck=tag)
             summary.append(row)
             flag = f" {RED}+-{spread:.0f}%{NC}" if row["unreliable"] else ""
-            print(f"  {m:10s} {frame:5d} {len(pts):4d} {offered_pps:9d} "
+            print(f"  {m:10s} {frame:5d} {phase:11s} {len(pts):4d} "
+                  f"{row['offered_real_pps']:9d} "
                   f"{row['rx_pps']:9d} {a['min']:9d} {a['max']:9d} "
-                  f"{a['std']:8.1f} {row['loss_pct']:7.2f}% "
-                  f"{tag:>18s}{flag}")
-        note("stesso rate offerto, stessa durata, stesse manopole: le "
-             "differenze in questa tabella sono del programma XDP.")
+                  f"{row['respinti_pct']:6.2f}% {row['loss_dut_pct']:6.2f}% "
+                  f"{row['loss_pct']:7.2f}% {tag:>18s}{flag}")
+        _compare_verdict(summary, offered_pps, threshold)
     return raw, summary
+
+
+def _compare_verdict(summary, offered_pps, threshold):
+    """Che cosa si puo' dire della tabella, deciso sui numeri e non scritto
+    prima di averli.
+
+    Sostituisce due frasi che il banco stampava SEMPRE: "sotto questo carico
+    nessuna pipeline e' in sovraccarico" e "le differenze in questa tabella
+    sono del programma XDP". Il 2026-09-23 erano false tutte e due."""
+    sat = [r for r in summary if r["phase"] == "saturazione"]
+    cmp_ = [r for r in summary if r["phase"] == "confronto"]
+    if sat:
+        piene = [r for r in sat if r["respinti_pct"] > threshold]
+        vuote = [r for r in sat if r["respinti_pct"] <= threshold]
+        if piene:
+            note("fase saturazione -- respinti > 0 su: "
+                 + ", ".join(f"{r['method']}/{r['frame']}B" for r in piene)
+                 + ". La coda d'ingresso trabocca, quindi il DUT e' in "
+                   "sovraccarico e l'RX e' la sua capacita' su questo "
+                   "percorso veth: fra queste righe le differenze di RX "
+                   "oltre la dispersione fra i giri sono di costo per "
+                   "pacchetto.")
+        if vuote:
+            warn("fase saturazione -- nessun respinto su: "
+                 + ", ".join(f"{r['method']}/{r['frame']}B" for r in vuote)
+                 + ". Il DUT non e' saturo nemmeno a massima spinta: l'RX e' "
+                   "quanto il generatore ha offerto, non la capacita' della "
+                   "pipeline.")
+    if cmp_:
+        corti = [r for r in cmp_ if r["offered_real_pps"] < 0.9 * offered_pps]
+        sporchi = [r for r in cmp_ if r["loss_worst"] > threshold]
+        if corti:
+            warn(f"fase confronto -- il generatore non ha offerto i "
+                 f"{offered_pps} pps chiesti a: "
+                 + ", ".join(f"{r['method']}/{r['frame']}B "
+                             f"({r['offered_real_pps']})" for r in corti)
+                 + ". Per queste righe il carico non e' identico.")
+        if sporchi:
+            warn(f"fase confronto -- a {offered_pps} pps offerti si perde: "
+                 + "; ".join(f"{r['method']}/{r['frame']}B respinti "
+                             f"{r['respinti_pct']:.2f}%, dopo l'ingresso "
+                             f"{r['loss_dut_pct']:.2f}%" for r in sporchi)
+                 + ". Il rate comune NON e' sotto la capacita' di tutte, "
+                   "oppure la coda d'ingresso trabocca per il tempo di "
+                   "risveglio del thread NAPI e non per il lavoro della "
+                   "pipeline: in entrambi i casi le differenze di RX in "
+                   "questa fase non sono del programma XDP.")
+        elif not corti:
+            note(f"fase confronto -- a {offered_pps} pps offerti nessuna "
+                 f"pipeline perde piu' del {threshold}%: tutte reggono questo "
+                 f"carico, e l'RX e' uguale per costruzione. Il confronto di "
+                 f"capacita' e' nella fase saturazione.")
 
 
 # ==========================================================================
@@ -4751,7 +5081,8 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
               f"{len(alive)} pipeline x {rounds} round, frame {frame} B{NC}")
         hdr = (f"  {'rate':>8s} {'pipeline':11s} {'TX':>9s} {'HIT':>9s} "
                f"{'RX':>9s} {'TX-HIT':>8s} {'HIT-RX':>8s} {'resp':>7s} "
-               f"{'perdita':>8s} {'pipe':>7s} {'e2e':>7s} {'xport':>7s}")
+               f"{'dopo':>8s} {'totale':>8s} "
+               f"{'pipe':>7s} {'e2e':>7s} {'xport':>7s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
 
@@ -4771,7 +5102,13 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                     _zero_counters(setup, b["rx_n"], n_out)
                     _clear_lat(b)
                     try:
-                        run = gen.run(frame, cnt, delay)
+                        if gen.window_mode == "steady":
+                            run = gen.steady(frame, delay, lambda: dict(
+                                hit=_read_u64(setup["pkt_stats"], 0),
+                                rx=sum(int(v) for v in
+                                       b["rx_n"][ct.c_int(0)])))
+                        else:
+                            run = gen.run(frame, cnt, delay)
                     except PktgenEmptyRun as e:
                         warn(f"rate {rate/1e6:.2f} Mpps {m}: punto scartato "
                              f"-- {e}")
@@ -4792,7 +5129,7 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                     # WINDOW_MIN_TX_FRACTION copre lo stesso caso ma vive in
                     # _measure_once, e questo percorso non ci passa.
                     atteso_tx = cnt * gen.n_inst
-                    if tx < atteso_tx:
+                    if not run.steady and tx < atteso_tx:
                         warn(f"rate {rate/1e6:.2f} Mpps {m}: punto scartato "
                              f"-- {tx} trasmessi su {atteso_tx} chiesti "
                              f"({100.0 * tx / atteso_tx:.0f}%), cioe' una o "
@@ -4800,9 +5137,12 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                              f"consegnato. Cio' che manca non e' stato offerto "
                              f"alla pipeline, quindi non e' una sua perdita.")
                         continue
-                    hit = _read_u64(setup["pkt_stats"], 0)
                     st = _read_lat_all(b)
-                    rx = st["rx"]
+                    if run.steady:
+                        hit, rx = run.dut["hit"], run.dut["rx"]
+                    else:
+                        hit = _read_u64(setup["pkt_stats"], 0)
+                        rx = st["rx"]
                     offered = tx + errors
                     persi_coda = max(0, tx - hit)
                     persi_dopo = max(0, hit - rx)
@@ -4812,8 +5152,16 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                     # finestra PRECEDENTE che non aveva finito di atterrare:
                     # DRAIN_S non basta a questo rate. La riga resta, marcata.
                     residui = max(0, hit - tx)
+                    if run.steady and residui <= STEADY_INFLIGHT:
+                        # a finestra stazionaria, HIT - TX piccolo e' la coda
+                        # in volo alle due letture, non la finestra prima
+                        residui = 0
                     loss = (round(100.0 * (persi_coda + persi_dopo) / offered, 3)
                             if offered else 0.0)
+                    # La perdita TOTALE, respinti compresi: e' quella su cui
+                    # si decide il rate sostenibile (vedi _report_rates).
+                    loss_tot = (round(100.0 * (errors + persi_coda + persi_dopo)
+                                      / offered, 3) if offered else 0.0)
                     resp = (round(100.0 * errors / offered, 3)
                             if offered else 0.0)
                     row = dict(
@@ -4822,7 +5170,9 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                         tx=tx, hit=hit, rx=rx, gen_errors=errors,
                         offered_tx=offered, tx_minus_hit=persi_coda,
                         hit_minus_rx=persi_dopo, respinti_pct=resp,
-                        loss_dut_pct=loss, residui_finestra=residui,
+                        loss_dut_pct=loss, loss_tot_pct=loss_tot,
+                        window_mode="steady" if run.steady else "count",
+                        residui_finestra=residui,
                         rx_pps=int(rx / secs), tx_pps=int(tx / secs),
                         rx_mbps=round(rx * frame * 8 / secs / 1e6, 2),
                         samples=st["pipe"]["n"] if st["pipe"] else 0)
@@ -4841,11 +5191,12 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                              f"finestra precedente, il drenaggio non basta a "
                              f"questo rate. La riga non e' confrontabile con "
                              f"le altre.")
-                    mark = (GREEN if loss <= threshold else
-                            (RED if loss > 1 else YELLOW))
+                    mark = (GREEN if loss_tot <= threshold else
+                            (RED if loss_tot > 1 else YELLOW))
                     print(f"  {rate/1e6:7.2f}M {m:11s} {tx:9d} {hit:9d} "
                           f"{rx:9d} {persi_coda:8d} {persi_dopo:8d} "
-                          f"{resp:6.2f}% {mark}{loss:7.3f}%{NC} "
+                          f"{resp:6.2f}% {loss:7.3f}% "
+                          f"{mark}{loss_tot:7.3f}%{NC} "
                           f"{_fmt_ns(row['pipe_min_ns']):>7s} "
                           f"{_fmt_ns(row['e2e_min_ns']):>7s} "
                           f"{_fmt_ns(row['xport_min_ns']):>7s}")
@@ -4872,18 +5223,28 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
     print(f"{YELLOW} Mediana fra i round{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
     hdr = (f"  {'chiesto':>8s} {'ottenuto':>9s} {'resa':>6s} {'pipeline':11s} "
-           f"{'perdita':>8s} {'pipe T2-T1':>11s} {'e2e T3-T1':>10s} "
+           f"{'dopo':>8s} {'totale':>8s} {'pipe T2-T1':>11s} {'e2e T3-T1':>10s} "
            f"{'xport T3-T2':>12s} {'round':>6s}")
     print(f"\n{hdr}")
     print("  " + "-" * (len(hdr) - 2))
 
     # sostenibile[m] = (rate OTTENUTO, rate chiesto) del punto piu' alto senza
-    # perdita del DUT. Si tiene l'ottenuto perche' e' l'unico dei due che il
-    # DUT ha davvero visto.
-    sostenibile, resa_min, ottenuti = {}, {}, {}
+    # perdita. Si tiene l'ottenuto perche' e' l'unico dei due che il DUT ha
+    # davvero visto.
+    #
+    # La perdita su cui si decide e' quella TOTALE, respinti compresi. Prima
+    # era solo quella "dopo l'ingresso" (TX-HIT + HIT-RX), e un rate con il 20%
+    # di respinti usciva sostenibile a perdita zero. Ma un respinto e' un
+    # pacchetto che il nodo non ha preso perche' la sua coda d'ingresso era
+    # piena: a quel rate il nodo NON regge, qualunque sia il motivo per cui la
+    # coda non si svuota (costo della pipeline o risveglio del thread NAPI).
+    # La perdita dopo l'ingresso resta in tabella, perche' e' lei a dire se la
+    # pipeline butta via qualcosa che ha ricevuto.
+    sostenibile, sost_dopo, offerto_gen, ottenuti = {}, {}, {}, {}
     for (m, rate) in sorted(per, key=lambda k: (k[0], k[1])):
         rs = per[(m, rate)]
-        loss = _median([x["loss_dut_pct"] for x in rs])
+        loss_dopo = _median([x["loss_dut_pct"] for x in rs])
+        loss = _median([x.get("loss_tot_pct", x["loss_dut_pct"]) for x in rs])
         rxp = _median([x["rx_pps"] for x in rs]) or 0
         pipe = _median([x["pipe_min_ns"] for x in rs])
         e2e = _median([x["e2e_min_ns"] for x in rs])
@@ -4892,18 +5253,28 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
         ok = loss is not None and loss <= threshold
         if ok and rxp > sostenibile.get(m, (0, 0))[0]:
             sostenibile[m] = (int(rxp), rate)
-        resa_min[m] = min(resa_min.get(m, 999.0), resa)
+        if (loss_dopo is not None and loss_dopo <= threshold
+                and rxp > sost_dopo.get(m, (0, 0))[0]):
+            sost_dopo[m] = (int(rxp), rate)
+        # Quanto il GENERATORE ha offerto (TX + respinti) rispetto al
+        # chiesto: e' questo, non la resa, a dire se il carico e' partito.
+        # Una resa bassa con l'offerto pieno sono respinti, cioe' il nodo.
+        offp = _median([x["offered_tx"] / x["secs"] for x in rs
+                        if x.get("secs")]) or 0
+        offerto_gen.setdefault(m, {})[rate] = (100.0 * offp / rate
+                                               if rate else 0.0)
         ottenuti.setdefault(m, []).append((rate, rxp))
         mark = GREEN if ok else RED
         rmark = GREEN if resa >= 90 else (YELLOW if resa >= 70 else RED)
         print(f"  {rate/1e6:7.2f}M {int(rxp)/1e6:8.2f}M "
               f"{rmark}{resa:5.0f}%{NC} {m:11s} "
+              f"{loss_dopo if loss_dopo is not None else 0:7.3f}% "
               f"{mark}{loss if loss is not None else 0:7.3f}%{NC} "
               f"{_fmt_ns(pipe):>11s} {_fmt_ns(e2e):>10s} "
               f"{_fmt_ns(xp):>12s} {len(rs):6d}")
 
     print(f"\n{YELLOW} Throughput SOSTENIBILE -- rate OTTENUTO, non quello "
-          f"chiesto (TX = HIT = RX, perdita <= {threshold}%){NC}")
+          f"chiesto (respinti + persi <= {threshold}% dell'offerto){NC}")
     print("  " + "-" * 68)
     metodi = sorted({r["method"] for r in raw})
     for m in metodi:
@@ -4914,6 +5285,12 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
         else:
             print(f"    {m:11s} {RED}nessun rate provato e' sostenibile{NC} "
                   f"{GREY}(gia' il piu' basso perde: abbassa --rates){NC}")
+        d = sost_dopo.get(m)
+        if d and (not v or d[0] > v[0]):
+            print(f"    {'':11s} {GREY}contando solo la perdita DOPO "
+                  f"l'ingresso sarebbe >= {d[0]/1e6:.2f} Mpps: la differenza "
+                  f"sono respinti a coda d'ingresso piena, cioe' carico che il "
+                  f"nodo non ha preso.{NC}")
 
     # La resa: quanto di cio' che si e' chiesto e' davvero arrivato. Se resta
     # bassa a OGNI rate, compreso il piu' basso, allora il tetto e' del
@@ -4934,12 +5311,23 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
              f"fortunato, non una soglia. Vale come \"il DUT ha retto almeno "
              f"questo\", non come capacita' misurata.")
 
-    peggiore = max(resa_min.values()) if resa_min else 0.0
-    if peggiore < 90.0:
-        warn(f"il generatore non ha mai consegnato piu' del {peggiore:.0f}% di "
-             f"quanto chiesto, nemmeno al rate piu' basso. Il tetto di questo "
-             f"sweep e' il GENERATORE, non il DUT: i numeri qui sopra dicono "
-             f"che il DUT regge almeno quel carico, non dove si romperebbe.")
+    # Il generatore non ha offerto nemmeno il rate PIU' BASSO? Prima questo
+    # avviso guardava la resa minima su TUTTI i rate -- quindi scattava
+    # appena un rate alto veniva respinto, e diceva "nemmeno al rate piu'
+    # basso" di un rate basso consegnato al 100% -- e attribuiva al
+    # generatore anche i respinti, che sono del nodo.
+    corti = {}
+    for m, per_rate in offerto_gen.items():
+        low = min(per_rate)
+        if per_rate[low] < 90.0:
+            corti[m] = (low, per_rate[low])
+    if corti:
+        warn("il generatore non ha offerto nemmeno il rate piu' basso a: "
+             + ", ".join(f"{m} ({v:.0f}% di {low/1e6:.2f} Mpps)"
+                         for m, (low, v) in sorted(corti.items()))
+             + ". Per queste il tetto dello sweep e' il GENERATORE: i numeri "
+               "dicono che il nodo regge almeno quel carico, non dove si "
+               "romperebbe.")
     top = max((r["rate_req_pps"] for r in raw), default=0)
     if sostenibile and all(v[1] >= top for v in sostenibile.values()):
         warn(f"nessuna pipeline ha perso un pacchetto nemmeno al rate piu' "
@@ -4948,8 +5336,9 @@ def _report_rates(raw, threshold=DEFAULT_LOSS_THRESHOLD):
              f"INFERIORE. Alza --rates, o aggiungi thread al generatore.")
     print(f"\n  {GREY}`chiesto` e' il rate offerto a pktgen, `ottenuto` "
           f"quello davvero consegnato, `resa` il rapporto fra i due. Una resa "
-          f"bassa non e' perdita del DUT: e' carico che non e' mai partito, e "
-          f"si legge nei respinti delle righe grezze.{NC}")
+          f"bassa ha due cause che le righe grezze separano: carico che il "
+          f"generatore non ha offerto (offered_tx sotto il chiesto), o "
+          f"pacchetti che il nodo ha respinto a coda piena (resp).{NC}")
     print(f"  {GREY}Il massimo Mpps osservato NON e' il throughput della "
           f"pipeline se TX > HIT o HIT > RX: in quella zona il numero "
           f"descrive il generatore o il veth. La riga da citare e' il "
@@ -5112,12 +5501,19 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 expected_chiesto = cnt * gen.n_inst
                 # Il punto e' stato troncato dal clamp? Allora la finestra non
                 # e' quella bersaglio, e va detto sulla riga.
-                capped = expected_chiesto < expected_nominale
+                # A finestra stazionaria il count non decide la durata: il
+                # clamp non tronca niente.
+                capped = (gen.window_mode != "steady"
+                          and expected_chiesto < expected_nominale)
                 gen.warmup(frame, delay)
                 time.sleep(DRAIN_S)
                 b["gen_rx"].clear()
                 try:
-                    run = gen.run(frame, cnt, delay)
+                    if gen.window_mode == "steady":
+                        run = gen.steady(frame, delay, lambda t=b["gen_rx"]: {
+                            "rx": _percpu_sum(t)})
+                    else:
+                        run = gen.run(frame, cnt, delay)
                 except PktgenEmptyRun as e:
                     warn(f"giro {rnd} target {rate/1e6:.2f} Mpps: punto "
                          f"scartato -- {e}")
@@ -5134,7 +5530,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 # corta, i rate che se ne ricavano sono un conteggio diviso
                 # un intervallo sbagliato, e la perdita che ne segue e' della
                 # strumentazione -- non del percorso.
-                if tx < expected_chiesto:
+                if not run.steady and tx < expected_chiesto:
                     warn(f"giro {rnd} target {rate/1e6:.2f} Mpps: punto "
                          f"scartato -- {tx} trasmessi su {expected_chiesto} "
                          f"chiesti ({100.0 * tx / expected_chiesto:.0f}%), "
@@ -5142,7 +5538,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                          f" istanza/e del generatore non ha consegnato. La "
                          f"finestra ({secs:.3f}s) non descrive questo rate.")
                     continue
-                rx = _percpu_sum(b["gen_rx"])
+                rx = run.dut["rx"] if run.steady else _percpu_sum(b["gen_rx"])
                 tx_mpps = tx / secs / 1e6
                 rx_mpps = rx / secs / 1e6
                 # Quanto il generatore metteva DAVVERO sul filo: i trasmessi
@@ -5342,7 +5738,8 @@ def _confronto_con_rates(out_dir, ceiling_rx):
     per = {}
     for r in righe:
         try:
-            if float(r.get("loss_dut_pct") or 0) > DEFAULT_LOSS_THRESHOLD:
+            if float(r.get("loss_tot_pct") or r.get("loss_dut_pct")
+                     or 0) > DEFAULT_LOSS_THRESHOLD:
                 continue
             m, v = r["method"], float(r["rx_pps"]) / 1e6
         except (KeyError, ValueError):
@@ -5353,9 +5750,10 @@ def _confronto_con_rates(out_dir, ceiling_rx):
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} Confronto con --mode rates (letto da {path}){NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
-    print(f"\n  Receive-path control (nessuna pipeline):")
+    print("\n  Receive-path control (nessuna pipeline):")
     print(f"      maximum achieved RX = {ceiling_rx:.2f} Mpps")
-    print(f"\n  Pipeline benchmark (massimo RX senza perdita del DUT):")
+    print("\n  Pipeline benchmark (massimo RX senza perdita, respinti "
+          "compresi):")
     for m in sorted(per, key=lambda k: -per[k]):
         print(f"      {m:11s} >= {per[m]:.2f} Mpps")
     print(f"\n  {GREY}Nessuna classifica e nessun vincitore: le due colonne "
@@ -5666,6 +6064,7 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("topologia_generatore", a.gen_topology)
         add("xmit_mode", a.xmit_mode)
         add("finestra_s", a.duration)
+        add("finestra_modo", getattr(a, "window", WINDOW_MODE))
         add("warmup_s", a.warmup)
         add("ripetizioni_per_punto", a.repeat)
         add("giri", a.rounds)
@@ -6106,8 +6505,17 @@ def main():
                    help="finestre per punto; si tiene la mediana del rate e la "
                         "PEGGIORE delle perdite")
     m.add_argument("--offered-pps", type=int, default=None, metavar="PPS",
-                   help="rate offerto fisso (modalita' compare). Senza, lo "
-                        "decide una calibrazione: 90%% del piu' lento.")
+                   help="rate della fase `confronto` (modalita' compare). "
+                        "Senza, lo decide una calibrazione: 90%% di quanto il "
+                        "piu' lento consegna a massima spinta. Che a quel "
+                        "rate nessuna perda lo verifica la fase stessa.")
+    m.add_argument("--window", choices=("steady", "count"), default="steady",
+                   help="steady (default): rate letti a differenza mentre "
+                        "tutte le istanze pktgen trasmettono, poi stop. "
+                        "count: il percorso storico, count fisso e rate diviso "
+                        "la durata del blocco su `pgctrl start`, che contiene "
+                        "fino a ~225 ms di tempo morto di pktgen. Tenuto per "
+                        "riprodurre le misure vecchie e per il confronto.")
     m.add_argument("--loss-threshold", type=float, default=None,
                    metavar="PCT",
                    help="sotto questa percentuale la perdita e' considerata "
@@ -6151,6 +6559,8 @@ def main():
     o.add_argument("--cleanup", action="store_true",
                    help="rimuovi un fabric rimasto da un run interrotto")
     a = p.parse_args()
+    global WINDOW_MODE
+    WINDOW_MODE = a.window
 
     if sys.platform != "linux":
         sys.exit(f"serve Linux, non {sys.platform}")
@@ -6302,7 +6712,11 @@ def main():
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
             burst=a.burst)
-        rc |= check_validity(rows)
+        # Il controllo "la baseline e' la piu' veloce" ha senso solo dove
+        # l'RX e' una capacita', cioe' a massima spinta: nella fase confronto
+        # tutte consegnano lo stesso rate per costruzione.
+        rc |= check_validity([r for r in rows
+                              if r.get("phase") == "saturazione"] or rows)
         if a.out and (rows or raw):
             os.makedirs(a.out, exist_ok=True)
             if rows:
