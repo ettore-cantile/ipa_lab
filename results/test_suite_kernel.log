@@ -1,0 +1,338 @@
+
+[1;33m=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ===[0m
+
+[topology_config] from the model descriptor's `trained_on` (germany50): {'n_interfaces': 6, 'n_nodes': 52, '_origin': '/home/admin/Scrivania/ipa_lab2/ipa/model_meta.json `trained_on`'}
+DIM INPUT: 65
+[verify:mac_table] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [1;33m[INFO][0m baseline: map memory 280B from 3 maps -- pkt_stats=36B, cls_stats=84B, mac_table=160B
+DIM INPUT: 65
+[count_lookups] baseline: instrumenting 6 lookup sites (<header>=1  xdp_baseline=5)
+[verify:mac_table] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [0;32m[PASS][0m baseline :   155 eBPF instr | lat=    17.0 ns (min of 7) [p50=20 max=35] | 58.824 Mpps | retval=4 | tail=0
+DIM INPUT: 65
+[Pipeline1/AOT] class semantics from model_meta.json (n_out=7, drop_class=5)
+[verify:mac_table] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [1;33m[INFO][0m hardcoded: map memory 2516B from 5 maps -- link_state=28B, pkt_stats=36B, cls_stats=84B, mac_table=320B, model_progs=2048B
+DIM INPUT: 65
+[Pipeline1/AOT] class semantics from model_meta.json (n_out=7, drop_class=5)
+[count_lookups] hardcoded: instrumenting 14 lookup sites (AOT object)
+[verify:mac_table] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [0;32m[PASS][0m hardcoded:  1011 eBPF instr | lat=    50.0 ns (min of 7) [p50=56 max=58] | 20.000 Mpps | retval=4 | tail=1
+DIM INPUT: 65
+[Pipeline2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[Pipeline2] arch_weights fd=45 block=1024 bytes
+[Pipeline2] arch_weights[0] verify: OK
+[class_action] class_action_t2: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline2] arch_registry[0] = arch_id=0 woff=0 scale=24 shape=65-4-4-7 weights=319
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+[Pipeline2] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t2] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [1;33m[INFO][0m template: map memory 10416B from 9 maps -- link_state=36B, queue_state=36B, model_desc=5376B, arch_weights=1028B, arch_registry=2816B, arch_progs=64B, mac_table_t2=640B, pkt_stats_t2=36B, cls_stats_t2=384B
+DIM INPUT: 65
+[count_lookups] template: instrumenting 21 lookup sites (<header>=1  arch_generic_2layer=19  ipa_switch_template=1)
+[Pipeline2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[Pipeline2] arch_weights fd=28 block=1024 bytes
+[Pipeline2] arch_weights[0] verify: OK
+[class_action] class_action_t2: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline2] arch_registry[0] = arch_id=0 woff=0 scale=24 shape=65-4-4-7 weights=319
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+[Pipeline2] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t2] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [0;32m[PASS][0m template : 14985 eBPF instr | lat=   180.0 ns (min of 7) [p50=233 max=348] |  5.556 Mpps | retval=4 | tail=1
+DIM INPUT: 65
+[Pipeline3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[class_action] class_action_t3: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline3] model_id=0 registered: scale=24, shape=65-4-4-7, n_layers=3, base_offset=0, total_weights=319
+[Pipeline3] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[P3 setup] nr_cpus=4  PERCPU ctypes Array enabled
+  [1;33m[INFO][0m modular: map memory 19508B from 12 maps -- link_state=36B, queue_state=36B, model_desc=5376B, layer_weights=2052B, layer_registry=1024B, layer_shapes=5120B, layer_chain=128B, scratch_acts=4100B, scratch_meta=576B, mac_table_t3=640B, pkt_stats_t3=36B, cls_stats_t3=384B
+DIM INPUT: 65
+[count_lookups] modular: instrumenting 34 lookup sites (<header>=2  layer_first=11  layer_hidden=6  ml_argmax_forward=12  modular_dispatcher=3)
+[Pipeline3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[class_action] class_action_t3: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline3] model_id=0 registered: scale=24, shape=65-4-4-7, n_layers=3, base_offset=0, total_weights=319
+[Pipeline3] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t3] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [0;32m[PASS][0m modular  : 12349 eBPF instr | lat=   278.0 ns (min of 7) [p50=294 max=336] |  3.597 Mpps | retval=4 | tail=3
+
+  Metric                                  baseline       hardcoded        template         modular
+  ------------------------------------------------------------------------------------------------
+  eBPF instructions (xlated)                   155            1011           14985           12349
+  Jited code (bytes)                           709            4917           67183           57372
+  Tail calls / packet                            0               1               1               3
+  Map lookups / packet (real)                  3.0             6.0            11.0            29.0
+  Map memory (bytes)                           280            2516           10416           19508
+  Latency (ns/pkt, min of 7)                  17.0            50.0           180.0           278.0
+    ...p50                                    20.0            56.0           233.0           294.0
+    ...max                                    35.0            58.0           348.0           336.0
+    ...spread (max-min)/min %                 106%             16%             93%             21%
+  Inference rate (Mpps, 1/latency)          58.824          20.000           5.556           3.597
+  ------------------------------------------------------------------------------------------------
+
+  NOTE: 'eBPF instructions' is the STATIC size of the loaded program, not the
+        number executed per packet. Pipeline 1 unrolls a 52-case switch for the
+        node one-hot of which exactly ONE case runs, so its executed path is a
+        fraction of the count shown; dividing instructions by latency would give
+        an impossible instructions-per-cycle figure. See docs/testing.md.
+
+  [1;33m[INFO][0m baseline  programs: xdp_baseline=155
+  [1;33m[INFO][0m hardcoded programs: xdp_model=983  xdp_dispatch=28
+  [1;33m[INFO][0m template  programs: ipa_switch_template=41  arch_generic_2layer=14944
+  [1;33m[INFO][0m modular   programs: modular_dispatcher=136  layer_first=10525  layer_hidden=1688
+
+======================================================================
+ IPA/eBPF BPF_PROG_TEST_RUN  --  method=hardcoded  model_id=0
+======================================================================
+
+NOTE: bpf_redirect() runs in the TEST_RUN sandbox.
+      PASS = retval in {0,4} (redirect fire) + cls_stats/pkt_stats hit.
+
+DIM INPUT: 65
+[Pipeline1/AOT] class semantics from model_meta.json (n_out=7, drop_class=5)
+[verify:mac_table] class semantics from model_meta.json (n_out=7, drop_class=5)
+[M1 update timing] reload on the node (AOT open+load): 14.473 ms   [clang, offline: 0.0 ms, 0 if cached]
+[M1 update timing] weight insert   (n/a, pure hardcoded): 0.000 ms
+[M1 update timing] total:                               14.473 ms
+
+[setup] scale=24  weights=319  disp_fd=88
+      All pipelines tested via the REAL dispatcher (full tail-call chain,
+      dispatcher -> ... -> action) -- no leaf-priming shortcut.
+      argmax -> mac_table[class] -> bpf_redirect.
+      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.
+  TTL=  2  ref_cls=2  ref_val=  128055  retval=4 cls_stats[2]=1  lat=3.74us  [PASS]
+  TTL=  3  ref_cls=2  ref_val=  131387  retval=4 cls_stats[2]=1  lat=1.01us  [PASS]
+  TTL=  4  ref_cls=2  ref_val=  125604  retval=4 cls_stats[2]=1  lat=0.53us  [PASS]
+  TTL=  5  ref_cls=2  ref_val=  125604  retval=4 cls_stats[2]=1  lat=0.42us  [PASS]
+  TTL=  6  ref_cls=2  ref_val=  122763  retval=4 cls_stats[2]=1  lat=0.16us  [PASS]
+----------------------------------------------------------------------
+Results: 5 PASS / 0 FAIL  (TTL range [2,6])
+pkt_stats: HIT=1  MISS=0  DROP=0
+  [0;32m[PASS][0m dispatch hardcoded: PASS (TTL 2-6)
+======================================================================
+ IPA/eBPF BPF_PROG_TEST_RUN  --  method=template  model_id=0
+======================================================================
+
+NOTE: bpf_redirect() runs in the TEST_RUN sandbox.
+      PASS = retval in {0,4} (redirect fire) + cls_stats/pkt_stats hit.
+
+DIM INPUT: 65
+[Pipeline2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[Pipeline2] arch_weights fd=105 block=1024 bytes
+[Pipeline2] arch_weights[0] verify: OK
+[class_action] class_action_t2: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline2] arch_registry[0] = arch_id=0 woff=0 scale=24 shape=65-4-4-7 weights=319
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+[Pipeline2] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[setup] scale=24  weights=319  disp_fd=106
+      All pipelines tested via the REAL dispatcher (full tail-call chain,
+      dispatcher -> ... -> action) -- no leaf-priming shortcut.
+      argmax -> mac_table[class] -> bpf_redirect.
+      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.
+  TTL=  2  ref_cls=2  ref_val=  128055  retval=4 cls_stats[2]=1  lat=3.44us  [PASS]
+  TTL=  3  ref_cls=2  ref_val=  131387  retval=4 cls_stats[2]=1  lat=0.41us  [PASS]
+  TTL=  4  ref_cls=2  ref_val=  125604  retval=4 cls_stats[2]=1  lat=0.30us  [PASS]
+  TTL=  5  ref_cls=2  ref_val=  125604  retval=4 cls_stats[2]=1  lat=4.09us  [PASS]
+  TTL=  6  ref_cls=2  ref_val=  122763  retval=4 cls_stats[2]=1  lat=1.01us  [PASS]
+----------------------------------------------------------------------
+Results: 5 PASS / 0 FAIL  (TTL range [2,6])
+pkt_stats: HIT=1  MISS=0  DROP=0
+  [0;32m[PASS][0m dispatch template: PASS (TTL 2-6)
+======================================================================
+ IPA/eBPF BPF_PROG_TEST_RUN  --  method=modular  model_id=0
+======================================================================
+
+NOTE: bpf_redirect() runs in the TEST_RUN sandbox.
+      PASS = retval in {0,4} (redirect fire) + cls_stats/pkt_stats hit.
+
+DIM INPUT: 65
+[Pipeline3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[class_action] class_action_t3: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline3] model_id=0 registered: scale=24, shape=65-4-4-7, n_layers=3, base_offset=0, total_weights=319
+[Pipeline3] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[P3 setup] nr_cpus=4  PERCPU ctypes Array enabled
+[setup] scale=24  weights=319  disp_fd=124
+      All pipelines tested via the REAL dispatcher (full tail-call chain,
+      dispatcher -> ... -> action) -- no leaf-priming shortcut.
+      argmax -> mac_table[class] -> bpf_redirect.
+      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.
+  TTL=  2  ref_cls=2  ref_val=  128055  retval=4 cls_stats[2]=1  lat=5.65us  [PASS]
+  TTL=  3  ref_cls=2  ref_val=  131387  retval=4 cls_stats[2]=1  lat=0.70us  [PASS]
+  TTL=  4  ref_cls=2  ref_val=  125604  retval=4 cls_stats[2]=1  lat=0.46us  [PASS]
+  TTL=  5  ref_cls=2  ref_val=  125604  retval=4 cls_stats[2]=1  lat=0.49us  [PASS]
+  TTL=  6  ref_cls=2  ref_val=  122763  retval=4 cls_stats[2]=1  lat=3.00us  [PASS]
+----------------------------------------------------------------------
+Results: 5 PASS / 0 FAIL  (TTL range [2,6])
+pkt_stats: HIT=1  MISS=0  DROP=0
+  [0;32m[PASS][0m dispatch modular: PASS (TTL 2-6)
+
+DIM INPUT: 65
+[Pipeline1/AOT] class semantics from model_meta.json (n_out=7, drop_class=5)
+[verify:mac_table] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [1;33m[INFO][0m   hardcoded: TTL 5 -> forwarded, out TTL=4, checksum OK
+  [1;33m[INFO][0m   hardcoded: TTL 1 -> not forwarded (retval=2, hits=0)
+  [0;32m[PASS][0m TTL handling hardcoded: 2/2 (decrement + checksum + expiry)
+DIM INPUT: 65
+[Pipeline2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[Pipeline2] arch_weights fd=147 block=1024 bytes
+[Pipeline2] arch_weights[0] verify: OK
+[class_action] class_action_t2: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline2] arch_registry[0] = arch_id=0 woff=0 scale=24 shape=65-4-4-7 weights=319
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+[Pipeline2] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t2] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [1;33m[INFO][0m   template: TTL 5 -> forwarded, out TTL=4, checksum OK
+  [1;33m[INFO][0m   template: TTL 1 -> not forwarded (retval=2, hits=0)
+  [0;32m[PASS][0m TTL handling template: 2/2 (decrement + checksum + expiry)
+DIM INPUT: 65
+[Pipeline3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[class_action] class_action_t3: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline3] model_id=0 registered: scale=24, shape=65-4-4-7, n_layers=3, base_offset=0, total_weights=319
+[Pipeline3] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[P3 setup] nr_cpus=4  PERCPU ctypes Array enabled
+  [1;33m[INFO][0m   modular: TTL 5 -> forwarded, out TTL=4, checksum OK
+  [1;33m[INFO][0m   modular: TTL 1 -> not forwarded (retval=2, hits=0)
+  [0;32m[PASS][0m TTL handling modular: 2/2 (decrement + checksum + expiry)
+
+DIM INPUT: 65
+[Pipeline1/AOT] class semantics from model_meta.json (n_out=7, drop_class=5)
+[verify:mac_table] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [0;32m[PASS][0m link_state reroute: 15/30 link-down cases change egress  [TTL2:link2 2->3, TTL2:link3 2->1, TTL2:link4 2->3, TTL3:link2 2->3, TTL3:link3 2->1, TTL3:link4 2->3]
+
+[1;33m--- Architetture alternative (non solo 65-4-4-7) ---[0m
+[model_meta] NOTE: descriptor declares no n_out; ASSUMING n_interfaces + 1 = 7. That formula says nothing about what the classes mean -- add "n_out" and "class_semantics" to model_meta.json.
+  [0;32m[PASS][0m hardcoded alt-arch 65-8-7: 5/5 PASS
+  [0;32m[PASS][0m hardcoded alt-arch 65-4-4-4-7: 5/5 PASS
+
+--- Pipeline 2 (template): model_id=0 real 65-4-4-7, model_id=1 synthetic 65-6-5-7 ---
+DIM INPUT: 65
+[Pipeline2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[Pipeline2] arch_weights fd=189 block=1024 bytes
+[Pipeline2] arch_weights[0] verify: OK
+[class_action] class_action_t2: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline2] arch_registry[0] = arch_id=0 woff=0 scale=24 shape=65-4-4-7 weights=319
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+[Pipeline2] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[Pipeline2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[Pipeline2] arch_weights fd=189 block=1024 bytes
+[Pipeline2] arch_weights[319] verify: OK
+[class_action] class_action_t2: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline2] arch_registry[1] = arch_id=0 woff=319 scale=30 shape=65-6-5-7 weights=473
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+[Pipeline2] model_desc[1] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t2] class semantics from model_meta.json (n_out=7, drop_class=5)
+[verify_multi_model] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [PASS] template   model_id=0 shape=65-4-4-7       ref_cls=2 ref_val=  131387 retval=4 hit=True
+  [PASS] template   model_id=1 shape=65-6-5-7       ref_cls=1 ref_val=   19800 retval=4 hit=True
+
+--- Pipeline 3 (modular): model_id=0 real 65-4-4-7 (3 layers), model_id=1 synthetic 65-5-6-4-7 (4 layers) ---
+DIM INPUT: 65
+[Pipeline3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[class_action] class_action_t3: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline3] model_id=0 registered: scale=24, shape=65-4-4-7, n_layers=3, base_offset=0, total_weights=319
+[Pipeline3] model_desc[0] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[Pipeline3] class semantics from model_meta.json (n_out=7, drop_class=5)
+[class_action] class_action_t3: n_out=7 drop_class=5 ports=[0, 1, 2, 3, 4]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: FORWARD -> logical_port 2
+[class_action]   class 3: FORWARD -> logical_port 3
+[class_action]   class 4: FORWARD -> logical_port 4
+[class_action]   class 5: DROP
+[class_action]   class 6: UNUSED
+[Pipeline3] model_id=1 registered: scale=30, shape=65-5-6-4-7, n_layers=4, base_offset=319, total_weights=429
+[Pipeline3] model_desc[1] = n_feat=4 n_in=65 feats=[(1, 6, 0, 1), (2, 6, 6, 1), (3, 1, 12, 30), (4, 52, 13, 1)]
+[verify:mac_table_t3] class semantics from model_meta.json (n_out=7, drop_class=5)
+  [PASS] modular    model_id=0 shape=65-4-4-7       ref_cls=2 ref_val=  131387 retval=4 hit=True
+  [PASS] modular    model_id=1 shape=65-5-6-4-7     ref_cls=6 ref_val= 1537268 retval=2 hit=True
+  [0;32m[PASS][0m template alt-arch (65-6-5-7, concurrent w/ 65-4-4-7): PASS
+  [0;32m[PASS][0m modular alt-arch (65-5-6-4-7, concurrent w/ 65-4-4-7): PASS
+
+====================================================
+ kernel suite: PASS
+====================================================
+
+[1;33m####################################################[0m
+[1;33m#  SUITE SUMMARY[0m
+   kernel     : [0;32mPASS[0m
+[1;33m####################################################[0m

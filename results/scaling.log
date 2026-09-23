@@ -1,0 +1,347 @@
+
+[1;33m==============================================================================[0m
+[1;33m asse x: nodi della rete (larghezza della colonna che identifica il nodo)[0m
+[0;90m n_in = 13 + n_nodes; il modello resta 4-4, cambia solo l'ingresso[0m
+[1;33m==============================================================================[0m
+
+      x pipeline               forma   pesi   insns      ns  update ms  build ms  mappe B tail
+  --------------------------------------------------------------------------------------------
+  [0;90m[14:25:42] nodes x=10 p1_static ...[0m
+     10 p1_static           23-4-4-7    151     623    40.0       5.89      72.2     2516    1
+  [0;90m[14:25:48] nodes x=10 hardcoded ...[0m
+     10 hardcoded           23-4-4-7    151     727    39.0       4.86     107.4     2516    1
+  [0;90m[14:25:53] nodes x=10 template ...[0m
+     10 template            23-4-4-7    151   14985   156.0       3.73    1491.9    10416    1
+  [0;90m[14:25:58] nodes x=10 modular ...[0m
+     10 modular             23-4-4-7    151   12349   255.0      10.42    1301.1    19508    3
+  [0;90m[14:26:04] nodes x=25 p1_static ...[0m
+     25 p1_static           38-4-4-7    211     631    39.0       5.65      66.5     2516    1
+  [0;90m[14:26:09] nodes x=25 hardcoded ...[0m
+     25 hardcoded           38-4-4-7    211     838    43.0       5.64      81.9     2516    1
+  [0;90m[14:26:13] nodes x=25 template ...[0m
+     25 template            38-4-4-7    211   14985   156.0       4.01    1613.8    10416    1
+  [0;90m[14:26:19] nodes x=25 modular ...[0m
+     25 modular             38-4-4-7    211   12349   265.0       4.53    1341.5    19508    3
+  [0;90m[14:26:25] nodes x=52 p1_static ...[0m
+     52 p1_static           65-4-4-7    319     618    37.0       6.09      67.6     2516    1
+  [0;90m[14:26:30] nodes x=52 hardcoded ...[0m
+     52 hardcoded           65-4-4-7    319    1028    48.0       5.13      84.0     2516    1
+  [0;90m[14:26:34] nodes x=52 template ...[0m
+     52 template            65-4-4-7    319   14985   168.0       4.40    1571.3    10416    1
+  [0;90m[14:26:40] nodes x=52 modular ...[0m
+     52 modular             65-4-4-7    319   12349   272.0       4.05    1312.6    19508    3
+  [0;90m[14:26:46] nodes x=75 p1_static ...[0m
+     75 p1_static           88-4-4-7    411     621    32.0      30.92      89.8     2516    1
+  [0;90m[14:26:51] nodes x=75 hardcoded ...[0m
+     75 hardcoded           88-4-4-7    411    1466    38.0      14.73      94.7     2516    1
+  [0;90m[14:26:55] nodes x=75 template ...[0m
+     75 template            88-4-4-7    411   14985   153.0       3.62    1506.8    10416    1
+  [0;90m[14:27:01] nodes x=75 modular ...[0m
+     75 modular             88-4-4-7    411   12349   259.0       4.08    1247.5    19508    3
+  [0;90m[14:27:07] nodes x=100 p1_static ...[0m
+    100 p1_static          113-4-4-7    511     636    37.0       5.24      73.6     2516    1
+  [0;90m[14:27:12] nodes x=100 hardcoded ...[0m
+    100 hardcoded          113-4-4-7    511    1695    44.0       8.09     113.4     2516    1
+  [0;90m[14:27:16] nodes x=100 template ...[0m
+    100 template           113-4-4-7    511   14985   152.0       4.26    1587.9    10416    1
+  [0;90m[14:27:23] nodes x=100 modular ...[0m
+    100 modular            113-4-4-7    511   12349   264.0       4.08    1287.2    19508    3
+
+  [0;32mscritto[0m /home/admin/Scrivania/ipa_lab2/results/scaling_nodes.csv  (20 righe)
+
+[1;33m==============================================================================[0m
+[1;33m asse x: numero di strati nascosti[0m
+[0;90m P2 copre la profondita' RICOMPILANDO (build_arch_leaf), P3 no: la ricompilazione E' il confronto[0m
+[1;33m==============================================================================[0m
+
+      x pipeline               forma   pesi   insns      ns  update ms  build ms  mappe B tail
+  --------------------------------------------------------------------------------------------
+  [0;90m[14:27:29] depth x=1 p1_static ...[0m
+      1 p1_static             65-4-7    299     573    37.0       6.36      77.4     2516    1
+  [0;90m[14:27:34] depth x=1 hardcoded ...[0m
+      1 hardcoded             65-4-7    299     973    37.0       5.24      81.0     2516    1
+  [0;90m[14:27:38] depth x=1 template ...[0m
+      1 template              65-4-7    299   14668   142.0       3.98    1492.8    10416    1
+  [0;90m[14:27:44] depth x=1 modular ...[0m
+      1 modular               65-4-7    299   12349   204.0       4.11    1278.2    19508    2
+  [0;90m[14:27:50] depth x=2 p1_static ...[0m
+      2 p1_static           65-4-4-7    319     618    35.0       6.68      70.9     2516    1
+  [0;90m[14:27:54] depth x=2 hardcoded ...[0m
+      2 hardcoded           65-4-4-7    319    1028    43.0       5.75      93.9     2516    1
+  [0;90m[14:27:58] depth x=2 template ...[0m
+      2 template            65-4-4-7    319   14985   162.0       3.83    1640.3    10416    1
+  [0;90m[14:28:04] depth x=2 modular ...[0m
+      2 modular             65-4-4-7    319   12349   254.0       9.60    1321.1    19508    3
+  [0;90m[14:28:09] depth x=3 p1_static ...[0m
+      3 p1_static         65-4-4-4-7    339     633    46.0       7.12      96.3     2516    1
+  [0;90m[14:28:14] depth x=3 hardcoded ...[0m
+      3 hardcoded         65-4-4-4-7    339    1044    46.0      12.05     117.4     2516    1
+  [0;90m[14:28:19] depth x=3 template ...[0m
+      3 template          65-4-4-4-7    339   16663   176.0       3.91    1807.0    10416    1
+  [0;90m[14:28:25] depth x=3 modular ...[0m
+      3 modular           65-4-4-4-7    339   12349   292.0       4.05    1301.4    19508    4
+  [0;90m[14:28:30] depth x=4 p1_static ...[0m
+      4 p1_static       65-4-4-4-4-7    359     719    44.0       5.51      84.6     2516    1
+  [0;90m[14:28:34] depth x=4 hardcoded ...[0m
+      4 hardcoded       65-4-4-4-4-7    359    1119    47.0       7.02      95.2     2516    1
+  [0;90m[14:28:39] depth x=4 template ...[0m
+      4 template        65-4-4-4-4-7    359   16867   197.0       3.81    1570.8    10416    1
+  [0;90m[14:28:45] depth x=4 modular ...[0m
+      4 modular         65-4-4-4-4-7    359   12349   323.0       4.71    1340.9    19508    5
+  [0;90m[14:28:51] depth x=5 p1_static ...[0m
+      5 p1_static     65-4-4-4-4-4-7    379     784    45.0       6.09      81.3     2516    1
+  [0;90m[14:28:56] depth x=5 hardcoded ...[0m
+      5 hardcoded     65-4-4-4-4-4-7    379    1192    50.0       6.54      88.5     2516    1
+  [0;90m[14:29:00] depth x=5 template ...[0m
+      5 template      65-4-4-4-4-4-7    379   17828   229.0       3.98    1824.7    10416    1
+  [0;90m[14:29:06] depth x=5 modular ...[0m
+      5 modular       65-4-4-4-4-4-7    379   12349   398.0       5.23    1328.0    19508    6
+  [0;90m[14:29:12] depth x=6 p1_static ...[0m
+      6 p1_static   65-4-4-4-4-4-4-7    399     853    49.0       5.86      79.4     2516    1
+  [0;90m[14:29:16] depth x=6 hardcoded ...[0m
+      6 hardcoded   65-4-4-4-4-4-4-7    399    1310    52.0      31.41     137.5     2516    1
+  [0;90m[14:29:21] depth x=6 template ...[0m
+      6 template    65-4-4-4-4-4-4-7    399   18801   278.0       3.65    1670.2    10416    1
+  [0;90m[14:29:27] depth x=6 modular ...[0m
+      6 modular     65-4-4-4-4-4-4-7    399   12349   413.0       4.80    1335.1    19508    7
+
+  [0;32mscritto[0m /home/admin/Scrivania/ipa_lab2/results/scaling_depth.csv  (24 righe)
+
+[1;33m==============================================================================[0m
+[1;33m asse x: neuroni per strato nascosto[0m
+[0;90m 8 e' il soffitto compilato di P2 (T2_MAX_H1/H2) e P3 (ML1_MAX_H1)[0m
+[1;33m==============================================================================[0m
+
+      x pipeline               forma   pesi   insns      ns  update ms  build ms  mappe B tail
+  --------------------------------------------------------------------------------------------
+  [0;90m[14:29:33] width x=2 p1_static ...[0m
+      2 p1_static           65-2-2-7    159     449    24.0       5.61      66.8     2516    1
+  [0;90m[14:29:38] width x=2 hardcoded ...[0m
+      2 hardcoded           65-2-2-7    159     736    39.0       5.27      70.6     2516    1
+  [0;90m[14:29:42] width x=2 template ...[0m
+      2 template            65-2-2-7    159   14985   153.0       3.80    1488.6    10416    1
+  [0;90m[14:29:48] width x=2 modular ...[0m
+      2 modular             65-2-2-7    159   12349   239.0       4.28    1304.7    19508    3
+  [0;90m[14:29:53] width x=4 p1_static ...[0m
+      4 p1_static           65-4-4-7    319     618    35.0      11.88      78.7     2516    1
+  [0;90m[14:29:58] width x=4 hardcoded ...[0m
+      4 hardcoded           65-4-4-7    319    1028    41.0       5.77      89.8     2516    1
+  [0;90m[14:30:02] width x=4 template ...[0m
+      4 template            65-4-4-7    319   14985   159.0       3.84    1580.4    10416    1
+  [0;90m[14:30:08] width x=4 modular ...[0m
+      4 modular             65-4-4-7    319   12349   255.0       4.15    1269.8    19508    3
+  [0;90m[14:30:14] width x=6 p1_static ...[0m
+      6 p1_static           65-6-6-7    487     834    49.0       9.97      88.2     2516    1
+  [0;90m[14:30:19] width x=6 hardcoded ...[0m
+      6 hardcoded           65-6-6-7    487    1388    49.0       5.90     101.9     2516    1
+  [0;90m[14:30:23] width x=6 template ...[0m
+      6 template            65-6-6-7    487   14985   163.0       3.70    1560.5    10416    1
+  [0;90m[14:30:29] width x=6 modular ...[0m
+      6 modular             65-6-6-7    487   12349   286.0       4.39    1335.4    19508    3
+  [0;90m[14:30:36] width x=8 p1_static ...[0m
+      8 p1_static           65-8-8-7    663    1242    58.0       6.12      88.7     2516    1
+  [0;90m[14:30:41] width x=8 hardcoded ...[0m
+      8 hardcoded           65-8-8-7    663    2270    63.0      16.48     127.2     2516    1
+  [0;90m[14:30:45] width x=8 template ...[0m
+      8 template            65-8-8-7    663   14985   172.0       3.89    1540.7    10416    1
+  [0;90m[14:30:52] width x=8 modular ...[0m
+      8 modular             65-8-8-7    663   12349   298.0       5.56    1321.3    19508    3
+
+  [0;32mscritto[0m /home/admin/Scrivania/ipa_lab2/results/scaling_width.csv  (16 righe)
+
+[1;33m==============================================================================[0m
+[1;33m asse x: composizione del vettore d'ingresso[0m
+[0;90m stesso modello 4-4, IV diverse: 0/1/2 one-hot, piccola (6) o grande (52)[0m
+[1;33m==============================================================================[0m
+
+      x pipeline               forma   pesi   insns      ns  update ms  build ms  mappe B tail
+  --------------------------------------------------------------------------------------------
+  [0;90m[14:30:58] descriptor x=default p1_static ...[0m
+  default p1_static           65-4-4-7    319     618    34.0       8.44      96.6     2516    1
+  [0;90m[14:31:02] descriptor x=default hardcoded ...[0m
+  default hardcoded           65-4-4-7    319    1028    40.0       5.39      82.6     2516    1
+  [0;90m[14:31:06] descriptor x=default template ...[0m
+  default template            65-4-4-7    319   14985   156.0       3.96    1579.4    10416    1
+  [0;90m[14:31:12] descriptor x=default modular ...[0m
+  default modular             65-4-4-7    319   12349   282.0       4.22    1283.7    19508    3
+  [0;90m[14:31:17] descriptor x=no_onehot p1_static ...[0m
+  no_onehot p1_static           11-4-4-7    103     596    33.0       5.88      65.4     2536    1
+  [0;90m[14:31:21] descriptor x=no_onehot hardcoded ...[0m
+  no_onehot hardcoded           11-4-4-7    103     596    34.0       5.03      71.7     2536    1
+  [0;90m[14:31:26] descriptor x=no_onehot template ...[0m
+  no_onehot template            11-4-4-7    103   14985   162.0       4.81    1545.1    10416    1
+  [0;90m[14:31:31] descriptor x=no_onehot modular ...[0m
+  no_onehot modular             11-4-4-7    103   12349   271.0       8.66    1257.6    19508    3
+  [0;90m[14:31:38] descriptor x=small_onehot p1_static ...[0m
+  small_onehot p1_static           13-4-4-7    111     605    32.0       5.84      64.0     2516    1
+  [0;90m[14:31:42] descriptor x=small_onehot hardcoded ...[0m
+  small_onehot hardcoded           13-4-4-7    111     605    33.0       6.84      71.6     2516    1
+  [0;90m[14:31:47] descriptor x=small_onehot template ...[0m
+  small_onehot template            13-4-4-7    111   14985   154.0       3.84    1533.3    10416    1
+  [0;90m[14:31:53] descriptor x=small_onehot modular ...[0m
+  small_onehot modular             13-4-4-7    111   12349   307.0       4.30    1281.5    19508    3
+  [0;90m[14:32:00] descriptor x=big_onehot p1_static ...[0m
+  big_onehot p1_static           59-4-4-7    295     539    31.0       8.38      72.6     2516    1
+  [0;90m[14:32:04] descriptor x=big_onehot hardcoded ...[0m
+  big_onehot hardcoded           59-4-4-7    295     950    34.0       5.77      75.7     2516    1
+  [0;90m[14:32:09] descriptor x=big_onehot template ...[0m
+  big_onehot template            59-4-4-7    295   14985   162.0       4.31    1539.8    10416    1
+  [0;90m[14:32:14] descriptor x=big_onehot modular ...[0m
+  big_onehot modular             59-4-4-7    295   12349   258.0       4.00    1275.1    19508    3
+
+  [0;32mscritto[0m /home/admin/Scrivania/ipa_lab2/results/scaling_descriptor.csv  (16 righe)
+
+[1;33m==============================================================================[0m
+[1;33m asse x: strati nascosti, a parita' di pesi (~592)[0m
+[0;90m stesso budget di pesi speso in modi diversi: una layer largo contro molti stretti[0m
+[1;33m==============================================================================[0m
+
+      x pipeline               forma   pesi   insns      ns  update ms  build ms  mappe B tail
+  --------------------------------------------------------------------------------------------
+  [0;90m[14:32:20] isoparam x=1 p1_static ...[0m
+      1 p1_static             65-8-7    591     919    48.0       4.85      70.7     2516    1
+  [0;90m[14:32:25] isoparam x=1 hardcoded ...[0m
+      1 hardcoded             65-8-7    591    1755    54.0       7.34     109.6     2516    1
+  [0;90m[14:32:31] isoparam x=1 template ...[0m
+      1 template              65-8-7    591   14668   138.0       3.83    1465.6    10416    1
+  [0;90m[14:32:37] isoparam x=1 modular ...[0m
+      1 modular               65-8-7    591   12349   232.0       4.10    1276.6    19508    2
+  [0;90m[14:32:44] isoparam x=2 p1_static ...[0m
+      2 p1_static           65-8-4-7    599     915    49.0       5.36      79.2     2516    1
+  [0;90m[14:32:48] isoparam x=2 hardcoded ...[0m
+      2 hardcoded           65-8-4-7    599    1718    52.0       7.64     123.4     2516    1
+  [0;90m[14:32:53] isoparam x=2 template ...[0m
+      2 template            65-8-4-7    599   14985   166.0       3.74    1534.4    10416    1
+  [0;90m[14:32:59] isoparam x=2 modular ...[0m
+      2 modular             65-8-4-7    599   12349   275.0       4.94    1358.6    19508    3
+  [0;90m[14:33:04] isoparam x=3 p1_static ...[0m
+      3 p1_static         65-8-3-3-7    595     877    41.0       8.03      99.4     2516    1
+  [0;90m[14:33:08] isoparam x=3 hardcoded ...[0m
+      3 hardcoded         65-8-3-3-7    595    1837    51.0       7.74     108.5     2516    1
+  [0;90m[14:33:13] isoparam x=3 template ...[0m
+      3 template          65-8-3-3-7    595   16663   175.0       7.21    1716.2    10416    1
+  [0;90m[14:33:19] isoparam x=3 modular ...[0m
+      3 modular           65-8-3-3-7    595   12349   288.0       4.26    1304.0    19508    4
+  [0;90m[14:33:25] isoparam x=4 p1_static ...[0m
+      4 p1_static       65-7-5-5-5-7    604    1086    53.0       9.48     126.0     2516    1
+  [0;90m[14:33:29] isoparam x=4 hardcoded ...[0m
+      4 hardcoded       65-7-5-5-5-7    604    1708    62.0       7.87     115.7     2516    1
+  [0;90m[14:33:34] isoparam x=4 template ...[0m
+      4 template        65-7-5-5-5-7    604   16867   230.0       3.90    1654.2    10416    1
+  [0;90m[14:33:40] isoparam x=4 modular ...[0m
+      4 modular         65-7-5-5-5-7    604   12349   368.0       4.56    1315.5    19508    5
+  [0;90m[14:33:46] isoparam x=5 p1_static ...[0m
+      5 p1_static     65-7-4-4-4-4-7    589    1001    59.0       7.47      92.8     2516    1
+  [0;90m[14:33:50] isoparam x=5 hardcoded ...[0m
+      5 hardcoded     65-7-4-4-4-4-7    589    1751    54.0      13.95     115.8     2516    1
+  [0;90m[14:33:55] isoparam x=5 template ...[0m
+      5 template      65-7-4-4-4-4-7    589   17828   235.0       3.94    1775.1    10416    1
+  [0;90m[14:34:01] isoparam x=5 modular ...[0m
+      5 modular       65-7-4-4-4-4-7    589   12349   406.0       5.38    1333.0    19508    6
+
+  [0;32mscritto[0m /home/admin/Scrivania/ipa_lab2/results/scaling_isoparam.csv  (20 righe)
+
+[1;33m==============================================================================[0m
+[1;33m asse x: porte realmente presenti sul nodo (su 6 previste)[0m
+[0;90m stesso modello, stessi pesi, stesse colonne di peso: cambia solo quante di esse la P1 specializzata genera[0m
+[1;33m==============================================================================[0m
+
+      x pipeline               forma   pesi   insns      ns  update ms  build ms  mappe B tail
+  --------------------------------------------------------------------------------------------
+  [0;90m[14:34:07] degree x=2 p1_static ...[0m
+      2 p1_static           65-4-4-7    319     549    33.0      10.09      69.4     2516    1
+  [0;90m[14:34:12] degree x=2 hardcoded ...[0m
+      2 hardcoded           65-4-4-7    319    1028    38.0       5.19      86.3     2516    1
+  [0;90m[14:34:17] degree x=2 template ...[0m
+      2 template            65-4-4-7    319   14985   152.0       3.42    1619.9    10416    1
+  [0;90m[14:34:22] degree x=2 modular ...[0m
+      2 modular             65-4-4-7    319   12349   263.0       4.49    1285.4    19508    3
+  [0;90m[14:34:28] degree x=3 p1_static ...[0m
+      3 p1_static           65-4-4-7    319     567    31.0       5.18      70.0     2516    1
+  [0;90m[14:34:32] degree x=3 hardcoded ...[0m
+      3 hardcoded           65-4-4-7    319    1028    44.0       9.68      85.1     2516    1
+  [0;90m[14:34:36] degree x=3 template ...[0m
+      3 template            65-4-4-7    319   14985   173.0       3.80    1571.3    10416    1
+  [0;90m[14:34:42] degree x=3 modular ...[0m
+      3 modular             65-4-4-7    319   12349   265.0       5.54    1261.6    19508    3
+  [0;90m[14:34:48] degree x=4 p1_static ...[0m
+      4 p1_static           65-4-4-7    319     584    32.0       7.33      65.0     2516    1
+  [0;90m[14:34:54] degree x=4 hardcoded ...[0m
+      4 hardcoded           65-4-4-7    319    1028    42.0       5.23      84.6     2516    1
+  [0;90m[14:34:58] degree x=4 template ...[0m
+      4 template            65-4-4-7    319   14985   153.0       3.51    1635.1    10416    1
+  [0;90m[14:35:04] degree x=4 modular ...[0m
+      4 modular             65-4-4-7    319   12349   242.0       7.90    1288.8    19508    3
+  [0;90m[14:35:09] degree x=5 p1_static ...[0m
+      5 p1_static           65-4-4-7    319     600    34.0       6.45      70.0     2516    1
+  [0;90m[14:35:13] degree x=5 hardcoded ...[0m
+      5 hardcoded           65-4-4-7    319    1028    38.0       5.47      80.9     2516    1
+  [0;90m[14:35:17] degree x=5 template ...[0m
+      5 template            65-4-4-7    319   14985   155.0       3.82    1478.3    10416    1
+  [0;90m[14:35:24] degree x=5 modular ...[0m
+      5 modular             65-4-4-7    319   12349   256.0       5.53    1270.5    19508    3
+  [0;90m[14:35:30] degree x=6 p1_static ...[0m
+      6 p1_static           65-4-4-7    319     618    38.0       9.01      80.7     2516    1
+  [0;90m[14:35:34] degree x=6 hardcoded ...[0m
+      6 hardcoded           65-4-4-7    319    1028    39.0       5.36      83.8     2516    1
+  [0;90m[14:35:39] degree x=6 template ...[0m
+      6 template            65-4-4-7    319   14985   154.0       3.50    1582.6    10416    1
+  [0;90m[14:35:45] degree x=6 modular ...[0m
+      6 modular             65-4-4-7    319   12349   245.0       5.34    1240.2    19508    3
+
+  [0;32mscritto[0m /home/admin/Scrivania/ipa_lab2/results/scaling_degree.csv  (20 righe)
+
+[1;33m==============================================================================[0m
+[1;33m asse x: frazione di pesi esattamente zero[0m
+[0;90m stessa forma, pesi diversi: P1 li compila come letterali, P2/P3 li leggono da mappa[0m
+[1;33m==============================================================================[0m
+
+      x pipeline               forma   pesi   insns      ns  update ms  build ms  mappe B tail
+  --------------------------------------------------------------------------------------------
+  [0;90m[14:35:51] sparsity x=0.0 p1_static ...[0m
+    0.0 p1_static           65-4-4-7    319     618    35.0       8.19      98.3     2516    1
+  [0;90m[14:35:55] sparsity x=0.0 hardcoded ...[0m
+    0.0 hardcoded           65-4-4-7    319    1028    45.0       5.22      82.0     2516    1
+  [0;90m[14:36:00] sparsity x=0.0 template ...[0m
+    0.0 template            65-4-4-7    319   14985   163.0       3.92    1578.5    10416    1
+  [0;90m[14:36:06] sparsity x=0.0 modular ...[0m
+    0.0 modular             65-4-4-7    319   12349   264.0       6.32    1348.7    19508    3
+  [0;90m[14:36:11] sparsity x=0.25 p1_static ...[0m
+   0.25 p1_static           65-4-4-7    319     559    29.0       4.98      66.6     2516    1
+  [0;90m[14:36:17] sparsity x=0.25 hardcoded ...[0m
+   0.25 hardcoded           65-4-4-7    319     943    42.0       5.57      85.3     2516    1
+  [0;90m[14:36:21] sparsity x=0.25 template ...[0m
+   0.25 template            65-4-4-7    319   14985   156.0       9.29    1723.0    10416    1
+  [0;90m[14:36:26] sparsity x=0.25 modular ...[0m
+   0.25 modular             65-4-4-7    319   12349   266.0       4.64    1586.2    19508    3
+  [0;90m[14:36:32] sparsity x=0.5 p1_static ...[0m
+    0.5 p1_static           65-4-4-7    319     413    25.0       5.34      62.8     2516    1
+  [0;90m[14:36:36] sparsity x=0.5 hardcoded ...[0m
+    0.5 hardcoded           65-4-4-7    319     661    30.0       5.83      83.0     2516    1
+  [0;90m[14:36:40] sparsity x=0.5 template ...[0m
+    0.5 template            65-4-4-7    319   14985   156.0       3.74    1665.7    10416    1
+  [0;90m[14:36:46] sparsity x=0.5 modular ...[0m
+    0.5 modular             65-4-4-7    319   12349   248.0       5.15    1354.4    19508    3
+  [0;90m[14:36:51] sparsity x=0.75 p1_static ...[0m
+   0.75 p1_static           65-4-4-7    319     289    20.0       0.67      50.3     2516    1
+  [0;90m[14:36:55] sparsity x=0.75 hardcoded ...[0m
+   0.75 hardcoded           65-4-4-7    319     359    29.0       1.29      55.5     2516    1
+  [0;90m[14:36:59] sparsity x=0.75 template ...[0m
+   0.75 template            65-4-4-7    319   14985   158.0       3.78    1623.0    10416    1
+  [0;90m[14:37:05] sparsity x=0.75 modular ...[0m
+   0.75 modular             65-4-4-7    319   12349   251.0       4.23    1378.6    19508    3
+  [0;90m[14:37:12] sparsity x=0.9 p1_static ...[0m
+    0.9 p1_static           65-4-4-7    319     215    18.0       0.49      46.1     2516    1
+  [0;90m[14:37:17] sparsity x=0.9 hardcoded ...[0m
+    0.9 hardcoded           65-4-4-7    319     223    23.0       0.60      48.5     2516    1
+  [0;90m[14:37:21] sparsity x=0.9 template ...[0m
+    0.9 template            65-4-4-7    319   14985   164.0       4.66    1675.6    10416    1
+  [0;90m[14:37:27] sparsity x=0.9 modular ...[0m
+    0.9 modular             65-4-4-7    319   12349   242.0       4.17    1282.6    19508    3
+
+  [0;32mscritto[0m /home/admin/Scrivania/ipa_lab2/results/scaling_sparsity.csv  (20 righe)
+
+[1;33m==============================================================================[0m
+ Grafici (non serve root, basta matplotlib):
+   python3 ipa/test/bench_scaling.py --plot /home/admin/Scrivania/ipa_lab2/results
+[1;33m==============================================================================[0m
