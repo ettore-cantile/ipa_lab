@@ -2232,6 +2232,11 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 window_mode=("steady" if getattr(run, "steady", False)
                              else "count"),
                 gen_start_offset_ms=getattr(run, "start_offset_ms", None),
+                # Quando e' stata presa, e quanto e' durata la lettura piu'
+                # lenta: servono a vedere se le finestre crollate cadono tutte
+                # nello stesso momento (la macchina) o no (la pipeline).
+                t_wall=round(time.time(), 2),
+                read_ms=getattr(run, "read_ms", None),
                 gen_skew_pct=getattr(run, "skew_pct", 0.0),
                 # Coerenza fra le due letture del rate offerto. Vedi GenRun:
                 # se TX/durata-globale e la somma dei pps per istanza non si
