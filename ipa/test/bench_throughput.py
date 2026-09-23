@@ -5513,7 +5513,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
 
         hdr = (f"  {'giro':>4s} {'target':>9s} {'TX':>10s} {'RX':>10s} "
                f"{'offerti':>8s} {'TX Mpps':>8s} {'RX Mpps':>8s} "
-               f"{'resa':>6s} {'loss':>7s} {'resp':>7s} {'stato':>22s}")
+               f"{'resa':>6s} {'loss':>7s} {'resp':>7s} {'stato':>26s}")
         print(f"\n{hdr}")
         print("  " + "-" * (len(hdr) - 2))
 
@@ -5595,17 +5595,31 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 loss = _pct(max(0, tx - rx), tx)
                 resp = _pct(errors, tx + errors)
 
-                # Lo stato dice DOVE si e' fermato, non quanto e' andato bene.
-                # In ordine di gravita': una perdita batte una resa bassa, che
-                # batte una finestra troncata.
+                # Lo stato dice DOVE si e' fermato, e i due lati si guardano
+                # separati. La resa (TX/target) non basta: TX sono i pacchetti
+                # ACCETTATI, quindi una resa bassa puo' essere il generatore
+                # che non offre il target oppure il ricevitore che respinge.
+                # Prima una resa bassa si chiamava sempre
+                # "GENERATOR_BACKPRESSURE": misurato il 2026-09-23 a 4 Mpps di
+                # target, 4,005 offerti e 3,58 accettati -- il generatore
+                # seguiva il target, a respingere era il ricevitore.
+                #
+                #   GEN_LIMIT        offerti (TX + respinti) sotto il target
+                #   RX_BACKPRESSURE  respinti oltre soglia: coda RX piena
+                #   RX_LOSS          accettati e non contati
+                gen_resa = 100.0 * offerti_mpps / target_mpps if target_mpps else 0.0
+                cause = []
                 if loss > threshold:
-                    stato, col = "RX_LOSS", RED
-                elif resa < 99.0:
-                    stato, col = "GENERATOR_BACKPRESSURE", YELLOW
-                elif capped:
-                    stato, col = "CAP_WINDOW", YELLOW
-                else:
-                    stato, col = "OK", GREEN
+                    cause.append("RX_LOSS")
+                if resp > threshold:
+                    cause.append("RX_BACKPRESSURE")
+                if gen_resa < 99.0:
+                    cause.append("GEN_LIMIT")
+                if capped:
+                    cause.append("CAP_WINDOW")
+                stato = "+".join(cause) or "OK"
+                col = (RED if "RX_LOSS" in cause else
+                       YELLOW if cause else GREEN)
 
                 raw.append(dict(
                     mode="generator", rate_target_mpps=round(rate / 1e6, 3),
@@ -5617,6 +5631,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                     expected_chiesto=expected_chiesto,
                     window_capped=int(capped),
                     tx_achievement=round(resa / 100.0, 4),
+                    gen_achievement=round(gen_resa / 100.0, 4),
                     loss_percent=round(loss, 4),
                     resp_percent=round(resp, 4), gen_errors=errors,
                     threads=gen.n_inst,
@@ -5633,7 +5648,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
                 print(f"  {rnd:4d} {rate/1e6:7.2f}M{segno} {tx:10d} {rx:10d} "
                       f"{offerti_mpps:8.3f} {tx_mpps:8.3f} {rx_mpps:8.3f} "
                       f"{resa:5.0f}% {loss:6.2f}% {resp:6.2f}% "
-                      f"{col}{stato:>22s}{NC}")
+                      f"{col}{stato:>26s}{NC}")
 
         gen.detach()
         pg_reset()
@@ -5729,18 +5744,37 @@ def _report_generator(raw, rates, threshold=DEFAULT_LOSS_THRESHOLD):
              f"({top:.2f} Mpps) is still achievable. Increase --rates to "
              f"determine a higher ceiling.")
     else:
-        dove = ("perdita sul lato RX" if loss_top > threshold
-                else "backpressure del generatore")
+        off_top = _median([x.get("gen_achievement", 0.0) for x in rs]) or 0.0
+        resp_top = _median([x.get("resp_percent", 0.0) for x in rs]) or 0.0
+        dove = []
+        if loss_top > threshold:
+            dove.append("perdita sul lato RX")
+        if resp_top > threshold:
+            dove.append(f"il ricevitore respinge il {resp_top:.1f}% "
+                        f"dell'offerto (coda RX piena)")
+        if off_top < 0.99:
+            dove.append(f"il generatore offre solo il {off_top * 100:.0f}% "
+                        f"del target")
         print(f"  {GREEN}Saturazione osservata{NC}: al target piu' alto "
               f"({top:.2f} Mpps) la resa e' {resa_top * 100:.0f}% e la perdita "
-              f"{loss_top:.2f}% -- {dove}.")
-        # Dove comincia: il primo target in cui la resa scende sotto il 99%.
-        primo = next((t for t in sorted(per_rate)
-                      if (_median([x["tx_achievement"]
-                                   for x in per_rate[t]]) or 0) < 0.99), None)
-        if primo is not None:
-            print(f"  {GREY}Il generatore smette di seguire il target da "
-                  f"{primo:.2f} Mpps in su.{NC}")
+              f"{loss_top:.2f}% -- {'; '.join(dove) or 'causa non isolata'}.")
+        # Dove comincia ciascuno dei due limiti: il ricevitore che respinge,
+        # e il generatore che non offre piu' il target. Sono due soglie
+        # diverse, e confonderle e' l'errore corretto qui sopra.
+        primo_rx = next((t for t in sorted(per_rate)
+                         if (_median([x.get("resp_percent", 0.0)
+                                      for x in per_rate[t]]) or 0)
+                         > threshold), None)
+        primo_gen = next((t for t in sorted(per_rate)
+                          if (_median([x.get("gen_achievement", 1.0)
+                                       for x in per_rate[t]]) or 0) < 0.99),
+                         None)
+        if primo_rx is not None:
+            print(f"  {GREY}Il ricevitore respinge da {primo_rx:.2f} Mpps di "
+                  f"target in su.{NC}")
+        if primo_gen is not None:
+            print(f"  {GREY}Il generatore smette di offrire il target da "
+                  f"{primo_gen:.2f} Mpps in su.{NC}")
 
     print(f"\n  {GREY}`offerti` = (TX + respinti) / finestra, cioe' quanto "
           f"il generatore metteva davvero sul filo. TX = quanti ne ha "
