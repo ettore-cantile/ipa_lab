@@ -4715,13 +4715,20 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 topology="shared", xmit_mode="start_xmit",
                 threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
                 warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0,
-                generator="pktgen"):
+                generator="pktgen", egress_cpu=None):
     """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate.
 
     generator="xdp": frame XDP grezzi (xdp_gen.XdpGen, BPF_PROG_TEST_RUN in
     modalita' live frames) invece degli skb di pktgen -- niente copia di
     headroom sul lato DUT, come da una NIC con XDP nativo. Senza cadenza:
-    solo la fase `saturazione`."""
+    solo la fase `saturazione`.
+
+    egress_cpu=N: i contatori d'uscita -- cioe' la RICEZIONE del nodo
+    successivo -- in thread NAPI sulla CPU N invece che in softirq sulla CPU
+    del DUT. Senza, 1/RX in saturazione somma al costo del nodo quello del
+    ricevitore a valle; con, sulla CPU del DUT resta solo il lavoro del nodo:
+    presa dalla coda di ricezione, programma XDP, redirect e accodamento sul
+    veth d'uscita -- dalla ricezione all'inoltro."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
     import statistics as stats
@@ -4789,6 +4796,20 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 napi_devs = []
                 warn("nessun thread NAPI pinnato: generatore e pipeline "
                      "restano sullo stesso core")
+        egress_napi = []
+        if egress_cpu is not None:
+            eplan = CpuPlan([], [egress_cpu], online_cpus(), [])
+            placed_e = enable_threaded_napi(list(attached), eplan)
+            egress_napi = [d for d, _, _ in placed_e]
+            if egress_napi:
+                info(f"uscita separata: NAPI dei {len(egress_napi)} veth "
+                     f"d'uscita in thread su cpu{egress_cpu}. Sulla CPU del "
+                     f"DUT resta il lavoro del nodo, dalla ricezione "
+                     f"all'inoltro.")
+            else:
+                warn(f"uscita NON separata: nessun thread NAPI d'uscita "
+                     f"pinnato su cpu{egress_cpu}; 1/RX contiene anche la "
+                     f"ricezione a valle")
 
         # --- sonda per pipeline: si misura inferenza o XDP_PASS?
         alive = []
@@ -4921,6 +4942,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
         pg_reset()
         if napi_devs:
             disable_threaded_napi(napi_devs)
+        if egress_napi:
+            disable_threaded_napi(egress_napi)
         for dev in ing.dut_devs:
             _detach(dev)
         ing.cleanup()
@@ -6257,6 +6280,9 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("finestra_s", a.duration)
         add("finestra_modo", getattr(a, "window", WINDOW_MODE))
         add("generatore", getattr(a, "generator", "pktgen"))
+        add("cpu_uscita", "separata: cpu%s" % a.egress_cpu
+            if getattr(a, "egress_cpu", None) is not None
+            else "stessa del DUT")
         add("warmup_s", a.warmup)
         add("ripetizioni_per_punto", a.repeat)
         add("giri", a.rounds)
@@ -6721,6 +6747,12 @@ def main():
                         "BPF_PROG_TEST_RUN live frames (ipa/test/xdp_gen.py), "
                         "come da una NIC con XDP nativo; niente cadenza, "
                         "quindi solo la fase saturazione.")
+    m.add_argument("--egress-cpu", type=int, default=None, metavar="N",
+                   help="solo --mode compare. Sposta la NAPI dei veth "
+                        "d'uscita (la ricezione del nodo successivo) sulla "
+                        "CPU N, fuori da quelle del DUT: 1/RX diventa il "
+                        "costo del nodo dalla ricezione all'inoltro. Di "
+                        "solito 0, la CPU lasciata al sistema.")
     m.add_argument("--window", choices=("steady", "count"), default="steady",
                    help="steady (default): rate letti a differenza mentre "
                         "tutte le istanze pktgen trasmettono, poi stop. "
@@ -6776,6 +6808,8 @@ def main():
     if a.generator == "xdp" and (a.latency or a.mode != "compare"
                                  or a.window != "steady"):
         sys.exit("--generator xdp: solo --mode compare a finestra steady")
+    if a.egress_cpu is not None and (a.latency or a.mode != "compare"):
+        sys.exit("--egress-cpu: solo --mode compare")
 
     if sys.platform != "linux":
         sys.exit(f"serve Linux, non {sys.platform}")
@@ -6808,6 +6842,16 @@ def main():
     # numeri.
     plan = plan_cpus(a.gen_cpus, a.dut_cpus, a.threads, a.allow_cpu0)
     plan.describe()
+    if a.egress_cpu is not None:
+        if a.egress_cpu in plan.dut:
+            sys.exit(f"--egress-cpu {a.egress_cpu} e' una CPU del DUT: "
+                     f"l'uscita resterebbe dove si misura")
+        if a.egress_cpu in plan.gen:
+            sys.exit(f"--egress-cpu {a.egress_cpu} e' una CPU del "
+                     f"generatore: gli toglierebbe tempo")
+        if a.egress_cpu not in online_cpus():
+            sys.exit(f"--egress-cpu {a.egress_cpu}: CPU non online")
+        info(f"CPU uscita (NAPI a valle) . {a.egress_cpu}")
 
     import model_meta as mm
     model_path = mm.default_checkpoint()
@@ -6931,7 +6975,8 @@ def main():
             topology=a.gen_topology, xmit_mode=a.xmit_mode,
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
-            burst=a.burst, generator=a.generator)
+            burst=a.burst, generator=a.generator,
+            egress_cpu=a.egress_cpu)
         # Il controllo "la baseline e' la piu' veloce" ha senso solo dove
         # l'RX e' una capacita', cioe' a massima spinta: nella fase confronto
         # tutte consegnano lo stesso rate per costruzione.
