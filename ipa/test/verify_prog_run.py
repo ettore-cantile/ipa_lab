@@ -995,10 +995,12 @@ class _AotPinned:
 
 
 class _FdProg:
-    """What a BCC load_func returns, as far as the benches use it: an fd."""
+    """What a BCC load_func returns, as far as the benches use it: an fd --
+    plus the bpffs path, which common.attach_xdp uses to attach it."""
 
-    def __init__(self, fd):
+    def __init__(self, fd, pin_path=None):
         self.fd = fd
+        self.pin_path = pin_path
 
 
 def setup_aot(model_id: int, model_path: str):
@@ -1034,7 +1036,9 @@ def setup_aot(model_id: int, model_path: str):
     _seed_link_state(b, 1)
     _install_mac_table(b, "mac_table")
     return {
-        "b": b, "fn": _FdProg(model_fd), "disp": _FdProg(disp_fd),
+        "b": b,
+        "fn": _FdProg(model_fd, os.path.join(pin_dir, "xdp_model")),
+        "disp": _FdProg(disp_fd, os.path.join(pin_dir, "xdp_dispatch")),
         "weights": weights, "scale": scale,
         "cls_stats": b["cls_stats"],
         "pkt_stats": b["pkt_stats"],

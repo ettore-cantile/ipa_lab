@@ -357,10 +357,18 @@ CPU_BUSY_PCT = 90.0
 #              X pacchetti/s, allora X e' il limite del veth e delle CPU, non
 #              della pipeline, e ogni cifra sotto va letta rispetto a quello.
 #   p1_static  pesi E indice del nodo compilati dentro: un binario per nodo.
-#   hardcoded  pesi compilati, nodo da mappa (la "P1.5").
+#   hardcoded  pesi compilati, nodo da mappa (la "P1.5"), build BCC.
+#   aot        la stessa P1.5 COME DEPLOYATA: l'oggetto AOT di gen_full_c,
+#              caricato da loader_aot, attaccato dal percorso pinnato. La riga
+#              `hardcoded` e' il build BCC, che su un nodo non va mai.
 #   template   solo i soffitti compilati.
 #   modular    anche la profondita' a runtime.
-METHODS = ("baseline", "p1_static", "hardcoded", "template", "modular")
+METHODS = ("baseline", "p1_static", "hardcoded", "aot", "template", "modular")
+
+# Le build con la latenza (--latency, --mode rates) iniettano i timestamp nel
+# SORGENTE BCC della pipeline. L'oggetto AOT e' compilato da gen_full_c senza
+# quei punti, quindi in quelle modalita' non c'e': si dice, non si finge.
+NOT_INSTRUMENTABLE = ("aot",)
 
 # Il nodo che la P1 specializzata si porta dentro. Lo stesso che installa
 # test_fabric, cosi' le due misure parlano dello stesso nodo.
@@ -1698,7 +1706,10 @@ def _percpu_sum(table, key=0):
 # ==========================================================================
 def _read_u64(table, key):
     try:
-        return int(table[ct.c_int(key)].value)
+        v = table[ct.c_int(key)]
+        if isinstance(v, (bytes, bytearray)):      # a pinned map (aot)
+            return int.from_bytes(v, "little")
+        return int(v.value)
     except Exception:
         return 0
 
@@ -3441,6 +3452,8 @@ def build_pipeline(method, model_path, fab, sem):
         setup = V.setup_baseline(0, model_path)
     elif method == "p1_static":
         setup = setup_p1_static(0, model_path)
+    elif method == "aot":
+        setup = V.setup_aot(0, model_path)
     else:
         setup = getattr(V, TF._SETUP[method])(0, model_path)
     b, pl = setup["b"], setup["pipeline"]
@@ -3474,7 +3487,7 @@ def build_pipeline(method, model_path, fab, sem):
 
 def _register_alias(method, setup, model_id):
     b, w, scale = setup["b"], setup["weights"], setup["scale"]
-    if method in ("hardcoded", "p1_static"):
+    if method in ("hardcoded", "p1_static", "aot"):
         b["model_progs"][ct.c_int(model_id)] = ct.c_int(setup["fn"].fd)
     elif method == "template":
         from ebpf_template_arch import load_arch_weights
@@ -6079,6 +6092,16 @@ def main():
         # farebbe scartare punti buoni.
         a.loss_threshold = 0.0 if a.latency else DEFAULT_LOSS_THRESHOLD
     methods = list(METHODS) if a.method == "all" else [a.method]
+    if a.latency or a.mode == "rates":
+        skip = [m for m in methods if m in NOT_INSTRUMENTABLE]
+        if skip and a.method != "all":
+            sys.exit(f"{a.method}: --latency e --mode rates strumentano il "
+                     f"sorgente BCC, e l'oggetto AOT non ha un sorgente BCC. "
+                     f"Usa --mode compare o --mode saturate.")
+        for m in skip:
+            methods.remove(m)
+            note(f"{m} escluso: --latency / --mode rates strumentano il "
+                 f"sorgente BCC, che l'oggetto AOT non ha")
 
     # Le condizioni si leggono PRIMA di misurare e si stampano subito: se
     # il run viene interrotto a meta' resta comunque scritto su che

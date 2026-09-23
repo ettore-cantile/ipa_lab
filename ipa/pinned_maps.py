@@ -220,6 +220,10 @@ class PinnedMap:
             return out
         return raw
 
+    def __len__(self):
+        """max_entries, as len() of a BCC array table."""
+        return self.max_entries
+
     def keys(self):
         """Every key, as raw bytes (BCC-like iteration for registries)."""
         out, prev = [], None

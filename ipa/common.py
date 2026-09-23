@@ -582,7 +582,10 @@ def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE, mode: str = None):
 
     print(f"[xdp] Attaching XDP to {iface} in {mode} mode (flags={flags})...")
     try:
-        b.attach_xdp(iface, fn, flags=flags)
+        if hasattr(b, "attach_xdp"):
+            b.attach_xdp(iface, fn, flags=flags)
+        else:
+            _attach_pinned(fn, iface, mode)
     except Exception as e:
         hint = ""
         if mode == "native":
@@ -617,5 +620,34 @@ def detach_xdp(b: BPF, iface: str = INGRESS_IFACE, mode: str = None):
     The flags must match: removing a native program with SKB flags fails.
     """
     mode = (mode or DEFAULT_XDP_MODE).lower()
-    b.remove_xdp(iface, flags=_MODE_FLAGS.get(mode, 0))
+    if hasattr(b, "remove_xdp"):
+        b.remove_xdp(iface, flags=_MODE_FLAGS.get(mode, 0))
+    else:
+        import subprocess
+        subprocess.run(["ip", "link", "set", "dev", iface,
+                        _IP_XDP_KEYWORD.get(mode, "xdp"), "off"],
+                       check=True, capture_output=True, text=True)
     print(f"[xdp] XDP removed from {iface}")
+
+
+# iproute2 spelling of each mode, for programs that are PINNED rather than
+# held by a BCC object (the AOT object of P1, see pinned_maps and
+# verify_prog_run.setup_aot): the kernel attach is the same netlink call BCC
+# makes, issued by `ip`, with the program named by its bpffs path.
+_IP_XDP_KEYWORD = {"native": "xdpdrv", "generic": "xdpgeneric", "auto": "xdp"}
+
+
+def _attach_pinned(fn, iface, mode):
+    """Attach a pinned program (fn.pin_path) with iproute2. -force replaces a
+    program already there, which is what BCC's attach does too."""
+    import subprocess
+    path = getattr(fn, "pin_path", None)
+    if not path:
+        raise RuntimeError("the program has no pin_path: neither a BCC "
+                           "function nor a pinned program")
+    r = subprocess.run(["ip", "-force", "link", "set", "dev", iface,
+                        _IP_XDP_KEYWORD[mode], "pinned", path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()
+                           or f"ip link set exited {r.returncode}")

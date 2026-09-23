@@ -151,10 +151,12 @@ il progetto chiamava P1.
 | **Variabile modificata** | Dove avviene la compilazione: sul nodo (BCC) contro su una macchina di build (AOT). |
 | **Variabili fisse** | Stesso modello, stessa topologia, **stessa sessione di misura**. |
 | **Metrica** | Costo di messa in servizio; latenza per pacchetto. |
-| **Risultato** | Aggiornamento 1 242 ms → 37 ms. Latenza 73 → 74 ns, cioè la stessa cifra. |
+| **Risultato** | Aggiornamento 1 242 ms → 37 ms. Latenza 73 → 74 ns, cioè la stessa cifra (**cifra AOT non valida, vedi sotto: misurava un altro percorso**). |
 | **Conclusione** | Due ordini di grandezza sull'aggiornamento, nessun costo per pacchetto. |
 | **Limite dichiarato** | ⚠️ La cifra di deploy varia molto fra esecuzioni (4,7 / 6,2 / 20,7 / 37,2 ms per lo stesso oggetto). Regge l'**ordine di grandezza** rispetto a 1,3 s, non il valore preciso. |
-| **Come rigirarlo** | `make -C ipa/poc_aot && sudo ./ipa/poc_aot/loader_aot nn_aot_arch.o --node-id 7` |
+| **Difetto della misura (C2, trovato il 2026-09-22)** | Il 74 ns non misurava l'inoltro: il loader eseguiva **una** chiamata `BPF_PROG_TEST_RUN` con repeat=1e6 sullo **stesso** frame (TTL 64), che il kernel non ripristina fra le ripetizioni. Dopo poche decine di esecuzioni il TTL scadeva (o, senza `--node-id`, la classe scivolava su DROP): il numero descriveva quel percorso corto, confrontato con 73 ns BCC misurati sull'inoltro. |
+| **Rimisurato (2026-09-23)** | Stesso schema per entrambi (blocchi da 200 su frame TTL 255 sempre nuovo, minimo delle medie), stessa sessione, percorso d'inoltro (retval 4), nodo non impostato in entrambi. `test_suite --only kernel`: **AOT 1 011 istruzioni (28 + 983), 46 ns** contro **BCC 1 026 (29 + 997), 44 ns**; il bench del loader corretto da' 45 ns. Differenza di 2 ns sul minimo, dentro il rumore di questo host (spread 52-76%, CPU ibrida). Aggiornamento: AOT 9,1-9,9 ms di open+load contro 741 ms di compilazione+caricamento BCC nella stessa sessione. **Conclusione che regge**: l'oggetto deployato e il build BCC costano uguale per pacchetto entro il rumore; e' la base per usare il build BCC come sostituto dichiarato nelle misure di P1 che non hanno ancora una versione AOT. |
+| **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel` (righe `hardcoded` e `aot`); `sudo ./ipa/poc_aot/loader_aot ipa/poc_aot/nn_aot_arch.o` |
 
 ---
 
