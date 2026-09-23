@@ -368,14 +368,14 @@ def t_label_mapping():
 def t_codegen():
     print(f"\n{YELLOW}[8] P1 / AOT generate the declared semantics{NC_}")
     import json
-    from ebpf_program import generate_ebpf_hardcoded
+    import p1_aot                          # P1 is the AOT object
     with open(os.path.join(SHARED_DIR, "weights.json")) as f:
         w = json.load(f)
 
     for name, sem in cases():
         if sem.n_out != 7:
             continue                      # weights.json is a 7-output model
-        src = generate_ebpf_hardcoded(w, 24, 0, semantics=sem)
+        src = p1_aot.p1_source([(0, w, 24)], semantics=sem)
         c1 = f"case {sem.drop_class}: {{" in src and "return XDP_DROP;" in src
         c2 = all(f"case {c}: _port = {sem.port_of(c)}U;" in src
                  for c in sem.forward_classes)
@@ -388,8 +388,8 @@ def t_codegen():
 
     # a descriptor whose n_out disagrees with the model must be refused
     try:
-        generate_ebpf_hardcoded(w, 24, 0,
-                                semantics=ClassSemantics.forward_then_drop(2, 2, n_out=3))
+        p1_aot.p1_source([(0, w, 24)],
+                         semantics=ClassSemantics.forward_then_drop(2, 2, n_out=3))
         bad("P1 accepted semantics whose n_out contradicts the model")
     except ValueError:
         ok("P1 refuses semantics whose n_out contradicts the model")
@@ -397,21 +397,17 @@ def t_codegen():
 
 def t_kernel():
     print(f"\n{YELLOW}[9] In-kernel: DROP drops, FORWARD redirects, UNUSED passes{NC_}")
-    try:
-        from bcc import BPF
-        import json
-    except Exception as e:
-        info(f"BCC unavailable ({e}) -- kernel section skipped")
+    import json
+    if sys.platform != "linux" or os.geteuid() != 0:
+        info("kernel section needs Linux + root -- skipped")
         return
-    from ebpf_program import build_combined_hardcoded_source
+    import p1_aot
     with open(os.path.join(SHARED_DIR, "weights.json")) as f:
         w = json.load(f)
     _, B = cases()[1]
     try:
-        src = build_combined_hardcoded_source([(0, w, 24, None)], semantics=B)
-        b = BPF(text=src)
-        b.load_func("model_0", BPF.XDP)
-        b.load_func("ipa_switch_hardcoded", BPF.XDP)
+        # The AOT object, loaded by loader_aot: its verifier and JIT.
+        p1_aot.load_p1([(0, w, 24)], semantics=B)["owner"].stop()
         ok("P1 with the real semantics (DROP=5, class 6 UNUSED) passes the verifier")
     except Exception as e:
         bad(f"P1 verifier: {e}")

@@ -163,7 +163,7 @@ def carica_scenario(d):
 def descrittore(model):
     """Il descrittore dello scenario nel formato di `derive_shape`.
 
-    `build_combined_hardcoded_source` vuole [{"type", "size"}]; lo scenario
+    `p1_aot.p1_source` vuole [{"type", "size"}]; lo scenario
     scrive [{"name", "size", "kind", ...}]. La traduzione e' solo di nomi --
     gli offset li ricalcola il generatore, e che coincidano con i suoi lo
     verifica gia' `test_synth` (prova [6] e [6] descriptor convention)."""
@@ -526,35 +526,41 @@ def sorgente_p1(model, wi, feats, node_index):
 
     Una funzione sola per le due vie che lo usano: il kernel lo compila,
     --dry-run lo valuta dal testo. Devono guardare lo STESSO sorgente, o il
-    confronto senza kernel proverebbe un altro programma."""
-    from ebpf_program import build_combined_hardcoded_source
+    confronto senza kernel proverebbe un altro programma.
+
+    E' l'OGGETTO AOT (p1_aot, lo stesso generatore del deploy); fino al
+    2026-09-23 era il sorgente BCC, che su un nodo non va mai."""
+    import p1_aot
+    import model_meta as mm
     n_out = int(model["arch"]["n_out"])
     scale = int(model["quant"]["scale_factor"])
-    topo = topologia(feats)
-    return build_combined_hardcoded_source(
-        [(0, wi, scale, None)],
-        n_interfaces=topo["n_interfaces"], n_nodes=topo["n_nodes"],
+    return p1_aot.p1_source(
+        [(0, wi, scale)],
         hidden_dims=tuple(int(h) for h in model["arch"]["hidden"]),
         features=feats, n_out=n_out,
+        semantics=mm.descriptor_semantics_or_reference(n_out, "verify:synth"),
         static_node=node_index)
 
 
 def costruisci_p1(model, wi, feats, node_index):
-    """P1 compilata sui pesi sintetici, con il descrittore dello scenario."""
-    from bcc import BPF
+    """P1 (l'oggetto AOT) sui pesi sintetici, con il descrittore dello
+    scenario, caricato e pinnato da loader_aot."""
+    import p1_aot
     from verify_prog_run import _install_mac_table
     import model_meta as mm
 
     n_out = int(model["arch"]["n_out"])
     scale = int(model["quant"]["scale_factor"])
-    b = BPF(text=sorgente_p1(model, wi, feats, node_index))
-    model_fn = b.load_func("model_0", BPF.XDP)
-    disp = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+    src = sorgente_p1(model, wi, feats, node_index)
+    o_path, _ = p1_aot.compile_object(src)
+    obj = p1_aot.AotObject(o_path, p1_aot._PROG_RE.findall(src))
+    b = obj.b
+    b._owner = obj
 
     semantics = mm.descriptor_semantics_or_reference(n_out, "verify:synth")
     _install_mac_table(b, "mac_table", semantics=semantics)
-    setup = {"b": b, "disp": disp, "fn": model_fn, "scale": scale,
+    setup = {"b": b, "disp": obj.progs["xdp_dispatch"],
+             "fn": obj.progs["xdp_model"], "scale": scale,
              "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"]}
     # La mappa esiste solo se il descrittore usa `ingress_iface`: gli scenari
     # che non la dichiarano non la fanno nemmeno generare.
@@ -662,7 +668,8 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
            f"(nodo {node_index}, {dove})")
     else:
         from p1_c_eval import P1Program
-        prog = P1Program(sorgente_p1(model, wi, feats, node_index))
+        prog = P1Program(sorgente_p1(model, wi, feats, node_index),
+                         func="xdp_model")
         ok(f"P1 generata sui pesi sintetici e letta da p1_c_eval "
            f"(nodo congelato: {node_index})")
         if pipeline != "p1":

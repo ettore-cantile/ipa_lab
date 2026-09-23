@@ -119,17 +119,22 @@ def run(args=None):
 
 
 def _verify_only(shape, ebpf_src, weights_int8, scale):
-    """Run the BPF verifier without attaching to any interface."""
-    from bcc import BPF
+    """Run the verifier on the object P1 DEPLOYS -- the AOT one (p1_aot),
+    loaded by loader_aot and never attached. `ebpf_src` is the BCC text
+    load_and_generate still returns; only its weights and scale are used.
+    Until 2026-09-23 this verified that BCC source, which no node runs."""
+    import p1_aot
     print(f"[verify-only] shape={shape}")
     print(f"DIM INPUT: {shape['n_in']}")
+    setup = p1_aot.load_p1([(0, weights_int8, scale)],
+                           features=shape["features"], n_out=shape["n_out"],
+                           hidden_dims=tuple(shape["hidden_dims"]))
     print(f"[verify-only] scale={scale}, weights={len(weights_int8)}, "
-          f"source_chars={len(ebpf_src)}")
-    b = BPF(text=ebpf_src)
-    dispatcher_fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    model_fn      = b.load_func("model_0", BPF.XDP)
-    print(f"[verify-only] Verifier PASSED — dispatcher fd={dispatcher_fn.fd}, "
-          f"model_0 fd={model_fn.fd}")
+          f"AOT object {setup['o_path']}")
+    print(f"[verify-only] Verifier PASSED — xdp_dispatch fd="
+          f"{setup['disp'].fd}, xdp_model fd={setup['fn'].fd} "
+          f"(open+load {setup['t_redirect_s']*1000:.1f} ms)")
+    setup["owner"].stop()
 
 
 if __name__ == "__main__":

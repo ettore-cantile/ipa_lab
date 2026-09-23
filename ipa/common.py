@@ -631,8 +631,8 @@ def detach_xdp(b: BPF, iface: str = INGRESS_IFACE, mode: str = None):
 
 
 # iproute2 spelling of each mode, for programs that are PINNED rather than
-# held by a BCC object (the AOT object of P1, see pinned_maps and
-# verify_prog_run.setup_aot): the kernel attach is the same netlink call BCC
+# held by a BCC object (the AOT object of P1, see pinned_maps and p1_aot):
+# the kernel attach is the same netlink call BCC
 # makes, issued by `ip`, with the program named by its bpffs path.
 _IP_XDP_KEYWORD = {"native": "xdpdrv", "generic": "xdpgeneric", "auto": "xdp"}
 

@@ -506,9 +506,8 @@ def run_sweep(timeout, xdp_mode, verbose):
     import tempfile
     import model_meta as mm
     import verify_prog_run as V
-    from bcc import BPF
+    import p1_aot
     from class_semantics import ClassSemantics
-    from ebpf_program import build_combined_hardcoded_source
     from common import write_vector_map, attach_xdp, detach_xdp
     from netns_fabric import NetnsFabric
 
@@ -552,16 +551,13 @@ def run_sweep(timeout, xdp_mode, verbose):
                  f"weights={len(weights)}")
 
         try:
-            src = build_combined_hardcoded_source(
-                models=[(0, weights, scale)], features=features, n_out=n_out,
-                hidden_dims=dims, semantics=sem)
-            b = BPF(text=src)
-            model_fn = b.load_func("model_0", BPF.XDP)
-            disp_fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+            # The AOT object, as P1 is deployed (p1_aot).
+            aot = p1_aot.load_p1([(0, weights, scale)], features=features,
+                                 n_out=n_out, hidden_dims=dims, semantics=sem)
         except Exception as e:
             fail(f"{name}: compile/verifier failed ({e})")
             continue
-        b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+        b, disp_fn = aot["b"], aot["disp"]
 
         with NetnsFabric(n_ports=len(ports), verbose=False) as fab:
             for port in ports:

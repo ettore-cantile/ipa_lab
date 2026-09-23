@@ -5,7 +5,7 @@ roughly fixed neuron/weight budget, is it cheaper (ns/pkt, xlated insns) to
 go WIDE (one or two big hidden layers) or DEEP (many small hidden layers)?
 
 Reuses the same measurement path as verify_prog_run.py / test_suite.py
---only kernel: BCC-compiles ebpf_program.build_combined_hardcoded_source
+--only kernel: builds and loads the P1 AOT object (p1_aot.load_p1)
 for each (hidden_dims) shape and times the dispatcher with
 BPF_PROG_TEST_RUN. Random int8 weights -- this measures SHAPE cost only,
 not inference correctness (that is already covered by test_suite).
@@ -56,7 +56,6 @@ import json
 import random
 import argparse
 import subprocess
-import ctypes as ct
 
 _TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
 SHARED_DIR = os.path.dirname(_TEST_DIR)
@@ -194,8 +193,7 @@ def _bench_one(descriptor_name, dims, repeat):
     """Runs in the WORKER subprocess. Prints exactly one JSON line to stdout
     (the parent's only contract) and exits 0/1. Any BCC/clang diagnostics go
     to stderr and are ignored by the parent unless this process crashes."""
-    from bcc import BPF
-    from ebpf_program import build_combined_hardcoded_source
+    import p1_aot
     from verify_prog_run import prog_test_run, prog_insn_count, build_frame_sparse
 
     shape = build_shape(descriptor_name)
@@ -208,13 +206,10 @@ def _bench_one(descriptor_name, dims, repeat):
     weights = [rng.randint(-100, 100) for _ in range(nw)]
     scale = 128
 
-    src = build_combined_hardcoded_source(
-        models=[(0, weights, scale)],
-        features=shape["features"], n_out=n_out, hidden_dims=dims)
-    b = BPF(text=src)
-    model_fn = b.load_func("model_0", BPF.XDP)
-    disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+    # The AOT object, as P1 is deployed (p1_aot).
+    setup = p1_aot.load_p1([(0, weights, scale)], features=shape["features"],
+                           n_out=n_out, hidden_dims=dims)
+    model_fn, disp_fn = setup["fn"], setup["disp"]
 
     xlated, jited = prog_insn_count(disp_fn.fd)
     xlated_model, _ = prog_insn_count(model_fn.fd)

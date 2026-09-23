@@ -1426,9 +1426,8 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
     import ctypes as ct
     import random as _random
     import verify_prog_run as V
-    from bcc import BPF
     import model_meta as mm
-    from ebpf_program import build_combined_hardcoded_source
+    import p1_aot
     from common import write_vector_map
 
     print(f"\n{YELLOW}--- Architetture alternative (non solo 65-4-4-7) ---{NC}")
@@ -1453,19 +1452,16 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
         # expectations below, so the test cannot pass by agreeing with itself
         # about a convention the datapath does not implement.
         alt_sem = suite_semantics(n_out)
-        src = build_combined_hardcoded_source(
-            models=[(0, weights, scale)],
-            features=features, n_out=n_out, hidden_dims=dims,
-            semantics=alt_sem)
         try:
-            b = BPF(text=src)
-            model_fn = b.load_func("model_0", BPF.XDP)
-            disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
+            # The AOT object, as P1 is deployed (p1_aot).
+            aot = p1_aot.load_p1([(0, weights, scale)], features=features,
+                                 n_out=n_out, hidden_dims=dims,
+                                 semantics=alt_sem)
         except Exception as e:
             fail(f"hardcoded alt-arch {dims}: compile/verifier failed ({e})")
             all_ok = False
             continue
-        b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+        b, disp_fn = aot["b"], aot["disp"]
         write_vector_map(b, "link_state", [1] * _ls_size)
         V._install_mac_table(b, "mac_table", semantics=alt_sem)
         ps, cs = b["pkt_stats"], b["cls_stats"]
@@ -1497,13 +1493,13 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
             # class 6 -- exactly backwards on both.
             _act = alt_sem.action_of(ref_cls)
             if _act == "FORWARD":
-                got = int(cs[ct.c_int(ref_cls)].value)
+                got = V._read_u64(cs, ref_cls)
                 good = (retval in V.XDP_REDIRECT_PASS) and got > 0
             elif _act == "DROP":
-                got = int(ps[ct.c_int(2)].value)
+                got = V._read_u64(ps, 2)
                 good = (retval == 1) and got > 0
             else:
-                got = int(cs[ct.c_int(ref_cls)].value)
+                got = V._read_u64(cs, ref_cls)
                 good = (retval == 2) and got > 0   # UNUSED -> XDP_PASS
             passed += good
             failed += not good
@@ -1550,11 +1546,10 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     mp = model_path or V.MODEL_PT
     methods = [
         ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
+        # P1.5 as DEPLOYED: the AOT object (gen_full_c + loader_aot, through
+        # p1_aot). Until 2026-09-23 this row was the BCC build, which never
+        # reaches a node; the two agreed within noise (claims.md B3).
         ("hardcoded", V.setup_hardcoded, 1),
-        # P1 as DEPLOYED: the AOT object (gen_full_c + loader_aot). The row
-        # above is the BCC build, which never reaches a node; until
-        # 2026-09-23 it was the only P1 measured here.
-        ("aot",       V.setup_aot,       1),
         ("template",  V.setup_template,  2),
         ("modular",   V.setup_modular,   3),
     ]

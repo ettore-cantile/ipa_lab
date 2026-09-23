@@ -136,7 +136,10 @@ def synth_weights(layer_dims: list, seed: int) -> list:
 
 def _read_u64(table, key_val):
     try:
-        return int(table[ct.c_int(key_val)].value)
+        v = table[ct.c_int(key_val)]
+        if isinstance(v, (bytes, bytearray)):      # a pinned map (P1, AOT)
+            return int.from_bytes(v, "little")
+        return int(v.value)
     except Exception:
         return 0
 
@@ -219,17 +222,14 @@ def _semantics_for(n_out: int):
 
 def test_hardcoded():
     print("\n--- Pipeline 1 (hardcoded): 2 model_id, SAME shape (routing only) ---")
-    from ebpf_program import build_combined_hardcoded_source
+    import p1_aot
     weights0, scale0 = load_weights(MODEL_PT)
     dims = [(65, 4), (4, 4), (4, 7)]
 
-    src = build_combined_hardcoded_source([(0, weights0, scale0, None), (1, weights0, scale0, None)])
-    b = BPF(text=src)
-    model0_fn = b.load_func("model_0", BPF.XDP)
-    model1_fn = b.load_func("model_1", BPF.XDP)
-    disp_fn   = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(0)] = ct.c_int(model0_fn.fd)
-    b["model_progs"][ct.c_int(1)] = ct.c_int(model1_fn.fd)
+    # The AOT object, as P1 is deployed: two xdp_model_<id> in one object,
+    # wired at model_progs[0] and [1] by loader_aot.
+    setup = p1_aot.load_p1([(0, weights0, scale0), (1, weights0, scale0)])
+    b, disp_fn = setup["b"], setup["disp"]
     _seed_link_state(b, 1)
     _install_mac_table(b, "mac_table")
 

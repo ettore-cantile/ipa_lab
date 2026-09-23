@@ -66,22 +66,22 @@ def bench_hardcoded(weights, scale, n_models):
     program whose weights are C literals (compiled offline once, loaded per
     model) would keep the datapath identical while collapsing the add cost to
     just `load`. See method4_hardcoded_aot.py."""
-    from bcc import BPF
-    import ctypes as ct
-    from ebpf_program import build_combined_hardcoded_source
+    # P1 is the AOT object (p1_aot), as deployed: `compile` is clang on the
+    # BUILD box, `load` the loader on the node (verifier + JIT). Until
+    # 2026-09-23 this measured BCC, which runs clang on the node itself.
+    import p1_aot
 
     times = []
     phases = {"gen": [], "compile": [], "load": []}
     for i in range(n_models):
         t0 = time.perf_counter()
-        src = build_combined_hardcoded_source([(i, weights, scale, None)])
+        src = p1_aot.p1_source([(i, weights, scale)])
         t_gen = time.perf_counter()
-        b = BPF(text=src)                         # clang/LLVM: C -> BPF bytecode
+        o_path, _ = p1_aot.compile_object(src, cache=False)   # clang, offline
         t_compile = time.perf_counter()
-        model_fn = b.load_func(f"model_{i}", BPF.XDP)   # verifier + kernel load
-        b.load_func("ipa_switch_hardcoded", BPF.XDP)
-        b["model_progs"][ct.c_int(i)] = ct.c_int(model_fn.fd)
+        obj = p1_aot.AotObject(o_path, p1_aot._PROG_RE.findall(src))
         t_load = time.perf_counter()
+        obj.stop()
         phases["gen"].append(t_gen - t0)
         phases["compile"].append(t_compile - t_gen)
         phases["load"].append(t_load - t_compile)

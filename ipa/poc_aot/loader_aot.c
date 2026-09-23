@@ -399,17 +399,37 @@ int main(int argc, char **argv) {
     if (bpf_object__load(obj)) { fprintf(stderr, "load %s\n", lit); goto err; }
     double t2 = now_ms();
 
-    // wire the tail-call: model_progs[0] = fd(xdp_model), exactly as the BCC
-    // control plane does b["model_progs"][0] = model_fn.fd.
+    // wire the tail-calls, exactly as the BCC control plane does
+    // b["model_progs"][id] = model_fn.fd: `xdp_model` -> model_progs[0], and
+    // `xdp_model_<id>` -> model_progs[<id>] when the object carries several
+    // models (gen_full_c._emit_arch(models=...)).
     struct bpf_program *disp = bpf_object__find_program_by_name(obj, "xdp_dispatch");
-    struct bpf_program *model = bpf_object__find_program_by_name(obj, "xdp_model");
     struct bpf_map *progs = bpf_object__find_map_by_name(obj, "model_progs");
-    if (!disp || !model || !progs) { fprintf(stderr, "missing dispatch/model/model_progs\n"); goto err; }
-    int disp_fd = bpf_program__fd(disp), model_fd = bpf_program__fd(model);
-    __u32 mid = 0, mfd = (__u32)model_fd;
-    if (bpf_map_update_elem(bpf_map__fd(progs), &mid, &mfd, BPF_ANY)) {
-        fprintf(stderr, "prog_array update\n"); goto err;
+    if (!disp || !progs) { fprintf(stderr, "missing xdp_dispatch/model_progs\n"); goto err; }
+    int disp_fd = bpf_program__fd(disp), model_fd = -1, n_models = 0;
+    {
+        struct bpf_program *pr;
+        bpf_object__for_each_program(pr, obj) {
+            const char *nm = bpf_program__name(pr);
+            long id;
+            if (!strcmp(nm, "xdp_model")) id = 0;
+            else if (!strncmp(nm, "xdp_model_", 10)) {
+                char *end;
+                id = strtol(nm + 10, &end, 10);
+                if (*end || id < 0 || id > 255) {
+                    fprintf(stderr, "program %s: model id outside [0, 255]\n", nm);
+                    goto err;
+                }
+            } else continue;
+            __u32 mid = (__u32)id, mfd = (__u32)bpf_program__fd(pr);
+            if (bpf_map_update_elem(bpf_map__fd(progs), &mid, &mfd, BPF_ANY)) {
+                fprintf(stderr, "prog_array update for %s\n", nm); goto err;
+            }
+            if (model_fd < 0 || id == 0) model_fd = (int)mfd;
+            n_models++;
+        }
     }
+    if (!n_models) { fprintf(stderr, "no xdp_model / xdp_model_<id> program\n"); goto err; }
 
     // --- PINNED modes. LIVE DEPLOY (--attach): pin, hand the maps to the
     // control plane, attach only when it says so, stay resident. PIN-ONLY (no

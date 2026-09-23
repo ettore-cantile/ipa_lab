@@ -357,18 +357,13 @@ CPU_BUSY_PCT = 90.0
 #              X pacchetti/s, allora X e' il limite del veth e delle CPU, non
 #              della pipeline, e ogni cifra sotto va letta rispetto a quello.
 #   p1_static  pesi E indice del nodo compilati dentro: un binario per nodo.
-#   hardcoded  pesi compilati, nodo da mappa (la "P1.5"), build BCC.
-#   aot        la stessa P1.5 COME DEPLOYATA: l'oggetto AOT di gen_full_c,
-#              caricato da loader_aot, attaccato dal percorso pinnato. La riga
-#              `hardcoded` e' il build BCC, che su un nodo non va mai.
+#   hardcoded  pesi compilati, nodo da mappa (la "P1.5").
 #   template   solo i soffitti compilati.
 #   modular    anche la profondita' a runtime.
-METHODS = ("baseline", "p1_static", "hardcoded", "aot", "template", "modular")
-
-# Le build con la latenza (--latency, --mode rates) iniettano i timestamp nel
-# SORGENTE BCC della pipeline. L'oggetto AOT e' compilato da gen_full_c senza
-# quei punti, quindi in quelle modalita' non c'e': si dice, non si finge.
-NOT_INSTRUMENTABLE = ("aot",)
+# P1 e P1.5 sono l'OGGETTO AOT (gen_full_c + loader_aot, via p1_aot), cioe'
+# quello che va sui nodi; fino al 2026-09-23 erano il build BCC, che su un
+# nodo non va mai (i due coincidono entro il rumore, claims.md B3).
+METHODS = ("baseline", "p1_static", "hardcoded", "template", "modular")
 
 # Il nodo che la P1 specializzata si porta dentro. Lo stesso che installa
 # test_fabric, cosi' le due misure parlano dello stesso nodo.
@@ -2211,8 +2206,10 @@ LAT_BUCKETS = 40
 # infilare il timestamp, ed e' quella che si attacca all'interfaccia.
 LAT_ENTRY = {
     "baseline": "xdp_baseline",
-    "p1_static": "ipa_switch_hardcoded",
-    "hardcoded": "ipa_switch_hardcoded",
+    # P1 / P1.5: l'oggetto AOT, strumentato da _instrument_aot_latency
+    # (ingresso LAT_ENTRY_AOT), non da questo dizionario.
+    "p1_static": "xdp_dispatch",
+    "hardcoded": "xdp_dispatch",
     "template": "ipa_switch_template",
     "modular": "modular_dispatcher",
 }
@@ -2226,10 +2223,8 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
     if method == "baseline":
         src = V.EBPF_BASELINE
     elif method in ("hardcoded", "p1_static"):
-        from ebpf_program import build_combined_hardcoded_source
-        src = build_combined_hardcoded_source(
-            [(0, weights, scale)],
-            static_node=(node if method == "p1_static" else None))
+        raise RuntimeError("P1/P1.5 sono l'oggetto AOT: la loro build "
+                           "strumentata e' _load_instrumented_aot")
     elif method == "template":
         from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
                                         EBPF_ARCH_GENERIC_2LAYER)
@@ -2325,8 +2320,135 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
     return src + "\n" + LAT_COUNTER_SRC, weights, scale
 
 
+# --------------------------------------------------------------------------
+# La stessa strumentazione per P1 e P1.5, che sono l'OGGETTO AOT (libbpf) e
+# non un sorgente BCC: stesse mappe, stessi nomi, stessi tre punti T1/T2/T3,
+# stesso istogramma log2 -- cambia solo il dialetto. Letta da Python
+# attraverso le mappe pinnate (pinned_maps), con la stessa interfaccia.
+# --------------------------------------------------------------------------
+_LAT_MAPS = (("ts_in", "1"), ("ts_mid", "1"), ("lat_acc", "4"),
+             ("pipe_acc", "4"), ("xport_acc", "4"), ("rx_n", "1"),
+             ("lat_hist", "LAT_BUCKETS"), ("pipe_hist", "LAT_BUCKETS"),
+             ("xport_hist", "LAT_BUCKETS"))
+
+LAT_DECLS_LIBBPF = "\n".join(
+    f"struct {{ __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); "
+    f"__uint(max_entries, {n}); __type(key, __u32); __type(value, __u64); }} "
+    f"{name} SEC(\".maps\");" for name, n in _LAT_MAPS) + """
+/* bpf_log2l: BCC's helper, which the libbpf dialect does not have. Same
+ * definition, so the buckets are the same as in the BCC builds. */
+static __always_inline unsigned int ipa_log2(unsigned int v) {
+    unsigned int r, shift;
+    r = (v > 0xFFFF) << 4; v >>= r;
+    shift = (v > 0xFF) << 3; v >>= shift; r |= shift;
+    shift = (v > 0xF) << 2; v >>= shift; r |= shift;
+    shift = (v > 0x3) << 1; v >>= shift; r |= shift;
+    r |= (v >> 1);
+    return r;
+}
+static __always_inline unsigned int bpf_log2l(unsigned long v) {
+    unsigned int hi = v >> 32;
+    if (hi) return ipa_log2(hi) + 32 + 1;
+    return ipa_log2(v) + 1;
+}
+"""
+
+
+def _lat_accum_libbpf(acc, hist, delta):
+    return f"""
+    {{ __u64 _d = {delta};
+      __u32 _bk = bpf_log2l(_d);
+      if (_bk >= LAT_BUCKETS) _bk = LAT_BUCKETS - 1;
+      __u32 _bi = _bk;
+      __u64 *_hb = bpf_map_lookup_elem(&{hist}, &_bi); if (_hb) *_hb += 1;
+      __u32 _k = 0;
+      __u64 *_n = bpf_map_lookup_elem(&{acc}, &_k); if (_n) *_n += 1;
+      _k = 1; __u64 *_sm = bpf_map_lookup_elem(&{acc}, &_k); if (_sm) *_sm += _d;
+      _k = 2; __u64 *_mn = bpf_map_lookup_elem(&{acc}, &_k);
+      if (_mn && (*_mn == 0 || _d < *_mn)) *_mn = _d;
+      _k = 3; __u64 *_mx = bpf_map_lookup_elem(&{acc}, &_k); if (_mx && _d > *_mx) *_mx = _d; }}"""
+
+
+LAT_COUNTER_LIBBPF = """
+SEC("xdp")
+int xdp_lat_count(struct xdp_md *ctx) {
+    __u32 z = 0;
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *rn = bpf_map_lookup_elem(&rx_n, &z); if (rn) *rn += 1;
+    __u64 *t0 = bpf_map_lookup_elem(&ts_in, &z);
+    __u64 *t1 = bpf_map_lookup_elem(&ts_mid, &z);
+    __u64 a = t0 ? *t0 : 0;
+    __u64 m = t1 ? *t1 : 0;
+    if (a && now > a) %(e2e)s
+    if (a && m && m > a) %(pipe)s
+    if (m && now > m) %(xport)s
+    return XDP_DROP;
+}
+""" % {"e2e": _lat_accum_libbpf("lat_acc", "lat_hist", "now - a"),
+       "pipe": _lat_accum_libbpf("pipe_acc", "pipe_hist", "m - a"),
+       "xport": _lat_accum_libbpf("xport_acc", "xport_hist", "now - m")}
+
+LAT_STAMP_LIBBPF = ("\n    { __u32 _lz = 0; __u64 _lt = bpf_ktime_get_ns();\n"
+                    "      bpf_map_update_elem(&ts_in, &_lz, &_lt, BPF_ANY); }\n")
+LAT_STAMP_MID_LIBBPF = ("{ __u32 _mz = 0; __u64 _mt = bpf_ktime_get_ns();\n"
+                        "          bpf_map_update_elem(&ts_mid, &_mz, &_mt, BPF_ANY); }\n"
+                        "        ")
+LAT_ENTRY_AOT = "int xdp_dispatch(struct xdp_md *ctx) {"
+
+
+def _instrument_aot_latency(src):
+    """T1 all'ingresso del dispatcher, T2 al redirect, T3 nel contatore
+    d'uscita -- come _instrumented_source fa per i sorgenti BCC."""
+    if src.count(LAT_ENTRY_AOT) != 1:
+        raise RuntimeError(f"oggetto AOT: '{LAT_ENTRY_AOT}' trovato "
+                           f"{src.count(LAT_ENTRY_AOT)} volte, atteso 1")
+    n_red = src.count(LAT_REDIRECT_ANCHOR)
+    if n_red != 1:
+        raise RuntimeError(f"oggetto AOT: {n_red} siti di redirect, non 1: T2 "
+                           f"coprirebbe solo una parte dei pacchetti")
+    at = src.index('SEC("xdp")')
+    src = (src[:at] + f"#define LAT_BUCKETS {LAT_BUCKETS}\n" + LAT_DECLS_LIBBPF
+           + "\n" + src[at:])
+    src = src.replace(LAT_ENTRY_AOT, LAT_ENTRY_AOT + LAT_STAMP_LIBBPF, 1)
+    src = src.replace(LAT_REDIRECT_ANCHOR,
+                      LAT_STAMP_MID_LIBBPF + LAT_REDIRECT_ANCHOR, 1)
+    return src + "\n" + LAT_COUNTER_LIBBPF
+
+
+def _load_instrumented_aot(method, model_path, fab, sem, node=STATIC_NODE):
+    """P1 / P1.5 strumentate: l'oggetto AOT con la latenza, caricato e
+    pinnato da loader_aot, cablato su questo fabric come _load_instrumented
+    fa per le pipeline BCC."""
+    import p1_aot
+    import verify_prog_run as V
+    import test_fabric as TF
+
+    weights, scale = V.load_weights(model_path)
+    src = p1_aot.p1_source([(0, weights, scale)],
+                           static_node=(node if method == "p1_static" else None))
+    src = _instrument_aot_latency(src)
+    o_path, _ = p1_aot.compile_object(src)
+    obj = p1_aot.AotObject(o_path, p1_aot._PROG_RE.findall(src))
+    b = obj.b
+    model_fn = obj.progs["xdp_model"]
+    b["model_progs"][ct.c_int(PKTGEN_MAGIC_MODEL_ID)] = ct.c_int(model_fn.fd)
+    setup = {"b": b, "disp": obj.progs["xdp_dispatch"], "fn": model_fn,
+             "weights": weights, "scale": scale, "pipeline": 1,
+             "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
+             "owner": obj}
+    V._seed_link_state(b, 1)
+    TF._install_fabric_mac_table(b, "mac_table", fab, sem.logical_ports)
+    b["ingress_port"][ct.c_uint32(fab.ingress_ifindex)] = \
+        ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
+    if method != "p1_static":
+        b["node_id"][ct.c_uint32(0)] = ct.c_uint32(TF.FABRIC_NODE_INDEX)
+    return setup, obj.progs["xdp_lat_count"]
+
+
 def _load_instrumented(method, model_path, fab, sem, node=STATIC_NODE):
     """Compila tutto insieme, carica, e cabla la pipeline su questo fabric."""
+    if method in ("hardcoded", "p1_static"):
+        return _load_instrumented_aot(method, model_path, fab, sem, node)
     from bcc import BPF
     import verify_prog_run as V
     import test_fabric as TF
@@ -3404,27 +3526,16 @@ def setup_p1_static(model_id, model_path, node=STATIC_NODE):
     della mappa node_id, restando n_h1 costanti che clang piega
     nell'accumulatore. Vedi _gen_feature_onehot_node in ebpf_program.py, e
     `bench_scaling.py --verify` per la prova che decide come la P1.5."""
-    from bcc import BPF
-    from ebpf_program import build_combined_hardcoded_source
+    import p1_aot
     import verify_prog_run as V
 
+    # L'oggetto AOT, come P1 si deploya (p1_aot), con il nodo congelato.
     weights, scale = V.load_weights(model_path)
-    src = build_combined_hardcoded_source(
-        [(model_id, weights, scale)], static_node=node)
-    b = BPF(text=src)
-    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
-    disp = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
-    V._seed_link_state(b, 1)
-    V._install_mac_table(b, "mac_table")
-    return {
-        "b": b, "fn": model_fn, "disp": disp,
-        "weights": weights, "scale": scale,
-        "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
-        "pipeline": 1, "static_node": node,
-        "progs": {"ipa_switch_hardcoded": disp.fd,
-                  f"model_{model_id}": model_fn.fd},
-    }
+    setup = p1_aot.load_p1([(model_id, weights, scale)], static_node=node)
+    setup.update(weights=weights, scale=scale, static_node=node)
+    V._seed_link_state(setup["b"], 1)
+    V._install_mac_table(setup["b"], "mac_table")
+    return setup
 
 
 def class_semantics():
@@ -3452,8 +3563,6 @@ def build_pipeline(method, model_path, fab, sem):
         setup = V.setup_baseline(0, model_path)
     elif method == "p1_static":
         setup = setup_p1_static(0, model_path)
-    elif method == "aot":
-        setup = V.setup_aot(0, model_path)
     else:
         setup = getattr(V, TF._SETUP[method])(0, model_path)
     b, pl = setup["b"], setup["pipeline"]
@@ -3487,7 +3596,7 @@ def build_pipeline(method, model_path, fab, sem):
 
 def _register_alias(method, setup, model_id):
     b, w, scale = setup["b"], setup["weights"], setup["scale"]
-    if method in ("hardcoded", "p1_static", "aot"):
+    if method in ("hardcoded", "p1_static"):
         b["model_progs"][ct.c_int(model_id)] = ct.c_int(setup["fn"].fd)
     elif method == "template":
         from ebpf_template_arch import load_arch_weights
@@ -6092,16 +6201,6 @@ def main():
         # farebbe scartare punti buoni.
         a.loss_threshold = 0.0 if a.latency else DEFAULT_LOSS_THRESHOLD
     methods = list(METHODS) if a.method == "all" else [a.method]
-    if a.latency or a.mode == "rates":
-        skip = [m for m in methods if m in NOT_INSTRUMENTABLE]
-        if skip and a.method != "all":
-            sys.exit(f"{a.method}: --latency e --mode rates strumentano il "
-                     f"sorgente BCC, e l'oggetto AOT non ha un sorgente BCC. "
-                     f"Usa --mode compare o --mode saturate.")
-        for m in skip:
-            methods.remove(m)
-            note(f"{m} escluso: --latency / --mode rates strumentano il "
-                 f"sorgente BCC, che l'oggetto AOT non ha")
 
     # Le condizioni si leggono PRIMA di misurare e si stampano subito: se
     # il run viene interrotto a meta' resta comunque scritto su che

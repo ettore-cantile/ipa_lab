@@ -424,7 +424,8 @@ def t_reference_vs_p1_source(root):
             [(0, wi, scale)], hidden_dims=tuple(hidden), features=feats,
             n_out=n_out, semantics=sem, static_node=static_node)
 
-    def aot_program(wi, scale, feats, hidden, n_out):
+    def aot_program(wi, scale, feats, hidden, n_out, static_node=None,
+                    static_ports=None, models=None, func="xdp_model"):
         # The AOT object is what P1 actually DEPLOYS, and gen_full_c is a
         # second generator, separate from ebpf_program: it kept the catalogue
         # TTL scale for days after the BCC one was fixed. Checked the same way.
@@ -432,7 +433,10 @@ def t_reference_vs_p1_source(root):
                                                n_out=n_out)
         shape = {"features": feats, "n_out": n_out, "hidden_dims": list(hidden),
                  "n_in": sum(f["size"] for f in feats)}
-        return P1Program(_emit_arch(shape, wi, scale, sem), func="xdp_model")
+        return P1Program(_emit_arch(shape, wi, scale, sem,
+                                    static_node=static_node,
+                                    static_ports=static_ports, models=models),
+                         func=func)
 
     # (a) The minimal case, by hand. One input, one hidden neuron, two
     # outputs; scale 10, weights W1=[1] b1=[0] | W2=[3, 0] b2=[0, 1].
@@ -492,12 +496,15 @@ def t_reference_vs_p1_source(root):
         if width:
             builds += [(f"P1 node={k}", k) for k in sorted({0, width - 1})]
         builds += [("AOT", None)]
+        if width:
+            builds += [(f"AOT node={k}", k) for k in sorted({0, width - 1})]
 
         tried = bad = stored = 0
         example = None
         for label, frozen in builds:
-            prog = (aot_program(wi, scale, feats, mspec.hidden, mspec.n_out)
-                    if label == "AOT" else
+            prog = (aot_program(wi, scale, feats, mspec.hidden, mspec.n_out,
+                                static_node=frozen)
+                    if label.startswith("AOT") else
                     P1Program(p1_source(wi, scale, feats, mspec.hidden,
                                         mspec.n_out, static_node=frozen)))
             for vi, xi in enumerate(vectors):
@@ -528,6 +535,47 @@ def t_reference_vs_p1_source(root):
         if example:
             label, xi, want, have = example
             info(f"  first mismatch ({label}): x={xi} reference={want} C={have}")
+    # (c) What P1 tests need from the AOT generator beyond one P1.5 model:
+    # frozen ports (a node of degree < n_interfaces) and several models in
+    # one object. Checked on ipa_like against the reference.
+    m = preset("ipa_like")
+    wq, sc, _ = ref.quantize(make_weights(m))
+    feats = descrittore(m.to_json())
+    dims, cs = m.layer_dims, m.features.column_scales()
+    ints, _, _ = make_inputs(m.features, 60, seed=21)
+    off = {f["type"]: sum(g["size"] for g in feats[:i]) for i, f in enumerate(feats)}
+    live, node = {0, 2, 4}, 7
+    prog = aot_program(wq, sc, feats, m.hidden, m.n_out, static_node=node,
+                       static_ports=live)
+    bad = 0
+    for x in ints:
+        x = list(x)
+        x[off["node"]:off["node"] + 52] = [int(k == node) for k in range(52)]
+        for i in range(6):
+            if i not in live:
+                x[off["link_state"] + i] = 0      # no interface there
+        maps, ttl, port, _ = _datapath_state(feats, x)
+        maps["ingress_port"] = {kif: port} if port else {}
+        bad += prog.run(ttl, maps, ingress_ifindex=kif)["logits"] != \
+            ref.forward_int8(wq, dims, x, cs, scale=sc)
+    check(bad == 0, f"AOT static_ports={sorted(live)} (node {node}): "
+                    f"{len(ints) - bad}/{len(ints)} identical logits, dead "
+                    f"columns not generated")
+    w2 = [random.Random(9).randint(-128, 127) for _ in wq]
+    bad = tried = 0
+    for mid, ww, s2 in ((0, wq, sc), (3, w2, 30)):
+        pm = aot_program(None, None, feats, m.hidden, m.n_out,
+                         models=[(0, wq, sc), (3, w2, 30)],
+                         func=f"xdp_model_{mid}")
+        for x in ints:
+            maps, ttl, port, nd = _datapath_state(feats, x)
+            maps["ingress_port"] = {kif: port} if port else {}
+            maps["node_id"] = {0: nd} if nd is not None else {}
+            tried += 1
+            bad += pm.run(ttl, maps, ingress_ifindex=kif)["logits"] != \
+                ref.forward_int8(ww, dims, x, cs, scale=s2)
+    check(bad == 0, f"AOT with two models in one object (ids 0 and 3): "
+                    f"{tried - bad}/{tried} identical logits")
     info("not covered here: clang, the verifier, the JIT, the packet path "
          "around the inference -- sudo python3 ipa/test/verify_synth_kernel.py --all")
 
@@ -600,11 +648,10 @@ def t_p2p3_scale_control_plane():
 # ---------------------------------------------------------------------------
 def t_kernel(root):
     """Run one synthetic scenario through the real pipelines."""
-    print(f"\n{YELLOW}[10] Synthetic model through P1 / P2 / P3 (needs BCC + root){NC}")
-    try:
-        from bcc import BPF
-    except Exception as e:
-        info(f"BCC unavailable ({e}) -- kernel section skipped")
+    print(f"\n{YELLOW}[10] Synthetic model through P1 / P2 / P3 (needs root; "
+          f"P1 = the AOT object){NC}")
+    if sys.platform != "linux" or os.geteuid() != 0:
+        info("needs Linux + root -- kernel section skipped")
         return
 
     m = preset("ipa_like")            # shape-compatible with all three pipelines
@@ -614,13 +661,10 @@ def t_kernel(root):
     info(f"scenario {mspec.name} {mspec.shape_str}, scale={scale}, "
          f"{len(inputs['vectors'])} vectors")
 
-    # P1: compile the generated weights and check the verifier accepts them
+    # P1: the AOT object on the generated weights, loaded by loader_aot
     try:
-        from ebpf_program import build_combined_hardcoded_source
-        src = build_combined_hardcoded_source([(0, wi, scale, None)])
-        b = BPF(text=src)
-        b.load_func("model_0", BPF.XDP)
-        b.load_func("ipa_switch_hardcoded", BPF.XDP)
+        import p1_aot
+        p1_aot.load_p1([(0, wi, scale)])["owner"].stop()
         ok("P1: synthetic weights compile and pass the in-kernel verifier")
     except Exception as e:
         fail(f"P1: {e}")

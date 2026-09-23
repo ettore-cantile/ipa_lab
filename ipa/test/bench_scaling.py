@@ -627,6 +627,12 @@ def _lookups_safe(build, n_in, n_out):
         frame = build_frame_sparse(model_id=0, ttl=LOOKUP_TTL, scale=SCALE,
                                    n_in=n_in, n_out=n_out)
         ctr = bb["lookup_ctr"]
+        if getattr(ctr, "Leaf", None) is None:
+            # P1, oggetto AOT: un ARRAY semplice con somma atomica (p1_aot).
+            ctr[ct.c_int(0)] = ct.c_ulonglong(0)
+            prog_test_run(disp_fd, frame, repeat=LOOKUP_REPEAT)
+            return (int.from_bytes(ctr[ct.c_int(0)], "little")
+                    / float(LOOKUP_REPEAT))
         ctr[ct.c_int(0)] = ctr.Leaf()        # per-CPU, azzerato ovunque
         prog_test_run(disp_fd, frame, repeat=LOOKUP_REPEAT)
         return sum(int(v) for v in ctr[ct.c_int(0)]) / float(LOOKUP_REPEAT)
@@ -679,8 +685,7 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     # RIFIUTA static_ports senza static_node, quindi e' la forma che la
     # chiamata deve avere perche' `hardcoded` resti quello di sempre.
     ports = cell.get("static_ports") if static_node is not None else None
-    from bcc import BPF
-    from ebpf_program import build_combined_hardcoded_source
+    import p1_aot
     from verify_prog_run import build_frame_sparse, _seed_link_state
 
     dims = cell["dims"]
@@ -691,36 +696,31 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     def _load(strumentata=False):
-        # Codegen is INSIDE the timed region on purpose. For P1 the weights
-        # are C literals, so installing a model is generating C and running
-        # clang over it -- there is no separate "load the weights" step to
-        # measure. build_ms and update_ms below are therefore the same number
-        # for this pipeline, by construction, and that identity is exactly
-        # what distinguishes it from P2 and P3.
-        src = build_combined_hardcoded_source(
-            models=[(0, weights, SCALE)],
-            features=shape["features"], n_out=n_out, hidden_dims=tuple(dims),
-            static_node=static_node, static_ports=ports)
-        bb = BPF(text=_instrumented(src) if strumentata else src)
-        m = bb.load_func("model_0", BPF.XDP)
-        d = bb.load_func("ipa_switch_hardcoded", BPF.XDP)
-        bb["model_progs"][ct.c_int(0)] = ct.c_int(m.fd)
-        return bb, m, d
+        # P1 is the AOT object (p1_aot), as it is deployed. Installing a model
+        # = generating the C, running clang (offline, on a build box) and
+        # loading the object on the node. build_ms times all three, uncached;
+        # update_ms is the NODE's part alone: the loader's open + load
+        # (verifier + JIT). Until 2026-09-23 P1 was measured on BCC, where
+        # clang runs on the node and the two were the same event.
+        return p1_aot.load_p1([(0, weights, SCALE)], instrument=strumentata,
+                              cache=False, features=shape["features"],
+                              n_out=n_out, hidden_dims=tuple(dims),
+                              static_node=static_node, static_ports=ports)
 
-    (b, model_fn, disp_fn), build_ms = _timed(_load)
-    update_ms = build_ms          # see _load: for P1 they are the same event
+    setup, build_ms = _timed(_load)
+    update_ms = setup["t_redirect_s"] * 1000.0
+    b, disp_fn = setup["b"], setup["disp"]
     _seed_link_state(b, 1)
 
-    insns, jited, mb, per_prog, maps = _totals(
-        b, {"ipa_switch_hardcoded": disp_fn.fd, "model_0": model_fn.fd})
+    insns, jited, mb, per_prog, maps = _totals(b, setup["progs"])
     lookups = None
     if cell.get("lookups"):
         def _ins():
             # link_state va seminata anche qui: senza, la feature densa legge
             # una mappa vuota e il percorso non e' quello misurato sopra.
-            bb, _m, dd = _load(True)
-            _seed_link_state(bb, 1)
-            return bb, dd.fd
+            s2 = _load(True)
+            _seed_link_state(s2["b"], 1)
+            return s2["b"], s2["disp"].fd
         lookups = _lookups_safe(_ins, n_in, n_out)
     # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
     from verify_prog_run import BENCH_TTL
@@ -1165,9 +1165,9 @@ def _give_back(path):
 # EQUIVALENCE: the specialised P1 must DECIDE the same thing as P1.5
 # ==========================================================================
 def _build_p1(cell, static_node):
-    """Build and load one P1 variant; returns (bpf, dispatcher fd, frame)."""
-    from bcc import BPF
-    from ebpf_program import build_combined_hardcoded_source
+    """Build and load one P1 variant (the AOT object); returns (maps,
+    dispatcher fd, shape)."""
+    import p1_aot
     from verify_prog_run import _install_mac_table
 
     dims = cell["dims"]
@@ -1177,17 +1177,14 @@ def _build_p1(cell, static_node):
     # `seed` esiste solo per il controllo negativo di verify_ports: la misura
     # usa sempre il pool di default, altrimenti l'asse cambierebbe due cose.
     weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
-    src = build_combined_hardcoded_source(
-        models=[(0, weights, SCALE)], features=shape["features"],
+    setup = p1_aot.load_p1(
+        [(0, weights, SCALE)], features=shape["features"],
         n_out=n_out, hidden_dims=tuple(dims), static_node=static_node,
         static_ports=(cell.get("static_ports")
                       if static_node is not None else None))
-    b = BPF(text=src)
-    model_fn = b.load_func("model_0", BPF.XDP)
-    disp_fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(0)] = ct.c_int(model_fn.fd)
+    b = setup["b"]
     _install_mac_table(b, "mac_table")
-    return b, disp_fn.fd, shape
+    return b, setup["disp"].fd, shape
 
 
 def _decide(b, disp_fd, n_in, n_out, ttl, links):

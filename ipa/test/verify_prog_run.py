@@ -11,7 +11,6 @@ import os
 import sys
 import json
 import struct
-import time
 import argparse
 import ctypes as ct
 
@@ -873,181 +872,28 @@ def setup_baseline_tailcall(model_id: int, model_path: str):
 
 def setup_hardcoded(model_id: int, model_path: str):
     """
-    Load the pure hardcoded eBPF program (Pipeline 1).
+    Pipeline 1 (P1.5: weights compiled in, node read from the node_id map),
+    as it is DEPLOYED: the AOT object built by gen_full_c and loaded by
+    loader_aot, driven through bpffs (p1_aot.load_p1).
 
-    There is NO model_cache / weight map anymore: the weights are C literals
-    compiled into the program, so updating the model = recompiling+reloading the
-    whole program. We therefore measure only the redirect/reload cost:
-      - t_redirect_s : BPF compile + load_func into the kernel (the real update cost)
-      - t_insert_s   : 0 (no runtime weight insertion in the pure hardcoded design)
+    This compiled ebpf_program's BCC source until 2026-09-23 -- a different
+    generator, in a different dialect, that never reaches a node. The two were
+    measured side by side (claims.md B3) and then the tests moved to the object
+    that actually runs. The dictionary is the same as before.
+
+    Model update on the node = loading the prebuilt object:
+      - t_redirect_s : open + load (verifier + JIT) by loader_aot
+      - t_compile_s  : clang, offline (0 when the object was already cached)
+      - t_insert_s   : 0 (no runtime weight insertion in P1)
     """
-    from ebpf_program import build_combined_hardcoded_source
+    import p1_aot
     weights, scale = load_weights(model_path)
-    src = build_combined_hardcoded_source([(model_id, weights, scale, None)])
-
-    # --- redirect/reload: eBPF compile + load into the kernel ---
-    t0 = time.perf_counter()
-    b  = BPF(text=src)
-    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
-    fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
-    t_redirect_s = time.perf_counter() - t0
-
-    # Dispatcher tail-calls model_progs[model_id] -- 1 tail call, matching
-    # the design-space spec's hardcoded pipeline (packet -> dispatcher ->
-    # tail call -> model_<id> -> action). Still zero weight-map lookups.
-    disp = fn
-
+    setup = p1_aot.load_p1([(model_id, weights, scale)])
+    setup.update(weights=weights, scale=scale)
     # link_state[0..5] = 1 (all egress links up) -- input feature, not a weight.
-    _seed_link_state(b, 1)
-    _install_mac_table(b, "mac_table")
-
-    progs = {"ipa_switch_hardcoded": fn.fd, f"model_{model_id}": model_fn.fd}
-
-    return {
-        "b": b, "fn": model_fn, "disp": disp,
-        "weights": weights, "scale": scale,
-        "cls_stats": b["cls_stats"],
-        "pkt_stats": b["pkt_stats"],
-        "pipeline": 1,
-        "progs": progs,
-        # real model-update timing: pure hardcoded = full recompile, no weight insert
-        "t_redirect_s": t_redirect_s,
-        "t_insert_s": 0.0,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Pipeline 1 as DEPLOYED: the AOT object, not the BCC build
-# ---------------------------------------------------------------------------
-# setup_hardcoded compiles P1 with BCC, and until 2026-09-23 every P1 number in
-# the kernel benches came from it -- but P1 is never deployed that way: the
-# node gets the object gen_full_c generates and loader_aot loads, a separate
-# generator in another dialect, compiled differently. setup_aot returns the
-# same dictionary as setup_hardcoded over THAT object, so every bench that
-# takes a setup measures what actually runs on a node.
-
-_AOT_BUILT = {}
-_AOT_PIN_SEQ = [0]
-
-
-def _build_aot(model_path):
-    """Build the .o and the loader once per process, with the production
-    script (method4_hardcoded_aot.py --build-only), not a copy of its steps."""
-    import re
-    import subprocess
-    key = os.path.abspath(model_path)
-    if key not in _AOT_BUILT:
-        script = os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py")
-        r = subprocess.run([sys.executable, script, "--build-only",
-                            "--model", model_path],
-                           capture_output=True, text=True)
-        m = re.search(r"^\[AOT\] build complete: (\S+) (\S+)\s*$", r.stdout, re.M)
-        if r.returncode != 0 or not m:
-            raise RuntimeError(f"AOT build failed (rc={r.returncode}): "
-                               f"{(r.stderr or r.stdout).strip()[-600:]}")
-        _AOT_BUILT[key] = (m.group(1), m.group(2))
-    return _AOT_BUILT[key]
-
-
-class _AotPinned:
-    """loader_aot in PIN-ONLY mode: it loads the object, pins maps and
-    programs, prints READY and stays until DETACH or EOF on its stdin -- so
-    the pins vanish with this process, or with it if it dies."""
-
-    def __init__(self, loader, o_path, pin_dir):
-        import atexit
-        import re
-        import subprocess
-        self.proc = subprocess.Popen([loader, o_path, "--pin-dir", pin_dir],
-                                     cwd=os.path.dirname(o_path),
-                                     stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, text=True,
-                                     bufsize=1)
-        self.load_ms = None
-        seen = []
-        for line in self.proc.stdout:
-            seen.append(line)
-            m = re.match(r"\[aot\] open\+load \(verify\+JIT\): ([\d.]+) ms", line)
-            if m:
-                self.load_ms = float(m.group(1))
-            if line.startswith("READY"):
-                break
-        else:
-            raise RuntimeError(f"loader_aot exited (rc={self.proc.wait()}) "
-                               f"before READY: {''.join(seen[-5:]).strip()!r}")
-        atexit.register(self.stop)
-
-    def stop(self):
-        import subprocess
-        if self.proc.poll() is not None:
-            return
-        try:
-            self.proc.stdin.write("DETACH\n")
-            self.proc.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.terminate()
-            self.proc.wait()
-
-
-class _FdProg:
-    """What a BCC load_func returns, as far as the benches use it: an fd --
-    plus the bpffs path, which common.attach_xdp uses to attach it."""
-
-    def __init__(self, fd, pin_path=None):
-        self.fd = fd
-        self.pin_path = pin_path
-
-
-def setup_aot(model_id: int, model_path: str):
-    """Pipeline 1 as DEPLOYED -- same dictionary as setup_hardcoded.
-
-    Same inputs as setup_hardcoded, so the two rows are comparable: node from
-    the node_id map, left empty (the object reads it at runtime, like BCC's
-    P1.5 build here); link_state all up; mac_table seeded for the model's
-    logical ports. t_redirect_s is the loader's open+load (verify + JIT),
-    the AOT counterpart of BCC's compile+load.
-    """
-    if model_id != 0:
-        raise ValueError("the AOT object carries ONE model, registered at "
-                         "model_progs[0]")
-    from pinned_maps import PinnedObject, FwdAction
-    from ebpf_program import load_and_generate
-    import model_meta as mm
-
-    o_path, loader = _build_aot(model_path)
-    _AOT_PIN_SEQ[0] += 1
-    pin_dir = f"/sys/fs/bpf/ipa_p1_bench_{os.getpid()}_{_AOT_PIN_SEQ[0]}"
-    owner = _AotPinned(loader, o_path, pin_dir)
-    b = PinnedObject(pin_dir, leaf_types={"mac_table": FwdAction,
-                                          "link_state": "u32vec",
-                                          "queue_state": "u32vec"})
-    disp_fd, model_fd = b.prog_fd("xdp_dispatch"), b.prog_fd("xdp_model")
-    # The numbers the object was compiled from (gen_full_c takes them from
-    # load_and_generate), so the reference cannot use different ones.
-    meta = mm.load_model_meta(model_path)
-    _, weights, scale = load_and_generate(
-        model_path, meta=meta, topology_config=mm.load_topology_config())
-
-    _seed_link_state(b, 1)
-    _install_mac_table(b, "mac_table")
-    return {
-        "b": b,
-        "fn": _FdProg(model_fd, os.path.join(pin_dir, "xdp_model")),
-        "disp": _FdProg(disp_fd, os.path.join(pin_dir, "xdp_dispatch")),
-        "weights": weights, "scale": scale,
-        "cls_stats": b["cls_stats"],
-        "pkt_stats": b["pkt_stats"],
-        "pipeline": 1,
-        "progs": {"xdp_dispatch": disp_fd, "xdp_model": model_fd},
-        "t_redirect_s": (owner.load_ms or 0.0) / 1000.0,
-        "t_insert_s": 0.0,
-        "owner": owner,
-    }
+    _seed_link_state(setup["b"], 1)
+    _install_mac_table(setup["b"], "mac_table")
+    return setup
 
 
 def setup_template(model_id: int, model_path: str):
@@ -1128,17 +974,18 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
         raise ValueError(f"{model_dir}/model_meta.json is not a sparse model with a 'features' descriptor")
     shape = mm.derive_shape(meta)
 
-    src, weights, scale = load_and_generate(model_path, model_id=model_id, meta=meta)
-    b = BPF(text=src)
-    model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
-    fn = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-    b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
-
+    import p1_aot
+    # Weights and scale as the deploy resolves them; the program is the AOT
+    # object (p1_aot), not load_and_generate's BCC source.
+    _, weights, scale = load_and_generate(model_path, model_id=model_id, meta=meta)
     n_out = shape["n_out"]
-    # The generator was handed these same semantics (load_and_generate ->
-    # generate_ebpf_hardcoded), so the seeded port space matches the switch the
-    # datapath actually runs.
+    # One semantics object for the generated switch AND the seeded port space.
     semantics = mm.descriptor_semantics_or_reference(n_out, "verify:sparse")
+    setup = p1_aot.load_p1([(model_id, weights, scale)],
+                           features=shape["features"], n_out=n_out,
+                           hidden_dims=tuple(shape["hidden_dims"]),
+                           semantics=semantics)
+    b = setup["b"]
     _install_mac_table(b, "mac_table", semantics=semantics)
 
     # Seed each dense_vector map with known values (deterministic, arbitrary).
@@ -1151,14 +998,9 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
         write_vector_map(b, map_name, vals)
         map_values[map_name] = vals
 
-    return {
-        "b": b, "fn": model_fn, "disp": fn,
-        "weights": weights, "scale": scale, "shape": shape,
-        "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
-        "pipeline": 1, "map_values": map_values,
-        "semantics": semantics,
-        "progs": {"ipa_switch_hardcoded": fn.fd, f"model_{model_id}": model_fn.fd},
-    }
+    setup.update(weights=weights, scale=scale, shape=shape,
+                 map_values=map_values, semantics=semantics)
+    return setup
 
 
 def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, repeat: int = None) -> float:
@@ -1197,14 +1039,13 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
         disp_fn = b.load_func("xdp_baseline", BPF.XDP)
         _install_mac_table(b, "mac_table")
     elif method == "hardcoded":
-        from ebpf_program import build_combined_hardcoded_source
-        raw = build_combined_hardcoded_source([(model_id, weights, scale, None)])
-        src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
-        _report(raw)
-        b = BPF(text=src)
-        model_fn = b.load_func(f"model_{model_id}", BPF.XDP)
-        disp_fn  = b.load_func("ipa_switch_hardcoded", BPF.XDP)
-        b["model_progs"][ct.c_int(model_id)] = ct.c_int(model_fn.fd)
+        # The AOT object with every bpf_map_lookup_elem counted
+        # (p1_aot.instrument_lookups, the libbpf twin of the BCC rewrite).
+        import p1_aot
+        setup = p1_aot.load_p1([(model_id, weights, scale)], instrument=True)
+        print(f"[count_lookups] {method}: instrumenting "
+              f"{setup['lookup_sites']} lookup sites (AOT object)")
+        b, disp_fn = setup["b"], setup["disp"]
         _seed_link_state(b, 1)
         _install_mac_table(b, "mac_table")
     elif method == "template":
@@ -1243,6 +1084,11 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
     # per-CPU counter pattern the design-space analysis recommends for
     # pkt_stats/cls_stats). Zero every CPU's copy, then sum them back.
     ctr = b["lookup_ctr"]
+    if method == "hardcoded":
+        # AOT build: a plain ARRAY with an atomic add (see p1_aot).
+        ctr[ct.c_int(0)] = ct.c_ulonglong(0)
+        prog_test_run(disp_fn.fd, frame, repeat=repeat)
+        return int.from_bytes(ctr[ct.c_int(0)], "little") / float(repeat)
     ctr[ct.c_int(0)] = ctr.Leaf()          # zeroed per-CPU array
     prog_test_run(disp_fn.fd, frame, repeat=repeat)
     total = sum(int(v) for v in ctr[ct.c_int(0)])
@@ -1267,7 +1113,7 @@ def _count_lookups_defaults(ttl, repeat):
 def _read_u64(table, key_val):
     try:
         v = table[ct.c_int(key_val)]
-        if isinstance(v, (bytes, bytearray)):      # a pinned map (setup_aot)
+        if isinstance(v, (bytes, bytearray)):      # a pinned map (P1, AOT)
             return int.from_bytes(v, "little")
         return int(v.value)
     except Exception:
@@ -1329,7 +1175,6 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
     Returns (n_pass, n_fail, details).
     """
     setup_fn = {"hardcoded": setup_hardcoded,
-                "aot":       setup_aot,
                 "template":  setup_template,
                 "modular":   setup_modular}[method]
     setup = setup_fn(model_id, model_path)
@@ -1415,8 +1260,8 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print("NOTE: bpf_redirect() runs in the TEST_RUN sandbox.")
     print("      PASS = retval in {0,4} (redirect fire) + cls_stats/pkt_stats hit.")
     print()
-    setup_fn = {"hardcoded": setup_hardcoded, "aot": setup_aot,
-                "template": setup_template, "modular": setup_modular}[method]
+    setup_fn = {"hardcoded": setup_hardcoded, "template": setup_template,
+                "modular": setup_modular}[method]
     setup = setup_fn(model_id, model_path)
     # b and fn are not referenced again but must stay in scope: they own the
     # BCC object and the loaded program: letting them be garbage-collected
@@ -1432,7 +1277,8 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     if pipeline == 1:
         t_redir = setup.get("t_redirect_s", 0.0)
         t_ins   = setup.get("t_insert_s", 0.0)
-        print(f"[M1 update timing] redirect/reload (BPF compile+load): {t_redir*1000:.3f} ms")
+        print(f"[M1 update timing] reload on the node (AOT open+load): {t_redir*1000:.3f} ms"
+              f"   [clang, offline: {setup.get('t_compile_s', 0.0)*1000:.1f} ms, 0 if cached]")
         print(f"[M1 update timing] weight insert   (n/a, pure hardcoded): {t_ins*1000:.3f} ms")
         print(f"[M1 update timing] total:                               {(t_redir+t_ins)*1000:.3f} ms")
         print()

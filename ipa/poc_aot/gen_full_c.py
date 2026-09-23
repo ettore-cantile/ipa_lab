@@ -92,22 +92,36 @@ def _feat_scalar(feat, offset, n_in, fc1_w, n_h1):
     return pre, term
 
 
-def _feat_dense_vector(feat, offset, n_in, fc1_w, n_h1):
+def _feat_dense_vector(feat, offset, n_in, fc1_w, n_h1, static_ports=None):
+    """Dense vector read from its map with ONE lookup. With static_ports only
+    the columns of ports that exist on the node are generated -- the rule and
+    its conditions are ebpf_program._live_slots, imported rather than copied,
+    so the two P1 backends cannot disagree on which columns are dead."""
+    from ebpf_program import _live_slots
     map_name = _model_meta.FEATURE_CATALOG[feat["type"]]["map"]
     prefix = "ls" if map_name == "link_state" else "qs"
     size = feat["size"]
+    live = _live_slots(feat, size, static_ports)
+    if len(live) == size:
+        head = (f"    /* feature '{feat['type']}': {size} values read with ONE "
+                f"lookup from {map_name} */")
+    else:
+        dead = [i for i in range(size) if i not in live]
+        head = (f"    /* feature '{feat['type']}': {len(live)} of {size} slots "
+                f"exist on this node ({live}); slots {dead} have no interface "
+                f"behind them, are structurally 0, and are not generated. */")
     lines = [
-        f"    /* feature '{feat['type']}': {size} values read with ONE lookup from {map_name} */",
-        "    long long " + ", ".join(f"{prefix}{i}=0LL" for i in range(size)) + ";",
+        head,
+        "    long long " + ", ".join(f"{prefix}{i}=0LL" for i in live) + ";",
         f"    {{ __u32 _z=0; struct {map_name}_vec *_p = bpf_map_lookup_elem(&{map_name}, &_z);",
         "      if (_p) {",
     ]
-    for i in range(size):
+    for i in live:
         lines.append(f"        {prefix}{i}=(long long)_p->v[{i}];")
     lines.append("      } }")
     def term(j):
         return " + ".join(
-            f"{prefix}{i} * {_lit(fc1_w[j * n_in + offset + i])}LL" for i in range(size))
+            f"{prefix}{i} * {_lit(fc1_w[j * n_in + offset + i])}LL" for i in live)
     return lines, term
 
 
@@ -135,8 +149,25 @@ def _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1):
+def _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1, static_index=None):
+    """Node one-hot. static_index=None: read from the node_id map (P1.5, one
+    object for the whole network). static_index=k: frozen at build time (P1,
+    one object per node) -- the switch collapses to n_h1 constants that clang
+    folds. Same two modes, same refusal, as ebpf_program's generator."""
     size = feat["size"]
+    if static_index is not None:
+        if not (0 <= static_index < size):
+            raise ValueError(
+                f"static_node={static_index} outside [0, {size}) for a node "
+                f"one-hot of width {size}. Refused rather than silently "
+                f"emitting an all-zero column, which would look like a "
+                f"working program for a node that is not in the topology.")
+        lines = [f"    /* feature 'node' (one-hot) FROZEN at index "
+                 f"{static_index} of {size}: no node_id read, no switch. */"]
+        for j in range(n_h1):
+            lines.append(f"    long long w_node_{j} = "
+                         f"{_lit(fc1_w[j * n_in + offset + static_index])}LL;")
+        return lines, (lambda j: f"w_node_{j}")
     lines = ["    /* feature 'node' (one-hot): this NODE's index, from the node_id",
              "     * map -- not ipa->model_id, which identifies the MODEL.",
              "     * Bounded to a byte so the verifier reasons about the switch",
@@ -159,18 +190,21 @@ def _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1):
     return lines, term
 
 
-def _gen_feature(feat, offset, n_in, fc1_w, n_h1):
+def _gen_feature(feat, offset, n_in, fc1_w, n_h1, static_node=None,
+                 static_ports=None):
     t = feat["type"]
     kind = _model_meta.FEATURE_CATALOG[t]["kind"]
     if kind == "scalar":
         return _feat_scalar(feat, offset, n_in, fc1_w, n_h1)
     if kind == "dense_vector_map":
-        return _feat_dense_vector(feat, offset, n_in, fc1_w, n_h1)
+        return _feat_dense_vector(feat, offset, n_in, fc1_w, n_h1,
+                                  static_ports=static_ports)
     if kind == "onehot":
         if t == "ingress_iface":
             return _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1)
         if t == "node":
-            return _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1)
+            return _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1,
+                                     static_index=static_node)
     raise ValueError(f"no C generator for feature type {t!r} (kind {kind!r})")
 
 
@@ -218,7 +252,8 @@ _PARSE = """    void *data = (void *)(long)ctx->data;
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;"""
 
 
-def _emit_model_body(shape, w, scale: int = 1, semantics=None) -> list:
+def _emit_model_body(shape, w, scale: int = 1, semantics=None,
+                     static_node=None, static_ports=None) -> list:
     """IV + MLP + argmax + action body of the tail-called model program (weights
     as literals). ctx/data/eth/ip/udp/ipa are already parsed by the caller-emitted
     _PARSE block (the SECOND parse the dispatcher+tail-call architecture forces)."""
@@ -226,6 +261,14 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None) -> list:
     n_out = shape["n_out"]
     n_in = shape["n_in"]
     sizes = _layer_sizes(shape)
+    if len(w) != _weight_count(sizes):
+        raise ValueError(f"expected {_weight_count(sizes)} weights for "
+                         f"{'-'.join(map(str, sizes))}, got {len(w)}")
+    if static_ports is not None and static_node is None:
+        raise ValueError(
+            "static_ports requires static_node: freezing WHICH ports exist is "
+            "part of specialising P1 to one node (the same rule as the BCC "
+            "generator); P1.5 keeps the model's full feature width.")
     layers = _slices(w, sizes)
     n_hidden = len(sizes) - 2
 
@@ -241,7 +284,9 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None) -> list:
     term_fns = []
     offset = 0
     for feat in features:
-        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1)
+        pre, term = _gen_feature(feat, offset, n_in, fc1_w, n_h1,
+                                 static_node=static_node,
+                                 static_ports=static_ports)
         L.extend(pre)
         term_fns.append(term)
         offset += feat["size"]
@@ -397,11 +442,21 @@ def _emit_maps(shape) -> list:
     return L
 
 
-def _emit_arch(shape, w, scale: int = 1, semantics=None) -> str:
+def _emit_arch(shape, w, scale: int = 1, semantics=None, static_node=None,
+               static_ports=None, models=None) -> str:
     """FULL-PATH, ARCHITECTURE-FAITHFUL literal program: dispatcher +
     PROG_ARRAY tail-call + model that RE-parses (double parse) -- same topology
     as the BCC hardcoded path, so BPF_PROG_TEST_RUN on the dispatcher measures
-    the identical per-packet work test_suite --kernel measures."""
+    the identical per-packet work test_suite --kernel measures.
+
+    One model: `xdp_model`, wired by loader_aot at model_progs[0].
+    models=[(model_id, weights, scale), ...]: one `xdp_model_<id>` each, all
+    sharing descriptor, shape and semantics (as build_combined_hardcoded_source
+    requires for BCC); loader_aot wires each at model_progs[<id>].
+    static_node / static_ports: P1 specialised to one node, see
+    _feat_onehot_node and _feat_dense_vector."""
+    if models is None:
+        models = [(None, w, scale)]
     feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in shape["features"])
     shape_str = "-".join(str(s) for s in _layer_sizes(shape))
     L = []; A = L.append
@@ -437,13 +492,17 @@ def _emit_arch(shape, w, scale: int = 1, semantics=None) -> str:
     A("")
     L.extend(_emit_maps(shape))
     A("")
-    # --- model program (tail-call target): re-parses, then infers ---
-    A("SEC(\"xdp\")")
-    A("int xdp_model(struct xdp_md *ctx) {")
-    A(_PARSE)
-    L.extend(_emit_model_body(shape, w, scale, semantics))
-    A("}")
-    A("")
+    # --- model program(s) (tail-call targets): re-parse, then infer ---
+    for mid, mw, mscale in models:
+        A("SEC(\"xdp\")")
+        A("int xdp_model(struct xdp_md *ctx) {" if mid is None
+          else f"int xdp_model_{int(mid)}(struct xdp_md *ctx) {{")
+        A(_PARSE)
+        L.extend(_emit_model_body(shape, mw, mscale, semantics,
+                                  static_node=static_node,
+                                  static_ports=static_ports))
+        A("}")
+        A("")
     # --- dispatcher (entry): parses, tail-calls model_progs[model_id] ---
     A("SEC(\"xdp\")")
     A("int xdp_dispatch(struct xdp_md *ctx) {")

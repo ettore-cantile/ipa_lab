@@ -38,6 +38,7 @@ _BPF_SYSCALL_NR = {"x86_64": 321, "aarch64": 280}
 
 _BPF_MAP_LOOKUP_ELEM = 1
 _BPF_MAP_UPDATE_ELEM = 2
+_BPF_MAP_DELETE_ELEM = 3
 _BPF_MAP_GET_NEXT_KEY = 4
 _BPF_OBJ_GET = 7
 _BPF_OBJ_GET_INFO_BY_FD = 15
@@ -45,6 +46,20 @@ _BPF_ANY = 0
 
 # BPF_MAP_TYPE_PERCPU_HASH, PERCPU_ARRAY, LRU_PERCPU_HASH, PERCPU_CGROUP_STORAGE
 _PERCPU_TYPES = (5, 6, 10, 21)
+# BPF_MAP_TYPE_ARRAY, PERCPU_ARRAY: every key exists, clear() zeroes them
+_ARRAY_TYPES = (2, 6)
+
+
+def possible_cpus() -> int:
+    """How many per-CPU slots the kernel copies: the POSSIBLE cpus
+    (/sys/devices/system/cpu/possible, e.g. "0-3"), not the online ones."""
+    with open("/sys/devices/system/cpu/possible") as f:
+        spec = f.read().strip()
+    n = 0
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        n += (int(hi) - int(lo) + 1) if hi else 1
+    return n
 
 _libc = None
 
@@ -161,12 +176,13 @@ class PinnedMap:
         self.value_size = int(info.value_size)
         self.max_entries = int(info.max_entries)
         self.type = int(info.type)
-        if self.type in _PERCPU_TYPES:
-            # A per-CPU value is value_size rounded up to 8, times the number
-            # of POSSIBLE cpus. Nothing P1 pins is per-CPU; supporting it
-            # without a caller to test it would be guessing.
-            raise PinnedMapError(f"{path}: per-CPU map (type {self.type}) not "
-                                 f"supported by PinnedMap")
+        # A per-CPU value travels as one slot per POSSIBLE cpu, each rounded
+        # up to 8 bytes -- the kernel's layout for lookup/update on these maps.
+        self.percpu = self.type in _PERCPU_TYPES
+        self.ncpu = possible_cpus() if self.percpu else 1
+        self._stride = ((self.value_size + 7) // 8) * 8 if self.percpu \
+            else self.value_size
+        self._buf_size = self._stride * self.ncpu
         self.Leaf = None                          # set by attach_leaf_type()
 
     def __repr__(self):
@@ -201,24 +217,66 @@ class PinnedMap:
         return _syscall(cmd, attr)
 
     # -- mapping interface -------------------------------------------------
+    def _value_buf(self, value):
+        """The update buffer. Per-CPU: a list/tuple gives one value per cpu;
+        a single value is written to EVERY cpu (what zeroing needs)."""
+        if not self.percpu:
+            return self._as_bytes(value, self.value_size, "value")
+        if isinstance(value, (list, tuple)):
+            if len(value) != self.ncpu:
+                raise PinnedMapError(f"{self.name}: {len(value)} per-cpu values, "
+                                     f"the map has {self.ncpu} cpus")
+            parts = value
+        else:
+            parts = [value] * self.ncpu
+        pad = b"\x00" * (self._stride - self.value_size)
+        return b"".join(self._as_bytes(v, self.value_size, "value") + pad
+                        for v in parts)
+
     def __setitem__(self, key, value):
-        v = ct.create_string_buffer(
-            self._as_bytes(value, self.value_size, "value"), self.value_size)
+        v = ct.create_string_buffer(self._value_buf(value), self._buf_size)
         if self._elem(_BPF_MAP_UPDATE_ELEM, key, v, _BPF_ANY) < 0:
             raise PinnedMapError(
                 f"update {self.name}: {os.strerror(ct.get_errno())}")
 
-    def __getitem__(self, key):
-        v = ct.create_string_buffer(self.value_size)
-        if self._elem(_BPF_MAP_LOOKUP_ELEM, key, v, 0) < 0:
-            raise KeyError(f"{self.name}: no entry "
-                           f"({os.strerror(ct.get_errno())})")
-        raw = bytes(v)
+    def _decode(self, raw):
         if self.Leaf is not None:
             out = self.Leaf()
             ct.memmove(ct.byref(out), raw, ct.sizeof(out))
             return out
         return raw
+
+    def __getitem__(self, key):
+        """Plain map: the value (Leaf if declared, else raw bytes). Per-CPU
+        map: a list with one value per cpu -- ints for u32/u64 values, as the
+        elements of a BCC per-cpu leaf read back."""
+        v = ct.create_string_buffer(self._buf_size)
+        if self._elem(_BPF_MAP_LOOKUP_ELEM, key, v, 0) < 0:
+            raise KeyError(f"{self.name}: no entry "
+                           f"({os.strerror(ct.get_errno())})")
+        raw = bytes(v)
+        if not self.percpu:
+            return self._decode(raw)
+        cells = [raw[i * self._stride: i * self._stride + self.value_size]
+                 for i in range(self.ncpu)]
+        if self.Leaf is None and self.value_size in (4, 8):
+            return [int.from_bytes(c, "little") for c in cells]
+        return [self._decode(c) for c in cells]
+
+    def clear(self):
+        """Zero every entry of an array, delete every key of a hash -- what
+        BCC's table.clear() does."""
+        if self.type in _ARRAY_TYPES:
+            zero = bytes(self.value_size)
+            for k in range(self.max_entries):
+                self[ct.c_uint32(k)] = zero
+            return
+        for k in self.keys():
+            kb = ct.create_string_buffer(k, self.key_size)
+            attr = _AttrMapElem(map_fd=self.map_fd, _pad=0,
+                                key=ct.cast(kb, ct.c_void_p).value,
+                                value=0, flags=0)
+            _syscall(_BPF_MAP_DELETE_ELEM, attr)
 
     def __len__(self):
         """max_entries, as len() of a BCC array table."""
@@ -243,8 +301,9 @@ class PinnedMap:
 
     def attach_leaf_type(self, ctype):
         """Declare the value's ctypes layout, so `.Leaf()` works and reads come
-        back structured. BCC knows this from the C source; here the caller
-        says it, and a layout of the wrong size is refused."""
+        back structured (per cpu, on a per-CPU map). BCC knows this from the C
+        source; here the caller says it, and a layout of the wrong size is
+        refused."""
         if ct.sizeof(ctype) != self.value_size:
             raise PinnedMapError(
                 f"{self.name}: leaf type {ctype.__name__} is "
