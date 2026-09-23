@@ -157,10 +157,20 @@ def build_frame(frame_size, src_mac, dst_mac="02:00:00:00:00:02",
     return frame
 
 
+# TRAFFICO MISTO. Con un pacchetto sempre identico la pipeline decide sempre
+# la stessa classe: una porta d'uscita, una voce di mac_table, cache e branch
+# predictor sempre caldi, e i percorsi DROP / UNUSED mai esercitati. Con
+# `ttls` il generatore scrive a ogni frame il TTL successivo della lista (per
+# CPU, a giro), con la checksum IP gia' calcolata per quel TTL: il TTL e' una
+# feature del modello, quindi le classi decise cambiano con lui.
+MIX_MAX = 256
+
 GEN_SRC = r"""
 #include <uapi/linux/bpf.h>
 struct hdr_t { __u8 b[HDR_COPY]; };
+struct mix_t { __u8 ttl; __u8 csum[2]; };
 BPF_ARRAY(gen_hdr, struct hdr_t, 1);
+BPF_ARRAY(gen_mix, struct mix_t, MIX_SLOTS);
 BPF_PERCPU_ARRAY(gen_runs, __u64, 1);   /* tentativi: uno per esecuzione */
 int xdp_gen(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
@@ -173,6 +183,16 @@ int xdp_gen(struct xdp_md *ctx) {
     if (!h) return XDP_ABORTED;
     /* il frame torna dalla page_pool com'e' stato lasciato dal DUT */
     __builtin_memcpy(data, h->b, HDR_COPY);
+    if (MIX_N > 0 && n) {
+        int i = (int)(*n % (MIX_N > 0 ? MIX_N : 1));
+        struct mix_t *m = gen_mix.lookup(&i);
+        if (m) {
+            __u8 *d = data;
+            d[22] = m->ttl;            /* 14 Ethernet + 8: iphdr.ttl */
+            d[24] = m->csum[0];        /* 14 + 10: iphdr.check */
+            d[25] = m->csum[1];
+        }
+    }
     return bpf_redirect(TARGET_IFINDEX, 0);
 }
 """
@@ -209,7 +229,7 @@ class XdpGen:
     rate_estimate = 0
 
     def __init__(self, target_dev, plan, window_s=0.3,
-                 dst_mac="02:00:00:00:00:02", dst_ip="10.0.0.2"):
+                 dst_mac="02:00:00:00:00:02", dst_ip="10.0.0.2", ttls=None):
         from bcc import BPF
         self.target = target_dev
         self.ifindex = socket.if_nametoindex(target_dev)
@@ -217,8 +237,14 @@ class XdpGen:
         self.window_s = window_s
         self.dst_mac, self.dst_ip = dst_mac, dst_ip
         self.src_mac = _mac_of(target_dev)
-        self.b = BPF(text=GEN_SRC, cflags=[f"-DHDR_COPY={HDR_COPY}",
-                                          f"-DTARGET_IFINDEX={self.ifindex}"])
+        self.ttls = list(ttls or [])
+        if len(self.ttls) > MIX_MAX or any(not 1 <= t <= 255
+                                           for t in self.ttls):
+            raise ValueError(f"ttls: al piu' {MIX_MAX} valori in 1..255")
+        self.b = BPF(text=GEN_SRC, cflags=[
+            f"-DHDR_COPY={HDR_COPY}", f"-DTARGET_IFINDEX={self.ifindex}",
+            f"-DMIX_N={len(self.ttls)}",
+            f"-DMIX_SLOTS={max(1, len(self.ttls))}"])
         self.fn = self.b.load_func("xdp_gen", BPF.XDP)
         self.last_run = None
         self._frame = None
@@ -236,6 +262,10 @@ class XdpGen:
             print(f"  [INFO] generatore XDP (live frames): {self.n_inst} "
                   f"thread su cpu {','.join(map(str, self.cpus))} -> "
                   f"redirect su {self.target} (ifindex {self.ifindex})")
+            if self.ttls:
+                print(f"  [INFO] traffico misto: TTL a giro su "
+                      f"{len(self.ttls)} valori ({min(self.ttls)}-"
+                      f"{max(self.ttls)})")
         return self
 
     def detach(self):
@@ -263,6 +293,14 @@ class XdpGen:
         v = hdr.Leaf()
         ct.memmove(ct.byref(v), data[:HDR_COPY], HDR_COPY)
         hdr[ct.c_int(0)] = v
+        mix = self.b["gen_mix"]
+        for i, ttl in enumerate(self.ttls):
+            f = build_frame(frame_size, self.src_mac, self.dst_mac,
+                            dst_ip=self.dst_ip, ttl=ttl)
+            e = mix.Leaf()
+            e.ttl = f[22]
+            e.csum[0], e.csum[1] = f[24], f[25]
+            mix[ct.c_int(i)] = e
         buf = ct.create_string_buffer(data, len(data))
         self._frame = (frame_size, buf, len(data))
         return buf

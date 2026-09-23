@@ -2298,6 +2298,11 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 # un pacchetto il cui accodamento in uscita fallisce e' costato
                 # al nodo lo stesso lavoro.
                 hit_pps=int(hit / secs),
+                # Tutti i pacchetti che il programma ha ELABORATO, con
+                # qualunque esito (HIT, MISS, DROP). Con traffico misto e' la
+                # capacita' del nodo: un pacchetto scartato per classe DROP o
+                # per TTL scaduto e' comunque passato dalla pipeline.
+                proc_pps=int((hit + miss + drop) / secs),
                 # I TRE MODI DI PERDERE UN PACCHETTO, tenuti separati perche'
                 # accusano tre colpevoli diversi:
                 #
@@ -4720,7 +4725,7 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 topology="shared", xmit_mode="start_xmit",
                 threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
                 warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0,
-                generator="pktgen", egress_cpu=None):
+                generator="pktgen", egress_cpu=None, ttl_mix=None):
     """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate.
 
     generator="xdp": frame XDP grezzi (xdp_gen.XdpGen, BPF_PROG_TEST_RUN in
@@ -4769,7 +4774,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
         gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
         if generator == "xdp":
             from xdp_gen import XdpGen
-            gen = XdpGen(gen_devs[0], plan, window_s=window_s).attach()
+            gen = XdpGen(gen_devs[0], plan, window_s=window_s,
+                         ttls=ttl_mix).attach()
         else:
             gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
                             topology=ing.topology, clone=clone, burst=burst,
@@ -4949,6 +4955,7 @@ def run_compare(methods, model_path, frames, offered_pps=None,
             disable_threaded_napi(napi_devs)
         if egress_napi:
             disable_threaded_napi(egress_napi)
+        _class_mix_report({m: loaded[m] for m in alive}, n_out, sem)
         for dev in ing.dut_devs:
             _detach(dev)
         ing.cleanup()
@@ -4991,6 +4998,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        rx_pps=int(stats.median(pps)), rx_pps_mean=a["mean"],
                        hit_pps=int(stats.median([r.get("hit_pps", 0)
                                                  for r in pts])),
+                       proc_pps=int(stats.median([r.get("proc_pps", 0)
+                                                  for r in pts])),
                        rx_pps_min=a["min"], rx_pps_max=a["max"],
                        rx_pps_std=a["std"], rx_pps_cv_pct=a["cv_pct"],
                        loss_pct=round(loss, 3),
@@ -5037,6 +5046,55 @@ def run_compare(methods, model_path, frames, offered_pps=None,
 RXONLY_FAILS = []
 
 
+def _read_any(table, key):
+    """Un contatore qualunque: plain (ctypes), per-CPU (lista), pinnato
+    (bytes). 0 se la chiave non c'e'."""
+    try:
+        v = table[ct.c_int(key)]
+    except Exception:
+        return 0
+    if isinstance(v, (bytes, bytearray)):
+        return int.from_bytes(v, "little")
+    if isinstance(v, list):
+        return sum(int(x) for x in v)
+    try:
+        return sum(int(x) for x in v)          # array ctypes per-CPU di BCC
+    except TypeError:
+        return int(getattr(v, "value", v))
+
+
+def _class_mix_report(loaded, n_out, sem):
+    """Le classi decise da ogni pipeline su tutto il run: la prova di COSA ha
+    esercitato il traffico. Con un pacchetto sempre uguale esce una classe
+    sola, e va letto come limite della misura, non come un risultato."""
+    righe = []
+    for m, setup in loaded.items():
+        if setup.get("rx_is_hit"):
+            continue
+        cs = setup.get("cls_stats")
+        ps = setup.get("pkt_stats")
+        if cs is None or ps is None:
+            continue
+        cls = [_read_any(cs, c) for c in range(n_out)]
+        tot = sum(cls)
+        if not tot:
+            continue
+        miss, drop = _read_any(ps, 1), _read_any(ps, 2)
+        dist = " ".join(f"{c}:{100.0 * v / tot:4.1f}%"
+                        for c, v in enumerate(cls) if v)
+        righe.append((m, len([v for v in cls if v]), dist, miss, drop))
+    if not righe:
+        return
+    print(f"\n  {YELLOW}Classi decise sul traffico del run (cls_stats, "
+          f"cumulativo){NC}")
+    for m, n, dist, miss, drop in righe:
+        print(f"    {m:10s} {n} classi  {dist}   miss {miss} drop {drop}")
+    if all(n == 1 for _, n, _, _, _ in righe):
+        warn("una classe sola per ogni pipeline: il traffico ha esercitato un "
+             "solo percorso (una porta, niente DROP). Il costo vale per quel "
+             "percorso; per un traffico misto --generator xdp --ttl-mix.")
+
+
 def _rxonly_verdict(sat, cmp_, threshold):
     """Le pipeline rispetto al tetto di sola ricezione misurato INSIEME a loro.
 
@@ -5052,16 +5110,17 @@ def _rxonly_verdict(sat, cmp_, threshold):
         cap = top["rx_pps"]
 
         def nodo(r):
-            # HIT se c'e': vedi hit_pps in _measure_once. rxonly non ha
-            # uscita, e per lui HIT e RX sono lo stesso contatore.
-            return r.get("hit_pps") or r["rx_pps"]
+            # Gli ELABORATI (HIT + MISS + DROP) se ci sono, vedi proc_pps in
+            # _measure_once; con un pacchetto sempre uguale coincidono con
+            # HIT. rxonly non ha uscita: per lui elaborati e RX coincidono.
+            return r.get("proc_pps") or r.get("hit_pps") or r["rx_pps"]
         base = next((r for r in sat if r["frame"] == frame
                      and r["method"] == "baseline"), None)
         base_ns = 1e9 / nodo(base) if base is not None and nodo(base) else None
         print(f"\n  {YELLOW}Costo per pacchetto sulla CPU del DUT ({frame}B, "
               f"saturazione, stessa sessione). Tetto di sola ricezione "
               f"({RX_ONLY}): {cap} pps = {1e9 / cap:.1f} ns{NC}")
-        print(f"    {'':10s} {'RX pps':>9s} {'HIT pps':>9s} {'ns/pkt':>7s} "
+        print(f"    {'':10s} {'RX pps':>9s} {'elab pps':>9s} {'ns/pkt':>7s} "
               f"{'vs base':>8s} {'% tetto':>8s} {'dopo':>6s}")
         uscita_corta = []
         for r in sat:
@@ -5075,14 +5134,15 @@ def _rxonly_verdict(sat, cmp_, threshold):
                   f"{r.get('loss_dut_pct', 0.0):5.2f}%")
             if r.get("loss_dut_pct", 0.0) > threshold:
                 uscita_corta.append(r["method"])
-        print(f"    {GREY}ns/pkt = 1e9 / HIT: dalla presa dalla coda di "
-              f"ricezione alla decisione e al redirect. Se l'uscita e' sulla "
+        print(f"    {GREY}ns/pkt = 1e9 / elaborati (HIT + MISS + DROP): "
+              f"dalla presa dalla coda di ricezione alla decisione e al "
+              f"redirect. Se l'uscita e' sulla "
               f"stessa CPU (senza --egress-cpu) contiene anche la ricezione "
               f"del nodo a valle.{NC}")
         if uscita_corta:
             note(f"`dopo` oltre soglia su {', '.join(uscita_corta)}: l'uscita "
                  f"non tiene il passo del nodo, quindi RX sottostima il nodo "
-                 f"e il costo si legge da HIT (qui sopra).")
+                 f"e il costo si legge dagli elaborati (qui sopra).")
         base = next((r for r in sat if r["frame"] == frame
                      and r["method"] == "baseline"), None)
         if base is not None and nodo(base) > cap * (1 + VALID_TOL):
@@ -6312,6 +6372,7 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("finestra_s", a.duration)
         add("finestra_modo", getattr(a, "window", WINDOW_MODE))
         add("generatore", getattr(a, "generator", "pktgen"))
+        add("ttl_mix", getattr(a, "ttl_mix", None) or "no (pacchetto fisso, TTL 32)")
         add("cpu_uscita", "separata: cpu%s" % a.egress_cpu
             if getattr(a, "egress_cpu", None) is not None
             else "stessa del DUT")
@@ -6779,6 +6840,12 @@ def main():
                         "BPF_PROG_TEST_RUN live frames (ipa/test/xdp_gen.py), "
                         "come da una NIC con XDP nativo; niente cadenza, "
                         "quindi solo la fase saturazione.")
+    m.add_argument("--ttl-mix", default=None, metavar="LISTA",
+                   help="solo con --generator xdp: TTL a giro, es. '2-33' o "
+                        "'2,8,16,32'. Il TTL e' una feature del modello, "
+                        "quindi le classi decise cambiano e il traffico "
+                        "esercita piu' porte d'uscita e il percorso DROP. "
+                        "Un TTL 1 manda il pacchetto allo stack (scaduto).")
     m.add_argument("--egress-cpu", type=int, default=None, metavar="N",
                    help="solo --mode compare. Sposta la NAPI dei veth "
                         "d'uscita (la ricezione del nodo successivo) sulla "
@@ -6842,6 +6909,9 @@ def main():
         sys.exit("--generator xdp: solo --mode compare a finestra steady")
     if a.egress_cpu is not None and (a.latency or a.mode != "compare"):
         sys.exit("--egress-cpu: solo --mode compare")
+    if a.ttl_mix and a.generator != "xdp":
+        sys.exit("--ttl-mix: solo con --generator xdp (pktgen scrive un TTL "
+                 "fisso)")
 
     if sys.platform != "linux":
         sys.exit(f"serve Linux, non {sys.platform}")
@@ -7008,7 +7078,8 @@ def main():
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
             burst=a.burst, generator=a.generator,
-            egress_cpu=a.egress_cpu)
+            egress_cpu=a.egress_cpu,
+            ttl_mix=(parse_cpu_list(a.ttl_mix) if a.ttl_mix else None))
         # Il controllo "la baseline e' la piu' veloce" ha senso solo dove
         # l'RX e' una capacita', cioe' a massima spinta: nella fase confronto
         # tutte consegnano lo stesso rate per costruzione.
