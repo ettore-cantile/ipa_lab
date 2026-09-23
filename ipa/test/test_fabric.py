@@ -24,6 +24,7 @@ Usage
 -----
     sudo python3 ipa/test/test_fabric.py                  # all three pipelines
     sudo python3 ipa/test/test_fabric.py --method template
+    sudo python3 ipa/test/test_fabric.py --method aot      # P1 as DEPLOYED
     sudo python3 ipa/test/test_fabric.py --ttl-max 60      # widen the search
     sudo python3 ipa/test/test_fabric.py --xdp-mode generic   # compare paths
 
@@ -141,7 +142,10 @@ def _counter_snapshot(m, n):
         except Exception:
             out.append(0)
             continue
-        out.append(int(getattr(v, "value", v)))
+        if isinstance(v, (bytes, bytearray)):     # a pinned map (AOT deploy)
+            out.append(int.from_bytes(v, "little"))
+        else:
+            out.append(int(getattr(v, "value", v)))
     return out
 
 
@@ -169,6 +173,98 @@ FABRIC_INGRESS_SLOT = 1
 _SETUP = {"hardcoded": "setup_hardcoded",
           "template": "setup_template",
           "modular": "setup_modular"}
+
+
+def _deliver_cases(fab, b, sem, n_out, cases, V, weights, scale,
+                   ingress_port, node_index, cls_map, pkt_map, timeout):
+    """Inject one frame per class case and check where it came out.
+
+    Shared by the BCC pipelines (run_one) and the deployed AOT object
+    (run_aot): the same question, asked of two ways of building P1.
+    """
+    from common import write_vector_map
+    delivered = 0
+    for exp_cls in sorted(cases):
+        ls, ttl = cases[exp_cls]
+        # The map and the reference must be told the same thing, or
+        # they are answering different questions.
+        write_vector_map(b, "link_state", ls)
+        got_cls = V.ref_infer(weights, scale, ttl, 0,
+                              ingress_port=ingress_port,
+                              node_index=node_index, link_state=ls)[0]
+        assert got_cls == exp_cls, (
+            f"the case search and the per-case reference disagree "
+            f"({exp_cls} vs {got_cls}) on the same input -- they are "
+            f"not being given the same ingress_port")
+        action = sem.action_of(exp_cls)
+        exp_port = sem.port_of(exp_cls) if action == "FORWARD" else None
+        lsd = "".join(map(str, ls))
+
+        cls_before = _counter_snapshot(cls_map, n_out)
+        pkt_before = _counter_snapshot(pkt_map, 3)
+
+        frame = V.build_frame(0, ttl, scale)
+        got_port, data = fab.send_and_capture(frame, timeout=timeout,
+                                              match=_is_probe_frame)
+
+        cls_d = _delta(cls_before,
+                       _counter_snapshot(cls_map, n_out))
+        pkt_d = _delta(pkt_before,
+                       _counter_snapshot(pkt_map, 3))
+        chosen = max(cls_d, key=cls_d.get) if cls_d else None
+        pkt_names = {0: "HIT", 1: "MISS", 2: "DROP"}
+        why = ", ".join(f"{pkt_names.get(i, i)}+{v}"
+                        for i, v in sorted(pkt_d.items())) or "no counter moved"
+
+        # Question one, and the only one the class semantics answer:
+        # did the datapath DECIDE what the reference decided?
+        if chosen is not None and chosen != exp_cls:
+            fail(f"link_state={lsd} ttl={ttl}: reference says class "
+                 f"{exp_cls}, datapath chose class {chosen} ({why})")
+            continue
+        if chosen is None:
+            fail(f"link_state={lsd} ttl={ttl}: expected class "
+                 f"{exp_cls}, but the datapath recorded no class at "
+                 f"all ({why}) -- the program did not reach argmax, or "
+                 f"took a path that does not record one")
+            continue
+
+        if action != "FORWARD":
+            # "nothing arrived" is NOT evidence of a DROP: a lost
+            # redirect, a filtered frame and a program that never ran
+            # all look identical from out here. The counter is.
+            if got_port is not None:
+                fail(f"link_state={lsd} ttl={ttl}: class {exp_cls} is "
+                     f"{action} but a packet came out of port {got_port}")
+            elif chosen == exp_cls:
+                ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} "
+                   f"{action} recorded ({why}), nothing left the node")
+            else:
+                fail(f"link_state={lsd} ttl={ttl}: expected class "
+                     f"{exp_cls} ({action}), nothing left the node but "
+                     f"the datapath recorded {chosen} ({why})")
+            continue
+
+        if got_port is None:
+            fail(f"link_state={lsd} ttl={ttl}: datapath chose class "
+                 f"{exp_cls} -> port {exp_port} (ifindex "
+                 f"{fab.ifindex_of[exp_port]}) and counted {why}, but "
+                 f"nothing arrived within {timeout}s -- decided "
+                 f"correctly, did not deliver")
+        elif got_port != exp_port:
+            fail(f"link_state={lsd} ttl={ttl}: expected class {exp_cls} -> "
+                 f"port {exp_port}, packet left by port {got_port}")
+        else:
+            delivered += 1
+            dst = data[0:6].hex(":") if data else "?"
+            ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} -> port "
+               f"{exp_port} (ifindex {fab.ifindex_of[exp_port]}), "
+               f"dst_mac={dst}, {why}")
+
+    if delivered:
+        info(f"{delivered} packet(s) redirected and captured on a real "
+             f"interface -- delivery, not just arithmetic")
+    return delivered
 
 
 def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
@@ -242,95 +338,134 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
         info(f"classes reachable by varying link_state and ttl: "
              f"{sorted(cases)}" + (f"; unreachable: {missing}" if missing else ""))
 
-        from common import write_vector_map
         attach_xdp(b, setup["disp"], iface=fab.ingress, mode=xdp_mode)
         try:
-            delivered = 0
-            for exp_cls in sorted(cases):
-                ls, ttl = cases[exp_cls]
-                # The map and the reference must be told the same thing, or
-                # they are answering different questions.
-                write_vector_map(b, "link_state", ls)
-                got_cls = V.ref_infer(weights, scale, ttl, 0,
-                                      ingress_port=ingress_port,
-                                      node_index=node_index, link_state=ls)[0]
-                assert got_cls == exp_cls, (
-                    f"the case search and the per-case reference disagree "
-                    f"({exp_cls} vs {got_cls}) on the same input -- they are "
-                    f"not being given the same ingress_port")
-                action = sem.action_of(exp_cls)
-                exp_port = sem.port_of(exp_cls) if action == "FORWARD" else None
-                lsd = "".join(map(str, ls))
-
-                cls_before = _counter_snapshot(setup["cls_stats"], n_out)
-                pkt_before = _counter_snapshot(setup["pkt_stats"], 3)
-
-                frame = V.build_frame(0, ttl, scale)
-                got_port, data = fab.send_and_capture(frame, timeout=timeout,
-                                                      match=_is_probe_frame)
-
-                cls_d = _delta(cls_before,
-                               _counter_snapshot(setup["cls_stats"], n_out))
-                pkt_d = _delta(pkt_before,
-                               _counter_snapshot(setup["pkt_stats"], 3))
-                chosen = max(cls_d, key=cls_d.get) if cls_d else None
-                pkt_names = {0: "HIT", 1: "MISS", 2: "DROP"}
-                why = ", ".join(f"{pkt_names.get(i, i)}+{v}"
-                                for i, v in sorted(pkt_d.items())) or "no counter moved"
-
-                # Question one, and the only one the class semantics answer:
-                # did the datapath DECIDE what the reference decided?
-                if chosen is not None and chosen != exp_cls:
-                    fail(f"link_state={lsd} ttl={ttl}: reference says class "
-                         f"{exp_cls}, datapath chose class {chosen} ({why})")
-                    continue
-                if chosen is None:
-                    fail(f"link_state={lsd} ttl={ttl}: expected class "
-                         f"{exp_cls}, but the datapath recorded no class at "
-                         f"all ({why}) -- the program did not reach argmax, or "
-                         f"took a path that does not record one")
-                    continue
-
-                if action != "FORWARD":
-                    # "nothing arrived" is NOT evidence of a DROP: a lost
-                    # redirect, a filtered frame and a program that never ran
-                    # all look identical from out here. The counter is.
-                    if got_port is not None:
-                        fail(f"link_state={lsd} ttl={ttl}: class {exp_cls} is "
-                             f"{action} but a packet came out of port {got_port}")
-                    elif chosen == exp_cls:
-                        ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} "
-                           f"{action} recorded ({why}), nothing left the node")
-                    else:
-                        fail(f"link_state={lsd} ttl={ttl}: expected class "
-                             f"{exp_cls} ({action}), nothing left the node but "
-                             f"the datapath recorded {chosen} ({why})")
-                    continue
-
-                if got_port is None:
-                    fail(f"link_state={lsd} ttl={ttl}: datapath chose class "
-                         f"{exp_cls} -> port {exp_port} (ifindex "
-                         f"{fab.ifindex_of[exp_port]}) and counted {why}, but "
-                         f"nothing arrived within {timeout}s -- decided "
-                         f"correctly, did not deliver")
-                elif got_port != exp_port:
-                    fail(f"link_state={lsd} ttl={ttl}: expected class {exp_cls} -> "
-                         f"port {exp_port}, packet left by port {got_port}")
-                else:
-                    delivered += 1
-                    dst = data[0:6].hex(":") if data else "?"
-                    ok(f"link_state={lsd} ttl={ttl}: class {exp_cls} -> port "
-                       f"{exp_port} (ifindex {fab.ifindex_of[exp_port]}), "
-                       f"dst_mac={dst}, {why}")
-
-            if delivered:
-                info(f"{delivered} packet(s) redirected and captured on a real "
-                     f"interface -- delivery, not just arithmetic")
+            _deliver_cases(fab, b, sem, n_out, cases, V, weights, scale,
+                           ingress_port, node_index, setup["cls_stats"],
+                           setup["pkt_stats"], timeout)
         finally:
             try:
                 detach_xdp(b, iface=fab.ingress, mode=xdp_mode)
             except Exception as e:
                 info(f"detach: {e}")
+
+
+def run_aot(model_path, ttl_range, xdp_mode, timeout, verbose):
+    """P1 as it is DEPLOYED, on the same fabric and with the same checks.
+
+    run_one("hardcoded") tests the BCC build, which never reaches a node: P1's
+    only deploy path is the AOT object attached by loader_aot. Until
+    2026-09-23 that path wrote mac_table itself with ifindex 1 for every port,
+    so every FORWARD went to `lo` -- and this test could not see it, because it
+    never ran that path. Here nothing is seeded by the test except link_state
+    per case: the object is built by method4_hardcoded_aot.py, attached by
+    loader_aot, and its maps are filled by the deploy's own control plane
+    (AotDeploy), told about the fabric through IPA_PORT_MAP exactly as a node
+    is. What the deploy installed is read back and checked before any packet.
+    """
+    import subprocess
+    import verify_prog_run as V
+    from netns_fabric import NetnsFabric
+    import model_meta as mm
+    from common import ingress_port_slots
+    from ebpf_program import load_and_generate
+    sys.path.insert(0, os.path.join(SHARED_DIR, "methods"))
+    import method4_hardcoded_aot as M4
+
+    print(f"\n{YELLOW}=== aot (P1 as deployed) on a real datapath "
+          f"({xdp_mode} XDP) ==={NC}")
+
+    # Built by the production script, not by a copy of its steps. It also runs
+    # its TEST_RUN bench; that output is not what this test is about.
+    r = subprocess.run([sys.executable,
+                        os.path.join(SHARED_DIR, "methods",
+                                     "method4_hardcoded_aot.py"),
+                        "--model", model_path],
+                       capture_output=True, text=True)
+    o_path = os.path.join(M4.POC_DIR, "nn_aot_arch.o")
+    loader = os.path.join(M4.POC_DIR, "loader_aot")
+    # "running loader_aot" is printed only after the .o AND the loader were
+    # produced (or a prebuilt .o reused on a node without clang). Checking the
+    # files alone would accept a stale .o left by an earlier run after clang
+    # failed on this one.
+    built = "[AOT] running loader_aot" in r.stdout
+    if not (built and os.path.exists(o_path) and os.path.exists(loader)):
+        fail(f"aot: build failed (rc={r.returncode}): "
+             f"{(r.stderr or r.stdout).strip()[-400:]}")
+        return
+    if r.returncode != 0:
+        info(f"aot: build script rc={r.returncode} (its bench step); the .o "
+             f"and the loader exist and are used")
+    ok("aot: object and loader built by method4_hardcoded_aot.py")
+
+    meta = mm.load_model_meta(model_path)
+    topo = mm.load_topology_config()
+    shape = mm.derive_shape(meta, topology_config=topo)
+    n_out = shape["n_out"]
+    sem = mm.load_class_semantics(model_path, n_out)
+    ports = sem.logical_ports
+    # The weights and scale the object was compiled from: gen_full_c takes
+    # them from this same function, so the reference cannot use other numbers.
+    _, weights, scale = load_and_generate(model_path, meta=meta,
+                                          topology_config=topo)
+
+    saved_env = {k: os.environ.get(k) for k in ("IPA_PORT_MAP", "IPA_NODE_ID")}
+    with NetnsFabric(n_ports=len(ports), verbose=verbose) as fab:
+        os.environ["IPA_PORT_MAP"] = ",".join(
+            f"{p}={fab.port_to_iface[p]}" for p in ports
+            if p in fab.port_to_iface)
+        os.environ["IPA_NODE_ID"] = str(FABRIC_NODE_INDEX)
+        pin_dir = "/sys/fs/bpf/ipa_p1_fabric_test"
+        cmd = [loader, o_path, "--attach", str(fab.ingress_ifindex),
+               "--xdp-mode", xdp_mode, "--pin-dir", pin_dir]
+        dep = M4.AotDeploy(cmd, pin_dir, sem, n_nodes=topo.get("n_nodes"),
+                           monitor=False, echo=verbose)
+        try:
+            b = dep.start()
+            ok(f"aot: loader READY -> control plane -> ATTACHED "
+               f"({xdp_mode}), maps pinned under {pin_dir}")
+
+            # What the DEPLOY wrote, before any packet: the defect was here.
+            wrong = []
+            for p in ports:
+                e = b["mac_table"][ct.c_uint32(p)]
+                if e.ifindex != fab.ifindex_of.get(p):
+                    wrong.append((p, e.ifindex, fab.ifindex_of.get(p)))
+            good = not wrong
+            (ok if good else fail)(
+                "aot: mac_table installed by the deploy's control plane: "
+                + ("every port -> its fabric ifindex "
+                   f"{[fab.ifindex_of[p] for p in ports]}, none -> 1 (lo)"
+                   if good else f"wrong entries (port, got, want): {wrong}"))
+
+            # The reference is told what the deploy installed: the fabric's
+            # ingress is not one of the node's ports, so no ingress bit.
+            slots = ingress_port_slots(dep.node_cfg, ports)
+            ingress_port = slots.get(fab.ingress_ifindex, 0)
+            node_index = FABRIC_NODE_INDEX
+            cases = _cases_covering_classes(V, weights, scale, 0, n_out,
+                                            max_ttl=max(ttl_range),
+                                            ingress_port=ingress_port,
+                                            node_index=node_index)
+            missing = [c for c in range(n_out) if c not in cases]
+            info(f"classes reachable by varying link_state and ttl: "
+                 f"{sorted(cases)}" + (f"; unreachable: {missing}"
+                                       if missing else ""))
+            _deliver_cases(fab, b, sem, n_out, cases, V, weights, scale,
+                           ingress_port, node_index, b["cls_stats"],
+                           b["pkt_stats"], timeout)
+        finally:
+            rc = dep.stop()
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            (ok if rc == 0 else fail)(
+                f"aot: loader detached and exited (rc={rc})")
+            (ok if not os.path.exists(pin_dir) else fail)(
+                f"aot: pins removed ({pin_dir} "
+                f"{'gone' if not os.path.exists(pin_dir) else 'STILL THERE'})")
 
 
 # --------------------------------------------------------------------------
@@ -512,7 +647,12 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("Usage")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--method", choices=list(_SETUP) + ["all"], default="all")
+    p.add_argument("--method", choices=list(_SETUP) + ["aot", "all"],
+                   default="all",
+                   help="hardcoded/template/modular are the BCC builds; aot is "
+                        "P1 as it is DEPLOYED -- the prebuilt object, attached "
+                        "by loader_aot, maps filled by the deploy's own "
+                        "control plane")
     p.add_argument("--model", default=None,
                    help="checkpoint (default: model_meta.default_checkpoint())")
     p.add_argument("--ttl-max", type=int, default=30,
@@ -540,7 +680,7 @@ def main():
 
     from model_meta import default_checkpoint
     model_path = a.model or default_checkpoint()
-    methods = list(_SETUP) if a.method == "all" else [a.method]
+    methods = list(_SETUP) + ["aot"] if a.method == "all" else [a.method]
     ttl_range = range(2, a.ttl_max + 1)
 
     print(f"{YELLOW}{'=' * 64}{NC}")
@@ -553,8 +693,12 @@ def main():
     if not a.only_sweep:
         for m in methods:
             try:
-                run_one(m, model_path, ttl_range, a.xdp_mode, a.timeout,
-                        verbose=not a.quiet)
+                if m == "aot":
+                    run_aot(model_path, ttl_range, a.xdp_mode, a.timeout,
+                            verbose=not a.quiet)
+                else:
+                    run_one(m, model_path, ttl_range, a.xdp_mode, a.timeout,
+                            verbose=not a.quiet)
             except Exception as e:
                 fail(f"{m}: {type(e).__name__}: {e}")
 

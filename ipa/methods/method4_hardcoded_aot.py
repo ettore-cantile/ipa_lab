@@ -119,83 +119,152 @@ def _run(cmd, **kw):
     return p.returncode, p.stdout, p.stderr
 
 
-def _live_deploy(cmd, pin_dir, semantics, n_nodes=None):
-    """Run the loader in deploy mode and be its control plane.
+class AotDeploy:
+    """The loader in deploy mode, with this process as its control plane.
 
     Protocol (see the top of poc_aot/loader_aot.c): the loader pins the maps
-    and prints READY; this fills them and writes ATTACH; the loader attaches
-    and prints ATTACHED; DETACH, EOF on its stdin or a signal makes it detach
-    and unpin. The program is therefore attached only once the maps hold this
-    node's facts -- no packet ever sees an empty mac_table.
+    and prints READY; start() fills them and writes ATTACH; the loader attaches
+    and prints ATTACHED, and start() returns the pinned maps. stop() writes
+    DETACH -- EOF on the loader's stdin or a signal do the same -- and the
+    loader detaches and unpins. The program is attached only once the maps
+    hold this node's facts: no packet ever sees an empty mac_table.
 
     The functions are the ones method5_template / method6_modular call on a
     BCC object; pinned_maps.PinnedObject gives the pinned maps the same
-    interface. One control plane for every pipeline, instead of a second one
-    written in C that nobody kept in step -- which is what the loader's own
-    seeding had become.
+    interface. One control plane for every pipeline, instead of a second one in
+    C that nobody kept in step -- which is what the loader's own seeding had
+    become (mac_table = ifindex 1, i.e. `lo`, for every port).
+
+    monitor=False leaves link_state to the caller after the initial seed: a
+    test that sets link_state per case cannot have a carrier poll rewriting it
+    every half second.
     """
-    import ctypes
-    import threading
-    from pinned_maps import PinnedObject, FwdAction
-    from common import (install_mac_per_port, install_ingress_port_table,
-                        install_node_id, start_mac_refresh_thread)
-    from link_state_monitor import init_link_state_up, start_monitor_thread
-    from node_config import NodeConfig
 
-    proc = subprocess.Popen(cmd, cwd=POC_DIR, stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, text=True, bufsize=1)
+    def __init__(self, cmd, pin_dir, semantics, n_nodes=None, monitor=True,
+                 echo=True):
+        self.cmd, self.pin_dir, self.semantics = cmd, pin_dir, semantics
+        self.n_nodes, self.monitor, self.echo = n_nodes, monitor, echo
+        self.proc = None
+        self.b = None
+        self.node_cfg = None
+        self.mac_info = None
+        self.lines = []
+        self._stop_monitor = None
+        self._rc = None
 
-    def expect(word):
-        """Echo the loader's stdout up to the line that starts with `word`."""
-        for line in proc.stdout:
-            sys.stdout.write(line)
+    def _expect(self, word):
+        """Read the loader's stdout up to the line that starts with `word`."""
+        for line in self.proc.stdout:
+            self.lines.append(line)
+            if self.echo:
+                sys.stdout.write(line)
             if line.startswith(word):
                 return line.split()[1:]
-        raise RuntimeError(f"loader_aot exited (rc={proc.wait()}) before "
-                           f"printing {word}")
+        raise RuntimeError(f"loader_aot exited (rc={self.proc.wait()}) before "
+                           f"printing {word}; last output: "
+                           f"{''.join(self.lines[-5:]).strip()!r}")
 
-    stop_monitor = None
+    def start(self):
+        import threading
+        from pinned_maps import PinnedObject, FwdAction
+        from common import (install_mac_per_port, install_ingress_port_table,
+                            install_node_id, start_mac_refresh_thread)
+        from link_state_monitor import init_link_state_up, start_monitor_thread
+        from node_config import NodeConfig
+
+        self.proc = subprocess.Popen(self.cmd, cwd=POC_DIR,
+                                     stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, text=True,
+                                     bufsize=1)
+        try:
+            self._expect("READY")
+            b = PinnedObject(self.pin_dir,
+                             leaf_types={"mac_table": FwdAction,
+                                         "link_state": "u32vec",
+                                         "queue_state": "u32vec"})
+            sem = self.semantics
+            print("[AOT] class semantics:")
+            print(sem.summary())
+            self.node_cfg = NodeConfig.resolve(sem.logical_ports)
+            print(self.node_cfg.summary())
+            for _p in self.node_cfg.validate(sem.logical_ports, strict=False):
+                print(f"[AOT] NOTE: {_p}")
+            self.mac_info = install_mac_per_port(b, "mac_table", self.node_cfg,
+                                                 sem.logical_ports)
+            if "ingress_port" in b:
+                install_ingress_port_table(b, "ingress_port", self.node_cfg,
+                                           sem.logical_ports)
+            if "node_id" in b:
+                install_node_id(b, "node_id", self.node_cfg,
+                                n_nodes=self.n_nodes)
+            if "link_state" in b:
+                init_link_state_up(b)
+                if self.monitor:
+                    self._stop_monitor = start_monitor_thread(b, interval=0.5)
+                    print("[AOT] link_state seeded (present interfaces up, "
+                          "absent slots 0); carrier monitor running")
+            if "queue_state" in b:
+                print("[AOT] NOTE: queue_state is left to "
+                      "queue_state_monitor.py, as in the P2/P3 deploys")
+            if self.mac_info["pending"]:
+                start_mac_refresh_thread(b, "mac_table",
+                                         self.mac_info["pending"], interval=5.0)
+
+            self.proc.stdin.write("ATTACH\n")
+            self.proc.stdin.flush()
+            self._expect("ATTACHED")
+
+            def _drain():
+                for line in self.proc.stdout:
+                    self.lines.append(line)
+                    if self.echo:
+                        sys.stdout.write(line)
+            threading.Thread(target=_drain, daemon=True).start()
+            self.b = b
+            return b
+        except BaseException:
+            self.stop()
+            raise
+
+    def stop(self):
+        """Detach and wait. Idempotent; returns the loader's exit code."""
+        if self.proc is None:
+            return None
+        if self._rc is not None:
+            return self._rc
+        if self._stop_monitor is not None:
+            self._stop_monitor.set()
+        try:
+            self.proc.stdin.write("DETACH\n")
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass    # Ctrl-C reached the loader too, and it already left
+        try:
+            self._rc = self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            self._rc = self.proc.wait()
+        return self._rc
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+
+def _live_deploy(cmd, pin_dir, semantics, n_nodes=None):
+    """Deploy until Ctrl-C, printing HIT | MISS | DROP once a second."""
+    import ctypes
+    dep = AotDeploy(cmd, pin_dir, semantics, n_nodes=n_nodes)
     rc = None
     try:
-        expect("READY")
-        b = PinnedObject(pin_dir, leaf_types={"mac_table": FwdAction,
-                                              "link_state": "u32vec",
-                                              "queue_state": "u32vec"})
-        print("[AOT] class semantics:")
-        print(semantics.summary())
-        node_cfg = NodeConfig.resolve(semantics.logical_ports)
-        print(node_cfg.summary())
-        for _p in node_cfg.validate(semantics.logical_ports, strict=False):
-            print(f"[AOT] NOTE: {_p}")
-        mac_info = install_mac_per_port(b, "mac_table", node_cfg,
-                                        semantics.logical_ports)
-        if "ingress_port" in b:
-            install_ingress_port_table(b, "ingress_port", node_cfg,
-                                       semantics.logical_ports)
-        if "node_id" in b:
-            install_node_id(b, "node_id", node_cfg, n_nodes=n_nodes)
-        if "link_state" in b:
-            init_link_state_up(b)
-            stop_monitor = start_monitor_thread(b, interval=0.5)
-            print("[AOT] link_state seeded (present interfaces up, absent "
-                  "slots 0); carrier monitor running")
-        if "queue_state" in b:
-            print("[AOT] NOTE: queue_state is left to queue_state_monitor.py, "
-                  "as in the P2/P3 deploys")
-        if mac_info["pending"]:
-            start_mac_refresh_thread(b, "mac_table", mac_info["pending"],
-                                     interval=5.0)
-
-        proc.stdin.write("ATTACH\n")
-        proc.stdin.flush()
-        expect("ATTACHED")
-        threading.Thread(target=lambda: [sys.stdout.write(l) for l in proc.stdout],
-                         daemon=True).start()
-
+        b = dep.start()
         stats = b["pkt_stats"]
         print(f"\n{'TRUE HIT':<22} | {'MISS':<22} | {'DROP':<20}")
         print("-" * 70)
-        while proc.poll() is None:
+        while dep.proc.poll() is None:
             time.sleep(1)
             try:
                 v = [int.from_bytes(stats[ctypes.c_uint32(i)], "little")
@@ -207,18 +276,7 @@ def _live_deploy(cmd, pin_dir, semantics, n_nodes=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if stop_monitor is not None:
-            stop_monitor.set()
-        try:
-            proc.stdin.write("DETACH\n")
-            proc.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            pass    # Ctrl-C reached the loader too, and it already left
-        try:
-            rc = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            rc = proc.wait()
+        rc = dep.stop()
     if rc != 0:
         sys.exit(f"\n[AOT] loader_aot exited with rc={rc}")
     print("\n[AOT] detached, pins removed.")
