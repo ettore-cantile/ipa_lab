@@ -59,8 +59,21 @@ BPF_F_TEST_XDP_LIVE_FRAMES = 1 << 1
 HDR_COPY = 48
 
 # Frame per chiamata. Una chiamata blocca il thread finche' non li ha mandati
-# tutti; e' quindi anche la granularita' dello stop (~15-30 ms a 2-4 Mpps).
-CALL_FRAMES = 1 << 16
+# tutti; e' quindi anche la granularita' dello stop.
+#
+# IL POOL DI PAGINE. In modalita' live ogni chiamata crea la sua page_pool e
+# la distrugge alla fine, e la pool ricicla al piu' `batch_size` pagine
+# (net/bpf/test_run.c, xdp_test_run_setup: pool_size = batch_size; default
+# 64, massimo TEST_XDP_MAX_BATCH = 256 -- dal sorgente del kernel, NON
+# VERIFICABILE DAL REPOSITORY). Le pipeline tengono in volo piu' frame di cosi'
+# (code d'ingresso e d'uscita, 256 posti l'una): le pagine in eccesso tornano
+# dalla CPU del DUT e vengono liberate invece che riciclate, un costo che una
+# NIC -- pool locale al DUT -- non ha. Primo run 2026-09-23 con 1<<16 e batch
+# 64: offerto e RX accoppiati, baseline +156 ns sopra rxonly contro +40 con
+# pktgen. Da qui batch al massimo e chiamate lunghe: la pool nasce e muore
+# sedici volte meno spesso.
+CALL_FRAMES = 1 << 20
+BATCH_SIZE = 256
 
 PKTGEN_MAGIC = 0xBE9BE955      # net/core/pktgen.c: primo byte 0xBE = model_id
 
@@ -257,7 +270,8 @@ class XdpGen:
     def _test_run(self, buf, size, frames):
         attr = _AttrTestRun(prog_fd=self.fn.fd, data_size_in=size,
                             data_in=ct.cast(buf, ct.c_void_p).value,
-                            repeat=frames, flags=BPF_F_TEST_XDP_LIVE_FRAMES)
+                            repeat=frames, flags=BPF_F_TEST_XDP_LIVE_FRAMES,
+                            batch_size=BATCH_SIZE)
         if _bpf(BPF_PROG_TEST_RUN, attr) < 0:
             e = ct.get_errno()
             raise OSError(e, f"BPF_PROG_TEST_RUN live frames: "
