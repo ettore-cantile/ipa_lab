@@ -1551,6 +1551,10 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     methods = [
         ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
         ("hardcoded", V.setup_hardcoded, 1),
+        # P1 as DEPLOYED: the AOT object (gen_full_c + loader_aot). The row
+        # above is the BCC build, which never reaches a node; until
+        # 2026-09-23 it was the only P1 measured here.
+        ("aot",       V.setup_aot,       1),
         ("template",  V.setup_template,  2),
         ("modular",   V.setup_modular,   3),
     ]

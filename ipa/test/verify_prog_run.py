@@ -917,6 +917,135 @@ def setup_hardcoded(model_id: int, model_path: str):
     }
 
 
+# ---------------------------------------------------------------------------
+# Pipeline 1 as DEPLOYED: the AOT object, not the BCC build
+# ---------------------------------------------------------------------------
+# setup_hardcoded compiles P1 with BCC, and until 2026-09-23 every P1 number in
+# the kernel benches came from it -- but P1 is never deployed that way: the
+# node gets the object gen_full_c generates and loader_aot loads, a separate
+# generator in another dialect, compiled differently. setup_aot returns the
+# same dictionary as setup_hardcoded over THAT object, so every bench that
+# takes a setup measures what actually runs on a node.
+
+_AOT_BUILT = {}
+_AOT_PIN_SEQ = [0]
+
+
+def _build_aot(model_path):
+    """Build the .o and the loader once per process, with the production
+    script (method4_hardcoded_aot.py --build-only), not a copy of its steps."""
+    import re
+    import subprocess
+    key = os.path.abspath(model_path)
+    if key not in _AOT_BUILT:
+        script = os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py")
+        r = subprocess.run([sys.executable, script, "--build-only",
+                            "--model", model_path],
+                           capture_output=True, text=True)
+        m = re.search(r"^\[AOT\] build complete: (\S+) (\S+)\s*$", r.stdout, re.M)
+        if r.returncode != 0 or not m:
+            raise RuntimeError(f"AOT build failed (rc={r.returncode}): "
+                               f"{(r.stderr or r.stdout).strip()[-600:]}")
+        _AOT_BUILT[key] = (m.group(1), m.group(2))
+    return _AOT_BUILT[key]
+
+
+class _AotPinned:
+    """loader_aot in PIN-ONLY mode: it loads the object, pins maps and
+    programs, prints READY and stays until DETACH or EOF on its stdin -- so
+    the pins vanish with this process, or with it if it dies."""
+
+    def __init__(self, loader, o_path, pin_dir):
+        import atexit
+        import re
+        import subprocess
+        self.proc = subprocess.Popen([loader, o_path, "--pin-dir", pin_dir],
+                                     cwd=os.path.dirname(o_path),
+                                     stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, text=True,
+                                     bufsize=1)
+        self.load_ms = None
+        seen = []
+        for line in self.proc.stdout:
+            seen.append(line)
+            m = re.match(r"\[aot\] open\+load \(verify\+JIT\): ([\d.]+) ms", line)
+            if m:
+                self.load_ms = float(m.group(1))
+            if line.startswith("READY"):
+                break
+        else:
+            raise RuntimeError(f"loader_aot exited (rc={self.proc.wait()}) "
+                               f"before READY: {''.join(seen[-5:]).strip()!r}")
+        atexit.register(self.stop)
+
+    def stop(self):
+        import subprocess
+        if self.proc.poll() is not None:
+            return
+        try:
+            self.proc.stdin.write("DETACH\n")
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            self.proc.wait()
+
+
+class _FdProg:
+    """What a BCC load_func returns, as far as the benches use it: an fd."""
+
+    def __init__(self, fd):
+        self.fd = fd
+
+
+def setup_aot(model_id: int, model_path: str):
+    """Pipeline 1 as DEPLOYED -- same dictionary as setup_hardcoded.
+
+    Same inputs as setup_hardcoded, so the two rows are comparable: node from
+    the node_id map, left empty (the object reads it at runtime, like BCC's
+    P1.5 build here); link_state all up; mac_table seeded for the model's
+    logical ports. t_redirect_s is the loader's open+load (verify + JIT),
+    the AOT counterpart of BCC's compile+load.
+    """
+    if model_id != 0:
+        raise ValueError("the AOT object carries ONE model, registered at "
+                         "model_progs[0]")
+    from pinned_maps import PinnedObject, FwdAction
+    from ebpf_program import load_and_generate
+    import model_meta as mm
+
+    o_path, loader = _build_aot(model_path)
+    _AOT_PIN_SEQ[0] += 1
+    pin_dir = f"/sys/fs/bpf/ipa_p1_bench_{os.getpid()}_{_AOT_PIN_SEQ[0]}"
+    owner = _AotPinned(loader, o_path, pin_dir)
+    b = PinnedObject(pin_dir, leaf_types={"mac_table": FwdAction,
+                                          "link_state": "u32vec",
+                                          "queue_state": "u32vec"})
+    disp_fd, model_fd = b.prog_fd("xdp_dispatch"), b.prog_fd("xdp_model")
+    # The numbers the object was compiled from (gen_full_c takes them from
+    # load_and_generate), so the reference cannot use different ones.
+    meta = mm.load_model_meta(model_path)
+    _, weights, scale = load_and_generate(
+        model_path, meta=meta, topology_config=mm.load_topology_config())
+
+    _seed_link_state(b, 1)
+    _install_mac_table(b, "mac_table")
+    return {
+        "b": b, "fn": _FdProg(model_fd), "disp": _FdProg(disp_fd),
+        "weights": weights, "scale": scale,
+        "cls_stats": b["cls_stats"],
+        "pkt_stats": b["pkt_stats"],
+        "pipeline": 1,
+        "progs": {"xdp_dispatch": disp_fd, "xdp_model": model_fd},
+        "t_redirect_s": (owner.load_ms or 0.0) / 1000.0,
+        "t_insert_s": 0.0,
+        "owner": owner,
+    }
+
+
 def setup_template(model_id: int, model_path: str):
     from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER, load_arch_weights)
     weights, scale = load_weights(model_path)
@@ -1133,7 +1262,10 @@ def _count_lookups_defaults(ttl, repeat):
 
 def _read_u64(table, key_val):
     try:
-        return int(table[ct.c_int(key_val)].value)
+        v = table[ct.c_int(key_val)]
+        if isinstance(v, (bytes, bytearray)):      # a pinned map (setup_aot)
+            return int.from_bytes(v, "little")
+        return int(v.value)
     except Exception:
         try:
             return int(table[ct.c_uint32(key_val)].value)
@@ -1193,6 +1325,7 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
     Returns (n_pass, n_fail, details).
     """
     setup_fn = {"hardcoded": setup_hardcoded,
+                "aot":       setup_aot,
                 "template":  setup_template,
                 "modular":   setup_modular}[method]
     setup = setup_fn(model_id, model_path)
@@ -1278,7 +1411,8 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print("NOTE: bpf_redirect() runs in the TEST_RUN sandbox.")
     print("      PASS = retval in {0,4} (redirect fire) + cls_stats/pkt_stats hit.")
     print()
-    setup_fn = {"hardcoded": setup_hardcoded, "template": setup_template, "modular": setup_modular}[method]
+    setup_fn = {"hardcoded": setup_hardcoded, "aot": setup_aot,
+                "template": setup_template, "modular": setup_modular}[method]
     setup = setup_fn(model_id, model_path)
     # b and fn are not referenced again but must stay in scope: they own the
     # BCC object and the loaded program: letting them be garbage-collected

@@ -335,9 +335,12 @@ Verificato il 2026-09-23 sulla VM, con due veth (`IPA_PORT_MAP="0=ipa0,1=ipa1"
 IPA_NODE_ID=7`, `--iface ipa0`): sequenza `READY` -> piano di controllo -> `ATTACHED native`;
 `bpftool map dump pinned .../mac_table` mostra porta 0 -> ifindex 5 (`ipa0`) e porta 1 ->
 ifindex 7 (`ipa1`) con i MAC sorgente reali, dst in attesa di ARP, porte 2-4 a zero (assenti
-sul nodo); dopo Ctrl-C `detached from ifindex 5` e i pin in `/sys/fs/bpf` spariscono. Resta
-da verificare che un pacchetto esca davvero dalla porta scelta (nessun pacchetto e' stato
-inviato).
+sul nodo); dopo Ctrl-C `detached from ifindex 5` e i pin in `/sys/fs/bpf` spariscono.
+
+**Consegna verificata** lo stesso giorno con `sudo python3 ipa/test/test_fabric.py --method aot`
+(11/11): il deploy vero (`AotDeploy`) su un fabric veth, porte comunicate con `IPA_PORT_MAP`;
+`mac_table` riletto dopo il deploy = ifindex del fabric; classi 0-4 catturate sulla porta
+attesa, classe 5 DROP contata e nulla in uscita, classe 6 irraggiungibile; rc=0 e pin rimossi.
 
 Protocollo del deploy (dal 2026-09-23): `loader_aot --attach IFX --pin-dir
 /sys/fs/bpf/ipa_p1_<iface>` carica, collega `model_progs`, pinna le mappe e stampa `READY`;

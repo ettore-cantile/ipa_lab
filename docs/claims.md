@@ -46,7 +46,9 @@ scheda lo dice invece di nasconderlo.
 | **Metrica** | Pacchetto catturato sull'interfaccia d'uscita; DROP letto dal contatore `cls_stats`, non dal silenzio. |
 | **Risultato** | **18/18** controlli, tutte e tre le pipeline, 6 classi su 7 raggiunte (la settima è `UNUSED`, irraggiungibile per costruzione). |
 | **Conclusione** | Consegna, non solo inferenza. |
-| **Come rigirarlo** | `sudo python3 ipa/test/test_fabric.py` |
+| **Limite trovato il 2026-09-22** | Per P1 i 18/18 provavano il build **BCC**, che non va mai su un nodo: l'unico deploy di P1 e' l'oggetto AOT attaccato da `loader_aot`, e quel percorso scriveva `mac_table` con **ifindex 1 (`lo`)** per ogni porta. La P1 deployata non consegnava sulla porta scelta, e nessun test la eseguiva. |
+| **P1 come deployata (2026-09-23)** | Corretto (mappe pinnate riempite dal piano di controllo Python prima dell'attach) e messo sotto lo stesso banco: `test_fabric --method aot`, **11/11** -- `mac_table` letto dopo il deploy con gli ifindex del fabric e nessuno a 1; le 5 classi FORWARD escono dalla porta attesa, la DROP e' contata e nulla esce, la 7a (`UNUSED`) e' irraggiungibile; loader staccato con rc=0 e pin rimossi. |
+| **Come rigirarlo** | `sudo python3 ipa/test/test_fabric.py` (ora comprende `aot`); solo la P1 deployata: `--method aot` |
 
 ### A3 — Il motore non dipende dalla topologia ✅
 

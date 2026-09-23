@@ -310,6 +310,11 @@ def main():
              "generic runs in netif_receive_skb, after it. auto lets the kernel "
              "pick, which means it may silently give you generic.")
     ap.add_argument(
+        "--build-only", action="store_true",
+        help="generate + compile the .o and build the loader, then stop: no "
+             "bench, no attach. Used by the kernel benches (verify_prog_run."
+             "setup_aot) and test_fabric, which drive the object themselves")
+    ap.add_argument(
         "--pin-root", default="/sys/fs/bpf",
         help="bpffs directory under which the live deploy pins its maps "
              "(ipa_p1_<iface>), for the control plane to fill before attach")
@@ -472,6 +477,11 @@ def main():
                 sys.exit(f"[AOT] loader build failed even dynamically (rc={rc}):\n{err}\n"
                          "      Need at least libbpf-dev: sudo apt-get install libbpf-dev")
             print("[AOT] built loader_aot (DYNAMIC -- libbpf.so required at runtime)")
+
+    if args.build_only:
+        # Machine-readable last line: the callers parse it for the two paths.
+        print(f"[AOT] build complete: {o_path} {loader_bin}")
+        return
 
     if args.iface:
         import socket

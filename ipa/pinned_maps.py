@@ -293,6 +293,14 @@ class PinnedObject:
         """BCC compatibility: some control-plane code calls this instead."""
         return self[name]
 
+    def prog_fd(self, name):
+        """File descriptor of a pinned PROGRAM (loader_aot pins them next to
+        the maps), for BPF_PROG_TEST_RUN and instruction counts."""
+        path = os.path.join(self.pin_dir, name)
+        if not os.path.exists(path):
+            raise PinnedMapError(f"no program pinned at {path}")
+        return obj_get(path)
+
     def close(self):
         for m in self._maps.values():
             try:

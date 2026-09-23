@@ -23,6 +23,11 @@
 //        sudo ./loader_aot <literal.o> --attach <ifidx> --pin-dir /sys/fs/bpf/<dir>
 //              [--xdp-mode native|generic|auto]
 //              (LIVE deploy, driven by method4_hardcoded_aot.py over stdin/stdout)
+//        sudo ./loader_aot <literal.o> --pin-dir /sys/fs/bpf/<dir>
+//              (PIN-ONLY: load, pin maps AND programs, print READY, wait for
+//              DETACH or EOF on stdin, unpin. No attach. This is how the kernel
+//              benches measure the object P1 actually deploys instead of the
+//              BCC build: verify_prog_run.setup_aot drives it.)
 //
 // LIVE DEPLOY PROTOCOL. The loader does NOT seed the datapath maps in deploy
 // mode: mac_table, link_state, ingress_port and node_id are node facts, and
@@ -173,6 +178,36 @@ static void unlink_stale_pins(struct bpf_object *obj, const char *dir) {
         if (unlink(path) == 0)
             fprintf(stderr, "removed stale pin %s\n", path);
     }
+    struct bpf_program *pr;
+    bpf_object__for_each_program(pr, obj) {
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, bpf_program__name(pr));
+        if (n < 0 || n >= (int)sizeof(path)) continue;
+        if (unlink(path) == 0)
+            fprintf(stderr, "removed stale pin %s\n", path);
+    }
+}
+
+/* Pin (or unpin) every program at <dir>/<program name>, next to the maps: a
+ * caller outside this process -- the Python benches -- gets their fds with
+ * BPF_OBJ_GET, exactly as it gets the maps'. */
+static int pin_programs(struct bpf_object *obj, const char *dir, int unpin) {
+    struct bpf_program *pr;
+    bpf_object__for_each_program(pr, obj) {
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, bpf_program__name(pr));
+        if (n < 0 || n >= (int)sizeof(path)) return -1;
+        if (unpin) {
+            bpf_program__unpin(pr, path);
+            continue;
+        }
+        if (bpf_program__pin(pr, path)) {
+            fprintf(stderr, "pinning program %s at %s failed: %s\n",
+                    bpf_program__name(pr), path, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static double now_ms(void) {
@@ -187,7 +222,7 @@ static int build_frame(unsigned char *buf) {
     unsigned char *p = buf;
     p[12] = 0x08; p[13] = 0x00;               // ethertype IPv4
     unsigned char *ip = p + 14;
-    ip[0] = 0x45; ip[8] = 64; ip[9] = 17;      // ihl 5, ttl 64, proto UDP
+    ip[0] = 0x45; ip[8] = 255; ip[9] = 17;     // ihl 5, ttl 255, proto UDP
     unsigned char *udp = p + 34;
     udp[2] = (9999 >> 8) & 0xff; udp[3] = 9999 & 0xff;  // dest port 9999 (BE)
     unsigned char *ipa = p + 42;
@@ -376,10 +411,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "prog_array update\n"); goto err;
     }
 
-    // --- LIVE DEPLOY mode: pin, hand the maps to the control plane, attach
-    // only when it says so, stay resident. See the protocol at the top.
+    // --- PINNED modes. LIVE DEPLOY (--attach): pin, hand the maps to the
+    // control plane, attach only when it says so, stay resident. PIN-ONLY (no
+    // --attach): pin maps and programs for an outside caller to drive, stay
+    // resident until told to go. See the protocol at the top.
     // Requires libbpf >= 0.7 for bpf_xdp_attach/detach. ---
-    if (g_attach_ifindex >= 0) {
+    if (g_attach_ifindex >= 0 || g_pin_dir) {
         int rc = 1;
         char line[64];
         if (!g_pin_dir || !*g_pin_dir) {
@@ -410,6 +447,8 @@ int main(int argc, char **argv) {
                     g_pin_dir, strerror(errno));
             goto err;
         }
+        if (pin_programs(obj, g_pin_dir, 0))
+            goto unpin;
         {
             struct sigaction sa;
             memset(&sa, 0, sizeof(sa));
@@ -417,8 +456,19 @@ int main(int argc, char **argv) {
             sigaction(SIGINT,  &sa, NULL);
             sigaction(SIGTERM, &sa, NULL);
         }
+        printf("[aot] open+load (verify+JIT): %.3f ms\n", t2 - t0);
         printf("READY %s\n", g_pin_dir);
         fflush(stdout);
+        if (g_attach_ifindex < 0) {
+            /* PIN-ONLY. The caller drives the pinned programs and maps; this
+             * process stays so the pins have an owner and vanish with it. */
+            while (!g_stop) {
+                if (read_line(line, sizeof(line)) < 0 || !strcmp(line, "DETACH"))
+                    break;
+            }
+            rc = 0;
+            goto unpin;
+        }
         if (read_line(line, sizeof(line)) < 0 || strcmp(line, "ATTACH")) {
             fprintf(stderr, "the control plane did not confirm the maps "
                             "(no ATTACH on stdin): not attaching\n");
@@ -476,6 +526,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
         rc = 0;
 unpin:
+        pin_programs(obj, g_pin_dir, 1);
         bpf_object__unpin_maps(obj, g_pin_dir);
         rmdir(g_pin_dir);
         bpf_object__close(obj);
@@ -490,14 +541,31 @@ unpin:
     long insn_total = insn_disp + insn_model;   // matches test_suite (disp + model)
 
     // run the DISPATCHER (parse -> tail call -> model re-parse -> infer -> action)
+    //
+    // In chunks, each on a FRESH frame. BPF_PROG_TEST_RUN copies data_in once
+    // and re-runs the program on that same buffer `repeat` times; the program
+    // decrements the TTL. This used to be ONE call with repeat=1e6 on a TTL-64
+    // frame: after ~60 runs every run took the TTL-expired short-circuit (or,
+    // without a node id, the DROP class the drifting TTL fell into), and that
+    // is what the reported ns/pkt measured -- not the forwarding path the BCC
+    // numbers it was compared with came from. Same scheme as
+    // verify_prog_run.prog_test_run_bench: 200 runs per chunk on a TTL-255
+    // frame (the TTL never reaches the expiry path within a chunk), minimum of
+    // the per-chunk averages.
+    enum { BENCH_CHUNK = 200, BENCH_CHUNKS = 25 };
     unsigned char in[128], out[256];
-    build_frame(in);
-    LIBBPF_OPTS(bpf_test_run_opts, o,
-        .data_in = in, .data_size_in = 63,
-        .data_out = out, .data_size_out = sizeof(out),
-        .repeat = 1000000);
-    if (bpf_prog_test_run_opts(disp_fd, &o)) { fprintf(stderr, "test_run %s\n", lit); goto err; }
-    double ns = (double)o.duration;
+    double ns = 0.0;
+    __u32 retval = 0;
+    for (int c = 0; c < BENCH_CHUNKS; c++) {
+        build_frame(in);
+        LIBBPF_OPTS(bpf_test_run_opts, o,
+            .data_in = in, .data_size_in = 63,
+            .data_out = out, .data_size_out = sizeof(out),
+            .repeat = BENCH_CHUNK);
+        if (bpf_prog_test_run_opts(disp_fd, &o)) { fprintf(stderr, "test_run %s\n", lit); goto err; }
+        if (o.duration && (ns == 0.0 || o.duration < ns)) ns = (double)o.duration;
+        retval = o.retval;
+    }
     double mpps = ns > 0 ? 1000.0 / ns : 0.0;
 
     printf("================================================================\n");
@@ -510,7 +578,9 @@ unpin:
     printf("   total deploy        : %8.3f ms\n", t2 - t0);
     printf("   (BCC recompile of the same model: ~1.3 s -- reference value, NOT\n");
     printf("    measured by this loader; see '[M1 update timing]' in --only kernel)\n\n");
-    printf("[perf] full-path per-packet cost (BPF_PROG_TEST_RUN on dispatcher, 1e6 reps, retval=%u):\n", o.retval);
+    printf("[perf] full-path per-packet cost (BPF_PROG_TEST_RUN on dispatcher, %d chunks x %d runs,\n"
+           "       fresh TTL-255 frame per chunk, min of chunk averages; retval=%u):\n",
+           BENCH_CHUNKS, BENCH_CHUNK, retval);
     printf("   xlated insns        : %8ld   (dispatch %ld + model %ld)\n", insn_total, insn_disp, insn_model);
     printf("   latency             : %8.1f ns/pkt\n", ns);
     printf("   throughput          : %8.2f Mpps\n", mpps);

@@ -375,27 +375,23 @@ def run_aot(model_path, ttl_range, xdp_mode, timeout, verbose):
     print(f"\n{YELLOW}=== aot (P1 as deployed) on a real datapath "
           f"({xdp_mode} XDP) ==={NC}")
 
-    # Built by the production script, not by a copy of its steps. It also runs
-    # its TEST_RUN bench; that output is not what this test is about.
+    # Built by the production script, not by a copy of its steps.
     r = subprocess.run([sys.executable,
                         os.path.join(SHARED_DIR, "methods",
                                      "method4_hardcoded_aot.py"),
-                        "--model", model_path],
+                        "--build-only", "--model", model_path],
                        capture_output=True, text=True)
     o_path = os.path.join(M4.POC_DIR, "nn_aot_arch.o")
     loader = os.path.join(M4.POC_DIR, "loader_aot")
-    # "running loader_aot" is printed only after the .o AND the loader were
+    # "build complete" is printed only after the .o AND the loader were
     # produced (or a prebuilt .o reused on a node without clang). Checking the
     # files alone would accept a stale .o left by an earlier run after clang
     # failed on this one.
-    built = "[AOT] running loader_aot" in r.stdout
+    built = "[AOT] build complete:" in r.stdout
     if not (built and os.path.exists(o_path) and os.path.exists(loader)):
         fail(f"aot: build failed (rc={r.returncode}): "
              f"{(r.stderr or r.stdout).strip()[-400:]}")
         return
-    if r.returncode != 0:
-        info(f"aot: build script rc={r.returncode} (its bench step); the .o "
-             f"and the loader exist and are used")
     ok("aot: object and loader built by method4_hardcoded_aot.py")
 
     meta = mm.load_model_meta(model_path)
