@@ -2293,6 +2293,11 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 offered_real_pps=int(offered_tx / secs),
                 hit=hit, miss=miss, drop=drop, rx=rx,
                 rx_pps=int(rx / secs),
+                # Il rate a cui il PROGRAMMA ha preso la decisione. E' la
+                # capacita' del nodo anche quando l'uscita non tiene il passo:
+                # un pacchetto il cui accodamento in uscita fallisce e' costato
+                # al nodo lo stesso lavoro.
+                hit_pps=int(hit / secs),
                 # I TRE MODI DI PERDERE UN PACCHETTO, tenuti separati perche'
                 # accusano tre colpevoli diversi:
                 #
@@ -4984,6 +4989,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        offered_real_pps=int(stats.median(
                            [r.get("offered_real_pps", 0) for r in pts])),
                        rx_pps=int(stats.median(pps)), rx_pps_mean=a["mean"],
+                       hit_pps=int(stats.median([r.get("hit_pps", 0)
+                                                 for r in pts])),
                        rx_pps_min=a["min"], rx_pps_max=a["max"],
                        rx_pps_std=a["std"], rx_pps_cv_pct=a["cv_pct"],
                        loss_pct=round(loss, 3),
@@ -5043,18 +5050,42 @@ def _rxonly_verdict(sat, cmp_, threshold):
         if top is None or not top["rx_pps"]:
             continue
         cap = top["rx_pps"]
-        print(f"\n  {YELLOW}Rispetto al tetto di sola ricezione ({RX_ONLY}, "
-              f"{frame}B, stessa sessione): {cap} pps{NC}")
+
+        def nodo(r):
+            # HIT se c'e': vedi hit_pps in _measure_once. rxonly non ha
+            # uscita, e per lui HIT e RX sono lo stesso contatore.
+            return r.get("hit_pps") or r["rx_pps"]
+        base = next((r for r in sat if r["frame"] == frame
+                     and r["method"] == "baseline"), None)
+        base_ns = 1e9 / nodo(base) if base is not None and nodo(base) else None
+        print(f"\n  {YELLOW}Costo per pacchetto sulla CPU del DUT ({frame}B, "
+              f"saturazione, stessa sessione). Tetto di sola ricezione "
+              f"({RX_ONLY}): {cap} pps = {1e9 / cap:.1f} ns{NC}")
+        print(f"    {'':10s} {'RX pps':>9s} {'HIT pps':>9s} {'ns/pkt':>7s} "
+              f"{'vs base':>8s} {'% tetto':>8s} {'dopo':>6s}")
+        uscita_corta = []
         for r in sat:
             if r["frame"] != frame or r["method"] == RX_ONLY or not r["rx_pps"]:
                 continue
-            extra = 1e9 / r["rx_pps"] - 1e9 / cap
-            print(f"    {r['method']:10s} {r['rx_pps']:9d} pps  "
-                  f"{100.0 * r['rx_pps'] / cap:5.1f}% del tetto  "
-                  f"{extra:+7.1f} ns/pacchetto")
+            ns = 1e9 / nodo(r)
+            vs = (f"{ns - base_ns:+7.1f}" if base_ns is not None
+                  and r["method"] != "baseline" else f"{'':>7s}")
+            print(f"    {r['method']:10s} {r['rx_pps']:9d} {nodo(r):9d} "
+                  f"{ns:7.1f} {vs} {100.0 * nodo(r) / cap:7.1f}% "
+                  f"{r.get('loss_dut_pct', 0.0):5.2f}%")
+            if r.get("loss_dut_pct", 0.0) > threshold:
+                uscita_corta.append(r["method"])
+        print(f"    {GREY}ns/pkt = 1e9 / HIT: dalla presa dalla coda di "
+              f"ricezione alla decisione e al redirect. Se l'uscita e' sulla "
+              f"stessa CPU (senza --egress-cpu) contiene anche la ricezione "
+              f"del nodo a valle.{NC}")
+        if uscita_corta:
+            note(f"`dopo` oltre soglia su {', '.join(uscita_corta)}: l'uscita "
+                 f"non tiene il passo del nodo, quindi RX sottostima il nodo "
+                 f"e il costo si legge da HIT (qui sopra).")
         base = next((r for r in sat if r["frame"] == frame
                      and r["method"] == "baseline"), None)
-        if base is not None and base["rx_pps"] > cap * (1 + VALID_TOL):
+        if base is not None and nodo(base) > cap * (1 + VALID_TOL):
             RXONLY_FAILS.append(("FAIL", f"{frame}B: {RX_ONLY} {cap} pps "
                                          f"sotto la baseline "
                                          f"{base['rx_pps']}: la sessione "
@@ -5094,8 +5125,9 @@ def _compare_verdict(summary, offered_pps, threshold):
             note("fase saturazione -- respinti > 0 su: "
                  + ", ".join(f"{r['method']}/{r['frame']}B" for r in piene)
                  + ". La coda d'ingresso trabocca, quindi il DUT e' in "
-                   "sovraccarico e l'RX e' la sua capacita' su questo "
-                   "percorso veth: fra queste righe le differenze di RX "
+                   "sovraccarico e il rate elaborato (HIT) e' la sua "
+                   "capacita' su questo percorso veth: fra queste righe "
+                   "le differenze di HIT "
                    "oltre la dispersione fra i giri sono di costo per "
                    "pacchetto.")
         if vuote:
