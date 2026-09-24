@@ -594,7 +594,7 @@ class _FakeTable(dict):
 def t_p2p3_scale_control_plane():
     """What the P2/P3 control planes write into feat_ent.scale -- no kernel."""
     print(f"\n{YELLOW}[9] P2/P3 control plane: declared scale in feat_ent, "
-          f"shared class_action (no kernel){NC}")
+          f"per-model class semantics (no kernel){NC}")
     try:
         import ebpf_template_arch as A
         import ebpf_modular as M
@@ -622,27 +622,38 @@ def t_p2p3_scale_control_plane():
         check(refused, f"{label}: a scale of 300 is refused, not written as "
                        f"255 (feat_ent.scale is one byte)")
 
-    # class_action_t2/_t3 is ONE table for every model_id. Registering a model
-    # with other semantics must be refused while another model is registered,
-    # and allowed when it only replaces itself.
-    from class_semantics import ClassSemantics
+    # class_action_t2/_t3 is keyed by (model_id, bank, class) now. Two models
+    # with different semantics must both be accepted, each written into its
+    # own rows only; re-registering a model must write its OTHER bank and
+    # leave the live one -- and every other model -- untouched until the
+    # registry entry commits the flip. The kernel side (packets selecting
+    # either model in one program) is verify_per_model_semantics.py.
+    from types import SimpleNamespace
+    from class_semantics import ClassSemantics, MAX_N_OUT
     sem7 = ClassSemantics.forward_then_drop(5, drop_class=5, n_out=7)
     sem4 = ClassSemantics.forward_then_drop(3, drop_class=3, n_out=4)
-    obj = {"arch_registry": _FakeTable({0: "model 0"}),
-           "class_action_t2": _FakeTable()}
-    A.load_class_action(obj, "class_action_t2", sem7)
-    outcomes = []
-    for mid, sem in ((1, sem7), (1, sem4), (0, sem4)):
-        try:
-            A.check_class_action_shared(obj, "class_action_t2", "arch_registry",
-                                        mid, sem)
-            outcomes.append("ok")
-        except ValueError:
-            outcomes.append("refused")
-    check(outcomes == ["ok", "refused", "ok"],
-          f"shared class_action: same semantics ok, other semantics refused "
-          f"while model 0 is registered, re-registering model 0 ok "
-          f"({outcomes})")
+    reg, tbl = _FakeTable(), _FakeTable()
+    obj = {"arch_registry": reg, "class_action_t2": tbl}
+
+    def rows(mid, bank):
+        return [(tbl[A.class_act_key(mid, bank, c)].action,
+                 tbl[A.class_act_key(mid, bank, c)].port)
+                for c in range(MAX_N_OUT)]
+
+    b0 = A.load_class_action(obj, "class_action_t2", "arch_registry", 0, sem7)
+    reg[0] = SimpleNamespace(sem_bank=b0)
+    b1 = A.load_class_action(obj, "class_action_t2", "arch_registry", 1, sem4)
+    reg[1] = SimpleNamespace(sem_bank=b1)
+    check(b0 == b1 == 0 and rows(0, 0) == sem7.action_table()
+          and rows(1, 0) == sem4.action_table() and len(tbl) == 2 * MAX_N_OUT,
+          "per-model class_action: model 0 (n_out 7) and model 1 (n_out 4) "
+          "with different semantics both accepted, each in its own rows")
+    b0b = A.load_class_action(obj, "class_action_t2", "arch_registry", 0, sem4)
+    check(b0b == 1 and rows(0, 1) == sem4.action_table()
+          and rows(0, 0) == sem7.action_table()
+          and rows(1, 0) == sem4.action_table(),
+          "re-registering model 0 writes its inactive bank; the live bank "
+          "and model 1 are untouched until the registry commits the flip")
 
 
 # ---------------------------------------------------------------------------

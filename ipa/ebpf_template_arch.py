@@ -25,7 +25,9 @@ load_arch_weights() with a clear error, not silently truncated.
 Control-plane split of responsibilities
   load_arch_weights() populates:
     - arch_weights    (int8 values via raw bpf(2) syscall)
-    - arch_registry   (arch_id, weight_offset, scale_factor, n_h1, n_h2)
+    - arch_registry   (arch_id, weight_offset, scale_factor, n_out, n_h1,
+                       n_h2, sem_bank)
+    - class_action_t2 (this model's class -> action rows)
   The CALLER must separately wire the tail-call array BEFORE or AFTER:
     leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
     b["arch_progs"][ct.c_int(arch_id)] = ct.c_int(leaf_fn.fd)
@@ -36,7 +38,9 @@ Control-plane split of responsibilities
 
 Action (mac_table):
   The NN decides the egress class (argmax). The program then does a single
-  lookup class_action_t2[class] -> {action, logical port}, then
+  lookup class_action_t2[(model_id, sem_bank, class)] -> {action, logical
+  port} -- per-model semantics, same one lookup as the old class-only key --
+  then
   mac_table_t2[port] -> {ifindex, src_mac, dst_mac}, rewrites the L2
   header and bpf_redirect()s. mac_table is just the physical next-hop
   dictionary -- no routing decision, no output validation. cls 6 = DROP.
@@ -336,6 +340,9 @@ struct arch_entry {
     __u8  n_out;
     __u8  n_h1;   /* fc1 output width  (<= T2_MAX_H1), read at runtime */
     __u8  n_h2;   /* fc2 output width  (<= T2_MAX_H2), read at runtime */
+    /* Which of this model's two class_action_t2 banks is live (see
+     * CLASS_ACT_KEY). Committed together with n_out in this one entry. */
+    __u8  sem_bank;
 } __attribute__((packed));
 
 struct fwd_action {
@@ -493,7 +500,37 @@ BPF_HASH(ingress_port_t2, __u32, __u32, 64);
  */
 BPF_HASH(node_id_t2, __u32, __u32, 1);
 
-BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
+/* class_action_t2: (model_id, class) -> {action, logical port}.
+ *
+ * It used to be indexed by class alone, ONE table for every model_id: two
+ * models could not give the same class different meanings, and the control
+ * plane had to refuse the second one. The key is now the composite
+ * (model_id, bank, class), flattened into an ARRAY index -- no hashing, and
+ * the lookup is inlined by the verifier exactly like the class-only one was.
+ * O(1) in the number of registered models: nothing iterates over them.
+ *
+ * Why an index into a separate map and not a cls[] table inside arch_entry
+ * (which the datapath already holds): indexing a map value by best_cls is
+ * pointer arithmetic, and the verifier then tracks best_cls PRECISELY back
+ * through the argmax, so no two argmax paths can be pruned against each other.
+ * Measured: P3's layer_hidden stops loading (E2BIG). A lookup KEY on the stack
+ * needs no such precision -- which is why the class-only lookup was cheap.
+ *
+ * Two banks per model_id, selected by arch_entry.sem_bank: re-registering a
+ * model writes the INACTIVE bank in full, then flips sem_bank in the same
+ * arch_registry update that installs the new n_out. A packet therefore sees
+ * the old (n_out, table) or the new one, never a half-written table, and a
+ * registration that fails midway leaves the live bank untouched. Other
+ * model_ids' rows are never written.
+ *
+ * Classes at or past a model's n_out are ACT_INVALID in its rows. */
+#define CLASS_ACT_BANKS   2
+#define CLASS_ACT_MODELS  256   /* model_id is a __u8 */
+#define CLASS_ACT_KEY(mid, bank, cls) \
+    (((((__u32)(mid) & 0xffU) * CLASS_ACT_BANKS + ((__u32)(bank) & 1U)) \
+      * MAX_N_OUT) + (__u32)(cls))
+BPF_ARRAY(class_action_t2, struct class_act,
+          CLASS_ACT_MODELS * CLASS_ACT_BANKS * MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);   /* per-class redirect counter */
 
@@ -605,6 +642,7 @@ struct arch_entry {
     __u8  n_out;
     __u8  n_h1;
     __u8  n_h2;
+    __u8  sem_bank;
 } __attribute__((packed));
 
 struct fwd_action {
@@ -723,7 +761,14 @@ BPF_HASH(ingress_port_t2, __u32, __u32, 64);
  */
 BPF_HASH(node_id_t2, __u32, __u32, 1);
 
-BPF_ARRAY(class_action_t2, struct class_act, MAX_N_OUT);
+/* Same (model_id, bank, class) map as in the dispatcher source. */
+#define CLASS_ACT_BANKS   2
+#define CLASS_ACT_MODELS  256
+#define CLASS_ACT_KEY(mid, bank, cls) \
+    (((((__u32)(mid) & 0xffU) * CLASS_ACT_BANKS + ((__u32)(bank) & 1U)) \
+      * MAX_N_OUT) + (__u32)(cls))
+BPF_ARRAY(class_action_t2, struct class_act,
+          CLASS_ACT_MODELS * CLASS_ACT_BANKS * MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t2, __u64, 3);
 BPF_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);
 #ifdef IPA_COUNT_LOOKUPS
@@ -786,6 +831,10 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     struct arch_entry *entry = arch_registry.lookup(&model_id);
     if (!entry) return XDP_PASS;
 
+    /* First row of THIS model's live class_action_t2 bank, taken now so a
+     * single scalar -- not the entry pointer plus model_id -- stays live
+     * until the argmax (measured: +157 instructions the other way). */
+    __u32 sem_key0 = CLASS_ACT_KEY(model_id, entry->sem_bank, 0);
     __u32 woff  = entry->weight_offset;
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
@@ -1024,15 +1073,18 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    /* Class -> action -> logical port, read from the descriptor-filled map.
-     * No index arithmetic decides what a class means. */
+    /* (model_id, class) -> action -> logical port, from THIS model's live
+     * bank of class_action_t2 (sem_bank comes from the arch_registry entry
+     * already looked up above). No index arithmetic decides what a class
+     * means, and no other model's rows are reachable from here. */
     if (best_cls < 0 || (__u32)best_cls >= n_out) {
         int mi = 1; __u64 *mv = pkt_stats_t2.lookup(&mi);
         if (mv) __sync_fetch_and_add(mv, 1);
         return XDP_PASS;                       /* argmax outside [0, n_out) */
     }
     __u32 _ci = (__u32)best_cls;
-    struct class_act *ca = class_action_t2.lookup(&_ci);
+    __u32 _sk = sem_key0 + _ci;
+    struct class_act *ca = class_action_t2.lookup(&_sk);
     if (!ca || ca->action == ACT_INVALID) {
         int mi = 1; __u64 *mv = pkt_stats_t2.lookup(&mi);
         if (mv) __sync_fetch_and_add(mv, 1);
@@ -1281,8 +1333,6 @@ def load_arch_weights(bpf_obj, weights_int8: list,
         semantics = descriptor_semantics_or_reference(reference_widths()[1],
                                                      "Pipeline2")
     semantics.validate()
-    check_class_action_shared(bpf_obj, "class_action_t2", "arch_registry",
-                              model_id, semantics)
 
     # n_hidden MUST match the depth the leaf was compiled for: the datapath
     # reads a fixed number of blocks out of this flat vector, so a mismatch
@@ -1341,13 +1391,18 @@ def load_arch_weights(bpf_obj, weights_int8: list,
                     ("scale_factor",   c_uint16),
                     ("n_out",          c_uint8),
                     ("n_h1",           c_uint8),
-                    ("n_h2",           c_uint8)]
+                    ("n_h2",           c_uint8),
+                    ("sem_bank",       c_uint8)]
 
+    # This model's semantics go into its INACTIVE bank first; the registry
+    # update below is the commit: it installs n_out and flips sem_bank in one
+    # BPF_MAP_UPDATE_ELEM. No other model_id's rows are touched.
+    bank = load_class_action(bpf_obj, "class_action_t2", "arch_registry",
+                             model_id, semantics)
     entry = ArchEntry(arch_id=arch_id, weight_offset=weight_offset,
                       scale_factor=scale, n_out=semantics.n_out,
-                      n_h1=n_h1, n_h2=n_h2)
+                      n_h1=n_h1, n_h2=n_h2, sem_bank=bank)
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
-    load_class_action(bpf_obj, "class_action_t2", semantics)
     print(f"[Pipeline2] arch_registry[{model_id}] = "
           f"arch_id={arch_id} woff={weight_offset} scale={scale} "
           f"shape={n_in}-{n_h1}-{n_h2}-{semantics.n_out} weights={n_weights}")
@@ -1428,52 +1483,33 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
                     for e in ents]}")
 
 
-def check_class_action_shared(bpf_obj, map_name: str, registry_name: str,
-                              model_id: int, semantics) -> None:
-    """Refuse a registration that would rewrite another model's class actions.
-
-    class_action_t2 / class_action_t3 is ONE table for every model_id: the
-    datapath indexes it by class only. Registering a model whose semantics
-    differ (another n_out, another DROP class, other ports) therefore changes
-    what every already-registered model's classes mean -- silently, on the
-    next packet. While P2 only accepted the configured n_out the collision was
-    unlikely; it is not any more, and a per-model table is a datapath change.
-    Until then this says so, BEFORE anything is written.
-
-    Re-registering the SAME model_id is allowed: that is an update, and the
-    model being replaced is the only one whose classes change."""
-    from ctypes import c_uint32
-    try:
-        others = sorted(int(getattr(k, "value", k))
-                        for k in bpf_obj[registry_name].keys())
-    except Exception:
-        return                      # no readable registry: nothing registered
-    others = [m for m in others if m != int(model_id)]
-    if not others:
-        return
-    tbl = bpf_obj[map_name]
-    want = semantics.action_table()
-    have = []
-    for cid in range(len(want)):
-        e = tbl[c_uint32(cid)]
-        have.append((int(e.action), int(e.port)))
-    if have != want:
-        raise ValueError(
-            f"{map_name} is shared by every model_id, and model(s) {others} "
-            f"are registered with other class semantics. Registering "
-            f"model_id={model_id} (n_out={semantics.n_out}, "
-            f"drop_class={semantics.drop_class}) would change what their "
-            f"classes mean. Register models with the same semantics in one "
-            f"program, or load a separate program.")
+# Must match CLASS_ACT_BANKS / CLASS_ACT_MODELS / CLASS_ACT_KEY in the eBPF
+# sources (P2 and P3 share the layout).
+CLASS_ACT_BANKS = 2
+CLASS_ACT_MODELS = 256
 
 
-def load_class_action(bpf_obj, map_name: str, semantics) -> None:
-    """Write a ClassSemantics into a class_action BPF map.
+def class_act_key(model_id: int, bank: int, cls: int) -> int:
+    """CLASS_ACT_KEY(model_id, bank, class) of the eBPF sources."""
+    from class_semantics import MAX_N_OUT
+    return (((int(model_id) & 0xFF) * CLASS_ACT_BANKS + (int(bank) & 1))
+            * MAX_N_OUT + int(cls))
 
-    Shared by P2 and P3 -- the map layout and the ACT_* codes are the same
-    contract in both. Entries past the model's n_out are left ACT_INVALID, so a
-    class the datapath should never produce is rejected explicitly instead of
-    reading as a zeroed (and therefore plausible-looking) action.
+
+def load_class_action(bpf_obj, map_name: str, registry_name: str,
+                      model_id: int, semantics) -> int:
+    """Write model_id's class semantics into its inactive class_action bank.
+
+    Shared by P2 (class_action_t2 / arch_registry) and P3 (class_action_t3 /
+    layer_registry) -- the map layout and the ACT_* codes are the same contract
+    in both. Returns the bank the caller must commit as sem_bank in the
+    model's registry entry; until it does, packets keep reading the old bank.
+
+    All MAX_N_OUT rows of the bank are written, those past the model's n_out
+    as ACT_INVALID, so a class the datapath should never produce is rejected
+    explicitly and nothing left by a previous occupant of the bank survives.
+    Only this model_id's rows are written: models with different semantics
+    coexist, each resolved through its own (model_id, class) key.
     """
     from ctypes import c_uint8, c_uint32, Structure
     from class_semantics import MAX_N_OUT
@@ -1483,12 +1519,22 @@ def load_class_action(bpf_obj, map_name: str, semantics) -> None:
         _fields_ = [("action", c_uint8), ("port", c_uint8),
                     ("_p0", c_uint8), ("_p1", c_uint8)]
 
+    if not 0 <= int(model_id) < CLASS_ACT_MODELS:
+        raise ValueError(f"model_id={model_id} outside [0, {CLASS_ACT_MODELS})")
+    try:
+        live = int(bpf_obj[registry_name][c_uint8(model_id)].sem_bank)
+        bank = (live & 1) ^ 1           # re-registration: the other bank
+    except KeyError:
+        bank = 0                        # new model_id: no packet reads it yet
     tbl = bpf_obj[map_name]
     table = semantics.action_table()
     for cid in range(MAX_N_OUT):
         act, port = table[cid]
-        tbl[c_uint32(cid)] = ClassAct(action=act, port=port, _p0=0, _p1=0)
-    print(f"[class_action] {map_name}: n_out={semantics.n_out} "
-          f"drop_class={semantics.drop_class} ports={semantics.logical_ports}")
+        tbl[c_uint32(class_act_key(model_id, bank, cid))] = \
+            ClassAct(action=act, port=port, _p0=0, _p1=0)
+    print(f"[class_action] {map_name}[model_id={model_id}, bank={bank}]: "
+          f"n_out={semantics.n_out} drop_class={semantics.drop_class} "
+          f"ports={semantics.logical_ports}")
     for cid in range(semantics.n_out):
         print(f"[class_action]   class {cid}: {semantics.classes[cid].describe()}")
+    return bank

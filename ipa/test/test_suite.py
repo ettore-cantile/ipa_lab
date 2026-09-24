@@ -764,8 +764,9 @@ def suite_core(model, verbose=False):
     #
     # Struct sizes (all packed, or all-__u8 hence alignment 1):
     #   fwd_action 4+6+6=16     ls_vec 4*6=24        qs_vec 4*4=16
-    #   feat_ent 4, model_desc 4+4*4=20              arch_entry 1+4+2+1+1=9
-    #   layer_model_entry 2+1=3 layer_shape_key 2    layer_shape_entry 2+2+4=8
+    #   feat_ent 4, model_desc 4+4*4=20   arch_entry 1+4+2+1+1+1+1=11
+    #   layer_model_entry 2+1+1=4 layer_shape_key 2  layer_shape_entry 2+2+4=8
+    #   class_act 4, class_action: (model_id, bank, class) = 256*2*32 rows
     #   act_vec 8*SCRATCH_ACT_SIZE=1024
     #
     # This is the DECLARED capacity of the maps, not kernel RSS: the kernel adds
@@ -777,6 +778,7 @@ def suite_core(model, verbose=False):
     MAX_WEIGHT_ENTRIES       = 1024   # aw_blk in ebpf_template_arch.py
     MAX_LAYER_WEIGHT_ENTRIES = 2048   # lw_blk in ebpf_modular.py
     ACT_VEC_BYTES            = 8 * 128  # act_vec: long long v[SCRATCH_ACT_SIZE]
+    CLASS_ACT_ROWS           = 256 * 2 * 32  # (model_id, bank, class) rows
     mac_capacity             = max(8, O)
 
     #                  name             key  value                     entries  percpu
@@ -790,7 +792,8 @@ def suite_core(model, verbose=False):
             ("link_state",               4,  24,                        1,      False),
             ("queue_state",              4,  16,                        1,      False),
             ("model_desc",               1,  20,                        256,    False),
-            ("arch_registry",            1,  9,                         256,    False),
+            ("arch_registry",            1,  11,                        256,    False),
+            ("class_action_t2",          4,  4,                         CLASS_ACT_ROWS, False),
             ("arch_progs",               4,  4,                         8,      False),
             ("mac_table_t2",             4,  16,                        8,      False),
             ("pkt_stats_t2",             4,  8,                         3,      False),
@@ -801,7 +804,8 @@ def suite_core(model, verbose=False):
             ("link_state",               4,  24,                        1,      False),
             ("queue_state",              4,  16,                        1,      False),
             ("model_desc",               1,  20,                        256,    False),
-            ("layer_registry",           1,  3,                         256,    False),
+            ("layer_registry",           1,  4,                         256,    False),
+            ("class_action_t3",          4,  4,                         CLASS_ACT_ROWS, False),
             ("layer_shapes",             2,  8,                         512,    False),
             ("layer_chain",              4,  4,                         16,     False),
             ("mac_table_t3",             4,  16,                        8,      False),
@@ -1392,11 +1396,11 @@ _PIPELINE_MAP_NAMES = [
     # P1 hardcoded (no weight map -- weights are C literals)
     "pkt_stats", "cls_stats", "mac_table", "model_progs",
     # P2 template
-    "arch_weights", "arch_registry", "arch_progs",
+    "arch_weights", "arch_registry", "arch_progs", "class_action_t2",
     "mac_table_t2", "pkt_stats_t2", "cls_stats_t2",
     # P3 modular
     "layer_weights", "layer_registry", "layer_shapes", "layer_chain",
-    "scratch_acts", "scratch_meta",
+    "scratch_acts", "scratch_meta", "class_action_t3",
     "mac_table_t3", "pkt_stats_t3", "cls_stats_t3",
 ]
 

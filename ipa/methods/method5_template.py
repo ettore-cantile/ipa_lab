@@ -51,7 +51,6 @@ from link_state_monitor import init_link_state_up, start_monitor_thread
 from model_meta import (derive_shape, load_model_meta, load_topology_config,
                         load_class_semantics)
 from node_config import NodeConfig
-from ebpf_template_arch import load_class_action
 
 # Resolve the shared/ directory relative to this file regardless of cwd.
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -149,7 +148,9 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
                                semantics.logical_ports)
     install_node_id(b, "node_id_t2", node_cfg,
                     n_nodes=load_topology_config().get("n_nodes"))
-    load_class_action(b, "class_action_t2", semantics)
+    # No class_action install here: each model writes its own (model_id,
+    # class) rows, committed by its registry entry, in the per-model
+    # load above -- from the same model_meta.json read here.
     if mac_info["pending"]:
         start_mac_refresh_thread(b, "mac_table_t2", mac_info["pending"], interval=5.0)
 

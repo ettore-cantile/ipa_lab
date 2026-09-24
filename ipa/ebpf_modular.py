@@ -75,15 +75,16 @@ Maps:
                       byte; eBPF C code casts each byte to __s8 via LW_W();
                       Python side stores int8 as v & 0xFF two's complement)
   layer_chain       : BPF_PROG_ARRAY  0 -> layer_first.fd, 1..15 -> layer_hidden.fd
-  layer_registry    : model_id -> {scale_factor, n_layers}
+  layer_registry    : model_id -> {scale_factor, n_layers, sem_bank}
   layer_shapes      : {model_id, layer_idx} -> {n_in, n_out, weight_offset}
-  class_action_t3   : u32 class (argmax output) -> {action, logical port}
+  class_action_t3   : (model_id, sem_bank, class) -> {action, logical port}
   mac_table_t3      : u32 LOGICAL PORT -> fwd_action {ifindex, src/dst MAC}
   cls_stats_t3      : per-class redirect counter
   pkt_stats_t3      : [0]=HIT [1]=MISS [2]=DROP
 
-Action: the last layer runs argmax -> class, then class_action_t3[class] gives
-the action + logical port, and a single mac_table_t3[port]
+Action: the last layer runs argmax -> class, then
+class_action_t3[(model_id, sem_bank, class)] gives this model's action +
+logical port, and a single mac_table_t3[port]
 lookup resolves the L2 next-hop and bpf_redirect()s (cls 6 = DROP). No output
 key, no per-TTL validation -- the NN decides, the table only maps class->port.
 
@@ -403,7 +404,20 @@ BPF_HASH(ingress_port_t3, __u32, __u32, 64);
  * see META_NODE_CTX. */
 BPF_HASH(node_id_t3, __u32, __u32, 1);
 
-BPF_ARRAY(class_action_t3, struct class_act, MAX_N_OUT);
+/* class_action_t3: (model_id, class) -> {action, logical port}, keyed by the
+ * composite (model_id, bank, class) flattened into an ARRAY index. Same
+ * layout and same reasons as class_action_t2 (see ebpf_template_arch.py): it
+ * used to be keyed by class alone, one table shared by every model_id. The
+ * lookup stays a single inlined array lookup, O(1) in the number of models;
+ * the bank makes re-registering a model_id switch n_layers and semantics in
+ * one layer_registry update. */
+#define CLASS_ACT_BANKS   2
+#define CLASS_ACT_MODELS  256   /* model_id is a __u8 */
+#define CLASS_ACT_KEY(mid, bank, cls) \
+    (((((__u32)(mid) & 0xffU) * CLASS_ACT_BANKS + ((__u32)(bank) & 1U)) \
+      * MAX_N_OUT) + (__u32)(cls))
+BPF_ARRAY(class_action_t3, struct class_act,
+          CLASS_ACT_MODELS * CLASS_ACT_BANKS * MAX_N_OUT);
 BPF_ARRAY(pkt_stats_t3, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_ARRAY(cls_stats_t3, __u64, MAX_N_OUT);   /* per-class redirect counter */
 
@@ -451,11 +465,15 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 #define META_NODE_CTX    3
 #define META_TTL         4
 
-/* Per-model metadata: model_id -> {scale_factor, n_layers}. n_layers tells
- * each hop when it has reached the last layer (layer_idx+1==n_layers). */
+/* Per-model metadata: model_id -> {scale_factor, n_layers, sem_bank}.
+ * n_layers tells each hop when it has reached the last layer
+ * (layer_idx+1==n_layers). sem_bank selects which of this model's two
+ * class_action_t3 banks is live -- see CLASS_ACT_KEY; it is committed in this
+ * entry, which the control plane writes LAST. */
 struct layer_model_entry {
     __u16 scale_factor;
     __u8  n_layers;
+    __u8  sem_bank;
 } __attribute__((packed));
 BPF_HASH(layer_registry, __u8, struct layer_model_entry, 256);
 
@@ -483,21 +501,27 @@ BPF_HASH(layer_shapes, struct layer_shape_key, struct layer_shape_entry, 512);
  * design (see git history: struct padding bugs from more implicit magic). */
 static inline __attribute__((always_inline))
 int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end,
-                      int best_cls, __u32 n_out) {
+                      int best_cls, __u32 n_out, __u32 sem_key0) {
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
 
-    /* Class -> action -> logical port, from the descriptor-filled map. The
-     * previous `best_cls >= 6` hardcoded both the DROP class and the
-     * class==port assumption; neither holds for this model (trained DROP is
-     * class 5) nor for any other output width. */
+    /* (model_id, class) -> action -> logical port, from THIS model's live
+     * bank of the descriptor-filled map. The previous `best_cls >= 6`
+     * hardcoded both the DROP class and the class==port assumption; neither
+     * holds for this model (trained DROP is class 5) nor for any other output
+     * width. sem_key0 is the first row of that bank, CLASS_ACT_KEY(model_id,
+     * sem_bank, 0), computed by the caller AT the call: taking it right after
+     * the layer_registry lookup keeps one more value live across layer_first's
+     * loop, and the IPA_COUNT_LOOKUPS build of layer_first then exceeds the
+     * 512-byte BPF stack (measured, clang 18). */
     if (best_cls < 0 || (__u32)best_cls >= n_out) {
         int mi = 1; __u64 *mv = pkt_stats_t3.lookup(&mi);
         if (mv) __sync_fetch_and_add(mv, 1);
         return XDP_PASS;
     }
     __u32 _ci = (__u32)best_cls;
-    struct class_act *ca = class_action_t3.lookup(&_ci);
+    __u32 _sk = sem_key0 + _ci;
+    struct class_act *ca = class_action_t3.lookup(&_sk);
     if (!ca || ca->action == ACT_INVALID) {
         int mi = 1; __u64 *mv = pkt_stats_t3.lookup(&mi);
         if (mv) __sync_fetch_and_add(mv, 1);
@@ -873,7 +897,8 @@ int layer_first(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    return ml_argmax_forward(ctx, data, data_end, best_cls, n_out);
+    return ml_argmax_forward(ctx, data, data_end, best_cls, n_out,
+                             CLASS_ACT_KEY(model_id, lentry->sem_bank, 0));
 }
 """
 
@@ -982,7 +1007,8 @@ int layer_hidden(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    return ml_argmax_forward(ctx, data, data_end, best_cls, n_out);
+    return ml_argmax_forward(ctx, data, data_end, best_cls, n_out,
+                             CLASS_ACT_KEY(model_id, lentry->sem_bank, 0));
 }
 """
 
@@ -1074,9 +1100,6 @@ def load_modular_weights(
             f"class semantics declare n_out={semantics.n_out} but the last "
             f"layer outputs {layer_dims[-1][1]}. Descriptor and model must "
             f"agree before either reaches the datapath.")
-    from ebpf_template_arch import check_class_action_shared
-    check_class_action_shared(bpf_obj, "class_action_t3", "layer_registry",
-                              model_id, semantics)
 
     n_layers = len(layer_dims)
     if n_layers == 0 or n_layers > LAYER_CHAIN_SIZE:
@@ -1145,15 +1168,20 @@ def load_modular_weights(
         shapes_table[LayerShapeKey(model_id=model_id, layer_idx=layer_idx)] = \
             LayerShapeEntry(n_in=n_in, n_out=n_out, weight_offset=woff)
 
+    # Semantics into this model's INACTIVE bank; the layer_registry write below
+    # (still the last one) commits n_layers and sem_bank together. Other
+    # model_ids' rows are never written.
     from ebpf_template_arch import load_class_action
-    load_class_action(bpf_obj, "class_action_t3", semantics)
+    bank = load_class_action(bpf_obj, "class_action_t3", "layer_registry",
+                             model_id, semantics)
 
     class LayerModelEntry(Structure):
         _pack_ = 1
-        _fields_ = [("scale_factor", c_uint16), ("n_layers", c_uint8)]
+        _fields_ = [("scale_factor", c_uint16), ("n_layers", c_uint8),
+                    ("sem_bank", c_uint8)]
 
     bpf_obj["layer_registry"][c_uint8(model_id)] = \
-        LayerModelEntry(scale_factor=scale, n_layers=n_layers)
+        LayerModelEntry(scale_factor=scale, n_layers=n_layers, sem_bank=bank)
 
     shape_str = "-".join(str(d[0]) for d in layer_dims) + f"-{layer_dims[-1][1]}"
     print(f"[Pipeline3] model_id={model_id} registered: scale={scale}, "
