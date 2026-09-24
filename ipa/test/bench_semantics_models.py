@@ -39,6 +39,7 @@ import ctypes as ct
 import importlib.util
 import os
 import sys
+import time
 
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 SHARED_DIR = os.path.dirname(_TEST_DIR)
@@ -196,28 +197,44 @@ def main():
     counts = [int(x) for x in a.models.split(",")]
     pls = ("p2", "p3") if a.pipeline == "all" else (a.pipeline,)
 
+    # Progress on stderr, prefixed '#': loading the P2 leaf alone takes seconds
+    # in the verifier, and there are 2 builds per (pipeline, tree, N), so a
+    # silent run looks hung for minutes.
+    t0 = time.monotonic()
+
+    def progress(msg):
+        print(f"# [{time.monotonic() - t0:6.0f}s] {msg}", file=sys.stderr,
+              flush=True)
+
     # (pipeline, tree, N, measured model_id)
     configs = []
+    n_builds, done = 2 * len(pls) * 2 * len(counts), 0
     for pl in pls:
         for tree in ("base", "new"):
             for n in counts:
+                progress(f"build {done + 1}-{done + 2}/{n_builds}: "
+                         f"{pl} {tree} N={n} (plain + IPA_COUNT_LOOKUPS)")
                 s = build(trees[tree], pl, n, distinct=(tree == "new"))
                 ins = build(trees[tree], pl, n, distinct=(tree == "new"),
                             instrument=True)
+                done += 2
                 for mid in sorted({0, n - 1}):
                     configs.append({"pl": pl, "tree": tree, "n": n, "mid": mid,
                                     "s": s, "ins": ins, "lat": [], "rv": set()})
 
+    progress(f"static metrics + lookup counts, {len(configs)} configurations")
     for c in configs:
         c["insn"], c["jit"], c["mem"] = static_metrics(c["s"])
         c["lookups"] = lookups(c["ins"], c["mid"])
         sample(c["s"], c["mid"], 1000)                     # warm-up
 
     for t in range(a.trials):                              # interleaved
+        progress(f"trial {t + 1}/{a.trials}")
         for c in configs:
             rv, ns = sample(c["s"], c["mid"], a.repeat)
             c["lat"].append(ns)
             c["rv"].add(rv)
+    progress("done")
 
     hdr = (f"{'pl':<3} {'tree':<5} {'N':>2} {'mid':>3} {'insn':>6} {'jit':>6} "
            f"{'lookups':>7} {'tail':>4} {'mem(B)':>8} {'min':>6} {'p50':>6} "
