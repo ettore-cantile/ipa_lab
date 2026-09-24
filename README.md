@@ -119,13 +119,14 @@ ipa_lab/
 │   └── test/                        #    engine tests, topology-agnostic
 │       ├── test_suite.py            #      core/pktstats/extract/quant/robust/kernel
 │       ├── test_class_semantics.py  #      69 checks, five class layouts, none Germany50
-│       ├── test_synth.py            #      59 checks on generated models, incl.
+│       ├── test_synth.py            #      63 checks on generated models, incl.
 │       │                            #        synth reference == P1's generated C
 │       ├── p1_c_eval.py             #      evaluates P1's C from its text (no kernel)
 │       ├── verify_prog_run.py       #      per-pipeline kernel verifier (BPF_PROG_TEST_RUN)
 │       ├── verify_multi_model.py    #      concurrent multi-model registration
+│       ├── verify_per_model_semantics.py #   P2/P3: class -> action per model_id
 │       ├── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost,
-│       │                            #        scaling (BPF_PROG_TEST_RUN)
+│       │                            #        scaling, per-model semantics (BPF_PROG_TEST_RUN)
 │       ├── bench_throughput.py      #      real traffic on veth: node cost per packet
 │       │                            #        (--mode compare --generator xdp --egress-cpu 0)
 │       ├── xdp_gen.py               #      XDP live-frames generator (no skb, no copy)
@@ -225,8 +226,11 @@ and multi-hop forwarding across several nodes.
 
 All three parse `Ethernet → IP → UDP:9999 → IPA header`, build the model's input
 vector **locally on the node**, run the same integer MLP, take the argmax, and
-resolve it to a physical action through a `mac_table` (class → `{ifindex,
-src_mac, dst_mac}` → `bpf_redirect`). The last class is DROP.
+resolve it to a physical action: the class goes through the model's declared
+semantics (class → FORWARD to a logical port / DROP / UNUSED, from
+`model_meta.json`; in the checked-in model DROP is class 5 and class 6 is
+unused), then the logical port through a `mac_table` (`{ifindex, src_mac,
+dst_mac}` → `bpf_redirect`).
 
 | | **P1 hardcoded** | **P2 template** | **P3 modular** |
 |---|---|---|---|
@@ -237,6 +241,7 @@ src_mac, dst_mac}` → `bpf_redirect`). The last class is DROP.
 | Intermediate state | none (fully unrolled) | none | per-CPU scratch |
 | Strength reduction | yes | no | no |
 | Model update cost | recompile + reload | one map write | one map write |
+| Class semantics | compiled into the model's program | per `model_id` (map) | per `model_id` (map) |
 | Per-packet cost | lowest | middle | highest |
 
 The trade-off is structural, not an implementation defect: per-packet cost and
@@ -447,6 +452,9 @@ sudo python3 ipa/test/verify_prog_run.py --method hardcoded|template|modular|spa
 
 # concurrent multi-model registration
 sudo python3 ipa/test/verify_multi_model.py
+
+# P2/P3: models with different class semantics in one program
+sudo python3 ipa/test/verify_per_model_semantics.py
 ```
 
 Correctness criterion, identical across pipelines: pre-install `mac_table`, run

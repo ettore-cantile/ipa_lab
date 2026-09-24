@@ -34,7 +34,7 @@ scheda lo dice invece di nasconderlo.
 | **Metrica** | La classe scelta, e la porta logica su cui il pacchetto esce. |
 | **Risultato** | Sul modello depositato `n_out=7`, `drop_class=5`, e la classe 6 è `UNUSED`. Le formule dedotte davano `drop=6`: avrebbero installato un next-hop per la classe DROP e trattato come inoltro una classe non addestrata. |
 | **Conclusione** | La catena classe → azione → porta logica → interfaccia è letta da mappe riempite dal descrittore. Nessuna aritmetica sugli indici decide che cosa significa una classe. |
-| **Come rigirarlo** | `python3 ipa/test/test_class_semantics.py` e la sezione `class_action` di `--only kernel`. |
+| **Come rigirarlo** | `python3 ipa/test/test_class_semantics.py` e la sezione `class_action` di `--only kernel`; per la semantica distinta per modello, A7. |
 
 ### A2 — Il datapath consegna pacchetti veri, non solo aritmetica ✅
 
@@ -112,9 +112,27 @@ scheda lo dice invece di nasconderlo.
 
 ---
 
+### A7 — Ogni modello ha la sua semantica, senza un programma per modello ✅
+
+| | |
+|---|---|
+| **Ipotesi** | In P2 e P3 modelli con significati diversi per la stessa classe possono convivere nello **stesso** programma caricato, senza contaminarsi e senza costo misurabile per pacchetto. Fino al 2026-09-23 non era possibile: `class_action_t2/_t3` era indicizzata dalla sola classe, condivisa da tutti i `model_id`, e il piano di controllo rifiutava un secondo modello con semantica diversa. |
+| **Variabile modificata** | La chiave della tabella classe → azione: classe sola contro `(model_id, banco, classe)`, appiattita in un `BPF_ARRAY` di 256 × 2 × 32 righe. Il banco attivo sta nell'entry di `arch_registry` / `layer_registry`: ricaricare un modello scrive il banco inattivo e un solo update del registry installa insieme `n_out` e banco. |
+| **Variabili fisse** | Inferenza, pesi, descrittori, un programma per architettura, pacchetti, VM (4 vCPU), metodologia di `test_suite` (minimo dei trial, p50/max). |
+| **Metrica** | Azione prodotta dal kernel per ogni classe di ogni modello (MAC riscritto, `XDP_DROP`, `XDP_PASS` con o senza contatore); istruzioni, JIT, letture di tabella, tail call, memoria mappe, latenza min/p50/max. |
+| **Risultato** | **53/53** su P2 e P3: un modello; due con la stessa semantica; due con semantiche diverse su ogni classe a pacchetti alternati (classe 0: FORWARD per A, DROP per B); A → B → A anche dopo aver ricaricato B; `model_id` inesistente o rimosso non elaborato; `n_out` 4 e 7 insieme; stesso `model_id` ricaricato con altra semantica e altro `n_out` (banco 0 → 1, altri modelli intatti). **Costo**: istruzioni P2 −9, P3 +77; letture 11 e 29 invariate; tail call invariate; latenza entro il rumore (mediana su 1/2/4/8 modelli, P2 289 → 298 ns, P3 481 → 470 ns); nessuna pendenza da 1 a 8 modelli; **memoria +131 072 byte per pipeline**, fissi. |
+| **Controllo negativo** | Con una tabella condivisa simulata (tutti i modelli sulle stesse righe) A e B passano e C, D, F, R falliscono: il test distingue le due cose. |
+| **Perché non dentro il registry** | Il datapath ha già l'entry del modello, ma indicizzarne il valore con `best_cls` obbliga il verificatore a tracciare `best_cls` con precisione attraverso l'argmax: `layer_hidden` di P3 non carica più (`E2BIG`). Una chiave sullo stack no. |
+| **Limite dichiarato** | ⚠️ I 128 KiB sono riservati per 256 modelli anche con un modello solo. Un'alternativa a pochi KB (slot allocato dal piano di controllo, come `weight_offset`) non è stata implementata. Nel bench il **minimo** di 4 configurazioni su 28 è sotto il pavimento del programma (artefatto non spiegato): il costo si legge sulle mediane. |
+| **Come rigirarlo** | `sudo python3 ipa/test/verify_per_model_semantics.py`; `sudo python3 -u ipa/test/bench_semantics_models.py --baseline-dir <albero precedente>/ipa --trials 21` |
+
+---
+
 ## B. Il costo della flessibilità
 
 > **Rimisura del 2026-09-23** (sezioni B, C, D). `bench_scaling` e `test_suite` sono stati rifatti con P1 e P1.5 come **oggetto AOT** (quello dei nodi). In quella sessione la macchina era circa il **35–40% più veloce** della precedente su **tutte** le pipeline, anche P2 e P3 che non sono cambiate: è lo stato dell'host (CPU ibrida), non dei programmi. I **rapporti** fra pipeline e le istruzioni restano invariati; le cifre assolute di sessioni diverse non si confrontano. Le schede riportano la rimisura in una riga propria.
+>
+> **Dal 2026-09-24** (semantica per modello, A7) P2 e P3 contano **14 976** e **12 426** istruzioni invece di 14 985 e 12 349, con letture di tabella, tail call e latenza invariate entro il rumore, e **+131 072 byte** di mappe per pipeline. Le cifre delle schede B, C e D sono state misurate prima: i rapporti e le conclusioni valgono, le istruzioni di P2/P3 e la memoria vanno lette con questa correzione.
 
 Questa è la sezione che risponde all'esempio del relatore. La scala ha **quattro**
 gradini, non tre: si è aggiunta una P1 pienamente specializzata sotto quella che

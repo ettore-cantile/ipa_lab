@@ -238,6 +238,12 @@ sudo python3 ipa/test/verify_prog_run.py --method modular
 sudo python3 ipa/test/verify_prog_run.py --method modular --model-id 3
 ```
 
+### Semantica delle classi per modello (P2/P3)
+
+```bash
+sudo python3 ipa/test/verify_per_model_semantics.py      # casi A-F, R, rimozione (§ 9-bis)
+```
+
 ---
 
 ## 3. Costruire un datapath reale (`netns_fabric.py`)
@@ -577,6 +583,124 @@ sudo python3 ipa/test/test_suite.py --only kernel
 
 ---
 
+## 9-bis. Semantica delle classi per modello (`verify_per_model_semantics.py`, `bench_semantics_models.py`)
+
+**Da 2026-09-24** il significato delle classi è una proprietà del **modello**, non
+del programma. In P2 e P3 la tabella `class_action` era indicizzata dalla sola
+classe e condivisa da tutti i `model_id`: due modelli non potevano dare alla
+stessa classe significati diversi, e il piano di controllo rifiutava il secondo.
+Ora la chiave è `(model_id, class_id)`, e un programma solo per architettura
+serve modelli con semantiche indipendenti.
+
+```text
+model_id ─► arch_registry / layer_registry   (lookup hash, già esistente)
+              {pesi, forma, n_out, sem_bank}
+                  │
+            inferenza P2/P3 (invariata)
+                  │
+               class_id
+                  │   chiave = (model_id·2 + sem_bank)·32 + class_id
+                  ▼
+            class_action[chiave] ─► azione ─► porta logica ─► mac_table
+```
+
+- **Array, non hash.** `class_action_t2/_t3` è un `BPF_ARRAY` di
+  256 × 2 × 32 righe (`model_id` è un `__u8`, 2 banchi, `MAX_N_OUT` classi): il
+  lookup resta uno solo, inline come quello per sola classe, O(1) nel numero di
+  modelli. Nessun ciclo sui modelli nel datapath.
+- **Perché non una tabella dentro l'entry del registry**, che il datapath ha già
+  in mano: indicizzare il valore di una mappa con `best_cls` è aritmetica sul
+  puntatore, e il verificatore deve allora tracciare `best_cls` con precisione
+  all'indietro attraverso l'argmax — nessun cammino si può più potare. Misurato:
+  `layer_hidden` di P3 non carica più (`E2BIG`). Una chiave sullo stack non
+  richiede quella precisione.
+- **Due banchi per modello, commit nel registry.** Ricaricare un `model_id`
+  scrive il banco **inattivo** per intero, poi un solo update di
+  `arch_registry`/`layer_registry` installa insieme `n_out` (o `n_layers`) e il
+  nuovo `sem_bank`. Un pacchetto vede la vecchia coppia o la nuova, mai una
+  tabella scritta a metà; un caricamento che fallisce a metà lascia intatto il
+  banco attivo. Le righe degli altri `model_id` non vengono mai scritte. Resta
+  com'era prima la riscrittura in place del blocco pesi di un modello ricaricato
+  nello stesso slot: la modifica riguarda la sola semantica.
+- **La chiave si calcola una volta.** In P2 subito dopo il lookup del registry
+  (`sem_key0`), perché tenere vivi puntatore e `model_id` fino all'argmax costava
+  +157 istruzioni; in P3 al momento della chiamata a `ml_argmax_forward`, perché
+  calcolarla prima allunga di un valore vivo il ciclo di `layer_first`, e la sua
+  build `IPA_COUNT_LOOKUPS` sfora i 512 byte di stack BPF.
+
+```bash
+# A-F + ricaricamento + rimozione, P2 e P3, un programma per pipeline
+sudo python3 ipa/test/verify_per_model_semantics.py [--pipeline p2|p3]
+
+# costo: vecchia chiave (albero di riferimento) contro (model_id, class), e 1/2/4/8 modelli
+git worktree add /tmp/ipa_base <commit-precedente>
+sudo python3 -u ipa/test/bench_semantics_models.py --baseline-dir /tmp/ipa_base/ipa \
+     --trials 21 --csv results/semantics_models.csv
+```
+
+**Correttezza (2026-09-24, VM di laboratorio): 53/53** su P2 e P3. I modelli di
+prova sono costruiti in modo che il TTL scelga la classe (`ttl = c + 2` dà la
+classe `c`, verificato contro il riferimento Python indipendente), quindi ogni
+classe di ogni modello è raggiungibile. Si osserva ciò che il programma ha fatto:
+MAC di destinazione riscritto (una porta logica diversa per ogni next hop),
+`XDP_DROP`, oppure `XDP_PASS` con o senza contatore.
+
+| Caso | Che cosa verifica | Esito |
+|---|---|---|
+| A | un modello: ogni classe dà l'azione dichiarata | ✅ |
+| B | due modelli, stessa semantica | ✅ |
+| C | due modelli, semantiche diverse su **ogni** classe, pacchetti alternati | ✅ (classe 0: FORWARD per A, DROP per B) |
+| D | A, poi B, poi A; anche dopo aver ricaricato B | ✅ |
+| E | `model_id` mai registrato, e uno rimosso: non elaborato, nessuna semantica altrui | ✅ |
+| F | `n_out` diversi (4 e 7): ogni argmax limitato dal **proprio** `n_out` | ✅ |
+| R | ricaricare lo stesso `model_id` con altra semantica e altro `n_out` | ✅ banco 0→1, gli altri modelli intatti |
+
+**Controllo negativo.** Con una tabella condivisa simulata (tutti i modelli
+scrivono e leggono le stesse righe) A e B passano e C, D, F, R falliscono: il test
+distingue le due cose, non passa comunque.
+
+**Regressione**: `test_suite --only kernel` PASS; `verify_multi_model` PASS
+(P1/P2/P3); `test_synth --kernel` 63/63; `verify_synth_kernel --all` P1 8/8,
+`--pipeline p2` 7/7, `--pipeline p3` 7/7; `test_class_semantics` 69/69.
+
+**Costo** (`bench_semantics_models`, stessa VM, 4 vCPU, modello 65-4-4-7, trial
+alternati fra tutte le configurazioni nello stesso processo, 21 trial):
+
+| | istruzioni | JIT (B) | lookup/pkt | tail call | memoria mappe (B) |
+|---|---:|---:|---:|---:|---:|
+| P2 classe sola | 14 985 | 67 183 | 11 | 1 | 11 192 |
+| P2 `(model_id, classe)` | 14 976 | 67 472 | 11 | 1 | 142 264 |
+| P3 classe sola | 12 349 | 57 372 | 29 | 3 | 20 284 |
+| P3 `(model_id, classe)` | 12 426 | 58 184 | 29 | 3 | 151 356 |
+
+| Latenza (ns, mediana su N = 1, 2, 4, 8) | minimo | p50 |
+|---|---:|---:|
+| P2 classe sola → per modello | 252 → 256 | 289 → 298 |
+| P3 classe sola → per modello | 409 → 413 | 481 → 470 |
+
+- **Δ istruzioni** P2 −9 (−0,06%), P3 +77 (+0,6%: `layer_first` +61,
+  `layer_hidden` +16). **Δ lookup 0**, **Δ tail call 0**.
+- **Δ latenza** entro il rumore: P2 +4 ns (+1,6%) e P3 +4 ns (+1%) sul minimo,
+  P2 +9 ns (+3%) e P3 −11 ns (−2%) sulla p50. Le suite
+  indipendenti dello stesso giorno danno lo stesso quadro: P2 281 ns contro
+  286/289/292 della versione precedente, P3 444 contro 444/447/451.
+- **Numero di modelli**: nessuna pendenza da 1 a 8, misurando sia il modello 0 sia
+  l'ultimo registrato (p50 P2 298 → 293–295, P3 475 → 486).
+- **Memoria: +131 072 byte per pipeline**, fissi (64 KiB di valori; la formula
+  della suite conta anche le chiavi). È il prezzo della scelta: 256 `model_id` ×
+  2 banchi × 32 classi preallocati. Non cresce col numero di modelli registrati.
+  L'alternativa a pochi KB è uno slot per modello allocato dal piano di controllo
+  in un array compatto, come già `weight_offset` per i pesi.
+
+> ⚠️ **Il minimo qui non è affidabile in 4 configurazioni su 28**: P3 classe sola
+> con N=1 dà 245 ns contro 406–414 delle altre sei, P2 per modello con N=4/8 dà
+> 149–165 contro ~255. Sono valori **sotto** il pavimento del programma stesso,
+> non ripetibili, quindi artefatti della misura (causa non verificata); il delta
+> "per N=1" che lo script stampa per P3 (+148 ns) ne è il prodotto. Le cifre sopra
+> sono mediane sulle N, che misurano lo stesso programma, con quei valori esclusi.
+
+---
+
 ## 10. Analisi parametrica (`bench_scaling.py`)
 
 Le sezioni precedenti misurano **un** modello su **una** topologia. Questa misura
@@ -841,33 +965,40 @@ Rimisurati dopo tre correzioni che invalidavano la tabella precedente:
 
 Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo.
 **Un solo run, un solo stato del codice**: nido di cicli invertito in
-`layer_first` (P3) e `fc1` (P2), `IPA_MAX_QUEUES = 8` in entrambe.
+`layer_first` (P3) e `fc1` (P2), `IPA_MAX_QUEUES = 8` in entrambe, P1 come
+oggetto AOT, semantica delle classi per modello in P2/P3 (§ 9-bis).
 
-| Metrica | baseline | P1 hardcoded | P2 template | P3 modular |
+| Metrica | baseline | P1 hardcoded (AOT) | P2 template | P3 modular |
 |---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | 155 | 1 026 | 14 985 | 12 349 |
-| Codice jited (byte) | 709 | 4 985 | 67 183 | 57 372 |
+| Istruzioni eBPF (xlated) | 155 | 1 011 | 14 976 | 12 426 |
+| Codice jited (byte) | 709 | 4 917 | 67 472 | 58 184 |
 | Tail call / pacchetto | 0 | 1 | 1 | **3** |
 | Map lookup / pacchetto (reali) | 3.0 | 6.0 | 11.0 | **29.0** |
-| Memoria mappe (byte) | 280 | 2 356 | 10 416 | 19 508 |
-| **Latenza min (ns/pkt)** | **28.0** | **71.0** | **276.0** | **453.0** |
-| ...p50 | 29.0 | 75.0 | 278.0 | 460.0 |
-| ...max | 36.0 | 93.0 | 295.0 | 494.0 |
-| ...spread (max−min)/min | 29% | 31% | **7%** | **9%** |
-| Throughput teorico (Mpps, da min) | 35.714 | 14.085 | 3.623 | 2.208 |
+| Memoria mappe (byte) | 280 | 2 516 | 141 744 | 150 836 |
+| **Latenza min (ns/pkt)** | **29.0** | **71.0** | **281.0** | **444.0** |
+| ...p50 | 31.0 | 71.0 | 291.0 | 477.0 |
+| ...max | 33.0 | 79.0 | 302.0 | 578.0 |
+| ...spread (max−min)/min | 14% | 11% | **7%** | 30% |
+| Throughput teorico (Mpps, da min) | 34.483 | 14.085 | 3.559 | 2.252 |
 
-> **Misurate il 2026-09-22.** I due run precedenti davano 35.0 / 70.0 / 286.0
-> / 444.0 (18 settembre) e 23.0 / 49.0 / 177.0 / 278.0 (21 settembre).
+> **Misurate il 2026-09-24**, dopo la semantica per modello. Rispetto alla
+> versione precedente cambiano solo P2 e P3: istruzioni −9 / +77, lookup
+> invariati, latenza dentro il rumore (le tre suite della versione precedente,
+> nello stesso giorno, davano P2 286 / 289 / 292 e P3 444 / 447 / 451 ns), e la
+> memoria: **+131 072 byte** per `class_action_t2/_t3`, che ora conta anche
+> nella tabella (prima la suite non la sommava affatto — 256 byte).
 >
-> Non è cambiato il codice, ed è verificabile: **istruzioni, byte jited, tail
-> call, letture di tabella e memoria sono identiche in tutti e tre i run**,
-> cifra per cifra. A muoversi è solo la colonna del tempo.
+> Il run precedente pubblicato qui (2026-09-22, stesso codice di P2/P3 prima
+> della modifica) dava 28.0 / 71.0 / 276.0 / 453.0 ns; quelli del 18 e del 21
+> settembre 35.0 / 70.0 / 286.0 / 444.0 e 23.0 / 49.0 / 177.0 / 278.0. Fra quei
+> tre run istruzioni, byte jited, tail call, letture e memoria erano identiche
+> cifra per cifra: a muoversi era solo la colonna del tempo.
 >
-> Da notare lo **spread**: 7% su template e 9% su modular, contro 39% e 74%
-> del run precedente. Le due pipeline grandi sono diventate le misure più
-> stabili della tabella, non le più rumorose. Le due piccole restano intorno
-> al 30%, che è il comportamento atteso: più il programma è breve, più pesa
-> in proporzione il rumore del sistema.
+> Lo spread di P3 (30%) in questo run viene da un solo trial lento (max 578
+> contro p50 477); nei tre run della versione precedente dello stesso giorno era
+> 5–12%. Le due piccole restano fra l'11 e il 30%, che è il comportamento
+> atteso: più il programma è breve, più pesa in proporzione il rumore del
+> sistema.
 >
 > Conseguenza pratica: **le latenze assolute di questa tabella non sono
 > trasferibili**; i rapporti fra pipeline sì. L'host è un processore ibrido a
@@ -1384,7 +1515,9 @@ il passaggio media→minimo, e il fatto che registrare un modello sia ora **una*
 ### Multi-model (`verify_multi_model.py`) — regge shape custom
 
 `model_desc` popolato correttamente anche per shape non-default: P2 `model_id=1` = 65-**6-5**-7,
-P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS.
+P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS. Dal 2026-09-24 ogni `model_id`
+ha anche le proprie righe di `class_action` (`class_action_t2[model_id=1, bank=0]` nel
+log); modelli con semantiche diverse nello stesso programma sono il caso C di § 9-bis.
 
 ## 11. Throughput end-to-end misurato (`bench_throughput.py`)
 

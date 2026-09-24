@@ -510,10 +510,11 @@ int ml_argmax_forward(struct xdp_md *ctx, void *data, void *data_end,
      * hardcoded both the DROP class and the class==port assumption; neither
      * holds for this model (trained DROP is class 5) nor for any other output
      * width. sem_key0 is the first row of that bank, CLASS_ACT_KEY(model_id,
-     * sem_bank, 0), computed by the caller AT the call: taking it right after
-     * the layer_registry lookup keeps one more value live across layer_first's
-     * loop, and the IPA_COUNT_LOOKUPS build of layer_first then exceeds the
-     * 512-byte BPF stack (measured, clang 18). */
+     * sem_bank, 0), computed by the caller without adding a value that stays
+     * live across the layer loop: layer_first sits at the 512-byte BPF stack
+     * limit in its instrumented builds (IPA_COUNT_LOOKUPS, and the T1/T2
+     * latency build of bench_throughput) -- measured, clang 18. See last_key
+     * in layer_first. */
     if (best_cls < 0 || (__u32)best_cls >= n_out) {
         int mi = 1; __u64 *mv = pkt_stats_t3.lookup(&mi);
         if (mv) __sync_fetch_and_add(mv, 1);
@@ -684,7 +685,15 @@ int layer_first(struct xdp_md *ctx) {
     if (!lentry) return XDP_PASS;
     __u8 n_layers = lentry->n_layers;
     if (n_layers == 0) return XDP_PASS;
-    __u8 is_last = (n_layers == 1) ? 1 : 0;
+    /* "Is this also the last layer" and, if so, the first class_action_t3 row
+     * of this model's live bank, in ONE value: bit 31 is the flag, the low
+     * bits are CLASS_ACT_KEY(model_id, sem_bank, 0). It replaces the __u8
+     * is_last that was already live across the whole loop below. Carrying the
+     * key separately -- model_id and lentry kept alive until the epilogue --
+     * pushed the latency-instrumented build (bench_throughput, T1/T2) past
+     * the 512-byte BPF stack; packed here it adds no live value at all. */
+    __u32 last_key = (n_layers == 1)
+        ? (0x80000000U | CLASS_ACT_KEY(model_id, lentry->sem_bank, 0)) : 0U;
 
     struct layer_shape_key key = {};
     key.model_id  = model_id;
@@ -875,14 +884,14 @@ int layer_first(struct xdp_md *ctx) {
     #pragma unroll
     for (int j = 0; j < ML1_MAX_H1; j++) {
         if (j >= n_out) { out[j] = 0LL; continue; }
-        if (is_last) {
+        if (last_key) {
             if (out[j] > best_val) { best_val = out[j]; best_cls = j; }
         } else {
             out[j] = RELU(out[j]);
         }
     }
 
-    if (!is_last) {
+    if (!last_key) {
         /* ONE lookup of this CPU's activation vector, then plain stores through
          * the returned pointer -- replaces ML1_MAX_H1 separate .update() calls. */
         int _az = 0;
@@ -898,7 +907,7 @@ int layer_first(struct xdp_md *ctx) {
     }
 
     return ml_argmax_forward(ctx, data, data_end, best_cls, n_out,
-                             CLASS_ACT_KEY(model_id, lentry->sem_bank, 0));
+                             last_key & 0x7fffffffU);
 }
 """
 

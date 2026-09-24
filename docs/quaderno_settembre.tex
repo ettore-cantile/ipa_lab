@@ -287,6 +287,7 @@ Nel C generato si legge esattamente così:
 
 % ==================================================================
 \chapter{Le classi non sono porte}
+\label{ch:classi}
 
 \section{Il problema}
 
@@ -376,6 +377,80 @@ giusto perché le due numerazioni coincidono nel modello depositato.
 Con un modello in cui non coincidono, il contatore avrebbe misurato la cosa
 sbagliata in silenzio. Separare i due spazi di indici ha reso l'errore visibile
 e correggibile.
+
+\section{Ogni modello ha la sua semantica (24 settembre)}
+
+\textbf{Il limite.} In P2 e P3 la tabella classe $\to$ azione era \emph{una}, letta
+con la sola classe e condivisa da tutti i modelli caricati. Due modelli non
+potevano dare alla stessa classe significati diversi: per evitare che il secondo
+riscrivesse in silenzio le azioni del primo, il piano di controllo lo rifiutava.
+Il vantaggio di P2 e P3 --- un programma solo, i modelli caricati come dati ---
+valeva quindi solo per modelli con la stessa semantica.
+
+\textbf{La soluzione.} La chiave della tabella è diventata la coppia
+$(\text{model\_id}, \text{classe})$. Il programma resta uno per architettura;
+aggiungere un modello resta scrivere delle tabelle.
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=9mm,
+              inner sep=6pt,font=\small,align=center},
+  arr/.style={-{Stealth[length=5pt]},draw=accent,thick}
+]
+\node[box] (m) {model\_id\\{\scriptsize dal pacchetto}};
+\node[box,right=8mm of m] (r) {registro\\{\scriptsize pesi, forma, banco}};
+\node[box,right=8mm of r] (n) {inferenza\\{\scriptsize invariata}};
+\node[box,right=8mm of n] (k) {(model\_id, classe)\\{\scriptsize una lettura}};
+\node[box,right=8mm of k] (a) {azione};
+\draw[arr] (m) -- (r);
+\draw[arr] (r) -- (n);
+\draw[arr] (n) -- (k);
+\draw[arr] (k) -- (a);
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+\item \textbf{Una tabella ad accesso diretto, non una tabella hash}: 256 modelli
+      $\times$ 2 banchi $\times$ 32 classi. Resta una sola lettura per pacchetto,
+      come prima, e nessun ciclo sui modelli registrati.
+\item \textbf{Due banchi per modello.} Ricaricare un modello scrive il banco
+      inattivo, poi un'unica scrittura del registro cambia insieme il numero di
+      classi e il banco in uso. Un pacchetto vede la semantica vecchia o quella
+      nuova, mai una tabella scritta a metà.
+\item \textbf{Perché non dentro il registro}, che il programma ha già letto: usare
+      la classe come indice dentro quel valore costringe il verificatore a
+      seguirne il valore esatto attraverso tutto l'argmax, e smette di potare i
+      cammini. Misurato: \texttt{layer\_hidden} di P3 non si carica più.
+\end{itemize}
+
+\textbf{La prova.} Modelli costruiti in modo che il TTL scelga la classe, così
+ogni classe di ogni modello è raggiungibile: un modello solo, due con la stessa
+semantica, due con semantiche opposte su ogni classe a pacchetti alternati, un
+modello inesistente o rimosso, numeri di classi diversi, un modello ricaricato
+con un'altra semantica. \textbf{53/53} su P2 e P3. Con una tabella condivisa
+simulata gli stessi test falliscono dove devono: il test distingue le due cose.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{\textbf{P2}} & \multicolumn{2}{c}{\textbf{P3}} \\
+& classe sola & per modello & classe sola & per modello \\
+\midrule
+istruzioni          & 14\,985 & 14\,976 & 12\,349 & 12\,426 \\
+letture di tabella  & 11 & 11 & 29 & 29 \\
+latenza, mediana    & 289 ns & 298 ns & 481 ns & 470 ns \\
+memoria delle tabelle & 11\,192 B & 142\,264 B & 20\,284 B & 151\,356 B \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+Il datapath non se ne accorge: stesse letture, pochi byte di codice in più o in
+meno, latenza entro il rumore, e nessuna crescita da 1 a 8 modelli. Il prezzo è
+in memoria: 128~KiB fissi per pipeline, riservati per 256 modelli anche quando ne
+è caricato uno solo.
+\end{lezione}
 
 % ==================================================================
 \chapter{Il motore non è lo scenario}
@@ -3158,6 +3233,11 @@ questa macchina cambia velocità da una sessione all'altra (la rimisura
 parametrica è uscita circa il 40\% più veloce della precedente su tutte le
 pipeline). Dentro una riga le cifre si confrontano; fra righe diverse si
 confrontano solo i rapporti.
+
+\textbf{Dopo il 24 settembre} (semantica delle classi per modello, capitolo
+\ref{ch:classi}) P2 e P3 contano 14\,976 e 12\,426 istruzioni invece di
+14\,985 e 12\,349, con le stesse letture di tabella e latenza entro il rumore;
+le loro tabelle occupano 128~KiB in più. Le altre righe non cambiano.
 \end{prima}
 
 % ==================================================================
@@ -3189,6 +3269,10 @@ confrontano solo i rapporti.
 \item \textbf{versione P1 specializzata}: congela anche l'indice del nodo, e
       toglie alla pipeline hardcoded la dipendenza dalla taglia della rete ---
       al prezzo di un binario per nodo;
+\item \textbf{semantica delle classi per modello} in P2 e P3: modelli con
+      significati diversi per la stessa classe convivono nello stesso programma,
+      con una sola lettura per pacchetto come prima e latenza invariata; costa
+      128~KiB di tabelle per pipeline (capitolo \ref{ch:classi});
 \item P2 non è più fissa a due hidden layer: la profondità è diventata un
       inviluppo compilato come già lo erano le larghezze --- al prezzo, onesto e
       misurato, di una ricompilazione per profondità.
@@ -3354,6 +3438,13 @@ sudo python3 ipa/test/test_suite.py --only kernel \
 
 # piu' modelli caricati insieme: si smistano davvero per model_id?
 sudo python3 ipa/test/verify_multi_model.py
+
+# ogni modello la sua semantica: classe -> azione per (model_id, classe)
+sudo python3 ipa/test/verify_per_model_semantics.py
+
+# quanto costa, contro la versione a classe sola (albero di riferimento)
+sudo python3 -u ipa/test/bench_semantics_models.py \
+     --baseline-dir /tmp/ipa_base/ipa --trials 21
 
 # le stesse prove di semantica e topologia, ma dentro al kernel
 sudo python3 ipa/test/test_class_semantics.py --kernel
