@@ -105,6 +105,8 @@ USAGE
     sudo python3 ipa/test/bench_scaling.py                  # all three axes
     sudo python3 ipa/test/bench_scaling.py --axis nodes
     sudo python3 ipa/test/bench_scaling.py --axis depth --trials 15
+    sudo python3 ipa/test/bench_scaling.py --axis depth --seeds 42,1,2,3,7
+                                             # same axis, 5 weight pools
     sudo python3 ipa/test/bench_scaling.py --out results/   # CSV per axis
 
     python3 ipa/test/bench_scaling.py --plot results/       # no root needed
@@ -693,7 +695,7 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    weights = make_weights(nw, cell["sparsity"])
+    weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
     sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     def _load(strumentata=False):
@@ -770,7 +772,7 @@ def _bench_p2(cell, repeat, trials):
     shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    weights = make_weights(nw, cell["sparsity"])
+    weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
     sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     # The source does not mention the model's WIDTHS anywhere -- that is P2's
@@ -843,7 +845,7 @@ def _bench_p3(cell, repeat, trials):
     shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    weights = make_weights(nw, cell["sparsity"])
+    weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
     sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     sizes = [n_in] + list(dims) + [n_out]
@@ -1209,8 +1211,10 @@ def _build_p1(cell, static_node):
     shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    # `seed` esiste solo per il controllo negativo di verify_ports: la misura
-    # usa sempre il pool di default, altrimenti l'asse cambierebbe due cose.
+    # `seed` serve al controllo negativo di verify_ports e a --seeds. Una
+    # curva lungo l'asse usa sempre UN seme, altrimenti l'asse cambierebbe due
+    # cose: --seeds misura ogni punto con tutti i semi, e ogni seme resta una
+    # curva a se'.
     weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
     setup = p1_aot.load_p1(
         [(0, weights, SCALE)], features=shape["features"],
@@ -1435,9 +1439,20 @@ def _write_csv(path, rows):
     print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
 
 
-def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
+def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False,
+             seeds=None):
     """Un asse. Restituisce le righe; `write=False` le lascia al chiamante,
-    che e' come i quattro assi della campagna finiscono in un CSV solo."""
+    che e' come i quattro assi della campagna finiscono in un CSV solo.
+
+    `seeds`: misura ogni punto x una volta per seme del pool dei pesi
+    (make_weights), i semi dello stesso punto uno dopo l'altro, cosi' un drift
+    della macchina li colpisce allo stesso modo. Ogni seme resta una curva
+    completa lungo l'asse. Ogni punto x diventa len(seeds) misure, e si vede
+    quanto della curva di P1 / P1.5 dipende dai VALORI dei pesi e quanto dalla
+    variabile sull'asse x. P2 e P3 fanno da controllo: il loro programma non
+    contiene i pesi, quindi istruzioni identiche a ogni seme. Le righe portano
+    la colonna `seed` e vanno in scaling_<asse>_seeds.csv, senza toccare il
+    CSV a seme unico."""
     spec = AXES[axis]
     print(f"\n{YELLOW}{'=' * 78}{NC}")
     print(f"{YELLOW} asse x: {spec['xlabel']}{NC}")
@@ -1455,10 +1470,14 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
     # entra negli assi della campagna. Gli assi storici restano a quattro
     # pipeline, cosi' i loro CSV conservano le stesse righe di prima.
     pipelines = (("baseline",) + PIPELINES) if spec.get("campaign") else PIPELINES
+    falliti = []      # (x, pipeline, seme) delle celle non misurate
 
-    for v in spec["values"]:
+    for v, seed in [(v, s) for v in spec["values"] for s in (seeds or [None])]:
         cell = cell_of(axis, v)
         cell["lookups"] = lookups     # viaggia in JSON fino al worker
+        if seed is not None:
+            cell["seed"] = seed       # anche questo: lo legge make_weights
+        tag = f" seme {seed}" if seed is not None else ""
         dims = cell["dims"]
         # Computed here, not read back from the result: a cell that was
         # skipped or that crashed has no n_in to report, and printing "?-4-7"
@@ -1486,7 +1505,7 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
                 # ore, che il banco sta andando avanti e su quale cella.
                 t_cella = time.time()
                 print(f"  {GREY}[{time.strftime('%H:%M:%S')}] {axis} x={v} "
-                      f"{pipe} ...{NC}", flush=True)
+                      f"{pipe}{tag} ...{NC}", flush=True)
                 r = bench_cell(pipe, cell, repeat, trials)
                 r = dict(r, _secs=round(time.time() - t_cella, 1))
                 if not r.get("ok"):
@@ -1503,8 +1522,11 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
                 print(f"  {str(v):>5s} {pipe:11s} {shape_str:>16s} {r['nw']:6d} "
                       f"{r['insns']:7d} {r['lat_ns']:7.1f} "
                       f"{r['update_ms']:10.2f} {r['build_ms']:9.1f} "
-                      f"{r['map_bytes']:8d} {r['tail']:4d}")
-                rows.append(dict(axis=axis, x=v, pipeline=pipe,
+                      f"{r['map_bytes']:8d} {r['tail']:4d}{tag}")
+                # `seed` solo quando si e' chiesto --seeds: senza, la riga e
+                # quindi il CSV restano identici a quelli gia' raccolti.
+                col_seme = {"seed": seed} if seed is not None else {}
+                rows.append(dict(axis=axis, x=v, pipeline=pipe, **col_seme,
                                  shape=shape_str, **forma_riga, **{
                                      k: r[k] for k in
                                      ("nw", "n_in", "insns", "jited",
@@ -1527,18 +1549,80 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False):
                 else:
                     mark = f"{RED}CRASH{NC}"
                 print(f"  {str(v):>5s} {pipe:11s} {shape_str:>16s} {'':6s} "
-                      f"{mark} {GREY}{r.get('detail', '')[:90]}{NC}")
+                      f"{mark}{tag} {GREY}{r.get('detail', '')[:90]}{NC}")
+                if str(r.get("detail", "")).startswith("soffitto compilato"):
+                    genere = "soffitto"        # dipende dalla forma, non dal seme
+                elif r.get("refused"):
+                    genere = "verificatore"
+                elif r.get("skipped"):
+                    genere = "n/d"
+                else:
+                    genere = "crash"
+                falliti.append((v, pipe, seed, genere))
 
     _warn_contaminated(rows)
+    if seeds:
+        _summary_seeds(axis, rows, falliti, seeds)
 
     if out_dir and write:
         os.makedirs(out_dir, exist_ok=True)
         _give_back(out_dir)
+        nome = f"scaling_{axis}_seeds.csv" if seeds else f"scaling_{axis}.csv"
         if rows:
-            _write_csv(os.path.join(out_dir, f"scaling_{axis}.csv"), rows)
+            _write_csv(os.path.join(out_dir, nome), rows)
         else:
             print(f"\n  {RED}nessuna riga da scrivere per {axis}{NC}")
     return rows
+
+
+def _summary_seeds(axis, rows, falliti, seeds):
+    """Per ogni (x, pipeline): mediana e intervallo fra i semi.
+
+    Un programma che non si carica con un seme e con un altro si' (claims.md,
+    C4) non e' un guasto del banco: e' un risultato, e il riepilogo lo conta
+    invece di nasconderlo nella mediana."""
+    import statistics
+    print(f"\n{YELLOW} {axis}: {len(seeds)} semi del pool dei pesi "
+          f"({', '.join(map(str, seeds))}){NC}")
+    hdr = (f"  {'x':>5s} {'pipeline':11s} {'caricati':>8s} "
+           f"{'insns mediana':>13s} {'[min - max]':>15s} "
+           f"{'ns mediana':>10s} {'[min - max]':>13s}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    xs = []
+    for r in rows:
+        if r["x"] not in xs:
+            xs.append(r["x"])
+    for f in falliti:
+        if f[0] not in xs:
+            xs.append(f[0])
+    pipes = []
+    for r in rows:
+        if r["pipeline"] not in pipes:
+            pipes.append(r["pipeline"])
+    for x in xs:
+        for pipe in pipes:
+            sel = [r for r in rows if r["x"] == x and r["pipeline"] == pipe]
+            ko = [(f[2], f[3]) for f in falliti if f[0] == x and f[1] == pipe]
+            if not sel and not ko:
+                continue
+            ins = [r["insns"] for r in sel]
+            lat = [r["lat_ns"] for r in sel]
+            if sel:
+                ins_s = (f"{statistics.median(ins):13.0f} "
+                         f"{'[' + str(min(ins)) + ' - ' + str(max(ins)) + ']':>15s}")
+                lat_s = (f"{statistics.median(lat):10.1f} "
+                         f"{'[' + f'{min(lat):.0f}' + ' - ' + f'{max(lat):.0f}' + ']':>13s}")
+            else:
+                ins_s = f"{'-':>13s} {'':>15s}"
+                lat_s = f"{'-':>10s} {'':>13s}"
+            nota = ""
+            for genere in ("verificatore", "crash", "soffitto", "n/d"):
+                semi = [str(k[0]) for k in ko if k[1] == genere]
+                if semi:
+                    nota += f"  {RED}{genere}: seme {', '.join(semi)}{NC}"
+            print(f"  {str(x):>5s} {pipe:11s} {f'{len(sel)}/{len(sel) + len(ko)}':>8s} "
+                  f"{ins_s} {lat_s}{nota}")
 
 
 # ==========================================================================
@@ -1919,6 +2003,12 @@ def main():
     p.add_argument("--ports", default=None,
                    help="porte presenti per --verify-ports, es. '0,1,4' "
                         "(default 0,1,4)")
+    p.add_argument("--seeds", default=None, metavar="S1,S2,...",
+                   help="ripete l'asse per ogni seme del pool dei pesi, es. "
+                        "'42,1,2,3,7', e scrive scaling_<asse>_seeds.csv con "
+                        "mediana e intervallo per punto. Per la dipendenza di "
+                        "P1/P1.5 dai valori dei pesi; P2/P3 fanno da "
+                        "controllo. Solo con --axis <un asse storico>")
     p.add_argument("--all-plots", action="store_true",
                    help="disegna tutte le combinazioni metrica x asse, non "
                         "solo quelle che portano un risultato")
@@ -1960,6 +2050,17 @@ def main():
     # that meant it to go.
     out_dir = os.path.abspath(a.out)
     os.chdir(SHARED_DIR)
+
+    semi = None
+    if a.seeds:
+        semi = [int(x) for x in a.seeds.split(",") if x.strip()]
+        if a.axis in ("all", "campaign") or AXES[a.axis].get("campaign"):
+            sys.exit("--seeds vale per UN asse storico alla volta, es. "
+                     "--axis depth --seeds 42,1,2,3,7")
+        righe = run_axis(a.axis, a.repeat, a.trials, out_dir,
+                         lookups=a.lookups, seeds=semi)
+        return 0 if righe else 1
+
     if a.axis == "all":
         axes = LEGACY_AXES          # invariato: i sette assi di sempre
     elif a.axis == "campaign":

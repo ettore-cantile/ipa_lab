@@ -421,6 +421,12 @@ aggiungere un modello resta scrivere delle tabelle.
       la classe come indice dentro quel valore costringe il verificatore a
       seguirne il valore esatto attraverso tutto l'argmax, e smette di potare i
       cammini. Misurato: \texttt{layer\_hidden} di P3 non si carica più.
+\item \textbf{Senza un valore vivo in più.} Il primo strato di P3 sta al
+      limite dei 512 byte di stack nelle sue versioni strumentate (quella che
+      conta le letture e quella con i timestamp T1/T2 del test reale): tenere
+      vivi fino alla fine \texttt{model\_id} e il registro la faceva sforare. La
+      chiave viaggia allora nella variabile che già diceva «questo è l'ultimo
+      strato», e il programma cresce di 9 istruzioni.
 \end{itemize}
 
 \textbf{La prova.} Modelli costruiti in modo che il TTL scelga la classe, così
@@ -437,9 +443,9 @@ simulata gli stessi test falliscono dove devono: il test distingue le due cose.
 & \multicolumn{2}{c}{\textbf{P2}} & \multicolumn{2}{c}{\textbf{P3}} \\
 & classe sola & per modello & classe sola & per modello \\
 \midrule
-istruzioni          & 14\,985 & 14\,976 & 12\,349 & 12\,426 \\
+istruzioni          & 14\,985 & 14\,976 & 12\,349 & 12\,374 \\
 letture di tabella  & 11 & 11 & 29 & 29 \\
-latenza, mediana    & 289 ns & 298 ns & 481 ns & 470 ns \\
+latenza, mediana    & 289 ns & 298 ns & 477 ns & 489 ns \\
 memoria delle tabelle & 11\,192 B & 142\,264 B & 20\,284 B & 151\,356 B \\
 \bottomrule
 \end{tabular}
@@ -3235,7 +3241,7 @@ pipeline). Dentro una riga le cifre si confrontano; fra righe diverse si
 confrontano solo i rapporti.
 
 \textbf{Dopo il 24 settembre} (semantica delle classi per modello, capitolo
-\ref{ch:classi}) P2 e P3 contano 14\,976 e 12\,426 istruzioni invece di
+\ref{ch:classi}) P2 e P3 contano 14\,976 e 12\,374 istruzioni invece di
 14\,985 e 12\,349, con le stesse letture di tabella e latenza entro il rumore;
 le loro tabelle occupano 128~KiB in più. Le altre righe non cambiano.
 \end{prima}
