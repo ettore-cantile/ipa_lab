@@ -1718,6 +1718,149 @@ fra i due non cambia mai. Servirebbero due macchine, o una NIC che supporti XDP 
 Quello che resta valido, ed è su cui si basano 11.2 e 11.3: il **confronto** fra pipeline a
 parità di condizioni, e il costo per pacchetto in regime senza perdite.
 
+## 12. Al crescere del bit rate: ritardo, ricevuti, rilanciati (`bench_bitrate.py`)
+
+La domanda del relatore: al crescere del bit rate inviato la coda si riempie, il tempo
+end-to-end cresce e poi si perde; se si perde all'**uscita** del programma il collo di
+bottiglia è trasmissivo, se si perde all'**ingresso** è il programma eBPF. Contare quanti
+pacchetti il programma riceve e quanti ne rilancia, con due programmi sullo stesso XDP: uno
+che conta soltanto, uno con la pipeline.
+
+### 12.1 Come si legge su XDP
+
+Un programma XDP gira dall'inizio alla fine su ogni pacchetto, dentro il poll NAPI: non ha
+una coda sua, e ogni pacchetto che entra esce con un verdetto. Se il programma è lento si
+riempie la coda che sta **davanti** a lui (su veth il `ptr_ring`, 256 descrittori per coda):
+il ritardo cresce, poi la coda trabocca e i pacchetti si perdono **prima di XDP**.
+
+| si osserva | vuol dire |
+|---|---|
+| inviati > ricevuti da XDP | coda d'ingresso piena: collo il **programma** (o la ricezione — lo separa `rxonly`, il solo contatore allo stesso rate) |
+| ricevuti > inoltrati, con HIT > inoltrati | il programma ha deciso l'inoltro ma il pacchetto non è arrivato: collo **trasmissivo** (redirect o coda d'uscita) |
+| ricevuti > inoltrati, con MISS/DROP | una **decisione** del modello, non una perdita |
+
+"Il programma riceve ma non riesce a rilanciare" non esiste come coda interna: fra
+ricevuti e rilanciati ci sono solo le decisioni e i fallimenti dell'uscita, e il test li
+conta separatamente.
+
+### 12.2 I due programmi sullo stesso hook
+
+Un'interfaccia porta **un** programma XDP. Due si ottengono in catena, con la tail call che
+P1, P2 e P3 usano già:
+
+```
+hook XDP di ipatg0 ─► xdp_ing_count   ing_count[0] += 1   (mappa per-CPU, niente atomiche)
+                        │ bpf_tail_call(ing_next[0])
+                        ▼
+                      dispatcher della pipeline di produzione (P1/P1.5/P2/P3/baseline)
+                        │ bpf_redirect
+                        ▼
+                      ipaN ──veth──► ipaNp: xdp_rx_lat   rx_count += 1  (+ latenza)
+```
+
+Se la tail call non parte il contatore incrementa `ing_count[1]` e scarta: è un contatore
+che deve restare a zero, e il test lo controlla a ogni finestra. La tail call richiede
+programmi compatibili — stesso tipo, stesso JIT e, sui kernel recenti, stesso
+`expected_attach_type`, che BCC lascia a 0 e libbpf mette a `BPF_XDP` — quindi il contatore
+viene caricato dallo **stesso caricatore** della pipeline: un oggetto BCC per baseline, P2 e
+P3; per P1 e P1.5 aggiunto in coda al sorgente dello **stesso oggetto AOT** (lo fa già la
+build strumentata `_instrument_aot_latency`). I programmi della pipeline restano quelli di
+produzione. `rxonly` è il contatore con lo slot vuoto: conta e scarta.
+
+Quanto costa la catena si misura, non si suppone: la fase finale porta ogni pipeline a rate
+massimo con e senza contatore davanti (`bitrate_overhead.csv`).
+
+### 12.3 Contatori e formule
+
+| grandezza | dove si conta | come si legge |
+|---|---|---|
+| inviati | pktgen: `pkts-sofar` + `errors` (respinti a coda d'ingresso piena) | `/proc/net/pktgen/<istanza>` |
+| ricevuti da XDP | `ing_count[0]`, programma 1 | somma per-CPU |
+| decisioni | `pkt_stats[0..2]` della pipeline (HIT, MISS, DROP) | mappa della pipeline |
+| inoltrati | `rx_count` sul nodo successivo (arrivati davvero) | somma per-CPU |
+
+Ogni punto è **una finestra stazionaria** di `bench_throughput`: pktgen parte, si aspetta che
+tutte le istanze trasmettano, si leggono tutti i contatori (lettura sotto i 3 ms), si
+aspettano `--duration` secondi (default 0,3), si rileggono, si ferma pktgen. La riga
+contiene le **differenze** fra le due letture; `duration_s` è l'intervallo fra i loro
+istanti medi. Nessun contatore si azzera, tranne l'istogramma della latenza, che si azzera
+prima di ogni punto.
+
+```
+loss_before_xdp  = inviati − ricevuti            = respinti + persi fra veth e XDP
+loss_in_pipeline = ricevuti − inoltrati          = (MISS + DROP) + (HIT − inoltrati) + residuo
+packets_lost     = inviati − inoltrati           (le percentuali sono sugli inviati e si sommano)
+bitrate_sent     = inviati / duration_s × frame × 8     (frame = pkt_size, senza FCS: byte sul veth)
+```
+
+`bitrate_sent_l1_gbps` aggiunge i 24 byte per frame di una Ethernet vera, solo come
+riferimento. Sull'asse dei grafici va il bit rate **misurato**: sopra il tetto del
+generatore il chiesto e l'inviato divergono (`gen_limited`).
+
+**Collo di bottiglia** (colonna `bottleneck`): la perdita prima di XDP della pipeline meno
+quella di `rxonly` allo stesso rate, contro la perdita all'uscita, con soglia
+`--loss-threshold` (default 1 punto percentuale: sotto capacità anche il solo contatore
+respinge l'1-2% su questa VM).
+
+### 12.4 La latenza end-to-end
+
+pktgen scrive già in ogni pacchetto, subito dopo UDP, magic `0xbe9be955`, seq, `tv_sec` e
+`tv_usec`: l'istante in cui ha costruito il pacchetto (`CLOCK_REALTIME`, µs). Il programma
+d'uscita lo confronta col proprio orologio:
+
+```
+lat_us = floor((bpf_ktime_get_ns() + off) / 1000) − (tv_sec·10⁶ + tv_usec)
+off    = CLOCK_REALTIME − CLOCK_MONOTONIC, letto prima di ogni punto
+```
+
+Il percorso misurato è tutto il nodo, **attesa in coda compresa** — che è ciò che cresce.
+`T3−T1` di `--mode rates` parte invece dall'ingresso del programma e la coda non la vede.
+
+**La correzione.** pktgen timbra il pacchetto e *poi* aspetta il momento di trasmetterlo
+(`spin()` fino a `next_tx`): a rate basso quell'attesa è quasi tutto il `delay`, ~10 µs a
+0,2 Mpps. pktgen la accumula nel suo contatore `idle`; Δidle / inviati si sottrae da ogni
+statistica (`e2e_spin_correction_us`), e i valori non corretti restano nel CSV
+(`e2e_latency_p50_raw_us`).
+
+Risoluzione 1 µs; istogramma a celle da 1 µs fino a 4096 µs più il trabocco; un pacchetto
+cronometrato ogni `mask+1` (circa `--lat-samples` per finestra, 20 000), solo fra le due
+letture della finestra. Il conteggio dei pacchetti è sempre completo.
+
+### 12.5 Comandi e uscite
+
+```bash
+# tutte le pipeline + rxonly, scala di default 0,1–3 Gbit/s a 64 B, 3 giri
+sudo python3 ipa/test/bench_bitrate.py --out results/bitrate
+
+# una scala scelta, meno metodi, più giri
+sudo python3 ipa/test/bench_bitrate.py --bitrates 0.5,1,1.5,2,2.5 \
+    --method rxonly,baseline,p1_static,template,modular --rounds 5 --out results/bitrate
+
+# i grafici dal CSV, anche fuori dalla VM
+python3 ipa/test/plot_bitrate.py results/bitrate
+
+# le formule, senza kernel
+python3 ipa/test/test_bitrate_math.py
+```
+
+| file | contenuto |
+|---|---|
+| `bitrate_raw.csv` | una riga per (metodo, rate, giro): `bitrate_sent_gbps`, `packets_sent`, `packets_received_by_xdp`, `packets_forwarded`, `packets_lost`, `loss_before_xdp`, `loss_in_pipeline` (+ scomposizione), `sent_pps`, `rx_pps`, `forwarded_pps`, `loss_*_pct`, `e2e_latency_p50/p90/p99/mean/min/max_us`, `duration_s` |
+| `bitrate.csv` | mediana fra i giri, min/max, `rxonly_loss_before_xdp_pct`, `bottleneck` |
+| `bitrate_overhead*.csv` | costo del contatore: ns per pacchetto con e senza catena |
+| `bitrate_latency`, `bitrate_pps`, `bitrate_loss` (.png/.pdf) | i tre grafici: latenza (p50, p99), pacchetti/s (inviati, ricevuti, inoltrati), perdita (prima di XDP, nella pipeline, pavimento rxonly) |
+
+### 12.6 Limiti
+
+- Tutto sta sulla stessa VM: senza `--egress-cpu` la ricezione del nodo successivo gira
+  sulla CPU del DUT (come in `--mode rates`), quindi una perdita all'uscita qui è
+  improbabile per costruzione; con `--egress-cpu 0` l'uscita ha una CPU sua.
+- Le cifre assolute sono di questo percorso veth su un vCPU (vedi 11.1 e 11.6); il
+  confronto fra pipeline e la forma delle curve sono ciò che il test sostiene.
+- Scritto e verificato **senza kernel** (`test_bitrate_math.py`, 70 controlli, e mutazioni
+  che li fanno fallire): la compilazione BCC/clang dei due programmi e il primo run si
+  fanno nella VM.
+
 ## Note oneste
 
 - **Ordine design-space confermato**: costo (istruzioni, jited, tail call, lookup, memoria)

@@ -130,6 +130,11 @@ ipa_lab/
 │       ├── bench_throughput.py      #      real traffic on veth: node cost per packet
 │       │                            #        (--mode compare --generator xdp --egress-cpu 0)
 │       ├── xdp_gen.py               #      XDP live-frames generator (no skb, no copy)
+│       ├── bench_bitrate.py         #      offered bit rate sweep: e2e latency, packets
+│       │                            #        received by XDP (counter -> tail call ->
+│       │                            #        pipeline) vs forwarded, where loss starts
+│       ├── plot_bitrate.py          #      its three figures, from bitrate.csv
+│       ├── test_bitrate_math.py     #      its formulas and loss attribution, no kernel
 │       └── test_steady_window.py    #      steady measurement window, no kernel needed
 │
 ├── topologies/                      # 3. SCENARIO DATA — one directory per network
