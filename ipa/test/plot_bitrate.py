@@ -93,9 +93,13 @@ def _lossy(r):
 
 
 def _onset(rows, method):
+    """Il rate da cui TUTTI i rate piu' alti perdono (come
+    bench_bitrate.onsets): una riga in perdita seguita da righe pulite e' una
+    finestra disturbata, non l'inizio della perdita."""
     pts = sorted((r for r in rows if r["method"] == method),
                  key=lambda r: r["rate_requested_pps"])
-    return next((r for r in pts if _lossy(r)), None)
+    lossy = [_lossy(r) for r in pts]
+    return next((pts[i] for i in range(len(pts)) if all(lossy[i:])), None)
 
 
 def _save(fig, out_dir, name):

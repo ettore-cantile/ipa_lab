@@ -68,10 +68,10 @@ def t_mask():
     check("potenza di 2, fra meta' bersaglio e bersaglio", ok)
 
 
-def _hist(pairs, n=None):
-    h = [0] * ((n or BB.LAT_US_BUCKETS) + 1)
+def _hist(pairs):
+    h = [0] * (BB.LAT_CELLS + 1)
     for us, c in pairs:
-        h[us] += c
+        h[BB.lat_cell(us)] += c
     return h
 
 
@@ -86,6 +86,29 @@ def t_percentile():
     v, clipped = BB.hist_percentile([0, 0, 0, 0, 10], 0.5)
     check("oltre l'istogramma: bordo e segnalato", v == 4.0 and clipped)
     check("vuoto", BB.hist_percentile([0, 0, 0], 0.5) == (None, False))
+    # due passi: 1 us fino a 1024, poi 64 us fino a 65 536, poi trabocco
+    check("celle fini fino a 1023 us",
+          BB.lat_cell(0) == 0 and BB.lat_cell(1023) == 1023)
+    check("celle da 64 us da 1024",
+          BB.lat_cell(1024) == 1024 and BB.lat_cell(1087) == 1024
+          and BB.lat_cell(1088) == 1025)
+    check("ultima cella grossa e trabocco",
+          BB.lat_cell(65535) == BB.LAT_CELLS - 1
+          and BB.lat_cell(65536) == BB.LAT_CELLS
+          and BB.lat_cell(10 ** 7) == BB.LAT_CELLS)
+    check("valore di una cella grossa = il suo centro",
+          BB.lat_cell_value(1025) == 1024 + 64 + 32)
+    check("il centro ricade nella sua cella",
+          all(BB.lat_cell(BB.lat_cell_value(i)) == i
+              for i in range(BB.LAT_CELLS)))
+    h = _hist([(10, 90), (3000, 10)])
+    v, clipped = BB.hist_percentile(h, 0.99)
+    check("p99 a 3 ms entro 32 us, non tagliato",
+          abs(v - 3000) <= 32 and not clipped, str(v))
+    h = _hist([(10, 90), (70_000, 10)])
+    v, clipped = BB.hist_percentile(h, 0.99)
+    check("oltre 65,5 ms: tagliato al bordo",
+          v == float(BB.LAT_MAX_US) and clipped)
 
 
 def t_latency():
@@ -176,6 +199,11 @@ def t_rates():
     check("inviato sotto il 95% del chiesto -> tetto del generatore",
           g["gen_limited"])
     check("al chiesto -> non limitato", not r["gen_limited"])
+    bu = _row(tx=12000, rej=0, rx=12000, fwd=12000, hit=12000, secs=0.01,
+              rate=1_000_000)
+    check("inviato oltre il 105% del chiesto -> raffica di recupero",
+          bu["gen_burst"] and not bu["gen_limited"])
+    check("al chiesto -> nessuna raffica", not r["gen_burst"])
     ref = _row(tx=10000, rej=0, rx=10000, method="rxonly")
     check("rxonly: niente inoltro, niente latenza (vuoti, non zero)",
           ref["reference"] and ref["packets_forwarded"] is None
@@ -241,21 +269,35 @@ def t_summary():
     check("rxonly non entra negli inizi",
           all(o["method"] != "rxonly" for o in BB.onsets(s)))
 
+    # una riga in perdita seguita da righe pulite: sporadica, non l'inizio
+    def srow(rate, label):
+        return dict(method="modular", frame=64, rate_requested_pps=rate,
+                    reference=False, bottleneck=label, forwarded_pps=rate,
+                    loss_in_pipeline_pct=0.0)
+    noisy = [srow(1, BB.LABEL_NONE), srow(2, BB.LABEL_PROG),
+             srow(3, BB.LABEL_NONE), srow(4, BB.LABEL_PROG),
+             srow(5, BB.LABEL_PROG)]
+    o = BB.onsets(noisy)[0]
+    check("inizio = da dove perdono tutti i rate piu' alti (4, non 2)",
+          o["first_loss"]["rate_requested_pps"] == 4
+          and o["last_clean"]["rate_requested_pps"] == 3)
+    check("la riga isolata e' sporadica",
+          [x["rate_requested_pps"] for x in o["sporadic"]] == [2])
+    tail = [srow(1, BB.LABEL_NONE), srow(2, BB.LABEL_PROG),
+            srow(3, BB.LABEL_NONE)]
+    check("perdita non persistente fino all'ultimo rate -> nessun inizio",
+          BB.onsets(tail)[0]["first_loss"] is None)
+
 
 def t_probe():
-    print("[8] il cancello della latenza fra le due letture")
-    events, t = [], [0.0]
-    p = BB.Probe(lambda: {"x": 1}, events.append, 0.3, clock=lambda: t[0])
-    for now in (0.0, 0.002, 0.004):      # prima marcatura, con due rifatte
-        t[0] = now
-        p()
-    check("aperto alla prima lettura, le rifatte non lo chiudono",
-          events == [1])
-    for now in (0.301, 0.303):           # seconda marcatura, e una rifatta
-        t[0] = now
-        out = p()
-    check("chiuso alla seconda, una volta sola", events == [1, 0])
-    check("restituisce i contatori", out == {"x": 1})
+    print("[8] il cancello della latenza")
+    events = []
+    p = BB.Probe(lambda: {"x": 1}, events.append)
+    out = [p() for _ in range(5)]       # A, rifatte di A, B, rifatta di B
+    check("aperto alla prima lettura, una volta sola", events == [1])
+    check("la sonda non lo chiude (lo chiude chi ferma pktgen)",
+          0 not in events)
+    check("restituisce i contatori", out[-1] == {"x": 1})
 
 
 def t_idle_parse():
@@ -264,6 +306,28 @@ def t_idle_parse():
             "     started: 123456us  stopped: 123999us idle: 789us\n")
     check("idle letto", BB.parse_idle_us(text) == 789)
     check("assente -> None", BB.parse_idle_us("pkts-sofar: 1") is None)
+
+
+def t_overhead():
+    print("[11] costo del contatore")
+    check("ns per esecuzione fra due letture di fdinfo",
+          BB.per_run_ns((1000, 10), (6000, 110)) == 50.0)
+    check("contatori fermi (statistiche spente) -> None",
+          BB.per_run_ns((1000, 10), (1000, 10)) is None
+          and BB.per_run_ns((None, None), (5, 5)) is None)
+    over = []
+    for rep, (pc, pd, cc, cd) in enumerate(((180.0, 170.0, 500.0, 430.0),
+                                            (181.0, 171.0, 420.0, 460.0),
+                                            (182.0, 170.0, 800.0, 440.0))):
+        for var, prog, cost in (("catena", pc, cc), ("diretta", pd, cd)):
+            over.append(dict(method="baseline", variant=var, rep=rep + 1,
+                             prog_ns=prog, cost_ns=cost))
+    o = BB.summarise_overhead(over)[0]
+    check("contatore dal tempo del programma: mediana 181 - 170 = 11 ns",
+          o["prog_overhead_ns"] == 11.0 and o["reps"] == 3)
+    check("dal throughput resta anche lo scarto fra le finestre",
+          o["cost_overhead_ns"] == 60.0
+          and o["cost_spread_chain_ns"] == 380.0)
 
 
 def t_sources():
@@ -280,8 +344,12 @@ def t_sources():
               and src.count("(") == src.count(")"))
     eg = BB.EGRESS_LAT_BCC
     check("uscita: parametri sostituiti",
-          "#define LAT_US_BUCKETS 4096" in eg and "#define PG_OFF 42" in eg
-          and "%(" not in eg)
+          f"#define LAT_CELLS {BB.LAT_CELLS}" in eg
+          and "#define LAT_FINE_US 1024" in eg
+          and "#define LAT_STEP_SHIFT 6" in eg
+          and "#define PG_OFF 42" in eg and "%(" not in eg)
+    check("uscita: si campiona sul contatore degli arrivi PRIMA di leggere "
+          "il pacchetto", 0 <= eg.find("(*cnt & *mask)") < eg.find("h[0]"))
     check("uscita: magic di pktgen 0xbe9be955 byte per byte",
           "h[0] != 0xbe" in eg and "h[1] != 0x9b" in eg
           and "h[2] != 0xe9" in eg and "h[3] != 0x55" in eg)
@@ -307,7 +375,7 @@ def t_sources():
 
 def main():
     for t in (t_bitrate, t_mask, t_percentile, t_latency, t_losses, t_rates,
-              t_summary, t_probe, t_idle_parse, t_sources):
+              t_summary, t_probe, t_idle_parse, t_sources, t_overhead):
         t()
     n, ok = len(RESULTS), sum(RESULTS)
     print(f"\n{ok}/{n} PASS")

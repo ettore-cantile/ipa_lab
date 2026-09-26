@@ -1768,7 +1768,13 @@ build strumentata `_instrument_aot_latency`). I programmi della pipeline restano
 produzione. `rxonly` è il contatore con lo slot vuoto: conta e scarta.
 
 Quanto costa la catena si misura, non si suppone: la fase finale porta ogni pipeline a rate
-massimo con e senza contatore davanti (`bitrate_overhead.csv`).
+massimo con e senza contatore davanti e legge dal kernel il tempo del programma attaccato
+(`kernel.bpf_stats_enabled`, `run_time_ns / run_cnt`; tail call comprese, girano dentro la
+sua esecuzione). Con la catena è contatore + pipeline, senza è la pipeline: la differenza è
+il programma 1. Accanto resta la stima dal throughput, che dice quanto rallenta il nodo ma
+su questa VM ha uno scarto di centinaia di ns fra finestre uguali — al primo run (tre
+finestre per variante) dava +34…+56 ns con p1_static "catena" a 775 e poi a 483 ns
+(`bitrate_overhead.csv`).
 
 ### 12.3 Contatori e formule
 
@@ -1802,6 +1808,14 @@ quella di `rxonly` allo stesso rate, contro la perdita all'uscita, con soglia
 `--loss-threshold` (default 1 punto percentuale: sotto capacità anche il solo contatore
 respinge l'1-2% su questa VM).
 
+**Inizio della perdita**: il rate più basso da cui *tutti* i rate più alti perdono. Una riga in
+perdita seguita da righe pulite è una finestra disturbata, e resta elencata come
+"sporadica": al primo run la baseline perdeva a 0,25 Gbit/s e non a 0,5, e la regola del
+"primo rate in perdita" avrebbe messo lì l'inizio. Le finestre in cui il generatore ha
+inviato oltre il 105% del chiesto sono marcate `gen_burst`: pktgen, se il suo vCPU è stato
+sospeso, trasmette di fila fino a rimettersi in orario, e quella raffica riempie la coda a
+qualunque rate medio (visto: 1,831 Mpps inviati su 1,465 chiesti). Giri di default: 5.
+
 ### 12.4 La latenza end-to-end
 
 pktgen scrive già in ogni pacchetto, subito dopo UDP, magic `0xbe9be955`, seq, `tv_sec` e
@@ -1822,19 +1836,25 @@ Il percorso misurato è tutto il nodo, **attesa in coda compresa** — che è ci
 statistica (`e2e_spin_correction_us`), e i valori non corretti restano nel CSV
 (`e2e_latency_p50_raw_us`).
 
-Risoluzione 1 µs; istogramma a celle da 1 µs fino a 4096 µs più il trabocco; un pacchetto
-cronometrato ogni `mask+1` (circa `--lat-samples` per finestra, 20 000), solo fra le due
-letture della finestra. Il conteggio dei pacchetti è sempre completo.
+Istogramma a due passi: celle da 1 µs fino a 1024 µs, poi da 64 µs fino a 65,5 ms, più il
+trabocco (sotto carico il p99 sta nei millisecondi, e una scala sola da 1 µs a 4 ms lo
+tagliava). Si cronometra un arrivo ogni `mask+1`, scelto sul contatore per-CPU degli
+arrivi *prima* di leggere il pacchetto (circa `--lat-samples` per finestra, 20 000); il
+conteggio dei pacchetti è sempre completo. Il cancello si apre alla prima lettura della
+finestra e si chiude a pktgen fermo e coda svuotata: qualche ms oltre la finestra dei
+conteggi, allo stesso rate. La prima versione lo chiudeva "alla prima lettura dopo metà
+finestra", e una prima lettura rifatta a lungo lo chiudeva prima del tempo (sonda del primo
+run: 5 750 pacchetti cronometrati su 12 307).
 
 ### 12.5 Comandi e uscite
 
 ```bash
-# tutte le pipeline + rxonly, scala di default 0,1–3 Gbit/s a 64 B, 3 giri
+# tutte le pipeline + rxonly, scala di default 0,1–3 Gbit/s a 64 B, 5 giri
 sudo python3 ipa/test/bench_bitrate.py --out results/bitrate
 
 # una scala scelta, meno metodi, più giri
 sudo python3 ipa/test/bench_bitrate.py --bitrates 0.5,1,1.5,2,2.5 \
-    --method rxonly,baseline,p1_static,template,modular --rounds 5 --out results/bitrate
+    --method rxonly,baseline,p1_static,template,modular --rounds 7 --out results/bitrate
 
 # i grafici dal CSV, anche fuori dalla VM
 python3 ipa/test/plot_bitrate.py results/bitrate
@@ -1847,7 +1867,7 @@ python3 ipa/test/test_bitrate_math.py
 |---|---|
 | `bitrate_raw.csv` | una riga per (metodo, rate, giro): `bitrate_sent_gbps`, `packets_sent`, `packets_received_by_xdp`, `packets_forwarded`, `packets_lost`, `loss_before_xdp`, `loss_in_pipeline` (+ scomposizione), `sent_pps`, `rx_pps`, `forwarded_pps`, `loss_*_pct`, `e2e_latency_p50/p90/p99/mean/min/max_us`, `duration_s` |
 | `bitrate.csv` | mediana fra i giri, min/max, `rxonly_loss_before_xdp_pct`, `bottleneck` |
-| `bitrate_overhead*.csv` | costo del contatore: ns per pacchetto con e senza catena |
+| `bitrate_overhead*.csv` | costo del contatore: ns del programma (statistiche BPF) e ns dal throughput, con e senza catena, e lo scarto fra le finestre |
 | `bitrate_latency`, `bitrate_pps`, `bitrate_loss` (.png/.pdf) | i tre grafici: latenza (p50, p99), pacchetti/s (inviati, ricevuti, inoltrati), perdita (prima di XDP, nella pipeline, pavimento rxonly) |
 
 ### 12.6 Limiti
@@ -1857,9 +1877,17 @@ python3 ipa/test/test_bitrate_math.py
   improbabile per costruzione; con `--egress-cpu 0` l'uscita ha una CPU sua.
 - Le cifre assolute sono di questo percorso veth su un vCPU (vedi 11.1 e 11.6); il
   confronto fra pipeline e la forma delle curve sono ciò che il test sostiene.
-- Scritto e verificato **senza kernel** (`test_bitrate_math.py`, 70 controlli, e mutazioni
-  che li fanno fallire): la compilazione BCC/clang dei due programmi e il primo run si
-  fanno nella VM.
+- Formule e attribuzione verificate **senza kernel** (`test_bitrate_math.py`, 87
+  controlli, e mutazioni che li fanno fallire).
+- Primo run nella VM (2026-09-26): i due programmi si caricano e la catena funziona con
+  tutti e due i caricatori (sonda: tail call tutte partite, latenza presente). Quella
+  sessione era circa 1,7 volte più lenta del 23/09 (costo della baseline a rate massimo
+  414–458 ns contro 250; `rxonly` a ~2,3 Mpps contro 4,3–4,8) e rumorosa: lo stesso punto
+  usciva al 58% / 0,2% / 7,7% di perdita nei tre giri. Di quel run regge che la perdita è
+  sempre prima di XDP (dopo XDP al massimo 0,22% degli inviati, lo scarto di lettura) e
+  l'ordine delle pipeline sopra il pavimento di `rxonly`; non reggono l'inizio della
+  perdita, le cifre assolute e il costo del contatore, per cui il test è stato corretto
+  come descritto sopra.
 
 ## Note oneste
 
