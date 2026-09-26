@@ -1319,6 +1319,10 @@ def print_summary(summary, ons, over_sum, threshold):
                       f" Gbit/s inviati, il rate piu' alto misurato; "
                       f"inoltrati al massimo {f(cap and cap / 1e6, '.3f')} "
                       f"Mpps")
+                if o.get("max_abs_pipeline_loss_pct") is not None:
+                    print(" " * len(head) + "perdita dopo XDP: al massimo "
+                          f"{o['max_abs_pipeline_loss_pct']:.2f}% degli "
+                          f"inviati")
                 continue
             print(head + f"pulita fino a "
                   f"{f(lc['bitrate_sent_gbps'] if lc else None, '.3f')} "
@@ -1349,6 +1353,30 @@ def print_summary(summary, ons, over_sum, threshold):
                   f"{f(o['cost_overhead_ns'], '+.1f')} ns (scarto fra le "
                   f"finestre {f(o['cost_spread_chain_ns'], '.0f')} / "
                   f"{f(o['cost_spread_direct_ns'], '.0f')} ns)")
+
+
+def report_from_csv(out_dir, threshold=DEFAULT_LOSS_THRESHOLD):
+    """Il riepilogo di un run gia' fatto, dai suoi CSV grezzi: serve quando
+    l'uscita del terminale e' andata persa o troncata, e per rileggere un run
+    vecchio con le regole di adesso (le sintesi si ricalcolano, i conteggi
+    grezzi restano quelli misurati)."""
+    from plot_bitrate import read_summary
+    path = os.path.join(out_dir, "bitrate_raw.csv")
+    if not os.path.exists(path):
+        sys.exit(f"{out_dir}: manca bitrate_raw.csv")
+    raw = read_summary(path)
+    opath = os.path.join(out_dir, "bitrate_overhead_raw.csv")
+    over = read_summary(opath) if os.path.exists(opath) else []
+    summary = summarise(raw, threshold)
+    print(f"  {len(raw)} finestre da {path}; giri per punto: "
+          f"{sorted({s['rounds'] for s in summary})}")
+    burst = sum(bool(r.get("gen_burst")) for r in raw)
+    limited = sum(bool(r.get("gen_limited")) for r in raw)
+    print(f"  finestre con raffica del generatore: {burst}, con generatore "
+          f"sotto il chiesto: {limited}")
+    print_summary(summary, onsets(summary), summarise_overhead(over),
+                  threshold)
+    return 0
 
 
 def _parse_list(spec, what):
@@ -1415,8 +1443,15 @@ def main(argv=None):
                    help="non disegnare i grafici a fine run")
     p.add_argument("--cleanup", action="store_true",
                    help="rimuovi un fabric rimasto da un run interrotto")
+    p.add_argument("--report", default=None, metavar="DIR",
+                   help="niente misure: rilegge bitrate_raw.csv (e "
+                        "bitrate_overhead_raw.csv) da DIR e ristampa "
+                        "riepilogo, inizio della perdita e costo del "
+                        "contatore con le regole attuali. Non serve root.")
     a = p.parse_args(argv)
 
+    if a.report:
+        return report_from_csv(a.report, a.loss_threshold)
     if sys.platform != "linux":
         sys.exit(f"serve Linux, non {sys.platform}")
     if os.geteuid() != 0:

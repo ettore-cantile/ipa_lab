@@ -1859,6 +1859,10 @@ sudo python3 ipa/test/bench_bitrate.py --bitrates 0.5,1,1.5,2,2.5 \
 # i grafici dal CSV, anche fuori dalla VM
 python3 ipa/test/plot_bitrate.py results/bitrate
 
+# il riepilogo di un run gia' fatto, dai CSV (senza root): uscita persa o troncata,
+# oppure un run vecchio riletto con le regole attuali
+python3 ipa/test/bench_bitrate.py --report results/bitrate
+
 # le formule, senza kernel
 python3 ipa/test/test_bitrate_math.py
 ```

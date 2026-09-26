@@ -330,6 +330,42 @@ def t_overhead():
           and o["cost_spread_chain_ns"] == 380.0)
 
 
+def t_report():
+    print("[12] --report: dai CSV al riepilogo")
+    import contextlib
+    import io
+    import tempfile
+    import bench_throughput as B
+    rows = []
+    for rnd in (1, 2, 3):
+        for m, fwd in (("rxonly", 0), ("baseline", 9000)):
+            d = dict(rx_xdp=9500, tail_miss=9500 if m == "rxonly" else 0,
+                     fwd=fwd, idle_us=0)
+            if m != "rxonly":
+                d.update(hit=9500, miss=0, drop=0)
+            rows.append(BB.window_row(m, 64, rnd, 1_000_000, 1000, 2, 0.01,
+                                      0.6, 9500, 500, d,
+                                      dict(n=0, hist=_hist([])), 0))
+    direct = BB.summarise(rows, 1.0)
+    with tempfile.TemporaryDirectory() as d:
+        with contextlib.redirect_stdout(io.StringIO()):
+            B._write_csv(os.path.join(d, "bitrate_raw.csv"), rows)
+        from plot_bitrate import read_summary
+        back = BB.summarise(read_summary(os.path.join(d, "bitrate_raw.csv")),
+                            1.0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = BB.report_from_csv(d, 1.0)
+    key = lambda s: (s["method"], s["rate_requested_pps"])  # noqa: E731
+    same = all(a[k] == b[k] for a, b in zip(sorted(direct, key=key),
+                                            sorted(back, key=key))
+               for k in ("reference", "packets_forwarded",
+                         "loss_before_xdp_pct", "bottleneck"))
+    check("i CSV riletti danno la stessa sintesi (tipi e booleani)", same)
+    check("il riepilogo si ristampa (rc 0, riga di baseline)",
+          rc == 0 and "baseline (64 B)" in out.getvalue())
+
+
 def t_sources():
     print("[10] i programmi (controlli statici: qui non c'e' un compilatore)")
     import p1_aot
@@ -375,7 +411,8 @@ def t_sources():
 
 def main():
     for t in (t_bitrate, t_mask, t_percentile, t_latency, t_losses, t_rates,
-              t_summary, t_probe, t_idle_parse, t_sources, t_overhead):
+              t_summary, t_probe, t_idle_parse, t_sources, t_overhead,
+              t_report):
         t()
     n, ok = len(RESULTS), sum(RESULTS)
     print(f"\n{ok}/{n} PASS")
