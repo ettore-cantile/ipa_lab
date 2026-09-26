@@ -202,6 +202,7 @@ Serve Linux, root, BCC, clang (per P1/P1.5) e il modulo pktgen.
 """
 import argparse
 import contextlib
+import csv
 import ctypes as ct
 import os
 import re
@@ -938,9 +939,12 @@ def pktgen_idle_us(B, names):
 # ==========================================================================
 def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 window_s, lat_target=LAT_TARGET_SAMPLES, egress_cpu=None,
-                overhead_reps=OVERHEAD_REPS):
+                overhead_reps=OVERHEAD_REPS, save=None):
     """Tutte le pipeline, stesso fabric e stesso generatore, a rate crescente.
-    Restituisce (righe grezze, righe del costo del contatore, note)."""
+    Restituisce (righe grezze, righe del costo del contatore, note).
+
+    `save(raw, over)`, se c'e', si chiama dopo OGNI finestra: un run da mezz'ora
+    interrotto al giro 6 lascia su disco i giri 1-6, invece di niente."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -1145,6 +1149,8 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                 getattr(run, "errors", 0), run.dut, lat, mask,
                                 idle_ok=idle_ok[0])
                             raw.append(row)
+                            if save:
+                                save(raw, over)
                             _print_point(row, done, npts, t_run)
                             if m != REFERENCE and row["tail_call_miss"]:
                                 B.warn(f"{m}: {row['tail_call_miss']} tail "
@@ -1200,6 +1206,8 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                              else None),
                                     prog_ns=(round(prog, 2) if prog is not None
                                              else None)))
+                                if save:
+                                    save(raw, over)
                                 print(f"  {rep + 1:2d} {m:10s} {var:8s} "
                                       f"{pps / 1e6:6.3f} Mpps elaborati  "
                                       f"{(1e9 / pps if pps else 0):7.1f} ns "
@@ -1355,6 +1363,25 @@ def print_summary(summary, ons, over_sum, threshold):
                   f"{f(o['cost_spread_direct_ns'], '.0f')} ns)")
 
 
+def save_csv(path, rows):
+    """Come bench_throughput._write_csv (unione delle chiavi), ma senza
+    stampare e scrivendo su un file temporaneo poi rinominato: si chiama dopo
+    ogni finestra, e un'interruzione a meta' scrittura non deve lasciare un CSV
+    troncato al posto di quello buono."""
+    cols = []
+    for r in rows:
+        for k in r:
+            if not k.startswith("_") and k not in cols:
+                cols.append(k)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, restval="",
+                           extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, path)
+
+
 def report_from_csv(out_dir, threshold=DEFAULT_LOSS_THRESHOLD):
     """Il riepilogo di un run gia' fatto, dai suoi CSV grezzi: serve quando
     l'uscita del terminale e' andata persa o troncata, e per rileggere un run
@@ -1449,9 +1476,15 @@ def main(argv=None):
                         "riepilogo, inizio della perdita e costo del "
                         "contatore con le regole attuali. Non serve root.")
     a = p.parse_args(argv)
+    # --out e --report sono rispetto alla cartella da cui si lancia. Sotto,
+    # main() si sposta in ipa/ (come bench_throughput): fino al 2026-09-26
+    # `--out results/bitrate` finiva cosi' in ipa/results/bitrate, mentre la
+    # riga "scritto results/bitrate/..." faceva credere il contrario, e
+    # `--report results/bitrate` dalla radice non trovava niente.
+    out_dir = os.path.abspath(a.out) if a.out else None
 
     if a.report:
-        return report_from_csv(a.report, a.loss_threshold)
+        return report_from_csv(os.path.abspath(a.report), a.loss_threshold)
     if sys.platform != "linux":
         sys.exit(f"serve Linux, non {sys.platform}")
     if os.geteuid() != 0:
@@ -1525,11 +1558,28 @@ def main(argv=None):
         return env
 
     B.print_env(env_now())
+    if out_dir:
+        B.info(f"risultati in {out_dir} (bitrate_raw.csv aggiornato dopo ogni "
+               f"finestra)")
+
+    def save(raw_rows, over_rows):
+        if not out_dir:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        save_csv(os.path.join(out_dir, "bitrate_raw.csv"), raw_rows)
+        if over_rows:
+            save_csv(os.path.join(out_dir, "bitrate_overhead_raw.csv"),
+                     over_rows)
+
     t0 = time.monotonic()
-    raw, over, notes = run_bitrate(
-        B, methods, model_path, frames, rates_of, plan, a.rounds, window_s,
-        lat_target=a.lat_samples, egress_cpu=a.egress_cpu,
-        overhead_reps=a.overhead_reps)
+    try:
+        raw, over, notes = run_bitrate(
+            B, methods, model_path, frames, rates_of, plan, a.rounds,
+            window_s, lat_target=a.lat_samples, egress_cpu=a.egress_cpu,
+            overhead_reps=a.overhead_reps, save=save)
+    finally:
+        if out_dir and os.path.isdir(out_dir):
+            B._give_back(out_dir)
     summary = summarise(raw, a.loss_threshold)
     ons = onsets(summary)
     over_sum = summarise_overhead(over)
@@ -1540,16 +1590,16 @@ def main(argv=None):
         B.warn("tail call non partite in qualche finestra: quei pacchetti "
                "sono entrati nel contatore e non nella pipeline")
         rc = 1
-    if a.out and raw:
-        os.makedirs(a.out, exist_ok=True)
-        B._write_csv(os.path.join(a.out, "bitrate_raw.csv"), raw)
-        B._write_csv(os.path.join(a.out, "bitrate.csv"), summary)
+    if out_dir and raw:
+        os.makedirs(out_dir, exist_ok=True)
+        B._write_csv(os.path.join(out_dir, "bitrate_raw.csv"), raw)
+        B._write_csv(os.path.join(out_dir, "bitrate.csv"), summary)
         if over:
-            B._write_csv(os.path.join(a.out, "bitrate_overhead_raw.csv"),
+            B._write_csv(os.path.join(out_dir, "bitrate_overhead_raw.csv"),
                          over)
-            B._write_csv(os.path.join(a.out, "bitrate_overhead.csv"),
+            B._write_csv(os.path.join(out_dir, "bitrate_overhead.csv"),
                          over_sum)
-        B.write_env(a.out, env_now([
+        B.write_env(out_dir, env_now([
             ("correzione_attesa_pktgen",
              "si" if notes.get("idle_correction") else "NO: idle assente"),
             ("costo_contatore_da",
@@ -1559,11 +1609,11 @@ def main(argv=None):
         if not a.no_plot:
             try:
                 import plot_bitrate
-                plot_bitrate.plot_all(a.out)
+                plot_bitrate.plot_all(out_dir)
             except ImportError as e:
                 B.warn(f"grafici non disegnati ({e}): "
-                       f"python3 ipa/test/plot_bitrate.py {a.out}")
-        B._give_back(a.out)
+                       f"python3 ipa/test/plot_bitrate.py {out_dir}")
+        B._give_back(out_dir)
     return rc
 
 

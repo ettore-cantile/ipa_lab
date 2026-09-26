@@ -1867,6 +1867,11 @@ python3 ipa/test/bench_bitrate.py --report results/bitrate
 python3 ipa/test/test_bitrate_math.py
 ```
 
+`--out` e `--report` sono rispetto alla cartella da cui si lancia (fino al 2026-09-26
+`--out results/bitrate` finiva in `ipa/results/bitrate`, perché lo script si sposta in
+`ipa/`). `bitrate_raw.csv` si riscrive dopo ogni finestra: un run interrotto lascia su disco
+le finestre già misurate, e `--report` le riassume.
+
 | file | contenuto |
 |---|---|
 | `bitrate_raw.csv` | una riga per (metodo, rate, giro): `bitrate_sent_gbps`, `packets_sent`, `packets_received_by_xdp`, `packets_forwarded`, `packets_lost`, `loss_before_xdp`, `loss_in_pipeline` (+ scomposizione), `sent_pps`, `rx_pps`, `forwarded_pps`, `loss_*_pct`, `e2e_latency_p50/p90/p99/mean/min/max_us`, `duration_s` |

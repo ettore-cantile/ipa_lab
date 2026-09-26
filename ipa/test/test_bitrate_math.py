@@ -364,6 +364,15 @@ def t_report():
     check("i CSV riletti danno la stessa sintesi (tipi e booleani)", same)
     check("il riepilogo si ristampa (rc 0, riga di baseline)",
           rc == 0 and "baseline (64 B)" in out.getvalue())
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "bitrate_raw.csv")
+        BB.save_csv(path, rows[:2])
+        BB.save_csv(path, rows)             # riscritto per intero, come a run
+        back = read_summary(path)
+        left = os.listdir(d)
+    check("save_csv: riscrive tutte le righe, niente .tmp rimasto",
+          len(back) == len(rows) and left == ["bitrate_raw.csv"]
+          and back[-1]["packets_sent"] == rows[-1]["packets_sent"])
 
 
 def t_sources():
