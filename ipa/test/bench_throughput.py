@@ -162,6 +162,8 @@ for _p in (SHARED_DIR, _TEST_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import host_conditions as HC  # noqa: E402
+
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
@@ -313,13 +315,12 @@ WINDOW_MIN_TX_FRACTION = 0.5
 # 256 descrittori a 1,5 Mpps sono 170 MICROSECONDI di traffico. Vuol dire che
 # il kernel thread NAPI del DUT deve essere schedulato entro 170 us OGNI
 # VOLTA, per sempre, altrimenti il ring trabocca e il generatore si vede
-# respingere pacchetti. Su un guest VirtualBox, il cui vCPU l'host puo'
-# deschedulare per millisecondi interi, questo e' impossibile: qualche punto
-# percentuale di respinti a QUALUNQUE rate sopra il centinaio di kpps e'
-# strutturale e non dice niente sulla pipeline.
-#
-# Il conto torna con le misure: a 74 kpps il ring copre 3,5 ms e la perdita
-# era 0,10%; a 1,5 Mpps copre 0,17 ms e la perdita sta fra il 9 e il 18%.
+# respingere pacchetti. Un core che va in uno stato di sonno profondo
+# (C6/C10 su questa macchina: risveglio fino a 310 us) o che viene preso da
+# un altro thread manca la scadenza, e i respinti non dicono niente sulla
+# pipeline. Per questo host_conditions spegne gli stati profondi e isola i
+# core del banco: con le condizioni applicate, sotto capacita' i respinti sono
+# zero.
 #
 # I kernel recenti espongono la dimensione via `ethtool -G <dev> rx N`. Non si
 # da' per scontato che ci sia: si PROVA, si rilegge, e si riporta l'esito fra
@@ -352,7 +353,7 @@ DRAIN_S = 0.05
 # veloce". Non lo era: era stata misurata in una finestra lunga un quarto.
 #
 # Il MASSIMO e non la mediana: qui si stima di cosa e' CAPACE il generatore, e
-# una finestra bassa e' un vCPU sospeso, non un generatore piu' lento. Per la
+# una finestra bassa e' un generatore interrotto, non uno piu' lento. Per la
 # perdita e per il confronto fra pipeline vale la regola opposta (mediana), e i
 # due casi sono diversi apposta.
 CALIB_WINDOWS = 3
@@ -426,10 +427,9 @@ METHODS = ("baseline", "p1_static", "hardcoded", "template", "modular")
 # IL TETTO DI SOLA RICEZIONE, NELLA STESSA SESSIONE DELLE PIPELINE.
 #
 # `--mode generator` misura lo stesso tetto (pktgen -> veth -> contatore che
-# scarta), ma in un run a parte. Fra un run e l'altro questa VM si sposta di
-# circa il 10%: misurato il 2026-09-23, sola ricezione 4,32 e poi 3,92 Mpps,
-# baseline 3,98 e poi 4,01 -- il rapporto fra le due usciva 0,92 o 1,02 a
-# seconda di quali run si accostavano. `rxonly` e' lo stesso contatore
+# scarta), ma in un run a parte, e due run separati possono cadere in
+# condizioni diverse della macchina: il rapporto fra i due tetti non sarebbe
+# una misura. `rxonly` e' lo stesso contatore
 # caricato come un metodo di `--mode compare`: stessi giri, stesso generatore,
 # stessa finestra, e il rapporto con le pipeline diventa una misura.
 #
@@ -518,6 +518,14 @@ def note(m):
 # Nulla e' assunto sul numero di core: le liste si intersecano con le CPU
 # davvero online e con i thread pktgen davvero esistenti, e cio' che avanza
 # viene detto invece che ignorato.
+#
+# Senza liste esplicite, su una macchina con core di tipi diversi o con SMT
+# il piano lo fa host_conditions.plan_roles -- DUT, uscita e generatore su
+# P-core fisici distinti, fratelli SMT a riposo, il core della CPU 0 al
+# sistema. La regola semplice ("un terzo al DUT, il resto al generatore") su
+# un Core Ultra 7 155H darebbe 14 thread pktgen su 1-14 e il DUT sugli E-core
+# e sui LP E-core 15-21. Su una macchina a core tutti uguali e senza SMT non
+# c'e' niente da scegliere e resta la regola semplice.
 
 
 def parse_cpu_list(spec):
@@ -580,9 +588,11 @@ def pg_thread_exists(cpu):
 
 
 class CpuPlan:
-    """Chi genera, chi elabora, e cosa e' stato scartato per arrivarci."""
+    """Chi genera, chi elabora, chi riceve a valle, e cosa e' stato scartato
+    per arrivarci."""
 
-    def __init__(self, gen, dut, online, notes, shared=False):
+    def __init__(self, gen, dut, online, notes, shared=False, egress=None,
+                 topo=None):
         self.gen = list(gen)
         self.dut = list(dut)
         self.online = list(online)
@@ -591,25 +601,55 @@ class CpuPlan:
         # stesse CPU. Non e' un errore fatale -- e' il vecchio comportamento --
         # ma da quel momento la cifra assoluta misura la SOMMA dei due.
         self.shared = shared
+        # La CPU della ricezione a valle (NAPI dei veth d'uscita), o None:
+        # softirq sulla CPU del DUT, il comportamento storico.
+        self.egress = egress
+        # host_conditions.Topology, o None se non leggibile.
+        self.topo = topo
 
     @property
     def threads(self):
         return len(self.gen)
 
     @property
+    def used(self):
+        return sorted(set(self.gen) | set(self.dut)
+                      | ({self.egress} if self.egress is not None else set()))
+
+    @property
+    def idle_siblings(self):
+        return HC.idle_siblings(self.topo, self.used) if self.topo else []
+
+    @property
     def excluded(self):
-        return [c for c in self.online
-                if c not in self.gen and c not in self.dut]
+        """Le CPU lasciate al sistema: tutte, meno quelle del banco e i loro
+        fratelli SMT, che restano a riposo."""
+        if self.topo:
+            return HC.housekeeping(self.topo, self.used)
+        return [c for c in self.online if c not in self.used]
+
+    def _fmt(self, xs):
+        if not xs:
+            return "(nessuna)"
+        if self.topo and self.topo.structured:
+            return ", ".join(self.topo.label(x) for x in xs)
+        return ",".join(str(x) for x in xs)
 
     def describe(self):
         print(f"\n{YELLOW}{'=' * 78}{NC}")
         print(f"{YELLOW} Piano CPU: generatore e DUT su questa macchina{NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
         fmt = lambda xs: ",".join(str(x) for x in xs) if xs else "(nessuna)"
+        if self.topo:
+            info(f"topologia ............... {self.topo.summary()}")
         info(f"CPU online .............. {fmt(self.online)}")
-        info(f"CPU generatore (pktgen) . {fmt(self.gen)}  "
+        info(f"CPU generatore (pktgen) . {self._fmt(self.gen)}  "
              f"-> {self.threads} thread kpktgend")
-        info(f"CPU DUT (XDP/NAPI) ...... {fmt(self.dut)}")
+        info(f"CPU DUT (XDP/NAPI) ...... {self._fmt(self.dut)}")
+        if self.egress is not None:
+            info(f"CPU uscita (NAPI a valle) {self._fmt([self.egress])}")
+        if self.idle_siblings:
+            info(f"fratelli SMT a riposo ... {fmt(self.idle_siblings)}")
         info(f"CPU lasciate al sistema . {fmt(self.excluded)}")
         for n in self.notes:
             warn(n)
@@ -622,15 +662,17 @@ class CpuPlan:
 
 
 def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
-              check_pktgen=True):
-    """Decide le due liste di CPU, verificandole contro la macchina vera.
+              check_pktgen=True, egress_spec=None, topo=None):
+    """Decide le liste di CPU, verificandole contro la macchina vera.
 
     Regole, in ordine:
       1. si parte dalle CPU ONLINE;
       2. la CPU 0 esce, se non la si e' chiesta: e' dove finiscono timer, RCU
          e IRQ, e un thread pktgen li' genera a rate variabile;
       3. cio' che l'utente ha chiesto vince, ma intersecato con (1);
-      4. quello che resta e' del DUT;
+      4. senza liste, su una macchina con core di tipi diversi o SMT, i ruoli
+         li decide host_conditions.plan_roles (un core fisico per ruolo);
+         altrimenti quello che resta e' del DUT;
       5. se non resta niente, si dichiara la condivisione invece di fingere
          una separazione che non c'e'.
 
@@ -638,9 +680,18 @@ def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
     regola sola: PIU' core al generatore che al DUT. E' la condizione in cui la
     pipeline satura, che e' cio' che si vuole misurare; il caso opposto -- un
     core per parte -- e' quello in cui il generatore satura per primo e il
-    banco non dice niente sulla pipeline."""
+    banco non dice niente sulla pipeline.
+
+    egress_spec: None (uscita in softirq sulla CPU del DUT), "auto" (un core
+    fisico suo, se ne resta uno) o una CPU. `topo` si legge dal sysfs se non
+    lo si passa (i test lo passano finto)."""
     notes = []
-    online = online_cpus()
+    if topo is None:
+        try:
+            topo = HC.Topology.read()
+        except Exception:
+            topo = None
+    online = topo.online if topo is not None else online_cpus()
     pool = [c for c in online if allow_cpu0 or c != 0]
     if not pool:
         notes.append("una sola CPU online e CPU 0 esclusa: la riammetto, "
@@ -649,43 +700,64 @@ def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
 
     want_gen = parse_cpu_list(gen_spec)
     want_dut = parse_cpu_list(dut_spec)
+    fixed_egress = egress_spec if isinstance(egress_spec, int) else None
+    egress = fixed_egress
+    auto_roles = (want_gen is None and want_dut is None and topo is not None
+                  and topo.structured)
 
-    if want_gen is not None:
-        gen = [c for c in want_gen if c in online]
-        dropped = [c for c in want_gen if c not in online]
-        if dropped:
-            notes.append(f"CPU {dropped} chieste per il generatore ma non "
-                         f"online: scartate.")
-        # Una lista esplicita vince anche sull'esclusione della CPU 0: se
-        # l'utente la scrive, la vuole, e --allow-cpu0 serve solo al caso
-        # automatico.
-        if 0 in gen and not allow_cpu0:
-            notes.append("CPU 0 chiesta esplicitamente per il generatore: la "
-                         "uso, ma li' girano timer, RCU e IRQ e il rate "
-                         "offerto e' meno stabile.")
+    if auto_roles:
+        roles = HC.plan_roles(
+            topo, n_gen=threads, want_egress=(egress_spec == "auto"),
+            allow_cpu0=allow_cpu0,
+            exclude=([fixed_egress] if fixed_egress is not None else ()))
+        gen, dut = roles["gen"], roles["dut"]
+        if egress_spec == "auto":
+            egress = roles["egress"]
+        notes += roles["notes"]
     else:
-        n = len(pool)
-        if threads and threads > 0:
-            gen_n = min(threads, n)
-            if threads > n:
-                notes.append(f"chiesti {threads} thread generatore ma solo {n} "
-                             f"CPU utilizzabili: ne uso {gen_n}. Due thread "
-                             f"pktgen sulla stessa CPU non esistono -- il "
-                             f"thread E' la CPU.")
+        if want_gen is not None:
+            gen = [c for c in want_gen if c in online]
+            dropped = [c for c in want_gen if c not in online]
+            if dropped:
+                notes.append(f"CPU {dropped} chieste per il generatore ma non "
+                             f"online: scartate.")
+            # Una lista esplicita vince anche sull'esclusione della CPU 0: se
+            # l'utente la scrive, la vuole, e --allow-cpu0 serve solo al caso
+            # automatico.
+            if 0 in gen and not allow_cpu0:
+                notes.append("CPU 0 chiesta esplicitamente per il generatore: "
+                             "la uso, ma li' girano timer, RCU e IRQ e il rate "
+                             "offerto e' meno stabile.")
         else:
-            # Un terzo al DUT, il resto al generatore, minimo uno per parte.
-            dut_n = max(1, n // 3)
-            gen_n = max(1, n - dut_n)
-        gen = pool[:gen_n]
+            n = len(pool)
+            if threads and threads > 0:
+                gen_n = min(threads, n)
+                if threads > n:
+                    notes.append(f"chiesti {threads} thread generatore ma solo "
+                                 f"{n} CPU utilizzabili: ne uso {gen_n}. Due "
+                                 f"thread pktgen sulla stessa CPU non esistono "
+                                 f"-- il thread E' la CPU.")
+            else:
+                # Un terzo al DUT, il resto al generatore, minimo uno per
+                # parte.
+                dut_n = max(1, n // 3)
+                gen_n = max(1, n - dut_n)
+            gen = pool[:gen_n]
 
-    if want_dut is not None:
-        dut = [c for c in want_dut if c in online]
-        dropped = [c for c in want_dut if c not in online]
-        if dropped:
-            notes.append(f"CPU {dropped} chieste per il DUT ma non online: "
-                         f"scartate.")
-    else:
-        dut = [c for c in pool if c not in gen]
+        if want_dut is not None:
+            dut = [c for c in want_dut if c in online]
+            dropped = [c for c in want_dut if c not in online]
+            if dropped:
+                notes.append(f"CPU {dropped} chieste per il DUT ma non online: "
+                             f"scartate.")
+        else:
+            dut = [c for c in pool if c not in gen and c != fixed_egress]
+        if egress_spec == "auto":
+            egress = (HC.spare_core(topo, set(gen) | set(dut), allow_cpu0)
+                      if topo is not None else None)
+            if egress is None:
+                notes.append("nessun core fisico libero per l'uscita: resta "
+                             "in softirq sulla CPU del DUT.")
 
     if check_pktgen and os.path.isdir(PKTGEN_DIR):
         missing = [c for c in gen if not pg_thread_exists(c)]
@@ -705,12 +777,20 @@ def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
         notes.append(f"CPU {overlap} chieste sia per il generatore sia per il "
                      f"DUT: su quei core i due si contendono il tempo.")
         shared = True
+    if topo is not None:
+        smt = sorted(c for c in gen if c not in dut
+                     and set(topo.core(c)) & set(dut))
+        if smt:
+            notes.append(f"CPU generatore {smt} sullo stesso core fisico del "
+                         f"DUT (fratelli SMT): si dividono pipeline e cache.")
+            shared = True
     if not dut:
         dut = list(gen)
         shared = True
         notes.append("nessuna CPU libera per il DUT: la NAPI restera' sui "
                      "core del generatore (comportamento storico).")
-    return CpuPlan(gen, dut, online, notes, shared=shared)
+    return CpuPlan(gen, dut, online, notes, shared=shared, egress=egress,
+                   topo=topo)
 
 
 # ==========================================================================
@@ -2072,12 +2152,11 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     # definisce il throughput come il rate a cui NON si perde nemmeno un
     # frame, e una finestra sporca su cinque squalifica il rate.
     #
-    # Ma RFC 2544 presuppone un DUT quieto e dedicato. Qui il DUT e' un guest
-    # VirtualBox su un host a core ibridi: capita che il vCPU venga
-    # deschedulato per l'INTERA finestra, e allora quella ripetizione non
-    # descrive il rate, descrive l'host. Misurato: cinque ripetizioni dello
-    # stesso punto con dispersione +-426%, perdita peggiore 98.11% e mediana
-    # a una cifra.
+    # Ma RFC 2544 presuppone un DUT quieto e dedicato. Qui DUT, generatore e
+    # contatore stanno sulla stessa macchina: se qualcosa interrompe il core
+    # del DUT per l'INTERA finestra, quella ripetizione non descrive il rate,
+    # descrive la macchina. host_conditions lo rende raro e il monitor lo
+    # segnala, ma non lo esclude.
     #
     # Quindi: si RIPORTA la peggiore, si DECIDE sulla mediana, e la deviazione
     # da RFC 2544 sta scritta qui e nel report invece di essere nascosta in
@@ -2097,11 +2176,9 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     # DISPERSIONE ROBUSTA, accanto a quella fra gli estremi.
     #
     # `spread_pct` e' (max - min) / min: la statistica piu' sensibile che
-    # esista a un singolo valore anomalo. Su questa macchina l'anomalo c'e' e
-    # ha una causa nota: ogni tanto l'host sospende il vCPU per l'intera
-    # finestra, e quella ripetizione esce vicina a zero. Misurato il
-    # 2026-09-18 in softirq: baseline a 512 byte, quattro ripetizioni
-    # d'accordo e la quinta a perdita 94.70%, `spread_pct` +-286%.
+    # esista a un singolo valore anomalo: una ripetizione in cui il core del
+    # DUT e' stato interrotto per l'intera finestra esce vicina a zero, e
+    # porta `spread_pct` a centinaia di punti anche se le altre concordano.
     #
     # Scartare l'anomala sarebbe barare. Misurare la dispersione su una
     # statistica che non le da' tutto il peso, e DIRE quante ce ne sono, no:
@@ -2406,9 +2483,8 @@ BPF_PERCPU_ARRAY(xport_acc, __u64, 4);    /* T3 - T2: redirect + veth + NAPI */
  * pipeline l'avesse perso. */
 BPF_PERCPU_ARRAY(rx_n, __u64, 1);
 /* Istogramma logaritmico: la cella i raccoglie [2^i, 2^(i+1)) ns. Serve per i
- * PERCENTILI, perche' media e massimo su una VM non dicono niente -- misurato:
- * media ~2000 ns con minimo 250 e massimo 10,6 ms, cioe' un singolo valore
- * enorme che trascina la media. */
+ * PERCENTILI, perche' media e massimo li trascina un singolo valore enorme
+ * (un'interruzione lunga del core): la media non dice niente. */
 BPF_PERCPU_ARRAY(lat_hist, __u64, LAT_BUCKETS);   /* log2: [2^i, 2^(i+1)) */
 BPF_PERCPU_ARRAY(pipe_hist, __u64, LAT_BUCKETS);
 BPF_PERCPU_ARRAY(xport_hist, __u64, LAT_BUCKETS);
@@ -2838,9 +2914,9 @@ def _read_lat(b, acc="lat_acc", hist="lat_hist"):
     campioni hanno sforato l'istogramma. I percentili vengono dai bucket;
     minimo e massimo sono esatti.
 
-    La MEDIA e' riportata ma non va usata per concludere: su questa VM un
-    singolo valore da 10 ms fra 100 000 campioni la sposta di piu' di quanto la
-    differenza fra due pipeline. I percentili no."""
+    La MEDIA e' riportata ma non va usata per concludere: un singolo valore da
+    10 ms fra 100 000 campioni la sposta di piu' di quanto la differenza fra
+    due pipeline. I percentili no."""
     acc = b[acc]
     n = sum(int(v) for v in acc[ct.c_int(0)])
     if not n:
@@ -3472,7 +3548,7 @@ def _napi_threads(dev):
         out = subprocess.run(["ps", "-eo", "pid,comm"], capture_output=True,
                              text=True, check=False).stdout
     except OSError:
-        # Niente `ps` (container minimale): i thread esistono lo stesso, ma
+        # Niente `ps` (sistema minimale): i thread esistono lo stesso, ma
         # non si possono pinnare. Dirlo invece di far esplodere il run.
         warn("`ps` non disponibile: non posso trovare i thread NAPI, quindi "
              "non posso pinnarli. Restano dove li mette lo scheduler.")
@@ -3716,6 +3792,36 @@ def make_tg_links(n, gen_queues=1, dut_queues=1):
     return made
 
 
+# Le code d'ingresso del DUT (e quindi le code TX del generatore, perche'
+# veth pretende rx(DUT) >= tx(peer)). La fissa main() da --dut-queues.
+#
+# None: il comportamento fino al 2026-09-26, una coda per thread generatore
+# -- max(CPU DUT, thread generatore) code RX sul DUT, cioe' un thread NAPI
+# per coda, tutti pinnati sullo stesso core. Quale coda viene servita lo
+# decide allora lo scheduler: a pieno carico ogni thread tiene la CPU per una
+# fetta intera (millisecondi, con EEVDF) mentre le altre code, 256
+# descrittori ciascuna, traboccano. Un inizio della perdita anticipato dallo
+# scheduler e non dalla pipeline.
+#
+# N: N code da entrambe le parti. Con N = CPU del DUT (--dut-queues auto, il
+# default) ogni core del DUT ha una coda e un thread, come una NIC servita da
+# un core per coda; i thread pktgen scrivono tutti sulla stessa coda. veth e'
+# LLTX (nessun lock del txq) e il ptr_ring serializza i produttori col suo
+# producer_lock: e' corretto, e la contesa la paga il GENERATORE, che ha
+# margine, non il DUT.
+DUT_QUEUES = None
+
+
+def ingress_queues(plan, dut_queues=None):
+    """(code TX del generatore, code RX del DUT) per la topologia shared."""
+    n_gen, n_dut = max(1, len(plan.gen)), max(1, len(plan.dut))
+    q = DUT_QUEUES if dut_queues is None else dut_queues
+    if q is None:
+        return n_gen, max(n_dut, n_gen)
+    q = max(1, int(q))
+    return min(n_gen, q), q
+
+
 def make_shared_tg_link(gen_threads, dut_queues, index=0):
     """UNA coppia veth per la topologia "shared": tutti i thread generatore
     trasmettono qui, su code TX distinte, e il lato DUT ha le sue code RX.
@@ -3910,10 +4016,11 @@ def build_ingress(fab, plan, topology="shared", rx_side=False):
                    ([fab.ingress_peer] + [m[1] for m in made])
         return Ingress(dut_devs, gen_devs, [m[2] for m in made],
                        max(0, n_gen - 1), "links")
-    rx, tx, idx = make_shared_tg_link(n_gen, max(n_dut, n_gen))
-    info(f"ingresso condiviso {rx}: {n_gen} code TX per il generatore, "
-         f"{max(n_dut, n_gen)} code RX sul DUT "
-         f"(veth pretende rx(DUT) >= tx(peer))")
+    tx_q, rx_q = ingress_queues(plan)
+    rx, tx, idx = make_shared_tg_link(tx_q, rx_q)
+    info(f"ingresso condiviso {rx}: {n_gen} thread generatore su {tx_q} "
+         f"code TX, {rx_q} code RX sul DUT, cioe' {rx_q} thread NAPI su "
+         f"{n_dut} CPU (veth pretende rx(DUT) >= tx(peer))")
     return Ingress([rx], [rx if rx_side else tx], [idx], 1, "shared")
 
 
@@ -5681,8 +5788,7 @@ def run_generator(frame=64, rates=None, rounds=DEFAULT_ROUNDS, threads=1,
              "e' piu' basso di quello che le pipeline vedono, e non e' un "
              "limite superiore per loro.")
 
-    n_gen, n_dut = len(plan.gen), len(plan.dut)
-    rx_dev, tx_dev, _ = make_shared_tg_link(n_gen, max(n_dut, n_gen))
+    rx_dev, tx_dev, _ = make_shared_tg_link(*ingress_queues(plan))
     info(f"coppia veth {rx_dev} (lato DUT, porta il contatore) <- {tx_dev} "
          f"(lato generatore)")
 
@@ -6161,9 +6267,9 @@ def check_validity(rows):
               f"un'altra dispersione. Un throughput inutilizzabile non la "
               f"invalida.{NC}")
     print(f"\n  {YELLOW}Che fare{NC}: chiudi tutto il resto, poi rilancia con "
-          f"--rounds 7. Se la dispersione resta, questa VM non e' un banco di "
-          f"misura per il throughput assoluto, e cio' che resta valido e' la "
-          f"latenza piu' il confronto dentro un singolo metodo.")
+          f"--rounds 7, a condizioni applicate (niente --no-conditioning). "
+          f"Se la dispersione resta, guarda host_monitor.csv: throttling, "
+          f"temperatura e frequenza del DUT dicono se e' la macchina.")
     return 1
 
 
@@ -6193,9 +6299,9 @@ def _write_csv(path, rows):
 # CONDIZIONI DEL TEST: l'unica parte della misura che non si puo' rifare dopo
 # ==========================================================================
 # Un pacchetti-al-secondo senza la macchina che l'ha prodotto non e' citabile.
-# Su questo banco TG, DUT e contatore stanno sulla STESSA VM: il numero di
-# vCPU, il governor della frequenza e perfino `mitigations=` sulla riga di
-# comando del kernel entrano nel risultato quanto la pipeline sotto test.
+# Su questo banco TG, DUT e contatore stanno sulla STESSA macchina: i core
+# assegnati, la frequenza e perfino `mitigations=` sulla riga di comando del
+# kernel entrano nel risultato quanto la pipeline sotto test.
 #
 # I CSV si riaprono e i grafici si rifanno; la configurazione della macchina
 # no, perche' al giro dopo e' gia' un'altra. Va quindi scritta INSIEME ai
@@ -6290,9 +6396,6 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
     add("cpu_governor", _first_line(
         "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"))
     add("ram_mb", _mem_total_mb())
-    # systemd-detect-virt manca su parecchie immagini minimali: l'assenza e'
-    # essa stessa un'informazione, non un errore.
-    add("virtualizzazione", _cmd_line(["systemd-detect-virt"], "sconosciuta"))
 
     # ---- kernel e software
     add("kernel", f"{u.sysname} {u.release} {u.machine}")
@@ -6323,9 +6426,19 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         "XDP_PACKET_HEADROOM (256B): una copia per pacchetto")
 
     # ---- parametri del run
+    egress = None
     if plan is not None:
         add("cpu_generatore", ",".join(str(c) for c in plan.gen))
         add("cpu_dut", ",".join(str(c) for c in plan.dut))
+        egress = getattr(plan, "egress", None)
+        if getattr(plan, "gen", None) and getattr(plan, "dut", None):
+            tx_q, rx_q = ingress_queues(plan)
+            add("code_ingresso_dut",
+                f"{rx_q} (generatore su {tx_q} code TX)"
+                if len(plan.gen) > 1 else "1 (ingresso del fabric)")
+    if egress is None and a is not None and \
+            isinstance(getattr(a, "egress_cpu", None), int):
+        egress = a.egress_cpu
     if a is not None:
         add("modalita", "latency" if getattr(a, "latency", False) else a.mode)
         add("napi_threaded", "no" if a.no_threaded_napi else "si")
@@ -6335,8 +6448,7 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("finestra_modo", getattr(a, "window", WINDOW_MODE))
         add("generatore", getattr(a, "generator", "pktgen"))
         add("ttl_mix", getattr(a, "ttl_mix", None) or "no (pacchetto fisso, TTL 32)")
-        add("cpu_uscita", "separata: cpu%s" % a.egress_cpu
-            if getattr(a, "egress_cpu", None) is not None
+        add("cpu_uscita", f"separata: cpu{egress}" if egress is not None
             else "stessa del DUT")
         add("warmup_s", a.warmup)
         add("ripetizioni_per_punto", a.repeat)
@@ -6348,7 +6460,23 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("frame_byte", ",".join(str(f) for f in frames))
     if methods:
         add("pipeline", ",".join(methods))
+
+    # ---- la macchina durante il run: ruoli, frequenze, idle, isolamento,
+    # temperatura e throttling (host_conditions). HOST_ENV lo fissa main()
+    # quando c'e' un run in corso; senza, le condizioni si leggono e basta.
+    try:
+        if HOST_ENV is not None:
+            env += HOST_ENV()
+        elif plan is not None and getattr(plan, "topo", None) is not None:
+            env += HC.env_pairs(plan)
+    except Exception as e:              # la raccolta non deve far fallire
+        add("host_conditions", f"n/d ({type(e).__name__}: {e})")
     return env
+
+
+# Le righe di env.csv sulla macchina per il run in corso (una funzione senza
+# argomenti), o None. La fissa main(), come WINDOW_MODE.
+HOST_ENV = None
 
 
 def print_env(env):
@@ -6572,9 +6700,9 @@ def write_report(out_dir, rows, env, threshold=DEFAULT_LOSS_THRESHOLD,
              "2544.** La norma definisce il throughput come il rate a cui non "
              "si perde nemmeno un frame, e squalifica il rate se una sola "
              "finestra sporca. Presuppone pero' un DUT quieto e dedicato. "
-             "Qui il DUT e' un guest su un host a core ibridi, e capita che "
-             "il vCPU venga sospeso per l'intera finestra: quella ripetizione "
-             "descrive l'host, non il rate. Si riporta quindi la perdita "
+             "Qui DUT, generatore e contatore stanno sulla stessa macchina, "
+             "e un'interruzione del core del DUT lunga quanto la finestra "
+             "descrive la macchina, non il rate. Si riporta quindi la perdita "
              "**peggiore** fra le ripetizioni, ma si **decide** sulla "
              "mediana. Chi vuole la lettura stretta RFC 2544 legge la colonna "
              "peggiore.")
@@ -6771,6 +6899,13 @@ def main():
                         "cioe' generatore e pipeline sullo stesso core. Serve "
                         "per riprodurre le misure vecchie, non per farne di "
                         "nuove.")
+    g.add_argument("--dut-queues", default="auto", metavar="N|auto|gen",
+                   help="code d'ingresso del DUT (topologia shared). auto "
+                        "(default): una per CPU del DUT, e i thread pktgen "
+                        "scrivono tutti li'. gen: una per thread generatore, "
+                        "il comportamento fino al 2026-09-26 (piu' thread "
+                        "NAPI sullo stesso core, alternati dallo scheduler). "
+                        "Vedi DUT_QUEUES.")
 
     m = p.add_argument_group("misura")
     m.add_argument("--duration", type=float, default=WINDOW_S, metavar="S",
@@ -6814,12 +6949,13 @@ def main():
                         "quindi le classi decise cambiano e il traffico "
                         "esercita piu' porte d'uscita e il percorso DROP. "
                         "Un TTL 1 manda il pacchetto allo stack (scaduto).")
-    m.add_argument("--egress-cpu", type=int, default=None, metavar="N",
+    m.add_argument("--egress-cpu", default=None, metavar="N|auto",
                    help="solo --mode compare. Sposta la NAPI dei veth "
                         "d'uscita (la ricezione del nodo successivo) sulla "
                         "CPU N, fuori da quelle del DUT: 1/RX diventa il "
-                        "costo del nodo dalla ricezione all'inoltro. Di "
-                        "solito 0, la CPU lasciata al sistema.")
+                        "costo del nodo dalla ricezione all'inoltro. auto: "
+                        "un core fisico suo scelto dal piano, se ne resta "
+                        "uno.")
     m.add_argument("--window", choices=("steady", "count"), default="steady",
                    help="steady (default): rate letti a differenza mentre "
                         "tutte le istanze pktgen trasmettono, poi stop. "
@@ -6832,8 +6968,8 @@ def main():
                    help="sotto questa percentuale la perdita e' considerata "
                         "rumore della macchina, non saturazione. Il percorso "
                         "--latency parte da ZERO STRETTO; gli altri da "
-                        f"{DEFAULT_LOSS_THRESHOLD}%%, che e' il pacchetto "
-                        "perso ogni tanto da una VM condivisa.")
+                        f"{DEFAULT_LOSS_THRESHOLD}%%, il pacchetto perso "
+                        "ogni tanto per un'interruzione del core.")
     m.add_argument("--search", choices=("ladder", "bisect"), default="ladder",
                    help="come cercare il punto di saturazione. ladder "
                         "(default) sale per gradini e verifica la monotonia; "
@@ -6869,8 +7005,16 @@ def main():
                         "build strumentata, a giri, piu' throughput.")
     o.add_argument("--cleanup", action="store_true",
                    help="rimuovi un fabric rimasto da un run interrotto")
+    HC.add_args(p)
     a = p.parse_args()
-    global WINDOW_MODE
+    HC.check_args(a)
+    a.egress_cpu = HC.parse_egress(a.egress_cpu)
+    # --out e' rispetto alla cartella da cui si lancia: sotto, main() si
+    # sposta in ipa/, e fino al 2026-09-27 `--out results/x` finiva in
+    # ipa/results/x (lo stesso difetto corretto in bench_bitrate il 26/09).
+    if a.out:
+        a.out = os.path.abspath(a.out)
+    global WINDOW_MODE, DUT_QUEUES
     WINDOW_MODE = a.window
     if a.generator == "xdp" and (a.latency or a.mode != "compare"
                                  or a.window != "steady"):
@@ -6914,9 +7058,10 @@ def main():
     # Il piano CPU si fa PRIMA di qualunque misura e si stampa: e' la
     # configurazione da cui dipende tutto il resto, e va letta insieme ai
     # numeri.
-    plan = plan_cpus(a.gen_cpus, a.dut_cpus, a.threads, a.allow_cpu0)
+    plan = plan_cpus(a.gen_cpus, a.dut_cpus, a.threads, a.allow_cpu0,
+                     egress_spec=a.egress_cpu)
     plan.describe()
-    if a.egress_cpu is not None:
+    if isinstance(a.egress_cpu, int):
         if a.egress_cpu in plan.dut:
             sys.exit(f"--egress-cpu {a.egress_cpu} e' una CPU del DUT: "
                      f"l'uscita resterebbe dove si misura")
@@ -6925,8 +7070,87 @@ def main():
                      f"generatore: gli toglierebbe tempo")
         if a.egress_cpu not in online_cpus():
             sys.exit(f"--egress-cpu {a.egress_cpu}: CPU non online")
-        info(f"CPU uscita (NAPI a valle) . {a.egress_cpu}")
+    DUT_QUEUES = parse_dut_queues(a.dut_queues, plan)
 
+    # Le condizioni della macchina si applicano dopo il piano (servono i
+    # ruoli) e prima di qualunque misura, e si ripristinano comunque vada.
+    return conditioned(a, plan, lambda mon: _main_run(a, plan), a.out)
+
+
+def parse_dut_queues(spec, plan):
+    """--dut-queues -> il valore di DUT_QUEUES: None (una coda per thread
+    generatore, storico) o un numero di code."""
+    s = str(spec).strip().lower()
+    if s == "gen":
+        return None
+    if s == "auto":
+        return max(1, len(plan.dut))
+    try:
+        n = int(s)
+    except ValueError:
+        sys.exit(f"--dut-queues: atteso auto, gen o un numero, ricevuto "
+                 f"{spec!r}")
+    if n < 1:
+        sys.exit("--dut-queues: almeno 1")
+    return n
+
+
+def conditioned(a, plan, body, out_dir=None):
+    """body(monitor) con le condizioni della macchina applicate (a meno di
+    --no-tune) e il monitor acceso; ripristino comunque vada. Imposta
+    HOST_ENV, cosi' ogni env.csv del run porta ruoli, frequenze, idle,
+    isolamento, temperatura e throttling. Il monitor (HostMonitor) serve a
+    chi vuole le colonne host_* per finestra (bench_bitrate)."""
+    global HOST_ENV
+    host = HC.from_args(a, plan)
+    if host is not None:
+        host.apply()
+    mon = HC.HostMonitor(plan.topo, plan.used,
+                         dut=(plan.dut[0] if plan.dut else None),
+                         target_khz=(host.target_khz if host else None))
+    mon.start_run()
+    log_path = None
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        log_path = os.path.join(out_dir, "host_monitor.csv")
+        mon.start_log(log_path)
+    HOST_ENV = lambda: HC.env_pairs(
+        plan, host=host, monitor=mon,
+        log_summary=HC.summarise_log(log_path) if log_path else None)
+    try:
+        return body(mon)
+    finally:
+        cols = mon.run_columns()
+        mon.close()
+        HOST_ENV = None
+        if host is not None:
+            host.restore()
+        if out_dir and os.path.isdir(out_dir):
+            _give_back(out_dir)
+        host_verdict(cols)
+
+
+def host_verdict(cols):
+    """Che cosa ha fatto la macchina durante il run, in una riga, e un
+    avviso se non e' stata nelle condizioni dichiarate."""
+    if not cols:
+        return
+    def f(k, spec=""):
+        v = cols.get(k)
+        return "n/d" if v is None else format(v, spec)
+    print(f"\n  {GREY}macchina durante il run: throttling core "
+          f"{f('host_throttle_core')}, pacchetto {f('host_throttle_pkg')}; "
+          f"SMI {f('host_smi')}; DUT occupato {f('host_dut_busy_pct')}% a "
+          f"{f('host_dut_mhz')} MHz; pacchetto a {f('host_pkg_temp_c')} C{NC}")
+    if cols.get("host_disturbed"):
+        warn("la macchina NON e' rimasta nelle condizioni dichiarate per "
+             "tutto il run (throttling termico, powerclamp, batteria o "
+             "frequenza del DUT fuori target): vedi host_monitor.csv e "
+             "env.csv prima di citare i numeri.")
+
+
+def _main_run(a, plan):
+    """Il corpo di main() dopo il piano CPU: misure, CSV, report."""
     import model_meta as mm
     model_path = mm.default_checkpoint()
     # I percorsi vogliono default diversi, e un default sbagliato qui costa
@@ -6940,8 +7164,8 @@ def main():
     delays = [int(x) for x in a.delays.split(",") if x.strip()]
     if a.loss_threshold is None:
         # Zero stretto dove il rate lo si cerca col percorso storico; soglia
-        # tollerante altrove, dove la perdita sparsa di una VM condivisa
-        # farebbe scartare punti buoni.
+        # tollerante altrove, dove una perdita sparsa (un'interruzione del
+        # core) farebbe scartare punti buoni.
         a.loss_threshold = 0.0 if a.latency else DEFAULT_LOSS_THRESHOLD
     methods = list(METHODS) if a.method == "all" else [a.method]
     if a.mode == "compare" and not a.latency and a.method == "all":
@@ -7053,7 +7277,7 @@ def main():
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
             burst=a.burst, generator=a.generator,
-            egress_cpu=a.egress_cpu,
+            egress_cpu=plan.egress,
             ttl_mix=(parse_cpu_list(a.ttl_mix) if a.ttl_mix else None))
         # Il controllo "la baseline e' la piu' veloce" ha senso solo dove
         # l'RX e' una capacita', cioe' a massima spinta: nella fase confronto
@@ -7127,7 +7351,7 @@ def _run_per_class(a, methods, model_path, frames, plan, env_finale):
             plan=plan, topology=a.gen_topology, xmit_mode=a.xmit_mode,
             threaded_napi=not a.no_threaded_napi, diag_enabled=a.diag,
             window_s=a.duration, warmup_s=a.warmup, generator="xdp",
-            egress_cpu=a.egress_cpu, scenario=sc)
+            egress_cpu=plan.egress, scenario=sc)
         # La classe decisa davvero, contro quella voluta.
         for m, cls in LAST_CLASS_MIX.items():
             if m == "baseline" or not sum(cls):

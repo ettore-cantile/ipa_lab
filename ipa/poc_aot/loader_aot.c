@@ -1,7 +1,7 @@
 // loader_aot.c -- AOT-literal deploy bench for Pipeline 1 (alternative to BCC).
 //
 // The BCC hardcoded path (method4_hardcoded.py) compiles the weights-literal C
-// with clang AT RUNTIME on every (re)load -> ~1.3 s of clang on the datapath
+// with clang AT RUNTIME on every (re)load -> clang (~75 ms per model) on the datapath
 // node for each new/modified model (machine-dependent; 1.26-1.66 s observed --
 // the live figure is the "[M1 update timing]" line printed by
 // test_suite.py --only kernel). This loader demonstrates the alternative
@@ -500,7 +500,7 @@ int main(int argc, char **argv) {
             if (xdp_flags == XDP_FLAGS_DRV_MODE)
                 fprintf(stderr,
                         "  This interface's driver may not support native XDP "
-                        "(emulated NICs such as e1000 do not; veth, virtio_net "
+                        "(some drivers, such as e1000, do not; veth, virtio_net "
                         "and most physical drivers do).\n"
                         "  To deploy on the generic path instead, say so "
                         "explicitly: --xdp-mode generic\n");
@@ -530,7 +530,7 @@ int main(int argc, char **argv) {
         printf(" AOT-literal LIVE deploy (Pipeline 1) -- NO clang on this node\n");
         printf("================================================================\n");
         printf("[deploy] open+load (verify+JIT): %.3f ms  "
-               "(BCC recompile of the same model: ~1.3 s, reference not measured here)\n",
+               "(BCC recompile of the same model: ~75 ms, reference not measured here)\n",
                t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d, maps pinned under "
                "%s. Ctrl-C to detach.\n", g_attach_ifindex, g_pin_dir);
@@ -596,7 +596,7 @@ unpin:
     printf("   open_file           : %8.3f ms\n", t1 - t0);
     printf("   load (verify+JIT)   : %8.3f ms\n", t2 - t1);
     printf("   total deploy        : %8.3f ms\n", t2 - t0);
-    printf("   (BCC recompile of the same model: ~1.3 s -- reference value, NOT\n");
+    printf("   (BCC recompile of the same model: ~75 ms -- reference value, NOT\n");
     printf("    measured by this loader; see '[M1 update timing]' in --only kernel)\n\n");
     printf("[perf] full-path per-packet cost (BPF_PROG_TEST_RUN on dispatcher, %d chunks x %d runs,\n"
            "       fresh TTL-255 frame per chunk, min of chunk averages; retval=%u):\n",

@@ -39,7 +39,7 @@ LINK_STATE_MAP = "link_state"
 # width, fixed by the trained checkpoint (the 65-4-4-7 model was trained with
 # n_interfaces=6, so fc1 reserves 6 columns for link_state) -- which is the
 # degree of the LARGEST node in the network, not the degree of the node this
-# runs on. In the generated Germany50 lab that maximum is 6 (karlsruhe, once
+# runs on. In the Germany50 scenario that maximum is 6 (karlsruhe, once
 # h_src is attached to it), but node degrees range from 2 to 6, so on every
 # node except karlsruhe some of these slots have no interface behind them.
 # The vector width must stay at the trained value or the fc1 column offsets
@@ -48,7 +48,7 @@ LINK_STATE_MAP = "link_state"
 def n_egress() -> int:
     """Number of link_state slots: the MODEL's feature width.
 
-    Was `N_EGRESS = 6`, a module constant -- the Germany50 lab's largest node
+    Was `N_EGRESS = 6`, a module constant -- the Germany50 scenario's largest node
     degree, frozen at import time and then used as the loop bound, the CLI
     default and the map width. Resolved from the scenario now; the value is
     still the network's maximum interface count, not this node's degree, since
@@ -67,7 +67,7 @@ def default_ifaces() -> list:
         IPA_PORT_MAP="0=ipav0,1=ipav1"    exact, per slot
         IPA_IFACE_PATTERN="ipav{i}"       a naming convention
 
-    "eth{i}" remains the fallback, but it is a convention of one lab, not a
+    "eth{i}" remains the fallback, but it is a convention of one scenario, not a
     property of the datapath.
     """
     from node_config import port_map_from_env
@@ -98,7 +98,7 @@ def carrier_state(iface: str) -> int:
     it cannot forward through is a slot it must not pick. Only the LOGGING
     separates the two (see monitor_loop): reporting a slot the node does not
     physically have as "down" made a structural padding slot look like a live
-    link failure, which is exactly the signal this lab is measuring.
+    link failure, which is exactly the signal the model reads.
     """
     base = f"/sys/class/net/{iface}"
     carrier = os.path.join(base, "carrier")
@@ -170,7 +170,7 @@ def monitor_loop(bpf_obj, ifaces=None, interval: float = 0.5,
     writing changes into the link_state map."""
     names = _slot_names(ifaces)
     # Which slots are backed by a real interface is decided ONCE: interfaces do
-    # not appear or vanish over a lab's lifetime, and re-deciding per poll would
+    # not appear or vanish over a node's lifetime, and re-deciding per poll would
     # make the log flap.
     present = [iface_exists(n) for n in names]
     absent = [n for n, p in zip(names, present) if not p]

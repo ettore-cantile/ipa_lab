@@ -10,7 +10,7 @@ that slot of the input vector from a dedicated BPF map named `queue_state`
 exactly like `link_state` but for a different signal.
 
 Unlike link_state (which reads a real kernel signal, /sys/.../carrier), this
-lab has no real per-queue occupancy source, so the values are SYNTHETIC:
+repository has no real per-queue occupancy source, so the values are SYNTHETIC:
 either a fixed seed, a constant, or a slow synthetic sweep. This is enough to
 exercise the datapath end-to-end (the model reads the map, multiplies by its
 compiled-in weights) -- it is not a real telemetry source. In a real

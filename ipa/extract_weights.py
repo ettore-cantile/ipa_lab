@@ -15,7 +15,7 @@ Architecture fixed to the germany50/5 checkpoint:
 Quantization: PTQ with SCALE_FACTOR = floor(127 / max|w|)
 
 Fallback (no torch):
-  If torch is not installed (e.g. inside a stripped container image), and a
+  If torch is not installed (e.g. on a minimal node image), and a
   precomputed weights.json exists in the same directory, extract_weights_int8()
   returns its contents directly without loading the .pt file.
 """
@@ -24,8 +24,8 @@ import os
 
 # Architecture of the checkpoint being extracted.
 #
-# N_INTERFACES and N_NODES were literals 6 and 52 here -- the Germany50 lab's
-# dimensions, restated in a third place. They are scenario properties, so they
+# N_INTERFACES and N_NODES were literals 6 and 52 here -- the Germany50
+# scenario's dimensions, restated in a third place. They are scenario properties, so they
 # are read from the scenario; only HIDDEN_DIM stays, because the hidden width
 # is a property of the trained model and nothing else knows it.
 HIDDEN_DIM   = 4
@@ -71,7 +71,7 @@ def extract_weights_int8(
 
     Priority:
       1. If torch is available: load from .pt checkpoint (authoritative).
-      2. Else if weights.json exists next to this file: use it (container mode).
+      2. Else if weights.json exists next to this file: use it (no-torch mode).
       3. Else raise ImportError with a helpful message.
 
     Returns:

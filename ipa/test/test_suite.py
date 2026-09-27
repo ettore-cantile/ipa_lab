@@ -1515,9 +1515,9 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
 
     # --- P2 template / P3 modular: delegate to verify_multi_model.py -----
     try:
-        import verify_multi_model as VM
-        t_ok = VM.test_template()
-        m_ok = VM.test_modular()
+        import verify_multi_model as VMM
+        t_ok = VMM.test_template()
+        m_ok = VMM.test_modular()
         (ok if t_ok else fail)(f"template alt-arch (65-6-5-7, concurrent w/ 65-4-4-7): "
                               f"{'PASS' if t_ok else 'FAIL'}")
         (ok if m_ok else fail)(f"modular alt-arch (65-5-6-4-7, concurrent w/ 65-4-4-7): "

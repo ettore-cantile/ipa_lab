@@ -18,7 +18,7 @@ even start ("cannot open shared object file") -- the whole point of
 building it elsewhere is defeated if it still needs libbpf.so present on
 every node it runs on.
 
-This removes the ~1.3 s of clang-at-runtime that the old BCC path paid on
+This removes the clang-at-runtime (~75 ms per model with BCC) that the old path paid on
 every (re)load, while keeping the literal-weights performance.
 
 Topology dimensions (n_interfaces, n_nodes, n_queues) come from
@@ -28,7 +28,7 @@ block is used; the engine has no built-in topology.
 
 The problem (measured, method4 BCC path -- the "[M1 update timing]" line printed
 by verify_prog_run.py / test_suite.py --only kernel):
-    [M1 update timing] redirect/reload (BPF compile+load): ~1.3 s
+    [M1 update timing] redirect/reload (BPF compile+load): ~75 ms with BCC
     -> the large majority of that is clang compiling the weights-literal C at
        runtime, on the datapath node, for EVERY new/modified model.
     The exact figure is machine-dependent (observed 1.26-1.66 s across boxes);
@@ -73,7 +73,7 @@ libbpf dialect, so ANY descriptor the BCC path (ebpf_program.py) accepts is now
 AOT-compilable too. The default [link_state, ingress_iface, ttl, node] / n_out=7
 still produces the byte-identical 65-4-4-7 program.
 
-Requires (on the VM/build box): clang, llvm, libbpf-dev, linux headers.
+Requires (on the build box): clang, llvm, libbpf-dev, linux headers.
     sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)
 
 Run:
@@ -356,8 +356,8 @@ def ensure_loader(cc="cc"):
             last_err = err
         if built and not won_fully_static:
             # Linked, but glibc is dynamic: this binary runs only where the
-            # node's glibc is >= the build host's. On this lab that produced
-            # "GLIBC_2.38 not found" on the deployment node. Warn loudly instead
+            # node's glibc is >= the build host's. A node with an older
+            # glibc answers "GLIBC_2.38 not found". Warn loudly instead
             # of pretending the build is deployable everywhere.
             print("[AOT] WARNING: the fully-static (-static) link did not succeed, so this")
             print("      loader links glibc DYNAMICALLY and may fail on a node with an OLDER")
@@ -465,6 +465,11 @@ def main():
     build_ms = None
     if shutil.which(args.clang):
         bpf_cflags = ["-O2", "-g", "-target", "bpf", "-D__TARGET_ARCH_x86"]
+        # la cartella multiarch di asm/types.h: vedi p1_aot.multiarch_include
+        import platform
+        _ma = f"/usr/include/{platform.machine()}-linux-gnu"
+        if os.path.isdir(os.path.join(_ma, "asm")):
+            bpf_cflags.append(f"-I{_ma}")
         t0 = time.perf_counter()
         rc, out, err = _run([args.clang, *bpf_cflags, "-c", c_path, "-o", o_path], cwd=POC_DIR)
         build_ms = (time.perf_counter() - t0) * 1000.0
@@ -529,7 +534,7 @@ def main():
     # Say so, so the line is not read as a fresh measurement sitting next to
     # three that are. The live figure is the "[M1 update timing]" line printed
     # by test_suite.py --only kernel on this same machine.
-    print("  BCC method4 (re)load    : ~1.3 s    (reference, NOT measured here --")
+    print("  BCC method4 (re)load    : ~75 ms    (reference, NOT measured here --")
     print("                                       see '[M1 update timing]' in --only kernel)")
     print(f"  AOT offline build       : {build_str}  (clang once, on build box)")
     print("  AOT runtime deploy      : ~few ms   (open+load only -- see [deploy] above)")

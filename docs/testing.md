@@ -3,600 +3,435 @@
 Tre pipeline (P1 hardcoded, P2 template, P3 modular) verificate su due piani:
 
 - **userspace** (numerico, PyTorch/NumPy) — accuratezza, quantizzazione, robustezza, struttura;
-- **kernel** (`BPF_PROG_TEST_RUN` sui programmi XDP reali) — istruzioni eBPF, latenza (min/p50/max/spread), throughput, memoria mappe + dispatch reale.
+- **kernel** — `BPF_PROG_TEST_RUN` sui programmi XDP reali (istruzioni, latenza, lookup,
+  memoria, dispatch) e **traffico vero** su un fabric `veth` con XDP nativo (pktgen o frame
+  XDP grezzi, contatori all'ingresso e all'uscita).
 
-Tutto è raccolto in un unico script: `ipa/test/test_suite.py`. Tutti gli script di test
-(compreso `bench_model_add.py`, vedi §6) vivono sotto `ipa/test/`.
+Tutti gli script di test vivono sotto `ipa/test/`; i comandi si eseguono dalla radice del
+repository. Il motore sta in `ipa/`; i dati della topologia su cui il checkpoint depositato è
+stato addestrato stanno in `topologies/germany50/`.
 
-**Nota sul layout.** Il motore sta in `ipa/`; i dati della topologia su cui il
-checkpoint depositato è stato addestrato stanno in `topologies/germany50/`. Tutti i
-comandi qui sotto si eseguono dalla radice del repository.
+**Tutte le cifre di questo documento sono state misurate il 2026-09-27** sulla macchina e
+nelle condizioni descritte in §0, con `ipa/test/remeasure_all.sh` e
+`ipa/test/remeasure_traffic.sh` (log in `/tmp/ipa_logs/`, `$IPA_LOG_DIR` per cambiarlo).
+
+---
+
+## 0. La macchina e le sue condizioni (`host_conditions.py`)
+
+### 0.1 La macchina
+
+| | |
+|---|---|
+| Macchina | Lenovo IdeaPad Slim 5 14IMH9 (83DA), BIOS N7CN32WW, alimentata da rete |
+| CPU | Intel Core Ultra 7 155H, **ibrida**: P-core 0-11 (6 core fisici con SMT: coppie 0/5, 1/2, 3/4, 6/7, 8/9, 10/11), E-core 12-19, LP E-core 20-21 (fuori dalla L3) |
+| Sistema | Ubuntu 24.04.4 LTS, kernel 6.8.0-100-generic, bare metal |
+| Toolchain | clang 18.1.3, BCC 0.29.1, libbpf 1.4, bpftool 7.4 |
+| Rete | nessuna scheda cablata: il datapath è un fabric `veth` (§3) |
+
+Prerequisiti oltre a BCC: `sudo apt install clang libbpf-dev libelf-dev zlib1g-dev
+libzstd-dev liblzma-dev` (l'oggetto AOT di P1 e il suo loader statico). Con `-target bpf`
+clang non cerca `asm/types.h` nella cartella multiarch di Ubuntu: i flag BPF
+(`p1_aot.BPF_CFLAGS`, `method4_hardcoded_aot.py`, `poc_aot/Makefile`) aggiungono
+`-I/usr/include/<arch>-linux-gnu`.
+
+### 0.2 Perché serve condizionare la macchina
+
+Lasciato a sé stesso, questo portatile mette un processo dove capita (anche su un E-core),
+fa girare desktop e browser sul fratello SMT del core che misura, cambia frequenza fra 0,4 e
+4,8 GHz secondo carico e temperatura, e addormenta i core in C10 (risveglio 310 µs, più di
+quanto il ring del `veth` — 256 descrittori — copra a 1 Mpps). E scalda: un solo P-core
+salito a 4,5–4,8 GHz porta il pacchetto da 51 a 99 °C in due secondi, con centinaia di
+eventi di throttling termico.
+
+### 0.3 Che cosa fa `host_conditions.py`
+
+Tutto reversibile e tutto scritto in `env.csv` accanto ai numeri.
+
+| | |
+|---|---|
+| ruoli | DUT, uscita e generatore su P-core fisici **distinti**, un thread per core; il fratello SMT di ognuno resta a riposo; il core della CPU 0 resta al sistema. Fra i P-core vengono prima quelli con il turbo più basso (4,5 GHz): i due "preferiti" (1-4, 4,8 GHz) sono quelli che vanno in throttling |
+| frequenza | sui core del banco e sui fratelli: governor `performance`, min = max = **3500 MHz** (`--freq`), poi **misurata** con APERF/MPERF |
+| sistema | CPU del sistema con un tetto di 2500 MHz (`--system-max-mhz`): il loro turbo scalderebbe il pacchetto fino al throttling, che rallenta anche i core del banco |
+| uncore | min = max = 3300 MHz (`--uncore`): L3 e anello non cambiano velocità a metà misura |
+| idle | sulle CPU del banco spenti gli stati con uscita > 1 µs (C6, C10); restano POLL e C1E (`--cstate-max-us`) |
+| isolamento | `user.slice`, `system.slice`, `init.scope` confinati sulle CPU del sistema (`AllowedCPUs`, runtime); sulle stesse CPU gli IRQ spostabili, le workqueue unbound e i kernel thread spostabili; il processo del banco in uno scope suo (`ipa-bench.slice`) |
+| profilo | power-profiles-daemon su `performance` (`--profile`) |
+| watchdog | NMI watchdog spento |
+
+Con il piano automatico: **DUT cpu6, uscita cpu8, generatore cpu10, cpu1, cpu3**; fratelli a
+riposo 2, 4, 7, 9, 11; sistema 0, 5, 12-21.
+
+**Il ripristino.** Ogni valore si salva in `/run/ipa-bench/host_state.json` prima di
+cambiarlo. A fine run (anche con Ctrl-C, SIGTERM, SIGHUP o un'eccezione) si riscrive tutto
+all'indietro. Un run ucciso con SIGKILL lascia il file: il run successivo ripristina per
+primo, oppure `sudo python3 ipa/test/host_conditions.py --restore`.
+
+**Il monitor.** Per finestra (colonne `host_*` di `bench_bitrate`) e per l'intero run
+(`env.csv`): eventi di throttling di core e pacchetto, temperatura, frequenza reale del DUT
+da APERF/MPERF, SMI, powerclamp, alimentazione; più un registro al secondo in
+`host_monitor.csv`, scritto da un processo a parte. Una finestra con throttling, powerclamp,
+batteria o frequenza del DUT fuori del 5% da quella misurata all'avvio è **disturbata**: si
+conta e si riporta, non si scarta.
+
+**La frequenza nel sysfs non è sempre quella vera.** Con min = max = 1400 MHz scritti nel
+sysfs (la `base_frequency` dei P-core) il DUT gira stabilmente a **~2000 MHz** misurati
+(1993–2003 su tutti i core del banco). Da 3000 MHz in su i due valori coincidono entro 10
+MHz. Per questo il riferimento del monitor è sempre la frequenza **misurata** all'avvio, e
+`env.csv` le riporta entrambe.
+
+### 0.4 Perché 3500 MHz
+
+`bench_bitrate` (rxonly, baseline, template), inoltro massimo in Mpps a 64 B, un giro da
+30 s per frequenza, più due run completi (6 metodi, 5 giri, ~5 minuti):
+
+| frequenza reale | rxonly | baseline | template | finestre disturbate | throttling | temp. |
+|---|---:|---:|---:|---|---|---|
+| 2,0 GHz | 2,65 | 2,00 | 1,14 | 0/39 | 0 | 53 °C |
+| 3,0 GHz | 3,93 | 2,89 | 1,66 | 0/39 | 0 | 47 °C |
+| 3,5 GHz | 4,37 | 3,22 | 1,86 | 0/39 | 0 | 55 °C |
+| 4,0 GHz | 4,84 | 3,55 | 2,09 | 0/39 | 0 | 61 °C |
+| 4,5 GHz | 5,17 | 3,54 | 2,04 | **28/39** | 8 930 eventi | 65 °C |
+| **run completo 4,0 GHz** | 4,87 | 3,56 | 2,07 | **11/260** | 219 sul **DUT** | registro fino a **98 °C** |
+| **run completo 3,5 GHz** | 4,39 | 3,18 | 1,86 | **1/390** | 2 di pacchetto | registro max 85 °C |
+
+A 4,5 GHz il throughput smette di crescere e l'inizio della perdita del template arretra. A
+4 GHz un run da 30 s è pulito, uno da 5 minuti no: il pacchetto arriva a 98 °C dopo ~100 s.
+**3500 MHz è la frequenza più alta che la macchina regge per un run intero.**
+
+La frequenza pesa quasi in proporzione, ma non del tutto: da 3 a 4 GHz il throughput sale
+del 23% invece del 33%, e i cicli per pacchetto crescono dell'8–13% fra 2 e 4 GHz (la
+uncore è fissa, la cache condivisa e la memoria non accelerano con il core). Il **rapporto
+fra pipeline** invece no: template/baseline vale 0,57–0,59 a ogni frequenza pulita. Le cifre
+assolute vanno citate insieme alla loro frequenza.
+
+### 0.5 Comandi
+
+```bash
+python3 ipa/test/host_conditions.py --show           # topologia, piano, condizioni (niente root)
+sudo python3 ipa/test/host_conditions.py --restore   # dopo un run ucciso
+# un comando qualunque sul core del DUT, a condizioni applicate
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/test_suite.py --only kernel
+
+python3 ipa/test/test_host_conditions.py             # 93 controlli su un /sys finto, niente root
+sudo python3 ipa/test/test_host_kernel.py            # sul kernel vero: applica, misura, ripristina
+sudo python3 ipa/test/test_host_kernel.py --bench    # + un giro corto di bench_bitrate
+
+bash ipa/test/remeasure_all.sh                      # tutte le misure BPF_PROG_TEST_RUN (~15 min)
+bash ipa/test/remeasure_traffic.sh                   # tutte le misure di traffico (~15 min)
+```
+
+`test_host_kernel.py` sul kernel vero: **25/25** con `--bench`. Rilegge dal kernel governor,
+limiti, stati di idle, `AllowedCPUs`, IRQ e workqueue; verifica che un processo nuovo di
+`user.slice` giri solo sulle CPU del sistema; misura che il DUT sotto carico tenga la
+frequenza; confronta valore per valore la macchina prima e dopo il ripristino, anche dopo un
+SIGKILL a condizioni applicate.
+
+`bench_throughput` e `bench_bitrate` condizionano la macchina da soli (`--no-tune` per non
+toccarla, `--freq`, `--no-isolate`, …: vedi `--help`). Gli altri banchi girano con
+`host_conditions.py --run`.
 
 ---
 
 ## 1. Test locali (userspace) — nessun root, nessun kernel eBPF
 
-Richiede solo `torch` + `numpy`. Girano ovunque: nessun kernel, nessun root.
+Richiede `torch` e `numpy`: senza torch `test_suite.py` si ferma subito, e gira solo
+`--only kernel`. Su Ubuntu 24.04 torch va installato in un virtualenv o con
+`pip install --user --break-system-packages torch`.
 
 ```bash
-# Tutte le suite (la suite kernel viene saltata se non c'è BCC/root)
-python3 ipa/test/test_suite.py
-
-# Una singola suite
-python3 ipa/test/test_suite.py --only core       # struttura design-space + update latency
+python3 ipa/test/test_suite.py                    # tutte le suite (kernel saltata senza BCC/root)
+python3 ipa/test/test_suite.py --only core        # struttura design-space + update latency
 python3 ipa/test/test_suite.py --only quant       # accuratezza argmax vs scale_factor
 python3 ipa/test/test_suite.py --only pktstats    # HIT/FAKE/MISS per pipeline
 python3 ipa/test/test_suite.py --only extract     # coerenza pesi / weights.json / dequant
 python3 ipa/test/test_suite.py --only robust      # input anomali, nessun crash
 
-# Opzioni
-python3 ipa/test/test_suite.py --only quant --samples 500
-python3 ipa/test/test_suite.py --model ipa/frr_germany50_5_model_4x2.pt --verbose
+python3 ipa/test/test_class_semantics.py          # 69 controlli, cinque layout di classi
+python3 ipa/test/test_synth.py                    # 63 controlli sui modelli sintetici
+python3 ipa/test/test_bitrate_math.py             # 98: formule e attribuzione di bench_bitrate
+python3 ipa/test/test_steady_window.py            # 18: la finestra stazionaria
+python3 ipa/test/test_host_conditions.py          # 93: ruoli, applicazione e ripristino
 ```
 
 ---
 
-## 2. Test nel kernel (`--only kernel`) — richiede Linux + BCC + root
+## 2. Test nel kernel (`--only kernel`)
 
-Carica i programmi XDP reali ed esegue `BPF_PROG_TEST_RUN`. Misura le metriche del design
-space direttamente dal kernel e verifica il dispatch (redirect) per ogni TTL. La tabella
-include ora una colonna **baseline** (parse + redirect, nessuna inferenza) come pavimento di
-riferimento — utile per capire quanto costa davvero l'inferenza rispetto al solo framework XDP.
+Carica i programmi XDP reali ed esegue `BPF_PROG_TEST_RUN`: metriche del design space e
+dispatch (redirect) per ogni TTL. La colonna **baseline** (parse + redirect, nessuna
+inferenza) è il pavimento del framework XDP.
 
 ```bash
-# Su host Linux con BCC installato
-sudo python3 ipa/test/test_suite.py --only kernel
-
-# Solo metriche, senza il gate di dispatch
-sudo python3 ipa/test/test_suite.py --only kernel --no-verify
-
-# Più ripetizioni per una latenza più stabile (per-trial repeat)
-sudo python3 ipa/test/test_suite.py --only kernel --kernel-repeat 200000
-
-# Più trial indipendenti (default 7) se il risultato è ancora volatile
-sudo python3 ipa/test/test_suite.py --only kernel --kernel-trials 15
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/test_suite.py --only kernel
+sudo python3 ipa/test/test_suite.py --only kernel --no-verify          # solo metriche
+sudo python3 ipa/test/test_suite.py --only kernel --kernel-trials 15   # più trial
 ```
 
-**Volatilità corretta**: la tabella misurava latenza/throughput con un **singolo** campione
-`BPF_PROG_TEST_RUN` — rumore di sistema a senso unico (scheduler/interrupt possono solo
-rallentare un trial, mai accelerarlo) lo faceva oscillare anche 2-5× da un run all'altro
-(es. hardcoded 10-25 Mpps, baseline 10-50 Mpps — esattamente il problema già trovato e
-corretto in `bench_depth_vs_width.py`). Ora ogni pipeline gira `--kernel-trials` volte
-(default 7) e riporta il **minimo** (la statistica giusta per rumore a senso unico, stesso
-principio di hyperfine/Google Benchmark) — la tabella mostra anche p50 e max per
-trasparenza, non solo il minimo.
+**Metodo.** Ogni pipeline gira `--kernel-trials` volte (default 7) e si riporta il
+**minimo**: il rumore di sistema è a senso unico (interrupt e scheduling possono solo
+rallentare un trial), lo stesso principio di hyperfine e Google Benchmark. La tabella
+riporta anche p50, max e spread. Il frame si rinfresca ogni 200 esecuzioni partendo da TTL
+255: `BPF_PROG_TEST_RUN` non ripristina il buffer, e il datapath decrementa il TTL.
 
-Output atteso: tabella metriche (istruzioni/jited/tail-call/memoria/latenza min/p50/max/
-spread/throughput) + `5 PASS / 0 FAIL` per ciascuna pipeline + il probe `link_state reroute`
-(un link giù cambia l'uscita) + `kernel suite: PASS`.
+Oltre al dispatch verifica:
+- **corrispondenza di classe**: pre-installa `mac_table`, esegue e controlla che la classe
+  scelta dal kernel sia quella del riferimento Python (`cls_stats[ref_cls] > 0`);
+- **TTL**: TTL 5 esce a 4 con checksum valido, TTL 1 non viene inoltrato;
+- **reroute su guasto**: con `link_state[k]=0` l'argmax cambia uscita (15/30 casi);
+- **architetture alternative**: P1 `(8,)` e `(4,4,4)`; P2 65-6-5-7 e P3 65-5-6-4-7 registrati
+  insieme al modello reale nello stesso oggetto.
 
-Cosa verifica in più oltre al dispatch:
-- **Corrispondenza di classe** (single-pass, uniforme sulle 3 pipeline): pre-installa `mac_table[0..5]`,
-  esegue una volta e controlla che la classe scelta dal kernel = classe del riferimento Python
-  (`cls_stats[ref_cls] > 0`). Nessun `ctx_in` custom: le semantiche di `ctx_in` per `xdp_md` non
-  sono portabili fra kernel, quindi si usa l'`ingress_ifindex` di default del device di test.
-- **Reroute su guasto**: per ogni TTL e interfaccia `k`, esegue P1 con tutti i link up e poi con
-  `link_state[k]=0`, e conferma che l'argmax cambia uscita in almeno un caso.
-
-> **`ingress_iface`: le tre pipeline ora concordano** (risolto il 2026-09-21).
-> Tutte e tre traducono l'ifindex del kernel in porta logica attraverso una mappa
-> letta a runtime — `ingress_port`, `ingress_port_t2`, `ingress_port_t3` — riempita
-> dal control plane con un'unica funzione, `common.ingress_port_slots`.
->
-> Com'era, e perché non si vedeva: P1 traduceva con una tabella compilata
-> (`ifindex_table`, default `[2..7]`, cioè l'assunzione `eth0 == ifindex 2`); P2/P3
-> usavano l'ifindex **grezzo** con clamp `[1, n_interfaces]`. Per lo stesso pacchetto
-> sceglievano colonne di pesi diverse. E su un nodo vero gli ifindex non stanno in
-> nessuno dei due intervalli, quindi **tutte e tre** azzeravano la feature: 6 dei 65
-> input costantemente nulli, in silenzio, con la suite verde perché nessuno
-> controllava che quella feature contribuisse qualcosa.
->
-> - La convenzione: chiave = ifindex del kernel, valore = slot del one-hot,
->   **1-based**, dove lo slot è il RANGO della porta fra quelle che il modello può
->   scegliere (`ClassSemantics.logical_ports`). L'1-based non è estetica: la guardia
->   nel datapath è `>= 1 && <= size`, quindi l'assenza (0) si legge da sola come
->   “non è una mia porta”. Il mapping non si deduce ordinando gli ifindex: passa per
->   il nome dell'interfaccia (`NodeConfig`) e poi per `socket.if_nametoindex`.
-> - Verificato su kernel il 2026-09-21, cinque veth con ifindex 5/7/9/11/13. Le tre
->   mappe contengono le stesse cinque coppie (`5→1, 7→2, 9→3, 11→4, 13→5`), lette
->   con `bpftool map dump`. Gli ifindex a passo 2 sono anche la prova del difetto
->   vecchio: la tabella compilata `[2..7]` qui avrebbe azzeccato **una** porta su
->   cinque, e per giunta la colonna sbagliata.
-> - Sotto `BPF_PROG_TEST_RUN` resta vero che il sandbox espone `ingress_ifindex = 1`
->   (`verify_prog_run.TEST_RUN_DEFAULT_INGRESS_IFINDEX`) e che quel runner non scrive
->   la mappa: nessuna porta risolve e il one-hot resta vuoto **per tutte e tre**. Il
->   riferimento dice la stessa cosa (`ref_ingress_port = 0`), quindi le due parti
->   confrontano lo stesso vettore. Il limite di validità esterna sopravvive in questa
->   forma ridotta: la suite misura una configurazione in cui quella feature è spenta,
->   e chi cita quei numeri deve dirlo.
+**`ingress_iface`.** Le tre pipeline traducono l'ifindex del kernel in porta logica con una
+mappa letta a runtime (`ingress_port`, `ingress_port_t2`, `ingress_port_t3`), riempita dal
+piano di controllo con `common.ingress_port_slots`. Chiave = ifindex, valore = slot del
+one-hot **1-based**, dove lo slot è il rango della porta fra quelle che il modello può
+scegliere (`ClassSemantics.logical_ports`); la guardia nel datapath è `>= 1 && <= size`,
+quindi l'assenza (0) si legge come "non è una mia porta". Sotto `BPF_PROG_TEST_RUN` il
+sandbox espone `ingress_ifindex = 1` e nessuna porta risolve: il one-hot resta vuoto per
+tutte e tre, e il riferimento dice la stessa cosa (`ref_ingress_port = 0`). La suite misura
+quindi una configurazione in cui quella feature è spenta; il fabric (§3) la accende.
 
 ### P1 specializzata: le porte presenti sul nodo
 
-`static_ports` dice al generatore di P1 **quali colonne di `link_state`
-esistono davvero** su questo nodo. Un nodo di grado 3 su 6 ha
-`link_state[3..5]` permanentemente a zero — quelle interfacce non esistono,
-non sono link caduti — e quelle colonne non vengono generate affatto.
+`static_ports` dice al generatore di P1 quali colonne di `link_state` esistono davvero su
+questo nodo: su un nodo di grado 3 su 6 `link_state[3..5]` vale sempre zero (quelle
+interfacce non esistono) e quelle colonne non vengono generate. `link_state[i]` resta letto
+a runtime per ogni porta che esiste; si congela la **struttura**. Solo la P1 specializzata
+lo usa: il generatore rifiuta `static_ports` senza `static_node`, e `hardcoded` (P1.5) resta
+identica byte per byte.
 
-Non è congelare il valore della feature: `link_state[i]` resta letto dalla
-mappa a runtime per ogni porta che esiste, e un link esistente può essere su o
-giù come prima. Si congela la **struttura**: quali posizioni possono esistere.
-
-**Chi lo può usare.** Solo la P1 specializzata. Il generatore rifiuta
-`static_ports` senza `static_node`:
-
-```
-static_ports requires static_node: freezing WHICH ports exist is part of
-specialising P1 to one node, and it is the node that makes that knowledge
-legitimate.
-```
-
-`hardcoded` (P1.5) serve l'intera rete da un binario solo e **resta identica a
-prima, byte per byte** — verificato confrontando il C generato con quello del
-file a HEAD.
-
-**Perché è esatto.** Saltare la colonna *i* toglie dall'accumulatore il termine
-`link_state[i] * w[j][offset+i]`. È esatto, non approssimato, a una condizione:
-che `link_state[i]` sia 0 su questo nodo. Lo è per costruzione —
-`link_state_monitor.carrier_state()` ritorna 0 per un'interfaccia che non
-esiste, al seed e a ogni poll — e `default_ifaces()` risolve gli slot con le
-stesse variabili d'ambiente di `NodeConfig.resolve`, quindi lo slot *i* è la
-porta logica *i*. La somma è in `long long`: togliere un addendo nullo non
-cambia un bit.
-
-`n_in`, gli offset dei pesi e l'ordine delle feature **non cambiano**: si
-saltano solo dei termini, e ogni colonna viva conserva esattamente il peso che
-aveva.
-
-> ⚠️ La condizione è del **deployment**, non del datapath. Un banco che semina
-> tutti gli slot a 1 — come `verify_prog_run._seed_link_state` — fa divergere
-> la versione specializzata, e ha ragione lui. Chi confronta le due versioni
-> deve azzerare gli slot assenti nel riferimento.
-
-**Che cosa sparisce.** Su 65-4-4-7 (nₕ₁ = 4), per ogni porta assente: una
-dichiarazione, una lettura di mappa e **4 moltiplicazioni-accumulo**, una per
-neurone, eseguite a ogni pacchetto. Grado 3 su 6: 12 MAC su 24. È la differenza
-sostanziale dal nodo congelato, dove lo switch a 52 casi ne esegue comunque uno.
-
-**Non tocca**: `queue_occupancy`, che è un vettore denso come `link_state` ma
-indicizzato per **coda**, non per porta — il filtro si applica solo alle feature
-con `dim_key == "n_interfaces"`. Né P2, né P3, né il formato del modello, né il
-mapping delle classi.
-
-**Come si rigira.**
+È esatto finché gli slot assenti valgono 0, e lo valgono per costruzione
+(`link_state_monitor.carrier_state()` ritorna 0 per un'interfaccia che non esiste). Un banco
+che semina tutti gli slot a 1 — come `verify_prog_run._seed_link_state` — fa divergere la
+versione specializzata: chi confronta deve azzerare gli slot assenti nel riferimento.
 
 ```bash
-# correttezza: la specializzata decide come quella a larghezza piena
-sudo python3 ipa/test/bench_scaling.py --verify-ports
-sudo python3 ipa/test/bench_scaling.py --verify-ports --ports 0,1,4
-
-# costo, al variare del grado del nodo (2..6)
+sudo python3 ipa/test/bench_scaling.py --verify-ports      # equivalenza + controllo negativo
 sudo python3 ipa/test/bench_scaling.py --axis degree --out results/
 ```
 
-Sull'asse `degree` cambia **solo** quante colonne P1 genera: modello, forma e
-pesi sono identici punto per punto, e le altre tre pipeline devono restare
-piatte. Una loro pendenza vorrebbe dire che l'asse stesso costa qualcosa.
+Esito: **80/80** casi identici (TTL 2-11 × 8 pattern realizzabili, porte {0,1,4}); accendendo
+uno slot assente le due build divergono in **29** casi (seme 123 del pool), quindi il
+controllo negativo morde e la condizione "slot assenti a 0" è portante.
 
-**Il controllo negativo, e perché c'è.** `--verify-ports` non si limita a
-verificare che le due build concordino: accende uno slot **assente** e pretende
-che a quel punto divergano. Senza, il test sarebbe compatibile con una
-specializzazione sbagliata — se quelle colonne non spostano mai l'argmax,
-«concordano» è vero comunque.
+**Asse `degree`** (65-4-4-7, stessi pesi in ogni punto):
 
-Il primo run (2026-09-21, porte `{0,1,4}`) è finito esattamente lì — 80/80 ma
-controllo muto — cioè **inconcludente**, non positivo: sul seme di default
-quelle colonne non spostavano mai l'argmax. Non è il codice, sono i **pesi**:
-una colonna di `link_state` contribuisce `1 × w` a un accumulatore che ne somma
-65. Il controllo ora prova più semi del pool e **fallisce** se nessuno morde;
-il seme diverso vale solo per il controllo, la misura resta sul pool di sempre.
-Con il seme 123 morde, e l'esito è:
+| porte presenti | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|
+| `p1_static` istruzioni | 565 | 583 | 600 | 617 | 631 |
+| `p1_static` latenza (ns) | 32 | 33 | 33 | 35 | 36 |
 
-```
-80/80 casi identici (ttl 2-11 x 8 pattern realizzabili).
-controllo negativo: accendendo uno slot assente le due divergono in 29 casi
-(pool seed 123) -- la condizione "slot assenti a 0" e' portante.
-```
+**16,5 istruzioni per porta**, lineare; grado 2 contro grado 6: −10,5% di istruzioni e
+**−4 ns** (−11%), con la latenza monotona. Fra grado 6 e grado 2 spariscono 16
+moltiplicazioni-accumulo, circa 4,6 ns a 3,5 GHz se ne costasse una per ciclo: la misura
+li vede. Il controllo regge:
+`hardcoded` 1 114, `template` 14 969, `modular` 12 318 istruzioni e latenze piatte (43,
+184–186, 306–311 ns) su tutti e cinque i punti.
 
-### Risultati dell'asse `degree` (2026-09-21, 4 vCPU, modello 65-4-4-7)
-
-| porte presenti | `p1_static` istruzioni | latenza |
-|---|---|---|
-| 2 | 546 | 54,0 ns |
-| 3 | 564 | 47,0 ns |
-| 4 | 582 | 58,0 ns |
-| 5 | 598 | 49,0 ns |
-| 6 | 614 | 53,0 ns |
-
-**Istruzioni: 17 per porta**, lineare (delta +18, +18, +16, +16). Grado 2 contro
-grado 6: **−11,1 %**.
-
-**Latenza: nessuna tendenza.** Non monotona, escursione del 23 % su ~50 ns.
-Fra grado 6 e grado 2 spariscono 16 moltiplicazioni-accumulo, ~5 ns a 3,2 GHz:
-**sotto il rumore di questo banco**, non risolvibile qui.
-
-> Era stato previsto il contrario — che, essendo `link_state` denso e non una
-> one-hot, togliere colonne avrebbe spostato la latenza dove congelare il nodo
-> non la sposta. La misura dice di no, a questa risoluzione. Resta vero il
-> meccanismo (quelle moltiplicazioni vengono davvero eseguite), ma sono 16 su
-> ~979 istruzioni.
-
-**Il controllo è riuscito**: `hardcoded` 1 071, `template` 14 985 e `modular`
-12 349 su **tutti e cinque i punti**, con 319 pesi ovunque. L'asse di per sé non
-costa nulla, quindi la pendenza della colonna `p1_static` viene da
-`static_ports` e da nient'altro.
-
-> Ancora da misurare: l'interazione con l'asse `sparsity`. Con pesi molto
-> sparsi clang cancella già parte di quel lavoro, e i due effetti potrebbero
-> non sommarsi — come successo in C6 fra nodo congelato e sparsità.
-
-### Verifier standalone (equivalente al gate di dispatch)
+### Verifier standalone e semantica per modello
 
 ```bash
-sudo python3 ipa/test/verify_prog_run.py --method hardcoded
-sudo python3 ipa/test/verify_prog_run.py --method template
-sudo python3 ipa/test/verify_prog_run.py --method modular
-sudo python3 ipa/test/verify_prog_run.py --method modular --model-id 3
-```
-
-### Semantica delle classi per modello (P2/P3)
-
-```bash
-sudo python3 ipa/test/verify_per_model_semantics.py      # casi A-F, R, rimozione (§ 9-bis)
+sudo python3 ipa/test/verify_prog_run.py --method hardcoded|template|modular   # 9/9 PASS, TTL 2-10
+sudo python3 ipa/test/verify_multi_model.py                                     # PASS su P1/P2/P3
+sudo python3 ipa/test/verify_per_model_semantics.py                             # 53/53 (§8-bis)
 ```
 
 ---
 
-## 3. Costruire un datapath reale (`netns_fabric.py`)
+## 3. Il datapath reale (`netns_fabric.py`, `test_fabric.py`)
 
-Non c'è più un emulatore. Il banco si costruisce con `veth` sull'host: una coppia
-per porta logica più un ingresso dedicato, ognuna col peer che porta uno stub
-`XDP_PASS`.
+Il banco si costruisce con `veth` sull'host: una coppia per porta logica più un ingresso
+dedicato, ognuna col peer che porta uno stub `XDP_PASS`.
 
 ```bash
 sudo python3 ipa/test/netns_fabric.py --n-ports 5          # costruisci, mostra, smonta
 sudo python3 ipa/test/netns_fabric.py --n-ports 5 --hold   # resta su, per deployarci sopra
 sudo python3 ipa/test/netns_fabric.py --cleanup            # resti di un run ucciso
+sudo python3 ipa/test/test_fabric.py                       # 29/29: P1/P2/P3, attach + redirect
+sudo python3 ipa/test/test_fabric.py --method aot          # 11/11: la P1 come si deploya
+sudo python3 ipa/test/test_fabric.py --sweep               # 34/34: cinque topologie + Germany50
 ```
 
-`veth` supporta XDP **native**, quindi la modalità di attach è quella di
-deployment, non un surrogato. Lo stub sui peer non è decorazione: redirigere
-*verso* una veth passa da `veth_xdp_xmit()`, e il kernel alloca le code che quel
-percorso richiede solo se il lato ricevente ha un programma XDP. Senza, il
-redirect fallisce in silenzio e il pacchetto sparisce — identico a un modello che
-decide di droppare tutto.
+`veth` supporta XDP **native**, quindi la modalità di attach è quella di deployment. Lo stub
+sui peer serve: redirigere *verso* una veth passa da `veth_xdp_xmit()`, e il kernel alloca
+le code che quel percorso richiede solo se il lato ricevente ha un programma XDP. Senza, il
+redirect fallisce in silenzio e il pacchetto sparisce — identico a un modello che decide di
+droppare tutto. L'ingresso è dedicato e non una porta logica: altrimenti una classe che
+inoltra su quella porta rimanderebbe il frame fuori dall'interfaccia da cui è entrato, dove
+la cattura non lo distingue da quello iniettato.
 
-L'ingresso è **dedicato**, non una porta logica: quando era la porta 0, una classe
-che inoltra su quella porta rimandava il frame fuori dall'interfaccia da cui era
-entrato, dove la cattura non lo distingue da quello appena iniettato.
+`test_fabric` inietta, cattura e confronta la decisione (`cls_stats`) con la porta d'uscita:
+6 classi su 7 raggiunte (la settima è `UNUSED`, irraggiungibile per costruzione), DROP
+verificato dal contatore e non dal silenzio.
 
-Cosa la macchina regge lo dice `sudo bash ipa/test/probe_env.sh`.
+Cosa la macchina regge lo dicono `python3 ipa/test/host_conditions.py --show` e
+`sudo python3 ipa/test/test_host_kernel.py` (§0.5).
 
 ---
 
-## 4. Attaccare una pipeline a un'interfaccia (XDP reale sul fabric)
+## 4. Attaccare una pipeline a un'interfaccia
 
-Attacca sull'interfaccia dove **entra** il traffico (XDP conta solo l'ingresso). In questo
-lab il traffico per `frankfurt` (IP loopback `10.255.255.17`) entra su **eth1** — verifica con
-`sudo tcpdump -i any -n udp port 9999`.
+Si attacca sull'interfaccia dove **entra** il traffico (XDP conta solo l'ingresso).
 
 ```bash
-# sul nodo che fa da switch (es. frankfurt), su eth1
-sudo python3 ipa/execute_pipeline.py --method template  --iface eth1 --model-id 0
-sudo python3 ipa/execute_pipeline.py --method modular   --iface eth1 --model-id 0
-
-# hardcoded: AOT-literal è l'UNICO backend di deploy (BCC live-attach rimosso su
-# richiesta esplicita del relatore). Serve un .o prebuilt (build offline su host
-# con clang) + loader_aot linkato staticamente contro libbpf (nessuna dipendenza
-# runtime su libbpf.so sul nodo). BCC resta solo internamente ai test
-# (verify_prog_run.py ecc.), mai per il deploy.
-sudo python3 ipa/execute_pipeline.py --method hardcoded --iface eth1
-
-# solo verifica del caricamento, senza restare in ascolto
-sudo python3 ipa/execute_pipeline.py --method hardcoded --verify-only
-
-# se un XDP resta appeso da un run precedente ("File exists"): staccalo
-sudo ip link set dev eth1 xdp off
+sudo python3 ipa/execute_pipeline.py --method template --iface ipain --model-id 0
+sudo python3 ipa/execute_pipeline.py --method modular  --iface ipain --model-id 0
+sudo python3 ipa/execute_pipeline.py --method hardcoded --iface ipain     # oggetto AOT
+sudo python3 ipa/execute_pipeline.py --method hardcoded --verify-only     # solo il caricamento
+sudo ip link set dev ipain xdp off                                         # un XDP rimasto appeso
 ```
 
-Tutte e tre stampano `HIT | MISS | DROP` dal vivo. Popolano `mac_table` (porta logica →
-ifindex + MAC, da `NodeConfig`), `ingress_port`, `node_id` e `link_state` all'avvio, con lo
-**stesso** piano di controllo Python; non serve un setup separato.
+Tutte e tre stampano `HIT | MISS | DROP` dal vivo e popolano `mac_table` (porta logica →
+ifindex + MAC, da `NodeConfig`), `ingress_port`, `node_id` e `link_state` all'avvio con lo
+**stesso** piano di controllo Python.
 
-> **Fino al 2026-09-23 questo era falso per `hardcoded`.** Il deploy AOT non eseguiva il piano
-> di controllo: `loader_aot` scriveva `mac_table` da solo, con **ifindex 1 e MAC a zero** per
-> ogni porta logica, e nessun monitor toccava `link_state`. Ogni decisione FORWARD veniva
-> rediretta a `lo` (ifindex 1 in ogni netns): in modalita' native `lo` non accetta redirect
-> XDP e il pacchetto si perde, in generic rientra nello stack locale. Mai sulla porta scelta
-> dal modello. Adesso il loader pinna le mappe in bpffs, `method4_hardcoded_aot.py` le riempie
-> con le funzioni di P2/P3 (`pinned_maps.PinnedObject` da' alle mappe pinnate l'interfaccia di
-> un oggetto BCC), e **solo dopo** il loader attacca: il protocollo e' in testa a
-> `ipa/poc_aot/loader_aot.c`.
+### P1: l'oggetto AOT è l'unico deploy
 
-### AOT-literal deploy / bench (P1) — unico backend hardcoded per il deploy
+La P1 si deploya solo come oggetto AOT: build offline del `.o` (clang, sulla macchina di
+build) e caricamento con `loader_aot`, linkato staticamente contro libbpf, sul nodo — che
+non ha bisogno né di clang né di `libbpf.so`. BCC resta solo dentro i test.
 
-Su richiesta del relatore, il deploy della pipeline hardcoded avviene **solo via
-AOT-literal** (il vecchio live-attach BCC è stato rimosso). Il flusso è: build offline del
-`.o` + del loader statico su un box con compilatore (l'host), poi attach del `.o` prebuilt
-sul nodo datapath, che non ha bisogno di clang/cc/libbpf.
+Protocollo: `loader_aot --attach IFX --pin-dir /sys/fs/bpf/ipa_p1_<iface>` carica, collega
+`model_progs`, pinna le mappe e stampa `READY`; il processo Python riempie le mappe (le
+stesse funzioni di P2/P3, con `pinned_maps.PinnedObject`) e scrive `ATTACH`; il loader
+attacca e stampa `ATTACHED`. Ctrl-C, `DETACH` o la morte del processo Python (EOF su stdin)
+lo fanno staccare e togliere i pin. `--node-id` e `--ingress-port` sono opzioni del solo
+bench.
 
 ```bash
-# bench (deploy-cost + perf, via BPF_PROG_TEST_RUN) -- richiede root sull'host
-sudo python3 ipa/methods/method4_hardcoded_aot.py
-# deploy LIVE su un'interfaccia (via execute_pipeline, backend AOT di default):
-sudo ip link set dev eth1 xdp off
-sudo python3 ipa/execute_pipeline.py --method hardcoded --iface eth1
+python3 ipa/methods/method4_hardcoded_aot.py     # build del .o e del loader, come utente
+sudo python3 ipa/methods/method4_hardcoded_aot.py  # bench: costo di deploy e per pacchetto
 ```
 
-**Verificato sul nodo `frankfurt`** (che NON ha clang, cc né `libbpf.so` usabile per il
-link): il loader fully-static carica il `.o` prebuilt e attacca il programma XDP; `ip link
-show dev eth1` mostra `prog/xdp id ... name xdp_dispatch ... jited`. **Questo prova il
-caricamento, l'attach e il JIT, non l'inoltro**: con il `mac_table` che il loader scriveva
-allora (ifindex 1) ogni FORWARD finiva su `lo`, e nessuna prova guardava su quale
-interfaccia usciva il pacchetto. La correttezza dell'inferenza la coprono `test_suite --only
-kernel` (sul build BCC) e `test_synth` [8] (sul C AOT valutato dal sorgente, senza kernel);
-l'inoltro del deploy AOT su un datapath reale **non e' ancora verificato** dopo la
-correzione del 2026-09-23.
+Il link statico di libbpf tira dentro anche `libelf`, `zlib`, `libzstd` e `liblzma`; lo
+script prova la riga a 3 librerie e poi quella a 5. Il loader va costruito come utente
+normale: file generati da root sotto `ipa/poc_aot/` fanno fallire un build successivo
+(`sudo chown -R $USER:$USER ipa/poc_aot`).
 
-Verificato il 2026-09-23 sulla VM, con due veth (`IPA_PORT_MAP="0=ipa0,1=ipa1"
-IPA_NODE_ID=7`, `--iface ipa0`): sequenza `READY` -> piano di controllo -> `ATTACHED native`;
-`bpftool map dump pinned .../mac_table` mostra porta 0 -> ifindex 5 (`ipa0`) e porta 1 ->
-ifindex 7 (`ipa1`) con i MAC sorgente reali, dst in attesa di ARP, porte 2-4 a zero (assenti
-sul nodo); dopo Ctrl-C `detached from ifindex 5` e i pin in `/sys/fs/bpf` spariscono.
+`test_fabric --method aot` (11/11) prova la consegna del deploy vero: `mac_table` riletto
+dopo il deploy con gli ifindex del fabric, le 5 classi FORWARD escono dalla porta attesa, la
+classe DROP è contata e nulla esce, loader staccato con rc=0 e pin rimossi.
 
-**Consegna verificata** lo stesso giorno con `sudo python3 ipa/test/test_fabric.py --method aot`
-(11/11): il deploy vero (`AotDeploy`) su un fabric veth, porte comunicate con `IPA_PORT_MAP`;
-`mac_table` riletto dopo il deploy = ifindex del fabric; classi 0-4 catturate sulla porta
-attesa, classe 5 DROP contata e nulla in uscita, classe 6 irraggiungibile; rc=0 e pin rimossi.
-
-Protocollo del deploy (dal 2026-09-23): `loader_aot --attach IFX --pin-dir
-/sys/fs/bpf/ipa_p1_<iface>` carica, collega `model_progs`, pinna le mappe e stampa `READY`;
-il processo Python riempie le mappe e scrive `ATTACH`; il loader attacca e stampa
-`ATTACHED`; Ctrl-C, `DETACH` o la morte del processo Python (EOF su stdin) lo fanno
-staccare e togliere i pin. `--node-id` e `--ingress-port` restano opzioni del solo bench.
-
-Il modello AOT è **build offline** (macchina con clang) → deploy del `.o` prebuilt sul nodo
-(nessun clang). Su un nodo senza clang, se `nn_aot_arch.o` è già presente viene riusato.
-
-**`loader_aot` va costruito una volta sola su una macchina di build**, non sul nodo
-che inoltra: un nodo stripped non ha né `clang` né `cc`. Costruiscilo come utente
-normale, non con `sudo` — il build non richiede root, solo l'attach XDP finale lo
-richiede:
-```bash
-# dev-lib per il link statico (una volta):
-sudo apt-get install -y libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
-python3 ipa/methods/method4_hardcoded_aot.py   # sulla macchina di build
-```
-Il binario è linkato **staticamente** (niente `libbpf.so` richiesto a runtime) e vive in
-`ipa/poc_aot/loader_aot`: è il file da copiare sul nodo, da solo, insieme al `.o`.
-
-Note pratiche emerse costruendolo davvero:
-- Il link statico di libbpf tira dentro dipendenze transitive che devono anch'esse essere
-  statiche: `libelf`, `zlib`, e — su elfutils recente che comprime le sezioni ELF —
-  anche `libzstd` e `liblzma`. Lo script prova prima la riga a 3 librerie, poi quella a 5
-  (con `zstd`/`lzma`); su Ubuntu recente serve la seconda. Se fallisce stampa l'errore
-  `ld` completo per capire quale `.a` manca.
-- I file generati sotto `ipa/poc_aot/` (`nn_aot_arch.bpf.c`, `.o`, `loader_aot`) prendono
-  il proprietario dell'utente che li crea: se un run precedente è stato fatto con `sudo`
-  (root), un run successivo come utente normale fallisce con
-  `PermissionError`. Rimedio: `sudo chown -R $USER:$USER ~/percorso/ipa_lab`.
-- Su un nodo dove BCC è installato `libbpf.so.1` è presente (tirato dentro da BCC), quindi
-  anche un loader linkato dinamicamente (`-lbpf`) funzionerebbe lì; il link statico resta
-  comunque la scelta preferita perché non dipende da questo dettaglio dell'immagine.
-- Il bench sull'host (`method4_hardcoded_aot.py` senza `--iface`) carica un programma BPF e
-  quindi richiede root: eseguito come utente normale fallisce con `RLIMIT_MEMLOCK -EPERM`.
-  Non è un problema del deploy — il caricamento reale avviene sul nodo, che gira
-  come root.
-
-Le pipeline avviano automaticamente il monitor `link_state` (thread di polling che tiene
-`link_state[0..5]` allineato al carrier reale delle interfacce egress). Per un dry-run dei
-carrier senza caricare eBPF:
+Le pipeline avviano il monitor `link_state` (polling del carrier reale delle interfacce
+d'uscita). Dry-run senza eBPF:
 
 ```bash
-# stampa lo stato up/down di eth0..eth5 che verrebbe scritto nella map
 sudo python3 ipa/link_state_monitor.py --ifaces eth0 eth1 eth2 eth3 eth4 eth5
 ```
 
 ---
 
-## 5. Invio pacchetti IPA di prova
-
-La verifica di correttezza end-to-end è `test_fabric.py` (sezione 4): inietta,
-cattura, e confronta sia la decisione (`cls_stats`) sia la porta d'uscita. Questi
-script servono per traffico manuale su un fabric già attivo:
+## 5. Costo di aggiunta modello (`bench_model_add.py`)
 
 ```bash
-sudo python3 ipa/recv_ipa.py --timeout 30 --port 9999
-sudo python3 ipa/send_ipa.py --dst <host> --count 100
-sudo python3 ipa/test/test_ipa.py --dest <host> --count 100 --model-id 0
-
-# traffico multi-modello (round-robin), per esercitare il dispatch di P2/P3
-sudo python3 ipa/test/test_ipa.py --dest <host> --count 90 --model-ids 42 43 44
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_model_add.py --n-models 3
 ```
+
+| pipeline | setup una tantum | add **min** (ms) | media | come |
+|---|---:|---:|---:|---|
+| hardcoded (BCC) | — | 76,1 | 80,7 | ricompilazione completa: BCC 75 ms, caricamento 2,2 ms |
+| template | 1 603 ms | **0,507** | 0,695 | una `bpf_map_update_elem` sul blocco pesi |
+| modular | 1 295 ms | **0,403** | 0,621 | una `bpf_map_update_elem` sul blocco pesi |
+
+Ricompilare P1 con BCC costa 150-190× una scrittura in mappa. Ma il deploy di P1 è l'oggetto
+AOT: sul nodo si paga solo il caricamento, **1,16 ms** (`open` 0,08 + verifica e JIT 1,08;
+§ Risultati), e clang (76 ms) gira una volta sulla macchina di build. Si riporta il minimo:
+con 3 modelli la media è dominata dal primo add, che paga il primo accesso alle pagine di
+una mappa appena creata. Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (3 modelli di questa
+architettura), `MAX_LAYER_WEIGHT_ENTRIES=2048` in P3 (6).
 
 ---
 
-## 6. Costo reale di aggiunta modello (`bench_model_add.py`)
+## 6. Larghezza contro profondità in P1 (`bench_depth_vs_width.py`)
 
-Misura, con `BPF(text=…)` + `load_func()` reali (non stimati), quanto costa registrare un
-nuovo `model_id` a runtime in ciascuna pipeline — sfrutta il multi-model concorrente di P2/P3
-(più `model_id` nella stessa run, blocchi di pesi non sovrapposti in `arch_weights`/`layer_weights`).
-
-```bash
-sudo python3 ipa/test/bench_model_add.py --n-models 3
-sudo python3 ipa/test/bench_model_add.py --n-models 3
-```
-
-Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (max 3 modelli con questa architettura),
-`MAX_LAYER_WEIGHT_ENTRIES=2048` in P3 (max 6). Risultati e lettura nel dettaglio
-in `docs/pipeline_design_space.html` (sezione Risultati Sperimentali).
-
----
-
-## 7. Trade-off larghezza vs profondità in P1 hardcoded (`bench_depth_vs_width.py`)
-
-P1 hardcoded ora supporta un numero **variabile** di hidden layer (`hidden_dims` di
-qualunque lunghezza: `(4,4)` storico, `(8,)`, `(4,4,4,4)`, `()` lineare puro — non più
-fisso a 2). Domanda del relatore: a parità di budget-pesi, conviene allargare un layer o
-aggiungerne uno nuovo? Script dedicato:
+P1 supporta un numero variabile di hidden layer. A parità di budget-pesi, conviene allargare
+un layer o aggiungerne uno?
 
 ```bash
-sudo python3 ipa/test/bench_depth_vs_width.py                      # tutti e 4 i descrittori
-sudo python3 ipa/test/bench_depth_vs_width.py --descriptor no_onehot
-sudo python3 ipa/test/bench_depth_vs_width.py --repeat 5000        # più stabile, più lento
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_depth_vs_width.py
 ```
 
-**Metodologia** (vedi il file per il codice completo):
-- 3 tier a **budget-pesi abbinato** (A ~300, B ~1200, C ~4700 pesi): per ciascuno, una forma
-  larga (1 layer) e due profonde (4 e 8 layer); lo scarto di pesi è stampato esplicitamente,
-  mai assunto "circa uguale".
-- **4 descrittori di feature** (`default` 2 one-hot, `no_onehot` 0, `small_onehot` 1 piccola,
-  `big_onehot` 1 grande = `node`, size 52) per isolare l'effetto del descrittore da un
-  effetto generale larghezza/profondità — il descrittore di default ha una one-hot
-  (`node`) molto costosa che da sola avrebbe potuto falsare la conclusione.
-- **Minimo su 7 trial indipendenti**, non un solo campione: un run con `repeat` singolo
-  oscillava fino a 20× senza correlazione con le istruzioni — rumore di sistema **a senso
-  unico** (interrupt/scheduling possono solo rallentare, mai accelerare un trial), quindi
-  il minimo stima il costo al netto delle interferenze (stesso principio di hyperfine /
-  Google Benchmark).
-- **Ogni cella (descrittore × forma) in un subprocess isolato**: oltre un certo budget lo
-  stack eBPF (512 byte) va in overflow e il backend LLVM di BCC termina con un abort
-  **fatale, non catturabile** come eccezione Python. Isolare ogni cella in un subprocess fa
-  sì che un crash marchi solo quella cella (`CRASHED`) senza fermare lo sweep.
+**Metodo.** Tre tier a budget abbinato (A ~300, B ~1 200, C ~4 700 pesi), per ciascuno una
+forma larga e tre profonde, con la larghezza **risolta per descrittore** perché il budget
+sia centrato (lo scarto è stampato). Quattro descrittori (`default` 2 one-hot,
+`big_onehot` una grande, `small_onehot` una piccola, `no_onehot` nessuna). Minimo su 7
+trial. Ogni cella in un subprocess: un abort di clang o un rifiuto del verificatore marca
+solo quella cella.
 
-**Metodologia, la correzione che conta.** Le forme erano **fisse** fra i quattro
-descrittori (1×16, 4×11, 8×9…), ma `n_in` va da 65 a 11: con 65 ingressi il primo
-layer domina il budget e gli strati in più lo muovono poco, con 11 no. Lo scarto di
-pesi dentro un tier arrivava così al **160%** sui descrittori a ingresso piccolo — la
-forma «profonda 8» aveva 2,6× i parametri della «larga» ed era più lenta anche solo
-per quello. E cadeva proprio sui due descrittori **senza** one-hot grande, cioè
-quelli che servono da controllo. Ora la larghezza è **risolta per descrittore**
-(`solve_width`) perché il budget sia centrato davvero; lo scarto resta stampato.
-
-**Risultato — tier B (~1 200 pesi), il meglio abbinato (scarti 3,9-10,1%):**
+**Tier A (~300 pesi)**, ns/pacchetto:
 
 | descrittore | n_in | larga | 2 layer | 4 layer | 8 layer |
 |---|---:|---:|---:|---:|---:|
-| `default` (2 one-hot) | 65 | **122 ns** | 183 (+50%) | 279 (+129%) | 293 (**+140%**) |
-| `big_onehot` (1 grande) | 59 | **110 ns** | 161 (+46%) | 215 (+95%) | 268 (**+144%**) |
-| `no_onehot` (0) | 11 | *crash* | *crash* | 501 ns | 457 ns |
-| `small_onehot` (1 piccola) | 13 | *crash* | *crash* | *rifiutata* | 465 ns |
+| `default` (2 one-hot) | 65 | **39** | 39 | 41 | 50 (+28%) |
+| `no_onehot` (0) | 11 | 96 | 96 | 84 | **76 (−21%)** |
+| `small_onehot` (1 piccola) | 13 | *non carica* | **74** | 78 | 78 |
 
-**Tier A (~300 pesi):**
+(`big_onehot` nel log `depth_vs_width.log` di `remeasure_all.sh`.)
 
-| descrittore | larga | 2 layer | 4 layer | 8 layer |
-|---|---:|---:|---:|---:|
-| `default` | **54 ns** | 56 | 58 | 70 (+30%) |
-| `big_onehot` | 41 ns | **38** | 59 | 57 (+39%) |
-| `no_onehot` | 107 ns | 110 | 107 | **102 (−5%)** |
-| `small_onehot` | 93 ns | **92** | 105 | 112 (+20%) |
+**Tier B (~1 200 pesi)**: su `default` si carica solo la forma a 8 strati (**230 ns**,
+4 851 istruzioni); larga, 2 e 4 strati vengono **rifiutate dal verificatore**:
+`BPF program is too large. Processed 1000001 insn (limit 1000000)`, errore −7 (`E2BIG`) su
+`xdp_model`. Non è lo stack: è il limite di **complessità di verifica**. Su `no_onehot` e
+`small_onehot` il tier B non carica in nessuna forma (abort di clang per lo stack o lo
+stesso limite del verificatore). **Tier C (~4 700 pesi)**: nessuna forma carica.
 
-**Tier C (~4 700 pesi): crash su tutti e quattro i descrittori e tutte e quattro le
-profondità.** Oltre ~1 300 pesi il modello non ci sta comunque.
-
-### Che cosa dicono davvero
-
-**1. Con un ingresso grande e dominato da one-hot, allargare batte approfondire** —
-ed è il caso di IPA. +30-39% a 300 pesi, **+140-144%** a 1 200: il divario cresce col
-budget, perché ogni strato in più ha una spesa fissa di transizione.
-
-**2. Con un ingresso piccolo e denso il vantaggio sparisce.** Su `no_onehot`
-(n_in=11) a 300 pesi la versione a 8 strati è marginalmente **più veloce** (102
-contro 107 ns) e **più piccola** (1 280 contro 1 583 istruzioni). Il motivo è
-strutturale: una one-hot larga costa poco per pacchetto perché il datapath ne legge
-**una colonna sola**, mentre un ingresso denso fa moltiplicare le letture di mappa
-per la larghezza del primo strato. La risposta dipende da **com'è fatto il vettore
-d'ingresso**, non solo dal budget.
-
-**3. Il limite mangia prima le forme larghe.** A parità di budget, la larga sfonda lo
-stack da 512 byte prima della profonda, perché è il primo strato a consumarlo. Su
-`no_onehot` a 1 200 pesi, in ordine di stack stimato:
-
-| forma | stack stimato | esito |
-|---|---:|---|
-| larga 1×63 | 584 | **crash** |
-| 2×26 | 288 | **crash** |
-| profonda 4×17 | 216 | carica |
-| profonda 8×11 | 168 | carica |
-
-Con un ingresso piccolo e un budget medio, **la rete profonda è l'unica che sta in
-piedi**. Da notare: `first_layer_stack_estimate` è documentata come diagnostica e non
-come predittore, ma qui l'ordine che stima è esattamente l'ordine dei crash.
-
-**4. Due limiti distinti, osservati nello stesso tier.** `small_onehot` a 1 200 pesi:
-`1×57` e `2×25` muoiono nello **stack** (abort di clang, `Looks like the BPF stack
-limit is exceeded`); `4×16` compila e viene rifiutata dal **verificatore**
-(`Program too large (5637 insns)`). Compilazione ed esecuzione sono soglie diverse e
-si toccano in punti diversi.
-
-> ⚠️ Il tier A ha scarti fino al 21,8%: a 300 pesi le larghezze intere fanno passi
-> grossi, e differenze di 2-3 ns dentro quel tier non sono risolvibili. Il tier B è
-> quello su cui appoggiarsi.
-
-**La frase per la tesi** non è «le reti larghe sono preferibili a quelle profonde»,
-ma: *con un ingresso dominato da feature one-hot — il caso di IPA — allargare batte
-approfondire, e sempre di più al crescere del budget; con un ingresso piccolo e denso
-il vantaggio sparisce, e oltre una certa taglia è la forma larga a non compilare più.*
+**Che cosa dicono.**
+1. Con un ingresso grande e dominato da one-hot (`default`, il caso di IPA) allargare batte
+   approfondire: +28% a 8 strati già a 300 pesi.
+2. Con un ingresso piccolo e denso (`no_onehot`) è il contrario: la versione a 8 strati è
+   **più veloce del 21%** e più piccola (1 323 contro 1 630 istruzioni). Una one-hot costa
+   poco perché il datapath ne legge una colonna; un ingresso denso moltiplica le letture per
+   la larghezza del primo strato. La risposta dipende da com'è fatto il vettore d'ingresso.
+3. Oltre ~300 pesi P1 (oggetto AOT) raggiunge il limite del verificatore, e ci arriva prima
+   la forma larga: a ~1 200 pesi su `default` la sola forma che carica è la più profonda.
 
 ---
 
-## 8. Isolare il costo del tail-call (`bench_tailcall_overhead.py`)
+## 7. Il costo del tail call (`bench_tailcall_overhead.py`)
 
-Le tre metriche esistenti (baseline, hardcoded, map-lookup) non isolavano MAI
-il costo del solo hop `bpf_tail_call`: `hardcoded_latency - baseline_latency`
-(sez. "Baseline vs hardcoded") impacchetta insieme tail-call + secondo parse
-del pacchetto + MLP. La letteratura sul design tail-call-based (vedi fonti
-in sez. 7-8 sotto) elenca il tail-call come una delle tre componenti di costo
-separabili — mancava una misura dedicata.
+Due varianti minime con lo stesso parse e lo stesso redirect, l'unica differenza è un hop
+`PROG_ARRAY`: `xdp_baseline` contro `xdp_baseline_dispatch → xdp_baseline_action`.
 
 ```bash
-sudo python3 ipa/test/bench_tailcall_overhead.py
-sudo python3 ipa/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_tailcall_overhead.py
 ```
 
-Confronta due varianti minime, **stesso parse, stessa azione di redirect**,
-l'unica differenza è un hop `PROG_ARRAY` in mezzo: `xdp_baseline` (0 tail
-call, già esistente) vs `xdp_baseline_dispatch → xdp_baseline_action` (1 tail
-call, nuovo, in `verify_prog_run.EBPF_BASELINE_TAILCALL`). Stessa metodologia
-minimo-su-N-trial di `bench_depth_vs_width.py`. Il delta stampato è il costo
-**puro** del salto, isolato da qualunque aritmetica MLP o doppio parsing.
+| variante | min | mediana | max (ns) |
+|---|---:|---:|---:|
+| baseline (0 tail call) | 10 | 10 | 11 |
+| baseline + 1 tail call | 11 | 12 | 13 |
+
+**+1 ns per salto.** Il salto in sé costa quasi niente: quello che P3 paga per strato (§9) è
+il resto — le letture di mappa che ricostruiscono il contesto a ogni hop.
 
 ---
 
-## 9. Architetture alternative dentro `test_suite.py --only kernel`
+## 8. Architetture alternative dentro `--only kernel`
 
-Prima, `test_suite --only kernel` verificava **una sola architettura** (65-4-4-7) su
-tutte e 3 le pipeline — un vuoto reale rispetto alla tesi "P1/P2/P3 gestiscono profondità/
-larghezza arbitrarie". Ora `suite_kernel()` chiama anche `verify_alt_architectures()`:
+`suite_kernel()` chiama anche `verify_alt_architectures()`: P1 con `(8,)` e `(4,4,4)`
+compilati separatamente, verificati contro `ref_infer_sparse` (5/5 ciascuna); P2 65-6-5-7 e
+P3 65-5-6-4-7 registrati **insieme** al modello reale nello stesso oggetto (PASS).
 
-- **P1 hardcoded**: due programmi compilati **separatamente** con profondità diverse
-  (`(8,)` un hidden layer, `(4,4,4)` tre hidden layer — esercita la generalizzazione a
-  profondità variabile del Task 7), stesso descrittore di default, pesi sintetici,
-  verificati contro `ref_infer_sparse` generalizzato (qualunque lunghezza di `hidden_dims`).
-- **P2 template / P3 modular**: richiama i controlli già esistenti in
-  `verify_multi_model.py` (65-6-5-7 per P2, 65-5-6-4-7 per P3, registrati **insieme** al
-  modello reale nello stesso oggetto compilato — la vera prova "multi-model concorrente").
-
-Nessun comando nuovo — è già dentro:
-```bash
-sudo python3 ipa/test/test_suite.py --only kernel
-```
+**Il limite di profondità di P2.** Su questo kernel P2 carica solo foglie con **al più due
+strati nascosti**: con tre o più `arch_generic_2layer` viene rifiutato dal verificatore
+(`Argument list too long`, `E2BIG`) — sull'asse `depth` di §9 (3–6 strati), su `isoparam`
+(3–5), sulla campagna (`depth_camp` 3–4) e sullo scenario sintetico `deep`. P3, che riusa
+un layer generico con i tail call, non ha questo limite (fino a 6 strati misurati). La causa
+precisa va letta nel log del verificatore.
 
 ---
 
-## 9-bis. Semantica delle classi per modello (`verify_per_model_semantics.py`, `bench_semantics_models.py`)
+## 8-bis. Semantica delle classi per modello
 
-**Da 2026-09-24** il significato delle classi è una proprietà del **modello**, non
-del programma. In P2 e P3 la tabella `class_action` era indicizzata dalla sola
-classe e condivisa da tutti i `model_id`: due modelli non potevano dare alla
-stessa classe significati diversi, e il piano di controllo rifiutava il secondo.
-Ora la chiave è `(model_id, class_id)`, e un programma solo per architettura
-serve modelli con semantiche indipendenti.
+In P2 e P3 la tabella `class_action` ha chiave `(model_id, class_id)`: un programma solo per
+architettura serve modelli con semantiche indipendenti.
 
 ```text
-model_id ─► arch_registry / layer_registry   (lookup hash, già esistente)
+model_id ─► arch_registry / layer_registry   (lookup hash)
               {pesi, forma, n_out, sem_bank}
                   │
-            inferenza P2/P3 (invariata)
+            inferenza P2/P3
                   │
                class_id
                   │   chiave = (model_id·2 + sem_bank)·32 + class_id
@@ -604,121 +439,62 @@ model_id ─► arch_registry / layer_registry   (lookup hash, già esistente)
             class_action[chiave] ─► azione ─► porta logica ─► mac_table
 ```
 
-- **Array, non hash.** `class_action_t2/_t3` è un `BPF_ARRAY` di
-  256 × 2 × 32 righe (`model_id` è un `__u8`, 2 banchi, `MAX_N_OUT` classi): il
-  lookup resta uno solo, inline come quello per sola classe, O(1) nel numero di
-  modelli. Nessun ciclo sui modelli nel datapath.
-- **Perché non una tabella dentro l'entry del registry**, che il datapath ha già
-  in mano: indicizzare il valore di una mappa con `best_cls` è aritmetica sul
-  puntatore, e il verificatore deve allora tracciare `best_cls` con precisione
-  all'indietro attraverso l'argmax — nessun cammino si può più potare. Misurato:
-  `layer_hidden` di P3 non carica più (`E2BIG`). Una chiave sullo stack non
-  richiede quella precisione.
-- **Due banchi per modello, commit nel registry.** Ricaricare un `model_id`
-  scrive il banco **inattivo** per intero, poi un solo update di
-  `arch_registry`/`layer_registry` installa insieme `n_out` (o `n_layers`) e il
-  nuovo `sem_bank`. Un pacchetto vede la vecchia coppia o la nuova, mai una
-  tabella scritta a metà; un caricamento che fallisce a metà lascia intatto il
-  banco attivo. Le righe degli altri `model_id` non vengono mai scritte. Resta
-  com'era prima la riscrittura in place del blocco pesi di un modello ricaricato
-  nello stesso slot: la modifica riguarda la sola semantica.
-- **La chiave si calcola una volta, senza allungare ciò che resta vivo.** In P2
-  subito dopo il lookup del registry (`sem_key0`): tenere vivi puntatore e
-  `model_id` fino all'argmax costava +157 istruzioni. In P3 `layer_first` sta al
-  limite dei 512 byte di stack BPF nelle sue build strumentate (conteggio dei
-  lookup, e la build T1/T2 di `bench_throughput`): la chiave viaggia dentro
-  `last_key`, che sostituisce l'`is_last` già vivo lungo tutto il ciclo (bit 31 =
-  ultimo strato, bit bassi = prima riga del banco), quindi non aggiunge nessun
-  valore vivo. La prima versione teneva vivi `model_id` e l'entry del registry e
-  faceva sforare lo stack alla build T1/T2 — verificato, come le due alternative,
-  su tutte e tre le build. `layer_hidden` ha margine e calcola la chiave alla
-  chiamata di `ml_argmax_forward`.
+- **Array, non hash**: `class_action_t2/_t3` è un `BPF_ARRAY` di 256 × 2 × 32 righe; il
+  lookup resta uno, O(1) nel numero di modelli.
+- **Perché non dentro l'entry del registry**: indicizzarne il valore con `best_cls` è
+  aritmetica sul puntatore, e il verificatore dovrebbe tracciare `best_cls` con precisione
+  attraverso l'argmax; `layer_hidden` di P3 non caricherebbe (`E2BIG`). Una chiave sullo
+  stack no.
+- **Due banchi per modello**: ricaricare un `model_id` scrive il banco inattivo, poi un solo
+  update del registry installa insieme `n_out` e `sem_bank`. Un pacchetto vede la coppia
+  vecchia o la nuova, mai una tabella scritta a metà.
+- **La chiave senza allungare ciò che resta vivo**: in P2 subito dopo il lookup del registry
+  (`sem_key0`); in P3 dentro `last_key`, che sostituisce `is_last` (bit 31 = ultimo strato,
+  bit bassi = prima riga del banco), perché `layer_first` sta al limite dei 512 byte di
+  stack nelle build strumentate.
 
 ```bash
-# A-F + ricaricamento + rimozione, P2 e P3, un programma per pipeline
 sudo python3 ipa/test/verify_per_model_semantics.py [--pipeline p2|p3]
-
-# costo: vecchia chiave (albero di riferimento) contro (model_id, class), e 1/2/4/8 modelli
-git worktree add /tmp/ipa_base <commit-precedente>
-sudo python3 -u ipa/test/bench_semantics_models.py --baseline-dir /tmp/ipa_base/ipa \
-     --trials 21 --csv results/semantics_models.csv
+bash ipa/test/remeasure_traffic.sh     # contiene il confronto con l'albero precedente
 ```
 
-**Correttezza (2026-09-24, VM di laboratorio): 53/53** su P2 e P3. I modelli di
-prova sono costruiti in modo che il TTL scelga la classe (`ttl = c + 2` dà la
-classe `c`, verificato contro il riferimento Python indipendente), quindi ogni
-classe di ogni modello è raggiungibile. Si osserva ciò che il programma ha fatto:
-MAC di destinazione riscritto (una porta logica diversa per ogni next hop),
-`XDP_DROP`, oppure `XDP_PASS` con o senza contatore.
+**Correttezza: 53/53** su P2 e P3 (casi A–F, ricaricamento R, rimozione). Controllo
+negativo: con una tabella condivisa simulata A e B passano e C, D, F, R falliscono.
 
-| Caso | Che cosa verifica | Esito |
-|---|---|---|
-| A | un modello: ogni classe dà l'azione dichiarata | ✅ |
-| B | due modelli, stessa semantica | ✅ |
-| C | due modelli, semantiche diverse su **ogni** classe, pacchetti alternati | ✅ (classe 0: FORWARD per A, DROP per B) |
-| D | A, poi B, poi A; anche dopo aver ricaricato B | ✅ |
-| E | `model_id` mai registrato, e uno rimosso: non elaborato, nessuna semantica altrui | ✅ |
-| F | `n_out` diversi (4 e 7): ogni argmax limitato dal **proprio** `n_out` | ✅ |
-| R | ricaricare lo stesso `model_id` con altra semantica e altro `n_out` | ✅ banco 0→1, gli altri modelli intatti |
+| Caso | Che cosa verifica |
+|---|---|
+| A | un modello: ogni classe dà l'azione dichiarata |
+| B | due modelli, stessa semantica |
+| C | semantiche diverse su **ogni** classe, pacchetti alternati (classe 0: FORWARD per A, DROP per B) |
+| D | A, poi B, poi A; anche dopo aver ricaricato B |
+| E | `model_id` mai registrato, o rimosso: non elaborato |
+| F | `n_out` diversi (4 e 7): ogni argmax limitato dal proprio `n_out` |
+| R | stesso `model_id` ricaricato con altra semantica e altro `n_out` (banco 0→1, altri intatti) |
 
-**Controllo negativo.** Con una tabella condivisa simulata (tutti i modelli
-scrivono e leggono le stesse righe) A e B passano e C, D, F, R falliscono: il test
-distingue le due cose, non passa comunque.
+**Costo** (`bench_semantics_models`, 21 trial, contro l'albero `16f1a024^` in cui la tabella
+era indicizzata dalla sola classe):
 
-**Regressione**: `test_suite --only kernel` PASS; `verify_multi_model` PASS
-(P1/P2/P3); `test_synth --kernel` 63/63; `verify_synth_kernel --all` P1 8/8,
-`--pipeline p2` 7/7, `--pipeline p3` 7/7; `test_class_semantics` 69/69.
+| | istruzioni | JIT (B) | lookup | tail call | mappe (B) | latenza min, N=1 |
+|---|---:|---:|---:|---:|---:|---:|
+| P2 classe sola | 14 978 | 67 139 | 11 | 1 | 11 192 | 192 ns |
+| P2 `(model_id, classe)` | 14 969 | 67 428 | 11 | 1 | 142 264 | 191 ns |
+| P3 classe sola | 12 277 | 57 605 | 29 | 3 | 41 020 | 325 ns |
+| P3 `(model_id, classe)` | 12 318 | 57 726 | 29 | 3 | 172 092 | 319 ns |
 
-**Costo** (`bench_semantics_models`, stessa VM, 4 vCPU, modello 65-4-4-7, trial
-alternati fra tutte le configurazioni nello stesso processo, 21 trial; P3 rimisurata
-con `--pipeline p3` dopo la correzione di `last_key`, P2 dal primo run):
-
-| | istruzioni | JIT (B) | lookup/pkt | tail call | memoria mappe (B) |
-|---|---:|---:|---:|---:|---:|
-| P2 classe sola | 14 985 | 67 183 | 11 | 1 | 11 192 |
-| P2 `(model_id, classe)` | 14 976 | 67 472 | 11 | 1 | 142 264 |
-| P3 classe sola | 12 349 | 57 372 | 29 | 3 | 20 284 |
-| P3 `(model_id, classe)` | 12 374 | 57 496 | 29 | 3 | 151 356 |
-
-| Latenza (ns, mediana su N = 1, 2, 4, 8) | minimo | p50 |
-|---|---:|---:|
-| P2 classe sola → per modello | 252 → 256 | 289 → 298 |
-| P3 classe sola → per modello | 439 → 442 | 477 → 489 |
-
-- **Δ istruzioni** P2 −9 (−0,06%), P3 +25 (+0,2%: `layer_first` +9,
-  `layer_hidden` +16). **Δ JIT** P2 +289 B, P3 +124 B. **Δ lookup 0**, **Δ tail
-  call 0**.
-- **Δ latenza** entro il rumore: P2 +4 ns (+1,6%) e P3 +3 ns (+0,7%) sul minimo,
-  P2 +9 ns (+3%) e P3 +12 ns (+2,5%) sulla p50. Le suite indipendenti dello
-  stesso giorno danno lo stesso quadro: P3 445 ns contro 444/447/451 della
-  versione precedente; P2 281 ns contro 286/289/292 (311 nell'ultima suite,
-  stesso codice, spread 30%).
-- **Numero di modelli**: nessuna pendenza da 1 a 8, misurando sia il modello 0 sia
-  l'ultimo registrato (p50 P2 298 → 293–295, P3 487 → 469–472).
-- **Memoria: +131 072 byte per pipeline**, fissi (64 KiB di valori; la formula
-  della suite conta anche le chiavi). È il prezzo della scelta: 256 `model_id` ×
-  2 banchi × 32 classi preallocati. Non cresce col numero di modelli registrati.
-  L'alternativa a pochi KB è uno slot per modello allocato dal piano di controllo
-  in un array compatto, come già `weight_offset` per i pesi.
-
-> ⚠️ **Nel primo run il minimo non era affidabile in 4 configurazioni su 28**:
-> P3 classe sola con N=1 dava 245 ns contro 406–414 delle altre sei, P2 per
-> modello con N=4/8 149–165 contro ~255. Valori **sotto** il pavimento del
-> programma stesso, non ripetibili, quindi artefatti della misura (causa non
-> verificata); il delta "per N=1" stampato per P3 (+148 ns) ne era il prodotto.
-> Le cifre di P2 sopra sono mediane sulle N con quei valori esclusi. Il run di
-> P3 rifatto dopo la correzione non ne ha (430–457 ns su tutte e 14 le righe).
+Istruzioni −9 (P2) e +41 (P3), lookup e tail call invariati, latenza invariata entro 2%.
+Con 1, 2, 4, 8 modelli registrati nessuna pendenza su P2 (188–194 ns); P3 316–319 ns fino a
+4 modelli, 340 ns con 8. **Memoria: +131 072 byte per pipeline**, fissi: 256 `model_id` × 2
+banchi × 32 classi preallocati. L'alternativa a pochi KB (uno slot per modello allocato dal
+piano di controllo, come `weight_offset`) non è implementata.
 
 ---
 
-## 10. Analisi parametrica (`bench_scaling.py`)
+## 9. Analisi parametrica (`bench_scaling.py`)
 
-Le sezioni precedenti misurano **un** modello su **una** topologia. Questa misura
-come cambia il costo al variare della dimensione — e soprattutto se le pipeline
-hanno **pendenze diverse**, che è l'argomento per cui ne esiste più di una.
+Come cambia il costo al variare della dimensione, e se le pipeline hanno **pendenze
+diverse**.
 
-**Quattro pipeline, non tre.** Lo sweep confronta una scala di specializzazione, cioè
-di quanto si sa quando il programma viene compilato:
+**Quattro pipeline**, una scala di specializzazione:
 
 | | cosa è compilato dentro | un binario per |
 |---|---|---|
@@ -727,998 +503,444 @@ di quanto si sa quando il programma viene compilato:
 | `template` (P2) | solo i soffitti | tutto |
 | `modular` (P3) | anche la profondità è a runtime | tutto |
 
-`hardcoded` è la pipeline che il resto del documento chiama P1. Di fronte a
-`p1_static` è in realtà una **P1.5**: la *disposizione* delle feature è compilata, ma
-l'indice del nodo no. Rinominarla nei CSV romperebbe ogni misura già presa, quindi la
-distinzione vive nelle etichette delle figure.
-
 ```bash
-sudo python3 ipa/test/bench_scaling.py --out results/    # misura (Linux + BCC + root)
-python3 ipa/test/bench_scaling.py --plot results/        # grafici (basta matplotlib)
-python3 ipa/test/bench_scaling.py --axis width --out results/   # un asse solo
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_scaling.py --axis all --out results/
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_scaling.py --axis campaign --out results/
+python3 ipa/test/bench_scaling.py --plot results/        # le figure (basta matplotlib)
+sudo python3 ipa/test/bench_scaling.py --verify          # 80/80: la P1 congelata decide come la P1.5
 ```
-
-**Cinque assi, una variabile ciascuno.** Tutto il resto è bloccato, così una curva si
-attribuisce alla variabile sull'asse x e a nient'altro.
 
 | asse | valori | fermo a |
 |---|---|---|
-| `nodes` | 10, 25, 52, 75, 100 nodi | `MAX_N_IN` = 128 in P2/P3 (`n_in = 13 + n_nodi`) |
+| `nodes` | 10, 25, 52, 75, 100 nodi | `MAX_N_IN` = 128 in P2/P3 |
 | `depth` | 1…6 hidden layer | — |
-| `isoparam` | 1…5 hidden layer, **a parametri fermi** | famiglia a imbuto dentro i soffitti |
+| `isoparam` | 1…5 hidden layer a **parametri fermi** (592 ± 2%) | famiglia a imbuto dentro i soffitti |
 | `width` | 2, 4, 6, 8 neuroni | soffitto compilato 8 in P2 e P3 |
-| `descriptor` | 4 composizioni di IV | 0/1/2 one-hot, piccola (6) o grande (52) |
+| `descriptor` | 4 composizioni del vettore d'ingresso | — |
 | `sparsity` | 0, 25, 50, 75, 90% di pesi zero | — |
+| `degree` | 2…6 porte presenti | §2 |
 
-**Metodologia, tre scelte che contano.**
+**Metodo.** Ogni cella in un subprocess (un abort di clang o un rifiuto del verificatore è
+un dato, stampato `RIFIUTATO` o `CRASH`). Pesi da un pool fisso presi come prefisso: un
+modello più grande **estende** il più piccolo, perché in P1 il conteggio istruzioni dipende
+dai valori. Allarme di contaminazione: se lo stesso programma (stesse istruzioni e tail call)
+varia oltre 2× lungo un asse, lo scarto è la macchina.
 
-- *Ogni cella in un subprocess isolato.* P1 può far abortire clang (overflow dello
-  stack a 512 byte) con un abort **fatale, non catturabile**; e un rifiuto del
-  verificatore è un **dato**, non un guasto, quindi la tabella lo stampa come
-  `RIFIUTATO` e non come `CRASH`.
-- *Pesi da un pool fisso, presi come prefisso.* Un modello più grande **estende**
-  quello più piccolo invece di sostituirne tutti i pesi. Serve perché in P1 il
-  conteggio istruzioni dipende dai **valori** (vedi sotto): estraendo un vettore
-  nuovo per ogni forma, parte della curva di P1 era rumore dei pesi travestito
-  da asse x.
-- *Allarme di contaminazione.* Se una pipeline mostra lo **stesso programma**
-  (stesse istruzioni **e** stesse tail call) con latenza che varia oltre 2× lungo
-  l'asse, lo scarto è la macchina e lo script lo dice. Il raggruppamento include le
-  tail call apposta: P3 ha il binario identico a ogni profondità ma esegue un hop in
-  più per layer, e senza quella chiave il controllo bollava come rumore il suo
-  risultato migliore.
+### Risultati per asse (latenza min, ns/pacchetto; istruzioni)
 
-### Le nove figure, e cosa deducono
+**`nodes`** (10 → 100 nodi):
 
-Lo sweep può disegnare decine di combinazioni metrica × asse. Nove portano un
-risultato; le altre no (la memoria delle mappe non dipende da nessun asse, `build_ms` è sempre
-la stessa compilazione). Il comando disegna **solo quelle**; `--all-plots` dà la
-matrice intera, per guardare, non per pubblicare.
-
-| # | figura | deduzione |
-|---|---|---|
-| 0 | `scaling_nodes_insns_log` | **La taglia della rete entra nel programma solo in P1.5** (746 → 1 692 istruzioni fra 10 e 100 nodi). Congelando l'indice del nodo la dipendenza **sparisce**: `p1_static` resta fra 611 e 640 a ogni taglia. Scala logaritmica, altrimenti le due curve P1 restano schiacciate contro le 14 985 di P2 e il confronto fra loro — che è il punto della figura — non si vede. |
-| 1 | `scaling_depth_insns` | **P2 cresce di ~780 istruzioni per layer, P3 di zero.** P3 srotola *un* layer denso generico e ci rientra per tail call, quindi la profondità non entra nel programma. P2 deve srotolarli tutti: la sua genericità è sulle larghezze, non sulla profondità. |
-| 2 | `scaling_depth_latenza` | **E P3 lo paga in tempo: ~70 ns per layer**, contro i ~36 di P2. Sono le sue tail call (da 2 a 7 hop). La stessa scelta di progetto spiega entrambe le figure: P3 è più piccolo *perché* riusa un pezzo, ed è più lento *perché* riusarlo costa un salto e delle letture ogni volta. |
-| 3 | `scaling_depth_update` | **Due ordini di grandezza sull'aggiornamento del modello**: P1 ~1 400 ms (rigenera C e chiama clang), P2 e P3 ~7 ms (scritture in mappa). Asse logaritmico, altrimenti le due curve basse si schiacciano sullo zero. È la metrica che decide se una pipeline è usabile in una rete che cambia. |
-| 4 | `scaling_nodes_insns` | **La taglia della rete entra nel programma solo in P1** (da 746 a 1 692 istruzioni fra 10 e 100 nodi: è lo `switch` sulla one-hot che si srotola). P2 e P3 restano alla cifra esatta a ogni punto — il loro sorgente non nomina mai la forma del modello. |
-| 5 | `scaling_nodes_latenza` | **E non costa nulla a runtime, a nessuna delle tre.** Piatte tutte e cinque le colonne. Il motivo è strutturale: una one-hot legge **una sola colonna di pesi** qualunque sia la sua larghezza. |
-| 6 | `scaling_width_latenza` | **Allargare i layer nascosti invece si paga**, su tutte e tre. Letto insieme alla figura 5: *la rete può crescere quanto vuole, il modello no.* |
-| 7 | `scaling_sparsity_insns_log` | **Con pesi più sparsi P1 crolla** (1 071 → 224 istruzioni al 90% di zeri), P2 e P3 non si muovono di un'istruzione. I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero; per P2/P3 uno zero è un byte in mappa come un altro. Scala logaritmica: su scala lineare P1 sta a ~10³ e P2/P3 a ~10⁴, e il crollo sparisce schiacciato sullo zero. |
-| 8a | `scaling_isoparam_insns` + `scaling_isoparam_latenza` | **A parità di parametri** (592 ± 2%), 1→5 hidden layer. Le due P1 non distinguono larga da profonda a questo budget; P2 cresce del 22% in istruzioni e dell'**84% in latenza**; P3 ha istruzioni **identiche** a tutti e cinque i punti e cresce del **58% in latenza**. Due meccanismi diversi per lo stesso sintomo: P2 srotola ogni layer, P3 ne paga uno in tail call. |
-| 8b | `scaling_isoparam_mpps` | Lo stesso in throughput teorico, l'unità in cui la domanda si pone di solito. È `1/latenza` sotto `BPF_PROG_TEST_RUN`: un **picco**, non un throughput retto. |
-| 9 | `scaling_descriptor_insns` | **Cambiare la composizione del vettore d'ingresso ricompila P1** (da 575 a 1 071 istruzioni fra le quattro IV), mentre P2 e P3 leggono il descrittore da `model_desc` e non cambiano. Ed è anche il **controllo** dell'esperimento sulla specializzazione: dove il descrittore non dichiara la feature `node`, le due P1 sono **identiche alla cifra** (599 e 599, 575 e 575); dove la dichiara, divergono (614 contro 1 071). Il divario è tutto lì e nient'altro. Barre e non curve: una linea fra `no_onehot` e `big_onehot` disegnerebbe una pendenza fra due nomi. |
-
-### Testa a testa: P1 specializzata contro P1.5
-
-Figura dedicata: `duel_p1_vs_p15.pdf`, quattro pannelli con le sole due P1 — in
-tutte le altre figure P2 e P3 stanno un ordine di grandezza sopra e schiacciano
-questo confronto sul fondo del grafico.
-
-**Su Germany50** (52 nodi, 65-4-4-7, il punto di riferimento di tutto il progetto):
-
-| | P1 specializzata | P1.5 hardcoded | |
-|---|---:|---:|---|
-| istruzioni eBPF | **614** | 1 071 | −43% |
-| codice nativo (byte) | **2 740** | 5 218 | −47% |
-| latenza (ns/pkt) | 54 | 57 | −5%, dentro il rumore |
-| memoria mappe (byte) | 2 356 | 2 356 | identica |
-| aggiornare il modello | ~1 550 ms | ~1 460 ms | identico |
-| lettura di `node_id` per pacchetto | **0** | 1 | una in meno |
-| binari da compilare e installare | **uno per nodo** | uno per modello | ⚠️ |
-
-**A 100 nodi** il divario si allarga, perché una delle due cresce e l'altra no:
-
-| | P1 specializzata | P1.5 hardcoded | |
-|---|---:|---:|---|
-| istruzioni eBPF | **640** | 1 692 | −62% |
-| codice nativo (byte) | **2 837** | 8 432 | −66% |
-| latenza (ns/pkt) | 55 | 61 | −10% |
-
-Due righe da leggere con attenzione perché smentiscono un'aspettativa ragionevole:
-
-- **La memoria delle mappe è identica.** Il programma specializzato non *legge* più
-  `node_id`, ma la mappa resta **dichiarata** nell'header condiviso. Sono pochi byte
-  e non cambia nulla nelle misure, ma è codice morto: un header specializzato potrebbe
-  non dichiararla affatto.
-- **Il costo di aggiornamento è identico.** Il sorgente è più piccolo, ma il tempo è
-  dominato dal costo fisso di far partire clang, non dalla lunghezza del file. La
-  specializzazione non rende la compilazione più veloce — e visto che ne servono N
-  invece di una, il costo totale di deployment **peggiora** di un fattore N.
-
-### Congelare il nodo conviene? Sì, ma non per la ragione che sembra
-
-L'indice del nodo è una **costante di deployment**: non cambia per tutta la vita del
-nodo. Congelarlo a tempo di generazione fa sparire lo `switch` a `n_nodi` casi e la
-lettura della mappa `node_id`; restano `n_h1` costanti che clang piega
-nell'accumulatore. Vale la pena? I numeri dicono sì, e dicono anche che il motivo non
-è quello che verrebbe da indovinare.
-
-**Equivalenza prima di tutto.** Congelare il nodo significa scegliere *una colonna*
-della matrice del primo layer a tempo di compilazione. Sceglierne una sbagliata dà un
-programma più piccolo, più veloce, e che calcola **un altro modello** — e nessuna
-misura di costo se ne accorgerebbe.
-
-```bash
-sudo python3 ipa/test/bench_scaling.py --verify     # 80/80 casi identici
-```
-
-80 casi (ttl 2-11 × 8 pattern di link): la specializzata decide **la stessa classe**
-della P1.5 con lo stesso indice installato. Solo dopo questo i numeri sotto
-significano qualcosa.
-
-**Quello che si guadagna: dimensione, e la sua pendenza.**
-
-| nodi della rete | 10 | 25 | 52 | 75 | 100 |
+| | 10 | 25 | 52 | 75 | 100 |
 |---|---:|---:|---:|---:|---:|
-| P1 specializzata | 617 | 625 | 614 | 611 | **640** |
-| P1.5 hardcoded | 746 | 863 | 1 071 | 1 539 | **1 692** |
+| `p1_static` istruzioni | 637 | 633 | 631 | 630 | 633 |
+| `hardcoded` istruzioni | 758 | 855 | 1 114 | 1 479 | 1 699 |
+| `p1_static` ns | 36 | 35 | 36 | 36 | 34 |
+| `hardcoded` ns | 43 | 41 | 43 | 43 | 41 |
+| `template` ns | 185 | 183 | 184 | 185 | 182 |
+| `modular` ns | 308 | 307 | 306 | 318 | 307 |
 
-A 100 nodi è **2,6× più piccola**. Ma il numero che conta non è il rapporto: è che la
-riga della specializzata è **piatta**. Il costo in dimensione della feature più grossa
-del modello — 52 dei 65 ingressi, 208 dei 319 pesi — smette di dipendere dalla taglia
-della rete.
+La taglia della rete entra nel programma solo in P1.5 (lo `switch` sulla one-hot del nodo si
+srotola); congelando il nodo la dipendenza sparisce. A runtime nessuna pendenza: una one-hot
+legge una sola colonna di pesi qualunque sia la sua larghezza.
 
-**Quello che NON si guadagna: velocità.**
+**`depth`** (1 → 6 hidden layer):
 
-| nodi della rete | 10 | 25 | 52 | 75 | 100 |
-|---|---:|---:|---:|---:|---:|
-| P1 specializzata | 58 | 68 | 54 | 55 | 55 ns |
-| P1.5 hardcoded | 61 | 60 | 57 | 59 | 61 ns |
+| | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| `p1_static` ns | 33 | 36 | 38 | 43 | 46 | 50 |
+| `hardcoded` ns | 41 | 44 | 45 | 49 | 53 | 57 |
+| `template` ns | 170 | 187 | *rifiutato* | | | |
+| `modular` ns | 257 | 315 | 360 | 415 | 476 | 537 |
+| `modular` istruzioni | 12 318 | 12 318 | 12 318 | 12 318 | 12 318 | 12 318 |
 
-Praticamente identiche, dentro il rumore. Sull'asse larghezza il vantaggio è un po'
-più visibile e costante (35 contro 47 ns a 2 neuroni, 92 contro 107 a 8: circa 10-15
-ns, il 12-15%), perché lo switch assegna `n_h1` pesi e quindi cresce con la larghezza.
-Ma resta un miglioramento modesto.
+**P3 ~56 ns per strato a istruzioni identiche**: srotola un layer generico e ci rientra con
+un tail call, quindi la profondità non entra nel programma e si paga in tempo (tail call e
+letture di mappa). P2 oltre due strati nascosti non carica (§8). P1 ~3–4 ns per strato.
 
-> **Il motivo per cui la dimensione crolla e il tempo no è lo stesso.** Lo switch ha
-> `n_nodi` casi ma ne **esegue uno**: a runtime è un salto indicizzato, che costa
-> poco. Quelle 208 assegnazioni sono compilate per eseguirne 4. Toglierle libera
-> molto **spazio** e quasi nessun **tempo** — che è, in miniatura, la stessa lezione
-> della tabella principale: le istruzioni misurano quanto è grande il programma, non
-> quanto lavora.
+**`width`** (neuroni per hidden layer 2 → 8):
 
-**I due vantaggi non si sommano.** Sull'asse sparsità le due P1 **convergono**:
-
-| pesi a zero | 0% | 25% | 50% | 75% | 90% |
-|---|---:|---:|---:|---:|---:|
-| P1 specializzata | 614 | 566 | 417 | 294 | **216** |
-| P1.5 hardcoded | 1 071 | 939 | 686 | 363 | **224** |
-
-Al 90% di zeri il divario è sparito (216 contro 224). Sparsità e nodo congelato sono
-**due strade alla stessa riduzione**: se i pesi sono già quasi tutti zero, clang
-cancella lo switch da solo e non c'è più niente da congelare.
-
-**Quello che si paga: un binario per nodo.** Una rete da 52 nodi vuole 52
-compilazioni e 52 installazioni, ognuna da ~1,4 s. Il costo di aggiornamento si
-moltiplica per la taglia della rete — esattamente la grandezza da cui la
-specializzazione ha appena liberato la *dimensione*.
-
-**Il verdetto.** Non è un'ottimizzazione di velocità: è ciò che rende P1 **praticabile
-su una rete grande**. Lo switch di P1.5 cresce con il numero di nodi moltiplicato per
-la larghezza del primo layer; su una topologia da 500 nodi con 8 neuroni sarebbero
-4 000 assegnazioni srotolate, e c'è una taglia oltre la quale P1.5 semplicemente non
-si carica più. La specializzata non ci arriva mai. Su Germany50, dove 52 nodi
-costano 1 071 istruzioni contro 614, è una scelta legittima in entrambe le direzioni;
-su una rete dieci volte più grande non lo è più.
-
----
-
-### Il risultato che non cercavamo: in P1 i pesi decidono se il programma si carica
-
-Nello sweep una cella si è fatta rifiutare dal verificatore: `65-4-4-4-4-7`, 359 pesi.
-Le forme intorno caricavano tutte, compresa `(4,4,4,3)` e la **più grande**
-`(4,4,4,4,4)`. Nessuna proprietà della profondità può produrre questo.
-
-Tenendo fissa la forma e cambiando **solo il seme** dei pesi:
-
-| seme | esito |
-|---|---|
-| 42 | **rifiutato** |
-| 1 | carica, 1 119 istruzioni |
-| 2 | carica, 1 175 |
-| 7 | carica, 1 118 |
-| 999 | carica, 1 075 |
-
-Il seme 1 carica a 1 119, il 42 viene rifiutato a 1 120. **Una istruzione di
-differenza.**
-
-> **In P1, riaddestrare un modello senza toccare l'architettura può renderlo non
-> caricabile.** Stessa rete, stessi iperparametri, pesi nuovi, e il nodo lo rifiuta.
-> P2 e P3 non hanno questo rischio: per loro i pesi sono byte in una mappa e la
-> caricabilità dipende solo dalla forma.
->
-> È il rovescio esatto del vantaggio della figura 7. La stessa strength reduction che
-> porta P1 a 224 istruzioni è quella che lo rende imprevedibile.
-
-Il meccanismo preciso — quale limite del kernel — **non è stato confermato**, e non
-va inventato: `E2BIG` ha più cause nel percorso di caricamento BPF e BCC ci stampa
-sopra `Program too large (1120 insns), at most 4096 insns`, dove il 4096 è una
-costante morta nella stringa di BCC (nello stesso sweep P2 carica a 18 057). È la
-stessa trappola documentata per P3. Per chiuderlo serve il log del verificatore
-(`BPF(text=src, debug=0x10)`).
-
-### Limiti di questo run, dichiarati
-
-- **Non affiancare latenze prese da assi diversi.** A programma identico P2 misura
-  ~250 ns sugli assi `nodes` e `width` e ~310 su `descriptor` e `sparsity`: la
-  macchina si è caricata nella seconda metà dell'esecuzione. Dentro un asse i
-  confronti reggono, fra assi no. Le istruzioni sono deterministiche e confrontabili
-  ovunque.
-- **La figura 6 va presa per la direzione, non per la pendenza.** I punti a 6 e 8
-  neuroni hanno anche `build_ms` più alto del resto, che è il segno della stessa
-  macchina carica. Che allargare i layer costi è strutturale; *quanto*, su questo
-  run, non è misurato bene.
-- **Oltre ~115 nodi non si va** senza alzare `MAX_N_IN` (128) in P2 e P3. Per dire
-  qualcosa su una rete da 500 nodi bisogna alzarlo e **rimisurare**.
-- La sparsità richiesta e quella ottenuta differiscono di qualche punto (i pesi sono
-  un prefisso di un pool mescolato, quindi un campione). La colonna `sparsity_real`
-  nel CSV riporta quella vera.
-
----
-
-## Risultati (kernel, `test_suite.py --only kernel`, 4 vCPU, modello 65→4→4→7, scale=24)
-
-Rimisurati dopo tre correzioni che invalidavano la tabella precedente:
-
-1. **bias dell'ultimo strato nel riferimento** (`ref_infer` moltiplicava per `scale⁰`
-   invece che per `scale²`): ogni confronto float/int8 misurava la cosa sbagliata;
-2. **mappa `ingress_port`**: la feature `ingress_iface` passava da contribuire **zero**
-   su hardware vero a contribuire davvero — il modello girava di fatto su 3 input su 4;
-3. **`cls_stats`** ora scritto anche su DROP e UNUSED, non solo sul FORWARD riuscito.
-
-> ⚠️ **La tabella precedente mescolava run di versioni diverse del codice.** Le righe
-> erano etichettate A/B/C come se fossero esecuzioni ripetute dello stesso build, ma
-> P2 vi compariva con 9 916 istruzioni mentre le note dello stesso documento
-> registravano già `~2 618→16 988` per un cambiamento successivo. Non erano numeri da
-> correggere: era la tabella da rifare. Qui c'è **un solo stato del codice**.
-
-Metodologia: minimo su 7 trial indipendenti, con p50/max e spread relativo.
-**Un solo run, un solo stato del codice**: nido di cicli invertito in
-`layer_first` (P3) e `fc1` (P2), `IPA_MAX_QUEUES = 8` in entrambe, P1 come
-oggetto AOT, semantica delle classi per modello in P2/P3 (§ 9-bis).
-
-| Metrica | baseline | P1 hardcoded (AOT) | P2 template | P3 modular |
+| | 2 | 4 | 6 | 8 |
 |---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | 155 | 1 011 | 14 976 | 12 374 |
-| Codice jited (byte) | 709 | 4 917 | 67 472 | 57 496 |
-| Tail call / pacchetto | 0 | 1 | 1 | **3** |
-| Map lookup / pacchetto (reali) | 3.0 | 6.0 | 11.0 | **29.0** |
-| Memoria mappe (byte) | 280 | 2 516 | 141 744 | 150 836 |
-| **Latenza min (ns/pkt)** | **28.0** | **76.0** | **311.0** | **445.0** |
-| ...p50 | 30.0 | 76.0 | 335.0 | 470.0 |
-| ...max | 35.0 | 86.0 | 404.0 | 566.0 |
-| ...spread (max−min)/min | 25% | 13% | 30% | 27% |
-| Throughput teorico (Mpps, da min) | 35.714 | 13.158 | 3.215 | 2.247 |
+| `p1_static` | 26 | 36 | 49 | 68 |
+| `hardcoded` | 33 | 44 | 56 | 79 |
+| `template` | 173 | 185 | 196 | 208 |
+| `modular` | 279 | 306 | 330 | 372 |
 
-> **Misurate il 2026-09-24**, sul codice finale della semantica per modello
-> (§ 9-bis, `last_key` compreso). Rispetto alla versione precedente cambiano
-> solo P2 e P3: istruzioni −9 / +25, lookup invariati, e la memoria:
-> **+131 072 byte** per `class_action_t2/_t3`, che ora conta anche nella
-> tabella (prima la suite non la sommava affatto — 256 byte). P3 resta
-> dentro il rumore (445 contro 444 / 447 / 451 ns delle tre suite della
-> versione precedente, stesso giorno). P2 dà 311 ns: il suo codice è lo stesso
-> che, un'ora prima, misurava 281 ns, e lo spread di questo run è del 30%: è la
-> macchina, non il programma — il confronto a trial alternati di § 9-bis dà
-> +4 ns.
->
-> Il run precedente pubblicato qui (2026-09-22, stesso codice di P2/P3 prima
-> della modifica) dava 28.0 / 71.0 / 276.0 / 453.0 ns; quelli del 18 e del 21
-> settembre 35.0 / 70.0 / 286.0 / 444.0 e 23.0 / 49.0 / 177.0 / 278.0. Fra quei
-> tre run istruzioni, byte jited, tail call, letture e memoria erano identiche
-> cifra per cifra: a muoversi era solo la colonna del tempo.
->
-> Gli spread di P2 e P3 (30% e 27%) sono alti per questa tabella: nei tre run
-> della versione precedente dello stesso giorno erano 7–22% e 5–12%. Le due
-> piccole restano fra il 13 e il 25%, che è il comportamento atteso: più il
-> programma è breve, più pesa in proporzione il rumore del sistema.
->
-> Conseguenza pratica: **le latenze assolute di questa tabella non sono
-> trasferibili**; i rapporti fra pipeline sì. L'host è un processore ibrido a
-> core prestazionali ed efficienti e il guest non vede la frequenza — vedi la
-> nota sulla non-misurabilità del throughput assoluto su questa VM.
+Allargare i layer nascosti si paga su tutte: *la rete può crescere quanto vuole, il modello
+no.*
 
-#### Il difetto del frame riusato, e la riproducibilità che ne è seguita
+**`isoparam`** (592 ± 2% parametri, 1 → 5 hidden layer):
 
-Fino al 21 settembre `_sample()` misurava **riusando un solo pacchetto** per
-tutte le ripetizioni. `BPF_PROG_TEST_RUN` non ripristina il buffer fra una
-ripetizione e l'altra, e il datapath decrementa il TTL: dopo una quarantina di
-esecuzioni restava inchiodato a 1, e da lì in poi ogni ripetizione prendeva il
-ramo `if (ip->ttl <= 1) return XDP_PASS`.
+| | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| `p1_static` | 50 | 52 | 49 | 63 | 59 |
+| `hardcoded` | 56 | 61 | 57 | 70 | 66 |
+| `template` | 167 | 183 | *rifiutato* | | |
+| `modular` | 279 | 323 | 357 | 453 | **471 (+69%)** |
 
-Quel ramo sta **dopo** l'inferenza — il modello girava comunque, ed è il
-motivo per cui le curve scalavano in modo regolare e il difetto non si vedeva
-— ma saltava la coda di inoltro: decremento del TTL, checksum, `pkt_stats`,
-`cls_stats`, `mac_table`, `bpf_redirect`.
+A parità di parametri le due P1 crescono poco e non in modo monotono (+18% fra gli estremi);
+P3 ha istruzioni identiche a tutti e cinque i punti e cresce del 69% in latenza.
 
-**Riguardava tutti e undici gli assi**, non solo la campagna: `_sample` è una
-sola e la chiamano tutti e quattro i worker.
+**`descriptor`** — istruzioni:
 
-La correzione è `prog_test_run_bench`, la stessa funzione che usa
-`test_suite`: rinfresca il frame ogni 200 esecuzioni partendo da TTL 255
-(255 − 200 = 55), quindi nessuna ripetizione arriva alla scadenza.
-
-**Come si vede che era il difetto giusto.** Il modello 65-4-4-7 compare in due
-sweep indipendenti — come punto a 6 porte dell'asse `degree` e come primo
-punto di `width_camp` nella campagna. Le istruzioni sono identiche al bit in
-entrambi, quindi è lo stesso identico programma:
-
-| Pipeline | ns `degree` | ns campagna | scarto prima | scarto dopo |
+| | default | no_onehot | small_onehot | big_onehot |
 |---|---:|---:|---:|---:|
-| p1_static | 58 | 59 | −45% | **+2%** |
-| hardcoded | 69 | 79 | −40% | **+14%** |
-| template | 268 | 271 | −44% | **+1%** |
-| modular | 436 | 428 | −44% | **−2%** |
+| `p1_static` | 631 | 602 | 597 | 560 |
+| `hardcoded` | 1 114 | 602 | 597 | 965 |
+| `template` / `modular` | 14 969 / 12 318 | ← | ← | ← |
 
-Prima della correzione i due sweep divergevano di un fattore uniforme 1.8;
-adesso concordano entro il 2% su tre righe su quattro. La correzione non ha
-solo alzato i valori: ha reso **confrontabili sweep diversi**, che è la
-proprietà che serve per citare un numero.
+Cambiare la composizione del vettore d'ingresso ricompila P1, mentre P2 e P3 leggono il
+descrittore da `model_desc`. È anche il **controllo** della specializzazione: dove il
+descrittore non dichiara la feature `node` le due P1 sono identiche alla cifra (602/602,
+597/597); dove la dichiara divergono.
 
-Resta vero che le cifre assolute dipendono dallo stato della macchina — l'host
-è un processore ibrido e il guest non vede la frequenza — quindi vale ancora
-la regola di citare i **rapporti** fra pipeline e non i nanosecondi nudi.
+**`sparsity`** (frazione di pesi zero):
 
-### Campagna sulle architetture — `bench_scaling.py --axis campaign`
+| | 0% | 25% | 50% | 75% | 90% |
+|---|---:|---:|---:|---:|---:|
+| `p1_static` istruzioni | 631 | 581 | 428 | 291 | **216** |
+| `hardcoded` istruzioni | 1 114 | 946 | 697 | 364 | **236** |
+| `p1_static` ns | 36 | 31 | 28 | 19 | 18 |
+| `hardcoded` ns | 43 | 40 | 33 | 25 | 24 |
+| `template` / `modular` ns | 184 / 308 | 182 / 310 | 184 / 311 | 185 / 311 | 183 / 311 |
 
-Undici architetture su quattro assi, stessa metodologia della tabella qui sopra
-(`BPF_PROG_TEST_RUN`, minimo su N prove), cinque pipeline inclusa la baseline.
-Un solo CSV: `results/model_scaling_test_suite.csv`.
+I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero: al 90% di zeri
+P1 perde metà della latenza, mentre per P2/P3 uno zero è un byte in mappa come un altro. Le
+due P1 convergono (216 contro 236 istruzioni): sparsità e nodo congelato sono due strade alla
+stessa riduzione.
+
+### Congelare il nodo: P1 specializzata contro P1.5
+
+| | 10 nodi | 52 nodi (Germany50) | 100 nodi |
+|---|---:|---:|---:|
+| istruzioni `p1_static` / `hardcoded` | 637 / 758 | 631 / 1 114 (−43%) | 633 / 1 699 (−63%) |
+| codice nativo (B) | 2 904 / 3 525 | 2 881 / 5 433 (−47%) | 2 874 / 8 499 (−66%) |
+| latenza (ns) | 36 / 43 | 36 / 43 (−16%) | 34 / 41 (−17%) |
+
+La riga della specializzata è **piatta**: la feature più grossa del modello (52 dei 65
+ingressi, 208 dei 319 pesi) smette di dipendere dalla taglia della rete. In tempo il
+guadagno c'è ma è piccolo (7 ns): lo `switch` ha N casi ma ne esegue uno. Il prezzo è un
+binario per nodo: `build_ms` ~70 ms (p1_static) e ~80-113 ms (hardcoded) per compilazione,
+N volte su una rete di N nodi. Aggiornare il modello sul nodo (oggetto AOT già compilato)
+costa ~1 ms per entrambe.
+
+### Aggiornare il modello
+
+`update_ms` (installare un modello nuovo su un nodo in servizio): P1 e P1.5 **0,9–2,3 ms**
+(caricamento dell'oggetto AOT), P2 e P3 **10–12 ms** (scritture in mappa, compresa la
+semantica). `build_ms` (una volta): P1 66–113 ms di clang sulla macchina di build, P2
+~1,6 s e P3 ~1,3 s di BCC all'avvio del nodo. Con l'oggetto precompilato non c'è più un
+divario di ordini di grandezza a favore di P2/P3: resta la differenza qualitativa, P1
+richiede un compilatore (fuori dal nodo) per ogni modello nuovo.
+
+### Campagna sulle architetture (`--axis campaign`)
+
+Quattro assi, cinque pipeline inclusa la baseline, un CSV: `results/model_scaling_test_suite.csv`.
 
 | Asse | Valori | Cosa muove |
 |---|---|---|
-| `iv_dense` | n_in 5, 9, 13, 17 | colonne d'ingresso **dense**: ognuna letta da mappa e moltiplicata |
-| `iv_onehot` | n_in 16, 32, 65 | colonne d'ingresso in una **one-hot** |
-| `width_camp` | 65-v-v-7, v = 4, 8, 16, 32 | neuroni per strato nascosto |
+| `iv_dense` | n_in 5, 9, 13, 17 | colonne d'ingresso dense |
+| `iv_onehot` | n_in 16, 32, 65 | colonne d'ingresso in una one-hot |
+| `width_camp` | 65-v-v-7, v = 4, 8, 16, 32 | neuroni per strato |
 | `depth_camp` | 65-8…8-7, 1–4 strati | profondità a larghezza 8 |
 
-**Il risultato.** Retta ai minimi quadrati sui quattro assi insieme:
+Retta ai minimi quadrati sui quattro assi insieme:
 
 | Pipeline | ns / MAC **eseguita** | r² | ns / MAC nominale | r² |
 |---|---:|---:|---:|---:|
-| p1_static | 0.324 | **0.99** | 0.081 | 0.65 |
-| hardcoded | 0.349 | **0.92** | 0.100 | 0.79 |
-| template | 0.812 | 0.71 | 0.153 | 0.34 |
-| modular | 1.462 | **0.91** | 0.123 | **0.09** |
+| p1_static | 0,255 | **0,96** | 0,026 | 0,14 |
+| hardcoded | 0,264 | **0,91** | 0,041 | 0,29 |
+| template | 0,277 | 0,48 | −0,014 | 0,02 |
+| modular | 1,074 | **0,91** | 0,083 | 0,07 |
 
-Con le MAC nominali il modello non spiega niente per P3 (r² 0.09). Con quelle
-eseguite i quattro assi collassano sulla stessa retta, e p1_static arriva a
-r² 0.99.
+Con le MAC nominali il modello non spiega niente; con quelle **eseguite** i quattro assi
+collassano sulla stessa retta. Una one-hot occupa `size` colonne nella matrice dei pesi ma
+nel datapath ne attiva una: contarla come `size × h1` sovrastima. **P3 costa 4,2× P1 per
+MAC eseguita**: il prezzo di leggere i pesi da una tabella invece che averli come letterali.
+Il template ha r² basso perché ha pochi punti (oltre due strati non carica) e un costo fisso
+alto rispetto alla pendenza.
 
-**Il rapporto è la cifra da citare**: 1.462 / 0.324 = **4.5×** fra pesi
-compilati come letterali e pesi letti da una tabella. È il prezzo della
-genericità espresso in una costante invece che in un aneddoto. Il pavimento
-della baseline, che di moltiplicazioni ne esegue zero, sta fra 16 e 30 ns: è
-il costo del framework XDP che ogni pipeline paga prima di moltiplicare
-qualunque cosa.
+L'asse `iv_onehot` lo mostra direttamente: n_in ×4, pesi ×2,4, latenza piatta su tutte
+(p1_static 66/64/65, hardcoded 66/65/64, template 171/169/173, modular 359/361/365 ns) mentre
+le istruzioni di P1 vanno da 1 238 a 2 162.
 
-**Perché.** Una feature one-hot occupa `size` colonne nella matrice dei pesi ma
-nel datapath ne attiva **una**: l'arm `FEAT_INGRESS_IF` / `FEAT_NODE_ID` fa h1
-addizioni e non guarda `size`. Contarla come `size × h1` MAC sovrastima, e di
-quanto dipende da quanta one-hot c'è nell'ingresso — cioè cambia da asse ad
-asse. La colonna `macs_eff` la conta per quello che esegue.
+I muri: larghezza 16 e 32 su P2/P3 sfondano `T2_MAX_H1`/`ML1_MAX_H1` = 8 e il banco segna
+`RIFIUTATO` prima di compilare (P3 risponderebbe `XDP_PASS` a runtime, cioè una misura di un
+programma che non calcola). Larghezza 16 su P1 non carica (limite di complessità del
+verificatore, §6), larghezza 32 non compila.
 
-Il sintomo, sull'asse `iv_onehot`:
-
-| n_in | pesi | p1_static | hardcoded | template | modular |
-|---:|---:|---:|---:|---:|---:|
-| 16 | 271 | 88 ns | 89 ns | 254 ns | 507 ns |
-| 32 | 399 | 89 ns | 89 ns | 249 ns | 487 ns |
-| 65 | 663 | 88 ns | 109 ns | 318 ns | 509 ns |
-
-n_in ×4, pesi ×2.4. **p1_static 88/89/88 e modular 507/487/509 sono piatte**,
-e le istruzioni di P1 intanto vanno da 1146 a 1702: la taglia statica cresce,
-il percorso eseguito no.
-
-Due righe però si muovono al punto più largo: `hardcoded` +22% e `template`
-+28% a n_in 65. Su `hardcoded` una spiegazione c'è — lo switch generato ha più
-casi, quindi più codice e più pressione sulla cache istruzioni, anche se ne
-esegue uno solo. Su `template` no, e con uno spread del 30% su misure di
-questo ordine è compatibile con il rumore. **La colonna piatta resta quella di
-p1_static e modular**; le altre due vanno citate con la riserva.
-
-**I due muri, entrambi dichiarati.** Larghezza 16 e 32 su P2/P3 sfondano
-`T2_MAX_H1`/`ML1_MAX_H1` = 8, e P3 non rifiuta il caricamento — risponde
-`XDP_PASS` a runtime, quindi una misura lì sarebbe una latenza vera di un
-programma che non calcola. Il banco controlla i soffitti **prima** di compilare
-e segna `RIFIUTATO` senza misurare. Larghezza 32 su P1 sfonda invece lo stack
-eBPF da 512 byte: abort del processo, cella `CRASH`, sweep che continua.
-Larghezza 16 su P1 si misura (120 e 132 ns) ed è un punto che P2 e P3 non
-possono avere.
-
-**Calibrazione contro la suite kernel.** Stesso modello 65-4-4-7:
-
-| Pipeline | `test_suite` | campagna | scarto |
-|---|---:|---:|---:|
-| baseline | 28 ns | 30 ns | +7% |
-| hardcoded | 71 ns | 79 ns | +11% |
-| template | 276 ns | 271 ns | −2% |
-| modular | 453 ns | 428 ns | −6% |
-
-**I due banchi convergono**, entro ±11% e senza segno sistematico. Prima della
-correzione del frame lo scarto era −61 / −24 / −16 / −14 %, cioè grande e
-tutto nello stesso verso: era la coda di inoltro che la campagna saltava.
-
-Lo scarto residuo su `hardcoded` non è rumore e ha una causa nota: `test_suite`
-usa i pesi veri del modello addestrato (1 026 istruzioni), la campagna pesi
-sintetici a sparsità nulla (1 071). Sono due programmi diversi, quindi 71
-contro 79 è quello che ci si aspetta.
-
-**Conseguenza per la tesi**: le due misure sono ora la stessa grandezza —
-inferenza più inoltro, sul percorso completo — e si possono accostare.
-
-Figure: `results/campaign_macs_eff_latenza.pdf`,
-`campaign_macs_nominali_latenza.pdf`, `campaign_insns_latenza.pdf`.
+**Calibrazione contro la suite kernel**, stesso modello 65-4-4-7: campagna 18 / 43 / 184 /
+311 ns contro `test_suite` 22 / 47 / 199 / 323 ns (baseline, hardcoded, template, modular):
+entro −4 / −18%, sempre nello stesso verso, e i programmi non sono identici (pesi sintetici
+contro pesi del modello: 1 114 contro 989 istruzioni per P1.5).
 
 ---
 
-> **Rimisurata il 2026-09-18**, dopo che la scala per-feature e' passata dal
-> `#define` al descrittore a runtime (vedi il capitolo sui modelli sintetici nel
-> quaderno). Che cosa e' cambiato e che cosa no:
->
-> - **Istruzioni**: P2 `+357`, P3 `+318`. E' il codice della divisione a
->   divisore variabile piu' la lettura della scala dalla mappa. `baseline` e
->   `hardcoded` sono **identiche** al conteggio precedente, come deve essere:
->   quei due percorsi non sono stati toccati.
-> - **Latenza**: si e' spostata su tutte e quattro le colonne, **compresa la
->   baseline** (29 -> 35 ns, `+21%`) che non e' stata modificata di una riga.
->   Quel `+21%` e' il metro del rumore della macchina in questo run, e sta
->   sopra lo spostamento di P2 (`+9%`) e P3 (`+5%`). Le differenze di latenza
->   qui **non sono attribuibili** alla modifica.
->
-> Le cifre di P2/P3 che compaiono altrove in questo documento e in `claims.md`
-> (sweep di scalabilita', sparsita', iso-parametri) vengono da esecuzioni
-> **precedenti** a questo cambiamento e sono quindi basse di circa 320-360
-> istruzioni. Non sono state riscritte perche' quegli sweep non sono stati
-> rieseguiti: vanno rimisurati prima di citarli insieme a questa tabella.
+## Risultati (kernel, `test_suite.py --only kernel`, modello 65→4→4→7, scala 24)
 
-Suddivisione per programma:
+Un solo run, un solo stato del codice, DUT a 3 494 MHz; minimo su 7 trial con p50/max.
+
+| Metrica | baseline | P1 hardcoded (AOT) | P2 template | P3 modular |
+|---|---:|---:|---:|---:|
+| Istruzioni eBPF (xlated) | 155 | 989 | 14 969 | 12 318 |
+| Codice jited (byte) | 706 | 4 957 | 67 428 | 57 726 |
+| Tail call / pacchetto | 0 | 1 | 1 | **3** |
+| Map lookup / pacchetto | 3 | 6 | 11 | **29** |
+| Memoria mappe (byte) | 280 | 2 516 | 141 744 | 171 572 |
+| **Latenza min (ns/pkt)** | **22** | **47** | **199** | **323** |
+| ...p50 | 22 | 48 | 203 | 334 |
+| ...max | 23 | 48 | 203 | 340 |
+| ...spread (max−min)/min | 5% | 2% | 2% | 5% |
+| Throughput teorico (Mpps, 1/latenza) | 45,5 | 21,3 | 5,0 | 3,1 |
 
 | | dispatcher | leaf |
 |---|---|---|
 | baseline | — | `xdp_baseline` 155 |
-| P1 hardcoded | `ipa_switch_hardcoded` 29 | `model_0` 997 |
-| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 14 587 |
-| P3 modular | `modular_dispatcher` 136 | `layer_first` 10 207 + `layer_hidden` 1 688 |
+| P1 hardcoded | `xdp_dispatch` 29 | `xdp_model` 960 |
+| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 14 928 |
+| P3 modular | `modular_dispatcher` 137 | `layer_first` 10 503 + `layer_hidden` 1 678 |
 
-Correttezza, stesso run:
+Correttezza, stesso run: dispatch TTL 2-6 **5/5** su tutte e tre; TTL (decremento + checksum
++ scadenza) **2/2** su tutte e tre; `link_state` reroute **15/30** casi di link-down cambiano
+uscita; architetture alternative PASS; `test_fabric` 29/29 e 11/11 (AOT). Aggiornamento del
+modello di P1 sul nodo (open + caricamento dell'oggetto AOT): **1,06 ms**.
+
+Lo spread fra minimo e massimo dei 7 trial sta fra il 2 e il 5%. I programmi più brevi
+restano i più sensibili: su 22 ns un nanosecondo è il 5%.
+
+### La dimensione non predice la velocità
+
+**P3 ha il 18% di istruzioni in meno di P2 ed è il 62% più lento** (12 318 contro 14 969;
+323 contro 199 ns). Le righe che lo spiegano: **3 tail call** contro 1, **29 lookup** contro
+11. Il conteggio `xlated` misura quanto è grande il programma, non quanto lavora.
+
+P2 è più grande perché tiene la rete intera in un programma: `arch_generic_2layer` srotola
+insieme fc1 (65→8), fc2 (8×8) e lo strato d'uscita (32×8, i soffitti). P3 srotola **un**
+layer denso generico (`layer_hidden`, 1 678 istruzioni) e ci rientra per tail call a ogni
+hop: la profondità non costa dimensione, e il riuso si paga in latenza (un salto più le
+letture di `scratch_meta`, `scratch_acts`, `layer_shapes`, i pesi).
+
+Le istruzioni sono un conteggio **statico**: in P1 lo switch della one-hot `node` ha 52 casi
+e ne esegue uno, e con i pesi letterali clang cancella i prodotti per zero e trasforma in
+shift le potenze di due. 989 istruzioni in 47 ns sarebbero 6,0 istruzioni per ciclo a 3,5
+GHz, sopra ogni processore reale: il percorso eseguito è una frazione del conteggio.
+
+### I soffitti compilati e il verificatore
+
+In P3 il soffitto delle code (`IPA_MAX_QUEUES`) cambia le istruzioni senza cambiare il
+percorso eseguito quando il descrittore non dichiara la feature coda (`diag_p3_bisect.py
+--ceilings`):
+
+| `IPA_MAX_QUEUES` | 1 | 2 | 4 | **8** |
+|---|---:|---:|---:|---:|
+| `layer_first` (istruzioni) | 7 009 | 7 611 | 8 707 | **10 503** |
+| esito | carica | carica | carica | carica |
+
+Il control plane protegge il soffitto: `load_modular_weights` rifiuta un descrittore che
+chieda più slot di coda di quanti il datapath ne compili, invece di troncarlo.
+
+**Istruzioni e complessità di verifica sono valute diverse.** Il verificatore percorre ogni
+cammino del corpo srotolato, e il costo cresce col **prodotto** dei soffitti: con soffitti
+larghi (`8 × 4 × 128`) P2 si ferma a `processed 1000001 insns (limit 1000000)` con ~14 900
+istruzioni, cioè dentro il limite di dimensione ma oltre quello di complessità. È lo stesso
+limite che oggi ferma P2 oltre due strati nascosti (§8) e P1 oltre ~300 pesi (§6). Questi
+limiti sono scogliere, non pendenze: un soffitto si cambia e **si rimisura**.
+
+BCC riporta i rifiuti come `Program too large (N insns), at most 4096 insns`: il 4096 è una
+costante vecchia nella stringa d'errore di BCC (P2 carica a ~15 000). Va letto come "il
+verificatore ha rinunciato". Il numero nel messaggio d'errore è il conteggio **grezzo** prima
+del caricamento, quello delle tabelle è **xlated**: non vanno confrontati.
+
+### I lookup si contano su tutte e quattro
+
+La riga "Map lookup / pacchetto" viene da build strumentate con un contatore su ogni sito di
+lookup (`count_lookups`): 6 siti per la baseline, 14 per P1 (oggetto AOT), 21 per P2
+(`arch_generic_2layer` 19), 34 per P3 (`layer_first` 11, `layer_hidden` 6,
+`ml_argmax_forward` 12, `modular_dispatcher` 3). P1 fa 6 letture per pacchetto, una delle
+quali è `node_id`: il prezzo di far dire alla one-hot del nodo *quale nodo è questo*.
+
+### L'oggetto AOT di P1 (`method4_hardcoded_aot.py`)
 
 | | |
 |---|---|
-| Dispatch (TTL 2-6) | 5/5 PASS su tutte e tre |
-| Gestione TTL (decremento + checksum + scadenza) | 2/2 PASS su tutte e tre |
-| `link_state` reroute | PASS, **15/30** casi di link-down cambiano uscita |
-| Architetture alternative (65-8-7, 65-4-4-4-7) | 5/5 PASS |
-| Multi-modello concorrente (P2 65-6-5-7, P3 65-5-6-4-7) | PASS |
-| Aggiornamento modello P1 (ricompila + ricarica) | 1 242 ms |
-| Datapath reale (`test_fabric.py`, XDP native, veth) | **18/18**, 6 classi su 7 |
+| build offline (clang → `.o`) | 76,5 ms, una volta, sulla macchina di build |
+| deploy sul nodo | **1,16 ms** (`open` 0,08 + verifica e JIT 1,08) |
+| istruzioni | 989 (dispatch 29 + modello 960) |
+| latenza | **47 ns/pkt** (percorso d'inoltro, retval 4), come in `test_suite` |
 
-### Il risultato principale: la dimensione non predice la velocità
+La strength reduction sui pesi letterali resta dentro l'oggetto, quindi il costo per pacchetto
+non peggiora, e il compilatore sparisce dal nodo.
 
-**P3 ha il 18% di istruzioni in meno di P2 ed è il 65% più lento** (12 349 contro
-14 985 istruzioni; 448 contro 271 ns). Le due righe che lo spiegano sono al centro
-della tabella:
-
-- **3 tail call** contro 1;
-- **29 lookup di mappa** per pacchetto contro 11.
-
-Il conteggio `xlated` misura quanto è grande il programma caricato, non quanto lavoro
-fa per pacchetto. In questo regime dominano **lookup e salti**, non l'aritmetica.
-
-### Perché P2 è più grande di P3, che pure è più lento
-
-Le due cose hanno la stessa causa: **P3 non tiene la rete intera in un programma.**
-
-```
-P2:  arch_generic_2layer = 14 587      una sola immagine
-     fc1 (65->8) + fc2 (8x8) + out (32x8), tutti srotolati insieme
-
-P3:  layer_first  = 10 207             IV sparsa dal descrittore, 8 uscite
-     layer_hidden =  1 688             UN layer denso generico 8x8
-     dispatcher   =    136
-                    12 031             layer_hidden e' UNA copia, eseguita DUE volte
-```
-
-P3 srotola **un** layer denso generico e ci rientra per tail call a ogni hop, quindi
-la profondità del modello non costa dimensione: un modello a 4 strati gira sullo
-stesso binario (provato sopra, `65-5-6-4-7`). P2 deve srotolarli tutti e tre, perché
-è un programma solo — e più strati significa un altro binario.
-
-Quel riuso è esattamente ciò che P3 paga in latenza: ogni rientro è una tail call più
-le letture di mappa che ricostruiscono il contesto (`scratch_meta`, `scratch_acts`,
-`layer_shapes`, i pesi). 29 lookup contro 11.
-
-> ⚠️ **Il confronto sulla DIMENSIONE è in parte un confronto fra soffitti, non fra
-> pipeline.** Entrambe portano capacità inutilizzata, e non la stessa:
->
-> | | soffitto | bisogno reale del modello depositato |
-> |---|---:|---:|
-> | P2, strato d'uscita | `MAX_N_OUT` 32 × `T2_MAX_H2` 8 = 256 MAC | 7 × 4 = 28 |
-> | P3, vettore code | `IPA_MAX_QUEUES` 8 | 0 (nessuna feature coda dichiarata) |
->
-> *(Numeri di questa bisezione, su uno stato del codice precedente alla scala
-> per-feature a runtime: oggi la stessa configurazione conta 12 349 invece di
-> 12 031. Il confronto interno regge, è la stessa build in entrambe le colonne.)*
->
-> Con `IPA_MAX_QUEUES=1` P3 misura 8 674 istruzioni invece di 12 031, cioè il 41% in
-> meno di P2 invece del 18%, **a parità di latenza** (419 contro 421 ns). Il numero
-> di istruzioni si sposta del 39% senza che cambi nulla di ciò che gira. È il motivo
-> per cui la riga delle istruzioni non va letta come una misura di costo.
-
-> ⚠️ **Le istruzioni sono un conteggio STATICO, non il percorso eseguito.** Dividere
-> 1 026 istruzioni per 73 ns darebbe ~4.2 istruzioni per ciclo a 3 GHz, sopra il
-> massimo pratico su x86 (3-4). In P1 lo switch della one-hot `node` ha 52 casi ma ne
-> esegue **uno solo**; inoltre, con i pesi come letterali, clang applica strength
-> reduction (i pesi a zero spariscono, quelli potenza di due diventano shift). Il
-> percorso dinamico è una frazione delle 1 026 — ed è il vantaggio strutturale della
-> hardcoded sulle altre due.
-
-### I lookup si contano di nuovo, su tutte e quattro
-
-La riga "Map lookup / pacchetto" riportava `n.d.` per P2 **e** P3: contarli richiede di
-ricompilare il programma con un contatore su ogni sito di lookup, e le due build
-strumentate sforavano il verificatore. Ora caricano entrambe:
-
-```
-[count_lookups] template: 21 lookup sites (arch_generic_2layer=19  ipa_switch_template=1  <header>=1)
-[count_lookups] modular : 34 lookup sites (layer_first=11  layer_hidden=6  ml_argmax_forward=12
-                                           modular_dispatcher=3  <header>=2)
-```
-
-Non è stato reinserito niente a mano: è il margine di verifica liberato dal nido di
-cicli invertito che ha reso caricabili le build strumentate. Una misura prima
-impossibile è adesso una riga di tabella.
-
-P1 passa da 5.0 a 6.0 lookup: è la mappa `node_id`, il prezzo di far dire alla one-hot
-del nodo *quale nodo è questo* invece di *quale modello porta il pacchetto*.
-
-### Il nido di cicli invertito: cosa ha cambiato e cosa no
-
-In `layer_first` (P3) e `fc1` (P2) il ciclo sulle feature era **dentro** quello sui
-neuroni. Ma `code`, `size` e `col_off` di una voce del descrittore non dipendono dal
-neurone, quindi la catena a cinque rami su `code` veniva rivalutata `8 × 4 = 32` volte
-per pacchetto e il gate `i < size` su un vettore denso 64 volte, per ricavare ogni
-volta la stessa risposta. Invertito: 4 dispatch, 8 gate, e cicli interni di sola
-moltiplica-accumula senza un ramo.
-
-**L'aritmetica non cambia, termine per termine.** Cambia solo l'ordine della somma, e
-l'addizione int64 in complemento a due è associativa e commutativa (anche in overflow,
-che avvolge uguale nei due ordini): ogni accumulatore finisce bit-identico.
-L'accumulatore diventa `out[]`/`h1[]`, che erano già vivi attraverso il ciclo, quindi
-non si aggiunge stato tracciato.
-
-| | prima | dopo |
-|---|---:|---:|
-| P2 `arch_generic_2layer` | 16 144 | **14 587** |
-| P3 `layer_first` (a parità di soffitti) | 6 417 | **6 850** |
-| P3 build strumentata (conteggio lookup) | non caricava | **carica** |
-| P3 `IPA_MAX_QUEUES` massimo caricabile | 1 | **8** |
-
-P3 è **cresciuto** di 433 istruzioni ed è diventato molto più economico da verificare.
-Non è una contraddizione: **il verificatore paga i cammini, non la dimensione**, e sono
-valute diverse. Prima della riscrittura, a `IPA_MAX_QUEUES=8` non caricava niente.
-
-### Il soffitto delle code è tornato a 8, e non costa tempo
-
-Misurato, non dedotto — due run consecutivi dello stesso codice con il solo `#define`
-cambiato:
-
-| | `IPA_MAX_QUEUES` 1 | `IPA_MAX_QUEUES` 8 |
-|---|---:|---:|
-| `layer_first` | 6 850 | 10 207 |
-| modular, totale | 8 674 | 12 031 |
-| **latenza min** | **419.0 ns** | **421.0 ns** |
-| lookup / pacchetto | 29.0 | 29.0 |
-| memoria mappe | 19 480 B | 19 508 B |
-
-**+3 357 istruzioni, +2 ns** — dentro uno spread del 13% — e i lookup identici. Con un
-descrittore che non dichiara la feature coda, il ramo `FEAT_QUEUE_OCC` non viene mai
-preso: cresce la dimensione statica, non il percorso eseguito. Le uniche voci che si
-muovono davvero sono i 28 byte di `queue_state` (8 slot invece di 1).
-
-È la dimostrazione più pulita, in questo documento, che dimensione statica e costo per
-pacchetto sono cose diverse.
-
-### Attendibilita' dei numeri di latenza
-
-**Due esecuzioni dello stesso binario, a minuti di distanza:**
-
-| | baseline | P1 | P2 | P3 |
-|---|---:|---:|---:|---:|
-| run 1 | 35.0 | 62.0 | 243.0 | 478.0 |
-| run 2 | 28.0 | 67.0 | 247.0 | 422.0 |
-| scarto | −20% | +8% | +2% | −12% |
-
-Le **istruzioni sono identiche** nei due run: sono deterministiche. Le latenze no.
-
-Quindi: su questa VM a 4 vCPU una differenza di latenza sotto il ~20% fra due misure
-prese in momenti diversi **non significa nulla**. Vale il confronto *dentro* un run, dove
-tutte le righe vedono la stessa macchina nello stesso secondo. Ogni cifra assoluta qui va
-letta come "ordine di grandezza su questa VM", mai come prestazione del sistema.
-
-Va aggiunto un limite di metodo più profondo: `BPF_PROG_TEST_RUN` esegue il programma in
-un ciclo sullo stesso buffer. Niente NIC, niente driver, niente allocazione di `sk_buff`,
-nessuna pressione di cache da traffico vero. Il `Mpps` in tabella è `1/latenza`, cioè un
-**picco teorico**, non throughput retto. Per quello serve traffico vero.
+**L'indice del nodo cambia la decisione.** L'oggetto AOT non può portarsi dentro l'indice
+del nodo: arriva al caricamento da `--node-id` o `$IPA_NODE_ID`. Lo stesso binario con e
+senza `--node-id 7` sceglie classi diverse: la feature `node` (208 pesi su 319) contribuisce
+davvero. Senza `--node-id` la one-hot resta spenta (la mappa è un `HASH`: il default è "non
+lo so", non "sono il nodo 0").
 
 ---
 
-### Nota storica: perché la sezione è stata rifatta
+## 10. Throughput end-to-end (`bench_throughput.py`)
 
-**La versione precedente sosteneva che le latenze assolute riproducessero bene**, e su
-quella base costruiva un modello di costo in cicli. Conservata qui perché la conclusione
-opposta — misurata sopra su due run dello stesso binario — è essa stessa il risultato.
-Il testo di allora diceva: su tre esecuzioni indipendenti
-P1 misura 47 / 48 / 51 ns e P3 misura 387 / 392 / 391 ns: variazione sotto il 10% su P1 e
-sotto l'1.5% su P3. Anche l'ordine di grandezza e' quello atteso in letteratura per XDP
-sotto `BPF_PROG_TEST_RUN` (un programma minimale sta sui 10-20 ns, un redirect sui 25-50):
-il baseline a 25-28 ns e' esattamente li'.
+Le cifre di throughput delle sezioni precedenti sono `1/latenza` sotto `BPF_PROG_TEST_RUN`:
+picchi teorici. Qui pktgen (in-kernel) o frame XDP grezzi generano traffico vero, la
+pipeline XDP lo elabora e lo redirige, e un contatore XDP sull'interfaccia d'uscita conta
+quanti sono arrivati.
 
-Il modello di costo torna. A circa 3 GHz, 25 ns sono ~75 cicli (parse + redirect), 51 ns
-~153 cicli (P1: piu' una tail call, un secondo parsing e l'intera rete), 391 ns ~1 170
-cicli per P3 — di cui la maggior parte spiegabile con le sole 26 letture di mappa e le 3
-tail call. E' esattamente la tesi che il capitolo sostiene: in questo regime dominano
-lookup e salti, non l'aritmetica.
-
-### Perche' la riga "latenza normalizzata sul baseline" e' stata rimossa
-
-Una versione precedente riportava una riga *latenza normalizzata (× baseline)*,
-giustificata cosi': il baseline e' lo stesso identico programma ovunque, quindi
-dividere per esso rende confrontabili misure prese su macchine diverse. Il caso di
-controllo era P1, invariato, con rapporto 1.67 e poi 1.68.
-
-I tre run mostrano che il metodo e' **fragile quanto la stima del baseline**:
-
-| run | trial | P1/base | P2/base | P3/base |
-|---|---:|---:|---:|---:|
-| A | 7 | 1.68 | 8.00 | 13.82 |
-| B | 7 | 3.43 | 11.79 | 28.00 |
-| C | 15 | 2.04 | 9.36 | 15.64 |
-
-A e C concordano entro il ~20%; B e' anomalo, ma va notato che lo e' su **due** colonne
-insieme (baseline 14 ns *e* template 165 ns), quindi era la macchina in uno stato diverso,
-non un difetto della metrica. Con 15 trial il baseline torna a 25 ns, vicino ai 28 del
-run A: il valore di 14 ns era un outlier da troppi pochi campioni.
-
-La causa strutturale resta pero' valida e si legge direttamente nella riga *spread*: il
-baseline ha uno spread relativo del **112%** contro il 31-38% delle tre pipeline. Essendo
-il programma piu' economico (129 istruzioni), l'overhead per iterazione di
-`BPF_PROG_TEST_RUN` e' dello stesso ordine di grandezza di cio' che si vuole misurare,
-quindi il suo minimo ha bisogno di **piu'** trial di quelli delle pipeline per assestarsi.
-
-**Conseguenza pratica:** la normalizzazione non e' priva di senso, ma non e' abbastanza
-stabile da essere riportata come numero in tesi — con 7 trial oscilla di un fattore 2, con
-15 resta entro il ~20%. Riporta quindi le latenze **assolute** insieme alle specifiche
-della macchina, e usa il baseline come *pavimento qualitativo* ("l'inferenza costa molto
-piu' del solo framework XDP"). Cio' che riproduce sempre e' l'**ordinamento** —
-baseline < P1 < P2 < P3 — insieme a istruzioni, lookup e memoria mappe, deterministici.
-
-### La colonna CPU (%) e' stata rimossa
-
-Era calcolata come `(utime + stime del processo) / wall time` del ciclo di misura. Ma
-tutto il lavoro avviene dentro una `bpf_prog_test_run()` **bloccante**, quindi quel
-rapporto non misura quanta CPU costi il programma eBPF: misura quanto lo scheduler ha
-lasciato il thread sulla CPU, cioe' l'interferenza di sistema. I dati lo confermano —
-risultava **non monotona** (template al 47%, sotto sia baseline 53% sia hardcoded 57%,
-pur costando 4× la latenza) e **non riproducibile** (59% e poi 47% per la stessa
-pipeline fra due run). Il costo per pipeline e' gia' descritto dalle colonne latenza e
-istruzioni. Il codice porta un commento che spiega perche' non va reintrodotta.
-
-### Blocco pesi a valore strutturato (P2/P3) — cosa è cambiato
-
-`arch_weights` e `layer_weights` erano `BPF_ARRAY` con valore da 1 byte: **una
-`lookup` + un NULL-check per ogni peso**. Contati sul sorgente generato, ~139 delle
-147 lookup di P2 erano esattamente questo. Ora ciascuna mappa è **una sola entry a
-valore strutturato** che contiene l'intero blocco: una `lookup`, poi accessi diretti
-su puntatore. L'indice runtime resta verifier-safe con la maschera `& (SIZE-1)`
-(SIZE potenza di due), che elimina anche i ~139 bound-check espliciti. Stesso
-trattamento per `scratch_acts` di P3, che veniva riletta per **ogni coppia**
-(neurone di uscita, ingresso) invece di una volta per hop.
-
-| | P2 prima | P2 dopo | P3 prima | P3 dopo |
-|---|---:|---:|---:|---:|
-| Map lookup / pacchetto | 147.0 | **8.0** | 160.0 | **26.0** |
-| Istruzioni xlated | 16 988 | 9 962 | 15 767 | 8 209 |
-| Jited (byte) | 84 587 | 48 640 | 76 376 | 40 635 |
-| Memoria mappe (byte) | 8 052 | 3 960 | 16 884 | 8 188 |
-| Latenza min (ns/pkt, stessa sessione) | 349.7 | **224.0** | 590.0 | **387.0** |
-
-(Prima/dopo misurati nella stessa sessione sulla stessa macchina, quindi qui le
-latenze assolute sono direttamente confrontabili senza normalizzare.)
-
-Inferenza **invariata**: stessa classe scelta su tutta la suite contro il riferimento
-Python, multi-model e alt-arch inclusi. Lato control plane, registrare un modello è
-ora **una** `bpf_map_update_elem` sull'intero blocco invece di 319 (P2) / 2048 (P3).
-
-Lettura onesta del risultato: ~1/3 del costo per pacchetto di P2 e P3 **non era il
-prezzo della flessibilità**, era il prezzo di una codifica del contenitore dei pesi.
-L'ordinamento del design space non cambia, ma il divario ha due componenti da
-separare: una *strutturale* (tail call + indirezione dei pesi a runtime) e una
-*implementativa*, che va misurata e sottratta prima di attribuirla al design space.
-
-### Baseline vs hardcoded (la domanda "perché l'hardcoded è così veloce?")
-
-Il **baseline** riceve il pacchetto in XDP, fa lo stesso parse del dispatcher e un
-`bpf_redirect` — **niente tail-call, niente MLP**. È il *pavimento* del framework:
-**28 ns** nel run A, **14 ns** nel run B. L'hardcoded costa 47-48 ns in entrambi,
-cioè aggiunge ~20-34 ns per tail-call + double-parse + la rete.
-
-La lettura qualitativa regge in entrambi i run: l'hardcoded **non** è sospettosamente
-veloce, sta nello stesso ordine di grandezza del do-nothing, e il throughput elevato
-è in larga parte il pavimento XDP+parse+redirect — la rete int8 65-4-4-7 srotolata
-costa poco in confronto. Il *fattore* preciso però non riproduce (1.68× vs 3.43×),
-perché è il baseline a oscillare: vedi la nota sulla normalizzazione sopra. Per
-quantificare davvero il costo del solo salto usa `bench_tailcall_overhead.py` (sez. 8),
-che confronta due programmi che differiscono **solo** per un hop `PROG_ARRAY` e non
-dipende da questo rapporto.
-
-### AOT-literal deploy (P1, `poc_aot/loader_aot.c`)
-
-Run del 17/09, **stessa sessione** del suite kernel qui sopra — che è la condizione
-senza la quale il confronto per-pacchetto non vale niente.
-
-| | BCC hardcoded | AOT literal |
-|---|---:|---:|
-| aggiornamento modello | **1 242 ms** (clang sul nodo) | **37.2 ms** (`open` 0.73 + `load` 36.5) |
-| istruzioni | 1 026 (disp 29 + model 997) | 979 (disp 28 + model 951) |
-| latenza | 73.0 ns | **74.0 ns** |
-| throughput teorico | 13.699 Mpps | 13.51 Mpps |
-
-**74.0 contro 73.0 ns: la stessa cifra**, dentro uno spread del 36% misurato nello
-stesso run. Il guadagno dell'AOT non è per-pacchetto e non è mai stato quello: è che
-la strength reduction sui pesi letterali **resta dentro l'oggetto**, quindi il costo
-per pacchetto non peggiora, e il compilatore sparisce dal nodo datapath.
-
-I due binari non sono identici (979 contro 1 026 istruzioni): passano per versioni di
-clang diverse e per dialetti di accesso alle mappe diversi (rewriter di BCC contro
-`bpf_map_lookup_elem` di libbpf). Affermazioni tipo "byte-identical" non sono
-supportate; quello che è supportato è che stanno nella stessa classe di costo,
-lontanissime da P2/P3.
-
-> ⚠️ **La cifra di deploy varia molto fra run.** Per lo stesso oggetto sono stati
-> osservati 4.66, 6.15, 20.7 e 37.2 ms, quasi tutto in `load` (verify+JIT). Regge
-> l'**ordine di grandezza** rispetto a 1.2-1.3 s di clang, cioè un fattore fra 30 e
-> 300, non il valore preciso. Una riga che citi "5 ms" o "37 ms" come proprietà
-> dell'AOT sta sovra-interpretando un campione.
-
-Il `1 242 ms` non è misurato da `loader_aot`, che non esegue mai il percorso BCC: è la
-riga `[M1 update timing]` di `--only kernel` nello stesso run.
-
-#### L'indice del nodo cambia la decisione, e si vede qui
-
-Un oggetto AOT è costruito su una macchina di build, quindi non può portarsi dentro
-l'indice del nodo: arriva al caricamento, da `--node-id` o `$IPA_NODE_ID`, come fa il
-control plane Python. Due esecuzioni dello **stesso identico binario**:
+### 10.1 Il banco
 
 ```
-$ sudo ./loader_aot nn_aot_arch.o
-node_id left empty (no --node-id and no $IPA_NODE_ID) ...      retval=1   (XDP_DROP)
-
-$ sudo ./loader_aot nn_aot_arch.o --node-id 7
-seeded node_id: this node is index 7                          retval=2   (XDP_PASS)
+pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] (DUT, cpu6)
+    ──bpf_redirect──► ipaN ──veth──► ipaNp [XDP: contatore d'uscita]
 ```
 
-Cambia solo la mappa `node_id`, e cambia la classe scelta. È la prova più diretta in
-tutto il repository che quella feature — 208 pesi su 319 — **contribuisce davvero**,
-e non un test che verifica sé stesso.
+- **CPU separate**: i thread `kpktgend_<cpu>` sulle CPU del generatore, il thread NAPI del
+  DUT (`/sys/class/net/<dev>/threaded`) pinnato sulla CPU del DUT, l'uscita in softirq sulla
+  CPU del DUT oppure in thread su una CPU sua (`--egress-cpu N|auto`).
+- **Una coda d'ingresso per core del DUT** (`--dut-queues auto`): i thread pktgen scrivono
+  tutti sulla stessa coda. Con una coda per thread generatore (`--dut-queues gen`) il DUT
+  avrebbe più thread NAPI sullo stesso core, e quale coda viene servita lo deciderebbe lo
+  scheduler: a pieno carico ogni thread tiene la CPU per una fetta intera (millisecondi)
+  mentre le altre code (256 descrittori) traboccano. `veth` è LLTX e il `ptr_ring` serializza
+  i produttori col suo `producer_lock`: la contesa la paga il generatore, che ha margine.
+- **Tre punti di conteggio**: TX (pktgen, più i respinti da `veth_xmit` a coda piena), HIT
+  (`pkt_stats[0]` della pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è
+  arrivato al programma, HIT − RX ciò che il programma ha elaborato e non è uscito.
+- **Finestra stazionaria** (default): i rate sono differenze fra due letture dei contatori
+  fatte mentre tutte le istanze pktgen trasmettono (lettura sotto 3 ms, rifatta se più
+  lunga), poi stop. Avvio, sfasamento dei thread e coda finale restano fuori.
+- **model_id 190**: pktgen scrive la propria intestazione (magic `0xbe9be955`) subito dopo
+  UDP, dove il dispatcher legge `ipa->model_id`. Il modello è registrato anche su 190 e una
+  sonda verifica HIT prima di misurare.
+- **La copia di headroom**: XDP su veth pretende 256 byte davanti al pacchetto, gli skb di
+  pktgen ne hanno 64, quindi `veth_xdp_rcv_skb` copia ogni pacchetto prima del programma.
+  Con `--generator xdp` (frame XDP grezzi da `BPF_PROG_TEST_RUN` live frames, `xdp_gen.py`)
+  la copia non c'è, come da una NIC con XDP nativo.
+- **La coda del veth**: `VETH_RING_SIZE` = 256 descrittori, non configurabile su questo
+  kernel (`ethtool -g` non la espone).
 
-Senza `--node-id` la one-hot resta **spenta**, non messa a zero: il default è "non lo
-so", non "sono il nodo 0". È lo stesso motivo per cui la mappa è un `HASH` e non un
-`ARRAY`.
+### 10.2 Confronto a saturazione e a carico comune (`--mode compare`)
 
-### Costo di aggiunta modello (`bench_model_add.py`, 3 modelli)
+```bash
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --out results/throughput_3500
+```
 
-| pipeline | add **min** (ms) | media | come |
+3 giri × 3 ripetizioni, 64 B, uscita sulla CPU del DUT, `results/throughput_3500/`:
+
+| pipeline | saturazione (Mpps) | [min–max] | variazione | a 1,338 Mpps offerti |
+|---|---:|---|---:|---|
+| rxonly (sola ricezione) | 4,39 | 4,33–4,40 | 1,7% | nessun respinto |
+| baseline | 3,26 | 3,26–3,29 | 1,0% | nessun respinto |
+| p1_static (P1) | 2,90 | 2,90–2,90 | 0,1% | nessun respinto |
+| hardcoded (P1.5) | 2,78 | 2,77–2,80 | 0,9% | nessun respinto |
+| template (P2) | 1,89 | 1,88–1,90 | 0,9% | nessun respinto |
+| modular (P3) | 1,48 | 1,48–1,49 | 0,7% | nessun respinto |
+
+Controllo di validità PASS (la baseline è la più veloce). A carico comune — 90% di quanto
+consegna la più lenta — tutte e sei consegnano tutto: **nessun pacchetto respinto sotto
+capacità**. Perdita dopo XDP ≤ 0,01% in ogni riga. Macchina: nessun evento di throttling,
+DUT a 3 494 MHz, registro max 83 °C.
+
+**P1 e P1.5 si separano**: 2,90 contro 2,78 Mpps, con dispersioni dello 0,1% e dello 0,9%.
+L'ordine P1 < P1.5 < P2 < P3 in costo per pacchetto regge in ogni giro. Costo sopra la
+baseline (1/RX): **+38 / +53 / +224 / +368 ns**.
+
+### 10.3 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
+
+```bash
+sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 \
+    --rates 0.5,1,1.5,2,2.5,3 --out results/throughput_rates
+```
+
+Build **strumentata**: il dispatcher marca T1, il programma marca T2 subito prima di
+`bpf_redirect`, il contatore d'uscita T3. Minimi per finestra, mediana fra tre giri, ns:
+
+| | T2−T1 (pipeline) | T3−T2 (redirect + veth + NAPI) | sostenibile (perdita totale ≤ 0,1%) |
 |---|---:|---:|---|
-| hardcoded | 1146.4 | 1299.2 | ricompilazione completa (clang = 99.7%) |
-| template | **0.346** | 4.86 | una `bpf_map_update_elem` sul blocco pesi |
-| modular | **0.385** | 0.73 | una `bpf_map_update_elem` sul blocco pesi |
+| baseline | 35 | 199–240 | ≥ 2,0 Mpps |
+| p1_static | 64 | 206–244 | ≥ 2,0 Mpps |
+| hardcoded | 73–75 | 201–243 | ≥ 2,0 Mpps |
+| template | 225–228 | 207–256 | ≥ 1,5 Mpps |
+| modular | 347–355 | 211–259 | ≥ 1,0 Mpps |
 
-Hardcoded ~3313× più lento di template, ~2977× di modular. L'AOT stima ~3 ms di load →
-**~432× più economico** del BCC, **senza perdita di perf**.
+Il trasporto è un costo comune di ~200–260 ns che non dipende dalla pipeline; T2−T1 è
+piatto sul rate. Sopra la baseline la sola pipeline costa **+29 / +39 / +191 / +314 ns**.
+Sotto capacità i respinti restano allo 0,00–0,02%. I "sostenibili" sono gradini della scala
+(0,5 Mpps): contando solo la perdita dopo l'ingresso salgono a 2,42 / 2,23 / 2,18 / 1,60 /
+1,30 Mpps. La build strumentata aggiunge due letture dell'orologio e due scritture per
+pacchetto: il suo throughput è più basso di quello di produzione (§10.2).
 
-La statistica riportata è il **minimo**, non la media — coerente con la sezione 2:
-il rumore è a senso unico e con soli 3 modelli la media è dominata dal primo add,
-che paga il primo accesso alle pagine di una mappa appena creata (template: min
-0.346 ms ma max 13.85, stdev 6.36 — la media descrive l'outlier, non l'operazione).
-Il crollo rispetto alle misure precedenti viene da **due** cause da non confondere:
-il passaggio media→minimo, e il fatto che registrare un modello sia ora **una**
-`bpf_map_update_elem` invece di 319 (P2) / 2048 (P3).
+### 10.4 Il tetto di sola ricezione (`--mode generator`)
 
-### Multi-model (`verify_multi_model.py`) — regge shape custom
+```bash
+sudo python3 ipa/test/bench_throughput.py --mode generator --frames 64 --rounds 5 \
+    --rates 8,10,12,15,20,25 --out results/throughput_generator
+```
 
-`model_desc` popolato correttamente anche per shape non-default: P2 `model_id=1` = 65-**6-5**-7,
-P3 `model_id=1` = 65-**5-6-4**-7 (4 layer). Tutti PASS. Dal 2026-09-24 ogni `model_id`
-ha anche le proprie righe di `class_action` (`class_action_t2[model_id=1, bank=0]` nel
-log); modelli con semantiche diverse nello stesso programma sono il caso C di § 9-bis.
+Contatore che scarta all'ingresso, nessuna pipeline: il generatore offre ~5,7 Mpps, il DUT ne
+riceve **4,33–4,42** (30 finestre). È lo stesso tetto che `rxonly` misura dentro `--mode
+compare` (4,39): la baseline sta al 74% del tetto di ricezione, P3 al 34%.
 
-## 11. Throughput end-to-end misurato (`bench_throughput.py`)
+### 10.5 Frame XDP grezzi: il costo del nodo (`--generator xdp`)
 
-Tutte le cifre di throughput nelle sezioni precedenti sono `1 / latenza` sotto
-`BPF_PROG_TEST_RUN`: un ciclo sullo stesso buffer, senza driver e senza un pacchetto che
-arrivi davvero. Sono **picchi teorici**. Questa sezione riporta l'altra cosa: pktgen (TG,
-in-kernel) genera traffico vero, la pipeline XDP (DUT) lo elabora e lo redirige, e un
-contatore XDP sull'interfaccia d'uscita conta quanti ne sono arrivati.
+```bash
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
+    --rounds 5 --out results/throughput_xdp
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
+    --frames 64,512,1514 --rounds 3 --out results/throughput_xdp_frames
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
+    --per-class --rounds 3 --out results/throughput_per_class
+```
 
-### 11.1 Il banco, e perché ne servono due
+Costo del nodo = 1e9 / pacchetti elaborati (HIT + MISS + DROP): dalla presa dalla coda di
+ricezione alla decisione e al redirect, con l'uscita su una CPU sua (cpu8).
 
-TG, DUT e contatore stanno sulla **stessa** macchina, collegati da una coppia veth con XDP
-in modalità nativa. Quel vincolo genera un dilemma che non si risolve su questa VM:
+| | ns/pacchetto | elaborati (Mpps) | arrivati all'uscita (Mpps) |
+|---|---:|---:|---:|
+| baseline | 142 | 7,03 | 4,38 |
+| p1_static | 157 | 6,39 | 4,70 |
+| hardcoded | 160 | 6,24 | 4,78 |
+| template | **287** | 3,48 | 3,48 |
+| modular | **426** | 2,35 | 2,35 |
 
-| | NAPI in thread (core separati) | softirq (`--no-threaded-napi`) |
-|---|---|---|
-| dove gira la RX | kernel thread su una CPU dedicata | sulla CPU che ha trasmesso |
-| perdita osservata | 8-70%, **a qualunque rate** | **0.00%** |
-| collo di bottiglia | la coda del veth | il generatore |
-| serve per | throughput massimo, confronto | rate a perdita nulla, costo per pacchetto |
+**Solo le righe di P2 e P3 sono costi del nodo.** Per baseline, P1 e P1.5 il nodo elabora più
+di quanto il banco riesca a portare via: il core d'uscita (cpu8, che riceve per tutti e
+cinque i veth) consegna 4,4–4,8 Mpps e il resto si perde dopo XDP, e la sola ricezione si
+ferma a ~6,8 Mpps, il tetto del generatore XDP a 3 thread. Le loro cifre sono **limiti
+superiori** del costo; il controllo di validità (baseline più veloce di tutte, misurato su
+RX) fallisce su due run su tre proprio per questo. Per risolverle servono più thread
+generatore e più di un core d'uscita.
 
-**Perché la prima colonna perde a qualunque rate.** Attaccando XDP a un veth il kernel
-alloca un `ptr_ring` sul lato ricevente, che `veth.c` fissa a `VETH_RING_SIZE` (256
-descrittori) e che su questo kernel `ethtool -g` non espone — verificato, non è
-configurabile. 256 descrittori a 1,5 Mpps sono **170 µs** di traffico: il thread NAPI deve
-essere schedulato entro 170 µs ogni volta, e un guest VirtualBox su host a core ibridi non
-lo garantisce. Il conto torna con le misure: a 74 kpps il ring copre 3,5 ms e la perdita è
-0,10%; a 1,5 Mpps copre 0,17 ms e sta fra il 9 e il 18%. È un pavimento del banco, non
-della pipeline — in tutte le righe `TX == HIT == RX`, cioè **il datapath non ha mai perso
-un pacchetto che gli sia stato consegnato**.
+- **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro l'1% su ogni pipeline
+  (template 285–287, modular 420–423 ns): il nodo tocca solo le intestazioni.
+- **Per classe** (stato dei link e TTL cercati per ciascuna delle 6 classi raggiungibili,
+  classe decisa verificata): sulle 5 classi FORWARD P2 244–272 e P3 420–433 ns; **la classe
+  DROP costa di più**, P1 256 contro ~155, P1.5 262 contro ~159, P2 325, P3 474 ns. Con il
+  DROP la pagina si restituisce sulla CPU del DUT; con l'inoltro sulla CPU d'uscita.
 
-In softirq la RX gira sulla CPU che ha trasmesso, il ring si drena in pratica
-sincronamente e la perdita sparisce. Il prezzo è che generatore e pipeline condividono il
-core, quindi il rate misurato è `1/(t_gen + t_pipeline)` e il tetto è sempre il generatore.
+### 10.6 Latenza arrivo → ripartenza (`--latency`)
 
-### 11.2 Rate a perdita nulla (softirq, perdita 0.00%)
+```bash
+sudo python3 ipa/test/bench_throughput.py --latency --frames 512 --rounds 3 --repeat 5 \
+    --out results/throughput_latency
+```
 
-Run del 2026-09-18, commit `131b7a6b`, `--threads 1 --duration 2.0 --repeat 5
---no-threaded-napi`. Sono **limiti inferiori** dell'NDR nel senso di RFC 2544: a massima
-spinta non si è perso niente, quindi la pipeline non era satura e il vero NDR sta più in
-alto.
+Build strumentata: il dispatcher marca l'arrivo, il programma d'uscita rilegge e sottrae.
+Latenza minima **a scarico** (50 kpps, nessuna coda), mediana fra tre giri:
 
-| pipeline | 64 B | 512 B | 1514 B |
-|---|---|---|---|
-| baseline (nessuna inferenza) | ≥ 879 581 | ≥ 886 897 | ≥ 688 287 |
-| p1_static (P1) | ≥ 784 711 | ≥ 774 151 | ≥ 652 699 |
-| hardcoded (P1.5) | ≥ 847 622 | ≥ 838 514 | ≥ 614 433 |
-| template (P2) | ≥ 643 508 | ≥ 637 925 | ≥ 542 678 |
-| modular (P3) | ≥ 549 003 | ≥ 548 085 | ≥ 480 756 |
+| | baseline | p1_static | hardcoded | template | modular |
+|---|---:|---:|---:|---:|---:|
+| min (ns) | 261 | 277 | 293 | 457 | 593 |
+| sopra la baseline | — | +16 | +32 | +196 | +332 |
+| rate a perdita nulla (Mpps) | 1,91 | 1,93 | 1,86 | 1,41 | 1,18 |
 
-**Variazione fra run.** Un secondo run identico sette minuti dopo (`f3821c1e`) ha dato
-baseline 913 530 / 889 125 / 713 687 e p1_static 839 712 / 819 103 / 674 403: le cifre
-assolute si spostano del 4-14% da un run all'altro, sempre verso l'alto o verso il basso
-insieme. È il motivo per cui la sezione seguente sottrae la baseline invece di citare i pps.
+Solo la colonna `min` è una misura: p50 e p99 vengono da un istogramma `bpf_log2l` (bucket a
+potenze di due) e cadono negli stessi due bucket per tutte le pipeline. Il run segnala una
+dispersione oltre il 25% su `p1_static` nella fase a perdita nulla e un 10,9% fra i giri
+sul minimo della baseline.
 
-### 11.3 Costo dell'inferenza per pacchetto
+---
 
-È la cifra che il regime senza perdite rende pulita. Senza code di mezzo `1/RX pps` è il
-tempo del percorso completo; la baseline fa lo stesso percorso **meno l'inferenza**, quindi
-la differenza è il costo dell'inferenza. Il termine `t_gen` è comune a tutte le righe della
-stessa taglia e sottraendo la baseline si cancella.
-
-**Quattro run indipendenti** a `--repeat 5`, stessi parametri, nell'arco di mezz'ora
-(`131b7a6b`, `f3821c1e`, `f4daa6d9`, `ee973cde`). `spread` è `(max − min) / media`.
-
-**Costo dell'inferenza, ns/pacchetto sopra la baseline**
-
-| pipeline | 512 B: A / B / C / E | media | spread | 1514 B media | spread |
-|---|---|---|---|---|---|
-| p1_static (P1) | 164 / 96 / 37 / 32 | 82 | 160% | 81 | 104% |
-| hardcoded (P1.5) | 65 / 186 / 120 / 93 | 116 | 104% | 135 | 154% |
-| template (P2) | 440 / — / 465 / 385 | **430** | 19% | 424 | 25% |
-| modular (P3) | 697 / 704 / 691 / 601 | **673** | 15% | 692 | 25% |
-
-**Cosa si può affermare, e con quale precisione.**
-
-- **L'ordine P1 ≈ P1.5 < P2 < P3 regge in tutti e quattro i run**, a tutte le taglie. È
-  l'affermazione solida di questa sezione.
-- **P3 costa ~670 ns per pacchetto, P2 ~430 ns**, con uno spread del 15-19% fra run. Sono
-  misure a una cifra significativa: "circa 0,7 µs" e "circa 0,4 µs", non 697 e 440.
-- **P1 e P1.5 stanno entrambi sotto i ~200 ns e non sono separabili**, né fra loro né
-  individualmente con precisione: i loro spread superano il 100%, cioè la variazione fra
-  run è maggiore del valore stesso. Fra i run il loro ordine reciproco si inverte.
-- **512 byte resta la taglia di riferimento** (spread 15-19% contro 25% a 1514).
-
-**Nota metodologica, e vale più dei numeri.** Una stesura precedente di questa sezione
-riportava P3 a "697/704/691 ns, spread 2%" sulla base dei primi tre run, e ne concludeva
-che fosse "la cifra più solida". Il quarto run ha dato 601 ns e ha portato lo spread al
-15%. Tre misure concordi su una macchina rumorosa non sono una misura precisa: sono tre
-estrazioni che è capitato cadessero vicine. Lo spread va ricalcolato a ogni run aggiunto,
-mai congelato al primo numero che fa una bella impressione.
-
-### 11.4 Come si leggono le due colonne di perdita
-
-Il banco riporta `perd.pegg` (la peggiore delle ripetizioni) e `perd.med` (la mediana), e
-**decide** sulla seconda. È una deviazione dichiarata da RFC 2544, che definisce il
-throughput come il rate a cui non si perde nemmeno un frame: la norma presuppone un DUT
-quieto e dedicato, mentre qui capita che l'host sospenda il vCPU per l'intera finestra e
-quella ripetizione descriva l'host, non il rate. Misurato: baseline a 512 byte, quattro
-ripetizioni d'accordo e la quinta a 94,70% di perdita. Per la stessa ragione la dispersione
-si valuta sull'intervallo interquartile e le ripetizioni anomale vengono **contate e
-riportate** invece che scartate in silenzio.
-
-La perdita è anche spezzata per colpevole, perché tre cause diverse chiedono tre rimedi
-diversi: `respinti (veth)` — mai entrati nel DUT, backpressure; `persi in coda` — accettati
-e mai arrivati al programma; `persi dopo` — elaborati e non usciti. In tutti i run di questa
-sezione gli ultimi due sono **zero**.
-
-### 11.5 Latenza end-to-end (`--latency`)
-
-Run del 2026-09-18, commit `2b85d1f0`, `--frames 512 --rounds 3 --repeat 5 --threads 1`.
-Il dispatcher marca `bpf_ktime_get_ns()` in una cella per-CPU e il programma d'uscita rilegge
-e sottrae: si misura arrivo → ripartenza, non la durata del solo programma. È una **build
-strumentata**, quindi la cifra è leggermente superiore a quella di produzione.
-
-**Attenzione a non confrontarla con 11.2 e 11.3**: questo percorso gira con NAPI in thread
-(core separati), non in softirq. I pps che riporta (1,4 Mpps contro gli 875 k della 11.2)
-sono di un altro esperimento.
-
-**Latenza minima a scarico (50 kpps, nessuna coda davanti), ns sopra la baseline**
-
-Tre run: uno a 3 giri e due a 5 (`2b85d1f0`, `b0447b3e`, `11fad915`). Mediana fra i giri.
-
-| pipeline | 3 giri | 5 giri | 5 giri | media | spread |
-|---|---|---|---|---|---|
-| p1_static (P1) | +76 | +107 | +121 | ~101 | 44% |
-| hardcoded (P1.5) | +102 | +91 | +94 | ~96 | 11% |
-| template (P2) | +269 | +288 | +308 | ~288 | 14% |
-| modular (P3) | +440 | +473 | +520 | ~478 | 17% |
-
-**P1 e P1.5 sono indistinguibili anche qui**: ~101 e ~96 ns, e l'ordine si inverte fra i
-run. Terza strada indipendente che dà la stessa conclusione della 11.3.
-
-**Un confondente da dichiarare.** La baseline assoluta scende da un run all'altro — 368,
-342, 332 ns — e siccome i delta si calcolano sottraendola, crescono di conseguenza. Non è
-un trend delle pipeline: è la macchina che deriva. Va letto come "P3 costa fra 440 e 520 ns
-sopra un percorso che costa fra 330 e 370", non come "P3 sta peggiorando".
-
-Dispersione dentro l'ultimo run: baseline 7%, P1.5 3,6%, P3 6,8%, P2 12,6%, P1 13,4%. Il
-`[FAIL]` residuo è su P1 a 13,4%, marginale e reale — non più l'artefatto da 1227% del run
-precedente.
-
-**Solo la colonna `min` è utilizzabile, e va detto perché.** Il minimo viene da un
-accumulatore ed è esatto. I percentili vengono da un istogramma `bpf_log2l`, quindi i
-bucket sono potenze di due e il valore riportato è il **bordo superiore** di quello che
-contiene il quantile: la risoluzione è un fattore 2. Nei run tutte e cinque le pipeline
-cadono negli stessi due bucket — `p50` fra 4 e 8 µs, `p99` fra 16 e 32 µs — quindi p50 e
-p99 **non separano niente** e non vanno riportati come misure. La tabella del banco li
-stampa come `<8192n` per rendere la lettura obbligata.
-
-**Un difetto del banco trovato proprio qui, e la ragione per cui la mediana è la statistica
-giusta.** Il percorso `--latency` non passa da `_measure_once` e per questo non aveva
-nessuna delle protezioni sulle finestre aggiunte per la modalità `saturate`. Al giro 5 la
-fase `scarico` di `hardcoded` ha consegnato **171 pacchetti invece di ~100 000**, ed è
-entrata in tabella con `min 5627 ns` contro i ~430 degli altri quattro giri. Effetto:
-
-| | spread di `hardcoded` |
-|---|---|
-| con la finestra rotta | 1227% → `[FAIL]` |
-| senza | **4%** → passa |
-
-La **mediana non si è spostata di un nanosecondo** — 433 ns con e senza. A cadere è stato
-solo il controllo di riproducibilità, che usa max/min. È la conferma pratica della scelta
-fatta in 11.4: riportare il caso peggiore, decidere sulla statistica robusta. Le protezioni
-(scarto delle finestre troncate, drenaggio prima e dopo) sono ora anche in
-`_one_fair_point`.
-
-**Il confronto fra le due stime del costo è esso stesso un risultato.** Per P1 e P1.5 la
-latenza minima e il costo dedotto dal throughput coincidono (76 contro 82, 102 contro 116).
-Per P2 e P3 divergono, e la divergenza cresce con la complessità: +269 contro 430 per P2,
-+440 contro 673 per P3, cioè il 53% in più. La lettura: il minimo è il cammino più
-fortunato — tutto in cache, nessuna contesa — mentre il costo dedotto dal throughput è
-quello medio sotto carico continuo. Le pipeline che usano tail call e lookup di mappa (P2,
-P3) pagano sotto carico quello che nel caso migliore non si vede. **Per dimensionare un
-nodo va usata la cifra da throughput, non la latenza minima.**
-
-### 11.6 Cosa questo banco NON può dare su questa macchina
-
-L'NDR vero. Con i core separati il pavimento del ring distrugge la misura a perdita nulla;
-con i core condivisi il generatore è sempre il collo di bottiglia, perché la sua CPU fa
-anche la RX — e aggiungere core al generatore ne aggiunge anche al DUT, quindi il rapporto
-fra i due non cambia mai. Servirebbero due macchine, o una NIC che supporti XDP nativo
-(l'unica fisica qui è `e1000`, emulata, che non lo supporta).
-
-Quello che resta valido, ed è su cui si basano 11.2 e 11.3: il **confronto** fra pipeline a
-parità di condizioni, e il costo per pacchetto in regime senza perdite.
-
-## 12. Al crescere del bit rate: ritardo, ricevuti, rilanciati (`bench_bitrate.py`)
+## 11. Al crescere del bit rate: ritardo, ricevuti, rilanciati (`bench_bitrate.py`)
 
 La domanda del relatore: al crescere del bit rate inviato la coda si riempie, il tempo
 end-to-end cresce e poi si perde; se si perde all'**uscita** del programma il collo di
@@ -1726,30 +948,23 @@ bottiglia è trasmissivo, se si perde all'**ingresso** è il programma eBPF. Con
 pacchetti il programma riceve e quanti ne rilancia, con due programmi sullo stesso XDP: uno
 che conta soltanto, uno con la pipeline.
 
-### 12.1 Come si legge su XDP
+### 11.1 Come si legge su XDP
 
 Un programma XDP gira dall'inizio alla fine su ogni pacchetto, dentro il poll NAPI: non ha
-una coda sua, e ogni pacchetto che entra esce con un verdetto. Se il programma è lento si
-riempie la coda che sta **davanti** a lui (su veth il `ptr_ring`, 256 descrittori per coda):
-il ritardo cresce, poi la coda trabocca e i pacchetti si perdono **prima di XDP**.
+una coda sua. Se è lento si riempie la coda che sta **davanti** a lui (su veth il
+`ptr_ring`, 256 descrittori): il ritardo cresce, poi la coda trabocca e i pacchetti si
+perdono **prima di XDP**.
 
 | si osserva | vuol dire |
 |---|---|
 | inviati > ricevuti da XDP | coda d'ingresso piena: collo il **programma** (o la ricezione — lo separa `rxonly`, il solo contatore allo stesso rate) |
-| ricevuti > inoltrati, con HIT > inoltrati | il programma ha deciso l'inoltro ma il pacchetto non è arrivato: collo **trasmissivo** (redirect o coda d'uscita) |
+| ricevuti > inoltrati, con HIT > inoltrati | il programma ha deciso l'inoltro ma il pacchetto non è arrivato: collo **trasmissivo** |
 | ricevuti > inoltrati, con MISS/DROP | una **decisione** del modello, non una perdita |
 
-"Il programma riceve ma non riesce a rilanciare" non esiste come coda interna: fra
-ricevuti e rilanciati ci sono solo le decisioni e i fallimenti dell'uscita, e il test li
-conta separatamente.
-
-### 12.2 I due programmi sullo stesso hook
-
-Un'interfaccia porta **un** programma XDP. Due si ottengono in catena, con la tail call che
-P1, P2 e P3 usano già:
+### 11.2 I due programmi sullo stesso hook
 
 ```
-hook XDP di ipatg0 ─► xdp_ing_count   ing_count[0] += 1   (mappa per-CPU, niente atomiche)
+hook XDP di ipatg0 ─► xdp_ing_count   ing_count[0] += 1   (mappa per-CPU)
                         │ bpf_tail_call(ing_next[0])
                         ▼
                       dispatcher della pipeline di produzione (P1/P1.5/P2/P3/baseline)
@@ -1758,295 +973,132 @@ hook XDP di ipatg0 ─► xdp_ing_count   ing_count[0] += 1   (mappa per-CPU, ni
                       ipaN ──veth──► ipaNp: xdp_rx_lat   rx_count += 1  (+ latenza)
 ```
 
-Se la tail call non parte il contatore incrementa `ing_count[1]` e scarta: è un contatore
-che deve restare a zero, e il test lo controlla a ogni finestra. La tail call richiede
-programmi compatibili — stesso tipo, stesso JIT e, sui kernel recenti, stesso
-`expected_attach_type`, che BCC lascia a 0 e libbpf mette a `BPF_XDP` — quindi il contatore
-viene caricato dallo **stesso caricatore** della pipeline: un oggetto BCC per baseline, P2 e
-P3; per P1 e P1.5 aggiunto in coda al sorgente dello **stesso oggetto AOT** (lo fa già la
-build strumentata `_instrument_aot_latency`). I programmi della pipeline restano quelli di
-produzione. `rxonly` è il contatore con lo slot vuoto: conta e scarta.
+Se la tail call non parte il contatore incrementa `ing_count[1]` e scarta: un contatore che
+deve restare a zero, controllato a ogni finestra. La tail call richiede programmi
+compatibili (stesso tipo, JIT e `expected_attach_type`), quindi il contatore è caricato
+dallo **stesso caricatore** della pipeline: un oggetto BCC per baseline, P2 e P3; per P1 e
+P1.5 aggiunto in coda al sorgente dello stesso oggetto AOT. `rxonly` è il contatore con lo
+slot vuoto: conta e scarta.
 
-Quanto costa la catena si misura, non si suppone: la fase finale porta ogni pipeline a rate
-massimo con e senza contatore davanti e legge dal kernel il tempo del programma attaccato
-(`kernel.bpf_stats_enabled`, `run_time_ns / run_cnt`; tail call comprese, girano dentro la
-sua esecuzione). Con la catena è contatore + pipeline, senza è la pipeline: la differenza è
-il programma 1. Accanto resta la stima dal throughput, che dice quanto rallenta il nodo ma
-su questa VM ha uno scarto di centinaia di ns fra finestre uguali — al primo run (tre
-finestre per variante) dava +34…+56 ns con p1_static "catena" a 775 e poi a 483 ns
-(`bitrate_overhead.csv`).
+Il costo della catena si misura: la fase finale porta ogni pipeline a rate massimo con e
+senza contatore davanti e legge dal kernel il tempo del programma attaccato
+(`kernel.bpf_stats_enabled`, `run_time_ns / run_cnt`, tail call comprese).
 
-### 12.3 Contatori e formule
+### 11.3 Contatori e formule
 
-| grandezza | dove si conta | come si legge |
-|---|---|---|
-| inviati | pktgen: `pkts-sofar` + `errors` (respinti a coda d'ingresso piena) | `/proc/net/pktgen/<istanza>` |
-| ricevuti da XDP | `ing_count[0]`, programma 1 | somma per-CPU |
-| decisioni | `pkt_stats[0..2]` della pipeline (HIT, MISS, DROP) | mappa della pipeline |
-| inoltrati | `rx_count` sul nodo successivo (arrivati davvero) | somma per-CPU |
+| grandezza | dove si conta |
+|---|---|
+| inviati | pktgen: `pkts-sofar` + `errors` (respinti a coda d'ingresso piena) |
+| ricevuti da XDP | `ing_count[0]`, programma 1 |
+| decisioni | `pkt_stats[0..2]` della pipeline (HIT, MISS, DROP) |
+| inoltrati | `rx_count` sul nodo successivo |
 
-Ogni punto è **una finestra stazionaria** di `bench_throughput`: pktgen parte, si aspetta che
-tutte le istanze trasmettano, si leggono tutti i contatori (lettura sotto i 3 ms), si
-aspettano `--duration` secondi (default 0,3), si rileggono, si ferma pktgen. La riga
-contiene le **differenze** fra le due letture; `duration_s` è l'intervallo fra i loro
-istanti medi. Nessun contatore si azzera, tranne l'istogramma della latenza, che si azzera
-prima di ogni punto.
+Ogni punto è una finestra stazionaria (§10.1), default 0,3 s.
 
 ```
 loss_before_xdp  = inviati − ricevuti            = respinti + persi fra veth e XDP
 loss_in_pipeline = ricevuti − inoltrati          = (MISS + DROP) + (HIT − inoltrati) + residuo
 packets_lost     = inviati − inoltrati           (le percentuali sono sugli inviati e si sommano)
-bitrate_sent     = inviati / duration_s × frame × 8     (frame = pkt_size, senza FCS: byte sul veth)
+bitrate_sent     = inviati / duration_s × frame × 8     (frame senza FCS: byte sul veth)
 ```
 
-`bitrate_sent_l1_gbps` aggiunge i 24 byte per frame di una Ethernet vera, solo come
-riferimento. Sull'asse dei grafici va il bit rate **misurato**: sopra il tetto del
-generatore il chiesto e l'inviato divergono (`gen_limited`).
+**Collo di bottiglia**: la perdita prima di XDP della pipeline meno quella di `rxonly` allo
+stesso rate, contro la perdita all'uscita, con soglia `--loss-threshold` (default **0,1
+punti**: sotto capacità `rxonly` perde lo 0,01–0,03%). **Inizio della perdita**: il rate più
+basso da cui *tutti* i rate più alti perdono; una riga in perdita seguita da righe pulite è
+"sporadica". Finestre marcate: `gen_limited` (generatore sotto il 95% del chiesto),
+`gen_burst` (oltre il 105%), `host_disturbed` (§0.3).
 
-**Collo di bottiglia** (colonna `bottleneck`): la perdita prima di XDP della pipeline meno
-quella di `rxonly` allo stesso rate, contro la perdita all'uscita, con soglia
-`--loss-threshold` (default 1 punto percentuale: sotto capacità anche il solo contatore
-respinge l'1-2% su questa VM).
+### 11.4 La latenza end-to-end
 
-**Inizio della perdita**: il rate più basso da cui *tutti* i rate più alti perdono. Una riga in
-perdita seguita da righe pulite è una finestra disturbata, e resta elencata come
-"sporadica": al primo run la baseline perdeva a 0,25 Gbit/s e non a 0,5, e la regola del
-"primo rate in perdita" avrebbe messo lì l'inizio. Le finestre in cui il generatore ha
-inviato oltre il 105% del chiesto sono marcate `gen_burst`: pktgen, se il suo vCPU è stato
-sospeso, trasmette di fila fino a rimettersi in orario, e quella raffica riempie la coda a
-qualunque rate medio (visto: 1,831 Mpps inviati su 1,465 chiesti). Giri di default: 5.
-
-### 12.4 La latenza end-to-end
-
-pktgen scrive già in ogni pacchetto, subito dopo UDP, magic `0xbe9be955`, seq, `tv_sec` e
-`tv_usec`: l'istante in cui ha costruito il pacchetto (`CLOCK_REALTIME`, µs). Il programma
-d'uscita lo confronta col proprio orologio:
+pktgen scrive in ogni pacchetto, dopo UDP, magic, seq, `tv_sec` e `tv_usec`: l'istante in cui
+ha costruito il pacchetto (`CLOCK_REALTIME`, µs). Il programma d'uscita lo confronta col
+proprio orologio:
 
 ```
 lat_us = floor((bpf_ktime_get_ns() + off) / 1000) − (tv_sec·10⁶ + tv_usec)
 off    = CLOCK_REALTIME − CLOCK_MONOTONIC, letto prima di ogni punto
 ```
 
-Il percorso misurato è tutto il nodo, **attesa in coda compresa** — che è ciò che cresce.
-`T3−T1` di `--mode rates` parte invece dall'ingresso del programma e la coda non la vede.
+Il percorso misurato è tutto il nodo, **attesa in coda compresa**. pktgen timbra il pacchetto
+e poi aspetta il momento di trasmetterlo: quell'attesa, accumulata nel suo contatore `idle`,
+si sottrae per pacchetto (`e2e_spin_correction_us`); i valori non corretti restano nel CSV.
+Istogramma a celle da 1 µs fino a 1 024 µs, poi da 64 µs fino a 65,5 ms, più il trabocco; si
+cronometra un arrivo ogni `mask+1` (circa `--lat-samples`, 20 000 per finestra).
 
-**La correzione.** pktgen timbra il pacchetto e *poi* aspetta il momento di trasmetterlo
-(`spin()` fino a `next_tx`): a rate basso quell'attesa è quasi tutto il `delay`, ~10 µs a
-0,2 Mpps. pktgen la accumula nel suo contatore `idle`; Δidle / inviati si sottrae da ogni
-statistica (`e2e_spin_correction_us`), e i valori non corretti restano nel CSV
-(`e2e_latency_p50_raw_us`).
-
-Istogramma a due passi: celle da 1 µs fino a 1024 µs, poi da 64 µs fino a 65,5 ms, più il
-trabocco (sotto carico il p99 sta nei millisecondi, e una scala sola da 1 µs a 4 ms lo
-tagliava). Si cronometra un arrivo ogni `mask+1`, scelto sul contatore per-CPU degli
-arrivi *prima* di leggere il pacchetto (circa `--lat-samples` per finestra, 20 000); il
-conteggio dei pacchetti è sempre completo. Il cancello si apre alla prima lettura della
-finestra e si chiude a pktgen fermo e coda svuotata: qualche ms oltre la finestra dei
-conteggi, allo stesso rate. La prima versione lo chiudeva "alla prima lettura dopo metà
-finestra", e una prima lettura rifatta a lungo lo chiudeva prima del tempo (sonda del primo
-run: 5 750 pacchetti cronometrati su 12 307).
-
-### 12.5 Comandi e uscite
+### 11.5 Comandi e uscite
 
 ```bash
-# tutte le pipeline + rxonly, scala di default 0,1–3 Gbit/s a 64 B, 5 giri
-sudo python3 ipa/test/bench_bitrate.py --out results/bitrate
-
-# una scala scelta, meno metodi, più giri
-sudo python3 ipa/test/bench_bitrate.py --bitrates 0.5,1,1.5,2,2.5 \
-    --method rxonly,baseline,p1_static,template,modular --rounds 7 --out results/bitrate
-
-# i grafici dal CSV, anche fuori dalla VM
-python3 ipa/test/plot_bitrate.py results/bitrate
-
-# il riepilogo di un run gia' fatto, dai CSV (senza root): uscita persa o troncata,
-# oppure un run vecchio riletto con le regole attuali
-python3 ipa/test/bench_bitrate.py --report results/bitrate
-
-# le formule, senza kernel
-python3 ipa/test/test_bitrate_math.py
+sudo python3 ipa/test/bench_bitrate.py --out results/bitrate_3500        # tutte, 5 giri (~5 min)
+sudo python3 ipa/test/bench_bitrate.py --method rxonly,baseline,template --rounds 1 \
+    --overhead-reps 0 --no-plot --out /tmp/br                              # un giro corto
+python3 ipa/test/plot_bitrate.py results/bitrate_3500                      # i grafici
+python3 ipa/test/bench_bitrate.py --report results/bitrate_3500            # riepilogo dai CSV
 ```
 
-`--out` e `--report` sono rispetto alla cartella da cui si lancia (fino al 2026-09-26
-`--out results/bitrate` finiva in `ipa/results/bitrate`, perché lo script si sposta in
-`ipa/`). `bitrate_raw.csv` si riscrive dopo ogni finestra: un run interrotto lascia su disco
-le finestre già misurate, e `--report` le riassume.
+- **Scala** (`--bitrates`): default `auto`, calibrata all'inizio su `rxonly` a massima spinta:
+  frazioni 0,05–1,25 del tetto di ricezione, fermate al 95% del tetto del generatore.
+  Oppure una lista in Gbit/s, o `--rates` in Mpps.
+- **Uscita**: `--egress-cpu auto` (default) mette la ricezione del nodo successivo su un core
+  fisico suo; `none` la lascia in softirq sulla CPU del DUT.
+- **Code**: `--dut-queues auto` (una per CPU del DUT, §10.1).
 
 | file | contenuto |
 |---|---|
-| `bitrate_raw.csv` | una riga per (metodo, rate, giro): `bitrate_sent_gbps`, `packets_sent`, `packets_received_by_xdp`, `packets_forwarded`, `packets_lost`, `loss_before_xdp`, `loss_in_pipeline` (+ scomposizione), `sent_pps`, `rx_pps`, `forwarded_pps`, `loss_*_pct`, `e2e_latency_p50/p90/p99/mean/min/max_us`, `duration_s` |
-| `bitrate.csv` | mediana fra i giri, min/max, `rxonly_loss_before_xdp_pct`, `bottleneck` |
-| `bitrate_overhead*.csv` | costo del contatore: ns del programma (statistiche BPF) e ns dal throughput, con e senza catena, e lo scarto fra le finestre |
-| `bitrate_latency`, `bitrate_pps`, `bitrate_loss` (.png/.pdf) | i tre grafici: latenza (p50, p99), pacchetti/s (inviati, ricevuti, inoltrati), perdita (prima di XDP, nella pipeline, pavimento rxonly) |
+| `bitrate_raw.csv` | una riga per (metodo, rate, giro), riscritta dopo ogni finestra: conteggi, perdite scomposte, latenze, colonne `host_*` |
+| `bitrate.csv` | mediana fra i giri, min/max, pavimento `rxonly`, collo di bottiglia, giri disturbati |
+| `bitrate_overhead*.csv` | costo del contatore: ns del programma (statistiche BPF) e dal throughput |
+| `host_monitor.csv` | la macchina al secondo |
+| `env.csv` | macchina, condizioni, scala usata, soglia |
+| `bitrate_latency`, `bitrate_pps`, `bitrate_loss` (.png/.pdf) | latenza (p50, p99), pacchetti/s, perdita; git li ignora, si rifanno dai CSV con `plot_bitrate.py` |
 
-### 12.6 Limiti
+### 11.6 Risultati (`results/bitrate_3500/`)
 
-- Tutto sta sulla stessa VM: senza `--egress-cpu` la ricezione del nodo successivo gira
-  sulla CPU del DUT (come in `--mode rates`), quindi una perdita all'uscita qui è
-  improbabile per costruzione; con `--egress-cpu 0` l'uscita ha una CPU sua.
-- Le cifre assolute sono di questo percorso veth su un vCPU (vedi 11.1 e 11.6); il
-  confronto fra pipeline e la forma delle curve sono ciò che il test sostiene.
-- Formule e attribuzione verificate **senza kernel** (`test_bitrate_math.py`, 87
-  controlli, e mutazioni che li fanno fallire).
-- Primo run nella VM (2026-09-26): i due programmi si caricano e la catena funziona con
-  tutti e due i caricatori (sonda: tail call tutte partite, latenza presente). Quella
-  sessione era circa 1,7 volte più lenta del 23/09 (costo della baseline a rate massimo
-  414–458 ns contro 250; `rxonly` a ~2,3 Mpps contro 4,3–4,8) e rumorosa: lo stesso punto
-  usciva al 58% / 0,2% / 7,7% di perdita nei tre giri. Di quel run regge che la perdita è
-  sempre prima di XDP (dopo XDP al massimo 0,22% degli inviati, lo scarto di lettura) e
-  l'ordine delle pipeline sopra il pavimento di `rxonly`; non reggono l'inizio della
-  perdita, le cifre assolute e il costo del contatore, per cui il test è stato corretto
-  come descritto sopra.
+6 metodi, 5 giri, 13 punti di scala (tetto di ricezione calibrato 4,40 Mpps = 2,25 Gbit/s a
+64 B), 390 finestre in 4,6 minuti. DUT a 3 494–3 499 MHz, nessun evento di throttling sui
+core, 1 finestra disturbata (2 eventi di pacchetto), registro max 85 °C.
 
-## Note oneste
+| pipeline | inoltro max (Mpps, mediana 5 giri) | variazione | pulita fino a | perde da |
+|---|---:|---:|---|---|
+| rxonly | 4,39 | 0,7% | — | — |
+| baseline | 3,18 | 2,0% | 1,35 Gbit/s | 1,58 Gbit/s |
+| p1_static | 2,84 | 1,4% | 1,13 Gbit/s | 1,35 Gbit/s |
+| hardcoded | 2,72 | 0,7% | 1,13 Gbit/s | 1,35 Gbit/s |
+| template | 1,86 | 0,6% | 0,90 Gbit/s | 1,13 Gbit/s |
+| modular | 1,45 | 0,4% | 0,68 Gbit/s | 0,90 Gbit/s |
 
-- **Ordine design-space confermato**: costo (istruzioni, jited, tail call, lookup, memoria)
-  cresce monotono baseline→P1→P2→P3; le prestazioni calano nello stesso ordine.
-- **Costo della flessibilità IV runtime (Task 3)**: rendere P2/P3 descrittore-driven ha
-  aumentato il loro conteggio istruzioni (P2 template ~2 618→16 988): il loop generico
-  per-feature unrolled (`MAX_FEAT` × neuroni × dense) pesa. Parte di quel costo è però
-  rientrata col blocco pesi strutturato (16 988→9 962): vedi la sezione dedicata sopra —
-  non tutto ciò che sembrava prezzo della flessibilità lo era davvero.
-- **P1 = meno memoria mappe** (308 B): nessun `model_cache`, solo contatori + `link_state`.
-- **Inferenza identica** nelle 3 pipeline (stesso MLP/pesi/argmax): verificata dal match di
-  classe kernel vs riferimento Python (10/10 e 5/5 PASS).
-- **Azione uniforme (`mac_table`)**: `argmax → mac_table[classe] → bpf_redirect`.
-- **Nessun `ctx_in` custom**: sotto `BPF_PROG_TEST_RUN` l'`ingress_ifindex` di sandbox vale 1.
-  Le tre pipeline lo risolvono ora nello stesso modo — lookup nella mappa `ingress_port*`,
-  guardia `>= 1 && <= size` — e quel runner non scrive la mappa, quindi il one-hot
-  `ingress_iface` resta vuoto **per tutte e tre** invece di divergere come prima. Il
-  riferimento dice la stessa cosa (`ref_ingress_port = 0`). La divergenza che questa riga
-  documentava (P1 con `ifindex_table` compilata, P2/P3 con l'ifindex grezzo) è stata
-  risolta il 2026-09-21; vedi il blocco su `ingress_iface` nella sezione 2 e il commento
-  in `verify_prog_run.py`.
-- **P2/P3 non caricano in un container minimale**: il nodo applica il cap storico di 4096 istruzioni per
-  programma, e `arch_generic_2layer` ne conta 9 318 compilato nel container (`bpf: Program too
-  large`). Le misure di questa tabella vengono da `BPF_PROG_TEST_RUN` **sull'host**, dove il
-  cap non si applica. È un limite preesistente e non una regressione — prima del blocco pesi
-  strutturato lo stesso programma era circa il doppio. Riguarda l'immagine container minimale, non il
-  kernel dell'host: vedi la voce seguente.
-- **P1, P2 e P3 girano end-to-end su un datapath reale** (`ipa/test/test_fabric.py`, 18/18):
-  XDP in modalità **native** su `veth`, `bpf_redirect` vero, pacchetto catturato sulla porta
-  d'uscita, DROP verificato dal contatore `cls_stats` e non dal silenzio. Questa riga diceva
-  il contrario fino a poco fa — era vera quando l'unico banco era un emulatore.
+- Per tutte e sei la perdita è **prima di XDP**: il collo di bottiglia è il programma eBPF.
+  Dopo XDP al massimo lo 0,02% degli inviati.
+- Latenza p50 al rate più basso 8–9 µs per tutte; all'ultimo punto pulito 11–68 µs; al primo
+  in perdita 54–192 µs (la coda d'ingresso piena).
+- **Costo del contatore** (statistiche BPF del kernel, tempo del programma attaccato):
+  baseline 27,7 → 29,7 ns (+2,0), P1 63,4 → 66,0 (+2,6), P1.5 73,8 → 76,6 (+2,7), P2
+  236,7 → 240,2 (+3,4), P3 386,8 → 385,2 (−1,6, dentro la dispersione di 5–10 ns).
+- I due banchi concordano: `bench_throughput` (§10.2) dà il 2–3% in più, e ha la stessa
+  macchina ma l'uscita sulla CPU del DUT e nessun contatore davanti.
 
-### P3 era al limite del verificatore: com'è stato chiuso
+---
 
-Per un giorno intero questa sezione ha detto che su Pipeline 3 la one-hot del nodo
-**non si poteva** fare: `layer_first` caricava a 9 994 istruzioni con l'indice preso dal
-`model_id` del pacchetto, e ogni tentativo di leggerlo da una mappa veniva rifiutato.
-Adesso l'indice arriva dalla mappa e `layer_first` carica a **6 417 istruzioni**, più
-piccolo di prima. Vale la pena raccontare perché, perché la conclusione sbagliata era
-ragionevole e la diagnosi ha richiesto dodici configurazioni.
+## Note e limiti
 
-**Il meccanismo.** Il costo per il verificatore non è la somma degli scalari che il ciclo
-srotolato tiene vivi: è il loro **prodotto**. La versione che caricava era quella in cui
-`_node = model_id`, cioè *lo stesso registro* che il verificatore stava già seguendo —
-uno scalare, non due. Qualunque `_node` indipendente ne aggiunge un secondo, e il numero
-di stati si moltiplica.
-
-Escluse una per una, ciascuna con la sua prova: il tipo di mappa, la dichiarazione della
-mappa, il valore in sé, il cast a `__u8`, il numero di chiamate helper, il numero di
-valori nati da una fusione (ternari), la larghezza in bit dell'intervallo, `barrier_var`
-con maschera esplicita. Tutte rifiutate, fra 9 069 e 9 402 istruzioni.
-
-**Quello che ha liberato spazio non tocca il nodo**: `IPA_MAX_QUEUES` in
-`ipa/ebpf_modular.py`, da 8 a 1. Il descrittore depositato **non dichiara** nessuna
-feature `queue_occupancy` (i suoi codici sono 1, 2, 3, 4; queue è 5), quindi otto slot
-restavano vivi lungo tutto il corpo srotolato per una feature che non c'è.
-
-| | istruzioni | esito |
-|---|---:|---|
-| indice da `model_id`, `IPA_MAX_QUEUES` 8 | 9 994 | carica (ma il nodo non è il nodo) |
-| indice da mappa, `IPA_MAX_QUEUES` 8 — 12 varianti | 9 069 – 9 402 | tutte rifiutate |
-| **indice da mappa, `IPA_MAX_QUEUES` 1** | **6 417** | **carica** |
-| indice da mappa, queues 1 **e** `IPA_MAX_IFACES` 6 | — | rifiutato |
-
-**Questi limiti sono scogliere, non pendenze.** L'ultima riga è la lezione: ridurre *anche*
-`IPA_MAX_IFACES` da 8 a 6 — cioè chiedere *meno* — fa fallire di nuovo. Un soffitto qui si
-cambia e **si rimisura**, non si ragiona.
-
-Il control plane protegge il soffitto invece di subirlo: `load_modular_weights`
-**rifiuta** un descrittore che chieda più slot di coda di quanti il datapath ne compili,
-invece di troncarlo silenziosamente al primo. Un modello che serve davvero quella feature
-fa alzare la costante e ripetere la misura.
-
-#### Epilogo: il soffitto è tornato a 8
-
-Tagliare `IPA_MAX_QUEUES` a 1 era una perdita reale, non una pulizia: a 1, un modello che
-dichiari `queue_occupancy` più larga di uno slot viene **rifiutato**. Il nido di cicli
-invertito (sezione Risultati) ha restituito il margine, e la misura è
-`diag_p3_bisect.py --ceilings`:
-
-| `IPA_MAX_QUEUES` | `layer_first` | esito |
-|---:|---:|---|
-| 1 | 6 850 | carica |
-| 2 | 7 320 | carica |
-| 4 | 8 365 | carica |
-| **8** | **10 207** | **carica** |
-
-Prima della riscrittura, a 8 non caricava niente. Il soffitto è di nuovo 8, uguale a
-Pipeline 2, e l'asimmetria fra le due è chiusa.
-
-La lettura da portarsi via è che **istruzioni e complessità di verifica sono valute
-diverse**: la riscrittura ha fatto *crescere* `layer_first` di 433 istruzioni e gli ha
-fatto accettare un corpo da 10 207. Il verificatore paga i cammini.
-
-Conseguenza per le tre pipeline: l'indice del nodo ora viene dalla mappa `node_id` in
-**tutte e tre**, letto a runtime, senza tabelle compilate. È la chiusura dell'ultimo
-ingresso su cui non concordavano.
-
-> **Due trappole nel leggere il fallimento**, entrambe costate ore.
->
-> BCC riporta il rifiuto come `Program too large (N insns), at most 4096 insns`. Il 4096 è
-> una **costante vecchia nella stringa d'errore di BCC**: nello stesso run P2 carica a
-> oltre 14 000 istruzioni. Va letto come "il verificatore ha rinunciato", non "il programma è
-> troppo lungo".
->
-> E il numero `layer_first=9994` è il conteggio **xlated**, cioè di un programma già
-> caricato, mentre quello nel messaggio d'errore è il conteggio **grezzo** prima del
-> caricamento. Confrontarli direttamente porta alla conclusione "ogni versione rifiutata è
-> più piccola di quella che carica", che è un artefatto di due unità di misura diverse. Quella
-> frase è stata in questo documento per un giorno.
-
-Lo strumento che ha chiuso la questione è `ipa/test/diag_p3_bisect.py`: con `--variants`
-costruisce modifiche testuali del sorgente corrente e riporta quali caricano; senza flag
-ripercorre la storia git. Le ipotesi sono state escluse da lì, non ragionando.
-
-### Il soffitto compilato ha un costo di verifica, e ha un limite
-
-`T2_MAX_H1`, `T2_MAX_H2` e `MAX_N_IN` sono **soffitti a compile-time**: i cicli interni sono
-`#pragma unroll`ati a quelli, non alle larghezze reali del modello, così un programma compilato
-serve qualunque modello che stia sotto. È il livello L1 del modello a tre livelli, ed è la
-ragione per cui P2 non ricompila quando cambia modello.
-
-Il conto però lo paga il **verificatore**, che percorre ogni cammino del corpo srotolato. Con i
-soffitti larghi (`8 × 4 × 128`) il kernel si arrende:
-
-```
-processed 1000001 insns (limit 1000000) ... total_states 13864 peak_states 1010
-```
-
-Due limiti distinti, da non confondere: il programma è ~14 900 istruzioni, ampiamente **dentro**
-il cap sulla dimensione. Quello che finisce è la **complessità di verifica**, e cresce col
-prodotto dei soffitti.
-
-È la misura concreta di quanto un programma "generico" possa essere generico: la genericità di
-P2 non è gratis, si paga in stati del verificatore, e il tetto è raggiungibile con numeri
-ragionevoli (8 neuroni, 128 feature). Il modello depositato usa 4-4-65, cioè circa metà di ogni
-soffitto — abbassarli a quelle misure riduce il corpo srotolato di circa 4×.
-
-Emerso provando a caricare lo stesso datapath con `libbpf` invece di BCC. Quel percorso non è
-stato portato avanti — BCC resta il backend di deploy per P2/P3 — ma il limite che ha messo in
-luce non dipende dal backend: è il verificatore del kernel, lo stesso per entrambi.
-- Latenza/throughput hanno varianza run-to-run non trascurabile sotto `BPF_PROG_TEST_RUN`
-  (fino a 20× su un singolo campione, rumore a senso unico — vedi sez. 7): tutti gli script
-  di benchmark aggiunti in questa sessione (7, 8) usano minimo su N trial indipendenti, mai
-  un campione singolo.
-
-- **Limiti dell'ambiente (onestà, cfr. Heiser "Benchmarking Crimes", arXiv:1801.02381)**:
-  nessun CPU pinning/isolamento core, nessuna frequenza CPU fissata, nessun C-state
-  disabilitato, VM — i numeri assoluti (ns/pacchetto, Mpps) non sono comparabili con
-  paper su bare-metal. Il confronto **relativo** fra le pipeline sullo stesso nodo, stesse
-  condizioni, è l'unica misura difendibile con questo setup — è quello su cui si basano
-  tutte le conclusioni di questo documento (ordine P1/P2/P3, larghezza-vs-profondità).
+- **Ordine del design space**: costo (istruzioni, jited, tail call, lookup, memoria) e
+  latenza crescono baseline → P1 → P2 → P3 su ogni banco.
+- **Inferenza identica** nelle tre pipeline (stesso MLP, pesi, argmax): verificata dalla
+  corrispondenza di classe kernel/riferimento e dall'equivalenza esatta sui modelli sintetici
+  (`verify_synth_kernel`: P1 8/8, P3 7/7, P2 6/7 con `large` non applicabile — 1 097 pesi
+  oltre `MAX_WEIGHT_ENTRIES` — e `deep` rifiutato dal verificatore, §8).
+- **Azione uniforme**: `argmax → class_action → porta logica → mac_table → bpf_redirect`.
+- **Tutto sta su una macchina**: generatore, DUT e nodo successivo sono core diversi dello
+  stesso processore, collegati da `veth`. Il costo del veth (e, con pktgen, della copia di
+  headroom) è dentro le cifre. Niente NIC, niente DMA: nessuna scheda cablata su questa
+  macchina supporta XDP nativo. Il confronto fra pipeline regge; le cifre assolute sono di
+  questo percorso, a 3,5 GHz.
+- **Nessun isolamento dal boot**: `isolcpus`, `nohz_full` e `rcu_nocbs` richiedono parametri
+  di boot. Le CPU del banco restano soggette al tick e ai callback RCU; il resto
+  dell'isolamento è a runtime (§0.3).
+- **Frequenza**: fissata e misurata, ma il sysfs può dichiararne un'altra (§0.3). Le cifre
+  assolute valgono a 3,5 GHz; a un'altra frequenza cambiano quasi in proporzione, i rapporti
+  fra pipeline no.
+- **Latenze sotto `BPF_PROG_TEST_RUN`**: esecuzione in un ciclo sullo stesso buffer, senza
+  driver e senza pressione di cache da traffico vero. Il `Mpps` di quelle tabelle è un picco
+  teorico; il costo sotto carico è quello di §10 e §11, più alto per P2 e P3.

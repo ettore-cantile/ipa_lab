@@ -63,7 +63,7 @@ def port_map_from_env():
       IPA_IFACE_PATTERN="ipav{i}"               a naming convention
 
     Returns (port_to_iface_or_None, pattern). The default pattern stays
-    "eth{i}", which is a convention of one lab and not a property of the
+    "eth{i}", which is a convention of one scenario and not a property of the
     datapath: a node whose interfaces are named anything else had no way to
     say so, and every FORWARD class came out unforwardable with five "no such
     interface" notes and no hint of what to set.
@@ -95,7 +95,7 @@ class NodeConfig:
     """Resolved per-node state: which logical ports this node can actually use.
 
     `port_to_iface` is the node's mapping. It defaults to the `eth{port}`
-    convention, which is what this lab uses -- but it is a DEFAULT of the node
+    convention, which is what the veth fabric uses -- but it is a DEFAULT of the node
     configuration, not an assumption baked into the datapath, and any node can
     override it.
     """

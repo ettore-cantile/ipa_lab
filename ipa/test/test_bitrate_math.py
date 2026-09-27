@@ -168,8 +168,10 @@ def t_losses():
           BB.classify(dd, 0.0) == BB.LABEL_NONE)
     # pavimento del trasporto: la pipeline perde quanto il solo contatore
     fl = _row(tx=9700, rej=300, rx=9700, fwd=9700, hit=9700)
-    check("3% prima di XDP con rxonly al 2,5% -> nessuna",
-          BB.classify(fl, 2.5) == BB.LABEL_NONE)
+    check("soglia alzata a mano (1): 3% prima di XDP con rxonly al 2,5% -> "
+          "nessuna", BB.classify(fl, 2.5, 1.0) == BB.LABEL_NONE)
+    check("soglia di default (0,1): gli stessi 0,5 punti oltre rxonly -> "
+          "programma", BB.classify(fl, 2.5) == BB.LABEL_PROG)
     check("3% prima di XDP con rxonly a 0 -> programma",
           BB.classify(fl, 0.0) == BB.LABEL_PROG)
     # le percentuali si sommano, la scomposizione torna
@@ -418,10 +420,41 @@ def t_sources():
           "p1_aot.load_p1" in inspect.getsource(B.setup_p1_static))
 
 
+def t_scale_and_host():
+    print("[13] scala calibrata e colonne della macchina")
+    r = BB.auto_rates(2_000_000, 6_000_000)
+    check("frazioni del tetto di ricezione, arrotondate al kpps",
+          r == [100_000, 200_000, 400_000, 600_000, 800_000, 1_000_000,
+                1_200_000, 1_400_000, 1_600_000, 1_800_000, 2_000_000,
+                2_200_000, 2_500_000], str(r))
+    r = BB.auto_rates(2_000_000, 2_100_000)
+    check("oltre il tetto del generatore: fermati al suo 95%, senza doppioni",
+          r[-1] == 1_995_000 and r[-2] == 1_800_000
+          and len(r) == len(set(r)) == 11, str(r))
+    check("tetto nullo: nessuna scala", BB.auto_rates(0, 5e6) == [])
+    host = dict(host_throttle_core=0, host_dut_mhz=3500, host_disturbed=False)
+    d = dict(rx_xdp=300000, tail_miss=0, fwd=300000, idle_us=0, hit=300000,
+             miss=0, drop=0)
+    rows = [BB.window_row("baseline", 64, rnd, 1e6, 1000, 3, 0.3, 0.6,
+                          300000, 0, d, dict(n=0, hist=_hist([])), 0,
+                          host=dict(host, host_disturbed=(rnd == 2),
+                                    host_dut_mhz=3500 + rnd))
+            for rnd in (1, 2, 3)]
+    check("la riga porta le colonne host_*", rows[0]["host_dut_mhz"] == 3501)
+    s = BB.summarise(rows)[0]
+    check("sintesi: giri con la macchina disturbata contati, non scartati",
+          s["host_disturbed_rounds"] == 1 and s["rounds"] == 3)
+    check("sintesi: frequenza del DUT come mediana fra i giri",
+          s["host_dut_mhz"] == 3502)
+    old = _row(tx=10000, rej=0, rx=10000, fwd=10000, hit=10000)
+    check("riga senza monitor (run vecchio): nessuna colonna host_*",
+          not any(k.startswith("host_") for k in old))
+
+
 def main():
     for t in (t_bitrate, t_mask, t_percentile, t_latency, t_losses, t_rates,
               t_summary, t_probe, t_idle_parse, t_sources, t_overhead,
-              t_report):
+              t_report, t_scale_and_host):
         t()
     n, ok = len(RESULTS), sum(RESULTS)
     print(f"\n{ok}/{n} PASS")

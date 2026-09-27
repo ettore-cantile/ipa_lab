@@ -15,7 +15,7 @@ min/max, collo di bottiglia) e scrive in <dir>, per ogni taglia di frame:
                     pipeline, e il pavimento del solo contatore (rxonly).
 
 Nessun numero viene prodotto qui: si disegna solo cio' che il CSV contiene.
-Gira ovunque ci sia matplotlib, anche fuori dalla VM:
+Gira ovunque ci sia matplotlib, anche senza root, BCC o kernel Linux:
 
     python3 ipa/test/plot_bitrate.py results/bitrate
 """

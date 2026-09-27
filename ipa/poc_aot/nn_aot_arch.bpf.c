@@ -74,6 +74,7 @@ int xdp_model(struct xdp_md *ctx) {
     if (udp->dest != bpf_htons(9999)) return XDP_PASS;
     struct ipa_hdr *ipa = (struct ipa_hdr *)(udp + 1);
     if ((void *)(ipa + 1) > data_end) return XDP_PASS;
+    /* Input vector built locally, features: link_state[6], ingress_iface[6], ttl[1], node[52] */
     /* feature 'link_state': 6 values read with ONE lookup from link_state */
     long long ls0=0LL, ls1=0LL, ls2=0LL, ls3=0LL, ls4=0LL, ls5=0LL;
     { __u32 _z=0; struct link_state_vec *_p = bpf_map_lookup_elem(&link_state, &_z);
@@ -204,7 +205,7 @@ int xdp_model(struct xdp_md *ctx) {
     if (o_4 > best_val) { best_val = o_4; best_cls = 4; }
     if (o_5 > best_val) { best_val = o_5; best_cls = 5; }
     if (o_6 > best_val) { best_val = o_6; best_cls = 6; }
-    /* class -> action -> logical port (from the model descriptor) */
+    /* --- class -> action -> logical port (from the model descriptor) --- */
     __u32 _port = 0xffffffffU;
     switch (best_cls) {
     case 0: _port = 0U; break;   /* FORWARD -> logical port 0 */
@@ -215,11 +216,17 @@ int xdp_model(struct xdp_md *ctx) {
     case 5: {   /* DROP (declared) */
         __u32 di = 2; __u64 *dv = bpf_map_lookup_elem(&pkt_stats, &di);
         if (dv) __sync_fetch_and_add(dv, 1);
+        __u32 dc = 5U;
+        __u64 *dcv = bpf_map_lookup_elem(&cls_stats, &dc);
+        if (dcv) __sync_fetch_and_add(dcv, 1);
         return XDP_DROP;
     }
     case 6: {   /* UNUSED */
         __u32 ui = 1; __u64 *uv = bpf_map_lookup_elem(&pkt_stats, &ui);
         if (uv) __sync_fetch_and_add(uv, 1);
+        __u32 uc = 6U;
+        __u64 *ucv = bpf_map_lookup_elem(&cls_stats, &uc);
+        if (ucv) __sync_fetch_and_add(ucv, 1);
         return XDP_PASS;
     }
     default: {   /* argmax outside [0, n_out) */

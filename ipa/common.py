@@ -1,15 +1,8 @@
 """
 common.py - Shared runtime helpers, scenario-independent.
 
-This docstring used to be the wiring table of ONE node of ONE lab:
-
-    darmstadt[0]="l59" <-> frankfurt[1]="l59"
-      eth0 = 10.0.0.233/30  -> INGRESS
-    darmstadt[1]="l62" <-> mannheim[0]="l62"
-      eth1 = 10.0.0.246/30  -> EGRESS
-
-and the module exported INGRESS_IFACE = "eth0" / EGRESS_IFACE = "eth1" /
-N_WEIGHTS = 319 to match it. Those are properties of a deployment and of a
+This module used to hard-code the wiring of ONE node: it exported
+INGRESS_IFACE = "eth0" / EGRESS_IFACE = "eth1" / N_WEIGHTS = 319. Those are properties of a deployment and of a
 checkpoint; this module is neither. Which interface a node ingresses on is a
 NODE fact (node_config.py), and the weight count is a MODEL fact
 (model_meta.derive_shape).
@@ -35,13 +28,13 @@ try:
 except ImportError:
     BPF = None
 
-# Default ingress interface, overridable by $IPA_IFACE. Not a lab constant:
+# Default ingress interface, overridable by $IPA_IFACE. Not a scenario constant:
 # every entry point also takes --iface, and this only names the interface a
 # bare `run()` attaches to when nothing else says.
 INGRESS_IFACE = os.environ.get("IPA_IFACE", "eth0")
 
 # Fallback destination MAC, used only until ARP resolves the real neighbour
-# (see start_mac_refresh_thread). Was a specific lab neighbour's address.
+# (see start_mac_refresh_thread). Was one specific neighbour's address.
 DST_MAC = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
 
 
@@ -328,7 +321,7 @@ def install_ingress_port_table(b, map_name: str, node_cfg,
 
     It used to be answered by a compile-time table, [2, 3, 4, ...], i.e. the
     assumption eth0 == ifindex 2. Kernel ifindexes are assigned by the kernel:
-    2 and 3 on a freshly booted container, 207 and 209 on a box that has
+    2 and 3 on a freshly booted machine, 207 and 209 on a box that has
     created a few veths. When they do not match, no bit is set and a trained
     feature contributes nothing -- silently, with every test still green
     because nothing checked that it contributed anything.
@@ -513,10 +506,9 @@ _MODE_FLAGS = {"native": XDP_FLAGS_DRV_MODE,
 
 # Default attach mode, overridable per call or by $IPA_XDP_MODE.
 #
-# This used to be hardcoded to generic (flags=2), and the reason was written
-# into the docstring: generic "works on every device regardless of driver
-# support, which mattered for veth interfaces inside the stripped
-# containers". That justification came from the emulator, not from the design.
+# This used to be hardcoded to generic (flags=2), on the grounds that generic
+# "works on every device regardless of driver support". That is a convenience,
+# not a design reason.
 # Generic XDP runs inside netif_receive_skb -- after the kernel has already
 # allocated the sk_buff -- which is later and slower than native XDP and is NOT
 # the path a real deployment takes. Native is the default now; a box that
@@ -590,7 +582,7 @@ def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE, mode: str = None):
         hint = ""
         if mode == "native":
             hint = (" This interface's driver may not support native XDP "
-                    "(emulated NICs such as e1000 do not; veth, virtio_net "
+                    "(some drivers, such as e1000, do not; veth, virtio_net "
                     "and most physical drivers do). To measure on the generic "
                     "path instead, say so explicitly: "
                     "IPA_XDP_MODE=generic, or mode='generic'.")

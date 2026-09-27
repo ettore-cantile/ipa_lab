@@ -47,6 +47,22 @@ for _p in (SHARED_DIR, POC_DIR, os.path.join(SHARED_DIR, "methods")):
 
 # The same flags the deploy build uses (method4_hardcoded_aot.py).
 BPF_CFLAGS = ["-O2", "-g", "-target", "bpf", "-D__TARGET_ARCH_x86"]
+
+
+def multiarch_include():
+    """["-I/usr/include/<triplet>"] se esiste, altrimenti [].
+
+    Con -target bpf clang non aggiunge la cartella multiarch di Debian/Ubuntu,
+    dove sta asm/types.h (pacchetto linux-libc-dev): senza, linux/bpf.h non
+    compila ("'asm/types.h' file not found", visto il 2026-09-27 su Ubuntu
+    24.04). Compila solo dove c'e' /usr/include/asm, cioe' con
+    gcc-multilib installato."""
+    import platform
+    d = f"/usr/include/{platform.machine()}-linux-gnu"
+    return [f"-I{d}"] if os.path.isdir(os.path.join(d, "asm")) else []
+
+
+BPF_CFLAGS = BPF_CFLAGS + multiarch_include()
 CACHE_DIR = os.environ.get("IPA_AOT_CACHE",
                            os.path.join(tempfile.gettempdir(), "ipa_aot_cache"))
 _PROG_RE = re.compile(r"^int (xdp_\w+)\(struct xdp_md \*ctx\)", re.M)

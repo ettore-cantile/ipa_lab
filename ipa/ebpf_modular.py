@@ -23,7 +23,7 @@ Why two programs, not one "fully generic" block:
   An earlier version of this file used ONE block generic over n_in up to 80
   (to also cover the 65-wide first layer) with a DENSE map-lookup loop over
   every input position. That blew the kernel's BPF_COMPLEXITY_LIMIT_INSNS
-  (4096 instructions on this lab's kernel -- the historic pre-5.2 hard cap,
+  (4096 instructions on the kernel used then -- the historic pre-5.2 hard cap,
   not the newer 1M-instruction limit): looping densely over 65 mostly-zero
   inputs for every hidden neuron is enormously wasteful, since real IPA
   packets only ever have ~9 non-zero features (link_state bits, one ingress-
@@ -97,8 +97,8 @@ Feature encoding (protocol-fixed, independent of hidden depth/width):
   (no dense 65-slot scratch_acts array is ever built for it).
 
 Weight storage:
-  layer_weights uses an unsigned-byte leaf (__u8). The libbcc build in the
-  container image cannot resolve a signed-byte leaf type, so signedness is
+  layer_weights uses an unsigned-byte leaf (__u8). An older libbcc cannot
+  resolve a signed-byte leaf type, so signedness is
   handled explicitly: the eBPF C code casts each byte to __s8 via LW_W()
   before arithmetic, and load_modular_weights() stores each int8 as
   v & 0xFF (identical two's-complement bits) inside the struct-valued block.
@@ -119,7 +119,7 @@ META_TTL          = 4
 # Compile-time layer-shape ceilings (see module docstring)
 # Was `PROTO_N_IN = 65   # protocol-fixed IPA feature vector width`. It is not
 # protocol-fixed: 65 = 6 link_state + 6 ingress_iface + 1 ttl + 52 node, the
-# Germany50 lab summed up. Resolved from the descriptor instead; the compiled
+# Germany50 scenario summed up. Resolved from the descriptor instead; the compiled
 # ceiling is ML1_MAX_N_IN below.
 def reference_n_in():
     """Input width of the model this repo is configured for."""
@@ -248,8 +248,8 @@ BPF_PERCPU_ARRAY(scratch_meta, long long, SCRATCH_META_SLOTS);
  * of one helper call per weight byte. Measured before this change: the large
  * majority of P3's 160 map lookups per packet were single-byte weight reads.
  *
- * __u8 storage (not __s8): BCC's str2ctype on an older libbcc such as the one in a stripped
- * container has no 'signed char', only 'unsigned char'. Sign semantics are
+ * __u8 storage (not __s8): BCC's str2ctype on an older libbcc has
+ * no 'signed char', only 'unsigned char'. Sign semantics are
  * preserved -- the eBPF code re-casts each byte to (__s8) via LW_W(). */
 #define MAX_LAYER_WEIGHT_ENTRIES 2048
 struct lw_blk { __u8 w[MAX_LAYER_WEIGHT_ENTRIES]; };
@@ -267,7 +267,7 @@ BPF_ARRAY(layer_weights, struct lw_blk, 1);
  * instead of 6. Written by the userspace carrier monitor. 1=up, 0=down. */
 /* COMPILED CEILINGS for the dense per-slot features, not deployment values.
  *
- * These were the literals 6 and 4 -- the Germany50 lab's interface count and
+ * These were the literals 6 and 4 -- the Germany50 scenario's interface count and
  * its queue count -- written into the struct sizes AND into every loop bound,
  * so the compiled datapath only fit that one network. The consumption loops
  * are already gated by the descriptor's per-feature `sz`, so widening the
@@ -381,7 +381,7 @@ BPF_ARRAY(mac_table_t3, struct fwd_action, MAX_N_OUT);
  *
  * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
  * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
- * kernel and are arbitrary -- 2 and 3 on a container, 207 and 209 on a box
+ * kernel and are arbitrary -- 2 and 3 on a freshly booted machine, 207 and 209 on a box
  * that has created a few veths -- so on real hardware the guard
  * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
  * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at
@@ -656,7 +656,7 @@ EBPF_LAYER_FIRST = EBPF_MODULAR_COMMON_HEADER + r"""
 
 #define ML1_MAX_H1   8
 /* Compiled CEILING on the queue_occupancy feature, not the deployment's queue
- * count. Was `ML_N_QUEUES 4` -- the lab's value, read as if it were a law.
+ * count. Was `ML_N_QUEUES 4` -- the scenario's value, read as if it were a law.
  * The ceiling now lives in IPA_MAX_QUEUES, shared with Pipeline 2. */
 
 /* Must match model_meta.DEFAULT_TTL_SCALE (the checkpoint's initial_ttl). */

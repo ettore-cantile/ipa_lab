@@ -75,7 +75,7 @@ Verifier constraints (why the sparse route's codegen is shaped this way):
   4) ip->protocol bitfield ambiguity on BCC with minimal headers
      (DBG_NOT_UDP=100%):
      struct iphdr declares ihl:4,version:4 as a bitfield at byte 0.
-     On BCC with minimal kernel headers inside a stripped container image,
+     On BCC with minimal kernel headers,
      Clang's packing of this bitfield can cause ip->protocol (byte 9)
      to be read at the wrong offset, making ALL UDP packets fail the
      IPPROTO_UDP check even though tcpdump confirms proto=17.
@@ -284,7 +284,7 @@ BPF_ARRAY(mac_table, struct fwd_action, {mac_capacity});
  *
  * This replaces a compile-time `ifindex_table`, baked into the generated
  * switch as `case 2: _iface = 1; case 3: _iface = 2; ...`. That table encoded
- * the assumption eth0 == ifindex 2, which holds in a freshly booted container
+ * the assumption eth0 == ifindex 2, which holds on a freshly booted machine
  * and nowhere else: on a box that has created a few veths the ingress arrives
  * with ifindex 207, no case matches, and the trained ingress_iface feature
  * silently contributes nothing. Which interface realises which logical port is

@@ -1139,7 +1139,7 @@ def _warn_contaminated(rows, factor=2.0):
     at every point -- same instruction count, same jited size. If the latency
     of an IDENTICAL program swings by more than `factor` across the axis, the
     swing is the machine, not the variable on the x axis: another process, CPU
-    frequency, a noisy neighbour on the hypervisor.
+    frequency, thermal throttling.
 
     Taking the min of N trials protects against a spike inside a cell. It does
     nothing when the whole cell was measured during a busy period, which is
@@ -1646,18 +1646,18 @@ PLOTS = [
     ("insns", "istruzioni del programma", "scaling_{axis}_insns", False),
     # The log twin exists for one figure only. P1 runs at ~10^3 instructions
     # and P2/P3 at ~10^4, so on a LINEAR axis P1's curve is pinned to the
-    # bottom and its collapse with sparser weights -- 1 071 to 224, the
+    # bottom and its collapse with sparser weights -- 1 114 to 236, the
     # sharpest result in the sweep -- is invisible. On a LOG axis that is
-    # plain, but P2's rise with depth (1.3x) flattens out. Neither scale
+    # plain, but the gaps among P2, P3 and the baseline flatten out. Neither scale
     # serves both readings, so each figure takes the one that shows what it
     # is about.
     ("insns", "istruzioni del programma (scala log)", "scaling_{axis}_insns_log", True),
-    ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latenza", False),
-    ("lat_ns", "latenza (ns/pacchetto, scala log)", "scaling_{axis}_latenza_log", True),
+    ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latency", False),
+    ("lat_ns", "latenza (ns/pacchetto, scala log)", "scaling_{axis}_latency_log", True),
     ("mpps", "pacchetti al secondo teorici (1 / latenza)", "scaling_{axis}_mpps", False),
     ("update_ms", "installare un modello nuovo (ms)", "scaling_{axis}_update", True),
     ("build_ms", "compilare il programma, una volta (ms)", "scaling_{axis}_build", False),
-    ("map_bytes", "memoria delle tabelle (byte)", "scaling_{axis}_mappe", False),
+    ("map_bytes", "memoria delle tabelle (byte)", "scaling_{axis}_maps", False),
 ]
 
 # (axis, metric) -> the one-line reading that figure supports. Keeping the
@@ -1666,16 +1666,18 @@ PLOTS = [
 # question gets asked.
 KEEP = {
     ("depth", "insns"):
-        "P2 cresce di ~780 istruzioni per layer, P3 di ZERO: riusa layer_hidden",
+        "P3 ha la stessa dimensione a ogni profondita': riusa layer_hidden; "
+        "P2 oltre due strati non passa il verificatore",
     ("depth", "lat_ns"):
-        "e P3 lo paga in tempo, ~70 ns per layer, che sono le sue tail call",
+        "e P3 lo paga in tempo, ~56 ns per layer: tail call e letture",
     ("depth", "update_ms"):
-        "installare un modello: P1 ricompila (~1,4 s), P2 e P3 scrivono in mappa (~7 ms)",
+        "installare un modello: P1 carica un oggetto AOT (~1-2 ms), P2 e P3 "
+        "scrivono in mappa (~10-12 ms)",
     ("nodes", "insns"):
         "la taglia della rete entra nel programma solo in P1.5; congelando il "
         "nodo (P1 specializzata) la dipendenza SPARISCE",
     # Lo stesso dato su scala log: in lineare le due P1 (600-1700) restano
-    # schiacciate contro le 14 628 di P2, e il confronto fra loro -- che e'
+    # schiacciate contro le ~15 000 di P2, e il confronto fra loro -- che e'
     # il punto della figura -- non si vede.
     ("nodes", "insns_log"):
         "lo stesso, leggibile: P1.5 sale 2,3x fra 10 e 100 nodi, la "
@@ -1776,11 +1778,11 @@ def plot_campaign(in_dir, fmt):
     made = 0
     for col, nome, unita, stem in (
             ("macs_eff", "MAC eseguite per pacchetto", "ns/MAC",
-             "campaign_macs_eff_latenza"),
+             "campaign_macs_eff_latency"),
             ("macs", "MAC nominali per pacchetto (n_in x h1 + ...)", "ns/MAC",
-             "campaign_macs_nominali_latenza"),
+             "campaign_macs_nominal_latency"),
             ("insns", "istruzioni del programma", "ns/istruzione",
-             "campaign_insns_latenza")):
+             "campaign_insns_latency")):
         fig, ax = plt.subplots(figsize=(6.4, 4.0))
         print(f"\n  {YELLOW}{nome}{NC}")
         for pipe in PIPELINES:

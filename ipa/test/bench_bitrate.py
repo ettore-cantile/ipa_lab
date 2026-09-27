@@ -82,8 +82,8 @@ Il costo del contatore non si suppone: la fase finale porta ogni pipeline a
 rate massimo con e senza catena e legge dal kernel il tempo del programma
 attaccato (kernel.bpf_stats_enabled, run_time_ns / run_cnt: con la catena e'
 contatore + pipeline, senza e' la pipeline). Accanto resta la stima dal
-throughput, che dice quanto rallenta il nodo ma su questa VM ha uno scarto di
-centinaia di ns fra finestre uguali (bitrate_overhead.csv).
+throughput, che dice quanto rallenta il nodo ma e' molto piu' rumorosa: la si
+tiene per confronto (bitrate_overhead.csv).
 
 --------------------------------------------------------------------------
 DOVE SI CONTA, E COME SI LEGGE
@@ -177,8 +177,9 @@ tentativo di lettura, e una prima lettura rifatta per piu' di mezza finestra
 chiudeva prima del tempo.
 
 Istogramma a due passi: celle da 1 us fino a 1024 us, poi da 64 us fino a
-65 536 us, piu' il trabocco. Sotto carico il p99 sta nei millisecondi (vCPU
-sospese), e una sola scala da 1 us fino a 4 ms lo tagliava.
+65 536 us, piu' il trabocco. Con la coda d'ingresso piena il p99 puo' salire
+verso il millisecondo, e una sola scala da 1 us fino a 4 ms rischiava di
+tagliarlo.
 
 --------------------------------------------------------------------------
 USCITE (in --out)
@@ -219,26 +220,41 @@ for _p in (SHARED, HERE):
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
-# Scala di default, in Gbit/s a 64 byte: da ben sotto la capacita' di P3
-# (~0,9 Gbit/s su questa VM) a sopra quella della baseline (~2 Gbit/s) e fino
-# al tetto del generatore a due thread (~3 Gbit/s).
+# La scala fissa di ripiego, in Gbit/s a 64 byte, se la calibrazione non
+# riesce. Il default e' la scala CALIBRATA (auto_rates): le capacita'
+# dipendono dalla frequenza fissata (--freq) e dai core, e una scala fissa o
+# si ferma prima della saturazione o spreca meta' dei punti sopra.
 DEFAULT_BITRATES_GBPS = (0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0,
                          2.5, 3.0)
+# La scala calibrata: frazioni del tetto di RICEZIONE misurato all'inizio del
+# run (rxonly a massima spinta, cioe' il massimo che il DUT riceve senza fare
+# altro). Fitta dove stanno i ginocchi delle pipeline -- P3 intorno al 40%
+# del tetto, la baseline verso il 90% -- e oltre il tetto per vedere la
+# saturazione. I punti che il generatore non raggiunge si fermano al suo
+# tetto.
+AUTO_FRACTIONS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+                  1.1, 1.25)
+AUTO_CALIB_WINDOWS = 3
+AUTO_STEP_PPS = 1000
 DEFAULT_FRAME = 64
 ETH_L1_OVERHEAD = 24            # FCS 4 + preambolo/SFD 8 + IFG 12
 # Cinque giri e non tre: al primo run (2026-09-26) lo stesso punto e' uscito
 # con 58% / 0,2% / 7,7% di perdita nei tre giri, e con tre la mediana e' il
 # valore di mezzo di due finestre disturbate su tre.
 DEFAULT_ROUNDS = 5
-# Soglia per dire "qui si perde", in punti percentuali degli inviati. Non
-# 0,1: su questa VM anche il solo contatore respinge l'1-2% sotto capacita'
-# (claims.md, "Il pavimento dei respinti"), e quel pavimento varia fra run.
-# Si confronta la pipeline con rxonly allo stesso rate e si chiede che la
+# Soglia per dire "qui si perde", in punti percentuali degli inviati: si
+# confronta la pipeline con rxonly allo stesso rate e si chiede che la
 # differenza superi la soglia.
-DEFAULT_LOSS_THRESHOLD = 1.0
+#
+# Con i core del banco isolati, a frequenza fissa e senza C6/C10, il solo
+# contatore (rxonly) non respinge niente sotto capacita': 0,1, come
+# bench_throughput. Se rxonly mostra comunque un pavimento, la sottrazione lo
+# toglie; se oscilla, lo dice la colonna rxonly_loss_before_xdp_pct, e la
+# soglia si alza a mano (--loss-threshold).
+DEFAULT_LOSS_THRESHOLD = 0.1
 GEN_LIMITED_FRACTION = 0.95     # sotto il 95% del chiesto: tetto del generatore
 # Sopra il 105% del chiesto il generatore ha RECUPERATO: pktgen, se il suo
-# vCPU e' stato sospeso, trasmette di fila fino a rimettersi in orario
+# thread e' stato fermato, trasmette di fila fino a rimettersi in orario
 # (next_tx avanza di `delay` per pacchetto), cioe' una raffica a velocita'
 # piena che riempie la coda d'ingresso a qualunque rate medio. Visto al
 # primo run: 1,831 Mpps inviati su 1,465 chiesti. La finestra resta, marcata.
@@ -438,6 +454,26 @@ def gbps_of(pps, frame, l1=False):
     return pps * (frame + (ETH_L1_OVERHEAD if l1 else 0)) * 8 / 1e9
 
 
+def auto_rates(rx_ceiling_pps, gen_ceiling_pps=None,
+               fractions=AUTO_FRACTIONS, step=AUTO_STEP_PPS):
+    """La scala calibrata, in pps: `fractions` del tetto di ricezione,
+    arrotondate a `step`. Un punto oltre il tetto del generatore (il 95% di
+    quanto offre a massima spinta: sopra, il chiesto non si ottiene piu')
+    diventa quel tetto. Ordinata, senza doppioni, senza zeri."""
+    if not rx_ceiling_pps or rx_ceiling_pps <= 0:
+        return []
+    cap = (gen_ceiling_pps * GEN_LIMITED_FRACTION
+           if gen_ceiling_pps and gen_ceiling_pps > 0 else None)
+    pts = set()
+    for f in fractions:
+        p = int(round(f * rx_ceiling_pps / step)) * step
+        if cap is not None and p > cap:
+            p = int(cap // step) * step
+        if p > 0:
+            pts.add(p)
+    return sorted(pts)
+
+
 def sample_mask(rate_pps, window_s, target=LAT_TARGET_SAMPLES):
     """Maschera sul seq di pktgen: si cronometra un pacchetto ogni mask+1.
 
@@ -540,11 +576,13 @@ def latency_stats(lat, spin_us, mask):
 
 
 def window_row(method, frame, rnd, rate_req_pps, delay_ns, gen_threads, secs,
-               wall_s, tx, rejected, d, lat, mask, idle_ok=True):
+               wall_s, tx, rejected, d, lat, mask, idle_ok=True, host=None):
     """Una finestra stazionaria -> una riga. `d` sono le DIFFERENZE dei
     contatori fra le due letture: rx_xdp, tail_miss, fwd, idle_us e, per le
     pipeline, hit/miss/drop. Il riferimento rxonly non ha pipeline ne'
-    uscita: i suoi campi di inoltro restano vuoti invece di valere zero."""
+    uscita: i suoi campi di inoltro restano vuoti invece di valere zero.
+    `host`: le colonne host_* della macchina attorno alla finestra
+    (host_conditions.host_columns), o None."""
     secs = secs if secs and secs > 0 else 1e-9
     sent = int(tx) + int(rejected)
     rx = int(d["rx_xdp"])
@@ -604,6 +642,8 @@ def window_row(method, frame, rnd, rate_req_pps, delay_ns, gen_threads, secs,
         row.update(latency_stats({}, spin, mask))
     else:
         row.update(latency_stats(lat, spin, mask))
+    if host:
+        row.update(host)
     return row
 
 
@@ -620,7 +660,8 @@ MEDIAN_KEYS = (
     "loss_total_pct", "e2e_latency_p50_us", "e2e_latency_p90_us",
     "e2e_latency_p99_us", "e2e_latency_mean_us", "e2e_latency_min_us",
     "e2e_latency_max_us", "e2e_latency_p50_raw_us", "e2e_samples",
-    "e2e_spin_correction_us", "duration_s", "point_wall_s")
+    "e2e_spin_correction_us", "duration_s", "point_wall_s",
+    "host_dut_mhz", "host_dut_busy_pct", "host_pkg_temp_c")
 SPREAD_KEYS = ("sent_pps", "rx_pps", "forwarded_pps", "bitrate_sent_gbps",
                "e2e_latency_p50_us", "e2e_latency_p99_us")
 
@@ -663,6 +704,11 @@ def summarise(rows, threshold=DEFAULT_LOSS_THRESHOLD):
                  gen_limited_rounds=sum(bool(r.get("gen_limited"))
                                         for r in rs),
                  gen_burst_rounds=sum(bool(r.get("gen_burst")) for r in rs),
+                 # Giri in cui la macchina non era nelle condizioni
+                 # dichiarate (throttling, frequenza fuori target, ...):
+                 # contati e riportati, come le raffiche, non scartati.
+                 host_disturbed_rounds=sum(bool(r.get("host_disturbed"))
+                                           for r in rs),
                  e2e_percentile_clipped=any(r.get("e2e_percentile_clipped")
                                             for r in rs))
         for k in MEDIAN_KEYS:
@@ -692,8 +738,8 @@ def onsets(summary):
     """Per pipeline e frame: da che rate si perde, e con che collo.
 
     L'inizio e' il rate piu' basso da cui TUTTI i rate piu' alti perdono: una
-    riga in perdita seguita da righe pulite e' una finestra disturbata (vCPU
-    sospesa, raffica del generatore), non la capacita' della pipeline. Al
+    riga in perdita seguita da righe pulite e' una finestra disturbata (core
+    interrotto, raffica del generatore), non la capacita' della pipeline. Al
     primo run la baseline "perdeva" a 0,25 Gbit/s e non a 0,5: con la regola
     del primo rate in perdita l'inizio sarebbe stato 0,25. Le righe cosi'
     restano elencate come sporadiche. Il riferimento resta fuori."""
@@ -934,17 +980,65 @@ def pktgen_idle_us(B, names):
     return tot
 
 
+def calibrate_scale(B, window, use, alive, frame):
+    """La scala calibrata, prima dello sweep: AUTO_CALIB_WINDOWS finestre a
+    massima spinta sul riferimento (rxonly, il solo contatore; senza, il primo
+    metodo vivo) danno il tetto di ricezione R e quello del generatore G, e
+    la scala e' auto_rates(R, G). `window` e `use` sono quelli di
+    run_bitrate. Restituisce (rate in pps, descrizione per env.csv)."""
+    ref = REFERENCE if REFERENCE in alive else alive[0]
+    print(f"\n{YELLOW} Calibrazione della scala: {ref} a massima spinta, "
+          f"{AUTO_CALIB_WINDOWS} finestre{NC}")
+    use(ref)
+    rx_best = sent_best = 0.0
+    for _ in range(AUTO_CALIB_WINDOWS):
+        try:
+            run, _, _, _ = window(ref, frame, 0, 0, timed=False)
+        except B.PktgenEmptyRun as e:
+            B.warn(f"finestra di calibrazione scartata ({e})")
+            continue
+        if not run.window or run.window <= 0:
+            continue
+        rx_best = max(rx_best, run.dut["rx_xdp"] / run.window)
+        sent_best = max(sent_best, (run.tx + getattr(run, "errors", 0))
+                        / run.window)
+    rates = auto_rates(rx_best, sent_best)
+    if not rates:
+        return [], "calibrazione fallita"
+    B.info(f"tetto di ricezione ({ref}): {rx_best / 1e6:.3f} Mpps = "
+           f"{gbps_of(rx_best, frame):.3f} Gbit/s a {frame} B; il generatore "
+           f"offre fino a {sent_best / 1e6:.3f} Mpps")
+    if sent_best < 1.1 * rx_best:
+        B.warn("il generatore supera appena il tetto di ricezione: la parte "
+               "satura della curva sara' corta (--threads per averne di piu')")
+    B.info("scala: " + ", ".join(f"{gbps_of(r, frame):.3f}" for r in rates)
+           + f" Gbit/s a {frame} B")
+    desc = (f"calibrata: {len(rates)} punti, da {AUTO_FRACTIONS[0]} a "
+            f"{AUTO_FRACTIONS[-1]} volte il tetto di ricezione di {ref} "
+            f"({rx_best / 1e6:.3f} Mpps = {gbps_of(rx_best, frame):.3f} "
+            f"Gbit/s a {frame} B), generatore {sent_best / 1e6:.3f} Mpps; "
+            f"pps " + ",".join(str(r) for r in rates))
+    return rates, desc
+
+
 # ==========================================================================
 # IL RUN
 # ==========================================================================
 def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 window_s, lat_target=LAT_TARGET_SAMPLES, egress_cpu=None,
-                overhead_reps=OVERHEAD_REPS, save=None):
+                overhead_reps=OVERHEAD_REPS, save=None, hostmon=None):
     """Tutte le pipeline, stesso fabric e stesso generatore, a rate crescente.
     Restituisce (righe grezze, righe del costo del contatore, note).
 
+    `rates_of(frame)` da' i rate in pps; None = scala calibrata (auto_rates)
+    sul tetto di ricezione misurato qui, dopo la sonda.
+
     `save(raw, over)`, se c'e', si chiama dopo OGNI finestra: un run da mezz'ora
-    interrotto al giro 6 lascia su disco i giri 1-6, invece di niente."""
+    interrotto al giro 6 lascia su disco i giri 1-6, invece di niente.
+
+    `hostmon`: host_conditions.HostMonitor. Legge la macchina prima che
+    pktgen parta e dopo che si e' fermato -- mai durante: le letture di MSR
+    sono IPI verso il DUT -- e ogni riga porta le colonne host_*."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -1021,6 +1115,7 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
             set_ctl(2, mask)
             gate = (lambda v: set_ctl(0, v)) if timed else (lambda v: None)
             probe = Probe(reader(m, direct), gate)
+            h0 = hostmon.mark() if hostmon is not None else None
             t0 = time.monotonic()
             try:
                 run = gen.steady(frame, gen.delay_for(rate) if rate else 0,
@@ -1036,9 +1131,11 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 set_ctl(0, 0)
             wall = time.monotonic() - t0
             time.sleep(DRAIN_S)
+            host = (hostmon.delta(h0, hostmon.mark())
+                    if hostmon is not None else None)
             lat = read_latency(acc, hist_tab)
             zero_latency(acc, hist_tab, lat)
-            return run, lat, wall
+            return run, lat, wall, host
 
         try:
             for setup, _ in loaded.values():
@@ -1080,7 +1177,7 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
             for m in loaded:
                 use(m)
                 try:
-                    run, lat, _ = window(m, f0, SANITY_PPS,
+                    run, lat, _, _ = window(m, f0, SANITY_PPS,
                                          sample_mask(SANITY_PPS, SANITY_S,
                                                      lat_target),
                                          seconds=SANITY_S)
@@ -1115,6 +1212,20 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 B.warn("nessun metodo ha superato la sonda")
                 return raw, over, notes
 
+            # --- la scala, se non e' data: calibrata sul tetto di ricezione
+            if rates_of is None:
+                rates, calib = calibrate_scale(B, window, use, alive, f0)
+                notes["scala"] = calib
+                if not rates:
+                    rates = [int(pps_for_gbps(g, DEFAULT_FRAME))
+                             for g in DEFAULT_BITRATES_GBPS]
+                    B.warn("calibrazione fallita: uso la scala fissa di "
+                           "ripiego")
+                    notes["scala"] = "fissa (calibrazione fallita)"
+
+                def rates_of(frame, _r=tuple(rates)):
+                    return list(_r)
+
             # --- lo sweep
             npts = rounds * sum(len(rates_of(f)) for f in frames) * len(alive)
             print(f"\n{YELLOW}{'=' * 78}{NC}")
@@ -1136,7 +1247,8 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                             use(m)
                             done += 1
                             try:
-                                run, lat, wall = window(m, frame, rate, mask)
+                                run, lat, wall, host = window(m, frame, rate,
+                                                              mask)
                             except B.PktgenEmptyRun as e:
                                 B.warn(f"giro {rnd} {m} "
                                        f"{gbps_of(rate, frame):.2f} Gbit/s: "
@@ -1147,7 +1259,7 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                 gen.delay_for(rate) if rate else 0,
                                 gen.n_inst, run.window, wall, run.tx,
                                 getattr(run, "errors", 0), run.dut, lat, mask,
-                                idle_ok=idle_ok[0])
+                                idle_ok=idle_ok[0], host=host)
                             raw.append(row)
                             if save:
                                 save(raw, over)
@@ -1171,8 +1283,8 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 notes["bpf_stats"] = old_stats is not None
                 if old_stats is None:
                     B.warn("kernel.bpf_stats_enabled non scrivibile: il costo "
-                           "si stima solo dal throughput, che su questa VM "
-                           "ha uno scarto di centinaia di ns")
+                           "si stima solo dal throughput, molto piu' "
+                           "rumoroso")
                 try:
                     for rep in range(overhead_reps):
                         for m in pipes:
@@ -1185,9 +1297,9 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                       else cnt["fn"]).fd
                                 before = prog_stats(fd)
                                 try:
-                                    run, _, _ = window(m, frames[0], 0, 0,
-                                                       direct=direct,
-                                                       timed=False)
+                                    run, _, _, host = window(
+                                        m, frames[0], 0, 0, direct=direct,
+                                        timed=False)
                                 except B.PktgenEmptyRun as e:
                                     B.warn(f"{m}: finestra scartata ({e})")
                                     continue
@@ -1205,7 +1317,8 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                     cost_ns=(round(1e9 / pps, 2) if pps
                                              else None),
                                     prog_ns=(round(prog, 2) if prog is not None
-                                             else None)))
+                                             else None),
+                                    **(host or {})))
                                 if save:
                                     save(raw, over)
                                 print(f"  {rep + 1:2d} {m:10s} {var:8s} "
@@ -1251,13 +1364,14 @@ def _print_point(r, done, total, t0):
           f"{f(r['loss_in_pipeline_pct'], '7.2f'):>7s} "
           f"{f(r['e2e_latency_p50_us'], '7.1f'):>7s} "
           f"{f(r['e2e_latency_p99_us'], '7.1f'):>7s}"
-          f"  {GREY}[{done}/{total}, ~{eta / 60:.0f} min]{NC}")
+          + (f" {RED}macchina{NC}" if r.get("host_disturbed") else "")
+          + f"  {GREY}[{done}/{total}, ~{eta / 60:.0f} min]{NC}")
 
 
 def summarise_overhead(over):
     """Per pipeline: mediana con e senza catena, dal tempo del programma
     (statistiche BPF, la cifra da usare) e dal throughput (quanto il nodo
-    rallenta, ma con lo scarto della VM), e le differenze."""
+    rallenta, ma piu' rumoroso), e le differenze."""
     per = {}
     for r in over:
         per.setdefault(r["method"], {}).setdefault(r["variant"], []).append(r)
@@ -1304,7 +1418,9 @@ def print_summary(summary, ons, over_sum, threshold):
         gl = ((f" (gen {s['gen_limited_rounds']}/{s['rounds']})"
                if s.get("gen_limited_rounds") else "")
               + (f" (raffica {s['gen_burst_rounds']}/{s['rounds']})"
-                 if s.get("gen_burst_rounds") else ""))
+                 if s.get("gen_burst_rounds") else "")
+              + (f" (macchina disturbata {s['host_disturbed_rounds']}/"
+                 f"{s['rounds']})" if s.get("host_disturbed_rounds") else ""))
         print(f"    {f(s['bitrate_sent_gbps'], '11.3f')} "
               f"{f(s['sent_pps'] and s['sent_pps'] / 1e6, '8.3f')} "
               f"{f(s['rx_pps'] and s['rx_pps'] / 1e6, '8.3f')} "
@@ -1417,12 +1533,26 @@ def _parse_list(spec, what):
     return sorted(vals)
 
 
+def _env_value(out_dir, key):
+    """Un valore dall'env.csv di un run gia' fatto, o None."""
+    path = os.path.join(out_dir, "env.csv")
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if len(row) >= 2 and row[0] == key:
+                    return row[1]
+    except OSError:
+        pass
+    return None
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(line_buffering=True)
         except (AttributeError, ValueError):
             pass
+    import host_conditions as HC
     p = argparse.ArgumentParser(
         description=__doc__.strip().split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1430,11 +1560,12 @@ def main(argv=None):
                    help="all (default: rxonly e le cinque pipeline) oppure "
                         "una lista, es. rxonly,baseline,p1_static")
     r = p.add_mutually_exclusive_group()
-    r.add_argument("--bitrates", default=None, metavar="LISTA",
+    r.add_argument("--bitrates", default=None, metavar="LISTA|auto",
                    help="bit rate da offrire in Gbit/s (L2, byte del frame), "
-                        "separati da virgola. Default: "
-                        + ",".join(str(x) for x in DEFAULT_BITRATES_GBPS)
-                        + " a 64 byte")
+                        "separati da virgola. Default auto: la scala "
+                        "calibrata sul tetto di ricezione misurato all'inizio "
+                        "(frazioni " + ",".join(str(x) for x in AUTO_FRACTIONS)
+                        + ")")
     r.add_argument("--rates", default=None, metavar="LISTA",
                    help="in alternativa, rate in Mpps")
     p.add_argument("--frames", default=str(DEFAULT_FRAME),
@@ -1449,11 +1580,12 @@ def main(argv=None):
     p.add_argument("--lat-samples", type=int, default=LAT_TARGET_SAMPLES,
                    help="campioni di latenza per finestra, circa (0 = ogni "
                         "pacchetto)")
-    p.add_argument("--loss-threshold", type=float,
-                   default=DEFAULT_LOSS_THRESHOLD, metavar="PCT",
+    p.add_argument("--loss-threshold", type=float, default=None,
+                   metavar="PCT",
                    help="perdita in punti %% degli inviati, oltre quella di "
                         "rxonly allo stesso rate, da cui una riga si dice "
-                        "'in perdita'")
+                        f"'in perdita'. Default {DEFAULT_LOSS_THRESHOLD}; con "
+                        f"--report quella scritta nell'env.csv del run")
     p.add_argument("--overhead-reps", type=int, default=OVERHEAD_REPS,
                    help="ripetizioni della misura del costo del contatore "
                         "(0 la salta)")
@@ -1461,10 +1593,17 @@ def main(argv=None):
     p.add_argument("--dut-cpus", default=None, metavar="LISTA")
     p.add_argument("--threads", type=int, default=None, metavar="N")
     p.add_argument("--allow-cpu0", action="store_true")
-    p.add_argument("--egress-cpu", type=int, default=None, metavar="N",
-                   help="NAPI dei veth d'uscita in thread sulla CPU N. Senza, "
-                        "la ricezione del nodo successivo gira sulla CPU del "
-                        "DUT (come in --mode rates)")
+    p.add_argument("--egress-cpu", default="auto", metavar="N|auto|none",
+                   help="NAPI dei veth d'uscita (il nodo successivo) in thread "
+                        "sulla CPU N. auto (default): un core fisico suo "
+                        "scelto dal piano, se ne resta uno; none: la "
+                        "ricezione del nodo successivo gira sulla CPU del DUT "
+                        "(il comportamento fino al 2026-09-26, dove una "
+                        "perdita all'uscita era improbabile per costruzione)")
+    p.add_argument("--dut-queues", default="auto", metavar="N|auto|gen",
+                   help="code d'ingresso del DUT: auto (default) una per CPU "
+                        "del DUT; gen una per thread generatore (storico). "
+                        "Vedi bench_throughput.DUT_QUEUES")
     p.add_argument("--out", default=None, help="cartella dei risultati")
     p.add_argument("--no-plot", action="store_true",
                    help="non disegnare i grafici a fine run")
@@ -1475,6 +1614,7 @@ def main(argv=None):
                         "bitrate_overhead_raw.csv) da DIR e ristampa "
                         "riepilogo, inizio della perdita e costo del "
                         "contatore con le regole attuali. Non serve root.")
+    HC.add_args(p)
     a = p.parse_args(argv)
     # --out e --report sono rispetto alla cartella da cui si lancia. Sotto,
     # main() si sposta in ipa/ (come bench_throughput): fino al 2026-09-26
@@ -1484,11 +1624,25 @@ def main(argv=None):
     out_dir = os.path.abspath(a.out) if a.out else None
 
     if a.report:
-        return report_from_csv(os.path.abspath(a.report), a.loss_threshold)
+        rdir = os.path.abspath(a.report)
+        thr = a.loss_threshold
+        if thr is None:
+            try:
+                thr = float(_env_value(rdir, "soglia_perdita_pct"))
+            except (TypeError, ValueError):
+                thr = DEFAULT_LOSS_THRESHOLD
+        return report_from_csv(rdir, thr)
     if sys.platform != "linux":
         sys.exit(f"serve Linux, non {sys.platform}")
     if os.geteuid() != 0:
         sys.exit("serve root: sudo python3 ipa/test/bench_bitrate.py")
+    HC.check_args(a)
+    a.egress_cpu = HC.parse_egress(a.egress_cpu)
+    if a.loss_threshold is None:
+        a.loss_threshold = DEFAULT_LOSS_THRESHOLD
+        threshold_why = "default"
+    else:
+        threshold_why = "data a mano"
     import bench_throughput as B
     os.chdir(B.SHARED_DIR)
     if a.cleanup:
@@ -1511,44 +1665,49 @@ def main(argv=None):
         sys.exit(f"--method: sconosciuti {bad}; validi: all, {REFERENCE}, "
                  f"{', '.join(PIPELINES)}")
     frames = [int(x) for x in _parse_list(a.frames, "--frames")]
-    if a.bitrates:
+    scale_spec = (a.bitrates or "auto").strip().lower() if not a.rates \
+        else "rates"
+    if scale_spec == "auto":
+        rates_of = None                 # calibrata in run_bitrate
+        scale_desc = "auto (calibrata sul tetto di ricezione all'inizio)"
+    elif scale_spec == "rates":
+        mpps = _parse_list(a.rates, "--rates")
+
+        def rates_of(frame):
+            return [int(x * 1e6) for x in mpps]
+        scale_desc = "Mpps: " + a.rates
+    else:
         gbps = _parse_list(a.bitrates, "--bitrates")
 
         def rates_of(frame):
             return [int(pps_for_gbps(g, frame)) for g in gbps]
-    else:
-        mpps = (_parse_list(a.rates, "--rates") if a.rates else
-                [pps_for_gbps(g, DEFAULT_FRAME) / 1e6
-                 for g in DEFAULT_BITRATES_GBPS])
-
-        def rates_of(frame):
-            return [int(x * 1e6) for x in mpps]
+        scale_desc = "Gbit/s: " + a.bitrates
     window_s = a.duration or B.WINDOW_S
 
-    plan = B.plan_cpus(a.gen_cpus, a.dut_cpus, a.threads, a.allow_cpu0)
+    plan = B.plan_cpus(a.gen_cpus, a.dut_cpus, a.threads, a.allow_cpu0,
+                       egress_spec=a.egress_cpu)
     plan.describe()
-    if a.egress_cpu is not None:
+    if isinstance(a.egress_cpu, int):
         if a.egress_cpu in plan.dut or a.egress_cpu in plan.gen:
             sys.exit(f"--egress-cpu {a.egress_cpu} e' gia' del generatore o "
                      f"del DUT")
         if a.egress_cpu not in B.online_cpus():
             sys.exit(f"--egress-cpu {a.egress_cpu}: CPU non online")
+    B.DUT_QUEUES = B.parse_dut_queues(a.dut_queues, plan)
 
     import model_meta as mm
     model_path = mm.default_checkpoint()
     envargs = argparse.Namespace(
         mode="bitrate", no_threaded_napi=False, gen_topology="shared",
         xmit_mode="start_xmit", duration=window_s, window="steady",
-        generator="pktgen", ttl_mix=None, egress_cpu=a.egress_cpu,
+        generator="pktgen", ttl_mix=None, egress_cpu=plan.egress,
         warmup=0.0, repeat=1, rounds=a.rounds,
         loss_threshold=a.loss_threshold, clone_skb=0, burst=0)
 
     def env_now(extra=()):
         env = B.capture_env(envargs, plan, methods, frames)
-        env += [("bitrate_gbps_richiesti" if a.bitrates else "rate_mpps",
-                 a.bitrates or a.rates or ",".join(
-                     f"{pps_for_gbps(g, DEFAULT_FRAME) / 1e6:.4f}"
-                     for g in DEFAULT_BITRATES_GBPS)),
+        env += [("scala", scale_desc),
+                ("soglia_perdita_origine", threshold_why),
                 ("latenza", "timbro pktgen -> contatore del nodo successivo, "
                             "celle da 1 us, corretta per l'attesa di pktgen"),
                 ("latenza_campioni_per_finestra", a.lat_samples),
@@ -1556,11 +1715,6 @@ def main(argv=None):
                                        "pipeline di produzione")]
         env += list(extra)
         return env
-
-    B.print_env(env_now())
-    if out_dir:
-        B.info(f"risultati in {out_dir} (bitrate_raw.csv aggiornato dopo ogni "
-               f"finestra)")
 
     def save(raw_rows, over_rows):
         if not out_dir:
@@ -1571,51 +1725,69 @@ def main(argv=None):
             save_csv(os.path.join(out_dir, "bitrate_overhead_raw.csv"),
                      over_rows)
 
-    t0 = time.monotonic()
-    try:
-        raw, over, notes = run_bitrate(
-            B, methods, model_path, frames, rates_of, plan, a.rounds,
-            window_s, lat_target=a.lat_samples, egress_cpu=a.egress_cpu,
-            overhead_reps=a.overhead_reps, save=save)
-    finally:
-        if out_dir and os.path.isdir(out_dir):
+    def body(hostmon):
+        B.print_env(env_now())
+        if out_dir:
+            B.info(f"risultati in {out_dir} (bitrate_raw.csv aggiornato dopo "
+                   f"ogni finestra; host_monitor.csv: la macchina al secondo)")
+        t0 = time.monotonic()
+        try:
+            raw, over, notes = run_bitrate(
+                B, methods, model_path, frames, rates_of, plan, a.rounds,
+                window_s, lat_target=a.lat_samples, egress_cpu=plan.egress,
+                overhead_reps=a.overhead_reps, save=save, hostmon=hostmon)
+        finally:
+            if out_dir and os.path.isdir(out_dir):
+                B._give_back(out_dir)
+        summary = summarise(raw, a.loss_threshold)
+        ons = onsets(summary)
+        over_sum = summarise_overhead(over)
+        print_summary(summary, ons, over_sum, a.loss_threshold)
+        print(f"\n  durata del run: {(time.monotonic() - t0) / 60:.1f} min")
+        rc = 0 if raw else 1
+        if any(r["tail_call_miss"] for r in raw if not r["reference"]):
+            B.warn("tail call non partite in qualche finestra: quei pacchetti "
+                   "sono entrati nel contatore e non nella pipeline")
+            rc = 1
+        disturbed = sum(bool(r.get("host_disturbed")) for r in raw)
+        if disturbed:
+            B.warn(f"{disturbed} finestre su {len(raw)} con la macchina fuori "
+                   f"dalle condizioni dichiarate (colonna host_disturbed: "
+                   f"throttling, frequenza del DUT fuori target, powerclamp, "
+                   f"batteria)")
+        if out_dir and raw:
+            os.makedirs(out_dir, exist_ok=True)
+            B._write_csv(os.path.join(out_dir, "bitrate_raw.csv"), raw)
+            B._write_csv(os.path.join(out_dir, "bitrate.csv"), summary)
+            if over:
+                B._write_csv(os.path.join(out_dir,
+                                          "bitrate_overhead_raw.csv"), over)
+                B._write_csv(os.path.join(out_dir, "bitrate_overhead.csv"),
+                             over_sum)
+            B.write_env(out_dir, env_now([
+                ("scala_usata", notes.get("scala", scale_desc)),
+                ("finestre_macchina_disturbata", f"{disturbed}/{len(raw)}"),
+                ("correzione_attesa_pktgen",
+                 "si" if notes.get("idle_correction") else "NO: idle assente"),
+                ("costo_contatore_da",
+                 "statistiche BPF del kernel + throughput"
+                 if notes.get("bpf_stats") else "solo throughput"),
+                ("durata_run_min", round((time.monotonic() - t0) / 60, 1))]))
+            if not a.no_plot:
+                try:
+                    import plot_bitrate
+                    plot_bitrate.plot_all(out_dir)
+                except ImportError as e:
+                    B.warn(f"grafici non disegnati ({e}): "
+                           f"python3 ipa/test/plot_bitrate.py {out_dir}")
             B._give_back(out_dir)
-    summary = summarise(raw, a.loss_threshold)
-    ons = onsets(summary)
-    over_sum = summarise_overhead(over)
-    print_summary(summary, ons, over_sum, a.loss_threshold)
-    print(f"\n  durata del run: {(time.monotonic() - t0) / 60:.1f} min")
-    rc = 0 if raw else 1
-    if any(r["tail_call_miss"] for r in raw if not r["reference"]):
-        B.warn("tail call non partite in qualche finestra: quei pacchetti "
-               "sono entrati nel contatore e non nella pipeline")
-        rc = 1
-    if out_dir and raw:
-        os.makedirs(out_dir, exist_ok=True)
-        B._write_csv(os.path.join(out_dir, "bitrate_raw.csv"), raw)
-        B._write_csv(os.path.join(out_dir, "bitrate.csv"), summary)
-        if over:
-            B._write_csv(os.path.join(out_dir, "bitrate_overhead_raw.csv"),
-                         over)
-            B._write_csv(os.path.join(out_dir, "bitrate_overhead.csv"),
-                         over_sum)
-        B.write_env(out_dir, env_now([
-            ("correzione_attesa_pktgen",
-             "si" if notes.get("idle_correction") else "NO: idle assente"),
-            ("costo_contatore_da",
-             "statistiche BPF del kernel + throughput"
-             if notes.get("bpf_stats") else "solo throughput"),
-            ("durata_run_min", round((time.monotonic() - t0) / 60, 1))]))
-        if not a.no_plot:
-            try:
-                import plot_bitrate
-                plot_bitrate.plot_all(out_dir)
-            except ImportError as e:
-                B.warn(f"grafici non disegnati ({e}): "
-                       f"python3 ipa/test/plot_bitrate.py {out_dir}")
-        B._give_back(out_dir)
-    return rc
+        return rc
 
+    # Le condizioni della macchina si applicano dopo il piano (servono i
+    # ruoli) e prima di qualunque misura, e si ripristinano comunque vada.
+    # Tutto il run sta dentro, CSV ed env.csv compresi: env.csv registra la
+    # macchina com'era mentre misurava, non dopo il ripristino.
+    return B.conditioned(a, plan, body, out_dir)
 
 if __name__ == "__main__":
     sys.exit(main())

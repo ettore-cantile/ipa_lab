@@ -27,7 +27,7 @@ The experimental setup uses the **Germany50** topology from the [SNDlib reposito
 |---|---|
 | Backbone routers | 50 |
 | End hosts | 2 (`h_src`, `h_dst`) |
-| Nodes in the emulated lab | **52** |
+| Nodes in the topology | **52** |
 | Links | 90 (88 backbone + 2 access) |
 | Max node degree | **6** (`karlsruhe`, interfaces `eth0`..`eth5`) |
 | Source host | `h_src` attached to **Karlsruhe** |
@@ -94,7 +94,7 @@ Three layers, and the dependency only ever points downward.
 
 ```
 ipa_lab/
-├── ipa/                             # 1. CORE ENGINE — no topology, no emulator
+├── ipa/                             # 1. CORE ENGINE — no topology data
 │   ├── execute_pipeline.py          #    SINGLE ENTRY POINT: --method hardcoded|template|modular
 │   ├── ebpf_program.py              #    P1 codegen (weights as C literals, BCC dialect)
 │   ├── ebpf_template_arch.py        #    P2 eBPF source + arch_weights control plane
@@ -128,14 +128,21 @@ ipa_lab/
 │       ├── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost,
 │       │                            #        scaling, per-model semantics (BPF_PROG_TEST_RUN)
 │       ├── bench_throughput.py      #      real traffic on veth: node cost per packet
-│       │                            #        (--mode compare --generator xdp --egress-cpu 0)
+│       │                            #        (--mode compare --generator xdp --egress-cpu auto)
 │       ├── xdp_gen.py               #      XDP live-frames generator (no skb, no copy)
 │       ├── bench_bitrate.py         #      offered bit rate sweep: e2e latency, packets
 │       │                            #        received by XDP (counter -> tail call ->
 │       │                            #        pipeline) vs forwarded, where loss starts
 │       ├── plot_bitrate.py          #      its three figures, from bitrate.csv
 │       ├── test_bitrate_math.py     #      its formulas and loss attribution, no kernel
-│       └── test_steady_window.py    #      steady measurement window, no kernel needed
+│       ├── test_steady_window.py    #      steady measurement window, no kernel needed
+│       ├── host_conditions.py       #      the machine during a bench: CPU roles, fixed
+│       │                            #        frequency, idle states, isolation, monitor,
+│       │                            #        restore (see docs/testing.md §0)
+│       ├── test_host_conditions.py  #      its logic on a fake /sys, no root
+│       ├── test_host_kernel.py      #      the same on the real kernel: apply, measure,
+│       │                            #        restore, compare
+│       └── remeasure_*.sh           #      every measurement cited in docs/, in one go
 │
 ├── topologies/                      # 3. SCENARIO DATA — one directory per network
 │   └── germany50/                   #    the network the checked-in model was trained on
@@ -143,17 +150,19 @@ ipa_lab/
 │       ├── topology_config.json     #      n_interfaces=6, n_nodes=52, n_queues=4
 │       └── importSNDLib.py          #      XML -> NetworkX
 │
+├── results/                       # 4. MEASUREMENTS — CSV only; plots, logs and
+│                                    #    reports are regenerated from them
+│
 └── docs/
     ├── testing.md                   # Test guide + measured results
     ├── claims.md                    # Every claim, its evidence and how to re-run it
-    ├── quaderno_settembre.tex/.pdf  # Lab notebook: what was measured, and why
-    └── tesi_ipa.tex                 # Thesis text
+    ├── september_notebook.tex/.pdf  # Lab notebook (Italian): what was measured, and why
+    └── figures/                     # the plots the notebook includes
 ```
 
 ### What "the core does not depend on the scenario" means, concretely
 
-`ipa/` contains no topology numbers, no hostnames, no `germany50.xml`, and no
-emulator paths. Where `n_interfaces` and `n_nodes` are needed they are resolved,
+`ipa/` contains no topology numbers, no hostnames and no `germany50.xml`. Where `n_interfaces` and `n_nodes` are needed they are resolved,
 in order, from:
 
 1. `$IPA_TOPOLOGY_CONFIG`
@@ -174,7 +183,7 @@ You can check both claims:
 
 ```bash
 # no code-level dependency on the experiment
-grep -rniE "import importSNDLib|germany50|kathara|topologies/" ipa/ --include=*.py
+grep -rniE "import importSNDLib|germany50|topologies/" ipa/ --include=*.py
 
 # generate a full P1 pipeline for a topology that is not Germany50
 cat > /tmp/tiny.json <<'JSON'
@@ -198,14 +207,13 @@ PY
 
 ### Running against a real datapath
 
-There is no emulator. The tests build their own network out of `veth` pairs on
-the host, attach XDP in **native** mode, inject a frame and read which
+The tests build their own network out of `veth` pairs on the host, attach XDP in **native** mode, inject a frame and read which
 interface it came out of:
 
 ```bash
 sudo python3 ipa/test/test_fabric.py          # P1/P2/P3, real attach + redirect
 sudo python3 ipa/test/netns_fabric.py --hold  # just the fabric, to deploy onto
-sudo bash ipa/test/probe_env.sh               # what this machine can support
+python3 ipa/test/host_conditions.py --show    # what this machine is, and the CPU plan
 ```
 
 `veth` supports native XDP, so the attach mode is the deployment mode rather
@@ -223,7 +231,8 @@ and multi-hop forwarding across several nodes.
 > space of three eBPF pipelines** that all run the *same* quantized multi-layer
 > model and differ only in *where the weights live and what can change without
 > recompiling*. The two branches are successive stages of one project, not
-> alternatives; the narrative link between them is in `docs/tesi_ipa.tex`.
+> alternatives; the narrative link between them is in the thesis, kept outside
+> this repository.
 
 ---
 
@@ -323,8 +332,9 @@ scale. `model_meta.DEFAULT_TTL_SCALE` holds the divisor; all three pipelines and
 the AOT generator divide the TTL **product** by it (dividing the TTL itself would
 collapse the 10..30 range onto 0 or 1 and throw the resolution away), and the
 Python reference uses `_trunc_div` so it matches C's truncate-toward-zero on
-negative weights. `send_ipa.py` sends with `INITIAL_TTL = 30` for the same
-reason: a higher TTL normalises above 1.0, outside anything the model saw.
+negative weights. Traffic meant to exercise the model should carry a TTL of at
+most 30 for the same reason: a higher TTL normalises above 1.0, outside anything
+the model saw.
 
 Run `ipa/test/diag_model_decisions.py` to see the numbers for the current
 weights — no root, no BCC, no kernel needed.
@@ -379,7 +389,7 @@ model to run. **The weight payload that follows is not read by any of the three
 pipelines**: weights are loaded out-of-band by the control plane at registration
 time. The payload exists to keep packets realistically sized. Making the weights
 travel in-band (a true IPA cache-miss path) is future work; see the discussion in
-`docs/tesi_ipa.tex`.
+the thesis.
 
 ---
 
@@ -389,15 +399,13 @@ travel in-band (a true IPA cache-miss path) is future work; see the discussion i
 
 Nothing to fetch. The engine compiles eBPF with BCC against the host's own
 kernel headers, so a box with `bcc`, `clang` and `linux-headers-$(uname -r)`
-installed is ready. Check what the machine supports:
+installed is ready. Check the machine and the bench's conditioning:
 
 ```bash
-sudo bash ipa/test/probe_env.sh
+python3 ipa/test/host_conditions.py --show     # CPU topology, role plan, current state
+sudo python3 ipa/test/test_host_kernel.py      # conditions applied, read back, restored
+sudo python3 ipa/test/test_fabric.py           # native XDP on veth, end to end
 ```
-
-It reports virtualisation, the kernel options that matter (`VETH`, `NET_PKTGEN`,
-BTF), the toolchain, and — the decisive one — whether **native** XDP attaches to
-a `veth`.
 
 ### Build a network to attach to
 
@@ -433,17 +441,32 @@ IPA_IFACE_PATTERN="ipa{i}"              # a naming convention
 
 If a stale program is left on an interface: `sudo ip link set dev ipain xdp off`.
 
-### Send traffic
-
-```bash
-sudo python3 ipa/send_ipa.py --dst <host> --count 100 --model-id 0
-sudo python3 ipa/recv_ipa.py
-sudo python3 ipa/test/test_ipa.py --dest <host> --count 100 --model-id 0
-```
-
 ## Testing
 
-Full guide with expected output in [`docs/testing.md`](docs/testing.md).
+Full guide with the measured results in [`docs/testing.md`](docs/testing.md); every
+claim, its evidence and how to re-run it in [`docs/claims.md`](docs/claims.md).
+
+The measurements run on a bare-metal laptop (Intel Core Ultra 7 155H, hybrid P/E
+cores, Ubuntu 24.04, kernel 6.8). `ipa/test/host_conditions.py` puts the machine in
+known conditions for the duration of a bench — DUT, generator and next hop on
+distinct physical P-cores, their frequency fixed at 3.5 GHz and **measured** with
+APERF/MPERF, deep C-states off, desktop, IRQs and kernel threads confined to the
+other CPUs — records them in `env.csv`, watches for thermal throttling during every
+measurement window, and restores everything afterwards (also after a crash).
+
+```bash
+python3 ipa/test/host_conditions.py --show                     # what it would do (no root)
+sudo python3 ipa/test/host_conditions.py --run -- CMD ...       # any command, conditioned
+sudo python3 ipa/test/test_host_kernel.py --bench               # verify it on the real kernel
+bash ipa/test/remeasure_all.sh && bash ipa/test/remeasure_traffic.sh   # every number in docs/
+
+# real traffic (they condition the machine themselves)
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --out results/throughput_3500
+sudo python3 ipa/test/bench_bitrate.py --out results/bitrate_3500
+```
+
+Build prerequisites for the P1 AOT object: `clang`, `libbpf-dev`, `libelf-dev`,
+`zlib1g-dev`, `libzstd-dev`, `liblzma-dev`.
 
 ```bash
 # userspace suites (torch + numpy, no root)

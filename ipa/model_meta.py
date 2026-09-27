@@ -67,7 +67,7 @@ _SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 # NO built-in topology numbers.
 #
 # This used to be `DEFAULT_TOPOLOGY_CONFIG = {"n_interfaces": 6, "n_nodes": 52,
-# "n_queues": 4}` -- the Germany50 lab, written into the engine, silently used
+# "n_queues": 4}` -- the Germany50 scenario, written into the engine, silently used
 # by every caller that did not supply a config. Feature widths are a property
 # of the network a model was TRAINED on, so the engine cannot have a default
 # for them: any number it picks is a claim about someone else's network.
@@ -177,9 +177,9 @@ FEATURE_CATALOG = {
 
 # Numeric wire/registry code per feature type — single source of truth shared by
 # the on-wire IPA header (feat*_code), the descriptor-driven eBPF programs
-# (model_desc registry) and their control planes. Matches the historical codes
-# in test_ipa.py (link_state=1, ingress_iface=2, ttl=3, node=4); queue_occupancy
-# is the added type (5).
+# (model_desc registry) and their control planes. The first four codes
+# (link_state=1, ingress_iface=2, ttl=3, node=4) are the original IPA header's;
+# queue_occupancy is the added type (5).
 FEATURE_CODE = {
     "link_state":      0x01,
     "ingress_iface":   0x02,

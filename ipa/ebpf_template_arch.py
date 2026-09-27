@@ -78,7 +78,7 @@ import os
 #
 # These were `T2_N_IN = 65` and `T2_N_OUT = 7`, described as "fixed by the IPA
 # header/feature encoding". 65 is not a protocol constant: it is
-# 6 link_state + 6 ingress_iface + 1 ttl + 52 node, i.e. the Germany50 lab's
+# 6 link_state + 6 ingress_iface + 1 ttl + 52 node, i.e. the Germany50 scenario's
 # dimensions summed. Neither value appears in the compiled C at all -- the
 # program reads the feature layout from model_desc and n_out from
 # arch_registry -- so they only ever served as Python defaults, and as defaults
@@ -423,7 +423,7 @@ BPF_ARRAY(arch_weights, struct aw_blk, 1);
  * of 6. Written by the userspace carrier monitor. 1=up, 0=down. */
 /* COMPILED CEILINGS for the dense per-slot features, not deployment values.
  *
- * These were the literals 6 and 4 -- the Germany50 lab's interface count and
+ * These were the literals 6 and 4 -- the Germany50 scenario's interface count and
  * its queue count -- written into the struct sizes AND into every loop bound,
  * so the compiled datapath only fit that one network. The consumption loops
  * are already gated by the descriptor's per-feature `sz`, so widening the
@@ -470,7 +470,7 @@ BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
  *
  * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
  * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
- * kernel and are arbitrary -- 2 and 3 on a container, 207 and 209 on a box
+ * kernel and are arbitrary -- 2 and 3 on a freshly booted machine, 207 and 209 on a box
  * that has created a few veths -- so on real hardware the guard
  * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
  * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at
@@ -564,7 +564,7 @@ int ipa_switch_template(struct xdp_md *ctx) {
     /* Same FIX(#4) Pipeline 1 already applies (see ebpf_program.py): read the
      * protocol at its absolute RFC 791 offset (byte 9) instead of ip->protocol,
      * because struct iphdr's ihl:4/version:4 bitfield can be packed differently
-     * by clang against minimal container headers, making every
+     * by clang against minimal kernel headers, making every
      * UDP packet fail the check; and derive the UDP header from the real ihl*4
      * instead of sizeof(struct iphdr), which is wrong when IP options present. */
     __u8 ip_proto = *((__u8 *)ip + 9);
@@ -698,7 +698,7 @@ BPF_ARRAY(arch_weights, struct aw_blk, 1);
 #define AW_W(blk, i) ((long long)(__s8)((blk)->w[(__u32)(i) & (MAX_WEIGHT_ENTRIES - 1)]))
 /* COMPILED CEILINGS for the dense per-slot features, not deployment values.
  *
- * These were the literals 6 and 4 -- the Germany50 lab's interface count and
+ * These were the literals 6 and 4 -- the Germany50 scenario's interface count and
  * its queue count -- written into the struct sizes AND into every loop bound,
  * so the compiled datapath only fit that one network. The consumption loops
  * are already gated by the descriptor's per-feature `sz`, so widening the
@@ -731,7 +731,7 @@ BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
  *
  * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
  * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
- * kernel and are arbitrary -- 2 and 3 on a container, 207 and 209 on a box
+ * kernel and are arbitrary -- 2 and 3 on a freshly booted machine, 207 and 209 on a box
  * that has created a few veths -- so on real hardware the guard
  * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
  * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at

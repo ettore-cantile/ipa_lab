@@ -12,7 +12,7 @@ SAME class as an independent reference -- equivalence. It does not ask whether
 that class is USEFUL. A model that returns a constant would pass every
 equivalence test in the repository. This script asks the other question:
 
-    across the whole input space the lab can actually produce,
+    across the whole input space the scenario can actually produce,
     how many distinct egress classes does the model ever emit?
 
 If the answer is one, the datapath is a very fast way of computing a constant,

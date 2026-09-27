@@ -111,7 +111,7 @@ For the full metric comparison across pipelines:
     # ------------------------------------------------------------------
     # Step 1: extract weights (produces weights.json + weights_float.json)
     # Skip if both files already exist — extract_weights.py requires torch
-    # which is NOT available inside a stripped container image.  The pre-built JSON
+    # which may not be installed on a minimal node.  The pre-built JSON
     # files checked into the repo are sufficient for all three pipelines.
     # ------------------------------------------------------------------
     weights_path = os.path.join(SHARED_DIR, "weights.json")

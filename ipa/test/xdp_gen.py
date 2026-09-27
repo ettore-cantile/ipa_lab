@@ -482,9 +482,7 @@ def main():
     BT.pg_reset()
     plan = BT.plan_cpus()
     plan.describe()
-    rx_dev, tx_dev, _ = BT.make_shared_tg_link(len(plan.gen),
-                                               max(len(plan.dut),
-                                                   len(plan.gen)))
+    rx_dev, tx_dev, _ = BT.make_shared_tg_link(*BT.ingress_queues(plan))
     cnt = BPF(text=BT.GEN_COUNTER_SRC % {"action": "XDP_DROP"})
     fn = cnt.load_func("xdp_gen_count", BPF.XDP)
     napi = []

@@ -28,7 +28,7 @@ ipaK, which delivers it out ipaKp -- where a raw socket is waiting. What comes
 back is the answer to the question TEST_RUN cannot ask: did the packet come out
 of the right port?
 
-This is not an emulator. It is the same kernel code path a physical NIC takes,
+This is not a simulation. It is the same kernel code path a physical NIC takes,
 minus the driver and the DMA. `veth` supports native XDP, so the attach mode is
 the deployment mode, not a stand-in for it.
 
