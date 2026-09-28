@@ -135,23 +135,15 @@ def synth_weights(layer_dims: list, seed: int) -> list:
 
 
 def _read_u64(table, key_val):
-    try:
-        v = table[ct.c_int(key_val)]
-        if isinstance(v, (bytes, bytearray)):      # a pinned map (P1, AOT)
-            return int.from_bytes(v, "little")
-        return int(v.value)
-    except Exception:
-        return 0
+    """A counter, summed over every CPU (pkt_stats/cls_stats are per-CPU)."""
+    from stats_maps import read_counter
+    return read_counter(table, key_val)
 
 
 def _reset(ps, cs, n_cls=7):
-    for i in range(3):
-        ps[ct.c_int(i)] = ct.c_ulonglong(0)
-    for i in range(n_cls):
-        try:
-            cs[ct.c_int(i)] = ct.c_ulonglong(0)
-        except Exception:
-            pass
+    from stats_maps import zero_all
+    zero_all(ps, 3)
+    zero_all(cs, min(n_cls, len(cs)))
 
 
 def _check(name, model_id, disp_fd, ps, cs, ref_layer_dims, weights, ttl=3,

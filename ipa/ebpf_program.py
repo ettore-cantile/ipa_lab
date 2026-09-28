@@ -275,8 +275,8 @@ def _build_header(dense_vector_maps: dict, n_out: int,
     else:
         mac_capacity = max(8, n_out)
     return _COMMON_STRUCTS + f"""
-{map_decls}BPF_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(no mac_table entry) [2]=drop */
-BPF_ARRAY(cls_stats,        __u64, {n_out});   /* per-class redirect counter */
+{map_decls}BPF_PERCPU_ARRAY(pkt_stats,        __u64, 3);   /* [0]=hit [1]=miss(no mac_table entry) [2]=drop */
+BPF_PERCPU_ARRAY(cls_stats,        __u64, {n_out});   /* per-class redirect counter */
 
 /* mac_table: LOGICAL PORT (what the class semantics map the argmax output
  * onto) -> {{ifindex, src/dst MAC}}.
@@ -397,34 +397,34 @@ def _gen_class_dispatch(semantics) -> str:
             lines.append(f"    case {cid}: {{"
                          f"   /* DROP (declared, not inferred) */")
             lines.append("        int _di = 2; __u64 *_dv = pkt_stats.lookup(&_di);")
-            lines.append("        if (_dv) __sync_fetch_and_add(_dv, 1);")
+            lines.append("        if (_dv) *_dv += 1;")
             # The class was decided; record it, so a DROP is distinguishable
             # from a program that never reached argmax.
             lines.append(f"        __u32 _dc = {cid}U;")
             lines.append("        __u64 *_dcv = cls_stats.lookup(&_dc);")
-            lines.append("        if (_dcv) __sync_fetch_and_add(_dcv, 1);")
+            lines.append("        if (_dcv) *_dcv += 1;")
             lines.append("        return XDP_DROP;")
             lines.append("    }")
         else:
             lines.append(f"    case {cid}: {{"
                          f"   /* UNUSED: countable, never forwarded */")
             lines.append("        int _ui = 1; __u64 *_uv = pkt_stats.lookup(&_ui);")
-            lines.append("        if (_uv) __sync_fetch_and_add(_uv, 1);")
+            lines.append("        if (_uv) *_uv += 1;")
             lines.append(f"        __u32 _uc = {cid}U;")
             lines.append("        __u64 *_ucv = cls_stats.lookup(&_uc);")
-            lines.append("        if (_ucv) __sync_fetch_and_add(_ucv, 1);")
+            lines.append("        if (_ucv) *_ucv += 1;")
             lines.append("        return XDP_PASS;")
             lines.append("    }")
     lines += [
         "    default: {   /* argmax outside [0, n_out): must not happen */",
         "        int _xi = 1; __u64 *_xv = pkt_stats.lookup(&_xi);",
-        "        if (_xv) __sync_fetch_and_add(_xv, 1);",
+        "        if (_xv) *_xv += 1;",
         "        return XDP_PASS;",
         "    }",
         "    }",
         "    if (_port == 0xffffffffU) {",
         "        int _xi = 1; __u64 *_xv = pkt_stats.lookup(&_xi);",
-        "        if (_xv) __sync_fetch_and_add(_xv, 1);",
+        "        if (_xv) *_xv += 1;",
         "        return XDP_PASS;",
         "    }",
     ]
@@ -455,15 +455,15 @@ def _gen_action_epilogue(semantics) -> str:
          * ICMP Time Exceeded and makes traceroute work. */
         if (ip->ttl <= 1) {{
             int _ti = 1; __u64 *_tv = pkt_stats.lookup(&_ti);
-            if (_tv) __sync_fetch_and_add(_tv, 1);
+            if (_tv) *_tv += 1;
             return XDP_PASS;
         }}
         ipa_ttl_dec(ip);
         int _hi = 0; __u64 *_hv = pkt_stats.lookup(&_hi);
-        if (_hv) __sync_fetch_and_add(_hv, 1);
+        if (_hv) *_hv += 1;
         __u32 _cs_key = (__u32)best_cls;
         __u64 *_cv = cls_stats.lookup(&_cs_key);
-        if (_cv) __sync_fetch_and_add(_cv, 1);
+        if (_cv) *_cv += 1;
         __builtin_memcpy(eth->h_source, _action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   _action->dst_mac, 6);
         return bpf_redirect(_action->ifindex, 0);
@@ -471,7 +471,7 @@ def _gen_action_epilogue(semantics) -> str:
     /* no mac_table entry for that logical port (the node did not provision
      * it, or its link is down) */
     int _mi = 1; __u64 *_mv = pkt_stats.lookup(&_mi);
-    if (_mv) __sync_fetch_and_add(_mv, 1);
+    if (_mv) *_mv += 1;
     return XDP_PASS;
 """
 

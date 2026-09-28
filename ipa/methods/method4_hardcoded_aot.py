@@ -240,8 +240,8 @@ def _live_deploy(cmd, pin_dir, semantics, n_nodes=None):
         while dep.proc.poll() is None:
             time.sleep(1)
             try:
-                v = [int.from_bytes(stats[ctypes.c_uint32(i)], "little")
-                     for i in range(3)]
+                from stats_maps import read_counter
+                v = [read_counter(stats, i) for i in range(3)]
                 print(f"\r{v[0]:<22} | {v[1]:<22} | {v[2]:<20}",
                       end="", flush=True)
             except Exception:

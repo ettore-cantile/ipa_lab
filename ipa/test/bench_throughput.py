@@ -440,12 +440,12 @@ METHODS = ("baseline", "p1_static", "hardcoded", "template", "modular")
 RX_ONLY = "rxonly"
 RXONLY_SRC = """
 #include <uapi/linux/bpf.h>
-BPF_ARRAY(pkt_stats, __u64, 3);
-BPF_ARRAY(cls_stats, __u64, 8);
+BPF_PERCPU_ARRAY(pkt_stats, __u64, 3);
+BPF_PERCPU_ARRAY(cls_stats, __u64, 8);
 int xdp_rxonly(struct xdp_md *ctx) {
     int k = 0;
     __u64 *v = pkt_stats.lookup(&k);
-    if (v) __sync_fetch_and_add(v, 1);
+    if (v) *v += 1;
     return XDP_DROP;
 }
 """
@@ -2036,23 +2036,15 @@ def _percpu_sum(table, key=0):
 # un punto di misura
 # ==========================================================================
 def _read_u64(table, key):
-    try:
-        v = table[ct.c_int(key)]
-        if isinstance(v, (bytes, bytearray)):      # a pinned map (aot)
-            return int.from_bytes(v, "little")
-        return int(v.value)
-    except Exception:
-        return 0
+    """A counter, summed over every CPU (pkt_stats/cls_stats are per-CPU)."""
+    from stats_maps import read_counter
+    return read_counter(table, key)
 
 
 def _zero_counters(setup, rx_tab, n_out):
-    for c in range(n_out):
-        try:
-            setup["cls_stats"][ct.c_int(c)] = ct.c_ulonglong(0)
-        except Exception:
-            break
-    for k in range(len(setup["pkt_stats"])):
-        setup["pkt_stats"][ct.c_int(k)] = ct.c_ulonglong(0)
+    from stats_maps import zero_all
+    zero_all(setup["cls_stats"], min(n_out, len(setup["cls_stats"])))
+    zero_all(setup["pkt_stats"])
     rx_tab.clear()
 
 
@@ -3780,9 +3772,9 @@ def make_tg_links(n, gen_queues=1, dut_queues=1):
     Tutte alimentano lo STESSO programma XDP, quindi il carico offerto scala
     con i core mentre la cosa sotto test resta un programma con le sue mappe --
     ed e' anche cio' che rende la misura interessante e non solo piu' grande:
-    pkt_stats e cls_stats sono BPF_ARRAY condivisi incrementati con
-    __sync_fetch_and_add, quindi piu' core che li martellano si contendono la
-    stessa cache line.
+    pkt_stats e cls_stats sono per-CPU, quindi piu' core non si contendono
+    i contatori: quello che resta condiviso sono le mappe lette (pesi,
+    registro, tabelle d'uscita).
 
     Returns [(rx_dev, tx_dev, rx_ifindex), ...]."""
     made = []

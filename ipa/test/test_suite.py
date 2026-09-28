@@ -786,6 +786,7 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
         b, disp_fn = aot["b"], aot["disp"]
         write_vector_map(b, "link_state", [1] * _ls_size)
         V._install_mac_table(b, "mac_table", semantics=alt_sem)
+        from stats_maps import zero_counter
         ps, cs = b["pkt_stats"], b["cls_stats"]
 
         shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{n_out}"
@@ -802,10 +803,10 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
                 ingress_port=0, scale=scale)
             frame = V.build_frame_sparse(model_id=0, ttl=ttl, scale=scale, n_in=n_in, n_out=n_out)
             for i in range(3):
-                ps[ct.c_int(i)] = ct.c_ulonglong(0)
+                zero_counter(ps, i)
             for i in range(n_out):
                 try:
-                    cs[ct.c_int(i)] = ct.c_ulonglong(0)
+                    zero_counter(cs, i)
                 except Exception:
                     pass
             retval, _ = V.prog_test_run(disp_fn.fd, frame, repeat=1)

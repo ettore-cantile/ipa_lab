@@ -179,9 +179,8 @@ def run(model_id: int = 42, iface: str = None, model_ids: list = None,
         while True:
             time.sleep(1)
             try:
-                hits   = stats[stats.Key(0)].value
-                misses = stats[stats.Key(1)].value
-                drops  = stats[stats.Key(2)].value
+                from stats_maps import read_counter
+                hits, misses, drops = (read_counter(stats, i) for i in range(3))
                 print(f"\r{hits:<22} | {misses:<22} | {drops:<20}",
                       end="", flush=True)
             except Exception:

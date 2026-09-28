@@ -531,8 +531,8 @@ BPF_HASH(node_id_t2, __u32, __u32, 1);
       * MAX_N_OUT) + (__u32)(cls))
 BPF_ARRAY(class_action_t2, struct class_act,
           CLASS_ACT_MODELS * CLASS_ACT_BANKS * MAX_N_OUT);
-BPF_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
-BPF_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);   /* per-class redirect counter */
+BPF_PERCPU_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
+BPF_PERCPU_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);   /* per-class redirect counter */
 
 /* CTR_INC(): real per-packet map-lookup counter, active only when
  * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
@@ -780,8 +780,8 @@ BPF_HASH(node_id_t2, __u32, __u32, 1);
       * MAX_N_OUT) + (__u32)(cls))
 BPF_ARRAY(class_action_t2, struct class_act,
           CLASS_ACT_MODELS * CLASS_ACT_BANKS * MAX_N_OUT);
-BPF_ARRAY(pkt_stats_t2, __u64, 3);
-BPF_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);
+BPF_PERCPU_ARRAY(pkt_stats_t2, __u64, 3);
+BPF_PERCPU_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);
 #ifdef IPA_COUNT_LOOKUPS
 BPF_PERCPU_ARRAY(lookup_ctr, __u64, 1);
 static inline __attribute__((always_inline)) void ctr_inc(void) {
@@ -1090,7 +1090,7 @@ int arch_generic_2layer(struct xdp_md *ctx) {
      * means, and no other model's rows are reachable from here. */
     if (best_cls < 0 || (__u32)best_cls >= n_out) {
         int mi = 1; __u64 *mv = pkt_stats_t2.lookup(&mi);
-        if (mv) __sync_fetch_and_add(mv, 1);
+        if (mv) *mv += 1;
         return XDP_PASS;                       /* argmax outside [0, n_out) */
     }
     __u32 _ci = (__u32)best_cls;
@@ -1098,24 +1098,24 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     struct class_act *ca = class_action_t2.lookup(&_sk);
     if (!ca || ca->action == ACT_INVALID) {
         int mi = 1; __u64 *mv = pkt_stats_t2.lookup(&mi);
-        if (mv) __sync_fetch_and_add(mv, 1);
+        if (mv) *mv += 1;
         return XDP_PASS;                       /* no semantics registered */
     }
     if (ca->action == ACT_DROP) {
         int di = 2; __u64 *dv = pkt_stats_t2.lookup(&di);
-        if (dv) __sync_fetch_and_add(dv, 1);
+        if (dv) *dv += 1;
         /* The class was decided; record it. Without this a DROP is visible
          * only as a pkt_stats counter, and "the model chose the DROP class"
          * cannot be told apart from "the program never reached argmax". */
         __u64 *dcv = cls_stats_t2.lookup(&_ci);
-        if (dcv) __sync_fetch_and_add(dcv, 1);
+        if (dcv) *dcv += 1;
         return XDP_DROP;
     }
     if (ca->action != ACT_FORWARD) {           /* ACT_UNUSED */
         __u64 *ucv = cls_stats_t2.lookup(&_ci);
-        if (ucv) __sync_fetch_and_add(ucv, 1);
+        if (ucv) *ucv += 1;
         int mi = 1; __u64 *mv = pkt_stats_t2.lookup(&mi);
-        if (mv) __sync_fetch_and_add(mv, 1);
+        if (mv) *mv += 1;
         return XDP_PASS;
     }
 
@@ -1132,21 +1132,21 @@ int arch_generic_2layer(struct xdp_md *ctx) {
          * ipa_ttl_dec() comment: counted as MISS and passed to the kernel. */
         if (ip->ttl <= 1) {
             int ti = 1; __u64 *tv = pkt_stats_t2.lookup(&ti);
-            if (tv) __sync_fetch_and_add(tv, 1);
+            if (tv) *tv += 1;
             return XDP_PASS;
         }
         ipa_ttl_dec(ip);
         int si = 0; __u64 *v = pkt_stats_t2.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
+        if (v) *v += 1;
         __u64 *cv = cls_stats_t2.lookup(&_ci);   /* keyed by CLASS */
-        if (cv) __sync_fetch_and_add(cv, 1);
+        if (cv) *cv += 1;
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     }
     /* no mac_table entry for that LOGICAL PORT (link down / not provisioned) */
     int si = 1; __u64 *v = pkt_stats_t2.lookup(&si);
-    if (v) __sync_fetch_and_add(v, 1);
+    if (v) *v += 1;
     return XDP_PASS;
 }
 """

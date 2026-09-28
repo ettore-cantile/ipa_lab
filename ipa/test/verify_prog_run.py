@@ -635,8 +635,8 @@ void ipa_ttl_dec(struct iphdr *iph) {
 }
 
 BPF_ARRAY(mac_table, struct fwd_action, 8);
-BPF_ARRAY(pkt_stats, __u64, 3);
-BPF_ARRAY(cls_stats, __u64, 7);
+BPF_PERCPU_ARRAY(pkt_stats, __u64, 3);
+BPF_PERCPU_ARRAY(cls_stats, __u64, 7);
 
 /* CTR_INC(): real per-packet map-lookup counter, active only when
  * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
@@ -697,20 +697,20 @@ int xdp_baseline(struct xdp_md *ctx) {
          * update into the "cost of the neural network" subtraction. */
         if (ip->ttl <= 1) {
             int ti = 1; __u64 *tv = pkt_stats.lookup(&ti);
-            if (tv) __sync_fetch_and_add(tv, 1);
+            if (tv) *tv += 1;
             return XDP_PASS;
         }
         ipa_ttl_dec(ip);
         int si = 0; __u64 *v = pkt_stats.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
+        if (v) *v += 1;
         __u64 *cv = cls_stats.lookup(&cls);
-        if (cv) __sync_fetch_and_add(cv, 1);
+        if (cv) *cv += 1;
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     }
     int mi = 1; __u64 *mv = pkt_stats.lookup(&mi);
-    if (mv) __sync_fetch_and_add(mv, 1);
+    if (mv) *mv += 1;
     return XDP_PASS;
 }
 """
@@ -776,8 +776,8 @@ void ipa_ttl_dec(struct iphdr *iph) {
 }
 
 BPF_ARRAY(mac_table, struct fwd_action, 8);
-BPF_ARRAY(pkt_stats, __u64, 3);
-BPF_ARRAY(cls_stats, __u64, 7);
+BPF_PERCPU_ARRAY(pkt_stats, __u64, 3);
+BPF_PERCPU_ARRAY(cls_stats, __u64, 7);
 BPF_PROG_ARRAY(tail_progs, 2);
 
 /* SAME parse + SAME action as xdp_baseline (EBPF_BASELINE), but the action is
@@ -804,7 +804,7 @@ int xdp_baseline_dispatch(struct xdp_md *ctx) {
     tail_progs.call(ctx, 0);
     /* fallthrough only if the tail call itself failed to attach */
     int mi = 1; __u64 *mv = pkt_stats.lookup(&mi);
-    if (mv) __sync_fetch_and_add(mv, 1);
+    if (mv) *mv += 1;
     return XDP_PASS;
 }
 
@@ -829,20 +829,20 @@ int xdp_baseline_action(struct xdp_md *ctx) {
          * update into the "cost of the neural network" subtraction. */
         if (ip->ttl <= 1) {
             int ti = 1; __u64 *tv = pkt_stats.lookup(&ti);
-            if (tv) __sync_fetch_and_add(tv, 1);
+            if (tv) *tv += 1;
             return XDP_PASS;
         }
         ipa_ttl_dec(ip);
         int si = 0; __u64 *v = pkt_stats.lookup(&si);
-        if (v) __sync_fetch_and_add(v, 1);
+        if (v) *v += 1;
         __u64 *cv = cls_stats.lookup(&cls);
-        if (cv) __sync_fetch_and_add(cv, 1);
+        if (cv) *cv += 1;
         __builtin_memcpy(eth->h_source, action->src_mac, 6);
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     }
     int mi = 1; __u64 *mv = pkt_stats.lookup(&mi);
-    if (mv) __sync_fetch_and_add(mv, 1);
+    if (mv) *mv += 1;
     return XDP_PASS;
 }
 """
@@ -1111,28 +1111,16 @@ def _count_lookups_defaults(ttl, repeat):
 
 
 def _read_u64(table, key_val):
-    try:
-        v = table[ct.c_int(key_val)]
-        if isinstance(v, (bytes, bytearray)):      # a pinned map (P1, AOT)
-            return int.from_bytes(v, "little")
-        return int(v.value)
-    except Exception:
-        try:
-            return int(table[ct.c_uint32(key_val)].value)
-        except Exception:
-            return 0
+    """A counter, summed over every CPU (pkt_stats/cls_stats are per-CPU)."""
+    from stats_maps import read_counter
+    return read_counter(table, key_val)
 
 def _reset_stats(setup, n_classes=7):
-    ps = setup["pkt_stats"]
-    for i in range(3):
-        ps[ct.c_int(i)] = ct.c_ulonglong(0)
+    from stats_maps import zero_all
+    zero_all(setup["pkt_stats"], 3)
     cs = setup.get("cls_stats")
     if cs is not None:
-        for i in range(n_classes):
-            try:
-                cs[ct.c_uint32(i)] = ct.c_ulonglong(0)
-            except Exception:
-                pass
+        zero_all(cs, min(n_classes, len(cs)))
 
 XDP_PASS = 2
 XDP_REDIRECT_PASS = frozenset({0, 4})

@@ -1232,15 +1232,16 @@ def _decide(b, disp_fd, n_in, n_out, ttl, links):
     from verify_prog_run import (prog_test_run, build_frame_sparse,
                                  _read_u64)
     from common import write_vector_map
+    from stats_maps import zero_counter
     # Sizes come from the maps, not from literals here. pkt_stats has 3
     # entries (hit / miss / drop) and cls_stats has n_out; writing range(4)
     # into the first of them raised `IndexError: Array index out of range`
     # from BCC, which is the right error for the wrong reason: the number was
     # never this file's to know.
     for c in range(len(b["cls_stats"])):
-        b["cls_stats"][ct.c_int(c)] = ct.c_ulonglong(0)
+        zero_counter(b["cls_stats"], c)
     for k in range(len(b["pkt_stats"])):
-        b["pkt_stats"][ct.c_int(k)] = ct.c_ulonglong(0)
+        zero_counter(b["pkt_stats"], k)
     write_vector_map(b, "link_state", list(links))
     frame = build_frame_sparse(model_id=0, ttl=ttl, scale=SCALE,
                                n_in=n_in, n_out=n_out)

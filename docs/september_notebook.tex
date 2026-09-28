@@ -2541,6 +2541,13 @@ per misurare il costo per core: una scheda di rete vera distribuisce i pacchetti
 su più code e più core (RSS), e la capacità del nodo cresce con il numero di
 core, mentre il costo per pacchetto resta quello misurato qui.
 
+Perché la capacità cresca davvero con i core, i core non devono contendersi
+niente di scritto a ogni pacchetto. Per questo i contatori delle pipeline
+(pacchetti inoltrati, persi, scartati, e uno per classe) sono \textbf{per-core}:
+ogni core incrementa la sua copia, senza istruzioni atomiche, e chi legge somma
+le copie. Un contatore unico incrementato da più core costringerebbe i core a
+passarsi a ogni pacchetto la stessa riga di cache.
+
 \begin{lezione}
 Per tutte e cinque la perdita è \textbf{all'ingresso}: il collo di bottiglia è il
 programma eBPF, non la trasmissione. Il ritardo cresce fino a una perdita, come

@@ -849,6 +849,10 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
   scheduler: a pieno carico ogni thread tiene la CPU per una fetta intera (millisecondi)
   mentre le altre code (256 descrittori) traboccano. `veth` è LLTX e il `ptr_ring` serializza
   i produttori col suo `producer_lock`: la contesa la paga il generatore, che ha margine.
+- **Contatori per-CPU**: `pkt_stats` e `cls_stats`, in tutte le pipeline e nella baseline,
+  sono `PERCPU_ARRAY`: ogni core incrementa la sua copia, senza istruzioni atomiche e senza
+  contendersi una riga di cache quando i pacchetti arrivano su più code. I lettori sommano i
+  core (`ipa/stats_maps.py`).
 - **Tre punti di conteggio**: TX (pktgen, più i respinti da `veth_xmit` a coda piena), HIT
   (`pkt_stats[0]` della pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è
   arrivato al programma, HIT − RX ciò che il programma ha elaborato e non è uscito.

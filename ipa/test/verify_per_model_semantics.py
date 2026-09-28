@@ -211,10 +211,8 @@ class Harness:
         return n_out, rows
 
     def _u64(self, t, k):
-        try:
-            return int(t[ct.c_uint32(k)].value)
-        except Exception:
-            return 0
+        from stats_maps import read_counter
+        return read_counter(t, k)
 
     def observe(self, model_id, ttl):
         """(action, port, class) the program actually produced."""

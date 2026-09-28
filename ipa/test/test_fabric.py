@@ -134,19 +134,9 @@ def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30,
     return found
 
 def _counter_snapshot(m, n):
-    """Current values of a BPF_ARRAY, as a plain list."""
-    out = []
-    for i in range(n):
-        try:
-            v = m[ct.c_int(i)]
-        except Exception:
-            out.append(0)
-            continue
-        if isinstance(v, (bytes, bytearray)):     # a pinned map (AOT deploy)
-            out.append(int.from_bytes(v, "little"))
-        else:
-            out.append(int(getattr(v, "value", v)))
-    return out
+    """Current values of a counter array, summed over CPUs, as a list."""
+    from stats_maps import read_counter
+    return [read_counter(m, i) for i in range(n)]
 
 
 def _delta(before, after):
