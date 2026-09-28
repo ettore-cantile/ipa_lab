@@ -441,7 +441,20 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 
 /* Explicit signed cast so arithmetic is correct after __u8 storage */
 #define WEIGHT(p) ((__s8)(*p))
-#define RELU(x)  ((x) > 0 ? (x) : 0)
+/* ReLU without a conditional jump, the same helper as P1 (gen_full_c.py) and
+ * P2 (ebpf_template_arch.py). As `(x) > 0 ? (x) : 0` it was one jump per
+ * neuron, which the verifier walks on both sides; in P2 and P1 that alone
+ * pushed the verifier past its 1 000 000-instruction budget (see
+ * docs/september_notebook, "Un bivio per ogni neurone"). P3 loaded anyway, and
+ * uses the same form so that the three pipelines compute the activation with
+ * the same instructions. x >> 63 is -1 for a negative x and 0 otherwise, so
+ * x & ~m is x or 0. The empty asm hides m from clang, which would otherwise
+ * recognise smax(x, 0) and emit the jump again. */
+static __always_inline long long ipa_relu(long long x) {
+    long long m = x >> 63;
+    asm volatile("" : "+r"(m));
+    return x & ~m;
+}
 
 /* Metadata slot indices */
 #define META_MODEL_ID    0
@@ -887,7 +900,7 @@ int layer_first(struct xdp_md *ctx) {
         if (last_key) {
             if (out[j] > best_val) { best_val = out[j]; best_cls = j; }
         } else {
-            out[j] = RELU(out[j]);
+            out[j] = ipa_relu(out[j]);
         }
     }
 
@@ -1000,7 +1013,7 @@ int layer_hidden(struct xdp_md *ctx) {
         if (is_last) {
             if (acc > best_val) { best_val = acc; best_cls = j; }
         } else {
-            out[j] = RELU(acc);
+            out[j] = ipa_relu(acc);
         }
     }
 

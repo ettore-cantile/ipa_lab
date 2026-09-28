@@ -1272,6 +1272,203 @@ era impossibile è diventata una riga di tabella --- 11 letture per P2, 29 per P
 --- senza che nessuno abbia riscritto il contatore.
 
 % ==================================================================
+\chapter{Un bivio per ogni neurone (28 settembre)}
+\label{ch:relu}
+
+\section{Il sintomo}
+
+Sulla macchina di laboratorio due cose smettevano di caricarsi:
+
+\begin{itemize}
+  \item \textbf{P2 con tre o più strati nascosti}: rifiutata dal verificatore;
+  \item \textbf{P1 oltre qualche centinaio di pesi}: rifiutata anche lei, e prima
+        la forma larga.
+\end{itemize}
+
+In entrambi i casi il messaggio era lo stesso:
+
+\begin{lstlisting}
+BPF program is too large. Processed 1000001 insn
+\end{lstlisting}
+
+Nella macchina virtuale P2 si caricava fino a sei strati. Il sorgente era lo
+stesso, quindi la prima spiegazione è stata "cambia il kernel". Era sbagliata.
+
+\section{Che cosa fa il verificatore}
+
+Prima di accettare un programma eBPF, il kernel lo fa controllare dal
+\textbf{verificatore}. Il verificatore non esegue il programma su un pacchetto
+vero: lo percorre \emph{su tutte le strade possibili}, per essere sicuro che
+nessuna faccia qualcosa di proibito. Ogni \texttt{if} è un bivio, e il
+verificatore prende tutti e due i rami. Ha però un budget: \textbf{un milione di
+passi}. Finito il budget, rifiuta il programma, per quanto corto sia.
+
+Il programma P2 a tre strati ha circa 16\,000 istruzioni: il verificatore ne
+percorreva un milione. Stava rileggendo gli stessi pezzi di codice molte volte,
+una per ogni strada.
+
+\section{Dove stavano i bivi: la ReLU}
+
+Ogni neurone nascosto applica la ReLU: \emph{se il valore è positivo tienilo,
+altrimenti metti zero}. Nel codice era scritta esattamente così:
+
+\begin{lstlisting}
+h = a > 0 ? a : 0;        // un if: due strade
+\end{lstlisting}
+
+Un bivio per neurone. Con tre neuroni in fila le strade sono
+\[
+  2 \times 2 \times 2 = 8 ,
+\]
+una per ogni combinazione di "positivo / negativo":
+
+\begin{center}
+\small
+\begin{tabular}{@{}cccc@{}}
+\toprule
+\textbf{neurone 1} & \textbf{neurone 2} & \textbf{neurone 3} & \\
+\midrule
+$+$ & $+$ & $+$ & strada 1 \\
+$+$ & $+$ & $-$ & strada 2 \\
+$+$ & $-$ & $+$ & strada 3 \\
+\multicolumn{3}{c}{\dots} & \dots \\
+$-$ & $-$ & $-$ & strada 8 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Con i 16 neuroni del modello largo di P1 sono $2^{16} = 65\,536$ strade. Il
+verificatore ha un meccanismo per riconoscere due strade "equivalenti" e
+percorrerne una sola (la \emph{potatura}), ma qui riusciva a riunirne poche: i
+numeri qui sotto dicono che la gran parte delle strade veniva percorsa per
+intero.
+
+Il verificatore scrive quanti passi ha fatto, se glielo si chiede
+(\texttt{diag\_verifier.py}, statistiche con \texttt{log\_level = 4}). Il P1
+largo, 3\,486 istruzioni, arrivava al milione: \textbf{287 volte} la sua
+lunghezza. P2 a \emph{uno} strato era già a 799\,563 passi, l'80\% del budget. Il
+margine era così piccolo che una differenza qualsiasi fra due kernel bastava a
+superarlo: per questo nella macchina virtuale passava e qui no.
+
+\section{La correzione: la ReLU senza bivio}
+
+La ReLU si può calcolare con sola aritmetica, senza \texttt{if}:
+
+\begin{lstlisting}
+m = a >> 63;              // tutti 1 se a e' negativo, tutti 0 altrimenti
+h = a & ~m;               // a se positivo, 0 se negativo
+\end{lstlisting}
+
+Lo spostamento a destra di 63 posizioni di un intero con segno a 64 bit
+"ricopia" il bit del segno su tutti i bit. Due esempi, mostrati su 8 bit per
+leggibilità (a 64 bit è identico):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+& \textbf{$a = 5$} & \textbf{$a = -3$} \\
+\midrule
+$a$ in bit & \texttt{00000101} & \texttt{11111101} \\
+$m = a \gg 63$ & \texttt{00000000} & \texttt{11111111} \\
+$\sim m$ & \texttt{11111111} & \texttt{00000000} \\
+$a \mathbin{\&} \sim m$ & \texttt{00000101} $= 5$ & \texttt{00000000} $= 0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Con $a$ positivo la maschera lascia passare tutto e resta $a$; con $a$ negativo
+la maschera azzera tutto. È la ReLU, \textbf{bit per bit la stessa}, ma senza
+bivio: il verificatore ha una strada sola da percorrere.
+
+\subsection*{Il dettaglio che la fa funzionare}
+
+Scritta così e basta, non cambia niente: clang riconosce che
+\texttt{a \& \textasciitilde(a >> 63)} è "il massimo fra $a$ e 0" e, per
+ottimizzare, \textbf{rimette il bivio}. Nel bytecode compilato i salti tornano
+tutti (136 contro 120 nel P1 largo). Serve una riga che impedisca a clang di
+vedere dentro la maschera:
+
+\begin{lstlisting}
+static __always_inline long long ipa_relu(long long a) {
+    long long m = a >> 63;
+    asm volatile("" : "+r"(m));   // barriera: nessuna istruzione, m invariato
+    return a & ~m;
+}
+\end{lstlisting}
+
+L'\texttt{asm} è vuoto: non produce nessuna istruzione e non cambia $m$. Dice
+solo a clang "di $m$ non sai niente", e clang non può più riconoscere il
+massimo. La funzione è la stessa in P1 (\texttt{gen\_full\_c.py}), in P2 (il
+leaf di \texttt{ebpf\_template\_arch.py}) e in P3 (\texttt{ebpf\_modular.py}). P3
+caricava anche prima, perché ripete un solo strato generico: la ReLU è cambiata
+anche lì perché le tre pipeline calcolino l'attivazione con le stesse
+istruzioni, e il confronto fra loro resti alla pari.
+
+\section{Il risultato}
+
+Passi del verificatore, su un budget di 1\,000\,000:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{ReLU con bivio} & \textbf{ReLU senza bivio} \\
+\midrule
+P2, 1 strato & 799\,563 & 120\,452 \\
+P2, 2 strati & 417\,292 & 120\,557 \\
+P2, 3 strati & \emph{rifiutata} & 127\,906 \\
+P2, 6 strati & \emph{rifiutata} & 136\,642 \\
+P2, 20 strati & \emph{rifiutata} & 201\,528 \\
+\midrule
+P1 larga, 1$\times$16 ($\sim$1\,200 pesi) & \emph{rifiutata} & 5\,698 \\
+P1 profonda, 8$\times$9 ($\sim$1\,300 pesi) & 229\,039 & 8\,516 \\
+\midrule
+P3, \texttt{layer\_first} & 27\,183 & 26\,755 \\
+P3, \texttt{layer\_hidden} & 186\,489 & 27\,979 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Adesso P2 carica fino a venti strati, e a sei ne usa il 14\% del budget. P1
+carica il tier da $\sim$1\,200 pesi in tutte le forme. P3 caricava già, ma lo
+strato che ripete (\texttt{layer\_hidden}) costava al verificatore 117 volte la
+sua lunghezza: ora 17. \texttt{layer\_first} quasi non cambia, perché la sua
+ReLU è una parte piccola di un programma dominato dalla lettura degli ingressi.
+
+\subsection*{Il nuovo limite di P2 non è il verificatore}
+
+Oltre venti strati è \textbf{clang} a fermarsi, prima ancora del kernel:
+
+\begin{lstlisting}
+LLVM ERROR: Branch target out of insn range
+\end{lstlisting}
+
+Un salto eBPF può arrivare al massimo a 32\,767 istruzioni di distanza. I
+controlli all'inizio del programma (\emph{se il pacchetto non va bene, esci})
+saltano fino in fondo, e ogni strato allunga il programma di circa mille
+istruzioni: a venti strati il programma ne ha 32\,388, appena sotto. Il terzo
+limite è la tabella dei pesi, 1\,024 posti: 37 strati al massimo a larghezza 4,
+7 a larghezza 8.
+
+\section{Che cosa costa}
+
+Il calcolo della rete è identico: i test che confrontano il C di P1 con il
+riferimento Python danno gli stessi logit su ogni modello sintetico
+(\texttt{test\_synth.py}), e \texttt{p1\_c\_eval.py} ora valuta anche
+\texttt{ipa\_relu} leggendone il corpo. Cambiano invece le istruzioni: circa tre
+per neurone al posto di due, in cambio di nessun salto. Il numero di istruzioni
+di P1 e P2 si sposta di qualche punto percentuale, e la latenza va rimisurata.
+
+\begin{lezione}
+"Cambia il kernel" era una spiegazione comoda e sbagliata. Il programma
+lavorava già all'80\% del budget di verifica, e il colpevole era una riga: un
+\texttt{if} per neurone. Come nel capitolo precedente, il verificatore non paga
+le istruzioni ma le \textbf{strade}: togliere un bivio vale più che togliere
+cento istruzioni.
+\end{lezione}
+
+% ==================================================================
 \chapter{I numeri, e che cosa dicono davvero}
 
 \section{La tabella}
@@ -1421,8 +1618,9 @@ verifica}, che è un limite diverso e cresce col \textbf{prodotto} dei tetti:
   \text{costo di verifica} \;\sim\; H_{\max} \times F_{\max} \times N_{\max} .
 \]
 
-Lo stesso limite ferma oggi P2 oltre due strati nascosti, e la P1 oltre qualche
-centinaio di pesi (capitolo seguente).
+Lo stesso limite fermava P2 oltre due strati nascosti, e la P1 oltre qualche
+centinaio di pesi, finché la ReLU non ha perso il suo bivio (capitolo
+\ref{ch:relu}).
 
 \begin{lezione}
 È la misura concreta di quanto un programma "generico" possa esserlo. La
@@ -1556,15 +1754,18 @@ Tre accortezze che cambiano i risultati, non solo la forma:
 
 \begin{lezione}
 \textbf{P3 ha la stessa dimensione da uno a sei strati}: 12\,318 istruzioni in
-ogni punto. P2 invece \textbf{oltre due strati non si carica}: il verificatore
-la rifiuta (\emph{E2BIG}).
+ogni punto. P2 invece, nella misura qui sopra, \textbf{oltre due strati non si
+caricava}: il verificatore la rifiutava (\emph{E2BIG}). La causa era la ReLU, e
+dal 28 settembre P2 carica fino a venti strati (capitolo \ref{ch:relu}); i
+grafici vanno rifatti.
 \end{lezione}
 
 P3 srotola \emph{un} solo strato denso generico e ci rientra a ogni passo della
 rete, quindi la profondità non entra nel programma. P2 deve srotolarli tutti,
 perché è un programma solo: con uno e due strati carica (14\,676 e 14\,969
-istruzioni), con tre o più il verificatore si arrende. La causa precisa --- quale
-limite --- va letta nel registro del verificatore, e non è ancora stata letta.
+istruzioni), con tre o più il verificatore si arrendeva. La causa, letta poi
+nelle statistiche del verificatore, era un bivio in ogni ReLU (capitolo
+\ref{ch:relu}).
 
 \begin{center}
 \includegraphics[width=0.92\textwidth]{figures/scaling_depth_latency.pdf}
@@ -1579,8 +1780,8 @@ strato.
 Le due figure hanno la \emph{stessa} causa vista dai due lati. P3 è più piccolo
 \textbf{perché} riusa un pezzo, ed è più lento \textbf{perché} riusarlo costa
 un salto e delle letture ogni volta. È il compromesso della modularità, ridotto
-a due numeri. E la profondità è anche la dimensione in cui P3 è generica e P2
-no, nel senso più elementare: P2 oltre due strati non si carica.
+a due numeri. La differenza vera sulla profondità resta un'altra: P3 cambia
+profondità senza ricompilare, P2 deve ricompilare il programma.
 
 \section{Aggiornare il modello: con l'oggetto precompilato, pari}
 
@@ -1679,7 +1880,9 @@ libbpf: prog 'xdp_model': failed to load: -7
 
 Non è lo stack: è lo stesso limite di complessità di verifica del capitolo
 precedente. Sugli altri ingressi, a quel budget, non carica nessuna forma; a
-$\sim$4\,700 pesi nemmeno.
+$\sim$4\,700 pesi nemmeno. \textbf{Aggiornamento del 28 settembre}: la causa era un
+bivio in ogni ReLU, e con la ReLU senza bivio il tier da $\sim$1\,200 pesi carica
+in tutte le forme (capitolo \ref{ch:relu}); questa sezione va rimisurata.
 
 \begin{lezione}
 La frase giusta non è "le reti larghe sono preferibili a quelle profonde". È:
@@ -1975,7 +2178,7 @@ soffitti \emph{prima} di compilare e segna la cella \textsc{rifiutato}.
 gira nel proprio sottoprocesso: la cella esce \textsc{crash} e lo sweep continua.
 
 \textbf{Più di due strati su Pipeline 2}: rifiutata dal verificatore, come
-sull'asse della profondità.
+sull'asse della profondità (fino al 28 settembre, capitolo \ref{ch:relu}).
 
 % ------------------------------------------------------------------
 \section{Il problema: le MAC nominali non predicono la latenza}
@@ -2580,13 +2783,16 @@ la frequenza era quella che capitava.
 \subsection*{Che cosa è peggiorato, o è diventato un limite}
 
 \begin{itemize}
-  \item \textbf{P2 oltre due strati nascosti non si carica più.} Nella macchina
+  \item \textbf{P2 oltre due strati nascosti non si caricava più.} Nella macchina
         virtuale si caricava fino a sei strati (da 14\,668 a 18\,801 istruzioni); qui
-        il verificatore la rifiuta da tre strati in su. Il sorgente di P2 è lo stesso:
-        cambia il kernel, e con lui il verificatore.
+        il verificatore la rifiutava da tre strati in su. La causa non era il kernel
+        ma il codice: ogni ReLU era un salto condizionale, e già a uno strato il
+        verificatore percorreva 800\,000 istruzioni su un limite di un milione.
+        Con la ReLU senza salto (28 settembre) P2 carica fino a sei strati.
   \item \textbf{P1 a $\sim$1\,200 pesi, lo stesso.} Sull'ingresso di IPA prima si caricavano tutte le
-        forme, dalla larga alla profonda (122--293~ns); oggi passa solo quella a otto
-        strati.
+        forme, dalla larga alla profonda (122--293~ns); qui passava solo quella a otto
+        strati. Stessa causa di P2, stessa correzione: con la ReLU senza salto il
+        tier B carica in tutte le forme.
   \item \textbf{Il portatile scalda.} Oltre 3,5~GHz non regge un run intero, quindi
         il banco non può usare il turbo.
   \item \textbf{Serve più preparazione}: la frequenza scritta nel sistema non è
@@ -2597,8 +2803,11 @@ la frequenza era quella che capitava.
 
 \begin{lezione}
 Nessuna misura è peggiorata. Sono peggiorati due \textbf{limiti di
-caricamento}, e dipendono dal kernel, non dal codice: il confine di ciò che P1 e
-P2 possono rappresentare va dichiarato insieme al kernel su cui è stato misurato.
+caricamento}, e sembravano dipendere dal kernel. Le statistiche del verificatore
+(\texttt{diag\_verifier.py}) hanno detto altro: i programmi lavoravano già vicino al
+limite di complessità, per colpa di un salto condizionale in ogni ReLU, e una
+piccola differenza fra kernel bastava a superarlo. Tolto il salto, il margine
+torna ampio (P2 a sei strati usa il 14\% del limite).
 \end{lezione}
 
 \section{Che cosa ha portato alla luce}
@@ -2606,10 +2815,9 @@ P2 possono rappresentare va dichiarato insieme al kernel su cui è stato misurat
 Rifare tutto su una macchina ferma ha trovato cose che il rumore nascondeva:
 
 \begin{itemize}
-  \item \textbf{P2 oltre due strati nascosti non si carica} (capitolo precedente):
-        il verificatore la rifiuta.
-  \item \textbf{P1 oltre qualche centinaio di pesi} tocca il limite di complessità
-        del verificatore, e la forma larga ci arriva prima.
+  \item \textbf{P2 oltre due strati nascosti non si caricava}, e \textbf{P1 oltre
+        qualche centinaio di pesi} nemmeno: la causa comune, un bivio in ogni ReLU,
+        è nel capitolo \ref{ch:relu}.
   \item \textbf{Le porte assenti} costano un nanosecondo ciascuna, e ora si vede;
         \textbf{congelare il nodo} vale il 16\% di latenza, e ora si vede.
   \item \textbf{Scartare costa più che inoltrare} sul banco a pacchetti grezzi.
@@ -2823,17 +3031,17 @@ In tre righe:
 \item \textbf{banco del bit rate}: dove comincia la perdita, e da che parte;
 \item \textbf{la macchina sotto controllo} (capitolo \ref{ch:macchina}): misure
       ripetibili entro pochi punti, frequenza vera misurata, niente respinti sotto
-      capacità, e tutto rifatto con due script.
+      capacità, e tutto rifatto con due script;
+\item \textbf{ReLU senza bivio} in P1, P2 e P3 (capitolo \ref{ch:relu}): P2 carica
+      fino a venti strati invece di due, P1 carica il tier da $\sim$1\,200 pesi.
 \end{itemize}
 
 \section{Aperto}
 
 \begin{itemize}
-\item \textbf{Perché P2 non va oltre due strati}: il verificatore la rifiuta
-      (\emph{E2BIG}); quale limite, lo dice il suo registro, che non è ancora
-      stato letto.
-\item \textbf{P1 oltre qualche centinaio di pesi}: stesso limite di complessità.
-      Da capire se una forma diversa del codice generato lo sposta.
+\item \textbf{Rimisurare le tre pipeline con la ReLU senza bivio} (capitolo
+      \ref{ch:relu}): istruzioni e latenze cambiano di poco, e sugli assi della
+      profondità e del budget di pesi compaiono punti che prima non caricavano.
 \item \textbf{Il costo del nodo delle pipeline leggere} con pacchetti grezzi: il
       banco non le satura. Servono più thread di generatore e più di un core per il
       nodo successivo.

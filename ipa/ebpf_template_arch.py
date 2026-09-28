@@ -606,7 +606,18 @@ _ARCH_LEAF_TEMPLATE = r"""
 #define FEAT_TTL         0x03
 #define FEAT_NODE_ID     0x04
 #define FEAT_QUEUE_OCC   0x05
-#define RELU(x)  ((x) > 0 ? (x) : 0)
+/* ReLU without a conditional jump. As `(x) > 0 ? (x) : 0` it compiled to one
+ * jump per neuron, and the verifier walked each on both sides: 1 hidden
+ * layer processed 799 563 instructions, 2 layers 417 292, 3 or more hit the
+ * 1 000 000 limit (E2BIG). With this, 120 000-137 000 from 1 to 6 layers
+ * (ipa/test/diag_verifier.py). x >> 63 is -1 for a negative x and 0
+ * otherwise, so x & ~m is x or 0. The empty asm hides m from clang, which
+ * would otherwise recognise smax(x, 0) and emit the jump again. */
+static __always_inline long long ipa_relu(long long x) {
+    long long m = x >> 63;
+    asm volatile("" : "+r"(m));
+    return x & ~m;
+}
 
 #ifndef IPA_ARCH_COMBINED
 #include <uapi/linux/if_ether.h>
@@ -1043,7 +1054,7 @@ int arch_generic_2layer(struct xdp_md *ctx) {
      * relies on h1[i] == 0 past the model's width. */
     #pragma unroll
     for (int j = 0; j < T2_MAX_H1; j++)
-        h1[j] = (j < n_h1) ? RELU(h1[j]) : 0LL;
+        h1[j] = (j < n_h1) ? ipa_relu(h1[j]) : 0LL;
 
 /*@FC2_BLOCK@*/
 /*@EXTRA_LAYERS@*/
@@ -1183,7 +1194,7 @@ _FC2_BLOCK = """    /* h1[i]==0 for i>=n_h1 (set above), so the inner loop can a
         for (int i = 0; i < T2_MAX_H1; i++) {
             acc += h1[i] * AW_W(AW, woff + fc2_w_off + j * n_h1 + i);
         }
-        h2[j] = RELU(acc);
+        h2[j] = ipa_relu(acc);
     }
 
 """
@@ -1221,7 +1232,7 @@ def build_arch_leaf(n_hidden: int = 2) -> str:
             #pragma unroll
             for (int i = 0; i < T2_MAX_H2; i++)
                 acc += h2[i] * AW_W(AW, woff + xw_off + j * n_h2 + i);
-            hx[j] = RELU(acc);
+            hx[j] = ipa_relu(acc);
         }}
         #pragma unroll
         for (int j = 0; j < T2_MAX_H2; j++) h2[j] = hx[j];

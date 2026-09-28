@@ -297,7 +297,7 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
         terms = " + ".join(tf(j) for tf in term_fns)
         A(f"    long long a1_{j} = {terms} + {_lit(fc1_b[j])}LL;")
         A(f"    long long {first}_{j} = "
-          + (f"a1_{j} > 0 ? a1_{j} : 0;" if n_hidden else f"a1_{j};"))
+          + (f"ipa_relu(a1_{j});" if n_hidden else f"a1_{j};"))
 
     # --- remaining layers: hidden ones with ReLU, output layer without ---
     prev = [f"{first}_{j}" for j in range(n_h1)]
@@ -321,7 +321,7 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
                 A(f"    long long {pfx}_{j} = {terms} + {_lit(int(B[j]) * bmul)}LL;")
             else:
                 A(f"    long long a{li+1}_{j} = {terms} + {_lit(int(B[j]) * bmul)}LL;")
-                A(f"    long long {pfx}_{j} = a{li+1}_{j} > 0 ? a{li+1}_{j} : 0;")
+                A(f"    long long {pfx}_{j} = ipa_relu(a{li+1}_{j});")
         prev = [f"{pfx}_{j}" for j in range(n_cur)]
 
     A("    long long best_val = o_0; int best_cls = 0;")
@@ -488,6 +488,19 @@ def _emit_arch(shape, w, scale: int = 1, semantics=None, static_node=None,
     A("    _c += (__u32)bpf_htons(0x0100);")
     A("    iph->check = (__u16)(_c + (_c >= 0xFFFF));")
     A("    iph->ttl--;")
+    A("}")
+    A("")
+    A("/* ReLU without a conditional jump. Written `a > 0 ? a : 0` it compiled")
+    A(" * to one jump per neuron, and the verifier walked each on both sides:")
+    A(" * a 1x16 model processed 1 000 001 instructions for a 3 486-instruction")
+    A(" * program and was refused (E2BIG); this way it processes 5 698")
+    A(" * (ipa/test/diag_verifier.py). a >> 63 is -1 for a negative a and 0")
+    A(" * otherwise, so a & ~m is a or 0. The empty asm hides m from clang,")
+    A(" * which would otherwise recognise smax(a, 0) and emit the jump again. */")
+    A("static __always_inline long long ipa_relu(long long a) {")
+    A("    long long m = a >> 63;")
+    A("    asm volatile(\"\" : \"+r\"(m));")
+    A("    return a & ~m;")
     A("}")
     A("")
     L.extend(_emit_maps(shape))

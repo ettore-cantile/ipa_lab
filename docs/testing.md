@@ -372,7 +372,10 @@ solo quella cella.
 **Tier B (~1 200 pesi)**: su `default` si carica solo la forma a 8 strati (**230 ns**,
 4 851 istruzioni); larga, 2 e 4 strati vengono **rifiutate dal verificatore**:
 `BPF program is too large. Processed 1000001 insn (limit 1000000)`, errore −7 (`E2BIG`) su
-`xdp_model`. Non è lo stack: è il limite di **complessità di verifica**. Su `no_onehot` e
+`xdp_model`. Non è lo stack: è il limite di **complessità di verifica**, e la causa era la
+stessa di P2 (§8): un salto per ogni ReLU. Con `ipa_relu` (dal 2026-09-28) il tier B
+carica in tutte le forme su `default` (5 698–8 516 istruzioni percorse, contro 1 000 001), e
+le celle vanno rimisurate. Su `no_onehot` e
 `small_onehot` il tier B non carica in nessuna forma (abort di clang per lo stack o lo
 stesso limite del verificatore). **Tier C (~4 700 pesi)**: nessuna forma carica.
 
@@ -413,12 +416,43 @@ il resto — le letture di mappa che ricostruiscono il contesto a ogni hop.
 compilati separatamente, verificati contro `ref_infer_sparse` (5/5 ciascuna); P2 65-6-5-7 e
 P3 65-5-6-4-7 registrati **insieme** al modello reale nello stesso oggetto (PASS).
 
-**Il limite di profondità di P2.** Su questo kernel P2 carica solo foglie con **al più due
-strati nascosti**: con tre o più `arch_generic_2layer` viene rifiutato dal verificatore
-(`Argument list too long`, `E2BIG`) — sull'asse `depth` di §9 (3–6 strati), su `isoparam`
-(3–5), sulla campagna (`depth_camp` 3–4) e sullo scenario sintetico `deep`. P3, che riusa
-un layer generico con i tail call, non ha questo limite (fino a 6 strati misurati). La causa
-precisa va letta nel log del verificatore.
+**Il limite di profondità di P2, e la sua causa.** Fino al 2026-09-28 P2 caricava solo foglie
+con **al più due strati nascosti**: da tre in su `arch_generic_2layer` veniva rifiutato
+(`BPF program is too large. Processed 1000001 insn`, `E2BIG`). Il programma non era troppo
+lungo (16–18 000 istruzioni): era il verificatore a percorrerne molte volte gli stessi
+blocchi. La ReLU scritta `x > 0 ? x : 0` diventava un salto condizionale per neurone, e
+il verificatore esplorava entrambi i lati di ciascuno senza riuscire a riunirli.
+`diag_verifier.py` lo misura con le statistiche del verificatore (`log_level = 4`):
+
+```bash
+sudo python3 ipa/test/diag_verifier.py      # variante `attuale` contro `salto` (la ReLU di prima)
+```
+
+| P2, istruzioni percorse (limite 1 000 000) | 1 strato | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| ReLU con salto (prima) | 799 563 | 417 292 | *rifiutato* | *rifiutato* | *rifiutato* | *rifiutato* |
+| ReLU senza salto (`ipa_relu`) | 120 452 | 120 557 | 127 906 | 127 738 | 134 413 | 136 642 |
+
+P3 caricava anche prima; con la stessa `ipa_relu` (per un confronto alla pari fra le tre
+pipeline) `layer_hidden` passa da 186 489 a 27 979 istruzioni percorse, `layer_first` da
+27 183 a 26 755 (`diag_verifier.py --only p3`).
+
+Già a uno strato P2 usava l'80% del limite: il margine era minimo, e per questo il confine
+si spostava fra macchine e versioni del kernel. `ipa_relu` calcola `x & ~(x >> 63)`: nessun
+salto, stesso risultato bit per bit. Una barriera `asm volatile("")` impedisce a clang di
+riconoscere `smax(x, 0)` e di rifarne un salto (senza, i salti tornano tutti).
+
+**Il limite di profondità di oggi** (larghezza 4, descrittore default). Il verificatore non è
+più il vincolo: 154 811 istruzioni percorse a 10 strati, 201 528 a 20 (~4 700 per strato).
+Il primo muro è la **distanza di salto**: le istruzioni di salto eBPF hanno un offset a
+16 bit (±32 767 istruzioni), e i controlli iniziali che escono con `XDP_PASS` saltano fino in
+fondo al programma. A 20 strati il leaf ha 32 388 istruzioni e compila; a 37 e 50 clang si
+ferma (`LLVM ERROR: Branch target out of insn range`). Il secondo muro è la tabella dei pesi
+(`MAX_WEIGHT_ENTRIES` = 1 024): ogni strato in più costa `n_h2² + n_h2` pesi, quindi 37 strati
+al massimo a larghezza 4 e 7 a larghezza 8, il soffitto `T2_MAX_H2`. Dichiarare le
+larghezze a runtime `__u64` invece di `__u32` aiuta poco (490 044 a uno strato), e
+azzerare anche i neuroni oltre la larghezza con una maschera fa sforare a clang lo stack
+BPF: non servono.
 
 ---
 

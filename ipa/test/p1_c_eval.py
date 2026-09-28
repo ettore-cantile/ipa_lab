@@ -19,7 +19,7 @@ This module closes that gap without a kernel. It reads the generated source
 and evaluates the model function's inference section -- feature reads, dense
 layers, argmax -- with C's integer rules: fixed widths, the usual arithmetic
 conversions, division truncating toward zero, RELU_LL expanded from its own
-#define. The numbers come from the literals in the text, never from the weight
+#define, ipa_relu evaluated from its own body. The numbers come from the literals in the text, never from the weight
 list, so a generator that emits a wrong multiplier gives a wrong answer here.
 
 What it does NOT cover: clang, the verifier, the JIT, and the packet path
@@ -31,8 +31,12 @@ never does.
 
 The subset: declarations (scalar and pointer), assignment, blocks, if/else,
 switch/case/break, map `.lookup(&key)` (BCC) and `bpf_map_lookup_elem(&map,
-&key)` (libbpf), `*p`, `p->field`, `a[i]`, casts, unary - ! * &, binary
-* / + - < > <= >= == != & && ||, and ?: .
+&key)` (libbpf), `*p`, `p->field`, `a[i]`, casts, unary - ! * & ~, binary
+* / + - >> < > <= >= == != & && ||, and ?: -- plus calls to the source's own
+one-argument `static __always_inline long long f(long long x)` helpers, whose
+bodies are evaluated in the same subset with `return`. Inside them the
+optimisation barrier `asm volatile("" : "+r"(v));` is read as a no-op: it
+emits no instruction and leaves v unchanged, it only hides v from clang.
 
 Both P1 backends are read: ebpf_program (BCC, `model_<id>`, outputs `out_k`)
 and poc_aot/gen_full_c (libbpf, `xdp_model`, outputs `o_k`) -- the AOT object
@@ -197,7 +201,8 @@ def _expand(tokens, macros, hide=frozenset()):
 # tokens -> tree
 # ---------------------------------------------------------------------------
 _BINARY = {"||": 1, "&&": 2, "&": 5, "==": 6, "!=": 6,
-           "<": 7, ">": 7, "<=": 7, ">=": 7, "+": 9, "-": 9, "*": 10, "/": 10}
+           "<": 7, ">": 7, "<=": 7, ">=": 7, ">>": 8, "+": 9, "-": 9,
+           "*": 10, "/": 10}
 
 
 class _Parser:
@@ -260,7 +265,7 @@ class _Parser:
             kind, val = self.peek()
             prec = _BINARY.get(val) if kind == "op" else None
             if prec is None or prec < min_prec:
-                if kind == "op" and val in ("<<", ">>", "|", "^", "%"):
+                if kind == "op" and val in ("<<", "|", "^", "%"):
                     raise CEvalError(f"operator {val!r} not evaluated")
                 return lhs
             self.i += 1
@@ -268,7 +273,7 @@ class _Parser:
 
     def unary(self):
         kind, val = self.peek()
-        if kind == "op" and val in ("-", "!", "*", "&"):
+        if kind == "op" and val in ("-", "!", "*", "&", "~"):
             self.i += 1
             return ("un", val, self.unary())
         if (kind, val) == ("op", "(") and self.is_type(1):
@@ -373,6 +378,11 @@ class _Parser:
             self.i += 1
             self.expect(";")
             return ("break",)
+        if (kind, val) == ("id", "return"):
+            self.i += 1
+            e = self.expr()
+            self.expect(";")
+            return ("return", e)
         if self.is_type():
             base = self.type_words()
             decls = []
@@ -461,9 +471,15 @@ class _Break(Exception):
     pass
 
 
+class _Return(Exception):
+    def __init__(self, val):
+        self.val = val
+
+
 class _Env:
-    def __init__(self, base):
+    def __init__(self, base, funcs=None):
         self.scopes = [dict(base)]
+        self.funcs = funcs or {}
 
     def push(self):
         self.scopes.append({})
@@ -509,6 +525,15 @@ def _binop(op, a, b):
         r = {"<": x < y, ">": x > y, "<=": x <= y, ">=": x >= y,
              "==": x == y, "!=": x != y}[op]
         return (int(r), "s32")
+    if op == ">>":
+        # Not the usual conversions: the result has the promoted type of the
+        # LEFT operand. A negative left operand shifts arithmetically, as
+        # clang does for BPF (implementation-defined in C).
+        t = _promote(a[1])
+        x, n = _fit(a[0], t, op), b[0]
+        if not 0 <= n < _INT[t][0]:
+            raise CEvalError(f"shift by {n} on {t} (undefined in C)")
+        return (_fit(x >> n, t, f"{x} >> {n}"), t)
     if op == "+":
         r = x + y
     elif op == "-":
@@ -573,8 +598,11 @@ def _eval(e, env):
                 raise CEvalError("* of a struct pointer not evaluated")
             return v.obj.val
         if not isinstance(v, tuple):
-            raise CEvalError("unary - of a pointer")
+            raise CEvalError(f"unary {op} of a pointer")
         t = _promote(v[1])
+        if op == "~":
+            x = _fit(v[0], t, "~")
+            return ((~x) if _INT[t][1] else _fit(~x, t, "~"), t)
         return (_fit(-_fit(v[0], t, "-"), t, "unary -"), t)
     if k == "cast":
         v = _eval(e[2], env)
@@ -612,6 +640,18 @@ def _eval(e, env):
         if not isinstance(key, _Ptr) or not isinstance(key.obj, _Cell):
             raise CEvalError("bpf_map_lookup_elem takes the address of a key")
         return m.lookup(key.obj.val[0])
+    if k == "call" and e[1][0] == "var" and e[1][1] in env.funcs:
+        param, body = env.funcs[e[1][1]]
+        if len(e[2]) != 1:
+            raise CEvalError(f"{e[1][1]} takes one argument")
+        arg = _convert(_eval(e[2][0], env), "s64", e[1][1])
+        fenv = _Env({param: ["s64", arg]}, env.funcs)
+        try:
+            for st in body:
+                _exec(st, fenv)
+        except _Return as r:
+            return _convert(r.val, "s64", f"return of {e[1][1]}")
+        raise CEvalError(f"{e[1][1]} ends without return")
     if k == "call":
         fn = _eval(e[1], env)
         if not (isinstance(fn, tuple) and fn[0] == "method") or len(e[2]) != 1:
@@ -671,6 +711,8 @@ def _exec(s, env):
             env.pop()
     elif k == "break":
         raise _Break()
+    elif k == "return":
+        raise _Return(_eval(s[1], env))
     elif k != "empty":
         raise CEvalError(f"statement {k!r} not evaluated")
 
@@ -692,6 +734,26 @@ _LIBBPF_MAP = re.compile(
 # The generator's own comments bound the section: the first opens the input
 # vector, the second opens the class dispatch that follows the argmax.
 _START = "/* Input vector built locally"
+
+# static __always_inline long long f(long long x) { ... } -- the helpers the
+# model function may call (gen_full_c's ipa_relu). Only this signature.
+_FUNC = re.compile(r"static\s+__always_inline\s+long\s+long\s+(\w+)\s*\(\s*"
+                   r"long\s+long\s+(\w+)\s*\)\s*\{(.*?)\n\}", re.S)
+# The optimisation barrier, and nothing else that contains a string: any
+# other asm leaves a '"' behind and the tokenizer refuses it.
+_BARRIER = re.compile(r'asm\s+volatile\s*\(\s*""\s*:\s*"\+r"\s*\(\s*\w+\s*\)'
+                      r'\s*\)\s*;')
+
+
+def _functions(src, macros):
+    out = {}
+    for name, param, body in _FUNC.findall(src):
+        p = _Parser(_expand(_tokenize(_BARRIER.sub(";", body)), macros))
+        stmts = []
+        while not p.done():
+            stmts.append(p.statement())
+        out[name] = (param, stmts)
+    return out
 _END = "/* --- class -> action"
 
 
@@ -728,6 +790,7 @@ class P1Program:
         self.maps.update({n: (kind.lower(), vt.strip(), int(c))
                           for kind, c, vt, n in _LIBBPF_MAP.findall(decls)})
         self.vec_sizes = {n: int(c) for n, c in _VEC.findall(decls)}
+        self.funcs = _functions(decls, self.macros)
 
         raw = _tokenize(_strip_comments(src[start:end]))
         self.used_macros = sorted({v for k, v in raw
@@ -764,13 +827,15 @@ class P1Program:
         for name, (kind, vt, n) in self.maps.items():
             base[name] = ["map", _Map(name, kind, vt, n, maps.get(name),
                                       self.vec_sizes)]
-        env = _Env(base)
+        env = _Env(base, self.funcs)
         env.push()                          # the function's own scope
         try:
             for s in self.body:
                 _exec(s, env)
         except _Break:
             raise CEvalError("break outside a switch")
+        except _Return:
+            raise CEvalError("return inside the inference section")
         scope = env.scopes[1]
         logits = [scope[f"{self.out_prefix}_{k}"][1][0] for k in range(self.n_out)]
         if "best_cls" not in scope:
