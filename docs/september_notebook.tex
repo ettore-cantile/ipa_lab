@@ -2547,6 +2547,36 @@ niente di scritto a ogni pacchetto. Per questo i contatori delle pipeline
 ogni core incrementa la sua copia, senza istruzioni atomiche, e chi legge somma
 le copie. Un contatore unico incrementato da più core costringerebbe i core a
 passarsi a ogni pacchetto la stessa riga di cache.
+Su un core solo il guadagno è piccolo: circa 8~ns per pacchetto per i programmi
+leggeri (la baseline passa da 3,31 a 3,40~Mpps, P1 da 2,94 a 3,01), niente di
+misurabile per P2 e P3. Le altre cifre del capitolo restano quelle misurate con
+i contatori di prima.
+
+Lo si verifica dando al nodo due core invece di uno, con una coda d'ingresso
+ciascuno e lo stesso generatore:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Programma} & \textbf{1 core (Mpps)} & \textbf{2 core (Mpps)} & \textbf{rapporto} \\
+\midrule
+\texttt{rxonly}     & 4,62 & 7,50 & 1,62 \\
+baseline            & 3,40 & 6,50 & 1,91 \\
+P1                  & 3,01 & 5,76 & 1,91 \\
+P1.5                & 2,87 & 5,58 & 1,95 \\
+P2                  & 1,91 & 3,72 & 1,95 \\
+P3                  & 1,49 & 2,95 & 1,98 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Con due core ogni pipeline elabora quasi il doppio (fra 1,91 e 1,98 volte): il
+secondo core non rallenta il primo. Il solo contatore cresce meno (1,62) perché
+a 7,5~Mpps il generatore è vicino al suo limite e le due code non ricevono
+esattamente lo stesso carico. Per un nodo con $N$ code vale quindi, in buona
+approssimazione, $N$ volte la capacità misurata su un core, finché generatore e
+scheda reggono.
 
 \begin{lezione}
 Per tutte e cinque la perdita è \textbf{all'ingresso}: il collo di bottiglia è il

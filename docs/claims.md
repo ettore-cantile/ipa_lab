@@ -373,6 +373,18 @@ generatore, DUT e nodo successivo su P-core fisici distinti.
 | **Risultato** | Pulite fino a: baseline 1,44, P1 e P1.5 1,20, P2 e P3 0,72 Gbit/s; perdono dal punto successivo, all'ingresso (i punti sono spaziati di ~0,24 Gbit/s: P2 e P3 le separa l'inoltro massimo, 1,89 contro 1,50 Mpps). Latenza p50 9–10 µs a basso carico per tutte, 69–194 µs al primo punto in perdita. Latenza minima arrivo → ripartenza a scarico (`--latency`, 512 B): 249 / 282 / 292 / 460 / 584 ns. |
 | **Come rigirarlo** | `bench_bitrate.py --out results/bitrate_3500`; `bench_throughput.py --latency --frames 512 --rounds 3 --repeat 5` |
 
+### E6 — La capacità cresce con i core ✅
+
+| | |
+|---|---|
+| **Ipotesi** | Con i contatori per-CPU i core del nodo non si contendono niente di scritto a ogni pacchetto, quindi due code su due core danno circa il doppio. |
+| **Variabile modificata** | Il numero di core e di code del DUT (1 o 2), stesso generatore a 3 thread. |
+| **Metrica** | Pacchetti elaborati al secondo a saturazione, 3 giri. |
+| **Risultato** | 1 → 2 core: baseline 3,40 → 6,50, P1 3,01 → 5,76, P1.5 2,87 → 5,58, P2 1,91 → 3,72, P3 1,49 → 2,95 Mpps: **rapporto 1,91–1,98**. `rxonly` 4,62 → 7,50 (1,62), vicino al tetto del generatore. |
+| **Conclusione** | Il costo misurato su un core è quello da moltiplicare per il numero di code di una scheda con RSS. |
+| **Limite dichiarato** | ⚠️ Solo 1 e 2 core: oltre, questa macchina non ha P-core liberi per generatore e DUT insieme. |
+| **Come rigirarlo** | `bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6` e `--dut-cpus 6,8` |
+
 ---
 
 ## G. La macchina

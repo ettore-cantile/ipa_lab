@@ -105,6 +105,7 @@ ipa_lab/
 │   ├── model_meta.py                #    2. CONFIG LAYER: feature catalog, scenario resolution,
 │   │                                #       shape derivation, checkpoint resolution
 │   ├── common.py                    #    map helpers, MAC/ifindex resolution, XDP attach/detach
+│   ├── stats_maps.py                #    read/zero the per-CPU pkt_stats / cls_stats counters
 │   ├── link_state_monitor.py        #    seeds link_state[] from real carrier state
 │   ├── queue_state_monitor.py       #    seeds queue_state[] (demo feature)
 │   ├── extract_weights.py           #    .pt -> weights.json / weights_float.json

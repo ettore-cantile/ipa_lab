@@ -853,6 +853,12 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
   sono `PERCPU_ARRAY`: ogni core incrementa la sua copia, senza istruzioni atomiche e senza
   contendersi una riga di cache quando i pacchetti arrivano su più code. I lettori sommano i
   core (`ipa/stats_maps.py`).
+  Su un core solo il cambio vale poco: rispetto a `results/throughput_3500/` (stesso banco,
+  contatori atomici) baseline, P1 e P1.5 guadagnano ~8 ns per pacchetto (3,31 → 3,40,
+  2,94 → 3,01, 2,81 → 2,87 Mpps), P2 e P3 restano entro la dispersione (1,89 → 1,91,
+  1,50 → 1,49). Sotto `BPF_PROG_TEST_RUN` la suite kernel dà 14 / 53 / 199 / 319 ns contro
+  18 / 52 / 195 / 315: differenze di pochi ns in entrambi i versi, dentro la variazione fra
+  i run. Le cifre di riferimento nel resto del documento restano quelle del 28-09.
 - **Tre punti di conteggio**: TX (pktgen, più i respinti da `veth_xmit` a coda piena), HIT
   (`pkt_stats[0]` della pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è
   arrivato al programma, HIT − RX ciò che il programma ha elaborato e non è uscito.
@@ -897,6 +903,32 @@ L'ordine P1 < P1.5 < P2 < P3 in costo per pacchetto regge in ogni giro. Costo so
 baseline (1/RX): **+38 / +53 / +226 / +364 ns**. Il 2026-09-27, prima di `ipa_relu`:
 +38 / +53 / +224 / +368. Sul traffico vero la ReLU senza salto non costa niente di
 misurabile, anche per P1 (sotto `BPF_PROG_TEST_RUN` le costava ~9 ns, § Risultati).
+
+**Su due core** (`--dut-cpus 6,8`, una coda d'ingresso per core, stesso generatore a 3
+thread; `results/throughput_cores1/` e `results/throughput_cores2/`, 2026-09-28, contatori
+per-CPU):
+
+```bash
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6   --out results/throughput_cores1
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6,8 --out results/throughput_cores2
+```
+
+| pipeline | 1 core (Mpps) | 2 core (Mpps) | rapporto |
+|---|---:|---:|---:|
+| rxonly | 4,62 | 7,50 | 1,62 |
+| baseline | 3,40 | 6,50 | 1,91 |
+| p1_static (P1) | 3,01 | 5,76 | 1,91 |
+| hardcoded (P1.5) | 2,87 | 5,58 | 1,95 |
+| template (P2) | 1,91 | 3,72 | 1,95 |
+| modular (P3) | 1,49 | 2,95 | 1,98 |
+
+Le pipeline crescono **quasi linearmente** (1,91–1,98): i core non si contendono niente di
+scritto a ogni pacchetto, e le due code ricevono un carico simile anche con 3 thread
+generatore su 2 code. `rxonly` cresce meno (1,62): a 7,5 Mpps il generatore offre 8,3 Mpps,
+vicino al suo tetto, e la differenza fra le code pesa di più. Nessun throttling, macchina non
+disturbata in entrambe le misure. Il costo per pacchetto per core resta quello di 1 core: il
+numero da riportare per un nodo con N code è ~N × la capacità a 1 core, finché il
+generatore e la scheda reggono.
 
 ### 10.3 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
 

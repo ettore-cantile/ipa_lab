@@ -58,6 +58,10 @@ run synth_p3            python3 ipa/test/verify_synth_kernel.py --all --n 300 --
 # traffico vero
 bench tp_compare    ipa/test/bench_throughput.py --mode compare --rounds 3 \
     --out "$ROOT/results/throughput_3500"
+bench tp_cores1     ipa/test/bench_throughput.py --mode compare --rounds 3 \
+    --gen-cpus 10,1,3 --dut-cpus 6 --out "$ROOT/results/throughput_cores1"
+bench tp_cores2     ipa/test/bench_throughput.py --mode compare --rounds 3 \
+    --gen-cpus 10,1,3 --dut-cpus 6,8 --out "$ROOT/results/throughput_cores2"
 bench bitrate       ipa/test/bench_bitrate.py --out "$ROOT/results/bitrate_3500"
 bench tp_rates      ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 \
     --rates 0.5,1,1.5,2,2.5,3 --out "$ROOT/results/throughput_rates"
