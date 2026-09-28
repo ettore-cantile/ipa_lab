@@ -4,7 +4,7 @@ verify_prog_run.py  --  BPF_PROG_TEST_RUN verifier for the 3 IPA pipelines.
 
 Lives in ipa/test/; the pipeline modules it imports (ebpf_program,
 ebpf_template_arch, ebpf_modular, extract_weights) live one level up in
-shared/, so SHARED_DIR is added to sys.path below.
+ipa/, so SHARED_DIR is added to sys.path below.
 """
 
 import os

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # remeasure_traffic.sh -- la seconda meta' delle misure citate in docs/: il
 # traffico vero (bench_throughput in tutte le modalita' che i documenti
-# citano, bench_bitrate), il costo della semantica per modello, i soffitti di
-# P3, lo sweep delle topologie, le equivalenze di P2/P3 sui modelli sintetici.
+# citano, bench_bitrate), lo sweep delle topologie, le equivalenze di P2/P3
+# sui modelli sintetici.
 #
 #   cd ~/Desktop/ipa_lab && bash ipa/test/remeasure_traffic.sh
 #
@@ -17,18 +17,14 @@ ROOT="$PWD"
 LOG="${IPA_LOG_DIR:-/tmp/ipa_logs}"
 mkdir -p "$LOG" "$ROOT/results"
 
-# L'albero di prima della semantica per modello (16f1a024), per il confronto
-# di bench_semantics_models: un worktree git, senza toccare quello di lavoro.
-BASE=/tmp/ipa_base_semantics
-if [ ! -d "$BASE/ipa" ]; then
-    git worktree add --detach "$BASE" 16f1a024^ > "$LOG/worktree.log" 2>&1 \
-        || echo "worktree non creato: vedi $LOG/worktree.log"
-fi
-
 sudo -v || exit 1
 ( while true; do sudo -n true; sleep 50; done ) 2>/dev/null &
 KEEP=$!
-trap 'kill $KEEP 2>/dev/null; sudo chown -R "$(id -u):$(id -g)" "$ROOT/results" "$LOG"' EXIT
+# Anche ipa/ e docs/: i comandi girano come root e riscrivono file dentro il
+# repository (l'oggetto AOT e il suo sorgente in ipa/poc_aot/, i __pycache__,
+# i grafici in docs/figures/). Lasciati a root, il primo build da utente
+# fallirebbe con PermissionError.
+trap 'kill $KEEP 2>/dev/null; sudo chown -R "$(id -u):$(id -g)" "$ROOT/results" "$ROOT/ipa" "$ROOT/docs" "$LOG"' EXIT
 
 report() {
     local name=$1 rc=$2 t0=$3
@@ -54,17 +50,10 @@ bench() {
     report "$name" $? $t0
 }
 
-# correttezza e soffitti
+# correttezza
 run fabric_sweep        python3 ipa/test/test_fabric.py --sweep
 run synth_p2            python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p2
 run synth_p3            python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p3
-run p3_ceilings         python3 ipa/test/diag_p3_bisect.py --ceilings
-# P1 larga/profonda a ~1 200 pesi: l'errore completo del caricamento
-run dvw_cell_65_16_7    python3 ipa/test/bench_depth_vs_width.py --_worker default 16 200
-run dvw_cell_65_14_14   python3 ipa/test/bench_depth_vs_width.py --_worker default 14,14 200
-# semantica per modello: costo contro l'albero di prima
-run semantics_models    python3 -u ipa/test/bench_semantics_models.py \
-    --baseline-dir "$BASE/ipa" --trials 21 --csv "$ROOT/results/semantics_models.csv"
 
 # traffico vero
 bench tp_compare    ipa/test/bench_throughput.py --mode compare --rounds 3 \
@@ -82,4 +71,9 @@ bench tp_per_class  ipa/test/bench_throughput.py --mode compare --generator xdp 
     --egress-cpu auto --per-class --rounds 3 --out "$ROOT/results/throughput_per_class"
 bench tp_latency    ipa/test/bench_throughput.py --latency --frames 512 --rounds 3 \
     --repeat 5 --out "$ROOT/results/throughput_latency"
-echo "fatto: log in $LOG"
+# I grafici del bit rate che il quaderno usa (bench_bitrate li scrive accanto
+# ai CSV; results/ ignora i PDF).
+for f in bitrate_latency bitrate_pps bitrate_loss; do
+    cp "$ROOT/results/bitrate_3500/$f.pdf" "$ROOT/docs/figures/"
+done
+echo "fatto: log in $LOG, grafici del bit rate in docs/figures/"

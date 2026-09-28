@@ -52,7 +52,7 @@ from model_meta import (derive_shape, load_model_meta, load_topology_config,
                         load_class_semantics)
 from node_config import NodeConfig
 
-# Resolve the shared/ directory relative to this file regardless of cwd.
+# Resolve the ipa/ directory relative to this file regardless of cwd.
 _SHARED_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

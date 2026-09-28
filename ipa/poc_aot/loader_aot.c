@@ -1,16 +1,11 @@
-// loader_aot.c -- AOT-literal deploy bench for Pipeline 1 (alternative to BCC).
+// loader_aot.c -- the Pipeline 1 loader: deploy, pin, and bench.
 //
-// The BCC hardcoded path (method4_hardcoded.py) compiles the weights-literal C
-// with clang AT RUNTIME on every (re)load -> clang (~75 ms per model) on the datapath
-// node for each new/modified model (machine-dependent; 1.26-1.66 s observed --
-// the live figure is the "[M1 update timing]" line printed by
-// test_suite.py --only kernel). This loader demonstrates the alternative
-// for the "models known a priori" case (the hardcoded assumption): the literal
-// .o is built OFFLINE (once, on a build box); at runtime the datapath node only
-// does bpf_object__open_file + bpf_object__load -- no clang -> a few ms.
+// Pipeline 1 bakes the weights into the C as literals. The literal .o is built
+// OFFLINE (once, with clang, on a build box); at runtime the datapath node only
+// does bpf_object__open_file + bpf_object__load -- no compiler on the node, and
+// about a millisecond to put a new model in service.
 //
-// ARCHITECTURE-FAITHFUL: the .o contains the SAME topology as the BCC path --
-// a dispatcher (xdp_dispatch) that parses and bpf_tail_calls into the model
+// ARCHITECTURE: a dispatcher (xdp_dispatch) that parses and bpf_tail_calls into the model
 // (xdp_model), which RE-parses (the double parse) and infers. We populate the
 // model_progs PROG_ARRAY, seed the descriptor's feature maps + mac_table, and BPF_PROG_TEST_RUN the
 // DISPATCHER, so this measures the identical per-packet work test_suite
@@ -26,8 +21,7 @@
 //        sudo ./loader_aot <literal.o> --pin-dir /sys/fs/bpf/<dir>
 //              (PIN-ONLY: load, pin maps AND programs, print READY, wait for
 //              DETACH or EOF on stdin, unpin. No attach. This is how the kernel
-//              benches measure the object P1 actually deploys instead of the
-//              BCC build: verify_prog_run.setup_aot drives it.)
+//              benches measure the object P1 deploys: p1_aot drives it.)
 //
 // LIVE DEPLOY PROTOCOL. The loader does NOT seed the datapath maps in deploy
 // mode: mac_table, link_state, ingress_port and node_id are node facts, and
@@ -359,8 +353,7 @@ int main(int argc, char **argv) {
     // Args: <literal.o> [--attach <ifindex>]
     //   no --attach  -> bench mode  (BPF_PROG_TEST_RUN, deploy-cost + perf)
     //   --attach N   -> deploy mode (attach xdp_dispatch to ifindex N, stay
-    //                   resident until Ctrl-C, then detach). This is the LIVE
-    //                   datapath alternative to BCC's method4_hardcoded attach.
+    //                   resident until Ctrl-C, then detach).
     const char *lit = "nn_aot_arch.o";
     // XDP attach mode. This used to be a bare 0, which means "kernel decides"
     // -- and the kernel decides by trying native and SILENTLY falling back to
@@ -399,7 +392,7 @@ int main(int argc, char **argv) {
     if (bpf_object__load(obj)) { fprintf(stderr, "load %s\n", lit); goto err; }
     double t2 = now_ms();
 
-    // wire the tail-calls, exactly as the BCC control plane does
+    // wire the tail-calls, as the P2/P3 control planes do
     // b["model_progs"][id] = model_fn.fd: `xdp_model` -> model_progs[0], and
     // `xdp_model_<id>` -> model_progs[<id>] when the object carries several
     // models (gen_full_c._emit_arch(models=...)).
@@ -529,9 +522,7 @@ int main(int argc, char **argv) {
         printf("================================================================\n");
         printf(" AOT-literal LIVE deploy (Pipeline 1) -- NO clang on this node\n");
         printf("================================================================\n");
-        printf("[deploy] open+load (verify+JIT): %.3f ms  "
-               "(BCC recompile of the same model: ~75 ms, reference not measured here)\n",
-               t2 - t0);
+        printf("[deploy] open+load (verify+JIT): %.3f ms\n", t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d, maps pinned under "
                "%s. Ctrl-C to detach.\n", g_attach_ifindex, g_pin_dir);
         /* Flush now: when stdout is a pipe rather than a TTY, C stdio is
@@ -567,8 +558,8 @@ unpin:
     // decrements the TTL. This used to be ONE call with repeat=1e6 on a TTL-64
     // frame: after ~60 runs every run took the TTL-expired short-circuit (or,
     // without a node id, the DROP class the drifting TTL fell into), and that
-    // is what the reported ns/pkt measured -- not the forwarding path the BCC
-    // numbers it was compared with came from. Same scheme as
+    // is what the reported ns/pkt measured -- not the forwarding path. Same
+    // scheme as
     // verify_prog_run.prog_test_run_bench: 200 runs per chunk on a TTL-255
     // frame (the TTL never reaches the expiry path within a chunk), minimum of
     // the per-chunk averages.
@@ -590,23 +581,22 @@ unpin:
 
     printf("================================================================\n");
     printf(" AOT-literal deploy bench (Pipeline 1, ARCH-FAITHFUL)\n");
-    printf(" dispatcher + tail-call + double-parse == BCC hardcoded topology\n");
+    printf(" dispatcher + tail-call + double-parse, as test_suite --only kernel\n");
     printf("================================================================\n\n");
     printf("[deploy] runtime cost of loading a prebuilt literal .o (NO clang):\n");
     printf("   open_file           : %8.3f ms\n", t1 - t0);
     printf("   load (verify+JIT)   : %8.3f ms\n", t2 - t1);
     printf("   total deploy        : %8.3f ms\n", t2 - t0);
-    printf("   (BCC recompile of the same model: ~75 ms -- reference value, NOT\n");
-    printf("    measured by this loader; see '[M1 update timing]' in --only kernel)\n\n");
+    printf("\n");
     printf("[perf] full-path per-packet cost (BPF_PROG_TEST_RUN on dispatcher, %d chunks x %d runs,\n"
            "       fresh TTL-255 frame per chunk, min of chunk averages; retval=%u):\n",
            BENCH_CHUNKS, BENCH_CHUNK, retval);
     printf("   xlated insns        : %8ld   (dispatch %ld + model %ld)\n", insn_total, insn_disp, insn_model);
     printf("   latency             : %8.1f ns/pkt\n", ns);
     printf("   throughput          : %8.2f Mpps\n", mpps);
-    printf("\n   Same topology and methodology as test_suite --kernel hardcoded,\n");
-    printf("   so these are directly comparable to the BCC numbers. AOT keeps the\n");
-    printf("   full literal perf (clang strength-reduction baked into the .o).\n");
+    printf("\n   Same topology and methodology as test_suite --only kernel, so the\n");
+    printf("   numbers compare directly. Run it under host_conditions.py for\n");
+    printf("   figures that repeat (fixed frequency, isolated core).\n");
 
     bpf_object__close(obj);
     return 0;

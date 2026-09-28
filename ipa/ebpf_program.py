@@ -15,7 +15,7 @@ Design space position:
     next-hop -- so the packet's Ethernet header is rewritten before
     leaving, not just its egress iface.
 
-Generic input vector (see shared/model_meta.py), zero-weight-lookup and
+Generic input vector (see ipa/model_meta.py), zero-weight-lookup and
 fully unrolled -- costs nothing vs. the original fixed 65-4-4-7 program
 when the default descriptor is used:
 
@@ -198,7 +198,16 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 #define CTR_INC() do {} while (0)
 #endif
 
-#define RELU_LL(x)    ((x) > 0LL ? (x) : 0LL)
+/* ReLU without a conditional jump, the same helper as the AOT object
+ * (poc_aot/gen_full_c.py), P2 and P3: a jump per neuron is what the verifier
+ * pays for (docs/testing.md §8). x >> 63 is -1 for a negative x and 0
+ * otherwise; the empty asm keeps clang from turning it back into a jump. */
+static __always_inline long long ipa_relu(long long x) {
+    long long m = x >> 63;
+    asm volatile("" : "+r"(m));
+    return x & ~m;
+}
+#define RELU_LL(x)    ipa_relu(x)
 """
 
 EBPF_HARDCODED_DISPATCHER = r"""
@@ -784,7 +793,7 @@ def generate_ebpf_hardcoded(
     Which class is which comes from the ClassSemantics passed in, never from
     the index.
       - inference always runs (pure hardcoded, no cache gate)
-      - mac_table itself is populated by the CALLER (method4_hardcoded.py)
+      - mac_table itself is populated by the CALLER (the control plane)
 
     The ingress_iface one-hot no longer takes an `ifindex_table` argument.
     It used to default to [2, 3, ...] and be compiled into a switch, which
@@ -968,7 +977,7 @@ def build_combined_hardcoded_source(
     models: list of (model_id, weights_int8, scale) tuples,
     all sharing the same feature descriptor / n_out / hidden_dims (the map
     sizes and cls range are shared by the whole compiled object; register
-    differently-shaped models via separate method4_hardcoded.py runs).
+    differently-shaped models as separate objects).
 
     Feature descriptor: pass `features` (+ `n_out`) for a heterogeneous
     feature set, or leave them None to build the historical default
@@ -1032,7 +1041,7 @@ def build_combined_hardcoded_source(
 
 
 # ---------------------------------------------------------------------------
-# Loader: resolves a model's descriptor (shared/model_meta.py) and generates
+# Loader: resolves a model's descriptor (ipa/model_meta.py) and generates
 # the combined hardcoded source.
 # ---------------------------------------------------------------------------
 def load_and_generate(

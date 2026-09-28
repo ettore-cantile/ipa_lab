@@ -65,7 +65,7 @@ def extract_weights_int8(
 
     n_interfaces/n_nodes/hidden_dim override the module defaults
     (the scenario's n_interfaces/n_nodes + HIDDEN_DIM) -- pass a resolved shape
-    (see shared/model_meta.py derive_shape()) to extract weights for a
+    (see ipa/model_meta.py derive_shape()) to extract weights for a
     topology other than the one checked-in 6/52/4 checkpoint. None means
     "use the module default", so existing callers are unaffected.
 

@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 """
-test_suite.py — LOCAL test suite for the 3 IPA methods (no eBPF/XDP required)
-================================================================================
-
-Single script consolidating all local tests (previously split across test_local.py,
-test_ipa_methods.py, test_extract_weights.py, test_quantization_accuracy.py,
-test_robustness.py). Measures, locally with PyTorch/NumPy, the
-design-space properties and metrics, without
-needing kernel/eBPF (for the in-kernel check use verify_prog_run.py).
+test_suite.py — weight extraction, quantization, and the in-kernel metrics
+=========================================================================
 
 Available suites (--only):
-  core     : inference consistency, update latency, determinism, .pt load,
-             plus the design-space table (throughput, tail calls, map lookups,
-             map memory, flexibility)                    [ex test_local]
-  pktstats : hit/fake/miss for the 3 methods + counter consistency   [ex test_ipa_methods]
-  extract  : extract_weights.py / weights.json / dequant consistency [ex test_extract_weights]
-  quant    : accuracy argmax vs scale_factor (PTQ trade-off)   [ex test_quantization_accuracy]
-  robust   : edge-case inputs, no crash, valid argmax       [ex test_robustness]
-  kernel   : IN-KERNEL metrics via BPF_PROG_TEST_RUN — eBPF instruction count,
-             per-packet latency, throughput Mpps, CPU%, + real dispatch
-             gate (ex verify_prog_run). Requires Linux + BCC + root; elsewhere
-             it is skipped gracefully (does not fail the run).
+  extract  : extract_weights.py / weights.json / dequant consistency
+  quant    : argmax accuracy vs scale_factor (the PTQ trade-off), on the
+             integer arithmetic P2/P3 run
+  kernel   : IN-KERNEL metrics via BPF_PROG_TEST_RUN -- eBPF instruction count,
+             per-packet latency, map lookups, map memory, + the real dispatch
+             gate. Requires Linux + BCC + root; elsewhere it is skipped
+             gracefully (does not fail the run).
   all      : every suite (default)
+
+Whether the datapath computes the model is checked elsewhere, on the real
+programs: test_synth.py (the P1 C, from its text), verify_synth_kernel.py (all
+three pipelines in the kernel), test_fabric.py (packets out of the right port).
 
 Usage:
   python3 ipa/test/test_suite.py                       # every suite (kernel skipped without BCC)
-  python3 ipa/test/test_suite.py --only core --verbose
   python3 ipa/test/test_suite.py --only quant --samples 200
   sudo python3 ipa/test/test_suite.py --only kernel    # kernel metrics (root)
-  sudo python3 ipa/test/test_suite.py --only kernel     # any Linux host + BCC
 """
 
 import argparse
@@ -37,7 +29,7 @@ import sys
 import os
 
 # Lives in ipa/test/; pipeline modules (ebpf_program, extract_weights, ...)
-# and the .pt/.json data files live one level up in shared/.
+# and the .pt/.json data files live one level up in ipa/.
 _TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
 SHARED_DIR = os.path.dirname(_TEST_DIR)
 if SHARED_DIR not in sys.path:
@@ -84,12 +76,6 @@ def reference_shape() -> dict:
                              topology_config=_mm.load_topology_config())
     return {"n_in": shape["n_in"], "n_out": shape["n_out"],
             "hidden_dims": list(shape["hidden_dims"])}
-
-# Nominal duration used in Method 1 to simulate the eBPF program
-# redirect/reload step (bpf_prog_load + iface redirect).
-# This constant is intentionally printed in Test 2 so it is always
-# visible in the output alongside the measured times.
-M1_REDIRECT_SIM_MS = 1.0   # milliseconds
 
 GREEN  = "\033[0;32m"
 YELLOW = "\033[1;33m"
@@ -212,48 +198,6 @@ if TORCH_AVAILABLE:
         while power * 2 <= raw:
             power *= 2
         return power
-
-
-class Method1_Hardcoded:
-    def __init__(self, model: "FRRModel"):
-        self._copy_weights(model)
-
-    def _copy_weights(self, model):
-        s = model.state_dict()
-        self.W1 = s['fc1.weight'].numpy().copy()
-        self.b1 = s['fc1.bias'].numpy().copy()
-        self.W2 = s['fc2.weight'].numpy().copy()
-        self.b2 = s['fc2.bias'].numpy().copy()
-        self.W3 = s['out.weight'].numpy().copy()
-        self.b3 = s['out.bias'].numpy().copy()
-
-    def infer(self, x):
-        h1 = np.maximum(0, self.W1 @ x + self.b1)
-        h2 = np.maximum(0, self.W2 @ h1 + self.b2)
-        return self.W3 @ h2 + self.b3
-
-    def measure_redirect_reload(self) -> float:
-        """Simulate eBPF program redirect/reload (bpf_prog_load + iface attach).
-        The nominal sleep duration is M1_REDIRECT_SIM_MS milliseconds."""
-        t0 = time.perf_counter()
-        time.sleep(M1_REDIRECT_SIM_MS / 1000.0)
-        return time.perf_counter() - t0
-
-    def measure_weight_insert(self, new_model) -> float:
-        """Measure only the weight copy step (analogous to bpf_map_update_elem
-        in Methods 2/3), so that it can be compared fairly against them."""
-        t0 = time.perf_counter()
-        self._copy_weights(new_model)
-        return time.perf_counter() - t0
-
-    def update_weights(self, new_model) -> dict:
-        t_redirect = self.measure_redirect_reload()
-        t_insert   = self.measure_weight_insert(new_model)
-        return {
-            'redirect_reload_s': t_redirect,
-            'weight_insert_s':   t_insert,
-            'total_s':           t_redirect + t_insert,
-        }
 
 
 class Method2_Template:
@@ -475,537 +419,6 @@ def _banner(passed, total):
     print(f"{YELLOW}{'='*52}{NC}\n")
 
 
-def suite_core(model, verbose=False):
-    print(f"\n{YELLOW}=== SUITE core — IPA Pipeline (3 methods) ==={NC}\n")
-    H = model.fc1.out_features
-    I = model.fc1.in_features
-    O = model.out.out_features
-    print(f"  Architecture: {I} -> {H} -> {H} -> {O}")
-    print()
-
-    m1 = Method1_Hardcoded(model)
-    m2 = Method2_Template(model)
-    m3 = Method3_Modular(model)
-    info(f"Method 2: scale_factor={m2.scale}")
-    info(f"Method 3: scale_factor={m3.scale}")
-    # Was: "output 0=DROP, 1=eth0, 2=eth1, ...". That is the abandoned
-    # DROP=0/ports-shifted-by-one convention no part of the datapath ever
-    # implemented -- printed for long enough to be quoted as fact.
-    for _l in suite_semantics(O).summary().splitlines():
-        info(_l)
-    print()
-
-    N = 50
-    passed = total = 0
-
-    print(f"{YELLOW}[Test 1] Output consistency & argmax ({N} samples){NC}")
-    mm = {1: 0, 2: 0, 3: 0}
-    me = {1: 0.0, 2: 0.0, 3: 0.0}
-    ref_range = 0.0
-    for i in range(N):
-        x = make_input(I)
-        ref = pytorch_ref(model, x)
-        nr = int(np.argmax(ref))
-        o1 = m1.infer(x)
-        o2 = m2.infer(x)
-        o3 = m3.infer(x)
-        ref_range = max(ref_range, float(np.max(ref) - np.min(ref)))
-        me[1] = max(me[1], float(np.max(np.abs(o1 - ref))))
-        me[2] = max(me[2], float(np.max(np.abs(o2 - ref))))
-        me[3] = max(me[3], float(np.max(np.abs(o3 - ref))))
-        a1, a2, a3 = int(np.argmax(o1)), int(np.argmax(o2)), int(np.argmax(o3))
-        if a1 != nr:
-            mm[1] += 1
-        if a2 != nr:
-            mm[2] += 1
-        if a3 != nr:
-            mm[3] += 1
-        if verbose:
-            _rs = suite_semantics(O)
-            print(f"    [sample {i:02d}] ref={decode_nexthop(nr, _rs)} "
-                  f"| M1={decode_nexthop(a1, _rs)} "
-                  f"| M2={decode_nexthop(a2, _rs)} "
-                  f"| M3={decode_nexthop(a3, _rs)}")
-
-    # Method 1's agreement used to be asserted without ever being computed: mm
-    # had no key 1, the loop never compared a1 against nr, and the line below
-    # printed "argmax 100% correct" with an unconditional passed += 1. It could
-    # not fail. It is a real (if trivially satisfied) check now.
-    #
-    # What it does and does NOT establish: Method1_Hardcoded here holds the
-    # model's FLOAT weights and does a float matmul, so it is numerically the
-    # same computation as pytorch_ref -- agreement is expected by construction
-    # and max_err is ~0. This is a self-consistency check on the harness, NOT
-    # evidence about the deployed int8-literal Pipeline 1. That evidence comes
-    # from the kernel suite, which compares the real XDP program's argmax
-    # against an independent integer Python reference (verify_prog_run.ref_infer).
-    total += 1
-    if mm[1] == 0:
-        passed += 1
-        ok(f"Method 1 (float reference, no quantization): argmax {N}/{N} == PyTorch "
-           f"| max_err={me[1]:.6f}  [harness self-check; quantized P1 is covered by --only kernel]")
-    else:
-        fail(f"Method 1 (float reference): {mm[1]}/{N} argmax differ from PyTorch "
-             f"| max_err={me[1]:.6f} -- the float path must match exactly, this is a harness bug")
-
-    for mid, name in [(2, 'template'), (3, 'modular')]:
-        total += 1
-        pct = mm[mid] / N * 100
-        if pct <= 10:
-            ok(f"Method {mid} ({name}): argmax {100-pct:.0f}% correct ({mm[mid]}/{N}) | max_err={me[mid]:.4f}")
-            passed += 1
-        else:
-            fail(f"Method {mid} ({name}): {mm[mid]}/{N} argmax errati | max_err={me[mid]:.4f} | scale={m2.scale}")
-
-    # Quantisation error, judged RELATIVE to the model's own output range.
-    #
-    # The bound used to be `tol = H / scale`, which is not a bound on anything:
-    # it ignores the input width and magnitude, and it ignores that the error
-    # compounds through three layers. It only ever passed because the suite was
-    # secretly running a 35-32-32-7 random model at scale=512, where H/sc came
-    # out 0.0625 and the error happened to be smaller. On the real checkpoint
-    # (H=4, scale=16) the same formula gives 0.25 against a measured 3.08 --
-    # not a regression, just the first time the number was computed on the
-    # model the datapath runs.
-    #
-    # An absolute logit error is meaningless without a scale to compare it to,
-    # so the scale used is the reference output's own range. What actually
-    # matters for forwarding is the ARGMAX, checked separately above.
-    rel_tol = 0.05
-    for mid, name, sc in [(2, 'template', m2.scale), (3, 'modular', m3.scale)]:
-        total += 1
-        tol = rel_tol * ref_range if ref_range > 0 else float("inf")
-        rel = me[mid] / ref_range if ref_range > 0 else 0.0
-        if me[mid] <= tol:
-            ok(f"Method {mid} ({name}): quant error {me[mid]:.4f} = {rel*100:.1f}% "
-               f"of the output range ({ref_range:.2f}) <= {rel_tol*100:.0f}% | scale={sc}")
-            passed += 1
-        else:
-            fail(f"Method {mid} ({name}): quant error {me[mid]:.4f} = {rel*100:.1f}% "
-                 f"of the output range ({ref_range:.2f}) > {rel_tol*100:.0f}% | scale={sc}")
-
-    print(f"\n{YELLOW}[Test 2] Weight update latency (10 updates){NC}")
-    # M1_REDIRECT_SIM_MS is a PLACEHOLDER sleep, not a measurement, and it is
-    # three orders of magnitude below the real thing. Stating that loudly here
-    # matters: the numbers below would otherwise read as "Method 1 updates in
-    # ~1 ms", the exact opposite of the design-space result the kernel suite
-    # actually measures (regenerating the C, running clang and reloading the
-    # program costs ~1.1-1.3 s -- see the "[M1 update timing]" line in
-    # --only kernel, and bench_model_add.py for the per-phase breakdown).
-    # The placeholder is kept small deliberately so --only core stays fast;
-    # only the M2/M3 numbers in this test are real measurements.
-    info(f"Method 1 redirect/reload: PLACEHOLDER sleep of {M1_REDIRECT_SIM_MS:.1f} ms — NOT a measurement.")
-    info("      The REAL cost (regenerate C + clang + reload) is ~1.1-1.3 s, i.e. ~1000x this")
-    info("      placeholder. Measured by: --only kernel ([M1 update timing]) and bench_model_add.py.")
-    info("      Do NOT quote the Method 1 rows below as a result.")
-    info("Method 2/3 have no redirect step — their update = map insert only (these ARE measured)")
-    print()
-
-    times = {
-        '1_redirect': [],
-        '1_insert':   [],
-        '1_total':    [],
-        2:            [],
-        3:            [],
-        '3s':         []
-    }
-    for _ in range(10):
-        nm = fresh_like(model)
-        t1 = m1.update_weights(nm)
-        times['1_redirect'].append(t1['redirect_reload_s'] * 1000)
-        times['1_insert'].append(t1['weight_insert_s'] * 1000)
-        times['1_total'].append(t1['total_s'] * 1000)
-        times[2].append(m2.update_weights(nm) * 1000)
-        times[3].append(m3.update_weights(nm) * 1000)
-        times['3s'].append(m3.update_weights(nm, layer_idx=2) * 1000)
-
-    # Headline statistic is the MINIMUM, matching bench_model_add.py and the
-    # kernel suite: the noise here is one-sided (scheduler/interrupts can only
-    # slow a sample down, never speed it below its true cost), and the mean is
-    # dominated by the first update, which pays first-touch page faults the
-    # later ones do not. avg/max are kept alongside for transparency.
-    for key, lbl in [
-        ('1_redirect', 'Method 1 hardcoded (redirect/reload)      [PLACEHOLDER, not measured]'),
-        ('1_insert',   'Method 1 hardcoded (weight insert only)   [fair vs M2/M3]'),
-        ('1_total',    'Method 1 hardcoded (redirect + insert)    [PLACEHOLDER-dominated]'),
-        (2,            'Method 2 template  (map update)'),
-        (3,            'Method 3 modular   (all layers)'),
-        ('3s',         'Method 3 modular   (single layer hot-swap)')
-    ]:
-        vals = times[key]
-        info(f"{lbl}: min={min(vals):.3f}ms  avg={sum(vals)/len(vals):.3f}ms  max={max(vals):.3f}ms")
-
-    print()
-    info("NOTE: to compare M1 fairly against M2/M3, use 'weight insert only'.")
-    info("      M1's real architectural cost is the recompile+reload, which this suite")
-    info("      does NOT measure — see --only kernel / bench_model_add.py.")
-
-    total += 1
-    passed += 1
-    ok("Update latency measured for M2/M3 (M1 redirect is a placeholder — see --only kernel)")
-
-    print(f"\n{YELLOW}[Test 3] Determinism (100 runs){NC}")
-    xf = make_input(I)
-    rs = {int(np.argmax(m2.infer(xf))) for _ in range(100)}
-    total += 1
-    if len(rs) == 1:
-        nh_str = decode_nexthop(list(rs)[0], suite_semantics(O))
-        ok(f"Method 2: deterministic ({list(rs)[0]} -> {nh_str}) over 100 runs")
-        passed += 1
-    else:
-        fail(f"Method 2: NOT deterministic: {rs}")
-
-    print(f"\n{YELLOW}[Test 4] Post-update consistency{NC}")
-    nm = fresh_like(model)
-    m2.update_weights(nm)
-    m3.update_weights(nm)
-    mp = 0
-    for _ in range(N):
-        x = make_input(I)
-        if int(np.argmax(m2.infer(x))) != int(np.argmax(m3.infer(x))):
-            mp += 1
-    total += 1
-    if mp == 0:
-        ok(f"Method 2 and 3 agree on {N} samples after update")
-        passed += 1
-    else:
-        fail(f"Method 2 and 3 disagree on {mp}/{N} samples")
-
-    print(f"\n{YELLOW}[Test 5] Load .pt model (auto-inferred sizes){NC}")
-    total += 1
-    pt_path = default_checkpoint()
-    if os.path.exists(pt_path):
-        try:
-            loaded, li, lh, lo = load_pt_dynamic(pt_path)
-            x = make_input(li)
-            out_vec = pytorch_ref(loaded, x)
-            nh_idx = int(np.argmax(out_vec))
-            # `lo` is the loaded model's output width; the semantics come
-            # from the descriptor when it matches, never from lo - 1.
-            _sem = suite_semantics(lo)
-            nh_str = decode_nexthop(nh_idx, _sem)
-            sc = compute_scale(loaded)
-            ok(f".pt caricato | arch={li}->{lh}->{lh}->{lo} | next-hop={nh_idx} ({nh_str}) | scale={sc}")
-            if verbose:
-                info(f"  Output scores: {[f'{v:.3f}' for v in out_vec.tolist()]}")
-                for _l in _sem.summary().splitlines():
-                    info(_l)
-            passed += 1
-        except Exception as e:
-            fail(f"Error loading .pt: {e}")
-    else:
-        info(f".pt not found ({pt_path}) — test skipped")
-        total -= 1
-
-    print(f"\n{YELLOW}[Test 6] Design-space metrics (throughput, structure, memory){NC}")
-
-    BENCH_SECS = 2.0
-    throughputs = {}
-    inputs_cache = [make_input(I) for _ in range(1000)]
-    for mid, mobj, name in [(1, m1, 'hardcoded'), (2, m2, 'template'), (3, m3, 'modular')]:
-        t0 = time.perf_counter()
-        count = 0
-        while time.perf_counter() - t0 < BENCH_SECS:
-            mobj.infer(inputs_cache[count % 1000])
-            count += 1
-        elapsed = time.perf_counter() - t0
-        mpps = count / elapsed / 1_000_000
-        throughputs[mid] = (mpps, count, elapsed)
-    info(f"Inference throughput (Python, single-core, {BENCH_SECS:.0f}s benchmark):")
-    for mid, name in [(1, 'hardcoded'), (2, 'template'), (3, 'modular')]:
-        mpps, cnt, el = throughputs[mid]
-        info(f"  Method {mid} ({name:<10}): {mpps:.4f} Mpps  ({cnt} infer in {el:.2f}s)")
-    info("  NOTE: eBPF kernel throughput expected 10-100x higher (no Python overhead)")
-    info("  NOTE: Python throughput not used for the assertion (see Test 6 comment)")
-
-    n_fc1 = I * H + H
-    n_fc2 = H * H + H
-    n_out = H * O + O
-    N_WEIGHTS = n_fc1 + n_fc2 + n_out
-
-    TAIL_CALLS = {1: 'kernel-only', 2: 'kernel-only', 3: 'kernel-only'}
-
-    p3_lookups = (1 + I
-                  + (I * H) + H
-                  + (H * H) + H
-                  + (H * O) + H
-                  + 2)
-    # P1: 0 weight lookups (pesi = letterali C). Le uniche map lookup sono le
-    # 6 feature link_state + i contatori (pkt/cls/debug ~2). P2/P3 leggono i
-    # pesi da map, quindi molte piu' lookup.
-    MAP_LOOKUPS = {1: 6 + 2, 2: N_WEIGHTS + 3, 3: p3_lookups}
-
-    try:
-        import multiprocessing
-        ncpus = multiprocessing.cpu_count()
-    except Exception:
-        ncpus = 4
-
-    # ------------------------------------------------------------------
-    # BPF map footprint, itemised per declared map.
-    #
-    # This used to be three hand-written expressions scaled by N_WEIGHTS, which
-    # understated P2 and P3 by roughly 4x and P1 by 5x. Two reasons:
-    #   * arch_weights / layer_weights are ONE struct-valued entry of a FIXED
-    #     size (MAX_WEIGHT_ENTRIES / MAX_LAYER_WEIGHT_ENTRIES bytes), not
-    #     N_WEIGHTS bytes: the block is allocated whole regardless of how many
-    #     weights the registered model actually uses.
-    #   * the registry/dispatch maps were missing entirely -- model_progs (256
-    #     slots) on P1, model_desc + arch_registry on P2, model_desc +
-    #     layer_registry + layer_shapes on P3. Those dominate P2/P3.
-    #
-    # Each line is (map name, key_size, value_size, max_entries, per_cpu) taken
-    # straight from the BPF_* declaration in the corresponding eBPF source, and
-    # costed with EXACTLY the formula the kernel-suite measurement uses on the
-    # real map (verify_prog_run.map_bytes):
-    #     (key_size + value_size * ncpus_if_percpu) * max_entries
-    # so this userspace estimate and the kernel-measured figure are directly
-    # comparable instead of counting different things.
-    #
-    # Struct sizes (all packed, or all-__u8 hence alignment 1):
-    #   fwd_action 4+6+6=16     ls_vec 4*6=24        qs_vec 4*4=16
-    #   feat_ent 4, model_desc 4+4*4=20   arch_entry 1+4+2+1+1+1+1=11
-    #   layer_model_entry 2+1+1=4 layer_shape_key 2  layer_shape_entry 2+2+4=8
-    #   class_act 4, class_action: (model_id, bank, class) = 256*2*32 rows
-    #   act_vec 8*SCRATCH_ACT_SIZE=1024
-    #
-    # This is the DECLARED capacity of the maps, not kernel RSS: the kernel adds
-    # per-element bookkeeping (bucket/link overhead on hash maps), so the real
-    # figure is higher. It is a like-for-like comparison across the three
-    # pipelines, which is what the design-space table is for.
-    # lookup_ctr is excluded: it only exists under IPA_COUNT_LOOKUPS
-    # (measurement builds), never in the programs these numbers describe.
-    MAX_WEIGHT_ENTRIES       = 1024   # aw_blk in ebpf_template_arch.py
-    MAX_LAYER_WEIGHT_ENTRIES = 2048   # lw_blk in ebpf_modular.py
-    ACT_VEC_BYTES            = 8 * 128  # act_vec: long long v[SCRATCH_ACT_SIZE]
-    CLASS_ACT_ROWS           = 256 * 2 * 32  # (model_id, bank, class) rows
-    mac_capacity             = max(8, O)
-
-    #                  name             key  value                     entries  percpu
-    MAP_BREAKDOWN = {
-        1: [("link_state",               4,  24,                        1,      False),
-            ("pkt_stats",                4,  8,                         3,      False),
-            ("cls_stats",                4,  8,                         O,      False),
-            ("mac_table",                4,  16,                        mac_capacity, False),
-            ("model_progs",              4,  4,                         256,    False)],
-        2: [("arch_weights",             4,  MAX_WEIGHT_ENTRIES,        1,      False),
-            ("link_state",               4,  24,                        1,      False),
-            ("queue_state",              4,  16,                        1,      False),
-            ("model_desc",               1,  20,                        256,    False),
-            ("arch_registry",            1,  11,                        256,    False),
-            ("class_action_t2",          4,  4,                         CLASS_ACT_ROWS, False),
-            ("arch_progs",               4,  4,                         8,      False),
-            ("mac_table_t2",             4,  16,                        8,      False),
-            ("pkt_stats_t2",             4,  8,                         3,      False),
-            ("cls_stats_t2",             4,  8,                         7,      False)],
-        3: [("layer_weights",            4,  MAX_LAYER_WEIGHT_ENTRIES,  1,      False),
-            ("scratch_acts",             4,  ACT_VEC_BYTES,             1,      True),
-            ("scratch_meta",             4,  8,                         16,     True),
-            ("link_state",               4,  24,                        1,      False),
-            ("queue_state",              4,  16,                        1,      False),
-            ("model_desc",               1,  20,                        256,    False),
-            ("layer_registry",           1,  4,                         256,    False),
-            ("class_action_t3",          4,  4,                         CLASS_ACT_ROWS, False),
-            ("layer_shapes",             2,  8,                         512,    False),
-            ("layer_chain",              4,  4,                         16,     False),
-            ("mac_table_t3",             4,  16,                        8,      False),
-            ("pkt_stats_t3",             4,  8,                         3,      False),
-            ("cls_stats_t3",             4,  8,                         7,      False)],
-    }
-
-    def _map_bytes(key, val, entries, percpu):
-        return (key + val * (ncpus if percpu else 1)) * entries
-
-    MAP_MEM_BYTES = {k: sum(_map_bytes(ks, vs, n, pc) for _, ks, vs, n, pc in v)
-                     for k, v in MAP_BREAKDOWN.items()}
-    FLEXIBILITY = {1: 'low',  2: 'medium',  3: 'high'}
-    MODEL_UPDATE = {
-        1: 'recompile + reload eBPF program',
-        2: 'bpf_map_update_elem() on arch_weights',
-        3: 'bpf_map_update_elem() on layer_weights + update layer_chain',
-    }
-
-    print()
-    COL = 32
-    hdr = f"  {'Metric':<{COL}} {'P1 hardcoded':>16} {'P2 template':>16} {'P3 modular':>16}"
-    sep = "  " + "-" * (COL + 50)
-    print(hdr)
-    print(sep)
-
-    def row(label, vals):
-        v = [str(vals[k]) for k in [1, 2, 3]]
-        print(f"  {label:<{COL}} {v[0]:>16} {v[1]:>16} {v[2]:>16}")
-
-    row("Local throughput (Mpps)",
-        {k: f"{throughputs[k][0]:.4f}" for k in [1, 2, 3]})
-    row("Tail calls / packet",  TAIL_CALLS)
-    row("Map lookups / packet (est.)", MAP_LOOKUPS)
-    row("BPF map memory (declared)",
-        {k: f"{MAP_MEM_BYTES[k]//1024}KB ({MAP_MEM_BYTES[k]}B)" for k in [1, 2, 3]})
-    row("Flexibility",             FLEXIBILITY)
-    print(sep)
-    print()
-
-    info("BPF map memory breakdown (declared capacity per map, "
-         "excludes kernel per-element overhead):")
-    for mid, lbl in [(1, 'P1 hardcoded'), (2, 'P2 template'), (3, 'P3 modular')]:
-        parts = ", ".join(f"{name}={_map_bytes(ks, vs, n, pc)}B"
-                          for name, ks, vs, n, pc in MAP_BREAKDOWN[mid])
-        info(f"  {lbl:<12}: {parts} = {MAP_MEM_BYTES[mid]}B")
-    print()
-
-    info(f"Logical CPUs detected: {ncpus} (affects the PERCPU scratch map for P3)")
-    info("Tail calls are no longer hardcoded in the local design-space table; use --only kernel for measured values.")
-    print()
-    for mid, lbl in [(1, 'P1 hardcoded'), (2, 'P2 template'), (3, 'P3 modular')]:
-        info(f"{lbl} - model update: {MODEL_UPDATE[mid]}")
-    print()
-
-    total += 1
-    ml_ok = MAP_LOOKUPS[1] <= MAP_LOOKUPS[2] <= MAP_LOOKUPS[3]
-    if ml_ok:
-        ok(f"eBPF trade-off on map lookups confirmed: P1({MAP_LOOKUPS[1]}) <= P2({MAP_LOOKUPS[2]}) <= P3({MAP_LOOKUPS[3]})")
-        passed += 1
-    else:
-        fail(f"structural trade-off inconsistent: map_lookups={list(MAP_LOOKUPS.values())}")
-
-    total += 1
-    if MAP_LOOKUPS[3] > MAP_LOOKUPS[1]:
-        ok(f"Structure: P3 has more map lookups ({MAP_LOOKUPS[3]}) vs P1 ({MAP_LOOKUPS[1]})")
-        passed += 1
-    else:
-        fail("Structure: inconsistent map-lookup counts")
-
-    total += 1
-    if MAP_MEM_BYTES[3] > MAP_MEM_BYTES[1]:
-        ok(f"Memory: P3 ({MAP_MEM_BYTES[3]}B) > P1 ({MAP_MEM_BYTES[1]}B) as expected")
-        passed += 1
-    else:
-        fail(f"Memory: P3 ({MAP_MEM_BYTES[3]}B) should be > P1 ({MAP_MEM_BYTES[1]}B)")
-
-    _banner(passed, total)
-    return passed == total
-
-
-def _classify_packet(output_vec, ref_vec, semantics):
-    """HIT / FAKE / MISS for one prediction.
-
-    `semantics` replaces a `valid_outputs` set that was built as
-    `set(range(1, O))` and labelled "0=DROP/MISS" -- the abandoned DROP=0
-    convention again. A forwarded packet is a HIT when it matches the
-    reference and FAKE otherwise; anything the semantics do not declare
-    FORWARD (DROP or UNUSED) is a MISS, because no packet left the node.
-    """
-    pred   = int(np.argmax(output_vec))
-    target = int(np.argmax(ref_vec))
-    if semantics.action_of(pred) == "FORWARD":
-        return "HIT" if pred == target else "FAKE"
-    return "MISS"
-
-
-def _run_pkt_stats(method, inputs, model, semantics):
-    stats = {"HIT": 0, "FAKE": 0, "MISS": 0}
-    for x in inputs:
-        ref = pytorch_ref(model, x)
-        out = method.infer(x)
-        stats[_classify_packet(out, ref, semantics)] += 1
-    return stats
-
-
-def suite_pktstats(model, n_samples=200, seed=42):
-    """`model` is the checkpoint main() loaded.
-
-    This used to build its own `FRRModel()`, which -- with the module constants
-    that used to live at the top of this file -- meant a random 35-32-32-7
-    model unrelated to anything the datapath runs.
-    """
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    print(f"\n{YELLOW}=== SUITE pktstats — pkt_stats (3 pipelines) ==={NC}\n")
-    H = model.fc1.out_features
-    I = model.fc1.in_features
-    O = model.out.out_features
-    print(f"  Architecture: {I} -> {H} -> {H} -> {O} | samples={n_samples} | seed={seed}")
-    print()
-    m1 = Method1_Hardcoded(model)
-    m2 = Method2_Template(model)
-    m3 = Method3_Modular(model)
-    pkt_sem = suite_semantics(O)
-    info(f"FORWARD classes (counted as HIT/FAKE): {pkt_sem.forward_classes}")
-    info(f"non-forwarding classes (counted as MISS): "
-         f"{sorted(set(range(O)) - set(pkt_sem.forward_classes))}")
-    print()
-    inputs = [make_input(I) for _ in range(n_samples)]
-    passed = total = 0
-    print(f"{YELLOW}[Test A] pkt_stats per method ({n_samples} samples){NC}")
-    stats = {}
-    for mid, mobj, name in [(1, m1, 'hardcoded'), (2, m2, 'template'), (3, m3, 'modular')]:
-        s = _run_pkt_stats(mobj, inputs, model, pkt_sem)
-        stats[mid] = s
-        total_pkts = s['HIT'] + s['FAKE'] + s['MISS']
-        hit_rate   = s['HIT'] / total_pkts * 100
-        info(f"  P{mid} {name:<10}: HIT={s['HIT']:4d} ({hit_rate:.1f}%)  FAKE={s['FAKE']:4d}  MISS={s['MISS']:4d}  total={total_pkts}")
-    print(f"\n{YELLOW}[Test B] Total counter == n_samples for each method{NC}")
-    for mid in [1, 2, 3]:
-        total += 1
-        s = stats[mid]
-        tot = s['HIT'] + s['FAKE'] + s['MISS']
-        if tot == n_samples:
-            ok(f"P{mid}: HIT+FAKE+MISS = {tot} == {n_samples}")
-            passed += 1
-        else:
-            fail(f"P{mid}: HIT+FAKE+MISS = {tot} != {n_samples}")
-    print(f"\n{YELLOW}[Test C] P1 hardcoded must have FAKE=0 (float weights){NC}")
-    total += 1
-    if stats[1]['FAKE'] == 0:
-        ok("P1 FAKE=0 confermato (hardcoded float)")
-        passed += 1
-    else:
-        fail(f"P1 FAKE={stats[1]['FAKE']} (expected 0 with float weights)")
-    print(f"\n{YELLOW}[Test D] P2 and P3 same HIT/FAKE/MISS (same quantization){NC}")
-    total += 1
-    if stats[2] == stats[3]:
-        ok(f"P2 e P3 concordano: HIT={stats[2]['HIT']} FAKE={stats[2]['FAKE']} MISS={stats[2]['MISS']}")
-        passed += 1
-    else:
-        fail(f"P2={stats[2]} != P3={stats[3]}")
-    print(f"\n{YELLOW}[Test E] HIT rate P1 >= P2 and P3 (float more precise){NC}")
-    total += 1
-    hr1 = stats[1]['HIT'] / n_samples
-    hr2 = stats[2]['HIT'] / n_samples
-    hr3 = stats[3]['HIT'] / n_samples
-    if hr1 >= hr2 and hr1 >= hr3:
-        ok(f"HIT rate: P1={hr1:.3f} >= P2={hr2:.3f} >= P3={hr3:.3f}")
-        passed += 1
-    else:
-        fail(f"HIT rate: P1={hr1:.3f} P2={hr2:.3f} P3={hr3:.3f} — expected P1 maximum")
-    print(f"\n{YELLOW}[Test F] pkt_stats after weight update (new random model){NC}")
-    torch.manual_seed(seed + 1)
-    new_model = fresh_like(model)
-    m1.update_weights(new_model)
-    m2.update_weights(new_model)
-    m3.update_weights(new_model)
-    stats_new = {}
-    for mid, mobj in [(1, m1), (2, m2), (3, m3)]:
-        stats_new[mid] = _run_pkt_stats(mobj, inputs, new_model, pkt_sem)
-    total += 1
-    tot2 = sum(stats_new[2].values())
-    tot3 = sum(stats_new[3].values())
-    if tot2 == n_samples and tot3 == n_samples:
-        ok(f"Post-update counters consistent: P2={tot2} P3={tot3} == {n_samples}")
-        passed += 1
-    else:
-        fail(f"Post-update counter: P2={tot2} P3={tot3} (expected {n_samples})")
-    total += 1
-    if stats_new[2] == stats_new[3]:
-        ok(f"P2 and P3 agree post-update: HIT={stats_new[2]['HIT']}")
-        passed += 1
-    else:
-        fail(f"P2/P3 disagree post-update: P2={stats_new[2]} P3={stats_new[3]}")
-    _banner(passed, total)
-    return passed == total
-
-
 def suite_extract(model_path):
     import json
     print(f"\n{YELLOW}=== SUITE extract — weight/quantization consistency ==={NC}\n")
@@ -1061,7 +474,7 @@ def suite_extract(model_path):
                 passed += 1
             else:
                 fail(f"weights.json has {mismatches}/{len(int8_weights)} weights differing from the live extraction")
-                info("  Regenerate with: python3 shared/extract_weights.py")
+                info("  Regenerate with: python3 ipa/extract_weights.py")
     print(f"\n{YELLOW}[Test 4] weights_float.json — scale_factor and float values{NC}")
     wf_path = os.path.join(shared_dir, 'weights_float.json')
     if not os.path.exists(wf_path):
@@ -1282,102 +695,6 @@ def suite_quant(model, n_samples=200, model_path=None):
     return passed == total
 
 
-def _make_zero_input(n):     return np.zeros(n, dtype=np.float32)
-def _make_ones_input(n):     return np.ones(n, dtype=np.float32)
-
-def _make_ttl_zero_input(n):
-    x = np.random.uniform(0, 1, n).astype(np.float32)
-    if n > 12:
-        x[12] = 0.0
-    return x
-
-def _make_out_of_range_input(n, scale=5.0):
-    return np.random.uniform(-scale, scale, n).astype(np.float32)
-
-def _make_extreme_input(n, val=1000.0):
-    x = np.zeros(n, dtype=np.float32)
-    x[::2]  =  val
-    x[1::2] = -val
-    return x
-
-_EDGE_CASES = [
-    ("zero vector",          _make_zero_input),
-    ("all-ones vector",      _make_ones_input),
-    ("TTL=0",                _make_ttl_zero_input),
-    ("out-of-range [-5,5]",  _make_out_of_range_input),
-    ("extreme +-1000",       _make_extreme_input),
-]
-
-
-def suite_robust(model):
-    """`model` is the checkpoint main() loaded -- see suite_pktstats."""
-    print(f"\n{YELLOW}=== SUITE robust — anomalous inputs ==={NC}\n")
-    torch.manual_seed(42)
-    np.random.seed(42)
-    I = model.fc1.in_features
-    O = model.out.out_features
-    H = model.fc1.out_features
-    print(f"  Architecture: {I} -> {H} -> {H} -> {O}")
-    print()
-    m1 = Method1_Hardcoded(model)
-    m2 = Method2_Template(model)
-    m3 = Method3_Modular(model)
-    methods = [(1, m1, 'hardcoded'), (2, m2, 'template'), (3, m3, 'modular')]
-    passed = total = 0
-    for case_name, input_fn in _EDGE_CASES:
-        print(f"{YELLOW}[Case: {case_name}]{NC}")
-        x = input_fn(I)
-        for mid, mobj, mname in methods:
-            total += 1
-            try:
-                out    = mobj.infer(x)
-                argmax = int(np.argmax(out))
-                valid  = 0 <= argmax < O
-                finite = bool(np.all(np.isfinite(out)))
-                if valid and finite:
-                    ok(f"P{mid} {mname:<10}: argmax={argmax} | output finite | OK")
-                    passed += 1
-                else:
-                    reasons = []
-                    if not valid:  reasons.append(f"argmax={argmax} fuori [0,{O-1}]")
-                    if not finite: reasons.append(f"output non finito: {out}")
-                    fail(f"P{mid} {mname:<10}: {' | '.join(reasons)}")
-            except Exception as e:
-                fail(f"P{mid} {mname:<10}: exception — {e}")
-        total += 1
-        try:
-            a2 = int(np.argmax(m2.infer(x)))
-            a3 = int(np.argmax(m3.infer(x)))
-            if a2 == a3:
-                ok(f"  P2 and P3 agree on anomalous input: argmax={a2}")
-                passed += 1
-            else:
-                fail(f"  P2={a2} and P3={a3} disagree on anomalous input '{case_name}'")
-        except Exception as e:
-            fail(f"  Exception in the consistency check: {e}")
-        print()
-    print(f"{YELLOW}[Stress] 1000 out-of-range inputs [-10, 10] without crashes{NC}")
-    total += 1
-    n_crash = 0
-    for _ in range(1000):
-        x = np.random.uniform(-10, 10, I).astype(np.float32)
-        try:
-            a1 = int(np.argmax(m1.infer(x)))
-            a2 = int(np.argmax(m2.infer(x)))
-            a3 = int(np.argmax(m3.infer(x)))
-            if not (0 <= a1 < O and 0 <= a2 < O and 0 <= a3 < O):
-                n_crash += 1
-        except Exception:
-            n_crash += 1
-    if n_crash == 0:
-        ok("No crash over 1000 stress inputs (range [-10,10])")
-        passed += 1
-    else:
-        fail(f"{n_crash}/1000 stress inputs caused invalid argmax or exception")
-    _banner(passed, total)
-    return passed == total
-
-
 # Every map a pipeline declares, summed by map_bytes() from the kernel's own
 # BPF_OBJ_GET_INFO_BY_FD. A name absent from a given pipeline is skipped by the
 # try/except at the call site, so one list covers all three.
@@ -1438,7 +755,8 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
     all_ok = True
 
     # --- P1 hardcoded: variable depth, same descriptor -------------------
-    shape = mm.derive_shape({"n_interfaces": 6, "n_nodes": 52})
+    shape = mm.derive_shape({"n_interfaces": 6, "n_nodes": 52,
+                             "n_out": reference_shape()["n_out"]})
     features, n_out, n_in = shape["features"], shape["n_out"], shape["n_in"]
 
     # link_state width from the resolved descriptor, not a literal 6.
@@ -1541,6 +859,13 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
         info("Run on a Linux host: sudo python3 ipa/test/test_suite.py --only kernel")
         return True
+    if os.geteuid() != 0:
+        # Checked up front: without root BCC reports a generic "Failed to
+        # compile BPF module", which the per-pipeline permission check below
+        # cannot tell apart from a real failure.
+        info("kernel suite skipped: needs root (loads XDP programs).")
+        info("Run: sudo python3 ipa/test/test_suite.py --only kernel")
+        return True
     try:
         import verify_prog_run as V
     except Exception as e:
@@ -1551,8 +876,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     methods = [
         ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
         # P1.5 as DEPLOYED: the AOT object (gen_full_c + loader_aot, through
-        # p1_aot). Until 2026-09-23 this row was the BCC build, which never
-        # reaches a node; the two agreed within noise (claims.md B3).
+        # p1_aot).
         ("hardcoded", V.setup_hardcoded, 1),
         ("template",  V.setup_template,  2),
         ("modular",   V.setup_modular,   3),
@@ -1649,7 +973,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         # column, useful for comparing the three pipelines against each other,
         # and NOT comparable with the zero-loss throughput figures reported in
         # the literature (RFC 2544), which are measured with real traffic.
-        # See docs/metodologia_test.pdf.
+        # See docs/testing.md §10 for the throughput measured on real traffic.
         mpps    = (1000.0 / lat_ns) if lat_ns > 0 else 0.0
         # Sum the kernel's own view of every map this pipeline declares. A name
         # this pipeline does not have raises and is skipped -- that is expected,
@@ -1823,17 +1147,15 @@ def _load_default_model(model_arg):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local IPA test suite (3 methods) — consolidates the old test_*.py")
-    parser.add_argument('--only', default='all', choices=['all', 'core', 'pktstats', 'extract', 'quant', 'robust', 'kernel'], help='Which suite to run (default: all)')
+    parser = argparse.ArgumentParser(description="IPA test suite: weight extraction, quantization, in-kernel metrics")
+    parser.add_argument('--only', default='all', choices=['all', 'extract', 'quant', 'kernel'], help='Which suite to run (default: all)')
     parser.add_argument('--model', type=str, default=None, help='Path to the .pt checkpoint')
-    parser.add_argument('--verbose', action='store_true', help='Extra detail (core suite)')
-    parser.add_argument('--samples', type=int, default=200, help='Samples for pktstats/quant')
-    parser.add_argument('--seed', type=int, default=42, help='Seed for pktstats')
+    parser.add_argument('--samples', type=int, default=200, help='Samples for quant')
     parser.add_argument('--kernel-repeat', type=int, default=50000, help='BPF_PROG_TEST_RUN repeats for the kernel suite')
     parser.add_argument('--kernel-trials', type=int, default=7, help='Independent min-of-N trials per pipeline (fixes run-to-run volatility, see suite_kernel docstring)')
     parser.add_argument('--no-verify', action='store_true', help='Kernel suite: skip the dispatch gate (metrics only)')
     args = parser.parse_args()
-    all_suites = ['core', 'pktstats', 'extract', 'quant', 'robust', 'kernel']
+    all_suites = ['extract', 'quant', 'kernel']
     which = all_suites if args.only == 'all' else [args.only]
     needs_torch = any(s != 'kernel' for s in which)
     if needs_torch and not TORCH_AVAILABLE:
@@ -1842,16 +1164,10 @@ def main():
         sys.exit(1)
     model, pt_path = _load_default_model(args.model) if needs_torch else (None, args.model)
     results = {}
-    if 'core' in which:
-        results['core'] = suite_core(model, args.verbose)
-    if 'pktstats' in which:
-        results['pktstats'] = suite_pktstats(model, args.samples, args.seed)
     if 'extract' in which:
         results['extract'] = suite_extract(pt_path)
     if 'quant' in which:
         results['quant'] = suite_quant(model, args.samples, pt_path)
-    if 'robust' in which:
-        results['robust'] = suite_robust(model)
     if 'kernel' in which:
         results['kernel'] = suite_kernel(args.model, repeat=args.kernel_repeat, verify=not args.no_verify, trials=args.kernel_trials)
     print(f"{YELLOW}{'#'*52}{NC}")

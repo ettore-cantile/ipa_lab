@@ -1,6 +1,6 @@
 """
 model_meta.py — Per-model feature descriptor + per-topology feature dimensions
-(shared by extract_weights.py, ebpf_program.py, methods/method4_hardcoded.py).
+(shared by extract_weights.py, ebpf_program.py, poc_aot/gen_full_c.py).
 
 Pipeline 1 (hardcoded) builds the model's input vector (IV) ON THE NODE from
 information the switch already has locally: some from the packet in transit
@@ -660,7 +660,7 @@ def descriptor_semantics_or_reference(n_out: int, who: str):
     there is one place where "no semantics were supplied" is resolved and one
     wording for it. Order matters:
 
-      1. shared/model_meta.json's class_semantics, if its n_out matches. This
+      1. ipa/model_meta.json's class_semantics, if its n_out matches. This
          is a DECLARATION and is used as-is.
       2. FORWARD 0..n_out-2 / DROP n_out-1, printed as an assumption.
 

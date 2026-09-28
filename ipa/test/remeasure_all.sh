@@ -21,7 +21,11 @@ sudo -v || exit 1
 # tiene vivo sudo per tutta la durata
 ( while true; do sudo -n true; sleep 50; done ) 2>/dev/null &
 KEEP=$!
-trap 'kill $KEEP 2>/dev/null; sudo chown -R "$(id -u):$(id -g)" "$ROOT/results" "$LOG"' EXIT
+# Anche ipa/ e docs/: i comandi girano come root e riscrivono file dentro il
+# repository (l'oggetto AOT e il suo sorgente in ipa/poc_aot/, i __pycache__,
+# i grafici in docs/figures/). Lasciati a root, il primo build da utente
+# fallirebbe con PermissionError.
+trap 'kill $KEEP 2>/dev/null; sudo chown -R "$(id -u):$(id -g)" "$ROOT/results" "$ROOT/ipa" "$ROOT/docs" "$LOG"' EXIT
 
 run() {
     local name=$1; shift
@@ -43,7 +47,6 @@ run verify_multi_model  python3 ipa/test/verify_multi_model.py
 run per_model_semantics python3 ipa/test/verify_per_model_semantics.py
 run synth_kernel        python3 ipa/test/verify_synth_kernel.py --all --n 300
 run tailcall_overhead   python3 ipa/test/bench_tailcall_overhead.py
-run model_add           python3 ipa/test/bench_model_add.py --n-models 3
 run aot_deploy_bench    python3 ipa/methods/method4_hardcoded_aot.py
 run depth_vs_width      python3 ipa/test/bench_depth_vs_width.py
 run scaling_verify      python3 ipa/test/bench_scaling.py --verify

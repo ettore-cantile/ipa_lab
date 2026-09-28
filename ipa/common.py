@@ -171,7 +171,7 @@ def resolve_ifindex(name: str, fallback: str = None):
         whichever name actually resolved. Appropriate for a secondary/
         egress lookup (e.g. populating a mac_table entry) where any
         working interface is an acceptable substitute -- this is exactly
-        what bit method4_hardcoded.py on a node missing eth4/eth5: the
+        what bit the P1 deploy on a node missing eth4/eth5: the
         ifindex had a fallback already, but the interface NAME used to
         read /sys/class/net/<name>/address for the MAC did not, and
         crashed on a nonexistent interface.

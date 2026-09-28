@@ -84,7 +84,7 @@ it rather than letting it look like a fault:
 
 All of this lives in [`topologies/germany50/`](topologies/germany50/), not in the engine. `germany50.xml` is the SNDlib topology the checked-in checkpoint was trained on, kept because it is the provenance of that model: delete it and `n_nodes=52` / `n_interfaces=6` become numbers with no origin. `importSNDLib.py` loads it into a NetworkX graph, for topology statistics and as the way to feed a real topology to the test fabric.
 
-The dimensions those files imply — `n_interfaces=6`, `n_nodes=52` — are written once, in `topologies/germany50/topology_config.json`, and read by the engine through `$IPA_TOPOLOGY_CONFIG` or `/etc/ipa/topology_config.json`. They are no longer constants inside `model_meta.py`.
+The dimensions those files imply — `n_interfaces=6`, `n_nodes=52` — are written once, in `topologies/germany50/topology_config.json`, and read by the engine through `$IPA_TOPOLOGY_CONFIG` or `/etc/ipa/topology_config.json`.
 
 ---
 
@@ -117,16 +117,18 @@ ipa_lab/
 │   ├── synth/                       #    synthetic model generator (scenarios/ is
 │   │                                #       generated output, not tracked)
 │   └── test/                        #    engine tests, topology-agnostic
-│       ├── test_suite.py            #      core/pktstats/extract/quant/robust/kernel
+│       ├── test_suite.py            #      extract / quant / kernel (in-kernel metrics)
 │       ├── test_class_semantics.py  #      69 checks, five class layouts, none Germany50
-│       ├── test_synth.py            #      63 checks on generated models, incl.
+│       ├── test_synth.py            #      60 checks on generated models, incl.
 │       │                            #        synth reference == P1's generated C
 │       ├── p1_c_eval.py             #      evaluates P1's C from its text (no kernel)
 │       ├── verify_prog_run.py       #      per-pipeline kernel verifier (BPF_PROG_TEST_RUN)
 │       ├── verify_multi_model.py    #      concurrent multi-model registration
 │       ├── verify_per_model_semantics.py #   P2/P3: class -> action per model_id
-│       ├── bench_*.py               #      model-add cost, depth-vs-width, tail-call cost,
-│       │                            #        scaling, per-model semantics (BPF_PROG_TEST_RUN)
+│       ├── bench_*.py               #      depth-vs-width, tail-call cost, scaling
+│       │                            #        (BPF_PROG_TEST_RUN)
+│       ├── diag_verifier.py         #      verifier statistics per program (log_level 4)
+│       ├── verify_synth_kernel.py   #      synthetic models: reference vs eBPF, all pipelines
 │       ├── bench_throughput.py      #      real traffic on veth: node cost per packet
 │       │                            #        (--mode compare --generator xdp --egress-cpu auto)
 │       ├── xdp_gen.py               #      XDP live-frames generator (no skb, no copy)
@@ -222,17 +224,7 @@ and multi-hop forwarding across several nodes.
 
 ---
 
-> **Historical note.** The preliminary phase of this project was organised around
-> `switch_core.py` and four *methods* (PTQ / QAT / OpenFlow-like / IPA-demo)
-> exploring quantization and table-population strategies, with a deliberately
-> minimal four-term dot product in the kernel and two maps (`model_cache`,
-> `fwd_table`). That code is preserved, with its own README, on the
-> **`ipa-poc-preliminar`** branch. `main` is organised instead around a **design
-> space of three eBPF pipelines** that all run the *same* quantized multi-layer
-> model and differ only in *where the weights live and what can change without
-> recompiling*. The two branches are successive stages of one project, not
-> alternatives; the narrative link between them is in the thesis, kept outside
-> this repository.
+The code of the project's preliminary phase is on the **`ipa-poc-preliminar`** branch.
 
 ---
 
@@ -273,38 +265,30 @@ per-model *descriptor* — an ordered list of feature types from
 | Feature type | Kind | Read from | Default size |
 |---|---|---|---|
 | `link_state` | dense vector map | `link_state` BPF map (real carrier state) | `n_interfaces` = 6 |
-| `ingress_iface` | one-hot | `ctx->ingress_ifindex` | `n_interfaces` = 6 |
+| `ingress_iface` | one-hot | `ctx->ingress_ifindex` → logical port, via the `ingress_port` map | `n_interfaces` = 6 |
 | `ttl` | scalar | `ip->ttl` | 1 |
-| `node` | one-hot | `ipa->model_id` | `n_nodes` = 52 |
+| `node` | one-hot | this node's index, from the `node_id` map | `n_nodes` = 52 |
 | `queue_occupancy` | dense vector map | `queue_state` BPF map (synthetic) | `n_queues` = 4 |
 
 Feature **sizes** are a property of the network topology, read from
 `topology_config.json` (falling back to 6 / 52 / 4). Feature **types and order**
 are a property of the model, read from `model_meta.json`. The default descriptor
 `[link_state, ingress_iface, ttl, node]` with `n_out = n_interfaces + 1` gives
-the historical `65-4-4-7` shape.
+the `65-4-4-7` shape.
 
-> **Known limitation — `node` is driven by `model_id`, not by node identity.**
-> The datapath sets the node one-hot index from `ipa->model_id`
-> (`__u32 _node = (__u32)ipa->model_id;` in all three pipelines), not from any
-> per-node identifier. With a single registered model (`--model-id 0`, the
-> default) the one-hot therefore fires slot 0 on **every** node, so the feature
-> contributes the same constant everywhere and carries no topological
-> information. Making it a real node feature means seeding a per-node id at
-> startup (from the node's own hostname or configuration) and reading that
-> instead of `model_id`.
+> **`node` is this node's identity.** The control plane writes the node's index
+> into the `node_id` map at startup (`common.install_node_id`): from
+> `$IPA_NODE_ID`, or from the topology's name → index table. With neither, the
+> map is left empty and the one-hot stays off — an unconfigured node does not
+> claim to be node 0. The index must follow the ordering the model was trained
+> on for the decisions to mean anything about the real network.
 
-> **`ingress_iface` used to be inert, and now is not.** The one-hot was indexed
-> by `ctx->ingress_ifindex` directly (P2/P3) or by a switch over a compile-time
-> `[2, 3, ...]` table (P1). Kernel ifindexes are assigned by the kernel and are
-> arbitrary — 205, 217, 229 on a box that has created a few veths — so neither
-> resolved to anything and a trained feature contributed **zero**, with every
-> test still green because none of them checked that it contributed anything.
-> All three pipelines now resolve the kernel ifindex through a runtime
-> `ingress_port` map, filled by the control plane from the node's own
-> interfaces: the mirror of `mac_table` on the ingress side. `test_fabric.py`
-> installs it and the per-class inputs it finds changed accordingly, which is
-> the evidence the feature is live.
+> **`ingress_iface` goes through a logical port.** Kernel ifindexes are
+> arbitrary (205, 217, 229 on a box that has created a few veths), so all three
+> pipelines translate `ctx->ingress_ifindex` through a runtime `ingress_port`
+> map, filled by the control plane from the node's own interfaces: the mirror
+> of `mac_table` on the ingress side. `test_fabric.py` installs it and checks
+> that the feature changes the decision.
 
 ---
 
@@ -317,9 +301,9 @@ starts at 1.0 and decreases with every hop: the *fraction of the journey
 remaining*. The dataset confirms it — the `ttl` column of
 `dataset_germany50_5.csv` ranges over `[0.3333, 1.0]` in steps of 1/30.
 
-The datapath used to feed the raw TTL (30-64). Since `link_state` enters the dot
-product as 0 or 1, that gave the TTL term 30-64x more leverage per unit of
-weight and buried the failure signal. Measured over the trained range:
+Feeding the raw TTL (30-64) instead would be wrong: since `link_state` enters
+the dot product as 0 or 1, the TTL term would get 30-64x more leverage per unit
+of weight and bury the failure signal. Measured over the trained range:
 
 | | raw TTL | normalised |
 |---|---|---|
@@ -327,17 +311,13 @@ weight and buried the failure signal. Measured over the trained range:
 | redirects onto the DEAD link | **16.7%** | **0.7%** |
 | egress classes ever used | 1 of 7 | 5 of 7 |
 
-The model was never the problem — it was being fed the feature at the wrong
-scale. `model_meta.DEFAULT_TTL_SCALE` holds the divisor; all three pipelines and
+The scale is part of the model's input contract. `model_meta.DEFAULT_TTL_SCALE` holds the divisor; all three pipelines and
 the AOT generator divide the TTL **product** by it (dividing the TTL itself would
 collapse the 10..30 range onto 0 or 1 and throw the resolution away), and the
 Python reference uses `_trunc_div` so it matches C's truncate-toward-zero on
 negative weights. Traffic meant to exercise the model should carry a TTL of at
 most 30 for the same reason: a higher TTL normalises above 1.0, outside anything
 the model saw.
-
-Run `ipa/test/diag_model_decisions.py` to see the numbers for the current
-weights — no root, no BCC, no kernel needed.
 
 ## TTL: the hop behaves like a router
 
@@ -470,7 +450,8 @@ Build prerequisites for the P1 AOT object: `clang`, `libbpf-dev`, `libelf-dev`,
 
 ```bash
 # userspace suites (torch + numpy, no root)
-python3 ipa/test/test_suite.py --only core
+python3 ipa/test/test_suite.py --only extract
+python3 ipa/test/test_suite.py --only quant
 
 # in-kernel metrics + dispatch correctness (Linux + BCC + root)
 sudo python3 ipa/test/test_suite.py --only kernel

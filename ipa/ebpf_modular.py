@@ -298,14 +298,8 @@ BPF_ARRAY(layer_weights, struct lw_blk, 1);
  * different currencies: the verifier charges for PATHS, not for size, and the
  * program got bigger while getting very much cheaper to verify.
  *
- * Measured with `diag_p3_bisect.py --ceilings` on that rewrite:
- *
- *     queues 1 -> layer_first  6 850 instructions, loads
- *     queues 2 ->              7 320, loads
- *     queues 4 ->              8 365, loads
- *     queues 8 ->             10 207, loads
- *
- * Before the rewrite, at queues 8, nothing loaded at all.
+ * Measured (2026-09-28): layer_first loads at IPA_MAX_QUEUES 1, 2, 4 and 8,
+ * with 7 003, 7 628, 8 729 and 10 528 instructions.
  *
  * The cost of sitting at 8 with a descriptor that declares no queue feature is
  * STATIC SIZE ONLY: the FEAT_QUEUE_OCC arm is never taken at runtime, so the

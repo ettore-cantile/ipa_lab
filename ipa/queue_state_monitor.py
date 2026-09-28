@@ -17,7 +17,7 @@ compiled-in weights) -- it is not a real telemetry source. In a real
 deployment this module would read actual queue depths (e.g. from tc/qdisc
 stats) and write them here.
 
-Usage (library, started by method4_hardcoded.py when the model's descriptor
+Usage (library, started by the deploy scripts when the model's descriptor
 uses queue_occupancy):
     from queue_state_monitor import init_queue_state, start_monitor_thread
     init_queue_state(b, size)                 # seed slots at startup

@@ -2,14 +2,11 @@
 """
 method4_hardcoded_aot.py  --  Pipeline 1 deploy loader: AOT-literal (libbpf).
 
-This is the ONLY deploy backend for Pipeline 1 (hardcoded) -- per the
-professor's explicit request, it replaces the old BCC live-attach path
-(method4_hardcoded.py's `run()`/`_attach`), which execute_pipeline.py no
-longer calls. method4_hardcoded.py itself still exists and is still used,
-but only as an internal compile-and-verify tool for the test suite
-(verify_prog_run.py, bench_model_add.py, ...) via ebpf_program.py -- that
-never runs on the datapath node in production, so it is a separate concern
-from what this script does.
+This is the only deploy backend for Pipeline 1 (hardcoded): the weights are
+C literals compiled offline with clang, and the node only loads the object.
+With no arguments it is also the verifier smoke test that
+`execute_pipeline.py --method hardcoded --verify-only` runs: generate, load
+through the verifier and JIT, BPF_PROG_TEST_RUN once, no attach.
 
 loader_aot (built below) is statically linked against libbpf (+ libelf,
 zlib): stripped node images typically have neither clang nor
@@ -18,44 +15,21 @@ even start ("cannot open shared object file") -- the whole point of
 building it elsewhere is defeated if it still needs libbpf.so present on
 every node it runs on.
 
-This removes the clang-at-runtime (~75 ms per model with BCC) that the old path paid on
-every (re)load, while keeping the literal-weights performance.
+Because the weights are still C literals compiled by clang -O2, the per-weight
+strength reduction (x*0 folded away, x*8 -> shift) is baked into the .o: the
+node gets the literal performance without a compiler.
 
 Topology dimensions (n_interfaces, n_nodes, n_queues) come from
 topology_config.json — a file that describes the NETWORK TOPOLOGY shared
 by all nodes in the same deployment. If absent, the descriptor's `trained_on`
 block is used; the engine has no built-in topology.
 
-The problem (measured, method4 BCC path -- the "[M1 update timing]" line printed
-by verify_prog_run.py / test_suite.py --only kernel):
-    [M1 update timing] redirect/reload (BPF compile+load): ~75 ms with BCC
-    -> the large majority of that is clang compiling the weights-literal C at
-       runtime, on the datapath node, for EVERY new/modified model.
-    The exact figure is machine-dependent (observed 1.26-1.66 s across boxes);
-    always quote the number your own run printed, not one from this comment.
-
-The alternative, for the "models known a priori" case (exactly the hardcoded
-assumption): compile the weights-literal program OFFLINE, once, on a build box,
-into a plain BPF .o (clang, libbpf dialect, weights as C literals). At runtime
-the datapath node only does bpf_object__open_file + bpf_object__load -> a few ms,
-NO clang. Because the weights are still C literals compiled by clang -O2, the
-per-weight strength reduction (x*0 folded away, x*8 -> shift) is preserved, so
-performance stays in the same class as BCC at the same architecture -- NOT
-bit-identical, though: the two go through different clang versions and different
-map-access dialects, so the generated programs differ slightly. A recent run
-measured 1026 xlated instructions (28 dispatcher + 998 model) at 57 ns/pkt for
-AOT against 997 (29 + 968) at 48 ns/pkt for BCC in the same session. Both
-numbers are machine- and toolchain-dependent; re-measure rather than quoting
-these.
-
 What this script does:
     0. with --iface: LIVE DEPLOY -- the loader loads the prebuilt .o and pins
        its maps in bpffs; THIS process fills them with the control plane P2
        and P3 use (mac_table from NodeConfig, ingress_port, node_id, the
        link_state monitor, the ARP refresh); only then does the loader attach.
-       Until 2026-09-23 the loader seeded mac_table itself with ifindex 1 and
-       zero MACs, so every FORWARD decision was redirected to `lo`. See
-       _live_deploy and the protocol at the top of poc_aot/loader_aot.c.
+       See _live_deploy and the protocol at the top of poc_aot/loader_aot.c.
     Without --iface, runs the bench instead:
     1. load topology_config.json (authoritative network dimensions), verify
        N_IN consistency with the checkpoint,
@@ -69,8 +43,7 @@ What this script does:
 
 Descriptor support: the offline generator (gen_full_c.py) is descriptor-driven
 — it ports the three feature kinds (scalar / dense_vector_map / onehot) to the
-libbpf dialect, so ANY descriptor the BCC path (ebpf_program.py) accepts is now
-AOT-compilable too. The default [link_state, ingress_iface, ttl, node] / n_out=7
+libbpf dialect, so any descriptor the engine accepts compiles. The default [link_state, ingress_iface, ttl, node] / n_out=7
 still produces the byte-identical 65-4-4-7 program.
 
 Requires (on the build box): clang, llvm, libbpf-dev, linux headers.
@@ -298,7 +271,7 @@ def ensure_loader(cc="cc"):
         # like the model .o -- must be built ONCE on a box that has one
         # (with libbpf-dev/libelf-dev/zlib1g-dev for the static link below),
         # then the resulting binary just needs to exist at this same path
-        # (shared/poc_aot/loader_aot) -- e.g. built directly on the host,
+        # (ipa/poc_aot/loader_aot) -- e.g. built directly on the host,
         # which is shared with every node via the bind
         # mount, so no manual copy step is needed once it is built there.
         raise RuntimeError(
@@ -364,7 +337,7 @@ def ensure_loader(cc="cc"):
             print("      glibc than this host (symptom: 'GLIBC_x.yy not found'). To get a")
             print("      portable fully-static binary, install the static libs it still needs:")
             print("      sudo apt-get install libc6-dev libbz2-dev libzstd-dev liblzma-dev")
-            print("      then rebuild: rm shared/poc_aot/loader_aot && python3 <this script>")
+            print("      then rebuild: rm ipa/poc_aot/loader_aot && python3 <this script>")
         if not built:
             print("[AOT] static link failed on all attempts. Full ld error:")
             print("      " + "\n      ".join(last_err.strip().splitlines()[-8:]))
@@ -401,7 +374,7 @@ def main():
         "--iface", default=None,
         help="LIVE DEPLOY: attach the prebuilt .o to this interface (real XDP "
              "attach, stays resident until Ctrl-C) instead of the TEST_RUN bench. "
-             "This is the AOT alternative to method4_hardcoded's BCC live attach.")
+             "The only way Pipeline 1 is deployed.")
     ap.add_argument(
         "--xdp-mode", choices=["native", "generic", "auto"], default="native",
         help="XDP attach mode for --iface. native (default) runs in the driver, "
@@ -412,7 +385,7 @@ def main():
         "--build-only", action="store_true",
         help="generate + compile the .o and build the loader, then stop: no "
              "bench, no attach. Used by the kernel benches (verify_prog_run."
-             "setup_aot) and test_fabric, which drive the object themselves")
+             "setup_hardcoded, via p1_aot) and test_fabric, which drive the object themselves")
     ap.add_argument(
         "--pin-root", default="/sys/fs/bpf",
         help="bpffs directory under which the live deploy pins its maps "
@@ -486,8 +459,7 @@ def main():
         sys.exit(
             f"[AOT] '{args.clang}' not found and no prebuilt "
             f"{os.path.relpath(o_path, _ORIGINAL_CWD)}.\n"
-            f"      AOT-literal is the only hardcoded deploy backend now (BCC live-attach\n"
-            f"      was removed at the professor's request). Build the .o OFFLINE on a\n"
+            f"      AOT-literal is the only hardcoded deploy backend. Build the .o OFFLINE on a\n"
             f"      box with clang (python3 ipa/methods/method4_hardcoded_aot.py),\n"
             f"      then copy nn_aot_arch.o onto this node.")
 
@@ -526,20 +498,10 @@ def main():
     if rc != 0:
         sys.exit(f"[AOT] loader_aot failed (rc={rc})")
 
-    print("\n" + "=" * 64)
-    print(" SUMMARY: BCC (runtime clang) vs AOT-literal (offline .o)")
-    print("=" * 64)
-    build_str = f"{build_ms:>7.1f} ms" if build_ms is not None else "  (reused prebuilt .o -- no clang on this node)"
-    # Reference value, NOT measured by this script (it never runs the BCC path).
-    # Say so, so the line is not read as a fresh measurement sitting next to
-    # three that are. The live figure is the "[M1 update timing]" line printed
-    # by test_suite.py --only kernel on this same machine.
-    print("  BCC method4 (re)load    : ~75 ms    (reference, NOT measured here --")
-    print("                                       see '[M1 update timing]' in --only kernel)")
-    print(f"  AOT offline build       : {build_str}  (clang once, on build box)")
-    print("  AOT runtime deploy      : ~few ms   (open+load only -- see [deploy] above)")
-    print("  performance             : literal maximum preserved (see [perf] above)")
-    print("=" * 64)
+    build_str = (f"{build_ms:.1f} ms" if build_ms is not None
+                 else "reused prebuilt .o (no clang on this node)")
+    print(f"\n[AOT] offline build: {build_str}; verifier + JIT and one "
+          f"BPF_PROG_TEST_RUN passed (see [deploy] and [perf] above).")
 
     if not args.keep:
         # Only the generated .c is disposable. The .o must SURVIVE: it is the

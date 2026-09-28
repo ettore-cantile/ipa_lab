@@ -2,7 +2,8 @@
 
 Tre pipeline (P1 hardcoded, P2 template, P3 modular) verificate su due piani:
 
-- **userspace** (numerico, PyTorch/NumPy) — accuratezza, quantizzazione, robustezza, struttura;
+- **userspace** (numerico, PyTorch/NumPy e il C di P1 valutato dal testo) — estrazione dei pesi,
+  quantizzazione, semantica delle classi, modelli sintetici, formule dei banchi;
 - **kernel** — `BPF_PROG_TEST_RUN` sui programmi XDP reali (istruzioni, latenza, lookup,
   memoria, dispatch) e **traffico vero** su un fabric `veth` con XDP nativo (pktgen o frame
   XDP grezzi, contatori all'ingresso e all'uscita).
@@ -11,8 +12,9 @@ Tutti gli script di test vivono sotto `ipa/test/`; i comandi si eseguono dalla r
 repository. Il motore sta in `ipa/`; i dati della topologia su cui il checkpoint depositato è
 stato addestrato stanno in `topologies/germany50/`.
 
-**Tutte le cifre di questo documento sono state misurate il 2026-09-27** sulla macchina e
-nelle condizioni descritte in §0, con `ipa/test/remeasure_all.sh` e
+**Le cifre di questo documento sono state misurate il 2026-09-28**, con la ReLU senza salto
+di §8, sulla macchina e nelle condizioni descritte in §0,
+con `ipa/test/remeasure_all.sh` e
 `ipa/test/remeasure_traffic.sh` (log in `/tmp/ipa_logs/`, `$IPA_LOG_DIR` per cambiarlo).
 
 ---
@@ -25,8 +27,8 @@ nelle condizioni descritte in §0, con `ipa/test/remeasure_all.sh` e
 |---|---|
 | Macchina | Lenovo IdeaPad Slim 5 14IMH9 (83DA), BIOS N7CN32WW, alimentata da rete |
 | CPU | Intel Core Ultra 7 155H, **ibrida**: P-core 0-11 (6 core fisici con SMT: coppie 0/5, 1/2, 3/4, 6/7, 8/9, 10/11), E-core 12-19, LP E-core 20-21 (fuori dalla L3) |
-| Sistema | Ubuntu 24.04.4 LTS, kernel 6.8.0-100-generic, bare metal |
-| Toolchain | clang 18.1.3, BCC 0.29.1, libbpf 1.4, bpftool 7.4 |
+| Sistema | Ubuntu 24.04.4 LTS, kernel 6.8.0-142-generic, bare metal |
+| Toolchain | clang 18.1.3, BCC 0.29.1, libbpf 1.3.0 (quella con cui si compila il loader AOT), bpftool 7.4 (con la sua libbpf 1.4) |
 | Rete | nessuna scheda cablata: il datapath è un fabric `veth` (§3) |
 
 Prerequisiti oltre a BCC: `sudo apt install clang libbpf-dev libelf-dev zlib1g-dev
@@ -140,15 +142,12 @@ Richiede `torch` e `numpy`: senza torch `test_suite.py` si ferma subito, e gira 
 `pip install --user --break-system-packages torch`.
 
 ```bash
-python3 ipa/test/test_suite.py                    # tutte le suite (kernel saltata senza BCC/root)
-python3 ipa/test/test_suite.py --only core        # struttura design-space + update latency
+python3 ipa/test/test_suite.py                    # extract + quant (kernel saltata senza BCC/root)
 python3 ipa/test/test_suite.py --only quant       # accuratezza argmax vs scale_factor
-python3 ipa/test/test_suite.py --only pktstats    # HIT/FAKE/MISS per pipeline
 python3 ipa/test/test_suite.py --only extract     # coerenza pesi / weights.json / dequant
-python3 ipa/test/test_suite.py --only robust      # input anomali, nessun crash
 
 python3 ipa/test/test_class_semantics.py          # 69 controlli, cinque layout di classi
-python3 ipa/test/test_synth.py                    # 63 controlli sui modelli sintetici
+python3 ipa/test/test_synth.py                    # 60 controlli sui modelli sintetici (58 senza torch)
 python3 ipa/test/test_bitrate_math.py             # 98: formule e attribuzione di bench_bitrate
 python3 ipa/test/test_steady_window.py            # 18: la finestra stazionaria
 python3 ipa/test/test_host_conditions.py          # 93: ruoli, applicazione e ripristino
@@ -322,14 +321,16 @@ sudo python3 ipa/link_state_monitor.py --ifaces eth0 eth1 eth2 eth3 eth4 eth5
 
 ---
 
-## 5. Costo di aggiunta modello (`bench_model_add.py`)
+## 5. Costo di aggiunta modello
 
-```bash
-sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_model_add.py --n-models 3
-```
+Installare un modello nuovo su un nodo in servizio (`update_ms` di `bench_scaling`, §9): P1
+carica l'oggetto AOT già compilato, **0,7–2,1 ms** (§ Risultati: `open` 0,09 + verifica e JIT
+1,03 ms sul modello standard), e clang (~76 ms) gira una volta sulla macchina di build; P2 e P3
+scrivono in mappa pesi, descrittore e semantica, **10–12 ms**, senza compilare niente.
+Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (3 modelli dell'architettura 65-4-4-7),
+`MAX_LAYER_WEIGHT_ENTRIES=2048` in P3 (6).
 
-| pipeline | setup una tantum | add **min** (ms) | media | come |
-|---|---:|---:|---:|---|
+---|---:|---:|---:|---|
 | hardcoded (BCC) | — | 75,6 | 78,9 | ricompilazione completa: BCC ~74 ms, caricamento ~2 ms |
 | template | 1 516 ms | **0,505** | 0,695 | una `bpf_map_update_elem` sul blocco pesi |
 | modular | 1 194 ms | **0,410** | 0,616 | una `bpf_map_update_elem` sul blocco pesi |
@@ -517,22 +518,9 @@ negativo: con una tabella condivisa simulata A e B passano e C, D, F, R fallisco
 | F | `n_out` diversi (4 e 7): ogni argmax limitato dal proprio `n_out` |
 | R | stesso `model_id` ricaricato con altra semantica e altro `n_out` (banco 0→1, altri intatti) |
 
-**Costo** (`bench_semantics_models`, 21 trial, contro l'albero `16f1a024^` in cui la tabella
-era indicizzata dalla sola classe):
-
-| | istruzioni | JIT (B) | lookup | tail call | mappe (B) | latenza min, N=1 |
-|---|---:|---:|---:|---:|---:|---:|
-| P2 classe sola | 14 978 | 67 139 | 11 | 1 | 11 192 | 192 ns |
-| P2 `(model_id, classe)` | 14 969 | 67 428 | 11 | 1 | 142 264 | 191 ns |
-| P3 classe sola | 12 277 | 57 605 | 29 | 3 | 41 020 | 325 ns |
-| P3 `(model_id, classe)` | 12 318 | 57 726 | 29 | 3 | 172 092 | 319 ns |
-
-Istruzioni −9 (P2) e +41 (P3), lookup e tail call invariati, latenza invariata entro 2%.
-Con 1, 2, 4, 8 modelli registrati nessuna pendenza su P2 (188–194 ns); P3 316–319 ns fino a
-4 modelli, 340 ns con 8. La tabella è del 2026-09-27. Il 28 la misura è stata rifatta dopo
-`ipa_relu` (§8), ma l'albero di confronto ha ancora la ReLU con il salto, quindi la
-differenza mescolerebbe due modifiche: resta la tabella pulita. Il punto a 8 modelli di P3
-non si è ripetuto (315 ns, come con un modello solo): era rumore. **Memoria: +131 072 byte per pipeline**, fissi: 256 `model_id` × 2
+**Costo per pacchetto**: nessuno misurabile. La chiave `(model_id, classe)` è una lettura come
+la chiave per sola classe: 11 lookup in P2 e 29 in P3, e da 1 a 8 modelli registrati la
+latenza non cambia. **Memoria: +131 072 byte per pipeline**, fissi: 256 `model_id` × 2
 banchi × 32 classi preallocati. L'alternativa a pochi KB (uno slot per modello allocato dal
 piano di controllo, come `weight_offset`) non è implementata.
 
@@ -787,8 +775,7 @@ GHz, sopra ogni processore reale: il percorso eseguito è una frazione del conte
 ### I soffitti compilati e il verificatore
 
 In P3 il soffitto delle code (`IPA_MAX_QUEUES`) cambia le istruzioni senza cambiare il
-percorso eseguito quando il descrittore non dichiara la feature coda (`diag_p3_bisect.py
---ceilings`):
+percorso eseguito quando il descrittore non dichiara la feature coda:
 
 | `IPA_MAX_QUEUES` | 1 | 2 | 4 | **8** |
 |---|---:|---:|---:|---:|
@@ -919,17 +906,17 @@ Build **strumentata**: il dispatcher marca T1, il programma marca T2 subito prim
 
 | | T2−T1 (pipeline) | T3−T2 (redirect + veth + NAPI) | sostenibile (perdita totale ≤ 0,1%) |
 |---|---:|---:|---|
-| baseline | 35 | 199–240 | ≥ 2,0 Mpps |
-| p1_static | 64 | 206–244 | ≥ 2,0 Mpps |
-| hardcoded | 73–75 | 201–243 | ≥ 2,0 Mpps |
-| template | 225–228 | 207–256 | ≥ 1,5 Mpps |
-| modular | 347–355 | 211–259 | ≥ 1,0 Mpps |
+| baseline | 34–35 | 194–239 | ≥ 2,0 Mpps |
+| p1_static | 68–69 | 195–244 | ≥ 2,0 Mpps |
+| hardcoded | 77–78 | 195–251 | ≥ 2,0 Mpps |
+| template | 228–233 | 200–257 | ≥ 1,5 Mpps |
+| modular | 340–348 | 207–251 | ≥ 1,0 Mpps |
 
-Il trasporto è un costo comune di ~200–260 ns che non dipende dalla pipeline; T2−T1 è
-piatto sul rate. Sopra la baseline la sola pipeline costa **+29 / +39 / +191 / +314 ns**.
+Il trasporto è un costo comune di ~195–255 ns che non dipende dalla pipeline; T2−T1 è
+piatto sul rate. Sopra la baseline la sola pipeline costa **+34 / +43 / +194 / +306 ns**.
 Sotto capacità i respinti restano allo 0,00–0,02%. I "sostenibili" sono gradini della scala
-(0,5 Mpps): contando solo la perdita dopo l'ingresso salgono a 2,42 / 2,23 / 2,18 / 1,60 /
-1,30 Mpps. La build strumentata aggiunge due letture dell'orologio e due scritture per
+(0,5 Mpps): contando solo la perdita dopo l'ingresso salgono a 2,42 / 2,25 / 2,18 / 1,59 /
+1,31 Mpps. La build strumentata aggiunge due letture dell'orologio e due scritture per
 pacchetto: il suo throughput è più basso di quello di produzione (§10.2).
 
 ### 10.4 Il tetto di sola ricezione (`--mode generator`)
@@ -940,8 +927,8 @@ sudo python3 ipa/test/bench_throughput.py --mode generator --frames 64 --rounds 
 ```
 
 Contatore che scarta all'ingresso, nessuna pipeline: il generatore offre ~5,7 Mpps, il DUT ne
-riceve **4,33–4,42** (30 finestre). È lo stesso tetto che `rxonly` misura dentro `--mode
-compare` (4,39): la baseline sta al 74% del tetto di ricezione, P3 al 34%.
+riceve **4,50–4,71** (30 finestre). È lo stesso tetto che `rxonly` misura dentro `--mode
+compare` (4,61): la baseline sta al 72% del tetto di ricezione, P3 al 33%.
 
 ### 10.5 Frame XDP grezzi: il costo del nodo (`--generator xdp`)
 
@@ -959,25 +946,30 @@ ricezione alla decisione e al redirect, con l'uscita su una CPU sua (cpu8).
 
 | | ns/pacchetto | elaborati (Mpps) | arrivati all'uscita (Mpps) |
 |---|---:|---:|---:|
-| baseline | 142 | 7,03 | 4,38 |
-| p1_static | 157 | 6,39 | 4,70 |
-| hardcoded | 160 | 6,24 | 4,78 |
-| template | **287** | 3,48 | 3,48 |
-| modular | **426** | 2,35 | 2,35 |
+| baseline | 141 | 7,11 | 4,38 |
+| p1_static | 158 | 6,34 | 4,78 |
+| hardcoded | 161 | 6,23 | 4,87 |
+| template | **296** | 3,38 | 3,38 |
+| modular | **434** | 2,30 | 2,30 |
 
-**Solo le righe di P2 e P3 sono costi del nodo.** Per baseline, P1 e P1.5 il nodo elabora più
-di quanto il banco riesca a portare via: il core d'uscita (cpu8, che riceve per tutti e
-cinque i veth) consegna 4,4–4,8 Mpps e il resto si perde dopo XDP, e la sola ricezione si
-ferma a ~6,8 Mpps, il tetto del generatore XDP a 3 thread. Le loro cifre sono **limiti
-superiori** del costo; il controllo di validità (baseline più veloce di tutte, misurato su
-RX) fallisce su due run su tre proprio per questo. Per risolverle servono più thread
-generatore e più di un core d'uscita.
+**Solo le righe di P2 e P3 sono costi del nodo.** Per baseline, P1 e P1.5 il nodo elabora
+quanto il generatore produce: la sola ricezione (`rxonly`) si ferma a ~6,9 Mpps, il tetto del
+generatore XDP a 3 thread, e la baseline la supera (7,1) proprio perché nessuna delle due è
+il limite. Le loro cifre sono **limiti superiori** del costo. Per risolverle servono più
+thread generatore.
 
-- **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro l'1% su ogni pipeline
-  (template 285–287, modular 420–423 ns): il nodo tocca solo le intestazioni.
+**Il controllo di validità conta gli elaborati, non gli arrivati.** Il core d'uscita (cpu8,
+che riceve per tutti e cinque i veth) consegna 4,4–4,9 Mpps e il resto si perde dopo XDP.
+Contando gli arrivati la baseline (4,38) sembrerebbe più lenta di P1 (4,78): più pacchetti
+spinge verso l'uscita già satura, più ne perde. `check_validity` confronta quindi
+`node_pps` (elaborati, altrimenti HIT, altrimenti RX), la stessa grandezza con cui il banco
+calcola il costo.
+
+- **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro il 3% su ogni pipeline
+  (template 298–307, modular 433–444 ns): il nodo tocca solo le intestazioni.
 - **Per classe** (stato dei link e TTL cercati per ciascuna delle 6 classi raggiungibili,
-  classe decisa verificata): sulle 5 classi FORWARD P2 244–272 e P3 420–433 ns; **la classe
-  DROP costa di più**, P1 256 contro ~155, P1.5 262 contro ~159, P2 325, P3 474 ns. Con il
+  classe decisa verificata): sulle 5 classi FORWARD P2 255–284 e P3 426–433 ns; **la classe
+  DROP costa di più**, P1 260 contro ~158, P1.5 268 contro ~161, P2 330, P3 468 ns. Con il
   DROP la pagina si restituisce sulla CPU del DUT; con l'inoltro sulla CPU d'uscita.
 
 ### 10.6 Latenza arrivo → ripartenza (`--latency`)
@@ -992,14 +984,16 @@ Latenza minima **a scarico** (50 kpps, nessuna coda), mediana fra tre giri:
 
 | | baseline | p1_static | hardcoded | template | modular |
 |---|---:|---:|---:|---:|---:|
-| min (ns) | 261 | 277 | 293 | 457 | 593 |
-| sopra la baseline | — | +16 | +32 | +196 | +332 |
-| rate a perdita nulla (Mpps) | 1,91 | 1,93 | 1,86 | 1,41 | 1,18 |
+| min (ns) | 249 | 282 | 292 | 460 | 584 |
+| sopra la baseline | — | +33 | +43 | +211 | +335 |
 
 Solo la colonna `min` è una misura: p50 e p99 vengono da un istogramma `bpf_log2l` (bucket a
-potenze di due) e cadono negli stessi due bucket per tutte le pipeline. Il run segnala una
-dispersione oltre il 25% su `p1_static` nella fase a perdita nulla e un 10,9% fra i giri
-sul minimo della baseline.
+potenze di due) e cadono negli stessi due bucket per tutte le pipeline (1 024 ns per
+baseline e P1, 2 048 per P2 e P3). Il minimo a scarico varia al massimo del 5% fra i giri.
+La **ricerca del rate a perdita nulla** invece disperde oltre il 25% fra i giri (fino al
+64%), perché al confine basta un'esitazione di pochi µs per perdere un pacchetto: il banco
+la segnala con `rc=1` e non è una cifra citabile; la saturazione (§10.2) e il carico comune
+sì.
 
 ---
 
@@ -1117,28 +1111,35 @@ python3 ipa/test/bench_bitrate.py --report results/bitrate_3500            # rie
 
 ### 11.6 Risultati (`results/bitrate_3500/`)
 
-6 metodi, 5 giri, 13 punti di scala (tetto di ricezione calibrato 4,40 Mpps = 2,25 Gbit/s a
-64 B), 390 finestre in 4,6 minuti. DUT a 3 494–3 499 MHz, nessun evento di throttling sui
-core, 1 finestra disturbata (2 eventi di pacchetto), registro max 85 °C.
+6 metodi, 5 giri, 13 punti di scala (tetto di ricezione calibrato 4,68 Mpps = 2,40 Gbit/s a
+64 B, generatore 6,13 Mpps), 390 finestre. DUT a 3 494 MHz, nessun evento di throttling né
+sui core né sul pacchetto, nessuna finestra disturbata o con burst del generatore.
 
 | pipeline | inoltro max (Mpps, mediana 5 giri) | variazione | pulita fino a | perde da |
 |---|---:|---:|---|---|
-| rxonly | 4,39 | 0,7% | — | — |
-| baseline | 3,18 | 2,0% | 1,35 Gbit/s | 1,58 Gbit/s |
-| p1_static | 2,84 | 1,4% | 1,13 Gbit/s | 1,35 Gbit/s |
-| hardcoded | 2,72 | 0,7% | 1,13 Gbit/s | 1,35 Gbit/s |
-| template | 1,86 | 0,6% | 0,90 Gbit/s | 1,13 Gbit/s |
-| modular | 1,45 | 0,4% | 0,68 Gbit/s | 0,90 Gbit/s |
+| rxonly | 4,67 | 1,5% | — | — |
+| baseline | 3,34 | 2,1% | 1,44 Gbit/s | 1,68 Gbit/s |
+| p1_static | 2,94 | 2,5% | 1,20 Gbit/s | 1,44 Gbit/s |
+| hardcoded | 2,84 | 2,0% | 1,20 Gbit/s | 1,44 Gbit/s |
+| template | 1,89 | 1,6% | 0,72 Gbit/s | 0,96 Gbit/s |
+| modular | 1,50 | 2,1% | 0,72 Gbit/s | 0,96 Gbit/s |
+
+"Pulita fino a" e "perde da" sono **punti della scala**, spaziati di ~0,24 Gbit/s: la soglia
+vera sta fra i due. P2 inoltra al massimo 1,89 Mpps ≈ 0,97 Gbit/s a 64 B, e il punto da
+0,96 cade sul suo limite; P3 (1,50 Mpps ≈ 0,77 Gbit/s) perde allo stesso punto perché fra
+0,72 e 0,96 la scala non ha valori. Le separa l'inoltro massimo. La scala si calibra a ogni
+sessione sul tetto di `rxonly`, quindi i punti cambiano da un run all'altro.
 
 - Per tutte e sei la perdita è **prima di XDP**: il collo di bottiglia è il programma eBPF.
   Dopo XDP al massimo lo 0,02% degli inviati.
-- Latenza p50 al rate più basso 8–9 µs per tutte; all'ultimo punto pulito 11–68 µs; al primo
-  in perdita 54–192 µs (la coda d'ingresso piena).
+- Latenza p50 al rate più basso 9–10 µs per tutte; all'ultimo punto pulito 6–30 µs; al primo
+  in perdita 69–194 µs (la coda d'ingresso piena).
 - **Costo del contatore** (statistiche BPF del kernel, tempo del programma attaccato):
-  baseline 27,7 → 29,7 ns (+2,0), P1 63,4 → 66,0 (+2,6), P1.5 73,8 → 76,6 (+2,7), P2
-  236,7 → 240,2 (+3,4), P3 386,8 → 385,2 (−1,6, dentro la dispersione di 5–10 ns).
-- I due banchi concordano: `bench_throughput` (§10.2) dà il 2–3% in più, e ha la stessa
-  macchina ma l'uscita sulla CPU del DUT e nessun contatore davanti.
+  baseline 28,0 → 29,9 ns (+2,0), P1 68,0 → 70,3 (+2,3), P1.5 78,6 → 81,1 (+2,5), P2
+  242,7 → 248,0 (+5,3), P3 380,4 → 378,5 (−1,9, dentro la dispersione di 10–15 ns).
+- I due banchi concordano: `bench_throughput` (§10.2) dà cifre entro l'1% (3,31 contro 3,34
+  per la baseline, 1,50 e 1,50 per P3), con la stessa macchina ma l'uscita sulla CPU del DUT
+  e nessun contatore davanti.
 
 ---
 
@@ -1148,8 +1149,8 @@ core, 1 finestra disturbata (2 eventi di pacchetto), registro max 85 °C.
   latenza crescono baseline → P1 → P2 → P3 su ogni banco.
 - **Inferenza identica** nelle tre pipeline (stesso MLP, pesi, argmax): verificata dalla
   corrispondenza di classe kernel/riferimento e dall'equivalenza esatta sui modelli sintetici
-  (`verify_synth_kernel`: P1 8/8, P3 7/7, P2 6/7 con `large` non applicabile — 1 097 pesi
-  oltre `MAX_WEIGHT_ENTRIES` — e `deep` rifiutato dal verificatore, §8).
+  (`verify_synth_kernel`: P1 8/8, P2 7/7 e P3 7/7, con `large` non applicabile a P2 e P3 —
+  1 097 pesi oltre `MAX_WEIGHT_ENTRIES` in P2).
 - **Azione uniforme**: `argmax → class_action → porta logica → mac_table → bpf_redirect`.
 - **Tutto sta su una macchina**: generatore, DUT e nodo successivo sono core diversi dello
   stesso processore, collegati da `veth`. Il costo del veth (e, con pktgen, della copia di

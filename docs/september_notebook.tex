@@ -80,7 +80,7 @@
 \centering
 \vspace*{3cm}
 {\color{soft}\large Quaderno di lavoro}\\[1.2cm]
-{\color{accent}\Huge\bfseries Che cosa è cambiato\\[0.3cm] e perché}\\[0.9cm]
+{\color{accent}\Huge\bfseries Come funziona,\\[0.3cm] e quanto costa}\\[0.9cm]
 {\Large Settembre 2026 --- dal modello\\ al datapath reale}\\[2.5cm]
 \rule{0.6\linewidth}{0.8pt}\\[0.8cm]
 {\large Progetto \textbf{IPA/eBPF}}\\[0.3cm]
@@ -122,7 +122,7 @@ il nodo ha sotto mano in quel momento.
 \draw[arr] (n) -- (o);
 \node[font=\scriptsize\itshape,color=soft,above=1mm of p] {pesi + descrittore};
 \node[font=\scriptsize\itshape,color=soft,below=1mm of st]
-     {link su/giù, TTL, interfaccia d'ingresso};
+     {link su/giù, TTL, interfaccia d'ingresso, identità del nodo};
 \end{tikzpicture}
 \end{center}
 
@@ -162,8 +162,19 @@ Lo stesso modello è implementato in tre modi, per misurare un compromesso.
 \end{center}
 
 P1 è veloce perché il compilatore vede i pesi e li semplifica; è rigido perché
-ogni modello nuovo richiede una ricompilazione. P2 e P3 sono l'opposto. Il
-lavoro di settembre serve a rendere questo confronto \emph{misurabile davvero}.
+ogni modello nuovo richiede una ricompilazione. P2 e P3 sono l'opposto. Questo
+quaderno misura il compromesso.
+
+P1 si costruisce \textbf{prima} (\emph{ahead of time}, AOT): il C con i pesi
+scritti dentro si compila con clang su una macchina qualunque, e al nodo arriva
+l'oggetto pronto, che un piccolo caricatore in C apre e attacca. Il caricatore
+lascia vuote le tabelle e le «appunta» nel file system del kernel; il piano di
+controllo in Python le riempie con le interfacce vere del nodo, poi dice al
+caricatore di attaccare il programma. Ogni cifra di P1 in questo quaderno è di
+quell'oggetto, attraverso un modulo solo (\texttt{ipa/p1\_aot.py}), e anche il
+controllo rapido \texttt{execute\_pipeline.py --method hardcoded --verify-only}
+carica quell'oggetto: lo genera, lo fa passare dal verificatore e lo esegue una
+volta, senza agganciarlo.
 
 % ==================================================================
 \chapter{La matematica che sta dentro il kernel}
@@ -196,10 +207,7 @@ test distinguono le scale \emph{rappresentabili} da quelle che saturano, e
 misurano solo sulle prime.
 \end{lezione}
 
-\section{Il problema dei bias, e l'errore che ci stava dentro}
-
-Qui sta l'errore più sottile trovato in settembre, e vale la pena seguirlo
-passo passo perché è istruttivo.
+\section{I bias vanno riportati nelle unità dell'accumulatore}
 
 Quando moltiplichiamo un ingresso per un peso quantizzato, il risultato porta
 un fattore $s$ in più rispetto al valore reale:
@@ -211,7 +219,7 @@ Se impiliamo gli strati, quel fattore si accumula. Dopo $\ell+1$ moltiplicazioni
 l'accumulatore dello strato $\ell$ porta $s^{\ell+1}$.
 
 Ma il \textbf{bias} è memorizzato come un peso qualsiasi, cioè con un solo
-fattore $s$. Sommarlo così com'è significa sommare una quantità
+fattore $s$. Sommarlo così com'è significherebbe sommare una quantità
 sistematicamente troppo piccola. Va riportato nelle unità dell'accumulatore:
 
 \begin{center}
@@ -235,36 +243,17 @@ sistematicamente troppo piccola. Va riportato nelle unità dell'accumulatore:
 \end{center}
 
 La regola è semplice: allo strato $\ell$ (contando da zero) il bias va
-moltiplicato per $s^{\ell}$.
+moltiplicato per $s^{\ell}$. In P1 il moltiplicatore si calcola alla
+generazione del codice e il bias entra già scalato come letterale; in P2 e P3
+il programma lo calcola a runtime dalla scala del modello.
 
-\begin{prima}[L'errore]
-Il modello di riferimento in Python --- quello con cui si controlla che il
-datapath calcoli la cosa giusta --- applicava $s^0$ e $s^1$ correttamente ai
-primi due strati, e lasciava l'\textbf{ultimo strato a $s^0$} invece di $s^2$.
-
-Il bias dell'uscita era sottopesato di $s^2 = 24^2 = 576$.
+\begin{prima}[Perché i test spengono i link]
+Con \textbf{tutti i link attivi} gli accumulatori sono grandi, e anche un bias
+sottopesato di $s^2 = 576$ volte non sposterebbe mai il massimo. Basta spegnere
+qualche link perché gli accumulatori si riducano e un errore del genere decida
+l'esito. Per questo le prove di correttezza variano lo stato dei link, non solo
+il TTL.
 \end{prima}
-
-\begin{prima}[Perché nessuno se n'era accorto per mesi]
-Tutti i test eseguivano il modello con \textbf{tutti i link attivi}. In quella
-condizione gli accumulatori sono grandi e un errore di 576 non sposta mai il
-massimo. Basta spegnere qualche link perché gli accumulatori si riducano e
-l'errore decida l'esito.
-
-Nello stesso file c'era una seconda funzione di riferimento, scritta per forme
-arbitrarie, che usava la formula generale $s^{\ell}$ ed era \textbf{già
-corretta}. Due riferimenti, uno giusto e uno sbagliato, e quello sbagliato era
-l'unico mai esercitato con link spenti.
-\end{prima}
-
-Corretto l'errore, il riferimento e le tre pipeline concordano su tutti i casi
-provati.
-
-\begin{lezione}
-La lezione non è "c'era un bug". È che \textbf{un test che varia un solo
-ingresso non è un test}: verifica una condizione e la ripete. Ci torneremo nel
-capitolo~5, dove lo stesso schema si ripresenta in una forma ancora più netta.
-\end{lezione}
 
 \section{Il TTL: dividere il prodotto, mai il valore}
 
@@ -285,40 +274,37 @@ Nel C generato si legge esattamente così:
 (((__s64)_ttl * 11LL) / 30LL)
 \end{lstlisting}
 
+La scala $T$ è del \textbf{modello}, non del codice: un modello addestrato su
+$\text{ttl}/16$ va eseguito con 16. Viaggia quindi nel descrittore del modello
+(il campo \texttt{scale} di \texttt{struct feat\_ent}, un byte); P1 la compila
+come letterale, P2 e P3 la leggono dalla mappa a ogni pacchetto, e con 0
+ricadono sul default compilato.
+
+In P2 e P3 il divisore è quindi una variabile, e \textbf{BPF non ha la divisione
+con segno}: il numeratore invece il segno ce l'ha, perché i pesi possono essere
+negativi. Il datapath divide il valore assoluto senza segno e rimette il segno,
+con troncamento verso lo zero --- lo stesso arrotondamento del riferimento
+Python, perché sui negativi le due implementazioni coincidono solo se
+arrotondano allo stesso modo.
+
 % ==================================================================
 \chapter{Le classi non sono porte}
 \label{ch:classi}
 
-\section{Il problema}
+\section{Che cosa significa una classe}
 
 La rete produce sette numeri; il più grande vince. Ma \emph{che cosa significa}
 la classe vincente?
 
-All'inizio di settembre la risposta era sparsa e incoerente. In punti diversi
-del progetto convivevano quattro convenzioni su quale classe significasse
-"scarta il pacchetto":
+Il significato si può \emph{dedurre} --- «la classe 6 è lo scarto», «DROP è
+l'ultima classe», «la classe $k$ esce dall'interfaccia $k$» --- e sul modello
+depositato ognuna di queste deduzioni sembrerebbe funzionare, perché lì le
+porte sono numerate come le classi. Su un altro modello darebbe risposte
+plausibili e sbagliate, senza alcun errore.
 
-\begin{center}
-\small
-\begin{tabular}{@{}ll@{}}
-\toprule
-\textbf{Convenzione} & \textbf{Dove} \\
-\midrule
-la classe 6 è DROP & in un punto \\
-la classe 5 è DROP & in un altro \\
-DROP $=$ $n_{\text{out}} - 1$ & in un terzo \\
-DROP $=$ $\max(\text{etichette}) + 1$ & dedotto dai dati \\
-\bottomrule
-\end{tabular}
-\end{center}
+\section{Una catena esplicita}
 
-E sotto ce n'era una quinta, implicita e più insidiosa: che la classe $k$
-volesse dire "manda fuori dall'interfaccia $k$". Funzionava per caso, perché nel
-modello depositato le porte sono numerate come le classi.
-
-\section{La soluzione: una catena esplicita}
-
-Adesso il significato è \textbf{dichiarato}, mai dedotto, e passa per una
+Il significato è quindi \textbf{dichiarato}, mai dedotto, e passa per una
 catena di quattro passi, ognuno con un responsabile diverso:
 
 \begin{center}
@@ -361,35 +347,23 @@ Nel modello depositato la dichiarazione è:
 \end{tabular}
 \end{center}
 
+Classe e porta sono due spazi di indici distinti anche nel datapath: il
+contatore per classe si scrive con l'indice della classe, la tabella delle
+uscite si legge con quello della porta. Sul modello depositato coincidono, ma il
+codice non ci conta.
+
 \begin{lezione}
-Il punto non è che adesso funziona: funzionava anche prima, per coincidenza
-numerica. Il punto è che adesso \textbf{smetterebbe di funzionare rumorosamente}
-se il modello cambiasse, invece di continuare a girare dando risposte
-plausibili e sbagliate.
+Con la semantica dichiarata, un modello diverso da quello depositato
+\textbf{smette di funzionare rumorosamente} invece di continuare a girare dando
+risposte plausibili e sbagliate.
 \end{lezione}
 
-\section{Un errore che questa separazione ha fatto emergere}
+\section{Ogni modello ha la sua semantica}
 
-Il datapath teneva un contatore per classe, ma scriveva nella casella
-della \emph{porta} invece che in quella della \emph{classe}. Sembrava
-giusto perché le due numerazioni coincidono nel modello depositato.
-
-Con un modello in cui non coincidono, il contatore avrebbe misurato la cosa
-sbagliata in silenzio. Separare i due spazi di indici ha reso l'errore visibile
-e correggibile.
-
-\section{Ogni modello ha la sua semantica (24 settembre)}
-
-\textbf{Il limite.} In P2 e P3 la tabella classe $\to$ azione era \emph{una}, letta
-con la sola classe e condivisa da tutti i modelli caricati. Due modelli non
-potevano dare alla stessa classe significati diversi: per evitare che il secondo
-riscrivesse in silenzio le azioni del primo, il piano di controllo lo rifiutava.
-Il vantaggio di P2 e P3 --- un programma solo, i modelli caricati come dati ---
-valeva quindi solo per modelli con la stessa semantica.
-
-\textbf{La soluzione.} La chiave della tabella è diventata la coppia
-$(\text{model\_id}, \text{classe})$. Il programma resta uno per architettura;
-aggiungere un modello resta scrivere delle tabelle.
+In P2 e P3 un solo programma per architettura serve più modelli, caricati come
+dati. Modelli diversi possono dare alla stessa classe significati diversi, e
+quindi la chiave della tabella classe $\to$ azione è la coppia
+$(\text{model\_id}, \text{classe})$.
 
 \begin{center}
 \begin{tikzpicture}[
@@ -399,7 +373,7 @@ aggiungere un modello resta scrivere delle tabelle.
 ]
 \node[box] (m) {model\_id\\{\scriptsize dal pacchetto}};
 \node[box,right=8mm of m] (r) {registro\\{\scriptsize pesi, forma, banco}};
-\node[box,right=8mm of r] (n) {inferenza\\{\scriptsize invariata}};
+\node[box,right=8mm of r] (n) {inferenza};
 \node[box,right=8mm of n] (k) {(model\_id, classe)\\{\scriptsize una lettura}};
 \node[box,right=8mm of k] (a) {azione};
 \draw[arr] (m) -- (r);
@@ -411,8 +385,8 @@ aggiungere un modello resta scrivere delle tabelle.
 
 \begin{itemize}
 \item \textbf{Una tabella ad accesso diretto, non una tabella hash}: 256 modelli
-      $\times$ 2 banchi $\times$ 32 classi. Resta una sola lettura per pacchetto,
-      come prima, e nessun ciclo sui modelli registrati.
+      $\times$ 2 banchi $\times$ 32 classi. Una sola lettura per pacchetto, e
+      nessun ciclo sui modelli registrati.
 \item \textbf{Due banchi per modello.} Ricaricare un modello scrive il banco
       inattivo, poi un'unica scrittura del registro cambia insieme il numero di
       classi e il banco in uso. Un pacchetto vede la semantica vecchia o quella
@@ -420,13 +394,10 @@ aggiungere un modello resta scrivere delle tabelle.
 \item \textbf{Perché non dentro il registro}, che il programma ha già letto: usare
       la classe come indice dentro quel valore costringe il verificatore a
       seguirne il valore esatto attraverso tutto l'argmax, e smette di potare i
-      cammini. Misurato: \texttt{layer\_hidden} di P3 non si carica più.
+      cammini. Misurato: \texttt{layer\_hidden} di P3 non si carica.
 \item \textbf{Senza un valore vivo in più.} Il primo strato di P3 sta al
-      limite dei 512 byte di stack nelle sue versioni strumentate (quella che
-      conta le letture e quella con i timestamp T1/T2 del test reale): tenere
-      vivi fino alla fine \texttt{model\_id} e il registro la faceva sforare. La
-      chiave viaggia allora nella variabile che già diceva «questo è l'ultimo
-      strato», e il programma cresce di 9 istruzioni.
+      limite dei 512 byte di stack nelle sue versioni strumentate: la chiave
+      viaggia allora nella variabile che dice «questo è l'ultimo strato».
 \end{itemize}
 
 \textbf{La prova.} Modelli costruiti in modo che il TTL scelga la classe, così
@@ -436,46 +407,21 @@ modello inesistente o rimosso, numeri di classi diversi, un modello ricaricato
 con un'altra semantica. \textbf{53/53} su P2 e P3. Con una tabella condivisa
 simulata gli stessi test falliscono dove devono: il test distingue le due cose.
 
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-& \multicolumn{2}{c}{\textbf{P2}} & \multicolumn{2}{c}{\textbf{P3}} \\
-& classe sola & per modello & classe sola & per modello \\
-\midrule
-istruzioni          & 14\,978 & 14\,969 & 12\,277 & 12\,318 \\
-letture di tabella  & 11 & 11 & 29 & 29 \\
-latenza, minimo     & 192 ns & 191 ns & 325 ns & 319 ns \\
-memoria delle tabelle & 11\,192 B & 142\,264 B & 41\,020 B & 172\,092 B \\
-\bottomrule
-\end{tabular}
-\end{center}
-
 \begin{lezione}
-Il datapath non se ne accorge: stesse letture, poche istruzioni in più o in
-meno, latenza entro il 2\%, e nessuna crescita da 1 a 4 modelli (a 8, P3 sale a
-340~ns: un punto solo, non spiegato). Il prezzo è
-in memoria: 128~KiB fissi per pipeline, riservati per 256 modelli anche quando ne
-è caricato uno solo.
+Il datapath non se ne accorge: la chiave per modello è una lettura come quella
+per sola classe, e la latenza non cresce da 1 a 8 modelli registrati. Il prezzo
+è in memoria: 128~KiB fissi per pipeline, riservati per 256 modelli anche quando
+ne è caricato uno solo.
 \end{lezione}
-
-I numeri in tabella sono del 27 settembre. Il 28 la misura è stata rifatta dopo
-la ReLU senza bivio (capitolo \ref{ch:relu}), ma il confronto è con l'albero di
-prima della semantica per modello, che ha ancora la ReLU vecchia: la differenza
-mescolerebbe due modifiche, e la tabella resta quella pulita. Una cosa però il
-28 l'ha detta: il punto a 8 modelli di P3 \textbf{non si è ripetuto} (315~ns,
-come con un modello solo). Era rumore.
 
 % ==================================================================
 \chapter{Il motore non è lo scenario}
 
-\section{Com'era}
+\section{Le dimensioni vengono dalla configurazione}
 
-Il progetto era nato attorno a una topologia precisa: \textbf{Germany50}, una
-rete di 50 router usata come riferimento in letteratura, con due host
-attaccati.
-
-Due numeri erano ovunque nel codice:
+Il modello depositato è addestrato su \textbf{Germany50}, una rete di 50 router
+usata come riferimento in letteratura, con due host attaccati. Due numeri ne
+descrivono la forma:
 \[
   n_{\text{nodi}} = 52, \qquad n_{\text{interfacce}} = 6 .
 \]
@@ -490,12 +436,7 @@ Questi numeri determinano la larghezza dell'ingresso:
   + \underbrace{1}_{\text{ttl}} + \underbrace{52}_{\text{nodo}} = 65 .
 \]
 
-Il problema non era che esistessero, ma che il motore li conoscesse. C'era un
-\emph{default} interno: se nessuno diceva niente, il motore assumeva 6 e 52.
-Ogni chiamante che dimenticava di specificare lo scenario risultava
-silenziosamente corretto per Germany50 e silenziosamente sbagliato altrove.
-
-\section{Com'è adesso: tre strati}
+Il motore non li conosce. Il progetto è diviso in tre strati:
 
 \begin{center}
 \begin{tikzpicture}[
@@ -520,15 +461,14 @@ nessuna delle tre risponde, il motore \textbf{si ferma} e dice dove ha cercato.
 
 \begin{lezione}
 Un default comodo è il modo più efficace di nascondere un'assunzione. Preferire
-un errore esplicito a un valore plausibile è una scelta di progetto, non
-pignoleria: il valore plausibile non si manifesta mai come errore, solo come
-risultato sbagliato mesi dopo.
+un errore esplicito a un valore plausibile è una scelta di progetto: il valore
+plausibile non si manifesta mai come errore, solo come risultato sbagliato.
 \end{lezione}
 
 \section{La prova}
 
-Non basta dirlo. Il motore genera oggi un datapath corretto per cinque
-topologie che non hanno niente a che vedere con quella d'origine:
+Il motore genera un datapath corretto per cinque topologie che non hanno niente
+a che vedere con Germany50:
 
 \begin{center}
 \small
@@ -546,41 +486,38 @@ topologie che non hanno niente a che vedere con quella d'origine:
 \end{center}
 
 Nessuna riga di C scritta a mano cambia fra una riga e l'altra.
+\texttt{test\_fabric.py --sweep}: \textbf{34/34}.
 
 % ==================================================================
 \chapter{Il modello non è quello depositato}
 
 \section{La domanda}
 
-Il capitolo precedente ha tolto la topologia dalle assunzioni del codice.
-Restava dentro un'assunzione più silenziosa: \textbf{un solo modello}. Ogni
-misura, ogni confronto fra pipeline e ogni prova di correttezza girava sullo
-stesso checkpoint fornito dal relatore --- 65-4-4-7, scala 25.
-
-Il rischio non è teorico. Un datapath che calcola la cosa giusta su un modello
-può calcolarla per caso: perché quel modello ha una forma particolare, perché i
-suoi pesi cadono in un intervallo comodo, o perché una costante scritta nel
-codice coincide con un suo parametro. Finché il modello è uno solo, la
-differenza fra ``corretto'' e ``corretto qui'' non si vede.
+Un datapath che calcola la cosa giusta su un modello può calcolarla per caso:
+perché quel modello ha una forma particolare, perché i suoi pesi cadono in un
+intervallo comodo, o perché una costante scritta nel codice coincide con un suo
+parametro. Con un modello solo, la differenza fra ``corretto'' e ``corretto
+qui'' non si vede. Servono altri modelli.
 
 \section{I modelli sintetici}
 
-La risposta sono \textbf{sette scenari generati}, con pesi casuali e nessun
-rapporto con il checkpoint depositato. Coprono un asse ciascuno:
+Otto scenari generati, con pesi casuali e nessun rapporto con il checkpoint
+depositato. Coprono un asse ciascuno:
 
 \begin{center}
 \small
-\begin{tabular}{@{}llr@{}}
+\begin{tabular}{@{}llrr@{}}
 \toprule
-\textbf{Scenario} & \textbf{Forma} & \textbf{Pesi} \\
+\textbf{Scenario} & \textbf{Forma} & \textbf{Pesi} & \textbf{scala del TTL} \\
 \midrule
-\texttt{ones}     & 11-2-3       &    33 \\
-\texttt{small}    & 15-4-4       &    84 \\
-\texttt{mixed}    & 18-6-5       &   149 \\
-\texttt{ipa\_like}& 65-4-4-7     &   319 \\
-\texttt{sparse}   & 65-4-4-7     &   319 \\
-\texttt{deep}     & 65-4-4-4-7   &   339 \\
-\texttt{large}    & 117-8-8-9    & 1\,097 \\
+\texttt{ones}      & 11-2-3       &    33 & 8 \\
+\texttt{small}     & 15-4-4       &    84 & 16 \\
+\texttt{mixed}     & 18-6-5       &   149 & 30 \\
+\texttt{ipa\_like} & 65-4-4-7     &   319 & 30 \\
+\texttt{ipa\_ttl16}& 65-4-4-7     &   319 & 16 \\
+\texttt{sparse}    & 65-4-4-7     &   319 & 30 \\
+\texttt{deep}      & 65-4-4-4-7   &   339 & 30 \\
+\texttt{large}     & 117-8-8-9    & 1\,097 & 64 \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -597,23 +534,12 @@ mobile, e le predizioni attese per entrambe.
 Gli artefatti non stanno in git: sono rigenerabili byte per byte a parità di
 seme, e il test li rigenera da solo se non li trova.
 
-\section{Che cosa era già provato, e che cosa no}
-
-Su quei sette scenari il progetto verificava che i pesi \textbf{compilassero} e
-passassero il verificatore del kernel, e che i control plane accettassero i
-blocchi. È una prova reale ma di una cosa sola: che il programma esiste. Non
-dice \emph{quale classe sceglie}.
-
-\begin{prima}[La distinzione che mancava]
-Un programma che compila e gira può comunque decidere diversamente dal modello
-che dovrebbe eseguire. La domanda scoperta era: \emph{a parità di ingresso, il
-datapath sceglie la stessa classe del riferimento?}
-\end{prima}
-
 \section{Il confronto a quattro vie}
 
-Due confronti non bastano, perché un disaccordo ha più di una causa possibile e
-le cause chiedono rimedi diversi. Le vie sono quattro:
+Compilare e passare il verificatore dimostra che il programma esiste, non
+\emph{quale classe sceglie}. E due confronti non bastano, perché un disaccordo
+ha più di una causa possibile e le cause chiedono rimedi diversi. Le vie sono
+quattro:
 
 \begin{center}
 \small
@@ -637,33 +563,43 @@ int8 (Python) vs int8 (eBPF) &
 \end{tabular}
 \end{center}
 
+C'è anche un quinto confronto che non ha bisogno del kernel:
+\texttt{p1\_c\_eval.py} legge il C generato per P1 \emph{come testo} e lo valuta
+con le regole degli interi del C, logit per logit, contro il riferimento Python.
+I numeri vengono dai letterali del sorgente, mai dalla lista dei pesi: un
+generatore che emettesse un moltiplicatore sbagliato darebbe un'altra risposta.
+Fatto girare su codice alterato apposta, se ne accorge.
+
 \subsection*{Perché non i 1\,000 vettori depositati}
 
 Il datapath non accetta un vettore d'ingresso arbitrario: lo \emph{costruisce}
 da ciò che ha sotto mano --- le mappe dense, il TTL del pacchetto, la porta
 d'ingresso risolta, l'indice del nodo. Un one-hot \texttt{node} diverso a ogni
-campione vorrebbe dire ricompilare il programma a ogni campione.
+campione vorrebbe dire riconfigurare il nodo a ogni campione.
 
 Si campiona quindi nello spazio che il datapath sa davvero esprimere, e il
 vettore Python si costruisce allo stesso modo. Confrontare due implementazioni
 su ingressi che una delle due non potrebbe mai ricevere non direbbe niente su
-nessuna delle due.
+nessuna delle due. Per la stessa ragione il banco comunica al kernel la porta
+d'ingresso che il riferimento usa: \texttt{BPF\_PROG\_TEST\_RUN} senza contesto
+fa vedere al programma sempre l'interfaccia di prova del kernel.
 
 \section{Il risultato}
 
-Trecento ingressi per scenario, seme fisso, pipeline P1.
+Trecento ingressi per scenario, seme fisso.
 
 \begin{center}
 \small
 \begin{tabular}{@{}lrrr@{}}
 \toprule
 \textbf{Scenario} & \textbf{float vs int8} &
-\textbf{int8 Python vs eBPF} & \textbf{decisioni} \\
+\textbf{int8 Python vs eBPF (P1)} & \textbf{decisioni} \\
 \midrule
 \texttt{ones}      & 100,00\,\% & \textbf{100,00\,\%} & 300/300 \\
 \texttt{small}     &  98,00\,\% & \textbf{100,00\,\%} & 300/300 \\
 \texttt{mixed}     & 100,00\,\% & \textbf{100,00\,\%} & 300/300 \\
 \texttt{ipa\_like} &  97,67\,\% & \textbf{100,00\,\%} & 300/300 \\
+\texttt{ipa\_ttl16}&  98,00\,\% & \textbf{100,00\,\%} & 300/300 \\
 \texttt{sparse}    &  99,33\,\% & \textbf{100,00\,\%} & 300/300 \\
 \texttt{deep}      &  98,67\,\% & \textbf{100,00\,\%} & 300/300 \\
 \texttt{large}     &  99,67\,\% & \textbf{100,00\,\%} & 300/300 \\
@@ -671,194 +607,40 @@ Trecento ingressi per scenario, seme fisso, pipeline P1.
 \end{tabular}
 \end{center}
 
-\textbf{Sette scenari su sette, equivalenza numerica esatta.} La colonna di
-sinistra --- fra 97,67\,\% e 100\,\% --- è la quantizzazione, cioè una
-proprietà del modello e della scala scelta, non un difetto.
+\textbf{Equivalenza numerica esatta.} P1 la dà su 8 scenari su 8, P2 e P3 su 7
+su 7 (\texttt{large} non si applica: supera la tabella dei pesi di P2 e le
+uscite di P3). La colonna di sinistra --- fra 97,67\,\% e 100\,\% --- è la
+quantizzazione, cioè una proprietà del modello e della scala scelta, non un
+difetto.
 
-\section{Ma ci è arrivato trovando due difetti}
-
-Il valore del test non sta nella tabella: sta nel fatto che la prima esecuzione
-\textbf{non} dava 7/7. Dava 1/7, e le due cause erano di natura diversa.
-
-\subsection*{Il primo: il banco}
-
-Cinque scenari su sette stavano fra il 71\,\% e l'85\,\%. Il banco non
-comunicava al kernel la porta d'ingresso: \texttt{prog\_test\_run} accetta un
-parametro \texttt{ingress\_ifindex} ma lo \textbf{ignora} --- gira senza
-\texttt{ctx\_in}, e il programma vede sempre l'ifindex del dispositivo di prova
-del kernel. Il riferimento Python usava una porta variabile, il datapath ne
-vedeva sempre nessuna, e le due metà costruivano due ingressi diversi.
-
-Il segnale diagnostico è stato più utile del sintomo: dopo la prima correzione
-le percentuali non si erano mosse \textbf{di un centesimo}. Codice che non
-cambia niente non è codice sbagliato: è codice mai eseguito. Confermato senza
-kernel, simulando ``il datapath vede porta 0'': le percentuali osservate si
-riproducono con scarto \textbf{0,00} su sei scenari.
-
-\subsection*{Il secondo: la scala compilata}
-
-Resisteva \texttt{small}, al 70,33\,\%. Con una coincidenza che era la
-risposta: le righe \emph{int8 Python vs riferimento} e \emph{int8 Python vs
-eBPF} davano lo stesso identico numero, e \emph{riferimento vs eBPF} dava
-100\,\%. Il datapath non sbagliava un conto: eseguiva \textbf{esattamente} una
-configurazione sbagliata.
-
-Tutte e tre le pipeline fissavano la scala della feature \texttt{ttl} a
-\textbf{30} in fase di compilazione --- \texttt{feature\_scale()} in P1,
-\texttt{T2\_TTL\_SCALE} in P2, \texttt{ML\_TTL\_SCALE} in P3 --- e la struttura
-del descrittore letto a runtime, \texttt{struct feat\_ent}, non aveva un campo
-dove metterla. Un modello addestrato su $\text{ttl}/16$ veniva eseguito con
-$\text{ttl}/30$. Gli scenari \texttt{small} (16), \texttt{large} (64) e
-\texttt{ones} (8) sono esattamente quei modelli.
-
-Sul checkpoint depositato, che usa 30, il difetto è invisibile.
+\textbf{La scala del TTL viene letta davvero.} Sugli scenari con scala diversa
+da 30 la scala dichiarata sposta le decisioni (41 casi su 300 per
+\texttt{ipa\_ttl16}, 89 per \texttt{small}). Controllo negativo in P2 e P3:
+riscritta nella mappa del nodo la scala al default, il datapath si stacca dal
+riferimento \emph{esattamente} su quei casi, e con la scala giusta torna
+identico.
 
 \begin{lezione}
-La genericità di P2 e P3 --- ``il descrittore si legge a runtime, quindi
-qualunque modello va bene'' --- era vera per la forma, il numero di feature e
-gli offset, e \textbf{falsa per la scala}: l'unico numero del descrittore che
-deve seguire il modello era l'unico compilato dentro. Un'affermazione di
-genericità va verificata voce per voce, non in blocco.
+Un'affermazione di genericità --- ``il descrittore si legge a runtime, quindi
+qualunque modello va bene'' --- va verificata \textbf{voce per voce}: la forma,
+il numero di feature, gli offset e la scala sono quattro affermazioni, e ognuna
+ha bisogno del suo modello di prova.
 \end{lezione}
 
-\section{La correzione}
-
-La scala ora viaggia nel descrittore. Il campo c'era già: \texttt{struct
-feat\_ent} aveva un byte di riempimento inutilizzato, e le scale in gioco
-(8, 16, 30, 64) ci stanno.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lp{8.8cm}@{}}
-\toprule
-\textbf{Dove} & \textbf{Che cosa cambia} \\
-\midrule
-\texttt{model\_meta} & \texttt{feature\_scale\_of(feat)} risponde per
-  \emph{feature} e non per \emph{tipo}; la scala entra nel descrittore
-  risolto. \\
-P1 & compila la scala del descrittore invece di quella del catalogo. \\
-P2 / P3 & \texttt{\_pad} diventa \texttt{scale}; la divisione la legge dalla
-  mappa. Con 0 si ricade sul default compilato, quindi i descrittori scritti
-  prima restano validi. \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Il modello depositato risolve a 30 come prima: nessuna regressione.
-
-\begin{prima}[Un effetto collaterale che il compilatore ha fermato]
-Passare da una costante a una variabile ha rotto la compilazione di P2:
-\emph{``unsupported signed division''}. Finché il divisore era un \texttt{\#define}
-clang lo trasformava in uno spostamento di bit; da variabile diventa una
-divisione vera, e \textbf{BPF non ha la divisione con segno}. Il numeratore qui
-ce l'ha, perché i pesi possono essere negativi.
-
-La correzione divide il valore assoluto senza segno e rimette il segno, con
-troncamento verso lo zero --- lo stesso arrotondamento del riferimento Python,
-perché sui negativi le due implementazioni coincidono solo se arrotondano allo
-stesso modo.
-\end{prima}
-
-\section{Che cosa è costata, e la prova che regge}
-
-Una correzione che tocca il codice che gira per ogni pacchetto va pagata e
-misurata, non solo dichiarata. La suite kernel, rieseguita sul modello
-depositato:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-\textbf{Pipeline} & \textbf{istruzioni prima} & \textbf{dopo} &
-\textbf{differenza} \\
-\midrule
-baseline        &    155 &    155 & \textbf{invariata} \\
-P1 hardcoded    & 1\,026 & 1\,026 & \textbf{invariata} \\
-P2 template     & 14\,628 & 14\,985 & $+357$ \quad($+2{,}4\,\%$) \\
-P3 modular      & 12\,031 & 12\,349 & $+318$ \quad($+2{,}6\,\%$) \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Il costo è \textbf{due virgola cinque per cento} sulle due pipeline generiche:
-il codice della divisione a divisore variabile più la lettura della scala dalla
-mappa. Che \texttt{baseline} e P1 restino \emph{identiche al conteggio} è la
-verifica che il cambiamento non ha toccato percorsi che non doveva toccare ---
-P1 compila la scala come prima, solo presa da un posto diverso.
-
-L'esito funzionale è \texttt{kernel suite: PASS} --- le quattro pipeline, la
-gestione del TTL, il reroute su link caduto, le architetture alternative e i
-due modelli concorrenti registrati insieme su P2 e su P3. E nel registro del
-descrittore si legge la scala arrivare a destinazione:
-
-\begin{center}
-\footnotesize
-\texttt{model\_desc[0] = feats=[}\\[2pt]
-\texttt{(1,6,0,\textbf{1})\ (2,6,6,\textbf{1})\ (3,1,12,\textbf{30})\ (4,52,13,\textbf{1})}
-\end{center}
-
-Il quarto campo è la scala: \texttt{ttl} porta 30 fin dentro la mappa, e non è
-più un numero scritto nel sorgente.
-
-\section{Tre difetti, e chi li ha trovati}
-
-Vale la pena tenere il conto, perché dice qualcosa sul metodo più che sul
-codice.
-
-\begin{center}
-\footnotesize
-\begin{tabular}{@{}lll@{}}
-\toprule
-\textbf{Difetto} & \textbf{Di chi} & \textbf{Trovato da} \\
-\midrule
-Porta d'ingresso non detta al kernel & banco &
-  il confronto, al primo run \\
-Scala del TTL compilata a 30 & datapath &
-  il confronto, tolto il primo \\
-Divisione con segno, non ammessa da BPF & correzione &
-  il compilatore \\
-Funzione nel ramo sbagliato di \texttt{\#ifndef} & correzione &
-  il compilatore, al secondo giro \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Gli ultimi due sono stati introdotti \emph{riparando} il secondo, e nessuno dei
-due sarebbe stato visibile senza compilare davvero. Da lì è nato
-\texttt{check\_source\_visibility.py}: i sorgenti eBPF di questo progetto non
-sono file ma stringhe, concatenate in combinazioni diverse dai chiamanti e
-ritagliate dal preprocessore con macro diverse. Una funzione può stare prima
-del suo uso \emph{nel file} e sparire lo stesso nella combinazione che conta.
-Il controllo valuta le guardie e verifica la visibilità in tutte e cinque le
-combinazioni realmente compilate --- senza root e senza BCC, quindi prima di
-spedire e non dopo.
-
-\section{Che cosa questo capitolo dimostra}
-
-Che le tre pipeline calcolano ciò che il modello dice, su sette modelli che
-nessuno ha scelto per farle funzionare. E, di passaggio, che l'affermazione era
-falsa prima di essere verificata --- il che è il motivo per cui la verifica
-serviva.
-
-
+% ==================================================================
 \chapter{Dalla chiamata di sistema al kernel vero}
 
-\section{Che cosa provavano i test di prima}
+\section{Due banchi}
 
-Fino a settembre ogni misura veniva da una chiamata di sistema,
-\mbox{\texttt{BPF\_PROG\_TEST\_RUN}}: si dà al programma un buffer, lo si
-esegue $N$ volte, e il kernel riporta quanti nanosecondi in media.
+Il primo banco è una chiamata di sistema, \mbox{\texttt{BPF\_PROG\_TEST\_RUN}}:
+si dà al programma un buffer, lo si esegue $N$ volte, e il kernel riporta quanti
+nanosecondi in media. È utile e onesto per confrontare le pipeline fra loro, ma
+non tocca un'interfaccia, non ha un driver, non consegna niente. Il programma
+può dire \emph{"redirigerei sulla porta 3"} senza che nessun pacchetto ne esca.
 
-È utile e onesto per confrontare le tre pipeline fra loro. Ma non tocca
-un'interfaccia, non ha un driver, non consegna niente. Il programma poteva dire
-\emph{"redirigerei sulla porta 3"} e nessuno verificava che un pacchetto ne
-uscisse davvero.
-
-\section{Il banco nuovo}
-
-Il banco è fatto di coppie di interfacce virtuali (\texttt{veth}) create
-sull'host: niente di più, e abbastanza vicino al vero da far girare XDP nella
-modalità in cui gira su un nodo.
+Il secondo banco è fatto di coppie di interfacce virtuali (\texttt{veth}) create
+sull'host: abbastanza vicino al vero da far girare XDP nella modalità in cui
+gira su un nodo.
 
 \begin{center}
 \begin{tikzpicture}[
@@ -891,8 +673,7 @@ modalità in cui gira su un nodo.
 \end{center}
 
 Si inietta un frame da un capo, il programma XDP gira davvero, e si legge da
-quale interfaccia è uscito. Questo risponde alla domanda che
-\texttt{BPF\_PROG\_TEST\_RUN} non può porre.
+quale interfaccia è uscito.
 
 \subsection*{Due dettagli che sembrano minori e non lo sono}
 
@@ -909,108 +690,64 @@ alloca le code necessarie solo in quel caso. Senza, il redirect fallisce in
 silenzio e il pacchetto sparisce --- indistinguibile da un modello che decide di
 scartare tutto. Il banco aggancia quindi un programma minimo a ogni capo.
 
-\section{Tre difetti del test, trovati misurando}
+\section{Come il test evita di essere vuoto}
 
-Il banco nuovo ha trovato più difetti nei \emph{test} che nel prodotto. Vale la
-pena elencarli, perché il motivo per cui erano invisibili è sempre lo stesso.
+Un test che non può fallire non è un test. Tre scelte del banco servono a
+questo:
 
-\begin{prima}[1. Il TTL non muove questo modello]
-La prima versione del test variava il TTL da 2 a 8 e riportava
-\emph{"7 verifiche su 7 superate"}.
+\begin{itemize}
+  \item \textbf{Cerca un ingresso per ogni classe}, invece di spazzare alla
+        cieca. Con tutti i link attivi il modello depositato risponde sempre con
+        la stessa classe per qualunque TTL: variare il solo TTL ripeterebbe un
+        caso solo. È \texttt{link\_state} la feature che sposta la decisione.
+  \item \textbf{Filtra la cattura} sui campi che il datapath non riscrive, e
+        disabilita IPv6 sulle interfacce del banco: una veth appena creata
+        manda traffico suo (IPv6 multicast), che altrimenti potrebbe essere
+        contato come la risposta della pipeline.
+  \item \textbf{Ha un ingresso dedicato}, separato da tutte le porte: se
+        l'ingresso fosse anche una porta d'uscita, un frame inoltrato su quella
+        porta non si distinguerebbe da quello appena iniettato.
+\end{itemize}
 
-Misurando lo spazio raggiungibile si scopre che con tutti i link attivi il
-modello risponde \textbf{sempre classe 2}, per qualsiasi TTL. Quel 7 su 7 era
-\textbf{un caso solo, ripetuto sette volte}.
-
-È \texttt{link\_state} la feature che sposta la decisione. Il test adesso
-\emph{cerca} un ingresso per ogni classe, invece di spazzare alla cieca.
-\end{prima}
-
-\begin{prima}[2. Un pacchetto del kernel contato come risultato]
-Su una veth appena creata il kernel manda del traffico suo (IPv6 multicast). Una
-volta è stato catturato e contato come la risposta della pipeline. È passato per
-caso, perché era sulla porta giusta.
-
-Adesso la cattura filtra sui campi che il datapath non riscrive, e IPv6 viene
-disabilitato sulle interfacce del banco.
-\end{prima}
-
-\begin{prima}[3. La porta 0 era invisibile per costruzione]
-L'ingresso era anche la porta logica 0. Una classe che inoltrava su quella porta
-rimandava il frame fuori dall'interfaccia da cui era entrato --- dove la cattura
-non lo distingue da quello appena iniettato. Una decisione \emph{corretta} sulla
-porta 0 non era osservabile.
-
-Il banco ha adesso un ingresso dedicato, separato da tutte le porte.
-\end{prima}
-
-\begin{lezione}
-Un test che non può fallire non è un test. In tutti e tre i casi il risultato
-era verde e privo di contenuto, e in tutti e tre il difetto è emerso solo
-mettendo in mezzo un kernel vero.
-\end{lezione}
+E lo scarto si verifica dal \emph{contatore}, non dal silenzio: "non è arrivato
+niente" è anche ciò che si osserva quando il redirect si perde.
 
 \section{Il risultato}
 
-Tutte e tre le pipeline superano oggi la verifica end-to-end su un datapath
-reale: XDP native, redirect vero, pacchetto ripreso sulla porta d'uscita, e
-scarto verificato dal \emph{contatore} e non dal silenzio --- perché "non è
-arrivato niente" è anche ciò che si osserva quando il redirect si perde.
-
-% ==================================================================
-\chapter{La feature che non c'era}
-
-\section{Il sintomo}
-
-Il modello ha quattro ingressi. Uno di questi è \emph{da quale interfaccia è
-arrivato il pacchetto}, codificato \emph{one-hot}: un vettore di sei posizioni
-con un solo uno.
-
-Il datapath leggeva l'indice dell'interfaccia dato dal kernel --- l'
-\texttt{ifindex} --- e lo usava direttamente come posizione nel vettore, con un
-controllo di validità:
-\[
-  1 \le \text{ifindex} \le n_{\text{interfacce}} .
-\]
-
-Gli \texttt{ifindex} però li assegna il kernel, in ordine di creazione. Su un
-sistema appena avviato valgono 2, 3, 4. Su una macchina che ha creato qualche
-interfaccia virtuale valgono 205, 217, 229.
-
-Il controllo falliva sempre. \textbf{Nessun bit veniva acceso.} Il modello
-girava di fatto su tre ingressi invece di quattro.
-
 \begin{center}
-\begin{tikzpicture}[
-  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=8mm,
-              inner sep=5pt,font=\scriptsize,align=center},
-  arr/.style={-{Stealth[length=4pt]},draw=soft,thick},
-  bad/.style={draw=bad,text=bad}
-]
-\node[box] (k) {ifindex del kernel\\\texttt{205}};
-\node[box,right=13mm of k,bad] (t) {$1 \le x \le 6$ ?};
-\node[box,right=13mm of t,bad] (z) {one-hot\\tutto zero};
-\draw[arr] (k) -- (t);
-\draw[arr] (t) -- node[above,font=\scriptsize,color=bad] {no} (z);
-\end{tikzpicture}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Prova} & \textbf{esito} \\
+\midrule
+consegna su rete di veth, tutte le pipeline, 6 classi su 7 & 29/29 \\
+consegna della P1 come si deploya (oggetto AOT, mappe appuntate) & 11/11 \\
+cinque topologie diverse & 34/34 \\
+\bottomrule
+\end{tabular}
 \end{center}
 
-\section{Perché nessun test lo vedeva}
+La settima classe è \texttt{UNUSED}: dichiarata, mai addestrata, e non ci sono
+ingressi che la raggiungano.
 
-Perché nessun test controllava che quella feature \emph{contribuisse} qualcosa.
-Riferimento e datapath la ignoravano entrambi, quindi \textbf{concordavano} --- e
-l'accordo veniva registrato come successo.
+% ==================================================================
+\chapter{Gli ingressi che dipendono dal nodo}
 
-Una pipeline aveva in effetti una tabella di traduzione, ma compilata dentro il
-programma come $[2,3,4,5,6,7]$: la stessa assunzione, scritta in un altro modo.
-Le altre due usavano l'indice grezzo. Le tre pipeline sceglievano quindi
-\emph{colonne diverse} per lo stesso pacchetto --- una discrepanza documentata in
-un commento e mai risolta.
+Due dei quattro ingressi del modello non vengono dal pacchetto ma dal nodo:
+\emph{da quale interfaccia è arrivato} il pacchetto, e \emph{quale nodo} lo sta
+elaborando. Tutti e due si risolvono con una tabella scritta dal piano di
+controllo quando il nodo entra in servizio.
 
-\section{La correzione}
+\section{L'interfaccia d'ingresso: una porta logica}
 
-La traduzione è diventata una \textbf{tabella a runtime}, riempita dal piano di
-controllo leggendo le interfacce del nodo:
+L'ingresso è un one-hot di sei posizioni. Il kernel però identifica le
+interfacce con un \texttt{ifindex} assegnato in ordine di creazione: su un
+sistema appena avviato valgono 2, 3, 4; su una macchina che ha creato qualche
+interfaccia virtuale 205, 217, 229. Usarlo come posizione nel vettore non
+accenderebbe mai un bit.
+
+Il datapath lo traduce allora in \textbf{porta logica} con una tabella a
+runtime, riempita dal piano di controllo leggendo le interfacce del nodo:
 
 \begin{center}
 \begin{tikzpicture}[
@@ -1026,153 +763,35 @@ controllo leggendo le interfacce del nodo:
 \end{tikzpicture}
 \end{center}
 
-È il \textbf{simmetrico} della tabella già usata in uscita: là "quale
-interfaccia realizza la porta che il modello ha scelto", qui "quale porta è
-l'interfaccia da cui il pacchetto è arrivato". Entrambe sono fatti del nodo,
-entrambe si risolvono quando il nodo esiste.
+È il \textbf{simmetrico} della tabella usata in uscita: là "quale interfaccia
+realizza la porta che il modello ha scelto", qui "quale porta è l'interfaccia da
+cui il pacchetto è arrivato". Entrambe sono fatti del nodo, entrambe si
+risolvono quando il nodo esiste. Un'interfaccia che non è una porta del modello
+non ha voce, e il one-hot resta spento.
 
-\section{La prova che adesso è viva}
+\section{L'identità del nodo}
 
-Prima e dopo la correzione, gli ingressi che raggiungono ciascuna classe
-\textbf{cambiano}:
+L'ingresso più grande del modello è \emph{quale nodo sta elaborando il
+pacchetto}: su Germany50 un one-hot di 52 posizioni, \textbf{208 dei 319 pesi}.
 
-\begin{center}
-\small
-\begin{tabular}{@{}rll@{}}
-\toprule
-\textbf{classe} & \textbf{prima} (feature morta) & \textbf{dopo} (feature viva) \\
-\midrule
-0 & \texttt{100110}, ttl 27 & \texttt{100111}, ttl 20 \\
-1 & \texttt{010000}, ttl 2  & \texttt{010000}, ttl \textbf{14} \\
-5 & \texttt{000000}, ttl 2  & \texttt{000000}, ttl \textbf{12} \\
-\bottomrule
-\end{tabular}
-\end{center}
+Non si può prendere dal pacchetto. Il campo \texttt{model\_id} dell'intestazione
+dice \emph{quale modello} il pacchetto chiede di usare, e viaggia identico dal
+mittente alla destinazione: usato come indice del nodo, ogni nodo della rete
+accenderebbe la stessa posizione.
 
-Stesso stato dei link, TTL diverso per ottenere la stessa classe: l'ingresso in
-più contribuisce. E il TTL ora sposta la decisione, cosa che prima non faceva.
+L'indice sta quindi in una tabella \texttt{node\_id}, scritta quando il nodo
+entra in servizio: dalla variabile d'ambiente \texttt{IPA\_NODE\_ID}, o dalla
+tabella nome $\to$ indice della topologia. L'indice deve seguire l'ordine dei
+nodi usato in addestramento, perché le decisioni significhino qualcosa sulla
+rete vera.
 
-\section{Il prezzo, misurato}
+La tabella è di tipo \emph{hash} e non \emph{array}, e non è un dettaglio. Un
+array in questo ambiente è preallocato e riempito di zeri, quindi una lettura
+riesce \textbf{sempre}: "non configurato" e "sono il nodo 0" tornerebbero lo
+stesso valore. Con un hash, finché nessuno scrive non c'è voce: il vettore resta
+spento, ed è la risposta onesta.
 
-Una lettura di tabella in più per pacchetto:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrr@{}}
-\toprule
-& \textbf{prima} & \textbf{dopo} \\
-\midrule
-letture per pacchetto (P1) & 4,0 & 5,0 \\
-letture per pacchetto (P3) & 26,0 & 28,0 \\
-istruzioni (P1) & 997 & 971 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Le istruzioni di P1 \emph{calano}: la tabella ha sostituito un blocco
-\texttt{switch} a sei casi, e una lettura costa meno di un salto.
-
-Una lettura in più arriverà poco dopo, per la stessa ragione applicata a un
-altro ingresso: è il capitolo che segue. Le cifre finali sono 6,0 letture per
-P1 e 29,0 per P3.
-
-% ==================================================================
-\chapter{Il nodo non sapeva di essere un nodo}
-
-\section{L'ingresso più grande di tutti}
-
-Dei quattro ingressi del modello, quello che pesa di più è \emph{quale nodo sta
-elaborando il pacchetto}. Su Germany50 sono 52 nodi, quindi un vettore one-hot
-di 52 posizioni: \textbf{208 dei 319 pesi} della rete, quasi due terzi.
-
-\section{Il sintomo}
-
-Il datapath riempiva quel vettore con il campo \texttt{model\_id} preso
-dall'intestazione IPA del pacchetto.
-
-Sono due cose diverse. \texttt{model\_id} dice \emph{quale modello} il pacchetto
-chiede di usare; il vettore vuole sapere \emph{quale nodo} lo sta elaborando. E
-il \texttt{model\_id} non cambia lungo il percorso: è scritto dal mittente e
-viaggia identico fino alla destinazione.
-
-\begin{lezione}
-Con un solo modello registrato --- il caso normale --- \textbf{ogni nodo della
-rete accendeva la stessa identica posizione}. Due terzi dei pesi della rete non
-distinguevano nulla.
-\end{lezione}
-
-\begin{center}
-\begin{tikzpicture}[
-  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=8mm,
-              inner sep=5pt,font=\scriptsize,align=center},
-  arr/.style={-{Stealth[length=4pt]},draw=soft,thick},
-  bad/.style={draw=bad,text=bad},
-  ok/.style={draw=good,text=good}
-]
-\node[box] (n1) {nodo 7};
-\node[box,below=4mm of n1] (n2) {nodo 23};
-\node[box,below=4mm of n2] (n3) {nodo 41};
-\node[box,right=16mm of n2,bad] (m) {\texttt{model\_id} $= 0$\\(dal pacchetto)};
-\node[box,right=14mm of m,bad] (o) {one-hot\\posizione 0\\\emph{sempre}};
-\draw[arr] (n1) -- (m);
-\draw[arr] (n2) -- (m);
-\draw[arr] (n3) -- (m);
-\draw[arr] (m) -- (o);
-\end{tikzpicture}
-\end{center}
-
-\section{La correzione, e perché una tabella e non un array}
-
-Stessa forma della correzione precedente: una \textbf{tabella letta a runtime},
-riempita quando il nodo viene messo in servizio, dalla variabile d'ambiente
-\texttt{IPA\_NODE\_ID} o dall'indice del nodo nella topologia.
-
-Un dettaglio che sembra tecnico e non lo è: la tabella è di tipo \emph{hash} e
-non \emph{array}. Un array in questo ambiente è preallocato e riempito di zeri,
-quindi una lettura riesce \textbf{sempre}: "non configurato" e "sono il nodo 0"
-tornerebbero lo stesso valore, indistinguibili. Sarebbe esattamente il difetto
-che la tabella serve a togliere. Con un hash, finché nessuno scrive non c'è
-voce: il vettore resta spento, ed è la risposta onesta.
-
-Questo errore è stato commesso e corretto: la prima versione usava un array, e
-un test su un'architettura alternativa è fallito 5 volte su 5 prima che se ne
-capisse il motivo.
-
-\section{Una pipeline ha resistito un giorno}
-
-P1 e P2 hanno accettato la modifica subito. P3 no: il verificatore del kernel ha
-\textbf{rifiutato il programma}, dodici configurazioni di fila.
-
-Il motivo è controintuitivo e vale la pena averlo scritto. Il verificatore non
-misura quanto è lungo il programma: esplora i \emph{cammini} possibili, e il
-numero di stati che deve tenere è il \textbf{prodotto} dei valori indipendenti
-che segue dentro un ciclo srotolato, non la loro somma.
-
-\[
-  \text{stati} \;\sim\; v_1 \times v_2 \times \dots \times v_k
-\]
-
-L'unica versione che caricava era quella in cui l'indice del nodo \emph{non era
-un valore indipendente}: \texttt{nodo = model\_id}, cioè lo stesso registro che
-il verificatore stava già seguendo. Un valore, non due.
-
-Escluse una a una, ognuna con la sua prova: il tipo di tabella, la sua
-dichiarazione, il valore, il tipo del dato, il numero di letture, la larghezza
-in bit. Nessuna era la causa.
-
-Quello che ha liberato spazio non toccava il nodo: un \textbf{tetto} di tutt'altra
-feature. Il programma teneva in vita otto posizioni per un vettore di occupazione
-delle code che il modello depositato \emph{non dichiara nemmeno}. Portato quel
-tetto da 8 a 1, il programma ha caricato --- e più piccolo di prima.
-
-\begin{lezione}
-Questi limiti sono \textbf{scogliere, non pendenze}. Nello stesso giro, ridurre
-\emph{anche} un secondo tetto --- cioè chiedere \emph{meno} --- ha fatto fallire
-di nuovo il caricamento. Un tetto qui si cambia e \textbf{si rimisura}; non si
-ragiona.
-\end{lezione}
-
-\section{La prova che il nodo è vivo}
+\section{La prova che contano}
 
 Stesso programma compilato, due esecuzioni che differiscono solo per la tabella
 del nodo:
@@ -1189,39 +808,43 @@ indice di nodo $= 7$ & non scartato \\
 \end{tabular}
 \end{center}
 
-Nient'altro è cambiato fra le due. L'ingresso sposta la decisione.
+Nient'altro cambia fra le due: l'ingresso sposta la decisione. Per
+l'interfaccia d'ingresso lo stesso lo mostra la consegna su veth, dove gli
+ingressi che raggiungono ciascuna classe dipendono dalla porta da cui il
+pacchetto entra.
+
+Il prezzo sono due letture di tabella per pacchetto: P1 ne fa 6 in tutto, P3 29.
+In P1 la tabella dell'interfaccia costa meno istruzioni dello \texttt{switch} a
+sei casi che sostituisce: una lettura costa meno di una catena di salti.
 
 % ==================================================================
-\chapter{Il verificatore non conta le istruzioni}
+\chapter{Il verificatore paga i cammini}
+\label{ch:relu}
 
-\section{Due monete diverse}
+\section{Che cosa fa il verificatore}
 
-Il tetto sulle code portato a 1 era una perdita vera: a 1, un modello che
-dichiari davvero quella feature viene \emph{rifiutato}. Per recuperarlo serviva
-margine di verifica, e il margine è arrivato da una riscrittura che non toglie
-niente.
-
-\section{Il ciclo era girato dalla parte sbagliata}
-
-Il primo strato della rete si calcola così: per ogni neurone, si sommano i
-contributi di ogni feature dichiarata nel descrittore.
-
-Il codice lo faceva nell'ordine ovvio --- neuroni fuori, feature dentro:
+Prima di accettare un programma eBPF, il kernel lo fa controllare dal
+\textbf{verificatore}. Il verificatore non esegue il programma su un pacchetto
+vero: lo percorre \emph{su tutte le strade possibili}, per essere sicuro che
+nessuna faccia qualcosa di proibito. Ogni \texttt{if} è un bivio, e il
+verificatore prende tutti e due i rami. Ha però un budget: \textbf{un milione di
+passi}. Finito il budget rifiuta il programma, per quanto corto sia:
 
 \begin{lstlisting}
-per ogni neurone j (8 volte)
-    per ogni feature f (4 volte)
-        di che tipo e' f?         <- catena a 5 rami
-        di che larghezza e' f?    <- controllo per ogni posizione
-        accumula
+BPF program is too large. Processed 1000001 insn
 \end{lstlisting}
 
-Ma \emph{di che tipo} e \emph{di che larghezza} è una feature non dipende dal
-neurone. Quella catena a cinque rami veniva quindi rivalutata $8 \times 4 = 32$
-volte per pacchetto, e il controllo sulla larghezza di un vettore denso
-$8 \times 8 = 64$ volte, per ottenere ogni volta la stessa risposta.
+Dimensione del programma e costo di verifica sono quindi \textbf{monete
+diverse}. Due scelte del codice servono a spendere poco della seconda.
 
-Girato al contrario --- feature fuori, neuroni dentro --- diventa:
+\section{Il primo strato: feature fuori, neuroni dentro}
+
+Il primo strato si calcola sommando, per ogni neurone, i contributi di ogni
+feature dichiarata nel descrittore. L'ordine ovvio --- neuroni fuori, feature
+dentro --- chiederebbe \emph{di che tipo} e \emph{di che larghezza} è ogni
+feature una volta per neurone, cioè $8 \times 4 = 32$ volte per pacchetto, e
+ogni domanda è un bivio. Ma tipo e larghezza non dipendono dal neurone. Il
+codice di P2 e P3 gira quindi i cicli al contrario:
 
 \begin{lstlisting}
 per ogni feature f (4 volte)
@@ -1231,90 +854,28 @@ per ogni feature f (4 volte)
         accumula                  <- nessun ramo qui dentro
 \end{lstlisting}
 
-\section{Perché il risultato non cambia di un bit}
+Il risultato non cambia di un bit: cambia solo l'\textbf{ordine} in cui i
+termini si sommano, e la somma fra interi a 64 bit in complemento a due è
+associativa e commutativa, anche quando trabocca. È questo margine che permette
+a P3 di compilare il tetto sulle code a 8 e alle versioni strumentate di P2 e P3
+(quelle che contano le letture di tabella) di caricarsi.
 
-Cambia solo l'\textbf{ordine in cui i termini vengono sommati}. I termini sono
-gli stessi, calcolati allo stesso modo. E la somma fra interi a 64 bit in
-complemento a due è associativa e commutativa --- anche in caso di traboccamento,
-che si comporta identicamente nei due ordini:
-\[
-  (a + b) + c \;=\; a + (b + c) .
-\]
-Ogni accumulatore finisce quindi \textbf{bit per bit identico}. Non "circa
-uguale": identico.
+\section{La ReLU: un bivio per neurone}
 
-\section{Il risultato, che sembra un errore}
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrr@{}}
-\toprule
-& \textbf{prima} & \textbf{dopo} \\
-\midrule
-P2, programma principale & 16\,144 & \textbf{14\,587} \\
-P3, primo strato & 6\,417 & \textbf{6\,850} \\
-P3, tetto sulle code caricabile & 1 & \textbf{8} \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\begin{lezione}
-P3 è \textbf{cresciuto} di 433 istruzioni ed è diventato molto più economico da
-verificare. Prima della riscrittura, col tetto delle code a 8 non caricava
-niente; dopo, carica a 10\,207 istruzioni.
-
-Dimensione del programma e complessità di verifica sono \textbf{monete diverse}.
-Il verificatore paga i cammini.
-\end{lezione}
-
-\section{Un effetto collaterale che vale una riga di tabella}
-
-Contare quante letture di tabella fa un programma per pacchetto richiede di
-ricompilarlo con un contatore su ogni punto di lettura. Le versioni strumentate
-di P2 e P3 \textbf{sforavano il verificatore}: per questo la riga "letture di
-tabella" riportava \emph{n.d.} per entrambe.
-
-Con il margine liberato dalla riscrittura, tutte e due caricano. La misura che
-era impossibile è diventata una riga di tabella --- 11 letture per P2, 29 per P3
---- senza che nessuno abbia riscritto il contatore.
-
-% ==================================================================
-\chapter{Un bivio per ogni neurone (28 settembre)}
-\label{ch:relu}
-
-\section{Il sintomo}
-
-Sulla macchina di laboratorio due cose smettevano di caricarsi:
+Fino al 27 settembre, sulla macchina di laboratorio, due cose non si caricavano:
 
 \begin{itemize}
-  \item \textbf{P2 con tre o più strati nascosti}: rifiutata dal verificatore;
-  \item \textbf{P1 oltre qualche centinaio di pesi}: rifiutata anche lei, e prima
-        la forma larga.
+  \item \textbf{P2 con tre o più strati nascosti};
+  \item \textbf{P1 oltre qualche centinaio di pesi}, e prima la forma larga.
 \end{itemize}
 
-In entrambi i casi il messaggio era lo stesso:
-
-\begin{lstlisting}
-BPF program is too large. Processed 1000001 insn
-\end{lstlisting}
-
-Nella macchina virtuale P2 si caricava fino a sei strati. Il sorgente era lo
-stesso, quindi la prima spiegazione è stata "cambia il kernel". Era sbagliata.
-
-\section{Che cosa fa il verificatore}
-
-Prima di accettare un programma eBPF, il kernel lo fa controllare dal
-\textbf{verificatore}. Il verificatore non esegue il programma su un pacchetto
-vero: lo percorre \emph{su tutte le strade possibili}, per essere sicuro che
-nessuna faccia qualcosa di proibito. Ogni \texttt{if} è un bivio, e il
-verificatore prende tutti e due i rami. Ha però un budget: \textbf{un milione di
-passi}. Finito il budget, rifiuta il programma, per quanto corto sia.
-
-Il programma P2 a tre strati ha circa 16\,000 istruzioni: il verificatore ne
-percorreva un milione. Stava rileggendo gli stessi pezzi di codice molte volte,
+Nella macchina virtuale P2 si caricava fino a sei strati, con lo stesso
+sorgente: la prima spiegazione è stata "cambia il kernel". Era sbagliata. Il
+programma P2 a tre strati ha circa 16\,000 istruzioni, e il verificatore ne
+percorreva un milione: stava rileggendo gli stessi pezzi di codice molte volte,
 una per ogni strada.
 
-\section{Dove stavano i bivi: la ReLU}
+\subsection*{Dove stavano i bivi}
 
 Ogni neurone nascosto applica la ReLU: \emph{se il valore è positivo tienilo,
 altrimenti metti zero}. Nel codice era scritta esattamente così:
@@ -1357,7 +918,7 @@ lunghezza. P2 a \emph{uno} strato era già a 799\,563 passi, l'80\% del budget. 
 margine era così piccolo che una differenza qualsiasi fra due kernel bastava a
 superarlo: per questo nella macchina virtuale passava e qui no.
 
-\section{La correzione: la ReLU senza bivio}
+\subsection*{La ReLU senza bivio}
 
 La ReLU si può calcolare con sola aritmetica, senza \texttt{if}:
 
@@ -1412,7 +973,7 @@ caricava anche prima, perché ripete un solo strato generico: la ReLU è cambiat
 anche lì perché le tre pipeline calcolino l'attivazione con le stesse
 istruzioni, e il confronto fra loro resti alla pari.
 
-\section{Il risultato}
+\section{La ReLU senza bivio: il risultato}
 
 Passi del verificatore, su un budget di 1\,000\,000:
 
@@ -1458,11 +1019,11 @@ istruzioni: a venti strati il programma ne ha 32\,388, appena sotto. Il terzo
 limite è la tabella dei pesi, 1\,024 posti: 37 strati al massimo a larghezza 4,
 7 a larghezza 8.
 
-\section{Che cosa costa}
+\section{La ReLU senza bivio: che cosa costa}
 
 Il calcolo della rete è identico: i test che confrontano il C di P1 con il
 riferimento Python danno gli stessi logit su ogni modello sintetico
-(\texttt{test\_synth.py}), e \texttt{p1\_c\_eval.py} ora valuta anche
+(\texttt{test\_synth.py}), e \texttt{p1\_c\_eval.py} valuta anche
 \texttt{ipa\_relu} leggendone il corpo. Cambiano invece le istruzioni: circa tre
 per neurone al posto di due, in cambio di nessun salto. Rimisurato tutto il 28
 settembre:
@@ -2675,11 +2236,9 @@ Contando gli arrivi, la baseline sembra più lenta di P1 --- impossibile, perch�
 fa strettamente meno lavoro. Più pacchetti la baseline spinge verso l'uscita, più
 l'uscita, già satura, ne perde.
 
-Fino al 28 settembre il controllo di validità del banco (``la baseline dev'essere
-la più veloce'') contava proprio gli arrivi, e su ogni misura con \texttt{xdp\_gen}
-dichiarava il run non valido. L'errore era del controllo: ora conta i pacchetti
-\emph{elaborati dal nodo}, la stessa misura con cui il banco calcola il costo, e
-su tutti i run passa.
+Per questo il controllo di validità del banco (``la baseline dev'essere la più
+veloce'') conta i pacchetti \emph{elaborati dal nodo}, la stessa misura con cui
+il banco calcola il costo, e non quelli arrivati all'uscita.
 \end{prima}
 
 \subsection*{3. Il cavo è virtuale, e tutto sta su un processore}
@@ -2834,10 +2393,78 @@ mostra con i numeri.
 La domanda del relatore: al crescere del traffico offerto la coda si riempie, il
 tempo di attraversamento cresce, e poi si perde. Se si perde \emph{all'ingresso}
 del programma, il collo di bottiglia è il programma; se si perde \emph{dopo}, è
-la trasmissione. Il banco del bit rate mette davanti a ogni pipeline un secondo
-programma che conta soltanto (una catena di due programmi sullo stesso aggancio,
-con un salto), e misura tredici valori di traffico calibrati sul tetto di
-ricezione della macchina, cinque giri ciascuno.
+la trasmissione. Per saperlo bisogna contare quanti pacchetti il programma
+riceve e quanti ne rilancia.
+
+\subsection*{Due programmi sullo stesso aggancio}
+
+Un'interfaccia porta un solo programma XDP. Due programmi sullo stesso aggancio
+si ottengono in \textbf{catena}, con lo stesso salto fra programmi che le
+pipeline usano già:
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=9mm,
+              inner sep=5pt,font=\scriptsize,align=center},
+  arr/.style={-{Stealth[length=4pt]},draw=soft,thick}
+]
+\node[box] (g) {generatore\\(pktgen)};
+\node[box,right=11mm of g,draw=accent] (c) {programma 1\\conta e basta\\\texttt{ing\_count += 1}};
+\node[box,right=11mm of c,draw=accent] (p) {programma 2\\la pipeline};
+\node[box,right=14mm of p] (n) {nodo successivo\\conta e misura\\il ritardo};
+\draw[arr] (g) -- node[above,font=\scriptsize] {coda} (c);
+\draw[arr] (c) -- node[above,font=\scriptsize] {salto} (p);
+\draw[arr] (p) -- node[above,font=\scriptsize] {redirect} (n);
+\end{tikzpicture}
+\end{center}
+
+Il primo programma è attaccato all'interfaccia, conta ogni pacchetto e salta al
+secondo, che è il dispatcher della pipeline, identico a quello di produzione.
+
+\textbf{Perché in catena.} Il kernel tiene, per ogni interfaccia, \emph{un}
+programma XDP nell'aggancio nativo: è come è fatto XDP, non un limite di questo
+progetto. I modi di averne più di uno sono tutti catene. Quello standard è
+\texttt{libxdp}, che aggancia un programma \emph{dispatcher} con alcuni posti
+liberi e ci inserisce gli altri; quello usato qui è il salto fra programmi
+(\emph{tail call}) che le pipeline già usano, senza dipendenze in più. (Per il
+punto di aggancio di \texttt{tc} i kernel dal 6.6 hanno anche una lista nativa di
+programmi; per XDP no.) Il costo del salto in più si misura, più sotto: pochi
+nanosecondi, dentro il rumore.
+Così si hanno tre conteggi per ogni valore di traffico: \textbf{inviati} (dal
+generatore), \textbf{ricevuti} (dal programma 1) e \textbf{inoltrati} (arrivati
+al nodo successivo). Inviati meno ricevuti è la perdita \emph{prima} del
+programma; ricevuti meno inoltrati quella \emph{dopo}. Un terzo metodo,
+\texttt{rxonly}, è il contatore da solo: dice quanto regge la sola ricezione allo
+stesso ritmo, e separa il collo del programma da quello del banco.
+
+Il banco misura tredici valori di traffico, da 0,12 a 3~Gbit/s a pacchetti da 64
+byte, calibrati sul tetto di ricezione della macchina, cinque giri ciascuno. Il
+ritardo è quello di tutto il percorso: dal timbro che il generatore scrive nel
+pacchetto all'arrivo al nodo successivo.
+
+\subsection*{Ricevuti e inoltrati}
+
+\begin{center}
+\includegraphics[width=\textwidth]{figures/bitrate_pps.pdf}
+\end{center}
+
+Ogni pannello ha tre curve. Finché il nodo regge sono sovrapposte: tutto ciò
+che si invia viene ricevuto e inoltrato. Oltre il suo limite la linea grigia
+(inviati) continua a salire e le altre due si fermano \textbf{insieme}, alla
+capacità della pipeline: 3,3 milioni al secondo per la baseline, 2,9 per P1,
+1,9 per P2, 1,5 per P3. Che ricevuti e inoltrati restino sovrapposte è la
+risposta alla domanda: \textbf{il programma rilancia tutto ciò che riceve}, e ciò
+che manca non è mai entrato.
+
+\begin{center}
+\includegraphics[width=\textwidth]{figures/bitrate_loss.pdf}
+\end{center}
+
+La stessa cosa come perdita: la curva blu (persi prima di XDP) sale, la rossa
+(persi dentro la pipeline o all'uscita) resta a zero, al massimo lo 0,02\% degli
+inviati. La linea grigia è il solo contatore: comincia a perdere solo oltre
+2,4~Gbit/s, molto dopo le pipeline, quindi la loro perdita non è della
+ricezione ma del programma.
 
 \begin{center}
 \small
@@ -2864,15 +2491,63 @@ cade proprio sul suo limite, e perde. P3 (1,50 milioni, $\approx 0{,}77$~Gbit/s)
 perde allo stesso gradino, pur essendo più lenta: fra 0,72 e 0,96 non c'è un
 valore intermedio che le separi. A distinguerle è la terza colonna.
 
+\subsection*{Il ritardo}
+
+\begin{center}
+\includegraphics[width=\textwidth]{figures/bitrate_latency.pdf}
+\end{center}
+
+Il ritardo fa quello che la domanda prevede: resta di pochi microsecondi finché
+il nodo regge, poi \textbf{salta di un ordine di grandezza} esattamente dove la
+pipeline comincia a perdere (marcatori vuoti), e da lì resta piatto. Il salto è
+la coda d'ingresso che si riempie: 256 posti davanti a un programma che serve un
+pacchetto ogni 300--670~ns fanno fra 80 e 170 microsecondi di attesa, vicino al
+livello a cui le curve si fermano --- circa 85~µs per la baseline, 100 per P1,
+150 per P2, 190 per P3; il resto è il percorso fino al nodo successivo. Oltre, la
+coda non può crescere: è piena, e ciò che arriva in più viene respinto. Il ritardo si ferma e cresce la perdita.
+
+\begin{prima}[Un dettaglio a basso carico]
+Al valore più basso (0,12~Gbit/s) la mediana è di circa 9~µs, più che a
+0,5~Gbit/s (3--5~µs): la curva scende prima di salire. Non è la correzione per
+l'attesa del generatore, che a quel ritmo vale 12~µs ed è quasi uguale alla
+distanza fra due pacchetti dello stesso thread. Il minimo resta intorno a
+1~µs a tutti i ritmi. La spiegazione più probabile, \textbf{non verificata}: con
+poco traffico i core del percorso che il banco non tiene svegli --- il nodo
+successivo --- vanno a dormire, e una parte dei pacchetti aspetta il loro
+risveglio. Non tocca la conclusione, che sta nel salto a destra.
+\end{prima}
+
+\subsection*{Perché il collo di bottiglia è il programma}
+
+È quello che ci si deve aspettare, per come funziona XDP. Il programma non ha una
+coda sua: gira dall'inizio alla fine su ogni pacchetto, sul core che riceve, e
+finché non ha finito quel core non prende il pacchetto successivo. Se i pacchetti
+arrivano più in fretta di quanto il core li finisca, si accumulano nella coda
+\emph{davanti} al programma, e quando è piena vengono respinti. La perdita
+all'ingresso è quindi il segno di un nodo più lento del traffico, e il nodo è il
+suo programma.
+
+Resta da escludere che il limite sia la sola ricezione, che gira sullo stesso
+core. Lo dice \texttt{rxonly}, il contatore da solo: regge fino a circa
+2,4~Gbit/s, e a 3~Gbit/s perde il 21\%. Allo stesso ritmo la baseline perde il
+44\%, P2 il 68\%, P3 il 74\%: la perdita \emph{in più} rispetto al solo
+contatore (23, 47 e 54 punti) è del programma, e cresce con il suo costo.
+L'uscita invece non limita mai: dopo il programma si perde lo 0,002\% al massimo.
+
+Due precisazioni. Per la baseline il ``programma'' è quasi solo lettura
+dell'intestazione e redirect: il suo limite è il costo fisso di un nodo XDP, non
+una rete neurale. E il nodo ha \textbf{una sola coda e un solo core} per scelta,
+per misurare il costo per core: una scheda di rete vera distribuisce i pacchetti
+su più code e più core (RSS), e la capacità del nodo cresce con il numero di
+core, mentre il costo per pacchetto resta quello misurato qui.
+
 \begin{lezione}
 Per tutte e cinque la perdita è \textbf{all'ingresso}: il collo di bottiglia è il
-programma eBPF. Dopo il programma si perde al massimo lo 0,02\% di ciò che è stato
-inviato. E il tempo di attraversamento fa quello che la domanda prevedeva: 9--10
-microsecondi a basso carico, fino a 69--194 al primo valore in cui si perde, cioè
-la coda d'ingresso piena.
+programma eBPF, non la trasmissione. Il ritardo cresce fino a una perdita, come
+previsto, e si ferma al livello della coda piena.
 \end{lezione}
 
-Il secondo programma della catena costa poco, e si misura invece di supporlo: il
+Il primo programma della catena costa poco, e si misura invece di supporlo: il
 kernel tiene il tempo di ogni programma attaccato, e con e senza il contatore
 davanti la differenza va da $-2$ a $+5$~ns, entro la variazione fra le
 ripetizioni della misura stessa.
@@ -2889,15 +2564,14 @@ modello:
 \end{itemize}
 
 % ==================================================================
-\chapter{La macchina di laboratorio, sotto controllo (27 settembre)}
+\chapter{La macchina di laboratorio, sotto controllo}
 \label{ch:macchina}
 % ==================================================================
 
-L'ultimo giorno di settembre i banchi sono passati sulla macchina di laboratorio
-vera, senza strati di mezzo: un portatile Lenovo IdeaPad Slim 5 con un
-\textbf{Intel Core Ultra 7 155H}, Ubuntu 24.04, kernel 6.8. Tutte le misure di
-questo quaderno sono state rifatte lì, lo stesso giorno. Questo capitolo racconta
-che cosa è servito per poterle rifare bene.
+Tutte le misure di questo quaderno sono fatte sulla macchina di laboratorio,
+senza strati di mezzo: un portatile Lenovo IdeaPad Slim 5 con un \textbf{Intel
+Core Ultra 7 155H}, Ubuntu 24.04 installato direttamente sul disco (dual boot),
+kernel 6.8. Questo capitolo spiega che cosa serve perché le misure si ripetano.
 
 \section{Un processore che non sta fermo}
 
@@ -2916,18 +2590,17 @@ LP E-core & 20--21 & base 0,7, turbo 2,5 GHz & fuori dalla cache condivisa \\
 \end{tabular}
 \end{center}
 
-Lasciato a sé stesso, un banco su questa macchina finisce dove capita. La regola
-che il banco usava per scegliere i processori (un terzo al nodo, il resto al
-generatore) qui dava quattordici thread di generatore e metteva il nodo sui core
-di efficienza. Il desktop e il browser giravano sul gemello del core che si stava
-misurando. La frequenza andava da 0,4 a 4,8~GHz secondo il carico, e i core si
-addormentavano in uno stato da cui il risveglio costa 310 microsecondi: più di
-quanto la coda d'ingresso da 256 posti copra a un milione di pacchetti al secondo.
+Lasciato a sé stesso, un banco su questa macchina finisce dove capita: una
+regola generica per scegliere i processori (un terzo al nodo, il resto al
+generatore) darebbe quattordici thread di generatore e metterebbe il nodo sui
+core di efficienza, e il desktop girerebbe sul gemello del core misurato. La
+frequenza va da 0,4 a 4,8~GHz secondo il carico, e i core si addormentano in uno
+stato da cui il risveglio costa 310 microsecondi: più di quanto la coda
+d'ingresso da 256 posti copra a un milione di pacchetti al secondo.
 
 E il portatile \textbf{scalda}. Un solo P-core salito a 4,5--4,8~GHz porta il
 processore da 51 a 99~°C in due secondi, e il chip riduce la frequenza per
-difendersi (\emph{throttling}): dopo 41 minuti di uso leggero, due core contavano
-già migliaia di questi interventi.
+difendersi (\emph{throttling}).
 
 \section{Le condizioni, messe e tolte}
 
@@ -2967,9 +2640,9 @@ scartata in silenzio.
 
 \section{La frequenza scritta non è la frequenza vera}
 
-La prima scelta era la frequenza \emph{base}, 1,4~GHz, l'unica garantita. Il
-sistema la accettava e la rileggeva: 1\,400 minimo, 1\,400 massimo. I contatori
-del processore dicevano un'altra cosa:
+La frequenza \emph{base} del processore, 1,4~GHz, è l'unica garantita. Il sistema
+la accetta e la rilegge: 1\,400 minimo, 1\,400 massimo. I contatori del
+processore dicono un'altra cosa:
 
 \begin{lezione}
 Con 1\,400~MHz scritti nel sistema, il core gira a \textbf{circa 2\,000~MHz} ---
@@ -2977,8 +2650,8 @@ fisso e stabile, ma non a quella frequenza. Da 3\,000~MHz in su scritto e vero
 coincidono entro 10~MHz.
 \end{lezione}
 
-Se il monitor si fosse fidato del numero scritto, avrebbe marcato come disturbate
-38 finestre su 39. Da allora la frequenza di riferimento è quella
+Se il monitor si fidasse del numero scritto, a 1,4~GHz marcherebbe come
+disturbate 38 finestre su 39. La frequenza di riferimento è quindi quella
 \textbf{misurata} all'avvio, su ogni core del banco; il numero scritto resta
 accanto, per confronto.
 
@@ -3006,8 +2679,7 @@ risposta si è misurata:
 A 4,5~GHz il throughput smette di crescere: il chip si difende. A 4~GHz un run
 corto è pulito, uno da cinque minuti porta il processore a 98~°C e il core del
 nodo stesso in throttling. \textbf{3,5~GHz} è la frequenza più alta che la
-macchina regge per un run intero: 1 finestra disturbata su 390, massimo 85~°C.
-È diventata la frequenza di default del banco.
+macchina regge per un run intero, ed è la frequenza di default del banco.
 
 \begin{lezione}
 La frequenza pesa quasi in proporzione, ma non del tutto: fra 2 e 4~GHz i cicli
@@ -3025,16 +2697,16 @@ si citano con la loro frequenza; i rapporti no.
 \toprule
 \textbf{banco} & \textbf{variazione} \\
 \midrule
-programma da solo (\texttt{test\_suite}, fra sette prove) & 2--5\% \\
-throughput a saturazione (fra tre giri) & 0,1--1,7\% \\
-inoltro massimo al crescere del bit rate (fra cinque giri) & 0,4--2,0\% \\
+programma da solo (\texttt{test\_suite}, fra sette prove) & 2--6\% \\
+throughput a saturazione (fra tre giri) & 0,2--0,9\% \\
+inoltro massimo al crescere del bit rate (fra cinque giri) & 1,5--2,5\% \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-E i pacchetti respinti con il nodo sotto capacità, che prima erano l'1--2\% anche
-per il programma che non fa niente, sono \textbf{zero}: l'unica causa rimasta era
-il risveglio del core, e il core non dorme più.
+E i pacchetti respinti con il nodo sotto capacità sono \textbf{zero} (nella
+macchina virtuale erano l'1--2\% anche per il programma che non fa niente): la
+causa era il risveglio del core, e il core del nodo non dorme.
 
 \section{Prima e dopo: che cosa è cambiato}
 
@@ -3084,7 +2756,7 @@ la frequenza era quella che capitava.
         il verificatore la rifiutava da tre strati in su. La causa non era il kernel
         ma il codice: ogni ReLU era un salto condizionale, e già a uno strato il
         verificatore percorreva 800\,000 istruzioni su un limite di un milione.
-        Con la ReLU senza salto (28 settembre) P2 carica fino a sei strati.
+        Con la ReLU senza salto (28 settembre) P2 carica fino a venti strati.
   \item \textbf{P1 a $\sim$1\,200 pesi, lo stesso.} Sull'ingresso di IPA prima si caricavano tutte le
         forme, dalla larga alla profonda (122--293~ns); qui passava solo quella a otto
         strati. Stessa causa di P2, stessa correzione: con la ReLU senza salto il
@@ -3106,25 +2778,6 @@ piccola differenza fra kernel bastava a superarlo. Tolto il salto, il margine
 torna ampio (P2 a sei strati usa il 14\% del limite).
 \end{lezione}
 
-\section{Che cosa ha portato alla luce}
-
-Rifare tutto su una macchina ferma ha trovato cose che il rumore nascondeva:
-
-\begin{itemize}
-  \item \textbf{P2 oltre due strati nascosti non si caricava}, e \textbf{P1 oltre
-        qualche centinaio di pesi} nemmeno: la causa comune, un bivio in ogni ReLU,
-        è nel capitolo \ref{ch:relu}.
-  \item \textbf{Le porte assenti} costano un nanosecondo ciascuna, e ora si vede;
-        \textbf{congelare il nodo} vale il 16\% di latenza, e ora si vede.
-  \item \textbf{Scartare costa più che inoltrare} sul banco a pacchetti grezzi.
-  \item Tre difetti del banco: con il compilatore di sistema i programmi di P1 non
-        trovavano un header (manca una cartella nel percorso di ricerca, ora
-        aggiunta); il banco del throughput scriveva i risultati nella cartella
-        sbagliata; e il generatore scriveva su una coda per thread, lasciando allo
-        scheduler la scelta di quale servire (ora una coda sola, sezione 5 del
-        capitolo \ref{ch:reale}).
-\end{itemize}
-
 \section{Come si rifà tutto}
 
 Due script rifanno ogni misura di questo quaderno, nelle stesse condizioni. I CSV
@@ -3135,121 +2788,6 @@ quaderno si rigenerano dai CSV in \texttt{docs/figures/}:
 bash ipa/test/remeasure_all.sh      # programma, correttezza, analisi parametrica
 bash ipa/test/remeasure_traffic.sh   # traffico vero, semantica, soffitti, topologie
 \end{lstlisting}
-
-% ==================================================================
-\chapter{Le altre correzioni di settembre}
-\label{ch:altre}
-% ==================================================================
-
-Il test reale non è stata l'unica cosa sistemata nell'ultima settimana. Questo
-capitolo racconta le altre, una sezione ciascuna: che cosa non andava, perché
-contava, che cosa è stato fatto, e come si è verificato che fosse a posto.
-
-\section{Il P1 che va sui nodi non inoltrava}
-
-\textbf{Il contesto.} P1 si può costruire in due modi. Con \emph{BCC}, che compila
-il programma sul nodo al momento del caricamento (serve un compilatore sul nodo).
-Oppure \emph{AOT} (\emph{ahead of time}): si compila prima, su un'altra macchina,
-e al nodo si spedisce l'oggetto già pronto, che un piccolo caricatore in C apre e
-attacca. È la versione AOT quella che va sui nodi.
-
-\textbf{Il difetto.} Il caricatore AOT riempiva la tabella delle uscite con
-l'interfaccia numero 1 per tutte le porte: \emph{loopback}, il collegamento
-interno della macchina con sé stessa. Ogni pacchetto da inoltrare veniva perso.
-Nessun test se ne accorgeva, perché i test di consegna provavano la versione BCC.
-
-\textbf{La correzione.} Il caricatore lascia le tabelle vuote e le «appunta» nel
-file system del kernel; il pannello di controllo in Python le riempie con le
-interfacce vere del nodo, poi dice al caricatore di attaccare il programma. Il
-caricatore stacca tutto e pulisce quando riceve lo stop.
-
-\textbf{La prova.} Il test di consegna ha una variante che usa esattamente il
-percorso di deploy: \textbf{11 casi su 11}, con ogni classe consegnata
-sull'interfaccia giusta e lo scarto contato.
-
-\section{Tutti i test di P1 usano l'oggetto AOT}
-
-Ogni test e ogni banco che tocca P1 o P1.5 usa l'oggetto AOT, attraverso un modulo
-solo (\texttt{ipa/p1\_aot.py}): la prova di consegna, le prove sul kernel, i
-modelli sintetici, l'analisi parametrica, i banchi su traffico vero.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lr@{}}
-\toprule
-\textbf{Prova} & \textbf{esito} \\
-\midrule
-consegna su rete di veth (tutte le pipeline) & 29/29 \\
-consegna della P1 come si deploya & 11/11 \\
-cinque topologie diverse & 34/34 \\
-equivalenza numerica sui modelli sintetici, P1 & 8/8 scenari, 300/300 ingressi ciascuno \\
-P1 statica contro P1.5: stessa decisione & 80/80 casi \\
-semantica delle classi per modello, P2 e P3 & 53/53 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\section{Il cronometro del caricatore AOT}
-
-\textbf{Il difetto.} Il caricatore misurava eseguendo il programma un milione di
-volte \emph{sullo stesso pacchetto}, e il kernel non rimette a posto il pacchetto
-fra un'esecuzione e l'altra: dopo poche decine di giri il TTL scadeva, e si
-misurava il ramo corto «pacchetto scaduto», non l'inoltro. È lo stesso difetto
-raccontato per il banco parametrico (capitolo \ref{ch:programma}).
-
-\textbf{La correzione.} Pacchetti nuovi ogni 200 esecuzioni, partendo da TTL 255.
-Il risultato: 989 istruzioni, 47~ns per pacchetto sul percorso d'inoltro, la
-stessa cifra di \texttt{test\_suite}.
-
-\section{Due implementazioni che devono dare lo stesso numero}
-
-\textbf{Il rischio.} Il progetto ha un \emph{riferimento}: il calcolo della rete
-scritto in Python, con gli stessi numeri interi del kernel. Se il riferimento e il
-codice generato per il kernel sbagliano \emph{allo stesso modo}, ogni test passa.
-
-\textbf{Il difetto trovato.} Il riferimento usato per i modelli sintetici non
-moltiplicava il bias per la scala giusta (il bias dello strato $l$ va moltiplicato
-per $s^l$). Sul modello depositato non si vedeva.
-
-\textbf{La correzione.} La scala è un argomento obbligatorio del riferimento, e
-ogni file di risposte attese dichiara lo schema e la scala con cui è stato
-calcolato. In più un controllo confronta direttamente \textbf{il riferimento
-Python con il codice C generato per P1}, valutato come testo, logit per logit. Per
-provare che il controllo sa fallire, lo si è fatto girare su codice alterato
-apposta: se ne accorge.
-
-\section{La scala delle feature in P2 e P3}
-
-Il TTL entra nella rete diviso per una costante scelta durante l'addestramento, e
-la costante viene dal modello. La prova \emph{nel kernel} per P2 e P3 ha un
-controllo negativo: su un modello addestrato con scala 16, se si altera la scala
-scritta nella tabella del nodo le decisioni cambiano esattamente nei 41 casi su
-300 previsti (89 nel modello \texttt{small}); con la scala giusta tornano identiche
-al riferimento. Quindi la scala viene davvero letta e usata.
-
-P2 accetta ora modelli con un numero di classi d'uscita diverso da quello
-configurato: il numero viene dalla semantica dichiarata del modello.
-
-\section{Pulizia del repository}
-
-Tolto ciò che non corrispondeva più al codice o all'ambiente di oggi:
-
-\begin{itemize}
-  \item gli script per inviare e ricevere pacchetti a mano fra i nodi del vecchio
-        laboratorio (\texttt{send\_ipa.py}, \texttt{recv\_ipa.py},
-        \texttt{test\_ipa.py}): senza quei nodi non avevano più un destinatario, e
-        la consegna la verifica \texttt{test\_fabric.py};
-  \item la sonda dell'ambiente (\texttt{probe\_env.sh}), sostituita da
-        \texttt{host\_conditions.py --show} e \texttt{test\_host\_kernel.py};
-  \item un controllo sui sorgenti C che nessun test eseguiva più;
-  \item da \texttt{results/} tutto ciò che non è una misura: restano solo i CSV.
-        Grafici, registri e resoconti si rigenerano dai CSV; i grafici di questo
-        quaderno stanno in \texttt{docs/figures/}.
-\end{itemize}
-
-Tenuti, dopo averli controllati, due script che sembravano superati:
-\texttt{diag\_p3\_bisect.py} (rifà la misura dei tetti del verificatore) e
-\texttt{bench\_tailcall\_overhead.py} (misura un costo che nessun altro isola).
 
 % ==================================================================
 \chapter{I numeri di oggi, in una pagina}
@@ -3294,56 +2832,17 @@ In tre righe:
         millisecondi per tutte le pipeline}. Il vantaggio residuo di P2 e P3 è non
         dover compilare niente, da nessuna parte.
   \item \textbf{Congelare anche il nodo (P1 statica) vale poco ma si vede}: circa
-        40~ns sul percorso vero, 7~ns sul solo programma, e la dimensione non
+        15~ns sul percorso vero, 5--9~ns sul solo programma, e la dimensione non
         dipende più dalla taglia della rete.
 \end{enumerate}
 \end{lezione}
 
 % ==================================================================
-\chapter{Quel che resta}
-
-\section{Fatto}
+\chapter{Quel che resta aperto}
 
 \begin{itemize}
-\item semantica delle classi dichiarata, mai dedotta; catena classe $\to$ azione
-      $\to$ porta logica $\to$ interfaccia;
-\item motore indipendente dallo scenario, dimostrato su cinque topologie diverse;
-\item verifica end-to-end su datapath reale con XDP native;
-\item errore del bias nell'ultimo strato corretto;
-\item feature dell'interfaccia d'ingresso resa viva in tutte e tre le pipeline;
-\item \textbf{indice del nodo} letto a runtime da tabella in tutte e tre: pesa 208
-      pesi su 319;
-\item primo strato riscritto con i cicli invertiti in P2 e P3: stesso risultato
-      bit per bit, e il margine di verifica che ne è uscito ha permesso di
-      \textbf{recuperare il tetto sulle code} (da 1 a 8) e di \textbf{contare le
-      letture di tabella};
-\item oggetto precompilato (AOT) come unico deploy di P1, e come unica P1 misurata;
-\item \textbf{analisi parametrica} su sette assi e quattro pipeline, e
-      \textbf{campagna} sulle architetture: le pendenze sono diverse, ed è la
-      misura che giustifica l'esistenza di più pipeline;
-\item \textbf{versione P1 specializzata}, per il nodo e per le porte presenti;
-\item \textbf{semantica delle classi per modello} in P2 e P3 (capitolo
-      \ref{ch:classi});
-\item \textbf{banco su traffico vero} con generatore, nodo e nodo successivo su
-      core separati, e un controllo di validità che il banco esegue su sé
-      stesso;
-\item \textbf{banco del bit rate}: dove comincia la perdita, e da che parte;
-\item \textbf{la macchina sotto controllo} (capitolo \ref{ch:macchina}): misure
-      ripetibili entro pochi punti, frequenza vera misurata, niente respinti sotto
-      capacità, e tutto rifatto con due script;
-\item \textbf{ReLU senza bivio} in P1, P2 e P3 (capitolo \ref{ch:relu}): P2 carica
-      fino a venti strati invece di due, P1 carica il tier da $\sim$1\,200 pesi.
-\end{itemize}
-
-\section{Aperto}
-
-\begin{itemize}
-\item \textbf{Rimisurare le tre pipeline con la ReLU senza bivio} (capitolo
-      \ref{ch:relu}): istruzioni e latenze cambiano di poco, e sugli assi della
-      profondità e del budget di pesi compaiono punti che prima non caricavano.
 \item \textbf{Il costo del nodo delle pipeline leggere} con pacchetti grezzi: il
-      banco non le satura. Servono più thread di generatore e più di un core per il
-      nodo successivo.
+      generatore non le satura. Servono più thread di generatore.
 \item \textbf{Architetture diverse su traffico vero}: il costo del nodo è misurato
       su un modello solo.
 \item \textbf{Hardware vero}: una scheda di rete con XDP nativo e una seconda
@@ -3353,42 +2852,12 @@ In tre righe:
       \emph{restringe l'insieme dei modelli rappresentabili}.
 \item \textbf{I salti fra programmi di P3}: tre per pacchetto, ed è lì (con le
       letture che li accompagnano) che sta la latenza.
+\item \textbf{La profondità massima di P2} fra 20 e 37 strati: il punto esatto in
+      cui clang si ferma non è misurato.
 \item \textbf{Isolamento dal boot}: i core del banco sono isolati a sistema acceso;
       l'isolamento completo (tick e callback del kernel) richiede parametri di
       avvio.
 \end{itemize}
-
-\section{Il filo conduttore}
-
-Guardando indietro, quasi tutti i problemi trovati a settembre hanno la stessa
-forma. Non erano calcoli sbagliati: erano \textbf{assunzioni non dichiarate} che
-risultavano vere per caso nell'unica configurazione mai provata.
-
-\begin{center}
-\small
-\begin{tabular}{@{}ll@{}}
-\toprule
-\textbf{Assunzione} & \textbf{Vera solo perché} \\
-\midrule
-classe $k$ $=$ interfaccia $k$ & le porte erano numerate come le classi \\
-DROP $=$ ultima classe & nel modello depositato capitava così \\
-$n_{\text{nodi}} = 52$ di default & si provava una topologia sola \\
-\texttt{eth0} $=$ ifindex 2 & si provava su un sistema appena avviato \\
-bias dell'uscita $\times\, s^0$ & si provava coi link tutti attivi \\
-one-hot del nodo $=$ \texttt{model\_id} & si registrava un modello solo \\
-tabella vuota $=$ nodo 0 & l'array è preallocato a zero \\
-frequenza scritta $=$ frequenza vera & non la si era mai misurata \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-E quasi tutte sono emerse allo stesso modo: cambiando \emph{una} condizione che
-nessun test aveva mai cambiato.
-
-\begin{lezione}
-Un test verde dice che il codice si comporta come il test si aspetta. Non dice
-che il test stia chiedendo qualcosa.
-\end{lezione}
 
 % ==================================================================
 \chapter{I comandi}
@@ -3430,11 +2899,9 @@ bash ipa/test/remeasure_traffic.sh
 
 \begin{lstlisting}
 python3 ipa/test/test_suite.py
-python3 ipa/test/test_suite.py --only core --verbose
 python3 ipa/test/test_class_semantics.py
 python3 ipa/test/test_synth.py
 python3 ipa/test/verify_synth_kernel.py --all --dry-run
-python3 ipa/test/diag_model_decisions.py
 \end{lstlisting}
 
 \section{Kernel: si carica, e quanto costa}
@@ -3518,10 +2985,9 @@ riportate, non scartate.
 
 \begin{lstlisting}
 sudo python3 ipa/test/bench_tailcall_overhead.py
-sudo python3 ipa/test/bench_model_add.py --n-models 3
-python3 ipa/methods/method4_hardcoded_aot.py        # build, come utente
-sudo python3 ipa/methods/method4_hardcoded_aot.py   # bench
-sudo python3 ipa/test/diag_p3_bisect.py --ceilings
+python3 ipa/methods/method4_hardcoded_aot.py --build-only   # build, come utente
+sudo python3 ipa/methods/method4_hardcoded_aot.py           # verifica e bench
+sudo python3 ipa/test/diag_verifier.py                      # statistiche del verificatore
 \end{lstlisting}
 
 \section{L'ordine consigliato}
@@ -3531,7 +2997,7 @@ Partendo da zero su una macchina nuova:
 \begin{enumerate}
 \item \texttt{python3 ipa/test/host\_conditions.py --show} --- com'è fatta la
       macchina, e dove andrebbe il banco?
-\item \texttt{python3 ipa/test/test\_suite.py} --- il modello è sano?
+\item \texttt{python3 ipa/test/test\_synth.py} --- il C generato per P1 calcola il modello? (\texttt{test\_suite.py}, che controlla estrazione dei pesi e quantizzazione, richiede PyTorch)
 \item \texttt{sudo python3 ipa/test/test\_host\_kernel.py} --- le condizioni si
       mettono e si tolgono davvero?
 \item \texttt{sudo python3 ipa/test/test\_fabric.py} --- il pacchetto attraversa

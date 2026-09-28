@@ -39,7 +39,7 @@ if SHARED_DIR not in sys.path:
 
 
 def main():
-    # chdir into shared/ so the pipeline modules resolve their relative data
+    # chdir into ipa/ so the pipeline modules resolve their relative data
     # paths (weights.json, the .pt checkpoint) the way they expect. Done here
     # rather than at module level: importing this module should not silently
     # change the caller's working directory.
@@ -155,29 +155,20 @@ For the full metric comparison across pipelines:
     if args.method == "hardcoded":
         # Pipeline 1 — weights hardcoded as C literals, unrolled inference.
         if args.verify_only:
-            # Verifier smoke test via the BCC generator (no attach, no offline clang).
-            # Forward the RESOLVED model_path, not args.model: this process has
-            # already os.chdir'd into SHARED_DIR, so method4_hardcoded.py's own
-            # default ("shared/frr_...pt", relative) would resolve to
-            # ipa/ipa/frr_...pt and fail to load.
-            sys.argv = ["method4_hardcoded.py", "--verify-only",
-                        "--iface", args.iface,
-                        "--model-id", str(args.model_id),
-                        "--model", model_path]
+            # Verifier smoke test on the object the node actually loads: the
+            # AOT bench mode generates the .o, loads it through the verifier
+            # and JIT, and BPF_PROG_TEST_RUNs it once -- no attach.
+            sys.argv = ["method4_hardcoded_aot.py", "--model", model_path]
             runpy.run_path(
-                os.path.join(SHARED_DIR, "methods", "method4_hardcoded.py"),
+                os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py"),
                 run_name="__main__"
             )
         else:
-            # AOT-literal deploy — the ONLY hardcoded deploy backend. Prebuilt
-            # .o attached live, NO clang/libbpf-dev needed on this node (see
-            # method4_hardcoded_aot.py and shared/poc_aot/loader_aot.c, now
-            # statically linked against libbpf for exactly this reason).
-            # BCC is no longer used to deploy hardcoded; it is still used
-            # internally by the test suite (verify_prog_run.py etc.) to
-            # compile-and-verify offline, which is a different concern from
-            # what actually runs on the datapath node.
-            # Same reason as above: pass the already-resolved absolute path.
+            # AOT-literal deploy: the prebuilt .o attached live, no clang or
+            # libbpf-dev needed on this node (see method4_hardcoded_aot.py and
+            # poc_aot/loader_aot.c, statically linked against libbpf). The
+            # model path is the already-resolved absolute one: this process
+            # has os.chdir'd into SHARED_DIR.
             sys.argv = ["method4_hardcoded_aot.py", "--iface", args.iface,
                         "--xdp-mode", args.xdp_mode or "native",
                         "--model", model_path]

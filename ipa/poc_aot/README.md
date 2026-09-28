@@ -4,8 +4,8 @@
 
 Pipeline 1 (hardcoded) bakes the model weights as **C literals** in the eBPF
 source. Compiled with BCC, i.e. clang at runtime on the node, every new or
-modified model triggers a full recompile: 75 ms of BCC compilation against
-~2 ms of kernel load (verifier + JIT), measured with `bench_model_add.py`.
+modified model would trigger a full recompile on the node: ~75 ms of clang
+against ~1 ms of kernel load (verifier + JIT).
 Retraining the same 65-4-4-7 model changes only 319 integers, yet the whole
 program is compiled from scratch, and the node needs a compiler.
 
@@ -19,18 +19,18 @@ per-weight strength reduction (`x*0` folded away, `x*8` → shift) is baked into
 the `.o`, so the datapath keeps the full literal performance.
 
 The program is **architecture-faithful**: dispatcher + `PROG_ARRAY` tail-call +
-a model that re-parses, the same topology the tests measure. Since 2026-09-23
-this object *is* Pipeline 1 everywhere: every P1 number in `docs/` comes from
-it, through `ipa/p1_aot.py`.
+a model that re-parses, the same topology the tests measure. This object *is*
+Pipeline 1 everywhere: every P1 number in `docs/` comes from it, through
+`ipa/p1_aot.py`.
 
-## Measured (2026-09-27, `docs/testing.md` §4 and Results)
+## Measured (2026-09-28, `docs/testing.md` §4 and Results)
 
 | | |
 |---|---|
-| offline build (clang → `.o`) | 76.5 ms, once, on the build machine |
-| deploy on the node (open + verify + JIT) | **1.16 ms** |
-| xlated instructions | 989 (dispatch 29 + model 960) |
-| latency (forwarding path, retval 4) | **47 ns/pkt** at 3.5 GHz, as in `test_suite --only kernel` |
+| offline build (clang → `.o`) | 75.8 ms, once, on the build machine |
+| deploy on the node (open + verify + JIT) | **1.12 ms** |
+| xlated instructions | 1 064 (dispatch 29 + model 1 035) |
+| latency (forwarding path, retval 4) | **51 ns/pkt** at 3.5 GHz, as in `test_suite --only kernel` (52) |
 
 ## Files
 
