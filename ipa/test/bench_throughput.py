@@ -5178,11 +5178,7 @@ def _rxonly_verdict(sat, cmp_, threshold):
             continue
         cap = top["rx_pps"]
 
-        def nodo(r):
-            # Gli ELABORATI (HIT + MISS + DROP) se ci sono, vedi proc_pps in
-            # _measure_once; con un pacchetto sempre uguale coincidono con
-            # HIT. rxonly non ha uscita: per lui elaborati e RX coincidono.
-            return r.get("proc_pps") or r.get("hit_pps") or r["rx_pps"]
+        nodo = node_pps
         base = next((r for r in sat if r["frame"] == frame
                      and r["method"] == "baseline"), None)
         base_ns = 1e9 / nodo(base) if base is not None and nodo(base) else None
@@ -6137,6 +6133,14 @@ def _confronto_con_rates(out_dir, ceiling_rx):
           f"generatore e il loro ginocchio non e' stato raggiunto.{NC}")
 
 
+def node_pps(r):
+    """Il rate del NODO: i pacchetti che il programma ha elaborato (HIT + MISS
+    + DROP, vedi proc_pps in _measure_once), altrimenti quelli decisi (HIT),
+    altrimenti i ricevuti. Con un pacchetto sempre uguale elaborati e HIT
+    coincidono; rxonly non ha uscita, e per lui elaborati e RX coincidono."""
+    return r.get("proc_pps") or r.get("hit_pps") or r["rx_pps"]
+
+
 def check_validity(rows):
     """La baseline deve essere la piu' veloce. Se non lo e', il run e' sporco.
 
@@ -6149,6 +6153,15 @@ def check_validity(rows):
 
     Questo controllo esiste perche' e' successo: baseline 2 658 k contro
     p1_static 3 342 k, con dispersioni fino al 75%.
+
+    SI CONFRONTANO I PACCHETTI ELABORATI DAL NODO (node_pps), non quelli
+    arrivati al nodo successivo: e' la stessa misura con cui il banco calcola
+    il costo per pacchetto. Con rx_pps il controllo falliva su ogni run con il
+    generatore XDP (2026-09-28, e con le stesse cifre il 27): la baseline
+    elaborava 7,1 M pacchetti/s e l'uscita sulla cpu0 ne consegnava 4,4 M,
+    mentre P1, piu' lenta, ne elaborava 6,3 M e l'uscita ne consegnava 4,8 M.
+    Il collo di bottiglia era l'uscita, e il controllo accusava la baseline di
+    essere lenta proprio perche' era la piu' veloce.
 
     IL CONFRONTO E' DENTRO UNA TAGLIA DI FRAME, mai fra taglie. Prendendo il
     massimo di ciascun metodo su TUTTE le taglie il controllo confrontava punti
@@ -6167,7 +6180,7 @@ def check_validity(rows):
         # tutte nello stesso gruppo, che li' e' corretto perche' la taglia e'
         # una sola.
         best = per_frame.setdefault(r.get("frame"), {})
-        if m not in best or r["rx_pps"] > best[m]["rx_pps"]:
+        if m not in best or node_pps(r) > node_pps(best[m]):
             best[m] = r
     usable = {k: b for k, b in per_frame.items()
               if "baseline" in b and len(b) >= 2}
@@ -6184,14 +6197,14 @@ def check_validity(rows):
     noisy, gen_bound = set(), set()
     for k in order:
         best = usable[k]
-        base = best["baseline"]["rx_pps"]
-        sopra = {m: r["rx_pps"] for m, r in best.items()
-                 if m != "baseline" and r["rx_pps"] > base * (1 + VALID_TOL)}
+        base = node_pps(best["baseline"])
+        sopra = {m: node_pps(r) for m, r in best.items()
+                 if m != "baseline" and node_pps(r) > base * (1 + VALID_TOL)}
         for m, v in sopra.items():
             faster[(k, m)] = (v, base)
         for m, r in best.items():
-            if m != "baseline" and base < r["rx_pps"] <= base * (1 + VALID_TOL):
-                close[(k, m)] = r["rx_pps"]
+            if m != "baseline" and base < node_pps(r) <= base * (1 + VALID_TOL):
+                close[(k, m)] = node_pps(r)
             if r.get("unreliable"):
                 noisy.add(m)
             if r.get("bottleneck") == BN_GEN:
@@ -6214,7 +6227,7 @@ def check_validity(rows):
               f"DUT (--dut-cpus) finche' la perdita compare: solo allora il "
               f"numero e' della pipeline.{NC}")
     if not faster and not noisy:
-        det = ", ".join(f"{_fr(k)} {usable[k]['baseline']['rx_pps']} pps"
+        det = ", ".join(f"{_fr(k)} {node_pps(usable[k]['baseline'])} pps"
                         for k in order)
         msg = (f"la baseline e' la piu' veloce entro {VALID_TOL:.0%} in ogni "
                f"taglia ({det}), come deve essere: fa strettamente meno "
@@ -7366,7 +7379,7 @@ def _run_per_class(a, methods, model_path, frames, plan, env_finale):
         for r in rows:
             if r.get("phase") != "saturazione":
                 continue
-            node = r.get("proc_pps") or r.get("hit_pps") or r["rx_pps"]
+            node = node_pps(r)
             if node:
                 per[c].setdefault(r["method"], {})[r["frame"]] = 1e9 / node
             r.update(scenario_class=c, scenario_action=act)

@@ -219,15 +219,15 @@ controllo negativo morde e la condizione "slot assenti a 0" è portante.
 
 | porte presenti | 2 | 3 | 4 | 5 | 6 |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` istruzioni | 565 | 583 | 600 | 617 | 631 |
-| `p1_static` latenza (ns) | 32 | 33 | 33 | 35 | 36 |
+| `p1_static` istruzioni | 579 | 599 | 615 | 639 | 663 |
+| `p1_static` latenza (ns) | 37 | 38 | 39 | 39 | 41 |
 
-**16,5 istruzioni per porta**, lineare; grado 2 contro grado 6: −10,5% di istruzioni e
-**−4 ns** (−11%), con la latenza monotona. Fra grado 6 e grado 2 spariscono 16
+**21 istruzioni per porta**, lineare; grado 2 contro grado 6: −12,7% di istruzioni e
+**−4 ns** (−10%), con la latenza monotona. Fra grado 6 e grado 2 spariscono 16
 moltiplicazioni-accumulo, circa 4,6 ns a 3,5 GHz se ne costasse una per ciclo: la misura
 li vede. Il controllo regge:
-`hardcoded` 1 114, `template` 14 969, `modular` 12 318 istruzioni e latenze piatte (43,
-184–186, 306–311 ns) su tutti e cinque i punti.
+`hardcoded` 1 090, `template` 15 142, `modular` 12 394 istruzioni e latenze piatte (46–47,
+187–189, 306–309 ns) su tutti e cinque i punti.
 
 ### Verifier standalone e semantica per modello
 
@@ -330,12 +330,12 @@ sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_model_a
 
 | pipeline | setup una tantum | add **min** (ms) | media | come |
 |---|---:|---:|---:|---|
-| hardcoded (BCC) | — | 76,1 | 80,7 | ricompilazione completa: BCC 75 ms, caricamento 2,2 ms |
-| template | 1 603 ms | **0,507** | 0,695 | una `bpf_map_update_elem` sul blocco pesi |
-| modular | 1 295 ms | **0,403** | 0,621 | una `bpf_map_update_elem` sul blocco pesi |
+| hardcoded (BCC) | — | 75,6 | 78,9 | ricompilazione completa: BCC ~74 ms, caricamento ~2 ms |
+| template | 1 516 ms | **0,505** | 0,695 | una `bpf_map_update_elem` sul blocco pesi |
+| modular | 1 194 ms | **0,410** | 0,616 | una `bpf_map_update_elem` sul blocco pesi |
 
 Ricompilare P1 con BCC costa 150-190× una scrittura in mappa. Ma il deploy di P1 è l'oggetto
-AOT: sul nodo si paga solo il caricamento, **1,16 ms** (`open` 0,08 + verifica e JIT 1,08;
+AOT: sul nodo si paga solo il caricamento, **1,12 ms** (`open` 0,09 + verifica e JIT 1,03;
 § Risultati), e clang (76 ms) gira una volta sulla macchina di build. Si riporta il minimo:
 con 3 modelli la media è dominata dal primo add, che paga il primo accesso alle pagine di
 una mappa appena creata. Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (3 modelli di questa
@@ -359,35 +359,47 @@ sia centrato (lo scarto è stampato). Quattro descrittori (`default` 2 one-hot,
 trial. Ogni cella in un subprocess: un abort di clang o un rifiuto del verificatore marca
 solo quella cella.
 
+Misurato il 2026-09-28, con `ipa_relu` (§8).
+
 **Tier A (~300 pesi)**, ns/pacchetto:
 
 | descrittore | n_in | larga | 2 layer | 4 layer | 8 layer |
 |---|---:|---:|---:|---:|---:|
-| `default` (2 one-hot) | 65 | **39** | 39 | 41 | 50 (+28%) |
-| `no_onehot` (0) | 11 | 96 | 96 | 84 | **76 (−21%)** |
-| `small_onehot` (1 piccola) | 13 | *non carica* | **74** | 78 | 78 |
+| `default` (2 one-hot) | 65 | **39** | 46 | 49 | 64 (+64%) |
+| `no_onehot` (0) | 11 | 93 | 88 | 83 | **81 (−13%)** |
+| `small_onehot` (1 piccola) | 13 | 81 | **71** | 79 | 84 |
 
-(`big_onehot` nel log `depth_vs_width.log` di `remeasure_all.sh`.)
+**Tier B (~1 200 pesi)**, ns/pacchetto:
 
-**Tier B (~1 200 pesi)**: su `default` si carica solo la forma a 8 strati (**230 ns**,
-4 851 istruzioni); larga, 2 e 4 strati vengono **rifiutate dal verificatore**:
-`BPF program is too large. Processed 1000001 insn (limit 1000000)`, errore −7 (`E2BIG`) su
-`xdp_model`. Non è lo stack: è il limite di **complessità di verifica**, e la causa era la
-stessa di P2 (§8): un salto per ogni ReLU. Con `ipa_relu` (dal 2026-09-28) il tier B
-carica in tutte le forme su `default` (5 698–8 516 istruzioni percorse, contro 1 000 001), e
-le celle vanno rimisurate. Su `no_onehot` e
-`small_onehot` il tier B non carica in nessuna forma (abort di clang per lo stack o lo
-stesso limite del verificatore). **Tier C (~4 700 pesi)**: nessuna forma carica.
+| descrittore | n_in | larga | 2 layer | 4 layer | 8 layer |
+|---|---:|---:|---:|---:|---:|
+| `default` (2 one-hot) | 65 | **110** | 150 | 176 | 219 (+99%) |
+| `no_onehot` (0) | 11 | *stack* | *stack* | 320 | **291 (−9%)** |
+| `small_onehot` (1 piccola) | 13 | *stack* | 295 | **286** | 288 |
+
+(`big_onehot` nel log `depth_vs_width.log` di `remeasure_all.sh`.) *stack*: clang si ferma
+(abort di LLVM, stack eBPF oltre 512 byte). **Tier C (~4 700 pesi)**: nessuna forma
+compila, per lo stesso motivo.
+
+**Fino al 2026-09-27** il tier B su `default` caricava solo la forma a 8 strati (230 ns):
+larga, 2 e 4 strati venivano **rifiutate dal verificatore** (`BPF program is too large.
+Processed 1000001 insn`, `E2BIG`), e su `small_onehot` non caricava nemmeno la larga del
+tier A. La causa era la stessa di P2 (§8): un salto condizionale per ogni ReLU. Con
+`ipa_relu` il verificatore percorre 5 698–8 516 istruzioni sul tier B, e il limite che
+resta è lo stack.
 
 **Che cosa dicono.**
 1. Con un ingresso grande e dominato da one-hot (`default`, il caso di IPA) allargare batte
-   approfondire: +28% a 8 strati già a 300 pesi.
+   approfondire: +64% a 8 strati a 300 pesi, il doppio a 1 200.
 2. Con un ingresso piccolo e denso (`no_onehot`) è il contrario: la versione a 8 strati è
-   **più veloce del 21%** e più piccola (1 323 contro 1 630 istruzioni). Una one-hot costa
+   **più veloce del 13%** e più piccola (1 368 contro 1 535 istruzioni). Una one-hot costa
    poco perché il datapath ne legge una colonna; un ingresso denso moltiplica le letture per
    la larghezza del primo strato. La risposta dipende da com'è fatto il vettore d'ingresso.
-3. Oltre ~300 pesi P1 (oggetto AOT) raggiunge il limite del verificatore, e ci arriva prima
-   la forma larga: a ~1 200 pesi su `default` la sola forma che carica è la più profonda.
+3. Con la ReLU senza salto le forme profonde pagano più di prima (8×3 a 300 pesi: 50 →
+   64 ns): ogni neurone nascosto aggiunge tre istruzioni sempre eseguite, mentre sotto
+   `BPF_PROG_TEST_RUN` il salto di prima era sempre predetto. La conclusione 1 si rafforza.
+4. Oltre ~1 200 pesi il limite di P1 è lo stack, e ci arriva prima la forma larga (più
+   valori intermedi vivi insieme).
 
 ---
 
@@ -517,7 +529,10 @@ era indicizzata dalla sola classe):
 
 Istruzioni −9 (P2) e +41 (P3), lookup e tail call invariati, latenza invariata entro 2%.
 Con 1, 2, 4, 8 modelli registrati nessuna pendenza su P2 (188–194 ns); P3 316–319 ns fino a
-4 modelli, 340 ns con 8. **Memoria: +131 072 byte per pipeline**, fissi: 256 `model_id` × 2
+4 modelli, 340 ns con 8. La tabella è del 2026-09-27. Il 28 la misura è stata rifatta dopo
+`ipa_relu` (§8), ma l'albero di confronto ha ancora la ReLU con il salto, quindi la
+differenza mescolerebbe due modifiche: resta la tabella pulita. Il punto a 8 modelli di P3
+non si è ripetuto (315 ns, come con un modello solo): era rumore. **Memoria: +131 072 byte per pipeline**, fissi: 256 `model_id` × 2
 banchi × 32 classi preallocati. L'alternativa a pochi KB (uno slot per modello allocato dal
 piano di controllo, come `weight_offset`) non è implementata.
 
@@ -566,12 +581,12 @@ varia oltre 2× lungo un asse, lo scarto è la macchina.
 
 | | 10 | 25 | 52 | 75 | 100 |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` istruzioni | 637 | 633 | 631 | 630 | 633 |
-| `hardcoded` istruzioni | 758 | 855 | 1 114 | 1 479 | 1 699 |
-| `p1_static` ns | 36 | 35 | 36 | 36 | 34 |
-| `hardcoded` ns | 43 | 41 | 43 | 43 | 41 |
-| `template` ns | 185 | 183 | 184 | 185 | 182 |
-| `modular` ns | 308 | 307 | 306 | 318 | 307 |
+| `p1_static` istruzioni | 647 | 656 | 663 | 647 | 648 |
+| `hardcoded` istruzioni | 776 | 869 | 1 090 | 1 488 | 1 718 |
+| `p1_static` ns | 41 | 40 | 41 | 41 | 38 |
+| `hardcoded` ns | 48 | 45 | 46 | 47 | 45 |
+| `template` ns | 188 | 186 | 188 | 187 | 187 |
+| `modular` ns | 310 | 310 | 307 | 309 | 311 |
 
 La taglia della rete entra nel programma solo in P1.5 (lo `switch` sulla one-hot del nodo si
 srotola); congelando il nodo la dipendenza sparisce. A runtime nessuna pendenza: una one-hot
@@ -581,24 +596,26 @@ legge una sola colonna di pesi qualunque sia la sua larghezza.
 
 | | 1 | 2 | 3 | 4 | 5 | 6 |
 |---|---:|---:|---:|---:|---:|---:|
-| `p1_static` ns | 33 | 36 | 38 | 43 | 46 | 50 |
-| `hardcoded` ns | 41 | 44 | 45 | 49 | 53 | 57 |
-| `template` ns | 170 | 187 | *rifiutato* | | | |
-| `modular` ns | 257 | 315 | 360 | 415 | 476 | 537 |
-| `modular` istruzioni | 12 318 | 12 318 | 12 318 | 12 318 | 12 318 | 12 318 |
+| `p1_static` ns | 33 | 41 | 46 | 51 | 56 | 60 |
+| `hardcoded` ns | 40 | 46 | 51 | 57 | 62 | 68 |
+| `template` ns | 166 | 187 | 213 | 235 | 266 | 289 |
+| `modular` ns | 249 | 310 | 358 | 423 | 470 | 513 |
+| `template` istruzioni | 14 657 | 15 142 | 16 866 | 16 998 | 17 992 | 18 990 |
+| `modular` istruzioni | 12 394 | 12 394 | 12 394 | 12 394 | 12 394 | 12 394 |
 
-**P3 ~56 ns per strato a istruzioni identiche**: srotola un layer generico e ci rientra con
+**P3 ~53 ns per strato a istruzioni identiche**: srotola un layer generico e ci rientra con
 un tail call, quindi la profondità non entra nel programma e si paga in tempo (tail call e
-letture di mappa). P2 oltre due strati nascosti non carica (§8). P1 ~3–4 ns per strato.
+letture di mappa). **P2 ~25 ns per strato** e ~870 istruzioni: lo strato in più è codice in
+linea. Fino al 2026-09-27 P2 oltre due strati non caricava (§8). P1 ~5 ns per strato.
 
 **`width`** (neuroni per hidden layer 2 → 8):
 
 | | 2 | 4 | 6 | 8 |
 |---|---:|---:|---:|---:|
-| `p1_static` | 26 | 36 | 49 | 68 |
-| `hardcoded` | 33 | 44 | 56 | 79 |
-| `template` | 173 | 185 | 196 | 208 |
-| `modular` | 279 | 306 | 330 | 372 |
+| `p1_static` | 27 | 42 | 51 | 67 |
+| `hardcoded` | 34 | 47 | 61 | 75 |
+| `template` | 174 | 190 | 201 | 212 |
+| `modular` | 279 | 306 | 341 | 383 |
 
 Allargare i layer nascosti si paga su tutte: *la rete può crescere quanto vuole, il modello
 no.*
@@ -607,63 +624,63 @@ no.*
 
 | | 1 | 2 | 3 | 4 | 5 |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` | 50 | 52 | 49 | 63 | 59 |
-| `hardcoded` | 56 | 61 | 57 | 70 | 66 |
-| `template` | 167 | 183 | *rifiutato* | | |
-| `modular` | 279 | 323 | 357 | 453 | **471 (+69%)** |
+| `p1_static` | 52 | 54 | 55 | 67 | 66 |
+| `hardcoded` | 60 | 65 | 62 | 75 | 71 |
+| `template` | 169 | 189 | 206 | 261 | **268 (+59%)** |
+| `modular` | 274 | 321 | 355 | 443 | **471 (+72%)** |
 
-A parità di parametri le due P1 crescono poco e non in modo monotono (+18% fra gli estremi);
-P3 ha istruzioni identiche a tutti e cinque i punti e cresce del 69% in latenza.
+A parità di parametri le due P1 crescono poco e non in modo monotono (circa +25% fra gli
+estremi); P2 cresce del 59% e P3, a istruzioni identiche in tutti e cinque i punti, del 72%.
 
 **`descriptor`** — istruzioni:
 
 | | default | no_onehot | small_onehot | big_onehot |
 |---|---:|---:|---:|---:|
-| `p1_static` | 631 | 602 | 597 | 560 |
-| `hardcoded` | 1 114 | 602 | 597 | 965 |
-| `template` / `modular` | 14 969 / 12 318 | ← | ← | ← |
+| `p1_static` | 663 | 656 | 649 | 563 |
+| `hardcoded` | 1 090 | 656 | 649 | 976 |
+| `template` / `modular` | 15 142 / 12 394 | ← | ← | ← |
 
 Cambiare la composizione del vettore d'ingresso ricompila P1, mentre P2 e P3 leggono il
 descrittore da `model_desc`. È anche il **controllo** della specializzazione: dove il
-descrittore non dichiara la feature `node` le due P1 sono identiche alla cifra (602/602,
-597/597); dove la dichiara divergono.
+descrittore non dichiara la feature `node` le due P1 sono identiche alla cifra (656/656,
+649/649); dove la dichiara divergono.
 
 **`sparsity`** (frazione di pesi zero):
 
 | | 0% | 25% | 50% | 75% | 90% |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` istruzioni | 631 | 581 | 428 | 291 | **216** |
-| `hardcoded` istruzioni | 1 114 | 946 | 697 | 364 | **236** |
-| `p1_static` ns | 36 | 31 | 28 | 19 | 18 |
-| `hardcoded` ns | 43 | 40 | 33 | 25 | 24 |
-| `template` / `modular` ns | 184 / 308 | 182 / 310 | 184 / 311 | 185 / 311 | 183 / 311 |
+| `p1_static` istruzioni | 663 | 609 | 529 | 446 | **263** |
+| `hardcoded` istruzioni | 1 090 | 968 | 885 | 717 | **357** |
+| `p1_static` ns | 41 | 36 | 30 | 24 | 19 |
+| `hardcoded` ns | 47 | 42 | 35 | 31 | 26 |
+| `template` / `modular` ns | 189 / 307 | 186 / 307 | 186 / 311 | 188 / 310 | 188 / 310 |
 
 I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero: al 90% di zeri
-P1 perde metà della latenza, mentre per P2/P3 uno zero è un byte in mappa come un altro. Le
-due P1 convergono (216 contro 236 istruzioni): sparsità e nodo congelato sono due strade alla
-stessa riduzione.
+P1 perde più di metà della latenza, mentre per P2/P3 uno zero è un byte in mappa come un
+altro. Le due P1 convergono (il divario scende da 427 a 94 istruzioni): sparsità e nodo
+congelato sono due strade alla stessa riduzione.
 
 ### Congelare il nodo: P1 specializzata contro P1.5
 
 | | 10 nodi | 52 nodi (Germany50) | 100 nodi |
 |---|---:|---:|---:|
-| istruzioni `p1_static` / `hardcoded` | 637 / 758 | 631 / 1 114 (−43%) | 633 / 1 699 (−63%) |
-| codice nativo (B) | 2 904 / 3 525 | 2 881 / 5 433 (−47%) | 2 874 / 8 499 (−66%) |
-| latenza (ns) | 36 / 43 | 36 / 43 (−16%) | 34 / 41 (−17%) |
+| istruzioni `p1_static` / `hardcoded` | 647 / 776 | 663 / 1 090 (−39%) | 648 / 1 718 (−62%) |
+| codice nativo (B) | 2 884 / 3 507 | 2 929 / 5 294 (−45%) | 2 867 / 8 507 (−66%) |
+| latenza (ns) | 41 / 48 | 41 / 46 (−11%) | 38 / 45 (−16%) |
 
 La riga della specializzata è **piatta**: la feature più grossa del modello (52 dei 65
 ingressi, 208 dei 319 pesi) smette di dipendere dalla taglia della rete. In tempo il
-guadagno c'è ma è piccolo (7 ns): lo `switch` ha N casi ma ne esegue uno. Il prezzo è un
-binario per nodo: `build_ms` ~70 ms (p1_static) e ~80-113 ms (hardcoded) per compilazione,
+guadagno c'è ma è piccolo (5–7 ns): lo `switch` ha N casi ma ne esegue uno. Il prezzo è un
+binario per nodo: `build_ms` ~70 ms (p1_static) e ~80-120 ms (hardcoded) per compilazione,
 N volte su una rete di N nodi. Aggiornare il modello sul nodo (oggetto AOT già compilato)
 costa ~1 ms per entrambe.
 
 ### Aggiornare il modello
 
-`update_ms` (installare un modello nuovo su un nodo in servizio): P1 e P1.5 **0,9–2,3 ms**
+`update_ms` (installare un modello nuovo su un nodo in servizio): P1 e P1.5 **0,7–2,1 ms**
 (caricamento dell'oggetto AOT), P2 e P3 **10–12 ms** (scritture in mappa, compresa la
-semantica). `build_ms` (una volta): P1 66–113 ms di clang sulla macchina di build, P2
-~1,6 s e P3 ~1,3 s di BCC all'avvio del nodo. Con l'oggetto precompilato non c'è più un
+semantica). `build_ms` (una volta): P1 66–120 ms di clang sulla macchina di build, P2
+~1,5 s e P3 ~1,2 s di BCC all'avvio del nodo. Con l'oggetto precompilato non c'è più un
 divario di ordini di grandezza a favore di P2/P3: resta la differenza qualitativa, P1
 richiede un compilatore (fuori dal nodo) per ogni modello nuovo.
 
@@ -682,81 +699,89 @@ Retta ai minimi quadrati sui quattro assi insieme:
 
 | Pipeline | ns / MAC **eseguita** | r² | ns / MAC nominale | r² |
 |---|---:|---:|---:|---:|
-| p1_static | 0,255 | **0,96** | 0,026 | 0,14 |
-| hardcoded | 0,264 | **0,91** | 0,041 | 0,29 |
-| template | 0,277 | 0,48 | −0,014 | 0,02 |
-| modular | 1,074 | **0,91** | 0,083 | 0,07 |
+| p1_static | 0,287 | **0,99** | 0,070 | 0,62 |
+| hardcoded | 0,290 | **0,98** | 0,076 | 0,70 |
+| template | 0,548 | 0,71 | 0,085 | 0,22 |
+| modular | 1,175 | **0,91** | 0,098 | 0,08 |
 
-Con le MAC nominali il modello non spiega niente; con quelle **eseguite** i quattro assi
+Con le MAC nominali il modello spiega poco; con quelle **eseguite** i quattro assi
 collassano sulla stessa retta. Una one-hot occupa `size` colonne nella matrice dei pesi ma
-nel datapath ne attiva una: contarla come `size × h1` sovrastima. **P3 costa 4,2× P1 per
+nel datapath ne attiva una: contarla come `size × h1` sovrastima. **P3 costa 4,1× P1 per
 MAC eseguita**: il prezzo di leggere i pesi da una tabella invece che averli come letterali.
-Il template ha r² basso perché ha pochi punti (oltre due strati non carica) e un costo fisso
-alto rispetto alla pendenza.
+Il template ha r² più basso perché ha un costo fisso alto rispetto alla pendenza, e il suo
+residuo più grande sta su `width_camp`, dove i neuroni oltre la larghezza del modello
+vengono calcolati comunque fino al soffitto.
 
 L'asse `iv_onehot` lo mostra direttamente: n_in ×4, pesi ×2,4, latenza piatta su tutte
-(p1_static 66/64/65, hardcoded 66/65/64, template 171/169/173, modular 359/361/365 ns) mentre
-le istruzioni di P1 vanno da 1 238 a 2 162.
+(p1_static 65/65/64, hardcoded 65/64/64, template 170/170/169, modular 363/367/367 ns) mentre
+le istruzioni di P1 vanno da 1 144 a 1 632.
 
 I muri: larghezza 16 e 32 su P2/P3 sfondano `T2_MAX_H1`/`ML1_MAX_H1` = 8 e il banco segna
 `RIFIUTATO` prima di compilare (P3 risponderebbe `XDP_PASS` a runtime, cioè una misura di un
-programma che non calcola). Larghezza 16 su P1 non carica (limite di complessità del
-verificatore, §6), larghezza 32 non compila.
+programma che non calcola). Larghezza 32 su P1 non compila (stack). Fino al 2026-09-27
+anche larghezza 16 su P1 era rifiutata dal verificatore: con `ipa_relu` carica (166 ns
+p1_static, 170 hardcoded).
 
-**Calibrazione contro la suite kernel**, stesso modello 65-4-4-7: campagna 18 / 43 / 184 /
-311 ns contro `test_suite` 22 / 47 / 199 / 323 ns (baseline, hardcoded, template, modular):
-entro −4 / −18%, sempre nello stesso verso, e i programmi non sono identici (pesi sintetici
-contro pesi del modello: 1 114 contro 989 istruzioni per P1.5).
+**Calibrazione contro la suite kernel**, stesso modello 65-4-4-7: campagna 18 / 46 / 190 /
+305 ns contro `test_suite` 18 / 52 / 195 / 315 ns (baseline, hardcoded, template, modular):
+entro 0 / −12%, sempre nello stesso verso, e i programmi non sono identici (pesi sintetici
+contro pesi del modello: 1 090 contro 1 064 istruzioni per P1.5).
 
 ---
 
 ## Risultati (kernel, `test_suite.py --only kernel`, modello 65→4→4→7, scala 24)
 
-Un solo run, un solo stato del codice, DUT a 3 494 MHz; minimo su 7 trial con p50/max.
+Un solo run, un solo stato del codice (2026-09-28, con `ipa_relu`, §8), DUT a 3 494 MHz;
+minimo su 7 trial con p50/max.
 
 | Metrica | baseline | P1 hardcoded (AOT) | P2 template | P3 modular |
 |---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | 155 | 989 | 14 969 | 12 318 |
-| Codice jited (byte) | 706 | 4 957 | 67 428 | 57 726 |
+| Istruzioni eBPF (xlated) | 155 | 1 064 | 15 142 | 12 394 |
+| Codice jited (byte) | 706 | 5 179 | 68 510 | 57 767 |
 | Tail call / pacchetto | 0 | 1 | 1 | **3** |
 | Map lookup / pacchetto | 3 | 6 | 11 | **29** |
 | Memoria mappe (byte) | 280 | 2 516 | 141 744 | 171 572 |
-| **Latenza min (ns/pkt)** | **22** | **47** | **199** | **323** |
-| ...p50 | 22 | 48 | 203 | 334 |
-| ...max | 23 | 48 | 203 | 340 |
-| ...spread (max−min)/min | 5% | 2% | 2% | 5% |
-| Throughput teorico (Mpps, 1/latenza) | 45,5 | 21,3 | 5,0 | 3,1 |
+| **Latenza min (ns/pkt)** | **18** | **52** | **195** | **315** |
+| ...p50 | 18 | 53 | 200 | 320 |
+| ...max | 19 | 53 | 200 | 322 |
+| ...spread (max−min)/min | 6% | 2% | 3% | 2% |
+| Throughput teorico (Mpps, 1/latenza) | 55,6 | 19,2 | 5,1 | 3,2 |
 
 | | dispatcher | leaf |
 |---|---|---|
 | baseline | — | `xdp_baseline` 155 |
-| P1 hardcoded | `xdp_dispatch` 29 | `xdp_model` 960 |
-| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 14 928 |
-| P3 modular | `modular_dispatcher` 137 | `layer_first` 10 503 + `layer_hidden` 1 678 |
+| P1 hardcoded | `xdp_dispatch` 29 | `xdp_model` 1 035 |
+| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 15 101 |
+| P3 modular | `modular_dispatcher` 137 | `layer_first` 10 528 + `layer_hidden` 1 729 |
 
 Correttezza, stesso run: dispatch TTL 2-6 **5/5** su tutte e tre; TTL (decremento + checksum
 + scadenza) **2/2** su tutte e tre; `link_state` reroute **15/30** casi di link-down cambiano
 uscita; architetture alternative PASS; `test_fabric` 29/29 e 11/11 (AOT). Aggiornamento del
-modello di P1 sul nodo (open + caricamento dell'oggetto AOT): **1,06 ms**.
+modello di P1 sul nodo (open + caricamento dell'oggetto AOT): **1,07 ms**.
 
-Lo spread fra minimo e massimo dei 7 trial sta fra il 2 e il 5%. I programmi più brevi
-restano i più sensibili: su 22 ns un nanosecondo è il 5%.
+Lo spread fra minimo e massimo dei 7 trial sta fra il 2 e il 6%. I programmi più brevi
+restano i più sensibili: su 18 ns un nanosecondo è il 6%.
+
+**Rispetto al 2026-09-27** (22 / 47 / 199 / 323 ns): la baseline, che non ha ReLU, scende di
+4 ns, e P2 e P3 con lei; P1 sale di 5 ns. La ReLU senza salto costa a P1 circa 9 ns sotto
+`BPF_PROG_TEST_RUN`, dove il salto di prima era sempre predetto; sul traffico vero la
+differenza sparisce (§10.2).
 
 ### La dimensione non predice la velocità
 
-**P3 ha il 18% di istruzioni in meno di P2 ed è il 62% più lento** (12 318 contro 14 969;
-323 contro 199 ns). Le righe che lo spiegano: **3 tail call** contro 1, **29 lookup** contro
+**P3 ha il 18% di istruzioni in meno di P2 ed è il 62% più lento** (12 394 contro 15 142;
+315 contro 195 ns). Le righe che lo spiegano: **3 tail call** contro 1, **29 lookup** contro
 11. Il conteggio `xlated` misura quanto è grande il programma, non quanto lavora.
 
 P2 è più grande perché tiene la rete intera in un programma: `arch_generic_2layer` srotola
 insieme fc1 (65→8), fc2 (8×8) e lo strato d'uscita (32×8, i soffitti). P3 srotola **un**
-layer denso generico (`layer_hidden`, 1 678 istruzioni) e ci rientra per tail call a ogni
+layer denso generico (`layer_hidden`, 1 729 istruzioni) e ci rientra per tail call a ogni
 hop: la profondità non costa dimensione, e il riuso si paga in latenza (un salto più le
 letture di `scratch_meta`, `scratch_acts`, `layer_shapes`, i pesi).
 
 Le istruzioni sono un conteggio **statico**: in P1 lo switch della one-hot `node` ha 52 casi
 e ne esegue uno, e con i pesi letterali clang cancella i prodotti per zero e trasforma in
-shift le potenze di due. 989 istruzioni in 47 ns sarebbero 6,0 istruzioni per ciclo a 3,5
+shift le potenze di due. 1 064 istruzioni in 52 ns sarebbero 5,8 istruzioni per ciclo a 3,5
 GHz, sopra ogni processore reale: il percorso eseguito è una frazione del conteggio.
 
 ### I soffitti compilati e il verificatore
@@ -767,7 +792,7 @@ percorso eseguito quando il descrittore non dichiara la feature coda (`diag_p3_b
 
 | `IPA_MAX_QUEUES` | 1 | 2 | 4 | **8** |
 |---|---:|---:|---:|---:|
-| `layer_first` (istruzioni) | 7 009 | 7 611 | 8 707 | **10 503** |
+| `layer_first` (istruzioni) | 7 003 | 7 628 | 8 729 | **10 528** |
 | esito | carica | carica | carica | carica |
 
 Il control plane protegge il soffitto: `load_modular_weights` rifiuta un descrittore che
@@ -777,8 +802,9 @@ chieda più slot di coda di quanti il datapath ne compili, invece di troncarlo.
 cammino del corpo srotolato, e il costo cresce col **prodotto** dei soffitti: con soffitti
 larghi (`8 × 4 × 128`) P2 si ferma a `processed 1000001 insns (limit 1000000)` con ~14 900
 istruzioni, cioè dentro il limite di dimensione ma oltre quello di complessità. È lo stesso
-limite che oggi ferma P2 oltre due strati nascosti (§8) e P1 oltre ~300 pesi (§6). Questi
-limiti sono scogliere, non pendenze: un soffitto si cambia e **si rimisura**.
+limite che fino al 2026-09-27 fermava P2 oltre due strati nascosti (§8) e P1 oltre ~300 pesi
+(§6), prima della ReLU senza salto. Questi limiti sono scogliere, non pendenze: un soffitto
+si cambia e **si rimisura**.
 
 BCC riporta i rifiuti come `Program too large (N insns), at most 4096 insns`: il 4096 è una
 costante vecchia nella stringa d'errore di BCC (P2 carica a ~15 000). Va letto come "il
@@ -797,10 +823,10 @@ quali è `node_id`: il prezzo di far dire alla one-hot del nodo *quale nodo è q
 
 | | |
 |---|---|
-| build offline (clang → `.o`) | 76,5 ms, una volta, sulla macchina di build |
-| deploy sul nodo | **1,16 ms** (`open` 0,08 + verifica e JIT 1,08) |
-| istruzioni | 989 (dispatch 29 + modello 960) |
-| latenza | **47 ns/pkt** (percorso d'inoltro, retval 4), come in `test_suite` |
+| build offline (clang → `.o`) | 75,8 ms, una volta, sulla macchina di build |
+| deploy sul nodo | **1,12 ms** (`open` 0,09 + verifica e JIT 1,03) |
+| istruzioni | 1 064 (dispatch 29 + modello 1 035) |
+| latenza | **51 ns/pkt** (percorso d'inoltro, retval 4), come in `test_suite` (52) |
 
 La strength reduction sui pesi letterali resta dentro l'oggetto, quindi il costo per pacchetto
 non peggiora, e il compilatore sparisce dal nodo.
@@ -858,25 +884,28 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
 sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --out results/throughput_3500
 ```
 
-3 giri × 3 ripetizioni, 64 B, uscita sulla CPU del DUT, `results/throughput_3500/`:
+3 giri × 3 ripetizioni, 64 B, uscita sulla CPU del DUT, `results/throughput_3500/`
+(2026-09-28, con `ipa_relu`):
 
-| pipeline | saturazione (Mpps) | [min–max] | variazione | a 1,338 Mpps offerti |
+| pipeline | saturazione (Mpps) | [min–max] | variazione | a 1,375 Mpps offerti |
 |---|---:|---|---:|---|
-| rxonly (sola ricezione) | 4,39 | 4,33–4,40 | 1,7% | nessun respinto |
-| baseline | 3,26 | 3,26–3,29 | 1,0% | nessun respinto |
-| p1_static (P1) | 2,90 | 2,90–2,90 | 0,1% | nessun respinto |
-| hardcoded (P1.5) | 2,78 | 2,77–2,80 | 0,9% | nessun respinto |
-| template (P2) | 1,89 | 1,88–1,90 | 0,9% | nessun respinto |
-| modular (P3) | 1,48 | 1,48–1,49 | 0,7% | nessun respinto |
+| rxonly (sola ricezione) | 4,61 | 4,60–4,62 | 0,2% | nessun respinto |
+| baseline | 3,31 | 3,24–3,31 | 0,9% | nessun respinto |
+| p1_static (P1) | 2,94 | 2,93–2,96 | 0,5% | nessun respinto |
+| hardcoded (P1.5) | 2,81 | 2,78–2,82 | 0,6% | nessun respinto |
+| template (P2) | 1,89 | 1,88–1,90 | 0,5% | nessun respinto |
+| modular (P3) | 1,50 | 1,50–1,51 | 0,3% | nessun respinto |
 
-Controllo di validità PASS (la baseline è la più veloce). A carico comune — 90% di quanto
+Controllo di validità PASS (la baseline è la più veloce). A carico comune — 91% di quanto
 consegna la più lenta — tutte e sei consegnano tutto: **nessun pacchetto respinto sotto
-capacità**. Perdita dopo XDP ≤ 0,01% in ogni riga. Macchina: nessun evento di throttling,
-DUT a 3 494 MHz, registro max 83 °C.
+capacità**. Perdita totale ≤ 0,02% in ogni riga. Macchina: nessun evento di throttling,
+DUT a 3 494 MHz.
 
-**P1 e P1.5 si separano**: 2,90 contro 2,78 Mpps, con dispersioni dello 0,1% e dello 0,9%.
+**P1 e P1.5 si separano**: 2,94 contro 2,81 Mpps, con dispersioni dello 0,5% e dello 0,6%.
 L'ordine P1 < P1.5 < P2 < P3 in costo per pacchetto regge in ogni giro. Costo sopra la
-baseline (1/RX): **+38 / +53 / +224 / +368 ns**.
+baseline (1/RX): **+38 / +53 / +226 / +364 ns**. Il 2026-09-27, prima di `ipa_relu`:
++38 / +53 / +224 / +368. Sul traffico vero la ReLU senza salto non costa niente di
+misurabile, anche per P1 (sotto `BPF_PROG_TEST_RUN` le costava ~9 ns, § Risultati).
 
 ### 10.3 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
 

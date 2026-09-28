@@ -1667,9 +1667,9 @@ PLOTS = [
 KEEP = {
     ("depth", "insns"):
         "P3 ha la stessa dimensione a ogni profondita': riusa layer_hidden; "
-        "P2 oltre due strati non passa il verificatore",
+        "P2 cresce di ~870 istruzioni per strato (fino al 27/9 oltre due strati non caricava)",
     ("depth", "lat_ns"):
-        "e P3 lo paga in tempo, ~56 ns per layer: tail call e letture",
+        "e P3 lo paga in tempo, ~53 ns per layer (P2 ~25): tail call e letture",
     ("depth", "update_ms"):
         "installare un modello: P1 carica un oggetto AOT (~1-2 ms), P2 e P3 "
         "scrivono in mappa (~10-12 ms)",
