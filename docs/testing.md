@@ -720,58 +720,63 @@ contro pesi del modello: 1 090 contro 1 064 istruzioni per P1.5).
 
 ## Risultati (kernel, `test_suite.py --only kernel`, modello 65→4→4→7, scala 24)
 
-Un solo run, un solo stato del codice (2026-09-28, con `ipa_relu`, §8), DUT a 3 494 MHz;
-minimo su 7 trial con p50/max.
+Un solo run, un solo stato del codice (2026-09-29: `ipa_relu` §8, contatori per-CPU §10.1),
+sotto `host_conditions`, alimentatore collegato, DUT a 3 493 MHz; minimo su 7 trial con
+p50/max. P1 è la specializzata (nodo 7 compilato dentro), P1.5 l'oggetto che si deploya.
 
-| Metrica | baseline | P1.5 hardcoded (AOT) | P2 template | P3 modular |
-|---|---:|---:|---:|---:|
-| Istruzioni eBPF (xlated) | 155 | 1 064 | 15 142 | 12 394 |
-| Codice jited (byte) | 706 | 5 179 | 68 510 | 57 767 |
-| Tail call / pacchetto | 0 | 1 | 1 | **3** |
-| Map lookup / pacchetto | 3 | 6 | 11 | **29** |
-| Memoria mappe (byte) | 280 | 2 516 | 141 744 | 171 572 |
-| **Latenza min (ns/pkt)** | **18** | **52** | **195** | **315** |
-| ...p50 | 18 | 53 | 200 | 320 |
-| ...max | 19 | 53 | 200 | 322 |
-| ...spread (max−min)/min | 6% | 2% | 3% | 2% |
-| Throughput teorico (Mpps, 1/latenza) | 55,6 | 19,2 | 5,1 | 3,2 |
+| Metrica | baseline | P1 (p1_static) | P1.5 hardcoded | P2 template | P3 modular |
+|---|---:|---:|---:|---:|---:|
+| Istruzioni eBPF (xlated) | 135 | 606 | 1 019 | 15 089 | 12 288 |
+| Codice jited (byte) | 625 | 2 700 | 5 000 | 68 307 | 57 501 |
+| Tail call / pacchetto | 0 | 1 | 1 | 1 | **3** |
+| Map lookup / pacchetto | 3 | 5 | 6 | 11 | **29** |
+| Memoria mappe (byte) | 1 960 | 4 196 | 4 196 | 147 624 | 177 452 |
+| **Latenza min (ns/pkt)** | **14** | **48** | **53** | **200** | **314** |
+| ...p50 | 14 | 48 | 53 | 200 | 317 |
+| ...max | 15 | 48 | 54 | 201 | 320 |
+| ...spread (max−min)/min | 7% | 0% | 2% | 0% | 2% |
+| Throughput teorico (Mpps, 1/latenza) | 71,4 | 20,8 | 18,9 | 5,0 | 3,2 |
 
 | | dispatcher | leaf |
 |---|---|---|
-| baseline | — | `xdp_baseline` 155 |
-| P1.5 hardcoded | `xdp_dispatch` 29 | `xdp_model` 1 035 |
-| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 15 101 |
-| P3 modular | `modular_dispatcher` 137 | `layer_first` 10 528 + `layer_hidden` 1 729 |
+| baseline | — | `xdp_baseline` 135 |
+| P1 (p1_static) | `xdp_dispatch` 29 | `xdp_model` 577 |
+| P1.5 hardcoded | `xdp_dispatch` 29 | `xdp_model` 990 |
+| P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 15 048 |
+| P3 modular | `modular_dispatcher` 137 | `layer_first` 10 475 + `layer_hidden` 1 676 |
 
-Correttezza, stesso run: dispatch TTL 2-6 **5/5** su tutte e tre; TTL (decremento + checksum
-+ scadenza) **2/2** su tutte e tre; `link_state` reroute **15/30** casi di link-down cambiano
-uscita; architetture alternative PASS; `test_fabric` 29/29 e 11/11 (AOT). Aggiornamento del
-modello di P1 sul nodo (open + caricamento dell'oggetto AOT): **1,07 ms**.
+Correttezza, stesso run: dispatch TTL 2-6 **5/5** su tutte e quattro (P1, col nodo 7 compilato
+dentro, decide la classe 1; le altre, senza nodo, la 2); TTL (decremento + checksum +
+scadenza) **2/2** su tutte e quattro; `link_state` reroute **15/30** casi di link-down
+cambiano uscita; architetture alternative PASS. Aggiornamento del modello di P1 sul nodo
+(open + caricamento dell'oggetto AOT): **0,6–0,9 ms**.
 
-Lo spread fra minimo e massimo dei 7 trial sta fra il 2 e il 6%. I programmi più brevi
-restano i più sensibili: su 18 ns un nanosecondo è il 6%.
+**P1 contro P1.5**: 413 istruzioni in meno (lo switch sui 52 nodi della one-hot sparisce),
+una lettura di tabella in meno (`node_id`), **5 ns** in meno. L'analisi parametrica, con
+pesi sintetici, dava 5–9 ns (§9).
 
-**Rispetto al 2026-09-27** (22 / 47 / 199 / 323 ns): la baseline, che non ha ReLU, scende di
-4 ns, e P2 e P3 con lei; P1 sale di 5 ns. La ReLU senza salto costa a P1 circa 9 ns sotto
-`BPF_PROG_TEST_RUN`, dove il salto di prima era sempre predetto; sul traffico vero la
-differenza sparisce (§10.2).
+**Rispetto al 2026-09-28** (18 / 52 / 195 / 315 ns, contatori atomici): la baseline perde 20
+istruzioni e 4 ns, cioè i due incrementi atomici di `pkt_stats` e `cls_stats`; P1.5, P2 e P3
+cambiano di +1 / +5 / −1 ns, dentro la variazione fra i run. La memoria delle mappe per-CPU
+si conta una volta per CPU (22): da qui 1 960 byte per la baseline contro 280.
 
 ### La dimensione non predice la velocità
 
-**P3 ha il 18% di istruzioni in meno di P2 ed è il 62% più lento** (12 394 contro 15 142;
-315 contro 195 ns). Le righe che lo spiegano: **3 tail call** contro 1, **29 lookup** contro
+**P3 ha il 19% di istruzioni in meno di P2 ed è il 57% più lento** (12 288 contro 15 089;
+314 contro 200 ns). Le righe che lo spiegano: **3 tail call** contro 1, **29 lookup** contro
 11. Il conteggio `xlated` misura quanto è grande il programma, non quanto lavora.
 
 P2 è più grande perché tiene la rete intera in un programma: `arch_generic_2layer` srotola
 insieme fc1 (65→8), fc2 (8×8) e lo strato d'uscita (32×8, i soffitti). P3 srotola **un**
-layer denso generico (`layer_hidden`, 1 729 istruzioni) e ci rientra per tail call a ogni
+layer denso generico (`layer_hidden`, 1 676 istruzioni) e ci rientra per tail call a ogni
 hop: la profondità non costa dimensione, e il riuso si paga in latenza (un salto più le
 letture di `scratch_meta`, `scratch_acts`, `layer_shapes`, i pesi).
 
-Le istruzioni sono un conteggio **statico**: in P1 lo switch della one-hot `node` ha 52 casi
-e ne esegue uno, e con i pesi letterali clang cancella i prodotti per zero e trasforma in
-shift le potenze di due. 1 064 istruzioni in 52 ns sarebbero 5,8 istruzioni per ciclo a 3,5
-GHz, sopra ogni processore reale: il percorso eseguito è una frazione del conteggio.
+Le istruzioni sono un conteggio **statico**: in P1.5 lo switch della one-hot `node` ha 52
+casi e ne esegue uno, e con i pesi letterali clang cancella i prodotti per zero e trasforma
+in shift le potenze di due. 1 019 istruzioni in 53 ns sarebbero 5,5 istruzioni per ciclo a
+3,5 GHz, sopra ogni processore reale: il percorso eseguito è una frazione del conteggio. In
+P1 lo switch non c'è più (606 istruzioni).
 
 ### I soffitti compilati e il verificatore
 
@@ -802,10 +807,11 @@ del caricamento, quello delle tabelle è **xlated**: non vanno confrontati.
 ### I lookup si contano su tutte e quattro
 
 La riga "Map lookup / pacchetto" viene da build strumentate con un contatore su ogni sito di
-lookup (`count_lookups`): 6 siti per la baseline, 14 per P1 (oggetto AOT), 21 per P2
-(`arch_generic_2layer` 19), 34 per P3 (`layer_first` 11, `layer_hidden` 6,
-`ml_argmax_forward` 12, `modular_dispatcher` 3). P1 fa 6 letture per pacchetto, una delle
-quali è `node_id`: il prezzo di far dire alla one-hot del nodo *quale nodo è questo*.
+lookup (`count_lookups`): 6 siti per la baseline, 13 per P1 e 14 per P1.5 (oggetti AOT), 21
+per P2 (`arch_generic_2layer` 19), 34 per P3 (`layer_first` 11, `layer_hidden` 6,
+`ml_argmax_forward` 12, `modular_dispatcher` 3). P1.5 fa 6 letture per pacchetto, una delle
+quali è `node_id`: il prezzo di far dire alla one-hot del nodo *quale nodo è questo*. P1 ne
+fa 5, perché il nodo è compilato dentro.
 
 ### L'oggetto AOT di P1 (`method4_hardcoded_aot.py`)
 
@@ -813,8 +819,8 @@ quali è `node_id`: il prezzo di far dire alla one-hot del nodo *quale nodo è q
 |---|---|
 | build offline (clang → `.o`) | 75,8 ms, una volta, sulla macchina di build |
 | deploy sul nodo | **1,12 ms** (`open` 0,09 + verifica e JIT 1,03) |
-| istruzioni | 1 064 (dispatch 29 + modello 1 035) |
-| latenza | **51 ns/pkt** (percorso d'inoltro, retval 4), come in `test_suite` (52) |
+| istruzioni | 1 019 (dispatch 29 + modello 990; 1 064 prima dei contatori per-CPU) |
+| latenza | **51 ns/pkt** (percorso d'inoltro, retval 4), come in `test_suite` (52–53) |
 
 La strength reduction sui pesi letterali resta dentro l'oggetto, quindi il costo per pacchetto
 non peggiora, e il compilatore sparisce dal nodo.
@@ -857,9 +863,10 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
   Su un core solo il cambio vale poco: rispetto a `results/throughput_3500/` (stesso banco,
   contatori atomici) baseline, P1 e P1.5 guadagnano ~8 ns per pacchetto (3,31 → 3,40,
   2,94 → 3,01, 2,81 → 2,87 Mpps), P2 e P3 restano entro la dispersione (1,89 → 1,91,
-  1,50 → 1,49). Sotto `BPF_PROG_TEST_RUN` la suite kernel dà 14 / 53 / 199 / 319 ns contro
-  18 / 52 / 195 / 315 (baseline / P1.5 / P2 / P3): differenze di pochi ns in entrambi i versi, dentro la variazione fra
-  i run. Le cifre di riferimento nel resto del documento restano quelle del 28-09.
+  1,50 → 1,49). Sotto `BPF_PROG_TEST_RUN` (29-09) la baseline scende da 18 a 14 ns e perde
+  20 istruzioni, i due incrementi atomici; P1.5 / P2 / P3 danno 53 / 200 / 314 contro 52 /
+  195 / 315, dentro la variazione fra i run (§ Risultati). Le cifre di traffico nel resto
+  del documento restano quelle del 28-09.
 - **Tre punti di conteggio**: TX (pktgen, più i respinti da `veth_xmit` a coda piena), HIT
   (`pkt_stats[0]` della pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è
   arrivato al programma, HIT − RX ciò che il programma ha elaborato e non è uscito.

@@ -6,7 +6,7 @@ mappa: per ogni affermazione, l'ipotesi, che cosa è stato mosso, che cosa è st
 tenuto fermo, che cosa è stato misurato, il numero ottenuto e il comando per
 rifarlo.
 
-**Le cifre sono del 2026-09-28** (tranne G2, del 27, e A8, E7, del 29), sulla macchina di laboratorio
+**Le cifre sono del 2026-09-28** (tranne G2, del 27, e A8, B1, B3, C1, E7, del 29), sulla macchina di laboratorio
 (Intel Core Ultra 7 155H, Ubuntu 24.04, kernel 6.8.0-142, bare metal) nelle condizioni di
 `host_conditions.py`: core del banco fissi a **3 500 MHz misurati**, isolati, senza
 C6/C10 (`docs/testing.md` §0). Si rifanno tutte con
@@ -152,8 +152,8 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Variabile modificata** | Quanto è noto alla compilazione: P1 specializzata → P1.5 → P2 (soffitti) → P3 (anche la profondità). |
 | **Variabili fisse** | Modello 65-4-4-7, topologia Germany50, descrittore, stesso run. |
 | **Metrica** | Latenza minima su 7 trial, istruzioni eBPF, tail call, letture di mappa. |
-| **Risultato** | `test_suite`: baseline **18**, P1.5 **52**, P2 **195**, P3 **315 ns**; istruzioni 155 / 1 064 / 15 142 / 12 394; letture 3 / 6 / 11 / 29; salti 0 / 1 / 1 / 3; spread 2–6%. Analisi parametrica (pesi sintetici): P1 specializzata **41**, P1.5 46, P2 188, P3 307 ns. |
-| **Conclusione** | **La flessibilità costa circa 7–8× in latenza** fra i due estremi, e il costo non è aritmetico: è in letture di mappa e salti fra programmi. |
+| **Risultato** | `test_suite` (29-09, contatori per-CPU): baseline **14**, P1 **48**, P1.5 **53**, P2 **200**, P3 **314 ns**; istruzioni 135 / 606 / 1 019 / 15 089 / 12 288; letture 3 / 5 / 6 / 11 / 29; salti 0 / 1 / 1 / 1 / 3; spread 0–7%. Analisi parametrica (pesi sintetici, 28-09): P1 specializzata **41**, P1.5 46, P2 188, P3 307 ns. |
+| **Conclusione** | **La flessibilità costa circa 6,5× in latenza** fra i due estremi (48 contro 314 ns; 7,5× con i pesi sintetici), e il costo non è aritmetico: è in letture di mappa e salti fra programmi. |
 | **Come rigirarlo** | `sudo python3 ipa/test/test_suite.py --only kernel`; `bench_scaling.py --out results/` |
 
 ### B2 — Aggiornare il modello: con l'oggetto precompilato il divario sparisce ✅
@@ -175,7 +175,7 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Ipotesi** | Compilare l'oggetto fuori dal nodo elimina clang dal nodo, e la strength reduction sui pesi letterali sopravvive dentro l'oggetto. |
 | **Variabile modificata** | Dove avviene la compilazione: macchina di build (clang, 75,8 ms) contro nodo. |
 | **Metrica** | Costo di messa in servizio; latenza per pacchetto. |
-| **Risultato** | Deploy dell'oggetto sul nodo **1,12 ms** (`open` 0,09 + verifica e JIT 1,03); latenza **51 ns** sul percorso d'inoltro (retval 4), come `test_suite` (52); 1 064 istruzioni (dispatch 29 + modello 1 035). Throughput reale P1.5: C1, E1. |
+| **Risultato** | Deploy dell'oggetto sul nodo **1,12 ms** (`open` 0,09 + verifica e JIT 1,03); latenza **51 ns** sul percorso d'inoltro (retval 4), come `test_suite` (52–53); 1 019 istruzioni (dispatch 29 + modello 990; 1 064 prima dei contatori per-CPU). Throughput reale P1.5: C1, E1. |
 | **Conclusione** | Il nodo non ha bisogno di un compilatore, e il binario che ci va costa per pacchetto come quello misurato ovunque in questo registro (tutte le cifre di P1 e P1.5 sono dell'oggetto AOT). |
 | **Come rigirarlo** | `sudo python3 ipa/methods/method4_hardcoded_aot.py` |
 
@@ -190,7 +190,7 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Ipotesi** | Le istruzioni eBPF sono un proxy del costo per pacchetto. **Falsa.** |
 | **Variabile modificata** | La pipeline (P2 contro P3); il soffitto `IPA_MAX_QUEUES` di P3. |
 | **Metrica** | Istruzioni contro latenza, con tail call e letture di mappa come variabili esplicative. |
-| **Risultato** | P3 ha il **18% di istruzioni in meno** di P2 ed è il **62% più lento** (12 394 contro 15 142; 315 contro 195 ns). Le righe che lo spiegano: 3 salti contro 1, 29 letture contro 11. Sul traffico vero lo stesso ordine: 1,50 contro 1,89 Mpps. **Prova di rinforzo**: `IPA_MAX_QUEUES` da 1 a 8 porta `layer_first` da 7 003 a 10 528 istruzioni (+50%) senza cambiare nulla di ciò che gira, perché il descrittore non dichiara la feature coda. |
+| **Risultato** | P3 ha il **19% di istruzioni in meno** di P2 ed è il **57% più lento** (12 288 contro 15 089; 314 contro 200 ns). Le righe che lo spiegano: 3 salti contro 1, 29 letture contro 11. Sul traffico vero lo stesso ordine: 1,50 contro 1,89 Mpps. **Prova di rinforzo**: `IPA_MAX_QUEUES` da 1 a 8 porta `layer_first` da 7 003 a 10 528 istruzioni (+50%) senza cambiare nulla di ciò che gira, perché il descrittore non dichiara la feature coda. |
 | **Conclusione** | `xlated` misura quanto è **grande** il programma caricato, non quanto **lavora**. In questo regime dominano letture di mappa e salti. |
 | **Come rigirarlo** | `test_suite.py --only kernel`; per i tetti, ricompilare `layer_first` con un altro `IPA_MAX_QUEUES` (`ebpf_modular.py`) |
 

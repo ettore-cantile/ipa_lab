@@ -1070,25 +1070,25 @@ cento istruzioni.
 
 \section{La tabella}
 
-Modello 65-4-4-7, scala 24, \texttt{test\_suite -{}-only kernel}, P1.5 come oggetto
-AOT (quello che va sui nodi). La colonna è la P1.5, quella che i capitoli
-precedenti chiamano semplicemente P1. La P1 specializzata, presentata nel
-capitolo seguente, è entrata nella suite il 29 settembre: le sue cifre si
-aggiungono a questa tabella con la prossima esecuzione. Misurato il 28 settembre sulla macchina di
-laboratorio, con la ReLU senza bivio (capitolo \ref{ch:relu}), il core del
-programma fisso a 3\,494~MHz e isolato dal resto (capitolo \ref{ch:macchina}).
+Modello 65-4-4-7, scala 24, \texttt{test\_suite -{}-only kernel}. P1.5 è l'oggetto
+AOT che va sui nodi, quello che i capitoli precedenti chiamano semplicemente P1;
+P1 è la specializzata, presentata nel capitolo seguente, con anche l'indice del
+nodo (7) compilato dentro. Misurato il 29 settembre sulla macchina di
+laboratorio, con la ReLU senza bivio (capitolo \ref{ch:relu}) e i contatori
+per-core (capitolo \ref{ch:reale}), il core del programma fisso a 3\,493~MHz e
+isolato dal resto (capitolo \ref{ch:macchina}).
 
 \begin{center}
 \small
-\begin{tabular}{@{}lrrrr@{}}
+\begin{tabular}{@{}lrrrrr@{}}
 \toprule
-& \textbf{baseline} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
+& \textbf{baseline} & \textbf{P1} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
-istruzioni caricate & 155 & 1\,064 & 15\,142 & 12\,394 \\
-salti fra programmi & 0 & 1 & 1 & 3 \\
-letture di tabella  & 3 & 6 & 11 & 29 \\
-memoria delle tabelle & 280 B & 2\,516 B & 141\,744 B & 171\,572 B \\
-latenza (minimo di 7) & 18 ns & 52 ns & 195 ns & 315 ns \\
+istruzioni caricate & 135 & 606 & 1\,019 & 15\,089 & 12\,288 \\
+salti fra programmi & 0 & 1 & 1 & 1 & 3 \\
+letture di tabella  & 3 & 5 & 6 & 11 & 29 \\
+memoria delle tabelle & 1\,960 B & 4\,196 B & 4\,196 B & 147\,624 B & 177\,452 B \\
+latenza (minimo di 7) & 14 ns & 48 ns & 53 ns & 200 ns & 314 ns \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -1096,13 +1096,19 @@ latenza (minimo di 7) & 18 ns & 52 ns & 195 ns & 315 ns \\
 Il \emph{baseline} è un programma che analizza il pacchetto e lo rimanda fuori
 senza alcuna inferenza: è il pavimento contro cui si legge tutto il resto.
 
+P1 costa 5~ns meno di P1.5: senza l'indice del nodo da leggere sparisce lo
+switch sui 52 nodi (413 istruzioni) e una lettura di tabella. La memoria delle
+tabelle comprende le copie per core dei contatori (22 CPU), per questo la
+baseline occupa 1\,960 byte. Rispetto al 28 settembre, con i contatori condivisi,
+la baseline è scesa da 18 a 14~ns: i due incrementi atomici che non fa più.
+
 Tutte le colonne vengono dalla \textbf{stessa esecuzione}, sulla stessa
 macchina, nello stesso minuto.
 
 \section{Primo risultato: la dimensione non predice la velocità}
 
 \begin{lezione}
-\textbf{P3 ha il 18\% di istruzioni in meno di P2 ed è il 62\% più lento.}
+\textbf{P3 ha il 19\% di istruzioni in meno di P2 ed è il 57\% più lento.}
 
 Il motivo sta nelle due righe centrali: tre salti fra programmi invece di uno, e
 ventinove letture di tabella per pacchetto invece di undici.
@@ -1159,20 +1165,20 @@ esecuzione:
 
 \begin{center}
 \small
-\begin{tabular}{@{}lrrrr@{}}
+\begin{tabular}{@{}lrrrrr@{}}
 \toprule
-& baseline & P1.5 & P2 & P3 \\
+& baseline & P1 & P1.5 & P2 & P3 \\
 \midrule
-minimo   & 18 ns & 52 ns & 195 ns & 315 ns \\
-mediana  & 18 ns & 53 ns & 200 ns & 320 ns \\
-massimo  & 19 ns & 53 ns & 200 ns & 322 ns \\
+minimo   & 14 ns & 48 ns & 53 ns & 200 ns & 314 ns \\
+mediana  & 14 ns & 48 ns & 53 ns & 200 ns & 317 ns \\
+massimo  & 15 ns & 48 ns & 54 ns & 201 ns & 320 ns \\
 \midrule
-dispersione & 6\% & 2\% & 3\% & 2\% \\
+dispersione & 7\% & 0\% & 2\% & 0\% & 2\% \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-La dispersione sta fra il 2 e il 6\%: su 18~ns un nanosecondo è il 6\%. È il
+La dispersione sta fra lo 0 e il 7\%: su 14~ns un nanosecondo è il 7\%. È il
 risultato del condizionamento della macchina (capitolo \ref{ch:macchina}):
 frequenza fissa e misurata, stati di sonno profondi spenti, il core del
 programma lasciato solo.
@@ -1248,8 +1254,8 @@ senza compilatore:
 \midrule
 compilazione, una volta, fuori dal nodo & 75,8 ms \\
 messa in servizio sul nodo (apri, verifica, JIT) & \textbf{1,12 ms} \\
-istruzioni & 1\,064 \\
-latenza per pacchetto & 51--52 ns \\
+istruzioni & 1\,019 \\
+latenza per pacchetto & 51--53 ns \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -3116,8 +3122,8 @@ pulita fino a (bit rate) & 1,44 & 1,20 & 1,20 & 0,72 & 0,72 Gbit/s \\
 \addlinespace
 \multicolumn{6}{@{}l}{\emph{Il solo programma}} \\
 $T_2-T_1$ sul percorso vero (minimo) & 34 ns & 68 ns & 77 ns & 228 ns & 340 ns \\
-\texttt{BPF\_PROG\_TEST\_RUN}, pesi del modello & 18 ns & --- & 52 ns & 195 ns & 315 ns \\
-istruzioni del programma & 155 & 663 & 1\,064 & 15\,142 & 12\,394 \\
+\texttt{BPF\_PROG\_TEST\_RUN}, pesi del modello & 14 ns & 48 ns & 53 ns & 200 ns & 314 ns \\
+istruzioni del programma & 135 & 606 & 1\,019 & 15\,089 & 12\,288 \\
 \addlinespace
 \multicolumn{6}{@{}l}{\emph{Cambiare modello su un nodo in servizio}} \\
 caricare sul nodo & --- & \multicolumn{2}{c}{0,7--2,1 ms (AOT)} & \multicolumn{2}{c}{10--12 ms} \\
@@ -3125,9 +3131,10 @@ anche generare e compilare & --- & \multicolumn{2}{c}{66--120 ms} & \multicolumn
 serve un compilatore sul nodo? & --- & \multicolumn{2}{c}{no (compilato prima)} & \multicolumn{2}{c}{no} \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} Tutto misurato il 28 settembre, con la ReLU senza bivio (capitolo
-\ref{ch:relu}), core del banco a 3,5~GHz. P1 statica ha i pesi sintetici dell'analisi
-parametrica per le istruzioni. Il bit rate si misura su una griglia di valori
+{\footnotesize\color{soft} Traffico vero e $T_2-T_1$ misurati il 28 settembre, il
+programma da solo (\texttt{BPF\_PROG\_TEST\_RUN} e istruzioni) il 29 con i contatori
+per-core; tutto con la ReLU senza bivio (capitolo \ref{ch:relu}), core del banco a
+3,5~GHz. Il bit rate si misura su una griglia di valori
 calibrata sulla sessione: ``pulita fino a'' è l'ultimo punto della griglia senza
 perdite, non la capacità esatta.}
 \end{center}
