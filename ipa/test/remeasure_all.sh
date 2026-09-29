@@ -46,6 +46,11 @@ run verify_prog_run     python3 ipa/test/verify_prog_run.py --method hardcoded
 run verify_multi_model  python3 ipa/test/verify_multi_model.py
 run per_model_semantics python3 ipa/test/verify_per_model_semantics.py
 run synth_kernel        python3 ipa/test/verify_synth_kernel.py --all --n 300
+run model_source_kernel python3 ipa/test/test_model_source.py --kernel
+# la suite kernel su ogni modello (docs/testing.md §12; results/models/)
+for m in checkpoint synth:ipa_like synth:deep synth:sparse synth:ipa_ttl16 synth:small synth:ones synth:mixed synth:large; do
+    run "suite_${m#synth:}"  python3 ipa/test/test_suite.py --only kernel --model "$m"
+done
 run tailcall_overhead   python3 ipa/test/bench_tailcall_overhead.py
 run aot_deploy_bench    python3 ipa/methods/method4_hardcoded_aot.py
 run depth_vs_width      python3 ipa/test/bench_depth_vs_width.py

@@ -1,0 +1,7 @@
+{
+  "_comment": "Synthetic network, no real topology: 3 interfaces, 8 nodes, TTL 16. The network of the synthetic preset small.",
+  "topology": "synth_small",
+  "n_interfaces": 3,
+  "n_nodes": 8,
+  "initial_ttl": 16
+}

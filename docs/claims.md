@@ -6,7 +6,7 @@ mappa: per ogni affermazione, l'ipotesi, che cosa è stato mosso, che cosa è st
 tenuto fermo, che cosa è stato misurato, il numero ottenuto e il comando per
 rifarlo.
 
-**Le cifre sono del 2026-09-28** (tranne G2, del 27), sulla macchina di laboratorio
+**Le cifre sono del 2026-09-28** (tranne G2, del 27, e A8, E7, del 29), sulla macchina di laboratorio
 (Intel Core Ultra 7 155H, Ubuntu 24.04, kernel 6.8.0-142, bare metal) nelle condizioni di
 `host_conditions.py`: core del banco fissi a **3 500 MHz misurati**, isolati, senza
 C6/C10 (`docs/testing.md` §0). Si rifanno tutte con
@@ -122,6 +122,20 @@ scheda lo dice.
 | **Perché non dentro il registry** | Indicizzare il valore dell'entry con `best_cls` obbliga il verificatore a tracciare `best_cls` con precisione attraverso l'argmax: `layer_hidden` di P3 non carica (`E2BIG`). Una chiave sullo stack no. |
 | **Limite dichiarato** | ⚠️ I 128 KiB sono riservati per 256 modelli anche con un modello solo; l'alternativa a pochi KB (slot allocato dal piano di controllo) non è implementata. |
 | **Come rigirarlo** | `sudo python3 ipa/test/verify_per_model_semantics.py` |
+
+### A8 — Ogni test del kernel e del traffico vero gira su qualsiasi modello compatibile ✅ ⚠️
+
+| | |
+|---|---|
+| **Ipotesi** | Suite kernel, verifica per TTL, consegna sul fabric e banchi di traffico non devono presupporre il checkpoint né Germany50: caricano un modello qualsiasi, su una rete le cui dimensioni esso rispetta. |
+| **Variabile modificata** | Il modello (`--model`: checkpoint e 8 preset sintetici, da 11-2-3 a 117-8-8-9) e la rete (`--topology`: 6 scenari in `topologies/`). |
+| **Variabili fisse** | Le pipeline, i costruttori comuni (`pipeline_setup.py`), il riferimento generico. |
+| **Metrica** | Classe e azione decise nel kernel contro il riferimento; pacchetto consegnato sulla porta attesa. |
+| **Compatibilità** | Ogni feature larga quanto la dimensione della rete da cui dipende, scala del TTL uguale al TTL iniziale; limiti compilati di P2/P3 da `pipeline_limits.py`. Un'incompatibilità ferma il test prima di compilare, con il motivo. |
+| **Risultato** | `test_model_source --kernel` **110/110** (scenario × modello × pipeline, 40 ingressi, model_id 0 e 190; `large` su P2/P3 non applicabile); suite kernel PASS e fabric senza errori su 9 modelli; `verify_synth_kernel` invariato dopo il passaggio ai costruttori comuni. Col checkpoint la strada nuova dà pesi, scala, semantica e riferimento identici (3 000/3 000), e sorgenti di P1 e della foglia di P2 identici byte per byte. |
+| **Controllo negativo** | Un modello incompatibile (one-hot a 52 su 30 nodi, TTL 16 su una rete a 30, 9 interfacce oltre il tetto) è rifiutato con il motivo: `test_model_source`, 62/62. |
+| **Limite dichiarato** | ⚠️ Le classi consegnate dal fabric sono quelle che il modello decide davvero: per `sparse` 2 su 7, per `ones` 1 su 3 (campionamento di 200 000 ingressi). `--mode rates` e `--latency` restano solo col checkpoint. |
+| **Come rigirarlo** | `sudo python3 ipa/test/test_model_source.py --kernel`; `test_suite.py --only kernel --model synth:deep`; `test_fabric.py --model synth:small` |
 
 ---
 
@@ -385,6 +399,19 @@ generatore, DUT e nodo successivo su P-core fisici distinti.
 | **Limite dichiarato** | ⚠️ Solo 1 e 2 core: oltre, questa macchina non ha P-core liberi per generatore e DUT insieme. |
 | **Come rigirarlo** | `bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6` e `--dut-cpus 6,8` |
 
+### E7 — Sul traffico vero il costo segue la forma del modello ✅ ⚠️
+
+| | |
+|---|---|
+| **Ipotesi** | I modelli sintetici caricati sul fabric si comportano come nel kernel: P2 e P3 costano per la forma, P1 per i valori dei pesi, e uno strato in più ha un costo fisso per pipeline. |
+| **Variabile modificata** | Il modello: checkpoint, `deep` (65-4-4-4-7), `small` (15-4-4), `mixed` (18-6-5), `large` (117-8-8-9), ciascuno sulla sua rete. |
+| **Variabili fisse** | Banco (1 core, generatore 10,1,3, 3 giri), pacchetto a TTL 32, uno stato dei link che il modello **inoltra** (cercato e stampato dal banco). |
+| **Metrica** | Mpps a saturazione, ns/pacchetto sopra la baseline. |
+| **Risultato** | Sopra la baseline, P1 / P1.5 / P2 / P3: checkpoint +39 / +58 / +237 / +385, deep +46 / +60 / +261 / +438, small +29 / +45 / +172 / +271, mixed +27 / +40 / +181 / +293, large +80 / +90 / N/A / N/A. Uno strato in più: +24 ns a P2 e +53 a P3 (nel kernel +24 e +44). Bit rate su deep: pulite fino a 1,44 / 1,44 / 1,20 / 0,72 / 0,48 Gbit/s, perdita sempre all'ingresso. |
+| **Conclusione** | Il confronto fra pipeline tiene su modelli diversi; la profondità pesa soprattutto su P3. |
+| **Limite dichiarato** | ⚠️ Un giro di misure per modello. Le latenze kernel dei sintetici (`results/models/kernel_battery.csv`) sono state prese a batteria: indicative. |
+| **Come rigirarlo** | `bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6 --model synth:deep`; `bench_bitrate.py --model synth:deep --rounds 3` |
+
 ---
 
 ## G. La macchina
@@ -429,5 +456,7 @@ Dichiarato per non far sembrare coperto ciò che non lo è.
   bisogna alzare quel soffitto e rimisurare.
 - **Che i pesi, a forma fissa, decidano se P1 si carica.** È possibile per C3 (il codice
   generato dipende dai valori), ma non è stato misurato variando il solo seme dei pesi.
+- **Tre marcature e latenza minima su modelli diversi dal checkpoint.** `--mode rates` e
+  `--latency` usano build strumentate generate dal sorgente del checkpoint.
 - **Isolamento dal boot.** `isolcpus`, `nohz_full` e `rcu_nocbs` non sono usati: le CPU del
   banco restano soggette al tick e ai callback RCU.

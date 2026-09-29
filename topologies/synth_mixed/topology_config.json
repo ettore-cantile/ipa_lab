@@ -1,0 +1,8 @@
+{
+  "_comment": "Synthetic network, no real topology: 4 interfaces, 12 nodes, 1 queue, TTL 30. The network of the synthetic preset mixed (queue_occupancy, no ingress_iface).",
+  "topology": "synth_mixed",
+  "n_interfaces": 4,
+  "n_nodes": 12,
+  "n_queues": 1,
+  "initial_ttl": 30
+}

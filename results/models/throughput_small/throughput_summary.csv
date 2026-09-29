@@ -1,0 +1,7 @@
+method,frame,max_rx_pps,max_rx_mbps,max_loss_pct,max_loss_med_pct,max_offered_pps,rx_pkts,tx_pkts,lost_before,lost_after,respinti,respinti_pct,persi_dut,persi_in_coda,persi_dopo,loss_dut_pct,noloss_rx_pps,noloss_gen_bound,noloss_rx_mbps,noloss_loss_pct,zero_rx_pps,lat_p50_ns,lat_min_ns,lat_rx_pps,bottleneck,unreliable,rounds,ns_pkt,ns_pkt_vs_baseline
+baseline,64,3304126,1691.71,50.3,,6537365,992064,1962844,970804,0,0,49.461,0,0,0,0.0,1515195,False,775.78,0.007,0,,,3304126,generatore,False,3,302.7,
+p1_static,64,3014168,1543.25,55.009,,6652629,905024,1997496,1090735,0,0,54.624,0,0,0,0.001,1515148,False,775.76,0.013,0,,,3014168,generatore,False,3,331.8,29.1
+hardcoded,64,2879927,1474.52,57.658,,6778706,864832,2035667,1167971,0,0,57.462,0,0,0,0.002,1515209,False,775.79,0.009,0,,,2879927,generatore,False,3,347.2,44.5
+template,64,2107110,1078.84,71.164,,7156553,632704,2148905,1519589,0,0,70.558,0,0,0,0.0,1515133,False,775.75,0.015,0,,,2107110,generatore,False,3,474.6,171.9
+modular,64,1742162,891.99,77.141,,7417761,522944,2226586,1703643,0,0,76.51,0,0,0,0.003,1515139,False,775.75,0.013,0,,,1742162,generatore,False,3,574.0,271.3
+rxonly,64,4597471,2353.91,24.383,,6012020,1380109,1805507,426822,2,0,23.65,0,0,0,0.0,1515137,False,775.75,0.009,0,,,4597471,generatore,False,3,217.5,-85.2

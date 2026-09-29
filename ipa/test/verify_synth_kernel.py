@@ -397,115 +397,55 @@ class NonApplicabile(Exception):
 def fuori_limiti(pipeline, model):
     """Perche' `pipeline` non puo' eseguire questo modello, oppure None.
 
-    Solo i limiti leggibili senza caricare niente, con i numeri presi dai
-    moduli e non riscritti qui. Il resto lo rifiutano i loader, e anche quel
-    rifiuto diventa NonApplicabile."""
-    hidden = [int(h) for h in model["arch"]["hidden"]]
-    n_in, n_out = int(model["arch"]["n_in"]), int(model["arch"]["n_out"])
-    if pipeline == "p2":
-        import ebpf_template_arch as A
-        # Fino al 2026-09-23 qui c'era "n_out diverso da quello del modello
-        # configurato (7)": il piano di controllo di P2 lo rifiutava. Il
-        # datapath no -- legge n_out da arch_registry -- e il vincolo e' stato
-        # tolto; resta il tetto MAX_N_OUT, controllato da semantics.validate().
-        if not hidden:
-            return "P2 ha bisogno di almeno uno strato nascosto"
-        if any(h != hidden[1] for h in hidden[2:]):
-            return (f"strati nascosti {hidden}: in P2 quelli oltre il secondo "
-                    f"sono n_h2 -> n_h2")
-        n_h1 = hidden[0]
-        n_h2 = hidden[1] if len(hidden) > 1 else hidden[0]
-        if n_h1 > A.T2_MAX_H1 or n_h2 > A.T2_MAX_H2:
-            return (f"strati nascosti {hidden} oltre T2_MAX_H1/T2_MAX_H2 "
-                    f"({A.T2_MAX_H1}/{A.T2_MAX_H2})")
-        nw = A.arch_weight_count(n_h1, n_h2, n_in, n_out, n_hidden=len(hidden))
-        if nw > A.MAX_WEIGHT_ENTRIES:
-            return f"{nw} pesi oltre MAX_WEIGHT_ENTRIES={A.MAX_WEIGHT_ENTRIES}"
-    elif pipeline == "p3":
-        import ebpf_modular as M
-        dims = dims_strati(model)
-        if dims[0][1] > M.ML1_MAX_H1 or any(max(a, b) > M.MLH_MAX_H
-                                            for a, b in dims[1:]):
-            return (f"strati {dims} oltre ML1_MAX_H1/MLH_MAX_H "
-                    f"({M.ML1_MAX_H1}/{M.MLH_MAX_H})")
-        nw = sum(a * b + b for a, b in dims)
-        if nw > M.MAX_LAYER_WEIGHT_ENTRIES:
-            return (f"{nw} pesi oltre MAX_LAYER_WEIGHT_ENTRIES="
-                    f"{M.MAX_LAYER_WEIGHT_ENTRIES}")
-    return None
+    Solo i limiti leggibili senza caricare niente; li tiene
+    ipa/pipeline_limits.py, con i numeri presi dai moduli che compilano i
+    programmi. Il resto lo rifiutano i loader, e anche quel rifiuto diventa
+    NonApplicabile."""
+    import pipeline_limits
+    a = model["arch"]
+    return pipeline_limits.why_not(
+        {"p1": "p1_static", "p2": "template", "p3": "modular"}[pipeline],
+        a["hidden"], a["n_in"], a["n_out"])
 
 
-def costruisci_p2(model, wi, feats, node_index):
+def _costruisci(pipeline, M, node_index):
+    """Una pipeline sul modello dello scenario, con i costruttori comuni
+    (pipeline_setup.build): gli stessi che usano i banchi quando ricevono un
+    modello diverso dal checkpoint. Il rifiuto di un limite compilato resta
+    NonApplicabile."""
+    import pipeline_setup as PS
+    try:
+        return PS.build(pipeline, M, node_index=node_index)
+    except PS.NotApplicable as e:
+        raise NonApplicabile(str(e))
+
+
+def costruisci_p2(M, node_index):
     """P2 sui pesi sintetici: dispatcher + foglia compilata per la profondita'
-    dello scenario, pesi e descrittore nelle mappe. Lo stesso montaggio di
-    verify_prog_run.setup_template, con la forma dello scenario al posto di
-    quella del checkpoint. Il nodo viene dalla mappa `node_id_t2`: P2 non lo
-    congela mai."""
-    from bcc import BPF
-    from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
-                                    build_arch_leaf, load_arch_weights,
-                                    load_model_desc)
-    from verify_prog_run import _install_mac_table
-    import model_meta as mm
-
-    hidden = [int(h) for h in model["arch"]["hidden"]]
-    n_in, n_out = int(model["arch"]["n_in"]), int(model["arch"]["n_out"])
-    scale = int(model["quant"]["scale_factor"])
-    n_h1 = hidden[0]
-    n_h2 = hidden[1] if len(hidden) > 1 else hidden[0]
-    semantics = mm.descriptor_semantics_or_reference(n_out, "verify:synth")
-    b = BPF(text="#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER
-            + "\n" + build_arch_leaf(len(hidden)))
-    disp = b.load_func("ipa_switch_template", BPF.XDP)
-    leaf = b.load_func("arch_generic_2layer", BPF.XDP)
-    b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf.fd)
-    try:
-        load_arch_weights(b, wi, model_id=0, scale=scale, n_h1=n_h1, n_h2=n_h2,
-                          features=feats, n_in=n_in, semantics=semantics,
-                          n_hidden=len(hidden))
-    except ValueError as e:
-        raise NonApplicabile(f"load_arch_weights: {e}")
-    _install_mac_table(b, "mac_table_t2", semantics=semantics)
-    b["node_id_t2"][ct.c_uint32(0)] = ct.c_uint32(node_index)
-    return {"b": b, "disp": disp, "fn": leaf, "scale": scale,
-            "cls_stats": b["cls_stats_t2"], "pkt_stats": b["pkt_stats_t2"],
-            "ingress_port": b["ingress_port_t2"],
-            "ricarica_desc": lambda f: load_model_desc(b, f, n_in, model_id=0)}
+    dello scenario, pesi e descrittore nelle mappe. Il nodo viene dalla
+    mappa `node_id_t2`: P2 non lo congela mai."""
+    import pipeline_setup as PS
+    from ebpf_template_arch import load_model_desc
+    setup = _costruisci("template", M, node_index)
+    PS.set_node(setup, node_index)
+    b = setup["b"]
+    setup["ingress_port"] = b["ingress_port_t2"]
+    setup["ricarica_desc"] = lambda f: load_model_desc(b, f, M.n_in, model_id=0)
+    return setup
 
 
-def costruisci_p3(model, wi, feats, node_index):
+def costruisci_p3(M, node_index):
     """P3 sui pesi sintetici: dispatcher, layer_first, layer_hidden e la
-    catena di tail call completa, come verify_prog_run.setup_modular ma con
-    gli strati dello scenario. Il nodo viene dalla mappa `node_id_t3`."""
-    from bcc import BPF
-    from ebpf_modular import (EBPF_MODULAR_FULL, LAYER_CHAIN_SIZE,
-                              load_modular_weights, load_model_desc)
-    from verify_prog_run import _install_mac_table
-    import model_meta as mm
-
-    n_in, n_out = int(model["arch"]["n_in"]), int(model["arch"]["n_out"])
-    scale = int(model["quant"]["scale_factor"])
-    semantics = mm.descriptor_semantics_or_reference(n_out, "verify:synth")
-    b = BPF(text=EBPF_MODULAR_FULL)
-    disp = b.load_func("modular_dispatcher", BPF.XDP)
-    first = b.load_func("layer_first", BPF.XDP)
-    hidden_fn = b.load_func("layer_hidden", BPF.XDP)
-    b["layer_chain"][ct.c_int(0)] = ct.c_int(first.fd)
-    for i in range(1, LAYER_CHAIN_SIZE):
-        b["layer_chain"][ct.c_int(i)] = ct.c_int(hidden_fn.fd)
-    try:
-        load_modular_weights(b, wi, model_id=0, scale=scale,
-                             layer_dims=dims_strati(model), features=feats,
-                             semantics=semantics)
-    except ValueError as e:
-        raise NonApplicabile(f"load_modular_weights: {e}")
-    _install_mac_table(b, "mac_table_t3", semantics=semantics)
-    b["node_id_t3"][ct.c_uint32(0)] = ct.c_uint32(node_index)
-    return {"b": b, "disp": disp, "fn": first, "fn_hidden": hidden_fn,
-            "scale": scale,
-            "cls_stats": b["cls_stats_t3"], "pkt_stats": b["pkt_stats_t3"],
-            "ingress_port": b["ingress_port_t3"],
-            "ricarica_desc": lambda f: load_model_desc(b, f, n_in, model_id=0)}
+    catena di tail call completa, con gli strati dello scenario. Il nodo
+    viene dalla mappa `node_id_t3`."""
+    import pipeline_setup as PS
+    from ebpf_modular import load_model_desc
+    setup = _costruisci("modular", M, node_index)
+    PS.set_node(setup, node_index)
+    b = setup["b"]
+    setup["ingress_port"] = b["ingress_port_t3"]
+    setup["ricarica_desc"] = lambda f: load_model_desc(b, f, M.n_in, model_id=0)
+    return setup
 
 
 def scale_colonne_default(model):
@@ -521,51 +461,31 @@ def scale_colonne_default(model):
 
 
 # ==========================================================================
-def sorgente_p1(model, wi, feats, node_index):
+def sorgente_p1(M, node_index):
     """Il sorgente di P1 sui pesi sintetici, con il descrittore dello scenario.
 
     Una funzione sola per le due vie che lo usano: il kernel lo compila,
     --dry-run lo valuta dal testo. Devono guardare lo STESSO sorgente, o il
-    confronto senza kernel proverebbe un altro programma.
+    confronto senza kernel proverebbe un altro programma: gli argomenti sono
+    quelli che pipeline_setup passa a p1_aot.load_p1.
 
     E' l'OGGETTO AOT (p1_aot, lo stesso generatore del deploy); fino al
     2026-09-23 era il sorgente BCC, che su un nodo non va mai."""
     import p1_aot
-    import model_meta as mm
-    n_out = int(model["arch"]["n_out"])
-    scale = int(model["quant"]["scale_factor"])
     return p1_aot.p1_source(
-        [(0, wi, scale)],
-        hidden_dims=tuple(int(h) for h in model["arch"]["hidden"]),
-        features=feats, n_out=n_out,
-        semantics=mm.descriptor_semantics_or_reference(n_out, "verify:synth"),
+        [(0, M.weights, M.scale)], hidden_dims=tuple(M.hidden),
+        features=M.features, n_out=M.n_out, semantics=M.semantics,
         static_node=node_index)
 
 
-def costruisci_p1(model, wi, feats, node_index):
+def costruisci_p1(M, node_index):
     """P1 (l'oggetto AOT) sui pesi sintetici, con il descrittore dello
-    scenario, caricato e pinnato da loader_aot."""
-    import p1_aot
-    from verify_prog_run import _install_mac_table
-    import model_meta as mm
-
-    n_out = int(model["arch"]["n_out"])
-    scale = int(model["quant"]["scale_factor"])
-    src = sorgente_p1(model, wi, feats, node_index)
-    o_path, _ = p1_aot.compile_object(src)
-    obj = p1_aot.AotObject(o_path, p1_aot._PROG_RE.findall(src))
-    b = obj.b
-    b._owner = obj
-
-    semantics = mm.descriptor_semantics_or_reference(n_out, "verify:synth")
-    _install_mac_table(b, "mac_table", semantics=semantics)
-    setup = {"b": b, "disp": obj.progs["xdp_dispatch"],
-             "fn": obj.progs["xdp_model"], "scale": scale,
-             "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"]}
+    scenario e il nodo congelato, caricato e pinnato da loader_aot."""
+    setup = _costruisci("p1_static", M, node_index)
     # La mappa esiste solo se il descrittore usa `ingress_iface`: gli scenari
     # che non la dichiarano non la fanno nemmeno generare.
     try:
-        setup["ingress_port"] = b["ingress_port"]
+        setup["ingress_port"] = setup["b"]["ingress_port"]
     except Exception:
         pass
     return setup
@@ -578,6 +498,12 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
     decisione, e che (nel kernel, P2/P3) il controllo negativo l'ha vista."""
     nome = os.path.basename(os.path.abspath(d))
     model, wi, wf = carica_scenario(d)
+    # Lo stesso modello come lo vedono i banchi: pesi, descrittore e la
+    # semantica delle classi che lo scenario DICHIARA (drop_class). Fino al
+    # 2026-09-29 le pipeline ricevevano quella di ipa/model_meta.json quando
+    # n_out coincideva -- DROP 5 per ipa_like, che dichiara DROP 6.
+    import model_source as ms
+    M = ms.load_model(d)
     feats = descrittore(model)
     # Il nodo congelato deve stare dentro la larghezza del one-hot di QUESTO
     # scenario: `ones` ne ha 4, e il 7 di default faceva rifiutare la
@@ -659,7 +585,7 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
         costruisci = {"p1": costruisci_p1, "p2": costruisci_p2,
                       "p3": costruisci_p3}[pipeline]
         try:
-            setup = costruisci(model, wi, feats, node_index)
+            setup = costruisci(M, node_index)
         except NonApplicabile as e:
             info(f"{pipeline.upper()} NON APPLICABILE: {e}")
             return {"esito": None, "scala_provata": False}
@@ -668,7 +594,7 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
            f"(nodo {node_index}, {dove})")
     else:
         from p1_c_eval import P1Program
-        prog = P1Program(sorgente_p1(model, wi, feats, node_index),
+        prog = P1Program(sorgente_p1(M, node_index),
                          func="xdp_model")
         ok(f"P1 generata sui pesi sintetici e letta da p1_c_eval "
            f"(nodo congelato: {node_index})")

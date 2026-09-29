@@ -106,6 +106,9 @@ ipa_lab/
 │   │                                #       shape derivation, checkpoint resolution
 │   ├── common.py                    #    map helpers, MAC/ifindex resolution, XDP attach/detach
 │   ├── stats_maps.py                #    read/zero the per-CPU pkt_stats / cls_stats counters
+│   ├── model_source.py              #    ONE LOADER for every model (checkpoint, synth preset,
+│   │                                #       directory) + model x scenario compatibility
+│   ├── pipeline_limits.py           #    which pipeline can run which shape (P2/P3 ceilings)
 │   ├── link_state_monitor.py        #    seeds link_state[] from real carrier state
 │   ├── queue_state_monitor.py       #    seeds queue_state[] (demo feature)
 │   ├── extract_weights.py           #    .pt -> weights.json / weights_float.json
@@ -130,6 +133,10 @@ ipa_lab/
 │       │                            #        (BPF_PROG_TEST_RUN)
 │       ├── diag_verifier.py         #      verifier statistics per program (log_level 4)
 │       ├── verify_synth_kernel.py   #      synthetic models: reference vs eBPF, all pipelines
+│       ├── pipeline_setup.py        #      builds baseline/P1/P1.5/P2/P3 for ANY model
+│       ├── model_under_test.py      #      --model / --topology, shared by every test and bench
+│       ├── test_model_source.py     #      62 checks (no root); --kernel: every scenario x
+│       │                            #        model x pipeline in the kernel
 │       ├── bench_throughput.py      #      real traffic on veth: node cost per packet
 │       │                            #        (--mode compare --generator xdp --egress-cpu auto)
 │       ├── xdp_gen.py               #      XDP live-frames generator (no skb, no copy)
@@ -148,10 +155,11 @@ ipa_lab/
 │       └── remeasure_*.sh           #      every measurement cited in docs/, in one go
 │
 ├── topologies/                      # 3. SCENARIO DATA — one directory per network
-│   └── germany50/                   #    the network the checked-in model was trained on
-│       ├── germany50.xml            #      SNDlib topology, 50 routers / 88 links
-│       ├── topology_config.json     #      n_interfaces=6, n_nodes=52, n_queues=4
-│       └── importSNDLib.py          #      XML -> NetworkX
+│   ├── germany50/                   #    the network the checked-in model was trained on
+│   │   ├── germany50.xml            #      SNDlib topology, 50 routers / 88 links
+│   │   ├── topology_config.json     #      n_interfaces=6, n_nodes=52, n_queues=4, initial_ttl=30
+│   │   └── importSNDLib.py          #      XML -> NetworkX
+│   └── germany50_ttl16/, synth_*/   #    the networks of the synthetic models (config only)
 │
 ├── results/                       # 4. MEASUREMENTS — CSV only; plots, logs and
 │                                    #    reports are regenerated from them
@@ -465,6 +473,24 @@ sudo python3 ipa/test/verify_multi_model.py
 
 # P2/P3: models with different class semantics in one program
 sudo python3 ipa/test/verify_per_model_semantics.py
+```
+
+### Other models, other networks
+
+Every kernel test and traffic bench takes `--model` (`checkpoint`, `synth:<preset>`,
+a directory, or another `.pt`) and `--topology` (a scenario under `topologies/`).
+The model must fit the network — each feature as wide as the network dimension it
+reads, the TTL scale equal to the network's initial TTL — or the run stops before
+compiling anything, saying why. Without `--model` everything runs the checked-in
+checkpoint through the same code as before. See `docs/testing.md` §12.
+
+```bash
+python3 ipa/test/test_model_source.py                    # models, scenarios, compatibility
+sudo python3 ipa/test/test_model_source.py --kernel      # every scenario x model x pipeline
+sudo python3 ipa/test/test_suite.py --only kernel --model synth:deep
+sudo python3 ipa/test/test_fabric.py --model synth:small --topology synth_small
+sudo python3 ipa/test/bench_throughput.py --mode compare --model synth:deep --out results/models/throughput_deep
+sudo python3 ipa/test/bench_bitrate.py --model synth:deep --out results/models/bitrate_deep
 ```
 
 Correctness criterion, identical across pipelines: pre-install `mac_table`, run

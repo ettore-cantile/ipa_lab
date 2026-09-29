@@ -1,0 +1,10 @@
+model,baseline_ns,hardcoded_ns,template_ns,modular_ns,host_on_ac,host_disturbed,note
+checkpoint,14.0,51.0,198.0,322.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+deep,15.0,57.0,222.0,366.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+ipa_like,14.0,51.0,194.0,314.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+ipa_ttl16,14.0,46.0,194.0,314.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+large,14.0,75.0,,,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+mixed,14.0,43.0,152.0,253.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+ones,14.0,28.0,126.0,209.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+small,14.0,36.0,133.0,221.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"
+sparse,14.0,38.0,196.0,312.0,False,True,"a batteria: indicativo, da rimisurare con l'alimentatore"

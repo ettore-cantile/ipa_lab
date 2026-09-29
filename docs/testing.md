@@ -151,6 +151,7 @@ python3 ipa/test/test_synth.py                    # 60 controlli sui modelli sin
 python3 ipa/test/test_bitrate_math.py             # 98: formule e attribuzione di bench_bitrate
 python3 ipa/test/test_steady_window.py            # 18: la finestra stazionaria
 python3 ipa/test/test_host_conditions.py          # 93: ruoli, applicazione e ripristino
+python3 ipa/test/test_model_source.py             # 62: modelli, scenari, compatibilita', limiti delle pipeline
 ```
 
 ---
@@ -1178,6 +1179,129 @@ sessione sul tetto di `rxonly`, quindi i punti cambiano da un run all'altro.
   e nessun contatore davanti.
 
 ---
+
+## 12. Modelli e scenari diversi dal checkpoint (`--model`, `--topology`)
+
+Tutti i test e i banchi del kernel e del traffico vero accettano un modello e una rete
+diversi dal checkpoint depositato. Senza `--model` fanno esattamente quello che facevano
+prima, per le stesse righe di codice.
+
+### 12.1 Scenario, modello, compatibilità
+
+- **Scenario = la rete**: `topologies/<nome>/topology_config.json`, con `n_interfaces`,
+  `n_nodes`, `n_queues` e `initial_ttl` (il TTL con cui i pacchetti entrano nella rete).
+  Oltre a `germany50` ci sono le reti dei modelli sintetici: `germany50_ttl16`,
+  `synth_small`, `synth_ones`, `synth_large`, `synth_mixed`.
+- **Modello**: il checkpoint (`checkpoint`), un altro `.pt` (`checkpoint:<file>`, serve
+  torch), un preset sintetico (`synth:ipa_like`, `synth:deep`, ...) o una cartella.
+  `ipa/model_source.py` li carica tutti nella stessa forma: pesi int8, scala, feature con
+  larghezza e scala, strati, semantica delle classi dichiarata dal modello.
+- **Compatibilità**: ogni feature ha la larghezza della dimensione della rete da cui
+  dipende (`link_state` e `ingress_iface` = interfacce, `node` = nodi, `queue_occupancy`
+  = code) e la scala del TTL è uguale al TTL iniziale. Un modello con il one-hot del nodo
+  a 52 su una rete da 30 nodi è escluso, con il motivo scritto.
+- **Limiti delle pipeline** (`ipa/pipeline_limits.py`, costanti prese dai moduli che
+  compilano): P2 al massimo 8 neuroni per strato, strati dal terzo in poi larghi come il
+  secondo, 1024 pesi; P3 al massimo 8 neuroni per strato, 16 strati, 2048 pesi; P1
+  nessuno. La profondità di P2 (circa 20 strati, distanza dei salti) non è una costante:
+  un modello più profondo lo rifiuta il verificatore. Una pipeline che non regge il
+  modello è **NON APPLICABILE**, non un errore.
+
+| scenario | interfacce / nodi / code / TTL | modelli compatibili |
+|---|---|---|
+| germany50 | 6 / 52 / 4 / 30 | checkpoint, ipa_like, deep, sparse, sparse_hetero_11 |
+| germany50_ttl16 | 6 / 52 / 4 / 16 | ipa_ttl16 |
+| synth_small | 3 / 8 / – / 16 | small |
+| synth_ones | 3 / 4 / – / 8 | ones |
+| synth_large | 8 / 100 / – / 64 | large (P2 e P3 non applicabili) |
+| synth_mixed | 4 / 12 / 1 / 30 | mixed |
+
+### 12.2 Come passa nei test
+
+- `--model REF` e `--topology NOME` (o `$IPA_MODEL` e `$IPA_TOPOLOGY_CONFIG` per un
+  processo figlio). Senza `--topology` si prende lo scenario compatibile, germany50 se lo
+  è. Un modello incompatibile si ferma prima di compilare, con il motivo.
+- `ipa/test/model_under_test.py` tiene il modello scelto; `load_weights`, `setup_*`,
+  `ref_infer` e `count_lookups` di `verify_prog_run` lo seguono passando per
+  `ipa/test/pipeline_setup.py`, i costruttori comuni di baseline, P1, P1.5, P2 e P3 (gli
+  stessi che usa `verify_synth_kernel`). `--model checkpoint` manda il checkpoint per la
+  strada nuova: pesi, scala, semantica e riferimento sono identici a quelli della strada
+  vecchia (3000/3000 decisioni e logit), i sorgenti di P1 e della foglia di P2 identici
+  byte per byte.
+- **Riferimento**: quello generico (`ref_infer_sparse`), uguale a quello del 65-4-4-7 su
+  20 000 ingressi casuali, classe e logit.
+- **Azione della classe**: con un modello la verifica per TTL controlla anche l'azione:
+  redirect per FORWARD, `XDP_DROP` per DROP, `XDP_PASS` per UNUSED. Il controllo del TTL
+  decrementato usa il primo TTL che il modello inoltra.
+- **Fabric**: porte, nodo, porta d'ingresso e larghezza di `link_state` dal modello. La
+  ricerca dei casi, dopo stato dei link × TTL, prova anche porta d'ingresso, nodo e code
+  per le classi mancanti (ogni caso scrive i suoi valori nelle mappe).
+- **Banchi di traffico**: il pacchetto dei generatori ha TTL 32 fisso. Il banco cerca lo
+  stato dei link (e delle code) con cui il modello **inoltra** quel pacchetto, lo scrive e
+  lo stampa (`large`: `00111000` → classe 4). Si misura sempre un inoltro.
+- **Saltati con un messaggio**: extract e quant (riguardano il `.pt` addestrato), le
+  architetture alternative della suite (forme proprie), il deploy AOT di `test_fabric`
+  (si costruisce da un checkpoint), `--mode rates` e `--latency` (build strumentate, per
+  ora solo col checkpoint).
+
+```bash
+sudo python3 ipa/test/test_model_source.py --kernel      # ogni scenario x modello x pipeline
+sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p2
+sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/test_suite.py --only kernel --model synth:deep
+sudo python3 ipa/test/test_fabric.py --model synth:small -q
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6 \
+     --model synth:deep --out results/models/throughput_deep
+sudo python3 ipa/test/bench_bitrate.py --model synth:deep --rounds 3 --out results/models/bitrate_deep
+```
+
+### 12.3 Risultati (2026-09-29)
+
+**Correttezza**, tutto PASS:
+
+| controllo | esito |
+|---|---|
+| `test_model_source --kernel`: 6 scenari × modelli compatibili × 5 pipeline, 40 ingressi ciascuna, model_id 0 e 190 | 110/110; large su P2/P3 N/A |
+| `verify_synth_kernel --all`, P1 / P2 / P3 | 8/8, 7/7 + large N/A, 7/7 + large N/A |
+| suite kernel con `--model`, 9 modelli | PASS su tutti |
+| `test_fabric --model`, 9 modelli | tutti i controlli PASS |
+
+Classi consegnate dal fabric con la ricerca allargata: checkpoint 0–5, ipa_like e
+ipa_ttl16 2–5, small 0–3, mixed 0–3, large 1, 4, 6, 8, deep 0, 1, 4, sparse 1, 5, ones 0.
+Per ipa_like, deep, sparse, small e ones sono tutte le classi che il modello decide su
+200 000 ingressi casuali: le altre i suoi pesi non le producono mai.
+
+**Traffico vero**, `bench_throughput --mode compare`, 1 core (cpu6), generatore 10,1,3,
+3 giri, macchina non disturbata, controllo di validità PASS in ogni run
+(`results/models/throughput_*/`). Mpps a saturazione, fra parentesi ns/pacchetto sopra
+la baseline:
+
+| modello | forma | baseline | P1 | P1.5 | P2 | P3 |
+|---|---|---:|---:|---:|---:|---:|
+| checkpoint | 65-4-4-7 | 3,37 | 2,98 (+39) | 2,81 (+58) | 1,87 (+237) | 1,47 (+385) |
+| deep | 65-4-4-4-7 | 3,31 | 2,87 (+46) | 2,76 (+60) | 1,78 (+261) | 1,35 (+438) |
+| small | 15-4-4 | 3,30 | 3,01 (+29) | 2,88 (+45) | 2,11 (+172) | 1,74 (+271) |
+| mixed | 18-6-5 | 3,28 | 3,02 (+27) | 2,90 (+40) | 2,06 (+181) | 1,67 (+293) |
+| large | 117-8-8-9 | 3,30 | 2,61 (+80) | 2,54 (+90) | N/A | N/A |
+
+Il checkpoint per la strada nuova dà 3,37 / 2,98 / 2,81 / 1,87 / 1,47 contro 3,40 / 3,01
+/ 2,87 / 1,91 / 1,49 del 28-09: i programmi sono identici, e anche la baseline, che non
+esegue modelli, perde l'1%. È variazione fra sessioni.
+
+**Bit rate** su deep (`results/models/bitrate_deep/`): perdita sempre all'ingresso; pulite
+fino a baseline 1,44, P1 1,44, P1.5 1,20, P2 0,72, P3 0,48 Gbit/s (col checkpoint P3 era
+pulita fino a 0,72: lo strato in più la porta sotto 1,41 Mpps).
+
+**Kernel** (`BPF_PROG_TEST_RUN`), ns/pacchetto, `results/models/kernel_battery.csv`:
+misurate sotto `host_conditions` ma **a batteria**, quindi indicative finché non si
+rimisurano con l'alimentatore. Baseline 14–15 ovunque; P1.5 / P2 / P3: checkpoint 51 /
+198 / 322, ipa_like 51 / 194 / 314, sparse 38 / 196 / 312, deep 57 / 222 / 366, small 36 /
+133 / 221, mixed 43 / 152 / 253, ones 28 / 126 / 209, large 75 / – / –.
+
+**Che cosa dicono**: P2 e P3 costano per la **forma**, non per i pesi (checkpoint,
+ipa_like, ipa_ttl16 e sparse hanno la stessa forma e lo stesso costo); P1 per i **valori**
+dei pesi (sparse, stessa forma, 38 ns contro 51). Uno strato in più costa circa +24 ns a
+P2 e +45–53 ns a P3, sia nel kernel sia sul traffico vero; ingressi più piccoli
+abbassano P2 e P3 di 60–110 ns.
 
 ## Note e limiti
 

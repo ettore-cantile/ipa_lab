@@ -256,6 +256,7 @@ il TTL.
 \end{prima}
 
 \section{Il TTL: dividere il prodotto, mai il valore}
+\label{sec:ttl}
 
 Il modello è addestrato con il TTL \emph{normalizzato}, cioè
 $\text{ttl}/T$ con $T = 30$ il valore iniziale. Con i numeri interi
@@ -2827,6 +2828,274 @@ bash ipa/test/remeasure_traffic.sh   # traffico vero, semantica, soffitti, topol
 \end{lstlisting}
 
 % ==================================================================
+\chapter{Altri modelli, altre reti}
+\label{ch:modelli}
+% ==================================================================
+
+\section{La domanda}
+
+Fino a questo capitolo quasi ogni numero viene da un modello solo, il 65-4-4-7
+addestrato su Germany50. L'unica eccezione era il confronto a tre vie del
+capitolo sui modelli sintetici, che però prova solo la correttezza: la suite
+del kernel, la consegna sul fabric e i banchi di traffico caricavano sempre e
+solo il checkpoint.
+
+E non per scelta: in molti punti la forma del checkpoint era scritta nel
+codice. Qualche esempio:
+\begin{itemize}
+  \item P3 veniva caricata con gli strati scritti a mano,
+        \texttt{[(65,4), (4,4), (4,7)]};
+  \item il fabric provava 6 bit di stato dei link e si dichiarava nodo 7;
+  \item il significato delle classi veniva sempre da
+        \texttt{model\_meta.json}, quello del checkpoint;
+  \item con \texttt{sudo} i pesi venivano sempre da \texttt{weights.json},
+        qualunque file si passasse.
+\end{itemize}
+Un modello diverso poteva quindi girare con i pesi, o con le classi, di un
+altro, senza che nessun test se ne accorgesse. L'obiettivo di questo capitolo:
+\textbf{lo stesso test, per qualsiasi modello e qualsiasi rete}, e un errore
+chiaro quando la combinazione non ha senso.
+
+\section{Scenario e modello}
+
+Le due parole hanno un significato preciso.
+
+\begin{itemize}
+  \item \textbf{Lo scenario è la rete}: quattro numeri in
+        \texttt{topologies/<nome>/topology\_config.json}, cioè quante
+        interfacce ha al massimo un nodo, quanti nodi ha la rete, quante code ha
+        ogni interfaccia e con che TTL i pacchetti ci entrano.
+  \item \textbf{Il modello è la rete neurale}: pesi, forma, ingressi (ognuno con
+        la sua larghezza e la sua scala) e significato di ogni classe.
+\end{itemize}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrp{4.6cm}@{}}
+\toprule
+\textbf{Scenario} & \textbf{interf.} & \textbf{nodi} & \textbf{code} & \textbf{TTL} & \textbf{modelli che ci girano} \\
+\midrule
+\texttt{germany50}       & 6 & 52  & 4 & 30 & checkpoint, ipa\_like, deep, sparse, sparse\_hetero\_11 \\
+\texttt{germany50\_ttl16} & 6 & 52  & 4 & 16 & ipa\_ttl16 \\
+\texttt{synth\_small}    & 3 & 8   & -- & 16 & small \\
+\texttt{synth\_ones}     & 3 & 4   & -- & 8  & ones \\
+\texttt{synth\_large}    & 8 & 100 & -- & 64 & large \\
+\texttt{synth\_mixed}    & 4 & 12  & 1 & 30 & mixed \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Oltre a Germany50 ci sono le reti dei modelli sintetici. Non sono topologie
+reali: sono le dimensioni per cui ciascun modello sintetico è stato generato.
+
+\section{Quando un modello può girare su una rete}
+
+Ogni ingresso del modello prende la sua larghezza da una dimensione della rete:
+lo stato dei link e la porta d'ingresso dalle interfacce, l'identità del nodo
+dai nodi, l'occupazione delle code dalle code. E il TTL il modello lo legge
+diviso per il TTL iniziale con cui è stato addestrato
+(sezione~\ref{sec:ttl} nel capitolo sulla matematica). Quindi:
+
+\begin{lezione}
+Un modello gira su una rete solo se \textbf{ogni suo ingresso è largo quanto la
+dimensione della rete da cui dipende} e se \textbf{la scala del suo TTL è il TTL
+iniziale della rete}.
+\end{lezione}
+
+Esempio: il checkpoint ha il one-hot del nodo largo 52. Su una rete da 30 nodi
+metà delle sue colonne non corrisponderebbe a nessun nodo, e il test si ferma
+subito con
+\begin{lstlisting}
+nodi: il modello ne vuole 52, la rete ne ha 30
+\end{lstlisting}
+Esempio con il TTL: \texttt{ipa\_ttl16} ha la stessa forma del checkpoint, ma è
+addestrato con il TTL diviso per 16. Su Germany50, dove i pacchetti partono da
+30, vedrebbe valori fino a quasi 2 invece che fino a 1, fuori da tutto ciò su
+cui è stato addestrato. Per questo gira sulla sua rete, \texttt{germany50\_ttl16}.
+
+C'è poi un secondo filtro, fra modello e \emph{pipeline}. Ogni pipeline ha dei
+tetti fissati quando il programma viene compilato:
+\begin{itemize}
+  \item \textbf{P2}: al massimo 8 neuroni per strato, strati dal terzo in poi
+        larghi come il secondo, 1\,024 pesi in tutto;
+  \item \textbf{P3}: al massimo 8 neuroni per strato, 16 strati, 2\,048 pesi;
+  \item \textbf{P1}: nessuno, perché il programma si genera per quel modello.
+\end{itemize}
+Il modello \texttt{large} (117-8-8-9) ha 1\,097 pesi e un primo strato da 117
+per 8: P2 e P3 non lo possono caricare. Non è un errore del test: la
+combinazione è \textbf{non applicabile}, ed è contata a parte.
+
+\section{Come è costruito}
+
+Quattro pezzi, ognuno con un compito solo.
+
+\begin{enumerate}
+  \item \texttt{model\_source.py} \textbf{carica qualsiasi modello nello stesso
+        formato}: il checkpoint, un altro \texttt{.pt}, un preset sintetico
+        (\texttt{synth:deep}) o una cartella. Il significato delle classi è
+        quello che il modello dichiara. Contiene anche il controllo modello
+        contro rete.
+  \item \texttt{pipeline\_limits.py} \textbf{dice se una pipeline regge una
+        forma}, con i numeri presi dai moduli che compilano i programmi, così i
+        due non possono divergere.
+  \item \texttt{pipeline\_setup.py} \textbf{carica un modello in una pipeline}:
+        baseline, P1, P1.5, P2, P3. Sono i costruttori che usava già il
+        confronto a tre vie, spostati in un posto comune.
+  \item \texttt{model\_under\_test.py} \textbf{legge \texttt{--model} e
+        \texttt{--topology}} e li passa ai processi figli con due variabili
+        d'ambiente.
+\end{enumerate}
+
+Il punto importante è che cosa succede \emph{senza} \texttt{--model}: niente.
+Ogni funzione controlla per prima cosa se c'è un modello sotto test, e se non
+c'è esegue le stesse righe di prima. Tutti i numeri dei capitoli precedenti
+restano validi, e si possono rifare con gli stessi comandi.
+
+\begin{lstlisting}
+sudo python3 ipa/test/test_suite.py --only kernel --model synth:deep
+sudo python3 ipa/test/test_fabric.py --model synth:small
+sudo python3 ipa/test/bench_throughput.py --mode compare --model synth:deep
+sudo python3 ipa/test/bench_bitrate.py --model synth:deep
+\end{lstlisting}
+Senza \texttt{--topology} viene scelta la rete compatibile (Germany50 se lo è).
+
+\section{Che cosa controllano i test, adesso}
+
+Passare un modello diverso ha costretto a rendere i controlli più precisi in tre
+punti.
+
+\textbf{L'azione, non solo la classe.} Prima la verifica per TTL accettava come
+corretto soltanto un redirect: col checkpoint, fra TTL 2 e 6, la classe è sempre
+un inoltro. Un altro modello può decidere DROP proprio lì. Ora il test controlla
+che il programma abbia scelto la classe del riferimento \emph{e} ne abbia
+eseguito l'azione: redirect per un inoltro, \texttt{XDP\_DROP} per uno scarto,
+\texttt{XDP\_PASS} per una classe inutilizzata.
+
+\textbf{Tutte le classi che il modello sa decidere.} Il fabric cercava un caso
+per ogni classe cambiando stato dei link e TTL, con nodo e porta d'ingresso
+fissi. Col checkpoint basta, perché è lo stato dei link a spostare la sua
+decisione. Coi pesi casuali dei sintetici conta anche il resto, e la ricerca
+trovava da 1 a 3 classi. Adesso, per le classi mancanti, la ricerca cambia
+anche porta d'ingresso, nodo e code, e ogni caso scrive i suoi valori nelle
+mappe prima di spedire il pacchetto.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Modello} & \textbf{prima} & \textbf{adesso} \\
+\midrule
+ipa\_like, ipa\_ttl16 & 3, 4, 5 & \textbf{2}, 3, 4, 5 \\
+small & 0, 1, 2 & 0, 1, 2, \textbf{3} \\
+mixed & 0, 1, 3 & 0, 1, \textbf{2}, 3 \\
+large & 4, 8 & \textbf{1}, 4, \textbf{6}, 8 \\
+deep / sparse / ones & 0, 1, 4 / 1, 5 / 0 & uguale \\
+\bottomrule
+\end{tabular}
+\end{center}
+Le classi che mancano ancora il modello non le decide mai: su 200\,000 ingressi
+casuali \texttt{deep} sceglie solo 0, 1 e 4, e \texttt{ones}, che ha tutti i pesi
+uguali a 1, sceglie sempre la classe 0. È una proprietà del modello, non un
+limite del test.
+
+\textbf{Il traffico misura un inoltro.} I generatori mandano pacchetti con TTL
+32. Col checkpoint, con tutti i link attivi, quel pacchetto viene inoltrato; con
+\texttt{large} invece viene scartato, e il banco misurerebbe lo scarto
+chiamandolo inoltro. Il banco allora cerca lo stato dei link che porta a un
+inoltro, lo scrive nella mappa e lo stampa:
+\begin{lstlisting}
+traffico di large con link_state=00111000, TTL 32 -> classe 4 (FORWARD)
+\end{lstlisting}
+
+\section{La prova che la strada nuova non cambia niente}
+
+Il checkpoint si può passare anche esplicitamente, \texttt{--model checkpoint}:
+va per la strada nuova. Confrontato con la strada di sempre:
+\begin{itemize}
+  \item pesi, scala e significato delle classi identici; il riferimento Python
+        dà la stessa classe e lo stesso logit su 3\,000 ingressi;
+  \item il sorgente di P1 e la foglia di P2 sono identici \emph{byte per byte};
+  \item il riferimento generico, che la strada nuova usa per tutti, coincide con
+        quello scritto per il 65-4-4-7 su 20\,000 ingressi;
+  \item sul traffico vero: 3,37 / 2,98 / 2,81 / 1,87 / 1,47~Mpps contro
+        3,40 / 3,01 / 2,87 / 1,91 / 1,49 del giorno prima. Anche la baseline,
+        che nessun modello tocca, perde l'1\%: è variazione fra sessioni.
+\end{itemize}
+
+E la correttezza sui modelli nuovi:
+\begin{itemize}
+  \item nel kernel, ogni scenario per ogni modello compatibile per ogni pipeline,
+        40 ingressi a testa, sotto due identificativi di modello:
+        \textbf{110 su 110}, più \texttt{large} non applicabile a P2 e P3;
+  \item suite kernel e fabric su nove modelli: tutto PASS.
+\end{itemize}
+
+\section{I risultati}
+
+Sul traffico vero, un core, stesso banco del capitolo~\ref{ch:reale}. Milioni
+di pacchetti al secondo e, fra parentesi, i nanosecondi per pacchetto in più
+rispetto alla baseline:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llrrrrr@{}}
+\toprule
+\textbf{Modello} & \textbf{forma} & \textbf{baseline} & \textbf{P1} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
+\midrule
+checkpoint & 65-4-4-7   & 3,37 & 2,98 (+39) & 2,81 (+58) & 1,87 (+237) & 1,47 (+385) \\
+deep       & 65-4-4-4-7 & 3,31 & 2,87 (+46) & 2,76 (+60) & 1,78 (+261) & 1,35 (+438) \\
+small      & 15-4-4     & 3,30 & 3,01 (+29) & 2,88 (+45) & 2,11 (+172) & 1,74 (+271) \\
+mixed      & 18-6-5     & 3,28 & 3,02 (+27) & 2,90 (+40) & 2,06 (+181) & 1,67 (+293) \\
+large      & 117-8-8-9  & 3,30 & 2,61 (+80) & 2,54 (+90) & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Tre cose si leggono subito.
+\begin{itemize}
+  \item \textbf{Uno strato in più costa soprattutto a P3}: \texttt{deep} ha uno
+        strato più del checkpoint e costa +24~ns su P2, +53~ns su P3, +7~ns su
+        P1. P3 paga ogni strato con un salto fra programmi e una lettura dei
+        suoi pesi; P1 ha tutto dentro lo stesso programma.
+  \item \textbf{Ingressi più piccoli abbassano P2 e P3} di 60--110~ns: il primo
+        strato, che è il più largo, scorre meno colonne.
+  \item \textbf{Un ingresso più grande pesa su P1}: \texttt{large} costa a P1 il
+        doppio del checkpoint, 80~ns contro 39.
+\end{itemize}
+
+Nel kernel, con \texttt{BPF\_PROG\_TEST\_RUN}, si vede anche una cosa che il
+traffico non può separare: \textbf{P2 e P3 costano per la forma, P1 per i valori
+dei pesi}. Checkpoint, \texttt{ipa\_like}, \texttt{ipa\_ttl16} e \texttt{sparse}
+hanno la stessa forma: P2 e P3 costano uguale per tutti (194--198 e
+312--322~ns), mentre P1.5 va da 38~ns (\texttt{sparse}, pesi a zero tolti in
+compilazione) a 51. Queste latenze però sono state prese col portatile a
+batteria: sono indicative finché non si rimisurano con l'alimentatore.
+
+Il bit rate su \texttt{deep} ripete il comportamento del checkpoint: per tutte
+le pipeline la perdita comincia \emph{all'ingresso}, quindi il collo di
+bottiglia resta il programma eBPF. Cambia solo dove: P3 è pulita fino a
+0,48~Gbit/s invece che 0,72, perché lo strato in più la porta sotto 1,41~Mpps.
+
+\begin{lezione}
+Il confronto fra le pipeline non è una proprietà del checkpoint: su cinque
+modelli l'ordine P1 $<$ P1.5 $<$ P2 $<$ P3 resta lo stesso, e i costi si spostano
+come ci si aspetta dalla forma. La profondità pesa soprattutto su P3,
+l'ampiezza dell'ingresso su P1.
+\end{lezione}
+
+\section{Che cosa non fa ancora}
+
+\begin{itemize}
+  \item \textbf{Tre marcature e latenza minima} (\texttt{--mode rates},
+        \texttt{--latency}) girano solo col checkpoint: usano versioni del
+        programma con i timbri dentro, generate dal suo sorgente.
+  \item \textbf{Una misura per modello} sul traffico vero, e le latenze del
+        kernel dei sintetici prese a batteria.
+  \item \textbf{Nessun modello sintetico è addestrato}: servono a provare le
+        pipeline su forme diverse, non a dire qualcosa sull'instradamento.
+\end{itemize}
+
+% ==================================================================
 \chapter{I numeri di oggi, in una pagina}
 \label{ch:numeri}
 % ==================================================================
@@ -2880,8 +3149,10 @@ In tre righe:
 \begin{itemize}
 \item \textbf{Il costo del nodo delle pipeline leggere} con pacchetti grezzi: il
       generatore non le satura. Servono più thread di generatore.
-\item \textbf{Architetture diverse su traffico vero}: il costo del nodo è misurato
-      su un modello solo.
+\item \textbf{Tre marcature e latenza minima su modelli diversi}: oggi solo col
+      checkpoint (capitolo \ref{ch:modelli}).
+\item \textbf{Le latenze del kernel dei modelli sintetici} con l'alimentatore: quelle
+      del capitolo \ref{ch:modelli} sono state prese a batteria.
 \item \textbf{Hardware vero}: una scheda di rete con XDP nativo e una seconda
       macchina, per un numero che non sia di un cavo virtuale.
 \item \textbf{Il tetto sull'uscita di P2}: lo strato finale è srotolato a 32
@@ -2951,6 +3222,21 @@ sudo python3 ipa/test/verify_per_model_semantics.py
 sudo python3 ipa/test/verify_synth_kernel.py --all --n 300
 sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p2
 sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p3
+\end{lstlisting}
+
+\section{Altri modelli, altre reti}
+
+\begin{lstlisting}
+python3 ipa/test/test_model_source.py
+sudo python3 ipa/test/test_model_source.py --kernel
+sudo python3 ipa/test/host_conditions.py --run -- \
+     python3 ipa/test/test_suite.py --only kernel --model synth:deep
+sudo python3 ipa/test/test_fabric.py --model synth:small -q
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 \
+     --gen-cpus 10,1,3 --dut-cpus 6 --model synth:deep \
+     --out results/models/throughput_deep
+sudo python3 ipa/test/bench_bitrate.py --model synth:deep --rounds 3 \
+     --out results/models/bitrate_deep
 \end{lstlisting}
 
 \section{Datapath reale: il pacchetto attraversa davvero}

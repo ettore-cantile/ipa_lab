@@ -1615,6 +1615,8 @@ def main(argv=None):
                         "riepilogo, inizio della perdita e costo del "
                         "contatore con le regole attuali. Non serve root.")
     HC.add_args(p)
+    import model_under_test as MUT
+    MUT.add_args(p)
     a = p.parse_args(argv)
     # --out e --report sono rispetto alla cartella da cui si lancia. Sotto,
     # main() si sposta in ipa/ (come bench_throughput): fino al 2026-09-26
@@ -1637,6 +1639,9 @@ def main(argv=None):
     if os.geteuid() != 0:
         sys.exit("serve root: sudo python3 ipa/test/bench_bitrate.py")
     HC.check_args(a)
+    # Il modello e lo scenario: senza, il checkpoint per la strada di sempre.
+    # build_pipeline e class_semantics (bench_throughput) li seguono da soli.
+    MUT.select(a.model, a.topology)
     a.egress_cpu = HC.parse_egress(a.egress_cpu)
     if a.loss_threshold is None:
         a.loss_threshold = DEFAULT_LOSS_THRESHOLD

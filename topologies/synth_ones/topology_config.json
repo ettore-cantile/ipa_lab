@@ -1,0 +1,7 @@
+{
+  "_comment": "Synthetic network, no real topology: 3 interfaces, 4 nodes, TTL 8. The network of the synthetic preset ones (hand-checkable smoke tests).",
+  "topology": "synth_ones",
+  "n_interfaces": 3,
+  "n_nodes": 4,
+  "initial_ttl": 8
+}

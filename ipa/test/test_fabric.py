@@ -118,7 +118,13 @@ def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30,
     """
     import itertools
     found = {}
-    for bits in itertools.product([0, 1], repeat=6):
+    # link_state as wide as the model reads it: 6 for the checkpoint, the
+    # model under test's own width otherwise.
+    n_ls = 6
+    m = V._mut()
+    if m is not None:
+        n_ls = (m.feature("link_state") or {"size": 0})["size"]
+    for bits in itertools.product([0, 1], repeat=n_ls):
         # From 2: ttl<=1 is never forwarded (a hop must not send a packet
         # whose TTL would reach 0), so those inputs cannot be delivered
         # whatever class the model picks.
@@ -132,6 +138,46 @@ def _cases_covering_classes(V, weights, scale, model_id, n_out, max_ttl=30,
             if len(found) == n_out:
                 return found
     return found
+
+def _cases_widened(model, cases, n_out, max_ttl, ingress_port, node_index,
+                   budget=20000, seed=20260929):
+    """The classes the link_state x TTL search left out, searched again over
+    EVERY input the node controls: link_state, TTL, ingress port, node index,
+    queue state. For a model under test only.
+
+    Why: the checkpoint's argmax moves with link_state, so the first search
+    reaches 6 of its 7 classes. A synthetic model's random weights give the
+    node and the ingress port as much say, and with those two fixed the first
+    search reached 1-3 classes of 3-9 -- a delivery test covering a third of
+    the decisions. The ingress port and the node are map entries, so a case
+    can set them as well as link_state: each returned case carries its own.
+
+    Returns {class: (link_state, ttl, extra)}, extra = {"port", "node",
+    "queues"}; the first search's cases keep this node and this port.
+    """
+    import random
+    import pipeline_setup as PS
+    size = {f["type"]: f["size"] for f in model.features}
+    out = {c: (ls, ttl, {"port": ingress_port, "node": node_index,
+                         "queues": None})
+           for c, (ls, ttl) in cases.items()}
+    rng = random.Random(seed)
+    for _ in range(budget):
+        if len(out) == n_out:
+            break
+        ls = [rng.randint(0, 1) for _ in range(size.get("link_state", 0))]
+        q = [rng.randint(0, 15) for _ in range(size.get("queue_occupancy", 0))]
+        ttl = rng.randint(2, max(2, max_ttl))
+        port = rng.randint(0, size["ingress_iface"]) if "ingress_iface" in size else 0
+        node = rng.randrange(size["node"]) if "node" in size else None
+        cls, _ = PS.reference(model, ttl, link_state=ls or None,
+                              ingress_port=port, node_index=node,
+                              queues=q or None)
+        if cls not in out:
+            out[cls] = (ls, ttl, {"port": port, "node": node,
+                                  "queues": q or None})
+    return out
+
 
 def _counter_snapshot(m, n):
     """Current values of a counter array, summed over CPUs, as a list."""
@@ -166,22 +212,36 @@ _SETUP = {"hardcoded": "setup_hardcoded",
 
 
 def _deliver_cases(fab, b, sem, n_out, cases, V, weights, scale,
-                   ingress_port, node_index, cls_map, pkt_map, timeout):
+                   ingress_port, node_index, cls_map, pkt_map, timeout,
+                   wire=None):
     """Inject one frame per class case and check where it came out.
 
     Shared by the BCC pipelines (run_one) and the deployed AOT object
     (run_aot): the same question, asked of two ways of building P1.
+
+    A case of three elements (_cases_widened) brings its own ingress port,
+    node and queue state: `wire(extra)` writes them into the maps before the
+    frame goes out, and the reference is asked with the same values.
     """
     from common import write_vector_map
     delivered = 0
     for exp_cls in sorted(cases):
-        ls, ttl = cases[exp_cls]
+        ls, ttl = cases[exp_cls][:2]
+        extra = cases[exp_cls][2] if len(cases[exp_cls]) > 2 else None
         # The map and the reference must be told the same thing, or
         # they are answering different questions.
         write_vector_map(b, "link_state", ls)
-        got_cls = V.ref_infer(weights, scale, ttl, 0,
-                              ingress_port=ingress_port,
-                              node_index=node_index, link_state=ls)[0]
+        if extra is not None:
+            import pipeline_setup as PS
+            ingress_port, node_index = wire(extra)
+            got_cls = PS.reference(V._mut(), ttl, link_state=ls or None,
+                                   ingress_port=ingress_port,
+                                   node_index=node_index,
+                                   queues=extra["queues"])[0]
+        else:
+            got_cls = V.ref_infer(weights, scale, ttl, 0,
+                                  ingress_port=ingress_port,
+                                  node_index=node_index, link_state=ls)[0]
         assert got_cls == exp_cls, (
             f"the case search and the per-case reference disagree "
             f"({exp_cls} vs {got_cls}) on the same input -- they are "
@@ -189,6 +249,10 @@ def _deliver_cases(fab, b, sem, n_out, cases, V, weights, scale,
         action = sem.action_of(exp_cls)
         exp_port = sem.port_of(exp_cls) if action == "FORWARD" else None
         lsd = "".join(map(str, ls))
+        if extra is not None:
+            lsd += (f" port={ingress_port} node={node_index}"
+                    + (f" queues={''.join(map(str, extra['queues']))}"
+                       if extra["queues"] else ""))
 
         cls_before = _counter_snapshot(cls_map, n_out)
         pkt_before = _counter_snapshot(pkt_map, 3)
@@ -263,11 +327,15 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
     from common import attach_xdp, detach_xdp
     import model_meta as mm
 
-    n_out = mm.derive_shape(mm.load_model_meta(
-        os.path.join(SHARED_DIR, "weights.json")),
-        topology_config=mm.load_topology_config())["n_out"]
-    sem = mm.load_class_semantics(os.path.join(SHARED_DIR, "weights.json"), n_out)
-    _ = n_out
+    mut = V._mut()
+    if mut is not None:
+        import pipeline_setup as PS
+        n_out, sem = mut.n_out, mut.semantics
+    else:
+        n_out = mm.derive_shape(mm.load_model_meta(
+            os.path.join(SHARED_DIR, "weights.json")),
+            topology_config=mm.load_topology_config())["n_out"]
+        sem = mm.load_class_semantics(os.path.join(SHARED_DIR, "weights.json"), n_out)
     ports = sem.logical_ports
 
     print(f"\n{YELLOW}=== {method} on a real datapath "
@@ -294,7 +362,11 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
         # the kernel ifindex (205, 217, ...) never falls inside [1, n_interfaces].
         ing_name = _INGRESS_NAME[setup["pipeline"]]
         ingress_port = FABRIC_INGRESS_SLOT
+        if mut is not None:
+            ingress_port = PS.ingress_slot_for(mut, FABRIC_INGRESS_SLOT) or 0
         try:
+            if not ingress_port:
+                raise KeyError("the model has no ingress_iface feature")
             b[ing_name][ct.c_uint32(fab.ingress_ifindex)] = \
                 ct.c_uint32(ingress_port)
             if verbose:
@@ -309,7 +381,11 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
         # the feature finally varies with the node rather than with the packet.
         nid_name = _NODEID_NAME[setup["pipeline"]]
         node_index = FABRIC_NODE_INDEX
+        if mut is not None:
+            node_index = PS.node_index_for(mut, FABRIC_NODE_INDEX)
         try:
+            if node_index is None:
+                raise KeyError("the model has no node feature")
             b[nid_name][ct.c_uint32(0)] = ct.c_uint32(node_index)
             if verbose:
                 info(f"{nid_name}: this node is index {node_index}")
@@ -320,19 +396,47 @@ def run_one(method, model_path, ttl_range, xdp_mode, timeout, verbose):
 
         # --ttl-max now bounds the SEARCH for per-class inputs, not a blind
         # sweep: the sweep was what made 7/7 mean one class seven times.
+        max_ttl = max(ttl_range)
+        if mut is not None:
+            import model_under_test as MUT
+            max_ttl = min(max_ttl, max(2, MUT.initial_ttl(mut)))
         cases = _cases_covering_classes(V, weights, scale, 0, n_out,
-                                        max_ttl=max(ttl_range),
+                                        max_ttl=max_ttl,
                                         ingress_port=ingress_port,
                                         node_index=node_index)
         missing = [c for c in range(n_out) if c not in cases]
         info(f"classes reachable by varying link_state and ttl: "
              f"{sorted(cases)}" + (f"; unreachable: {missing}" if missing else ""))
+        wire = None
+        if mut is not None:
+            first = set(cases)
+            cases = _cases_widened(mut, cases, n_out, max_ttl,
+                                   ingress_port, node_index)
+            missing = [c for c in range(n_out) if c not in cases]
+            info(f"classes reachable varying also ingress port, node and "
+                 f"queues: {sorted(cases)} (new: "
+                 f"{sorted(set(cases) - first) or 'none'})"
+                 + (f"; unreachable: {missing}" if missing else ""))
+            from common import write_vector_map
+
+            def wire(extra):
+                """This case's ingress port, node and queues, into the maps."""
+                PS.set_ingress(setup, fab.ingress_ifindex, extra["port"])
+                PS.set_node(setup, extra["node"])
+                # Always written, empty included: a case that leaves the
+                # queues alone inherits the previous case's, while the
+                # reference is asked with empty ones.
+                qf = mut.feature("queue_occupancy")
+                if qf is not None:
+                    write_vector_map(b, "queue_state",
+                                     extra["queues"] or [0] * qf["size"])
+                return extra["port"], extra["node"]
 
         attach_xdp(b, setup["disp"], iface=fab.ingress, mode=xdp_mode)
         try:
             _deliver_cases(fab, b, sem, n_out, cases, V, weights, scale,
                            ingress_port, node_index, setup["cls_stats"],
-                           setup["pkt_stats"], timeout)
+                           setup["pkt_stats"], timeout, wire=wire)
         finally:
             try:
                 detach_xdp(b, iface=fab.ingress, mode=xdp_mode)
@@ -636,7 +740,11 @@ def main():
                         "by loader_aot, maps filled by the deploy's own "
                         "control plane")
     p.add_argument("--model", default=None,
-                   help="checkpoint (default: model_meta.default_checkpoint())")
+                   help="modello: checkpoint, synth:<preset>, una cartella o un "
+                        ".pt (vedi model_under_test.py). Senza: il checkpoint "
+                        "configurato")
+    p.add_argument("--topology", default=None,
+                   help="scenario in topologies/ (senza: quello compatibile)")
     p.add_argument("--ttl-max", type=int, default=30,
                    help="upper bound of the TTL search for per-class inputs")
     p.add_argument("--xdp-mode", choices=["native", "generic", "auto"],
@@ -661,14 +769,23 @@ def main():
         sys.exit("needs root: sudo python3 ipa/test/test_fabric.py")
 
     from model_meta import default_checkpoint
-    model_path = a.model or default_checkpoint()
+    import model_under_test as MUT
+    mut = MUT.select(a.model, a.topology)
+    model_path = default_checkpoint()
     methods = list(_SETUP) + ["aot"] if a.method == "all" else [a.method]
+    if mut is not None and not mut.reference and "aot" in methods:
+        # The deploy path builds its object from a trained checkpoint
+        # (method4_hardcoded_aot.py --model <.pt>); the same P1 object on
+        # this model is what `hardcoded` above loads, through p1_aot.
+        info(f"aot: il deploy costruisce l'oggetto da un checkpoint; con "
+             f"{mut.name} P1 e' provata da `hardcoded` (stesso generatore)")
+        methods.remove("aot")
     ttl_range = range(2, a.ttl_max + 1)
 
     print(f"{YELLOW}{'=' * 64}{NC}")
     print(f"{YELLOW} fabric test -- real attach, real redirect, real capture{NC}")
     print(f"{YELLOW}{'=' * 64}{NC}")
-    print(f"  model   : {model_path}")
+    print(f"  model   : {mut.name + ' (' + mut.shape + ')' if mut else model_path}")
     print(f"  ttl     : search 1..{a.ttl_max}")
     print(f"  xdp     : {a.xdp_mode}")
 
@@ -682,7 +799,11 @@ def main():
                     run_one(m, model_path, ttl_range, a.xdp_mode, a.timeout,
                             verbose=not a.quiet)
             except Exception as e:
-                fail(f"{m}: {type(e).__name__}: {e}")
+                import pipeline_setup as PS
+                if isinstance(e, PS.NotApplicable):
+                    info(f"{m}: NON APPLICABILE a questo modello ({e})")
+                else:
+                    fail(f"{m}: {type(e).__name__}: {e}")
 
     if a.sweep or a.only_sweep:
         try:

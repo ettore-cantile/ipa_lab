@@ -261,7 +261,29 @@ _PercpuLeaf = ct.c_longlong * _NR_CPUS
 def _percpu_arr(val: int) -> "_PercpuLeaf":
     return _PercpuLeaf(*([int(val)] * _NR_CPUS))
 
+def _mut():
+    """The model under test (--model / $IPA_MODEL), or None: then every
+    function below runs the configured checkpoint exactly as before."""
+    import model_under_test as MUT
+    return MUT.active()
+
+
+def _setup_mut(pipeline, model_id, m):
+    """setup_* for the model under test: the shared builders, the model also
+    answering to `model_id`, every link up -- what the setups below do for
+    the checkpoint."""
+    import pipeline_setup as PS
+    setup = PS.build(pipeline, m)
+    if model_id != 0:
+        PS.register_model_id(setup, model_id)
+    PS.seed_inputs(setup)
+    return setup
+
+
 def load_weights(model_path=MODEL_PT):
+    m = _mut()
+    if m is not None:
+        return list(m.weights), m.scale
     from extract_weights import extract_weights_int8
     weights = extract_weights_int8(model_path)
     scale = 128
@@ -332,7 +354,18 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ingress_port: int = 
     ttl 2..8 returns the same class every time, so a test that varies only TTL
     exercises exactly one output class however many times it runs. link_state
     is the feature that actually changes the decision.
+
+    With a model under test the generic reference answers (it equals this one
+    on the checkpoint, logit for logit); h1/h2 are then empty.
     """
+    m = _mut()
+    if m is not None:
+        import pipeline_setup as PS
+        cls, val = PS.reference(m, ttl, link_state=link_state,
+                                ingress_port=ingress_port,
+                                node_index=node_index)
+        return cls, val, [], []
+
     def s8(v):
         return ct.c_int8(int(v) & 0xFF).value
     N_IN, N_H1, N_H2, N_OUT = 65, 4, 4, 7
@@ -542,6 +575,9 @@ def _default_semantics_for(b, name):
     Routed through the one shared resolver so the verifier cannot disagree with
     the datapath about what class 5 means.
     """
+    m = _mut()
+    if m is not None:
+        return m.semantics
     import model_meta as mm
     n_out = None
     try:
@@ -722,6 +758,9 @@ def setup_baseline(model_id: int, model_path: str):
     the reference FLOOR for the throughput/latency comparison -- it answers "how
     much of the hardcoded number is just the XDP+parse+redirect framework vs the
     actual inference". Returns the same dict shape as the other setups."""
+    m = _mut()
+    if m is not None:
+        return _setup_mut("baseline", model_id, m)
     weights, scale = load_weights(model_path)
     b = BPF(text=EBPF_BASELINE)
     fn = b.load_func("xdp_baseline", BPF.XDP)
@@ -886,6 +925,9 @@ def setup_hardcoded(model_id: int, model_path: str):
       - t_compile_s  : clang, offline (0 when the object was already cached)
       - t_insert_s   : 0 (no runtime weight insertion in P1)
     """
+    m = _mut()
+    if m is not None:
+        return _setup_mut("hardcoded", model_id, m)
     import p1_aot
     weights, scale = load_weights(model_path)
     setup = p1_aot.load_p1([(model_id, weights, scale)])
@@ -897,6 +939,9 @@ def setup_hardcoded(model_id: int, model_path: str):
 
 
 def setup_template(model_id: int, model_path: str):
+    m = _mut()
+    if m is not None:
+        return _setup_mut("template", model_id, m)
     from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER, EBPF_ARCH_GENERIC_2LAYER, load_arch_weights)
     weights, scale = load_weights(model_path)
     src = "#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER + "\n" + EBPF_ARCH_GENERIC_2LAYER
@@ -918,6 +963,9 @@ def setup_template(model_id: int, model_path: str):
 
 
 def setup_modular(model_id: int, model_path: str):
+    m = _mut()
+    if m is not None:
+        return _setup_mut("modular", model_id, m)
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
     weights, scale = load_weights(model_path)
     b = BPF(text=EBPF_MODULAR_FULL)
@@ -1029,6 +1077,19 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
     ttl, repeat = _count_lookups_defaults(ttl, repeat)
     weights, scale = load_weights(model_path)
 
+    m = _mut()
+    if m is not None:
+        import pipeline_setup as PS
+        setup = PS.build(method, m, instrument=True)
+        if model_id != 0:
+            PS.register_model_id(setup, model_id)
+        PS.seed_inputs(setup)
+        if method == "hardcoded":
+            print(f"[count_lookups] {method}: instrumenting "
+                  f"{setup['lookup_sites']} lookup sites (AOT object)")
+        return _lookups_per_packet(method, setup["b"], setup["disp"],
+                                   build_frame(model_id, ttl, scale), repeat)
+
     if method == "baseline":
         # The reference floor: same parse + same mac_table action as the real
         # pipelines, no inference. Its lookups are the framework cost every
@@ -1079,7 +1140,13 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
     else:
         raise ValueError(f"count_lookups: unknown method {method!r}")
 
-    frame = build_frame(model_id, ttl, scale)
+    return _lookups_per_packet(method, b, disp_fn,
+                               build_frame(model_id, ttl, scale), repeat)
+
+
+def _lookups_per_packet(method, b, disp_fn, frame, repeat):
+    """Run `repeat` packets through the instrumented build, return the
+    lookups per packet."""
     # lookup_ctr is a BPF_PERCPU_ARRAY (no atomic on the hot path -- the same
     # per-CPU counter pattern the design-space analysis recommends for
     # pkt_stats/cls_stats). Zero every CPU's copy, then sum them back.
@@ -1172,9 +1239,22 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
 
     npass, nfail, details = 0, 0, []
 
-    # --- forwarded: TTL 5 must come out as TTL 4 with a valid checksum ---
+    # --- forwarded: TTL t must come out as TTL t-1 with a valid checksum ---
+    # t = 5 for the checkpoint, whose decision there is FORWARD. Another model
+    # may DROP at 5; the property is about forwarding, so the first TTL whose
+    # reference decision is FORWARD is used (none: nothing to check).
+    t_fwd = 5
+    m = _mut()
+    if m is not None:
+        import model_under_test as MUT
+        t_fwd = next((t for t in range(5, MUT.initial_ttl(m) + 1)
+                      if m.semantics.action_of(ref_infer(
+                          None, scale, t, model_id)[0]) == "FORWARD"), None)
+        if t_fwd is None:
+            details.append(f"{method}: nessun TTL porta a una classe FORWARD "
+                           f"con tutti i link su: inoltro non verificabile")
     _reset_stats(setup)
-    frame = build_frame(model_id, 5, scale)
+    frame = build_frame(model_id, t_fwd or 5, scale)
     retval, _, out = prog_test_run_data(disp.fd, frame)
     if len(out) >= 34:
         ttl_out = out[14 + 8]                    # eth(14) + offset of TTL in IP hdr
@@ -1182,13 +1262,15 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
     else:
         ttl_out, csum_ok = None, False
     forwarded = retval in (0, 4)
-    if forwarded and ttl_out == 4 and csum_ok:
+    if t_fwd is None:
+        pass
+    elif forwarded and ttl_out == t_fwd - 1 and csum_ok:
         npass += 1
-        details.append(f"{method}: TTL 5 -> forwarded, out TTL={ttl_out}, checksum OK")
+        details.append(f"{method}: TTL {t_fwd} -> forwarded, out TTL={ttl_out}, checksum OK")
     else:
         nfail += 1
-        details.append(f"{method}: TTL 5 -> retval={retval} out_ttl={ttl_out} "
-                       f"csum_ok={csum_ok} (atteso retval in (0,4), ttl 4, csum OK)")
+        details.append(f"{method}: TTL {t_fwd} -> retval={retval} out_ttl={ttl_out} "
+                       f"csum_ok={csum_ok} (atteso retval in (0,4), ttl {t_fwd - 1}, csum OK)")
 
     # --- expired: TTL 1 must NOT be forwarded ---
     _reset_stats(setup)
@@ -1308,9 +1390,19 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
         # latency for the tables is measured by prog_test_run_bench().
         retval, dur_ns = prog_test_run(disp.fd, frame, repeat=1, ingress_ifindex=0)
         cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
-        ok = (retval in XDP_REDIRECT_PASS) and (cls_count > 0)
+        # The checkpoint's reference class over this TTL range is a FORWARD
+        # one, so a redirect is what it must do. Another model may decide
+        # DROP or UNUSED: then the program must drop, or pass, instead.
+        expect = XDP_REDIRECT_PASS
+        m = _mut()
+        if m is not None:
+            import model_under_test as MUT
+            expect = MUT.expected_retvals(m, ref_cls)
+        ok = (retval in expect) and (cls_count > 0)
         detail = f"retval={retval} cls_stats[{ref_cls}]={cls_count}"
-        if retval == XDP_PASS:
+        if m is not None:
+            detail += f" ({m.semantics.action_of(ref_cls)})"
+        if retval == XDP_PASS and XDP_PASS not in expect:
             ok = False
             detail += "  <-- XDP_PASS: inference did not complete / no mac_table entry"
         lat_us = dur_ns / 1000
@@ -1420,13 +1512,21 @@ def main():
     p.add_argument("--method", choices=["hardcoded", "template", "modular", "sparse-hetero"],
                    default="hardcoded")
     p.add_argument("--model-id", type=int, default=0)
-    p.add_argument("--model", default=MODEL_PT)
+    p.add_argument("--model", default=None,
+                   help="modello (vedi model_under_test.py); senza: il "
+                        "checkpoint configurato")
+    p.add_argument("--topology", default=None,
+                   help="scenario in topologies/ (senza: quello compatibile)")
     p.add_argument("--model-dir", default=os.path.join(SHARED_DIR, "test", "fixtures", "sparse_hetero_11"),
                    help="sparse-hetero: directory with model_meta.json (+ weights.json)")
     p.add_argument("--ttl-min", type=int, default=2)   # 1 = expired, never forwarded
     p.add_argument("--ttl-max", type=int, default=10)
     p.add_argument("--repeat", type=int, default=1000, help="BPF_PROG_TEST_RUN repeat count for latency measurement")
     args = p.parse_args()
+    import model_under_test as MUT
+    MUT.select(args.model, args.topology)
+    if MUT.active() is None:
+        args.model = MODEL_PT
     if args.method == "sparse-hetero":
         sys.exit(run_sparse_hetero(args.model_dir, args.model_id, args.ttl_min, args.ttl_max, args.repeat))
     sys.exit(run(args.method, args.model_id, args.model, args.ttl_min, args.ttl_max, args.repeat))

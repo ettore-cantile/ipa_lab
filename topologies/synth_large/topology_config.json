@@ -1,0 +1,7 @@
+{
+  "_comment": "Synthetic network, no real topology: 8 interfaces (the compiled IPA_MAX_IFACES), 100 nodes, TTL 64. The network of the synthetic preset large.",
+  "topology": "synth_large",
+  "n_interfaces": 8,
+  "n_nodes": 100,
+  "initial_ttl": 64
+}

@@ -1,0 +1,8 @@
+{
+  "_comment": "Germany50 dimensions with packets entering at TTL 16: the network of the synthetic preset ipa_ttl16.",
+  "topology": "germany50_ttl16",
+  "n_interfaces": 6,
+  "n_nodes": 52,
+  "n_queues": 4,
+  "initial_ttl": 16
+}

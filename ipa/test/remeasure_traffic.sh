@@ -54,6 +54,9 @@ bench() {
 run fabric_sweep        python3 ipa/test/test_fabric.py --sweep
 run synth_p2            python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p2
 run synth_p3            python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p3
+for m in checkpoint synth:ipa_like synth:deep synth:sparse synth:ipa_ttl16 synth:small synth:ones synth:mixed synth:large; do
+    run "fabric_${m#synth:}" python3 ipa/test/test_fabric.py --model "$m" -q
+done
 
 # traffico vero
 bench tp_compare    ipa/test/bench_throughput.py --mode compare --rounds 3 \
@@ -62,6 +65,14 @@ bench tp_cores1     ipa/test/bench_throughput.py --mode compare --rounds 3 \
     --gen-cpus 10,1,3 --dut-cpus 6 --out "$ROOT/results/throughput_cores1"
 bench tp_cores2     ipa/test/bench_throughput.py --mode compare --rounds 3 \
     --gen-cpus 10,1,3 --dut-cpus 6,8 --out "$ROOT/results/throughput_cores2"
+# modelli diversi dal checkpoint (docs/testing.md §12)
+for m in checkpoint deep small mixed large; do
+    ref=$([ "$m" = checkpoint ] && echo checkpoint || echo "synth:$m")
+    bench "tp_model_$m" ipa/test/bench_throughput.py --mode compare --rounds 3 \
+        --gen-cpus 10,1,3 --dut-cpus 6 --model "$ref" --out "$ROOT/results/models/throughput_$m"
+done
+bench bitrate_deep  ipa/test/bench_bitrate.py --model synth:deep --rounds 3 \
+    --out "$ROOT/results/models/bitrate_deep"
 bench bitrate       ipa/test/bench_bitrate.py --out "$ROOT/results/bitrate_3500"
 bench tp_rates      ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 \
     --rates 0.5,1,1.5,2,2.5,3 --out "$ROOT/results/throughput_rates"

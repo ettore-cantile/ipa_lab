@@ -874,6 +874,14 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         info("Needs Linux + BCC + root: sudo python3 ipa/test/test_suite.py --only kernel")
         return True
     mp = model_path or V.MODEL_PT
+    mut = V._mut()
+    if mut is not None:
+        import model_under_test as MUT
+        c = V.ref_infer(None, mut.scale, V.BENCH_TTL, 0)[0]
+        info(f"modello sotto test: {mut.name} ({mut.shape}); al TTL del banco "
+             f"({V.BENCH_TTL}, link tutti su) decide la classe {c}, "
+             f"{mut.semantics.action_of(c)}: la latenza e' quella di quel "
+             f"percorso")
     methods = [
         ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
         # P1.5 as DEPLOYED: the AOT object (gen_full_c + loader_aot, through
@@ -884,9 +892,16 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     ]
     rows = []
     all_ok = True
+    import pipeline_setup as PS
+    not_applicable = set()
     for name, setup_fn, pl in methods:
         try:
             setup = setup_fn(0, mp)
+        except PS.NotApplicable as e:
+            # A compiled ceiling of this pipeline, not a failure of it.
+            info(f"{name}: NON APPLICABILE a questo modello ({e})")
+            not_applicable.add(name)
+            continue
         except PermissionError:
             info(f"{name}: permission denied loading XDP (needs root/CAP_BPF) — suite skipped.")
             return True
@@ -1044,7 +1059,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     if verify:
         print()
         for name, _, _ in methods:
-            if name == "baseline":
+            if name == "baseline" or name in not_applicable:
                 continue   # baseline has no inference to verify (pure parse+redirect)
             try:
                 failed = V.run(name, 0, mp, ttl_min, ttl_max, repeat=1000)
@@ -1063,7 +1078,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         # so a missing checksum fix cannot pass unnoticed.
         print()
         for name, _, _ in methods:
-            if name == "baseline":
+            if name == "baseline" or name in not_applicable:
                 continue
             try:
                 np_, nf_, det = V.verify_ttl_handling(name, 0, mp)
@@ -1087,6 +1102,11 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
             if changes:
                 sample = ", ".join(f"TTL{t}:link{k} {u}->{d}" for t, k, u, d in changes[:6])
                 ok(f"link_state reroute: {len(changes)}/{tested} link-down cases change egress  [{sample}]")
+            elif mut is not None:
+                # "the model never reroutes" is a property of the trained
+                # checkpoint worth failing on; of a synthetic model it is not.
+                info(f"link_state reroute: 0/{tested} casi cambiano classe con "
+                     f"{mut.name} (proprieta' del modello, non del datapath)")
             else:
                 fail(f"link_state reroute: 0/{tested} link-down cases changed the egress class "
                      f"(feature wired but the model never reroutes on failure for TTL {ttl_min}-{ttl_max})")
@@ -1099,7 +1119,15 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         # design-space claim ("arbitrary depth/width per pipeline") actually
         # holds in the kernel, not just in the Python generator.
         try:
-            alt_ok = verify_alt_architectures(ttl_min, ttl_max)
+            if mut is not None:
+                # Fixed shapes of their own (65-8-7, 65-6-5-7 next to the
+                # checkpoint, ...): they test the pipelines, not the model
+                # under test, and run with no --model.
+                info("architetture alternative: saltate con --model "
+                     "(usano forme proprie; girano senza --model)")
+                alt_ok = True
+            else:
+                alt_ok = verify_alt_architectures(ttl_min, ttl_max)
             all_ok = all_ok and alt_ok
         except Exception as e:
             fail(f"alt-architecture verification: error ({e})")
@@ -1150,14 +1178,32 @@ def _load_default_model(model_arg):
 def main():
     parser = argparse.ArgumentParser(description="IPA test suite: weight extraction, quantization, in-kernel metrics")
     parser.add_argument('--only', default='all', choices=['all', 'extract', 'quant', 'kernel'], help='Which suite to run (default: all)')
-    parser.add_argument('--model', type=str, default=None, help='Path to the .pt checkpoint')
+    parser.add_argument('--model', type=str, default=None,
+                        help='Model: checkpoint, synth:<preset>, a directory or a .pt '
+                             '(see model_under_test.py). Default: the configured checkpoint')
+    parser.add_argument('--topology', type=str, default=None,
+                        help='Scenario (network) in topologies/; default: the one the model fits')
     parser.add_argument('--samples', type=int, default=200, help='Samples for quant')
     parser.add_argument('--kernel-repeat', type=int, default=50000, help='BPF_PROG_TEST_RUN repeats for the kernel suite')
     parser.add_argument('--kernel-trials', type=int, default=7, help='Independent min-of-N trials per pipeline (fixes run-to-run volatility, see suite_kernel docstring)')
     parser.add_argument('--no-verify', action='store_true', help='Kernel suite: skip the dispatch gate (metrics only)')
     args = parser.parse_args()
+    import model_under_test as MUT
+    mut = MUT.select(args.model, args.topology)
     all_suites = ['extract', 'quant', 'kernel']
     which = all_suites if args.only == 'all' else [args.only]
+    if mut is not None and not mut.reference:
+        # extract/quant check the trained checkpoint's .pt: its extraction and
+        # its quantisation. A synthetic model has no .pt to extract from.
+        skipped = [s_ for s_ in which if s_ != 'kernel']
+        if skipped:
+            print(f"{YELLOW}[INFO]{NC} {', '.join(skipped)}: riguardano il "
+                  f"checkpoint addestrato, non {mut.name} -- saltate")
+        which = [s_ for s_ in which if s_ == 'kernel']
+    if mut is not None:
+        # The model travels through $IPA_MODEL now; the path argument below is
+        # the checkpoint's own (or unused), never the reference string.
+        args.model = None
     needs_torch = any(s != 'kernel' for s in which)
     if needs_torch and not TORCH_AVAILABLE:
         print("[ERROR] PyTorch not found. Install with: pip install torch")

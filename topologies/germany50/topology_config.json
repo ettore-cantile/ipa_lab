@@ -4,7 +4,9 @@
   "n_interfaces": 6,
   "n_nodes": 52,
   "n_queues": 4,
+  "initial_ttl": 30,
   "_n_interfaces_note": "Largest node degree in the network, NOT this node's degree. karlsruhe reaches 6 once h_src is attached; the rest range from 2 to 6 and pad the unused link_state slots with zeros.",
   "_n_nodes_note": "50 SNDlib routers + h_src + h_dst.",
-  "_n_queues_note": "Declared for completeness. The checked-in model's feature descriptor has no queue_occupancy feature, so nothing reads this."
+  "_n_queues_note": "Declared for completeness. The checked-in model's feature descriptor has no queue_occupancy feature, so nothing reads this.",
+  "_initial_ttl_note": "TTL with which packets enter the network; the model reads ttl / initial_ttl (model_meta.json inputs.ttl.normalize_by). A model trained with another initial TTL is not compatible with this scenario."
 }

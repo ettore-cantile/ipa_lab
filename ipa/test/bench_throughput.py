@@ -465,6 +465,8 @@ def setup_rxonly():
 # Il nodo che la P1 specializzata si porta dentro. Lo stesso che installa
 # test_fabric, cosi' le due misure parlano dello stesso nodo.
 STATIC_NODE = 7
+# Il TTL dei pacchetti dei due generatori (pktgen e xdp_gen, senza --ttl-mix).
+TRAFFIC_TTL = 32
 
 # Contatore sull'uscita: XDP_DROP, cosi' il conteggio non paga lo stack di rete
 # e non falsa la misura con il costo di consegnare a un socket.
@@ -2887,11 +2889,12 @@ def _map_extra_ingress(setup, ifindexes):
     misura una decisione presa su un input diverso da quello dichiarato."""
     import test_fabric as TF
     pl = setup["pipeline"]
-    if pl == 0:
+    _, slot = _node_slot()
+    if pl == 0 or not slot:
         return          # la baseline non legge la porta d'ingresso
     ing = setup["b"][TF._INGRESS_NAME[pl]]
     for idx in ifindexes:
-        ing[ct.c_uint32(idx)] = ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
+        ing[ct.c_uint32(idx)] = ct.c_uint32(slot)
 
 
 def _read_lat(b, acc="lat_acc", hist="lat_hist"):
@@ -3835,6 +3838,56 @@ def del_tg_links(n):
 # ==========================================================================
 # setup
 # ==========================================================================
+def _node_slot():
+    """(indice del nodo, porta d'ingresso logica) che il banco dichiara: il 7
+    e l'1 del fabric, o i piu' vicini che il modello sotto test sa esprimere
+    (una rete da 4 nodi non ha il nodo 7). None = il modello non ha quella
+    feature."""
+    import test_fabric as TF
+    import verify_prog_run as V
+    m = V._mut()
+    if m is None:
+        return TF.FABRIC_NODE_INDEX, TF.FABRIC_INGRESS_SLOT
+    import pipeline_setup as PS
+    return (PS.node_index_for(m, TF.FABRIC_NODE_INDEX),
+            PS.ingress_slot_for(m, TF.FABRIC_INGRESS_SLOT))
+
+
+def _forwarding_inputs(setup, m, node, slot, ttl=TRAFFIC_TTL):
+    """Lo stato dei link (e delle code) con cui il pacchetto dei generatori --
+    TTL fisso, questo nodo, questa porta -- viene INOLTRATO dal modello sotto
+    test, scritto nelle mappe.
+
+    Col checkpoint e' implicito: link tutti su, TTL 32 danno una classe
+    FORWARD. Un altro modello puo' decidere DROP proprio li', e il banco
+    misurerebbe il percorso di scarto chiamandolo inoltro. Si cerca: prima
+    tutti su, poi ogni combinazione dei link, poi (se ci sono) le code. Senza
+    uno stato che inoltra, il banco non si applica a questo modello."""
+    import itertools
+    import random
+    import pipeline_setup as PS
+    size = {f["type"]: f["size"] for f in m.features}
+    n_ls, n_q = size.get("link_state", 0), size.get("queue_occupancy", 0)
+    cands = [([1] * n_ls, [0] * n_q)]
+    cands += [(list(b), [0] * n_q)
+              for b in itertools.product([1, 0], repeat=n_ls)]
+    if n_q:
+        rng = random.Random(20260929)
+        cands += [([rng.randint(0, 1) for _ in range(n_ls)],
+                   [rng.randint(0, 15) for _ in range(n_q)])
+                  for _ in range(5000)]
+    for ls, q in cands:
+        c, _ = PS.reference(m, ttl, link_state=ls or None,
+                            ingress_port=slot or 0, node_index=node,
+                            queues=q or None)
+        if m.semantics.action_of(c) == "FORWARD":
+            PS.seed_inputs(setup, link_state=ls or None, queues=q or None)
+            setup["traffic_class"] = c
+            return ls, q, c
+    raise PS.NotApplicable(f"con TTL {ttl} nessuno stato dei link o delle "
+                           f"code porta {m.name} a un inoltro")
+
+
 def setup_p1_static(model_id, model_path, node=STATIC_NODE):
     """setup_hardcoded, ma con l'indice del nodo congelato nel sorgente.
 
@@ -3845,6 +3898,14 @@ def setup_p1_static(model_id, model_path, node=STATIC_NODE):
     `bench_scaling.py --verify` per la prova che decide come la P1.5."""
     import p1_aot
     import verify_prog_run as V
+
+    m = V._mut()
+    if m is not None:
+        import pipeline_setup as PS
+        node = PS.node_index_for(m, node)
+        setup = PS.build("p1_static", m, node_index=node)
+        PS.seed_inputs(setup)
+        return setup
 
     # L'oggetto AOT, come P1 si deploya (p1_aot), con il nodo congelato.
     weights, scale = V.load_weights(model_path)
@@ -3857,6 +3918,10 @@ def setup_p1_static(model_id, model_path, node=STATIC_NODE):
 
 def class_semantics():
     """The declared class semantics, resolved the same way test_fabric does."""
+    import verify_prog_run as V
+    m = V._mut()
+    if m is not None:
+        return m.semantics, m.n_out
     import model_meta as mm
     meta_path = os.path.join(SHARED_DIR, "weights.json")
     n_out = mm.derive_shape(
@@ -3898,22 +3963,37 @@ def build_pipeline(method, model_path, fab, sem):
         # esattamente cio' che la rende il tetto del banco.
         return setup
 
-    b[TF._INGRESS_NAME[pl]][ct.c_uint32(fab.ingress_ifindex)] = \
-        ct.c_uint32(TF.FABRIC_INGRESS_SLOT)
-    if method != "p1_static":
+    node, slot = _node_slot()
+    if slot:
+        b[TF._INGRESS_NAME[pl]][ct.c_uint32(fab.ingress_ifindex)] = \
+            ct.c_uint32(slot)
+    if method != "p1_static" and node is not None:
         # La specializzata ha l'indice del nodo compilato dentro: la mappa e'
         # ancora dichiarata nell'header condiviso ma nessuno la legge, e
         # scriverci darebbe l'impressione sbagliata che serva.
-        b[TF._NODEID_NAME[pl]][ct.c_uint32(0)] = \
-            ct.c_uint32(TF.FABRIC_NODE_INDEX)
+        b[TF._NODEID_NAME[pl]][ct.c_uint32(0)] = ct.c_uint32(node)
 
     # The model under the id pktgen writes. See the docstring: this is the
     # difference between measuring inference and measuring XDP_PASS.
     _register_alias(method, setup, PKTGEN_MAGIC_MODEL_ID)
+
+    m = V._mut()
+    if m is not None:
+        ls, q, c = _forwarding_inputs(setup, m, node, slot)
+        info(f"{method}: traffico di {m.name} con link_state="
+             f"{''.join(map(str, ls)) or '-'}"
+             + (f" code={q}" if q else "")
+             + f", TTL {TRAFFIC_TTL}, nodo {node}, porta {slot} -> classe "
+             f"{c} (FORWARD, porta logica {m.semantics.port_of(c)})")
     return setup
 
 
 def _register_alias(method, setup, model_id):
+    import verify_prog_run as V
+    if V._mut() is not None:
+        import pipeline_setup as PS
+        PS.register_model_id(setup, model_id, V._mut())
+        return
     b, w, scale = setup["b"], setup["weights"], setup["scale"]
     if method in ("hardcoded", "p1_static"):
         b["model_progs"][ct.c_int(model_id)] = ct.c_int(setup["fn"].fd)
@@ -5086,9 +5166,10 @@ def _class_scenarios(model_path):
     import test_fabric as TF
     sem, n_out = class_semantics()
     weights, scale = V.load_weights(model_path)
+    node, slot = _node_slot()
     cases = TF._cases_covering_classes(
-        V, weights, scale, 0, n_out, ingress_port=TF.FABRIC_INGRESS_SLOT,
-        node_index=TF.FABRIC_NODE_INDEX)
+        V, weights, scale, 0, n_out, ingress_port=slot or 0,
+        node_index=node)
     out = []
     for c in sorted(cases):
         act = sem.action_of(c)
@@ -6453,6 +6534,13 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("finestra_modo", getattr(a, "window", WINDOW_MODE))
         add("generatore", getattr(a, "generator", "pktgen"))
         add("ttl_mix", getattr(a, "ttl_mix", None) or "no (pacchetto fisso, TTL 32)")
+        import verify_prog_run as V
+        import model_under_test as MUT
+        m = V._mut()
+        add("modello", f"{m.name} ({m.ref})" if m else "checkpoint configurato")
+        add("modello_forma", m.shape if m else "dal checkpoint")
+        topo = MUT.active_topology() if m else None
+        add("scenario", topo["topology"] if topo else "dal checkpoint (trained_on)")
         add("cpu_uscita", f"separata: cpu{egress}" if egress is not None
             else "stessa del DUT")
         add("warmup_s", a.warmup)
@@ -7011,8 +7099,16 @@ def main():
     o.add_argument("--cleanup", action="store_true",
                    help="rimuovi un fabric rimasto da un run interrotto")
     HC.add_args(p)
+    import model_under_test as MUT
+    MUT.add_args(p)
     a = p.parse_args()
     HC.check_args(a)
+    mut = MUT.select(a.model, a.topology)
+    if mut is not None and (a.latency or a.mode == "rates"):
+        # Le due modalita' misurano con build STRUMENTATE (timbri nel
+        # programma), generate a parte dal sorgente del checkpoint.
+        sys.exit("--latency e --mode rates: per ora solo col checkpoint "
+                 "configurato (build strumentate); togli --model")
     a.egress_cpu = HC.parse_egress(a.egress_cpu)
     # --out e' rispetto alla cartella da cui si lancia: sotto, main() si
     # sposta in ipa/, e fino al 2026-09-27 `--out results/x` finiva in
