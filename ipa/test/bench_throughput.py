@@ -3891,29 +3891,11 @@ def _forwarding_inputs(setup, m, node, slot, ttl=TRAFFIC_TTL):
 def setup_p1_static(model_id, model_path, node=STATIC_NODE):
     """setup_hardcoded, ma con l'indice del nodo congelato nel sorgente.
 
-    Non e' in verify_prog_run perche' la specializzazione e' nata qui: lo
-    switch a n_nodi casi sulla one-hot del nodo sparisce e con lui la lettura
-    della mappa node_id, restando n_h1 costanti che clang piega
-    nell'accumulatore. Vedi _gen_feature_onehot_node in ebpf_program.py, e
-    `bench_scaling.py --verify` per la prova che decide come la P1.5."""
-    import p1_aot
+    Sta in verify_prog_run accanto alle altre pipeline, cosi' la suite kernel
+    misura la stessa P1 di questo banco. Passa da p1_aot.load_p1, quindi il
+    contatore che bench_bitrate inietta nell'oggetto AOT arriva anche qui."""
     import verify_prog_run as V
-
-    m = V._mut()
-    if m is not None:
-        import pipeline_setup as PS
-        node = PS.node_index_for(m, node)
-        setup = PS.build("p1_static", m, node_index=node)
-        PS.seed_inputs(setup)
-        return setup
-
-    # L'oggetto AOT, come P1 si deploya (p1_aot), con il nodo congelato.
-    weights, scale = V.load_weights(model_path)
-    setup = p1_aot.load_p1([(model_id, weights, scale)], static_node=node)
-    setup.update(weights=weights, scale=scale, static_node=node)
-    V._seed_link_state(setup["b"], 1)
-    V._install_mac_table(setup["b"], "mac_table")
-    return setup
+    return V.setup_p1_static(model_id, model_path, node=node)
 
 
 def class_semantics():

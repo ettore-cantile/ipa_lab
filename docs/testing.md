@@ -723,7 +723,7 @@ contro pesi del modello: 1 090 contro 1 064 istruzioni per P1.5).
 Un solo run, un solo stato del codice (2026-09-28, con `ipa_relu`, §8), DUT a 3 494 MHz;
 minimo su 7 trial con p50/max.
 
-| Metrica | baseline | P1 hardcoded (AOT) | P2 template | P3 modular |
+| Metrica | baseline | P1.5 hardcoded (AOT) | P2 template | P3 modular |
 |---|---:|---:|---:|---:|
 | Istruzioni eBPF (xlated) | 155 | 1 064 | 15 142 | 12 394 |
 | Codice jited (byte) | 706 | 5 179 | 68 510 | 57 767 |
@@ -739,7 +739,7 @@ minimo su 7 trial con p50/max.
 | | dispatcher | leaf |
 |---|---|---|
 | baseline | — | `xdp_baseline` 155 |
-| P1 hardcoded | `xdp_dispatch` 29 | `xdp_model` 1 035 |
+| P1.5 hardcoded | `xdp_dispatch` 29 | `xdp_model` 1 035 |
 | P2 template | `ipa_switch_template` 41 | `arch_generic_2layer` 15 101 |
 | P3 modular | `modular_dispatcher` 137 | `layer_first` 10 528 + `layer_hidden` 1 729 |
 
@@ -858,7 +858,7 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
   contatori atomici) baseline, P1 e P1.5 guadagnano ~8 ns per pacchetto (3,31 → 3,40,
   2,94 → 3,01, 2,81 → 2,87 Mpps), P2 e P3 restano entro la dispersione (1,89 → 1,91,
   1,50 → 1,49). Sotto `BPF_PROG_TEST_RUN` la suite kernel dà 14 / 53 / 199 / 319 ns contro
-  18 / 52 / 195 / 315: differenze di pochi ns in entrambi i versi, dentro la variazione fra
+  18 / 52 / 195 / 315 (baseline / P1.5 / P2 / P3): differenze di pochi ns in entrambi i versi, dentro la variazione fra
   i run. Le cifre di riferimento nel resto del documento restano quelle del 28-09.
 - **Tre punti di conteggio**: TX (pktgen, più i respinti da `veth_xmit` a coda piena), HIT
   (`pkt_stats[0]` della pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è

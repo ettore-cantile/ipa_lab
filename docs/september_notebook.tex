@@ -1070,8 +1070,11 @@ cento istruzioni.
 
 \section{La tabella}
 
-Modello 65-4-4-7, scala 24, \texttt{test\_suite -{}-only kernel}, P1 come oggetto
-AOT (quello che va sui nodi). Misurato il 28 settembre sulla macchina di
+Modello 65-4-4-7, scala 24, \texttt{test\_suite -{}-only kernel}, P1.5 come oggetto
+AOT (quello che va sui nodi). La colonna è la P1.5, quella che i capitoli
+precedenti chiamano semplicemente P1. La P1 specializzata, presentata nel
+capitolo seguente, è entrata nella suite il 29 settembre: le sue cifre si
+aggiungono a questa tabella con la prossima esecuzione. Misurato il 28 settembre sulla macchina di
 laboratorio, con la ReLU senza bivio (capitolo \ref{ch:relu}), il core del
 programma fisso a 3\,494~MHz e isolato dal resto (capitolo \ref{ch:macchina}).
 
@@ -1079,7 +1082,7 @@ programma fisso a 3\,494~MHz e isolato dal resto (capitolo \ref{ch:macchina}).
 \small
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-& \textbf{baseline} & \textbf{P1} & \textbf{P2} & \textbf{P3} \\
+& \textbf{baseline} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
 istruzioni caricate & 155 & 1\,064 & 15\,142 & 12\,394 \\
 salti fra programmi & 0 & 1 & 1 & 3 \\
@@ -1158,7 +1161,7 @@ esecuzione:
 \small
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-& baseline & P1 & P2 & P3 \\
+& baseline & P1.5 & P2 & P3 \\
 \midrule
 minimo   & 18 ns & 52 ns & 195 ns & 315 ns \\
 mediana  & 18 ns & 53 ns & 200 ns & 320 ns \\

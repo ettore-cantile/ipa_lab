@@ -938,6 +938,42 @@ def setup_hardcoded(model_id: int, model_path: str):
     return setup
 
 
+# The node P1 is specialised to. 7 is what the fabric has always claimed
+# (pipeline_setup.node_index_for keeps it when the model's node one-hot is
+# large enough); bench_scaling and bench_throughput use the same one.
+STATIC_NODE = 7
+
+
+def setup_p1_static(model_id: int, model_path: str, node: int = STATIC_NODE):
+    """
+    Pipeline 1 specialised (P1): setup_hardcoded with the node index frozen
+    into the source as well as the weights -- one binary per NODE. The
+    n_nodes-case switch on the node one-hot disappears, and the node_id map
+    read with it: n_h1 constants that clang folds into the accumulator (see
+    _gen_feature_onehot_node in ebpf_program.py; `bench_scaling.py --verify`
+    proves it decides like P1.5).
+
+    The setup carries "static_node": the reference must set that node's bit,
+    whereas the other pipelines, with no node_id entry installed, set none.
+    """
+    m = _mut()
+    if m is not None:
+        import pipeline_setup as PS
+        setup = PS.build("p1_static", m, node_index=PS.node_index_for(m, node))
+        if model_id != 0:
+            PS.register_model_id(setup, model_id)
+        PS.seed_inputs(setup)
+        return setup
+    # The AOT object, as P1 is deployed (p1_aot), with the node frozen.
+    import p1_aot
+    weights, scale = load_weights(model_path)
+    setup = p1_aot.load_p1([(model_id, weights, scale)], static_node=node)
+    setup.update(weights=weights, scale=scale, static_node=node)
+    _seed_link_state(setup["b"], 1)
+    _install_mac_table(setup["b"], "mac_table")
+    return setup
+
+
 def setup_template(model_id: int, model_path: str):
     m = _mut()
     if m is not None:
@@ -1080,11 +1116,12 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
     m = _mut()
     if m is not None:
         import pipeline_setup as PS
-        setup = PS.build(method, m, instrument=True)
+        node = PS.node_index_for(m, STATIC_NODE) if method == "p1_static" else None
+        setup = PS.build(method, m, node_index=node, instrument=True)
         if model_id != 0:
             PS.register_model_id(setup, model_id)
         PS.seed_inputs(setup)
-        if method == "hardcoded":
+        if method in ("p1_static", "hardcoded"):
             print(f"[count_lookups] {method}: instrumenting "
                   f"{setup['lookup_sites']} lookup sites (AOT object)")
         return _lookups_per_packet(method, setup["b"], setup["disp"],
@@ -1099,11 +1136,13 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
         b = BPF(text=src)
         disp_fn = b.load_func("xdp_baseline", BPF.XDP)
         _install_mac_table(b, "mac_table")
-    elif method == "hardcoded":
+    elif method in ("p1_static", "hardcoded"):
         # The AOT object with every bpf_map_lookup_elem counted
         # (p1_aot.instrument_lookups, the libbpf twin of the BCC rewrite).
         import p1_aot
-        setup = p1_aot.load_p1([(model_id, weights, scale)], instrument=True)
+        setup = p1_aot.load_p1(
+            [(model_id, weights, scale)], instrument=True,
+            static_node=STATIC_NODE if method == "p1_static" else None)
         print(f"[count_lookups] {method}: instrumenting "
               f"{setup['lookup_sites']} lookup sites (AOT object)")
         b, disp_fn = setup["b"], setup["disp"]
@@ -1151,7 +1190,7 @@ def _lookups_per_packet(method, b, disp_fn, frame, repeat):
     # per-CPU counter pattern the design-space analysis recommends for
     # pkt_stats/cls_stats). Zero every CPU's copy, then sum them back.
     ctr = b["lookup_ctr"]
-    if method == "hardcoded":
+    if method in ("p1_static", "hardcoded"):
         # AOT build: a plain ARRAY with an atomic add (see p1_aot).
         ctr[ct.c_int(0)] = ct.c_ulonglong(0)
         prog_test_run(disp_fn.fd, frame, repeat=repeat)
@@ -1229,13 +1268,15 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
 
     Returns (n_pass, n_fail, details).
     """
-    setup_fn = {"hardcoded": setup_hardcoded,
+    setup_fn = {"p1_static": setup_p1_static,
+                "hardcoded": setup_hardcoded,
                 "template":  setup_template,
                 "modular":   setup_modular}[method]
     setup = setup_fn(model_id, model_path)
     b, disp = setup["b"], setup["disp"]          # noqa: F841 (b keeps maps alive)
     scale = setup["scale"]
     ps = setup["pkt_stats"]
+    node = setup.get("static_node")              # only P1 has one frozen in
 
     npass, nfail, details = 0, 0, []
 
@@ -1249,7 +1290,8 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
         import model_under_test as MUT
         t_fwd = next((t for t in range(5, MUT.initial_ttl(m) + 1)
                       if m.semantics.action_of(ref_infer(
-                          None, scale, t, model_id)[0]) == "FORWARD"), None)
+                          None, scale, t, model_id,
+                          node_index=node)[0]) == "FORWARD"), None)
         if t_fwd is None:
             details.append(f"{method}: nessun TTL porta a una classe FORWARD "
                            f"con tutti i link su: inoltro non verificabile")
@@ -1330,8 +1372,8 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print("NOTE: bpf_redirect() runs in the TEST_RUN sandbox.")
     print("      PASS = retval in {0,4} (redirect fire) + cls_stats/pkt_stats hit.")
     print()
-    setup_fn = {"hardcoded": setup_hardcoded, "template": setup_template,
-                "modular": setup_modular}[method]
+    setup_fn = {"p1_static": setup_p1_static, "hardcoded": setup_hardcoded,
+                "template": setup_template, "modular": setup_modular}[method]
     setup = setup_fn(model_id, model_path)
     # b and fn are not referenced again but must stay in scope: they own the
     # BCC object and the loaded program: letting them be garbage-collected
@@ -1373,8 +1415,9 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     # map now -- P3 included, by packing it alongside the ingress port in one
     # scratch_meta slot rather than paying a second map lookup. This runner
     # installs no entry, so no node resolves and no bit is set, the same for
-    # every pipeline.
-    ref_node_index = None
+    # every pipeline -- except P1 specialised, whose node is frozen into the
+    # object and whose bit is therefore always set.
+    ref_node_index = setup.get("static_node")
 
     passed = failed = 0
     for ttl in range(ttl_min, ttl_max + 1):
@@ -1509,7 +1552,7 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
 
 def main():
     p = argparse.ArgumentParser(description="IPA/eBPF pipeline verifier")
-    p.add_argument("--method", choices=["hardcoded", "template", "modular", "sparse-hetero"],
+    p.add_argument("--method", choices=["p1_static", "hardcoded", "template", "modular", "sparse-hetero"],
                    default="hardcoded")
     p.add_argument("--model-id", type=int, default=0)
     p.add_argument("--model", default=None,

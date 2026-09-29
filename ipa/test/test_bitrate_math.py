@@ -416,8 +416,15 @@ def t_sources():
         p1_aot.p1_source = orig
     check("load_p1 compila p1_source(...) per nome (la sostituzione vale)",
           "p1_source(models" in inspect.getsource(p1_aot.load_p1))
+    # Il banco delega a verify_prog_run, che importa bcc: se ne legge il
+    # sorgente come testo invece di importarlo.
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "verify_prog_run.py"), encoding="utf-8") as f:
+        v_src = f.read()
+    v_p1s = v_src.split("def setup_p1_static(", 1)[1].split("\ndef ", 1)[0]
     check("setup_p1_static passa da p1_aot.load_p1",
-          "p1_aot.load_p1" in inspect.getsource(B.setup_p1_static))
+          "V.setup_p1_static" in inspect.getsource(B.setup_p1_static)
+          and "p1_aot.load_p1" in v_p1s)
 
 
 def t_scale_and_host():

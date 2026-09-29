@@ -884,8 +884,11 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
              f"percorso")
     methods = [
         ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
+        # P1 specialised: weights AND node index compiled in, one binary per
+        # node. The same AOT object as P1.5 with the node frozen (node 7).
+        ("p1_static", V.setup_p1_static, 1),
         # P1.5 as DEPLOYED: the AOT object (gen_full_c + loader_aot, through
-        # p1_aot).
+        # p1_aot). Until 2026-09-29 this was the only P1 in the table.
         ("hardcoded", V.setup_hardcoded, 1),
         ("template",  V.setup_template,  2),
         ("modular",   V.setup_modular,   3),
@@ -1048,10 +1051,11 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     print("  " + "-" * (32 + 16 * len(rows)))
     print()
     print("  NOTE: 'eBPF instructions' is the STATIC size of the loaded program, not the")
-    print("        number executed per packet. Pipeline 1 unrolls a 52-case switch for the")
-    print("        node one-hot of which exactly ONE case runs, so its executed path is a")
+    print("        number executed per packet. P1.5 (hardcoded) unrolls a 52-case switch for")
+    print("        the node one-hot of which exactly ONE case runs, so its executed path is a")
     print("        fraction of the count shown; dividing instructions by latency would give")
-    print("        an impossible instructions-per-cycle figure. See docs/testing.md.")
+    print("        an impossible instructions-per-cycle figure. P1 (p1_static) has the node")
+    print("        frozen in, so the switch is gone. See docs/testing.md.")
     print()
     for r in rows:
         detail = "  ".join(f"{p}={c}" for p, c in r["per"])
