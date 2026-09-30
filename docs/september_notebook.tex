@@ -2096,18 +2096,18 @@ che riceve e butta).
 
 Il secondo generatore (\texttt{ipa/test/xdp\_gen.py}) consegna al cavo virtuale
 pacchetti già nel formato di XDP, con \texttt{BPF\_PROG\_TEST\_RUN} in modalità
-\emph{live frames}: niente skb, niente copia. Arriva a circa 7 milioni di
-pacchetti al secondo.
+\emph{live frames}: niente skb, niente copia. Un solo thread offre 12--15
+milioni di pacchetti al secondo, ed è così che si usa: un thread per ogni coda
+del nodo (sezione~\ref{sec:scrittore}).
 
 \begin{prima}[Esempio: lo stesso programma con i due generatori]
-La baseline --- ricevi, leggi l'intestazione, inoltra --- costa \textbf{302~ns}
-per pacchetto con \texttt{pktgen} e \textbf{141~ns} con \texttt{xdp\_gen}. Il
-programma è lo stesso byte per byte: i 161~ns di differenza sono la copia della
-skb e il percorso dello stack, cioè il costo del \emph{generatore}, pagato sul
-core del nodo. Per questo i due generatori non si confrontano fra loro, ma ognuno
-confronta le pipeline \emph{al suo interno}: sopra la baseline, P2 costa 226~ns
-con il primo e 155~ns con il secondo, e P3 364 contro 293. La differenza fra le
-due stime è il costo del nodo che dipende da come arriva il pacchetto.
+P2 costa \textbf{526~ns} di CPU per pacchetto con \texttt{pktgen} e
+\textbf{293~ns} con \texttt{xdp\_gen}. Il programma è lo stesso byte per byte: i
+233~ns di differenza sono la copia della skb e il percorso dello stack, cioè il
+costo del \emph{generatore}, pagato sul core del nodo; per P3 la differenza è la
+stessa (672 contro 428). \emph{Sopra la baseline} invece i due generatori danno
+lo stesso costo della rete neurale: P2 226~ns con tutti e due, P3 364 contro 361,
+P1.5 53 contro 58. Il trasporto cambia, il costo del programma no.
 \end{prima}
 
 \section{Com'era il test nella macchina virtuale, e com'è adesso}
@@ -2213,24 +2213,26 @@ Il dual boot toglie il rumore. Non toglie i limiti di un banco che sta tutto su
 un portatile: vanno conosciuti, perché ognuno dice quali numeri si possono citare
 e quali no.
 
-\subsection*{1. Il generatore ha un tetto}
+\subsection*{1. Il generatore può non bastare, o intralciare}
 
 Se il nodo è più veloce di quanto il generatore riesca a produrre, il banco
-misura il generatore. \texttt{pktgen} arriva a circa 4,6 milioni di pacchetti al
-secondo consegnati, \texttt{xdp\_gen} a circa 7.
+misura il generatore: con un thread, \texttt{pktgen} si ferma a 2,8 milioni di
+pacchetti al secondo e \texttt{xdp\_gen} a 12--15. Aggiungere thread sembra la
+soluzione, ma più thread che scrivono nella \emph{stessa} coda si intralciano, e
+rallentano anche il nodo che la svuota: è la sezione~\ref{sec:scrittore}.
 
-\begin{prima}[Esempio: tre pipeline appiccicate al soffitto]
-Con \texttt{xdp\_gen}, \texttt{rxonly} --- che riceve e butta, e quindi fa meno di
-tutti --- arriva a 6,89 milioni al secondo; la baseline a 7,11; P1 a 6,34; P1.5
-a 6,23. Sono tutti lì, contro il soffitto dei 7 milioni: che la baseline superi
-\texttt{rxonly} dice proprio che nessuno dei due è il vero limite. P2 (3,38) e P3
-(2,30) invece stanno ben sotto: loro sì saturano, e il loro numero è il loro
-costo. Per questo la tabella dei pacchetti grezzi cita come costi solo P2 e P3.
+\begin{prima}[Esempio: il ``tetto del generatore'' che non era del generatore]
+Con \texttt{xdp\_gen} a tre thread \texttt{rxonly} arrivava a 6,89 milioni al
+secondo, la baseline a 7,11, P1 a 6,34, P1.5 a 6,23: tutti contro un soffitto di
+circa 7 milioni. Sembrava il limite del generatore. Invece, con un thread solo, la
+baseline elabora 12,4 milioni e \texttt{rxonly} 14,9: il soffitto era la coda
+condivisa da tre scrittori. P2 e P3, che saturano molto prima, non ne risentivano.
 \end{prima}
 
-Con \texttt{pktgen} il tetto è più basso ma le pipeline sono più lente (c'è la
-copia), e tutte e cinque saturano sotto di esso: è per questo che la tabella
-principale del capitolo viene da \texttt{pktgen}.
+Con \texttt{pktgen} l'effetto è piccolo (circa 17~ns per pacchetto, uguali per
+tutte le pipeline) e tutte e cinque saturano: è per questo che la tabella
+principale del capitolo viene da \texttt{pktgen} a tre thread, dove anche
+\texttt{rxonly} satura.
 
 \subsection*{2. Contare all'uscita sottostima il nodo}
 
@@ -2250,6 +2252,10 @@ Per questo il controllo di validità del banco (``la baseline dev'essere la più
 veloce'') conta i pacchetti \emph{elaborati dal nodo}, la stessa misura con cui
 il banco calcola il costo, e non quelli arrivati all'uscita.
 \end{prima}
+
+Con un solo scrittore per coda anche all'uscita (un core del nodo che inoltra,
+sezione~\ref{sec:scrittore}) il nodo successivo tiene il passo: riceve 12
+milioni di pacchetti al secondo senza perderne.
 
 \subsection*{3. Il cavo è virtuale, e tutto sta su un processore}
 
@@ -2362,41 +2368,125 @@ nel rumore.
 \section{Il costo del nodo, con pacchetti grezzi}
 
 Con il generatore a pacchetti grezzi (\texttt{xdp\_gen}, sezione
-\ref{sec:generatori}) e il nodo successivo su un core suo, il costo per
-pacchetto sul core del nodo --- dalla presa del pacchetto alla consegna
-all'uscita --- è:
+\ref{sec:generatori}), un thread solo, un core del nodo e il nodo successivo su
+un core suo --- uno scrittore per coda, sezione~\ref{sec:scrittore} --- il
+tempo di CPU che il nodo spende per ogni pacchetto, dalla presa del pacchetto
+alla consegna all'uscita, è:
 
 \begin{center}
 \small
-\begin{tabular}{@{}lrr@{}}
+\begin{tabular}{@{}lrrr@{}}
 \toprule
-\textbf{Pipeline} & \textbf{ns per pacchetto} & \\
+\textbf{Pipeline} & \textbf{ns di CPU per pacchetto} & \textbf{sopra la baseline} & \textbf{con \texttt{pktgen}} \\
 \midrule
-P2 (template) & 296--307 & \\
-P3 (modular)  & 433--444 & \\
-baseline, P1, P1.5 & 141, 158, 161 & \emph{al tetto del generatore: limiti superiori} \\
+P1 & 116 & +49 & +38 \\
+P1.5 & 125 & +58 & +53 \\
+P2 (template) & 293 & +226 & +226 \\
+P3 (modular)  & 428 & +361 & +364 \\
+baseline & 67 & --- & --- \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} 5 giri a 64 byte, e 3 giri per taglia a 64, 512 e 1\,514 byte.}
+{\footnotesize\color{soft} 30 settembre, 3 giri a 64 byte. La baseline, con un
+thread, non satura: il suo valore è indicativo. A 512 e 1\,514 byte P2 e P3
+costano uguale entro il 3\%.}
 \end{center}
 
-Solo P2 e P3 sono costi del nodo. Le tre più leggere elaborano 6,2--7,1 milioni
-di pacchetti al secondo, e il generatore a pacchetti grezzi non ne produce più
-di circa 7: il loro numero è quello del generatore, e dice solo che il nodo
-costa \emph{al massimo} tanto. La sezione sui limiti (\ref{sec:limiti}) lo
-mostra con i numeri.
+I costi sopra la baseline sono quasi gli stessi dei due generatori: la rete
+neurale costa lo stesso, comunque arrivi il pacchetto.
 
 \begin{itemize}
   \item \textbf{La taglia del pacchetto non conta}: a 64, 512 e 1\,514 byte il costo
         è lo stesso entro il 3\%. Il nodo guarda solo l'intestazione.
   \item \textbf{La porta d'uscita non conta}: le cinque classi che inoltrano costano
         uguale entro l'11\%.
-  \item \textbf{Scartare costa di più che inoltrare}: la classe DROP costa 260~ns
-        su P1 contro 158, 330 su P2, 468 su P3. Quando il pacchetto viene
-        scartato la sua pagina di memoria si restituisce sul core del nodo;
-        quando viene inoltrato, su quello del nodo successivo. È un effetto del
-        banco, non della pipeline.
+  \item \textbf{Scartare costa di più che inoltrare}: la classe DROP costa circa
+        50~ns in più delle altre (P1 173 contro 117, P1.5 177 contro 124, P3 480
+        contro 427). Quando il pacchetto viene scartato la sua pagina di memoria
+        si restituisce sul core del nodo; quando viene inoltrato, su quello del
+        nodo successivo. È un effetto del banco, non della pipeline.
 \end{itemize}
+
+\section{Uno scrittore per coda}
+\label{sec:scrittore}
+
+\subsection*{La domanda}
+
+Con \texttt{xdp\_gen} a tre thread, \texttt{rxonly}, la baseline, P1 e P1.5 si
+fermavano tutte intorno a 7 milioni di pacchetti al secondo, mentre il
+generatore ne offriva 34--39 milioni e l'80\% veniva respinto. Il limite era del
+generatore o del nodo? La prova naturale è cambiare il numero di thread: se il
+limite è del generatore, più thread lo alzano.
+
+\subsection*{Con meno thread il nodo elabora di più}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Thread del generatore} & \textbf{\texttt{rxonly}} & \textbf{baseline} & \textbf{P1.5} \\
+\midrule
+1 & 14,9 & 12,4 & 6,9 \\
+2 & 9,8 & 7,3 & 6,3 \\
+3 & 7,4 & 7,2 & 6,2 \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize\color{soft} Milioni di pacchetti elaborati al secondo, un core del
+nodo, \texttt{xdp\_gen}. Misura presa a batteria: le differenze arrivano al
+doppio, e le misure con l'alimentatore qui sotto dicono la stessa cosa.}
+\end{center}
+
+Il limite non era né il generatore né il programma: era \textbf{la coda}. Tre
+thread scrivono nella stessa coda da 256 posti, e per farlo devono passarsi un
+lucchetto e le stesse righe di cache; il core del nodo, che dalla stessa coda
+legge, ne subisce il rallentamento. È come una cassa dove tre fornitori scaricano
+merce nello stesso punto: il cassiere non lavora peggio, ma gli spazi sono
+contesi.
+
+\begin{prima}[La prova con due code]
+Con due core sul nodo ci sono due code. Con due thread, uno per coda, la baseline
+elabora 13,0 milioni al secondo; con tre thread, due dei quali finiscono sulla
+stessa coda, 7,6. Lo stesso nodo, cambia solo quanti scrivono in ogni coda.
+P1 e P1.5 guadagnano il 45\%, P2 il 6\%, P3 l'1\%: il danno è grande per i
+programmi leggeri e quasi nullo per quelli il cui limite è davvero il programma.
+\end{prima}
+
+Lo stesso succede \textbf{all'uscita}: con due core sul nodo, tutti e due
+inoltrano nelle stesse code verso il nodo successivo, e con la baseline metà dei
+pacchetti si perde dopo il programma anche se il nodo successivo è occupato solo
+al 77\%. Con \texttt{pktgen}, che riempie la coda più lentamente, la contesa
+costa circa 17~ns per pacchetto, uguali per tutte le pipeline: i costi sopra la
+baseline non cambiano.
+
+\begin{lezione}
+Un solo scrittore per coda, in ingresso e in uscita: più thread di generatore
+non aiutano, peggiorano. Con una scheda di rete vera la regola è rispettata da
+sé: la coda di ricezione la riempie la scheda, un solo scrittore, e i pacchetti
+degli altri host arrivano in fila sul cavo. Resta quello che conta, la coda
+piena davanti a un nodo troppo lento.
+\end{lezione}
+
+\subsection*{Il tempo di CPU, non il tempo che passa}
+
+Con un solo thread \texttt{xdp\_gen} spedisce a raffiche: la raffica riempie la
+coda e il resto viene respinto, poi fra una raffica e l'altra il nodo svuota la
+coda e \emph{aspetta}. Il core del nodo lavora così l'84--88\% del tempo, anche
+mentre respinge il 70--80\% dei pacchetti. Dividere il tempo per i pacchetti
+elaborati conterebbe anche l'attesa: P2 risulterebbe 334~ns invece di 293.
+
+Per questo il banco misura quanto il core del nodo è occupato, nella stessa
+finestra in cui conta i pacchetti, e dà il costo come \textbf{tempo di CPU per
+pacchetto}: occupazione per il tempo diviso i pacchetti. Con \texttt{pktgen} il
+nodo è occupato al 100\% e le due cose coincidono: le cifre della tabella
+principale sono tempi di CPU veri.
+
+\begin{prima}[Scartare o inoltrare]
+Un gemello di \texttt{rxonly} che invece di scartare inoltra, nella stessa
+sessione a tre thread, elabora il 4\% in più (7,53 contro 7,21 milioni al
+secondo); la baseline, 7,21, \emph{non} supera \texttt{rxonly}. Il ``baseline più
+veloce di \texttt{rxonly}'' del 28 settembre era una differenza di pochi punti
+dentro la coda contesa. La misura pulita è quella per classe: scartare costa al
+nodo circa 50~ns in più che inoltrare.
+\end{prima}
 
 \section{Al crescere del bit rate}
 
@@ -3157,8 +3247,10 @@ In tre righe:
 \chapter{Quel che resta aperto}
 
 \begin{itemize}
-\item \textbf{Il costo del nodo delle pipeline leggere} con pacchetti grezzi: il
-      generatore non le satura. Servono più thread di generatore.
+\item \textbf{Il costo del nodo di baseline e \texttt{rxonly}} con pacchetti
+      grezzi: con un thread per coda il generatore non le satura, e più thread
+      intralciano la coda (sezione~\ref{sec:scrittore}). Serve un generatore
+      più veloce su un solo scrittore, o una scheda vera.
 \item \textbf{Tre marcature e latenza minima su modelli diversi}: oggi solo col
       checkpoint (capitolo \ref{ch:modelli}).
 \item \textbf{Le latenze del kernel dei modelli sintetici} con l'alimentatore: quelle

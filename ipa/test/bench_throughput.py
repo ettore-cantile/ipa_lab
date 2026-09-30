@@ -451,6 +451,47 @@ int xdp_rxonly(struct xdp_md *ctx) {
 """
 
 
+# IL GEMELLO DI rxonly CHE INOLTRA.
+#
+# rxonly conta e SCARTA; la baseline analizza, decrementa il TTL e INOLTRA.
+# Con i frame XDP grezzi la baseline elabora piu' di rxonly (7,1 contro 6,9
+# Mpps) pur facendo piu' lavoro. L'ipotesi: scartare costa di piu' che
+# inoltrare, perche' con XDP_DROP la pagina del pacchetto si restituisce sul
+# core del nodo, con il redirect la libera il core d'uscita. rxonly_fwd
+# differisce da rxonly SOLO nell'ultima istruzione: conta, poi redirige sulla
+# porta 0 (una lettura di mac_table in piu'), senza analisi ne' TTL. Se elabora
+# piu' di rxonly, lo scarto costa al nodo piu' dell'inoltro.
+RX_FWD = "rxonly_fwd"
+RXFWD_SRC = """
+#include <uapi/linux/bpf.h>
+struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
+BPF_ARRAY(mac_table, struct fwd_action, 8);
+BPF_PERCPU_ARRAY(pkt_stats, __u64, 3);
+BPF_PERCPU_ARRAY(cls_stats, __u64, 8);
+int xdp_rxonly_fwd(struct xdp_md *ctx) {
+    int k = 0;
+    __u64 *v = pkt_stats.lookup(&k);
+    if (v) *v += 1;
+    __u32 port = 0;
+    struct fwd_action *a = mac_table.lookup(&port);
+    if (!a || !a->ifindex)
+        return XDP_DROP;
+    return bpf_redirect(a->ifindex, 0);
+}
+"""
+
+
+def setup_rxonly_fwd():
+    """rxonly che inoltra: HIT e' pkt_stats[0], RX il contatore d'uscita,
+    come per la baseline."""
+    from bcc import BPF
+    b = BPF(text=RXFWD_SRC)
+    fn = b.load_func("xdp_rxonly_fwd", BPF.XDP)
+    return {"b": b, "fn": fn, "disp": fn, "pipeline": 0,
+            "cls_stats": b["cls_stats"], "pkt_stats": b["pkt_stats"],
+            "progs": {"xdp_rxonly_fwd": fn.fd}}
+
+
 def setup_rxonly():
     """Il contatore d'ingresso con la forma di un setup di pipeline. RX e' il
     suo HIT (`rx_is_hit`): il pacchetto non arriva mai al contatore d'uscita,
@@ -2008,7 +2049,9 @@ def report_generator(gen):
         return
     print("")
     print(f"{YELLOW}  -- generatore, ultima finestra --{NC}")
-    cpu_of = {i["name"]: i["cpu"] for i in gen.instances}
+    # pktgen ha un'istanza per thread con la sua CPU; il generatore XDP no
+    # (gira nei thread che lancia lui): li' la colonna resta "?".
+    cpu_of = {i["name"]: i["cpu"] for i in getattr(gen, "instances", [])}
     for d in r.per_dev:
         print(f"    {d['dev']:16s} cpu{cpu_of.get(d['dev'], '?'):<3} "
               f"tx={d['tx']:>9d} {d['pps']:>9d} pps  {d['secs']:>6.3f} s  "
@@ -2257,7 +2300,17 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     if diag_data:
         g, d = gen_cpu_load(diag_data, plan)
         med["cpu_gen_pct"] = g
+        med["cpu_dut_pct_punto"] = d
         med["cpu_dut_pct"] = d
+    # L'occupazione nella finestra dei pacchetti, se c'e' (finestra
+    # stazionaria): e' quella giusta per il tempo di CPU. Mediana fra le
+    # ripetizioni, come il rate.
+    win = [r.get("_cpu_win") or {} for r in runs]
+    if plan and plan.dut and all(all(c in w for c in plan.dut) for w in win):
+        per_run = [sum(w[c] for c in plan.dut) / len(plan.dut) for w in win]
+        med["cpu_dut_pct"] = round(statistics.median(per_run), 1)
+    if med.get("cpu_dut_pct") is not None:
+        med["ns_cpu"] = ns_cpu(med, med["cpu_dut_pct"], plan)
         med["softnet_dropped"] = diag_data.get("softnet_dropped")
         med["_diag"] = diag_data
     return med
@@ -2275,22 +2328,37 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     e si cambiano solo i parametri del punto. Senza, si ricade sul percorso
     storico -- aggiungi, configura, misura -- che serve ai chiamanti che non
     hanno un Generator."""
+    cpu_win = {}
     if gen is not None and steady and gen.window_mode == "steady":
         # Finestra stazionaria: i contatori si leggono a differenza mentre
         # tutte le istanze trasmettono, quindi niente azzeramento, niente
         # drenaggio e niente controllo sul count (vedi Generator.steady).
+        #
+        # Anche /proc/stat, nella STESSA lettura: l'occupazione dei core va
+        # misurata sulla finestra dei pacchetti. Diag la misura attorno a
+        # tutto il punto (avvio e arresto del generatore compresi), e da li'
+        # veniva un nodo "fermo il 17%" che nella finestra forse non c'era.
+        # Risoluzione: un jiffy (10 ms) su ~300 ms, cioe' ~3%.
         def probe():
-            return dict(hit=_read_u64(setup["pkt_stats"], 0),
-                        miss=_read_u64(setup["pkt_stats"], 1),
-                        drop=_read_u64(setup["pkt_stats"], 2),
-                        rx=(_read_u64(setup["pkt_stats"], 0)
-                            if setup.get("rx_is_hit") else _percpu_sum(rx_tab)))
+            out = dict(hit=_read_u64(setup["pkt_stats"], 0),
+                       miss=_read_u64(setup["pkt_stats"], 1),
+                       drop=_read_u64(setup["pkt_stats"], 2),
+                       rx=(_read_u64(setup["pkt_stats"], 0)
+                           if setup.get("rx_is_hit") else _percpu_sum(rx_tab)))
+            for c, (busy, tot) in _read_proc_stat().items():
+                out[f"_cpub{c}"] = busy
+                out[f"_cput{c}"] = tot
+            return out
         run = gen.steady(frame, delay, probe)
         devs = gen.names
         tx, tx_pps, elapsed = run
         d = run.dut
         hit, miss, drop, rx = d["hit"], d["miss"], d["drop"], d["rx"]
         secs = run.window if run.window > 0 else 1e-9
+        for k, dt in d.items():
+            if k.startswith("_cput") and dt > 0:
+                c = int(k[5:])
+                cpu_win[c] = round(100.0 * d.get(f"_cpub{c}", 0) / dt, 1)
     else:
         # PRIMA di azzerare: la coda della finestra precedente (warm-up o
         # ripetizione) deve essere atterrata, altrimenti i suoi pacchetti finiscono
@@ -2366,6 +2434,7 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 offered_tx=offered_tx,
                 offered_real_pps=int(offered_tx / secs),
                 hit=hit, miss=miss, drop=drop, rx=rx,
+                _cpu_win=cpu_win,
                 rx_pps=int(rx / secs),
                 # Il rate a cui il PROGRAMMA ha preso la decisione. E' la
                 # capacita' del nodo anche quando l'uscita non tiene il passo:
@@ -3807,6 +3876,38 @@ def make_tg_links(n, gen_queues=1, dut_queues=1):
 DUT_QUEUES = None
 
 
+def _warn_shared_queues(plan):
+    """Avvisa se due thread del generatore XDP scrivono nella stessa coda.
+
+    Il redirect nel veth sceglie la coda del nodo dalla CPU che trasmette
+    (CPU modulo numero di code: e' cio' che le misure del 2026-09-30
+    mostrano, results/generator_contention/). Due scrittori sulla stessa coda
+    la svuotano piu' lentamente: su un core, 1 -> 3 thread porta la baseline
+    da 12,4 a 7,2 Mpps; su due core, 2 thread (uno per coda) contro 3 danno
+    13,0 contro 7,6. Le pipeline leggere ne escono sottostimate fino al 70%,
+    P2 e P3 entro il 6%. Regola: un thread per coda, su CPU di resto diverso."""
+    if len(plan.dut) > 1:
+        warn(f"{len(plan.dut)} core del nodo inoltrano nelle STESSE code "
+             f"d'uscita (una per veth): due scrittori per coda anche li'. Con "
+             f"le pipeline leggere l'uscita si intasa e il redirect fallisce, "
+             f"cioe' il nodo paga lo scarto: misurato il 2026-09-30 su 2 core, "
+             f"baseline persa per il 49% dopo XDP con l'uscita occupata al "
+             f"77%. P2 e P3 non ne risentono.")
+    n_q = ingress_queues(plan)[1] if len(plan.gen) > 1 else 1
+    per_q = {}
+    for c in plan.gen:
+        per_q.setdefault(c % n_q, []).append(c)
+    shared = {q: cs for q, cs in per_q.items() if len(cs) > 1}
+    if shared:
+        warn("piu' thread del generatore sulla stessa coda del nodo: "
+             + "; ".join(f"coda {q} <- cpu{','.join(map(str, cs))}"
+                         for q, cs in sorted(shared.items()))
+             + ". La contesa sulla coda abbassa gli elaborati delle pipeline "
+               "leggere (baseline, P1, P1.5) fino al 70%: per misurarle usa un "
+               "thread per coda (--gen-cpus con tante CPU quante --dut-cpus, "
+               "di resto diverso rispetto al numero di code).")
+
+
 def ingress_queues(plan, dut_queues=None):
     """(code TX del generatore, code RX del DUT) per la topologia shared."""
     n_gen, n_dut = max(1, len(plan.gen)), max(1, len(plan.dut))
@@ -3925,7 +4026,9 @@ def build_pipeline(method, model_path, fab, sem):
 
     if method == RX_ONLY:
         return setup_rxonly()
-    if method == "baseline":
+    if method == RX_FWD:
+        setup = setup_rxonly_fwd()
+    elif method == "baseline":
         setup = V.setup_baseline(0, model_path)
     elif method == "p1_static":
         setup = setup_p1_static(0, model_path)
@@ -3939,7 +4042,7 @@ def build_pipeline(method, model_path, fab, sem):
     mac_name = "mac_table" if pl in (0, 1) else TF._MAC_NAME[pl]
     TF._install_fabric_mac_table(b, mac_name, fab, sem.logical_ports)
 
-    if method == "baseline":
+    if method in ("baseline", RX_FWD):
         # Nessuna feature: non c'e' ingress_port, non c'e' node_id, e il
         # programma non legge nemmeno ipa->model_id. Niente da cablare, ed e'
         # esattamente cio' che la rende il tetto del banco.
@@ -4828,6 +4931,7 @@ def run_compare(methods, model_path, frames, offered_pps=None,
             from xdp_gen import XdpGen
             gen = XdpGen(gen_devs[0], plan, window_s=window_s,
                          ttls=ttl_mix).attach()
+            _warn_shared_queues(plan)
         else:
             gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
                             topology=ing.topology, clone=clone, burst=burst,
@@ -5043,7 +5147,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
         print(f"{YELLOW}{'=' * 78}{NC}")
         hdr = (f"  {'pipeline':10s} {'frame':>5s} {'fase':11s} {'giri':>4s} "
                f"{'offerti':>9s} {'RX pps':>9s} {'min':>9s} {'max':>9s} "
-               f"{'resp':>7s} {'dopo':>7s} {'perdita':>8s} {'collo':>18s}")
+               f"{'resp':>7s} {'dopo':>7s} {'perdita':>8s} {'nodo%':>6s} "
+               f"{'ns CPU':>7s} {'collo':>18s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         ordine = {m: i for i, m in enumerate((RX_ONLY,) + tuple(METHODS))}
@@ -5100,16 +5205,30 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        window_mode=pts[0].get("window_mode", "count"),
                        pps_spread_pct=round(spread, 1),
                        unreliable=spread > MAX_SPREAD_PCT,
-                       threads=len(plan.gen), bottleneck=tag)
+                       threads=len(plan.gen), bottleneck=tag,
+                       cpu_dut_pct=_median_or_none(
+                           [r.get("cpu_dut_pct") for r in pts]),
+                       ns_cpu=_median_or_none([r.get("ns_cpu") for r in pts]))
             summary.append(row)
             flag = f" {RED}+-{spread:.0f}%{NC}" if row["unreliable"] else ""
             print(f"  {m:10s} {frame:5d} {phase:11s} {len(pts):4d} "
                   f"{row['offered_real_pps']:9d} "
                   f"{row['rx_pps']:9d} {a['min']:9d} {a['max']:9d} "
                   f"{row['respinti_pct']:6.2f}% {row['loss_dut_pct']:6.2f}% "
-                  f"{row['loss_pct']:7.2f}% {tag:>18s}{flag}")
+                  f"{row['loss_pct']:7.2f}% "
+                  f"{_fmt_opt(row['cpu_dut_pct']):>6s} "
+                  f"{_fmt_opt(row['ns_cpu']):>7s} {tag:>18s}{flag}")
         _compare_verdict(summary, offered_pps, threshold)
     return raw, summary
+
+
+def _fmt_opt(v):
+    return "-" if v is None else f"{v:.1f}"
+
+
+def _median_or_none(vals):
+    vals = [v for v in vals if v is not None and v != ""]
+    return round(statistics.median(vals), 1) if vals else None
 
 
 # I FAIL di _rxonly_verdict. Lista propria, non VERDICT: check_validity, che
@@ -6188,6 +6307,23 @@ def _confronto_con_rates(out_dir, ceiling_rx):
           f"generatore e il loro ginocchio non e' stato raggiunto.{NC}")
 
 
+def ns_cpu(r, dut_pct, plan):
+    """TEMPO DI CPU del nodo per pacchetto: occupazione dei core del DUT x
+    numero di core / elaborati al secondo.
+
+    1e9 / elaborati vale come costo solo se il core del nodo lavora il 100%
+    del tempo. Non e' sempre cosi': con un solo thread del generatore XDP il
+    nodo resta fermo ~17% del tempo pur respingendo il 72% dei pacchetti (le
+    raffiche riempiono la coda, le pause la lasciano vuota), e 1/elaborati
+    attribuiva al pacchetto anche l'attesa: P2 339 ns contro 286 di CPU.
+    Misurato il 2026-09-30, results/generator_contention/. None senza
+    diagnostica."""
+    pps = node_pps(r)
+    if not dut_pct or not pps or not plan or not plan.dut:
+        return None
+    return round(dut_pct / 100.0 * len(plan.dut) * 1e9 / pps, 1)
+
+
 def node_pps(r):
     """Il rate del NODO: i pacchetti che il programma ha elaborato (HIT + MISS
     + DROP, vedi proc_pps in _measure_once), altrimenti quelli decisi (HIT),
@@ -6647,6 +6783,9 @@ def report_rows(rows, threshold=DEFAULT_LOSS_THRESHOLD):
             method=meth, frame=frame,
             max_rx_pps=int(_num(peak, "rx_pps")),
             max_rx_mbps=_num(peak, "rx_mbps"),
+            ns_cpu=peak.get("ns_cpu") if peak.get("ns_cpu") is not None else "",
+            cpu_dut_pct=peak.get("cpu_dut_pct")
+            if peak.get("cpu_dut_pct") is not None else "",
             max_loss_pct=round(_loss_of(peak), 3),
             max_loss_med_pct=_num(peak, "loss_med", ""),
             max_offered_pps=int(_num(peak, "offered_real_pps",
@@ -6696,7 +6835,14 @@ def aggiungi_costo(summ):
     calcolato fra taglie diverse non sarebbe il costo dell'inferenza."""
     base = {r["frame"]: r["max_rx_pps"] for r in summ
             if r["method"] == "baseline"}
+    base_cpu = {r["frame"]: r.get("ns_cpu") for r in summ
+                if r["method"] == "baseline"}
     for r in summ:
+        bc = base_cpu.get(r["frame"])
+        r["ns_cpu_vs_baseline"] = (round(r["ns_cpu"] - bc, 1)
+                                   if r.get("ns_cpu") not in (None, "")
+                                   and bc not in (None, "")
+                                   and r["method"] != "baseline" else "")
         r["ns_pkt"] = _costo_ns(r["max_rx_pps"])
         b = _costo_ns(base.get(r["frame"]))
         if b is not None and r["ns_pkt"] is not None and r["method"] != "baseline":
@@ -6913,11 +7059,12 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("USO")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--method", choices=list(METHODS) + [RX_ONLY, "all"],
-                   default="all",
+    p.add_argument("--method", default="all",
                    help=f"all = le cinque pipeline; in --mode compare anche "
                         f"{RX_ONLY}, il tetto di sola ricezione misurato nella "
-                        f"stessa sessione.")
+                        f"stessa sessione. Oppure una lista separata da "
+                        f"virgole fra {', '.join(METHODS)}, {RX_ONLY}, "
+                        f"{RX_FWD} ({RX_ONLY} che inoltra invece di scartare).")
     p.add_argument("--rates", default=None, metavar="LISTA",
                    help="modalita' rates: rate offerti in Mpps, separati da "
                         "virgola (default: 0.1,0.2,0.4,0.6,0.8,1,1.2,1.5,2)")
@@ -7070,10 +7217,13 @@ def main():
                          "modi, e niente separazione gen/DUT.")
 
     o = p.add_argument_group("uscita")
-    o.add_argument("--diag", action="store_true",
+    o.add_argument("--diag", action="store_true", default=True,
                    help="raccoglie occupazione per core, contatori dei device "
-                        "e softnet_stat attorno alle misure. Disattivata per "
-                        "default: legge procfs fra un punto e l'altro.")
+                        "e softnet_stat attorno a ogni misura (legge procfs "
+                        "prima e dopo la finestra, mai durante). Attiva per "
+                        "default: da lei viene il tempo di CPU per pacchetto.")
+    o.add_argument("--no-diag", dest="diag", action="store_false",
+                   help="spegne la diagnostica (niente tempo di CPU)")
     o.add_argument("--out", default=None, help="dove scrivere i CSV")
     o.add_argument("--latency", action="store_true",
                    help="percorso storico: latenza arrivo->ripartenza con una "
@@ -7250,12 +7400,18 @@ def _main_run(a, plan):
         # tollerante altrove, dove una perdita sparsa (un'interruzione del
         # core) farebbe scartare punti buoni.
         a.loss_threshold = 0.0 if a.latency else DEFAULT_LOSS_THRESHOLD
-    methods = list(METHODS) if a.method == "all" else [a.method]
+    methods = list(METHODS) if a.method == "all" else \
+        [m.strip() for m in a.method.split(",") if m.strip()]
+    unknown = [m for m in methods if m not in METHODS + (RX_ONLY, RX_FWD)]
+    if unknown:
+        sys.exit(f"--method: sconosciuti {unknown}; validi: all, "
+                 f"{', '.join(METHODS + (RX_ONLY, RX_FWD))}")
     if a.mode == "compare" and not a.latency and a.method == "all":
         methods = [RX_ONLY] + methods
-    if RX_ONLY in methods and (a.latency or a.mode != "compare"):
-        sys.exit(f"{RX_ONLY} esiste solo in --mode compare; da solo, lo stesso "
-                 f"tetto lo misura --mode generator.")
+    if (RX_ONLY in methods or RX_FWD in methods) and \
+            (a.latency or a.mode != "compare"):
+        sys.exit(f"{RX_ONLY} e {RX_FWD} esistono solo in --mode compare; da "
+                 f"solo, lo stesso tetto lo misura --mode generator.")
 
     # Le condizioni si leggono PRIMA di misurare e si stampano subito: se
     # il run viene interrotto a meta' resta comunque scritto su che
@@ -7369,7 +7525,8 @@ def _main_run(a, plan):
         # _rxonly_verdict.
         rc |= check_validity([r for r in rows
                               if r.get("phase") == "saturazione"
-                              and r.get("method") != RX_ONLY] or rows)
+                              and r.get("method") not in (RX_ONLY, RX_FWD)]
+                             or rows)
         VERDICT.extend(RXONLY_FAILS)
         rc |= int(bool(RXONLY_FAILS))
         if a.out and (rows or raw):
@@ -7461,7 +7618,8 @@ def _run_per_class(a, methods, model_path, frames, plan, env_finale):
         if act == "FORWARD":
             rc |= check_validity([r for r in rows
                                   if r.get("phase") == "saturazione"
-                                  and r.get("method") != RX_ONLY] or rows)
+                                  and r.get("method") not in (RX_ONLY, RX_FWD)]
+                                 or rows)
         tutti_raw += raw
         tutte_rows += rows
     _per_class_table(per, frames)

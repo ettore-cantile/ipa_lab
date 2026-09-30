@@ -119,7 +119,14 @@ FAKE = None
 STOPS = []
 
 
+_real_open = open
+
+
 def fake_open(path, *a, **k):
+    # Solo i file di pktgen sono simulati; il resto (/proc/stat, letto dalla
+    # finestra stazionaria per l'occupazione dei core) e' quello vero.
+    if "/proc/net/pktgen" not in str(path):
+        return _real_open(path, *a, **k)
     if "kpktgend_" in path:
         return io.StringIO(FAKE.thread_text())
     name = path.rsplit("/", 1)[1]

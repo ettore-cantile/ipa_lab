@@ -371,11 +371,11 @@ generatore, DUT e nodo successivo su P-core fisici distinti.
 |---|---|
 | **Ipotesi** | Il costo del nodo dipende dalla pipeline, non dalla taglia del pacchetto né dalla classe decisa. |
 | **Variabile modificata** | Il generatore (frame XDP grezzi, niente skb né copia di headroom), la taglia (64 / 512 / 1514 B), la classe (stato dei link e TTL cercati per ciascuna delle 6 classi raggiungibili). |
-| **Metrica** | ns/pacchetto = 1e9 / pacchetti elaborati, uscita su un core suo. |
-| **Risultato** | P2 **296–307** e P3 **433–444 ns** a ogni taglia (entro il 3%). Per classe: sulle 5 FORWARD P2 255–284, P3 426–433 ns; **la classe DROP costa di più**: P1 260 contro ~158, P1.5 268 contro ~161, P2 330, P3 468 ns (con il DROP la pagina si restituisce sulla CPU del DUT; con l'inoltro sulla CPU d'uscita). |
-| **Conclusione** | Il nodo tocca solo le intestazioni: il costo è per pacchetto. La porta d'uscita non conta, la decisione DROP sì. |
-| **Limite dichiarato** | ⚠️ Con i frame XDP baseline, P1 e P1.5 stanno al tetto del generatore XDP a 3 thread (~7 Mpps; `rxonly` 6,9): le loro cifre (141 / 158 / 161 ns) sono limiti superiori del costo. Il core d'uscita consegna solo 4,4–4,9 Mpps, quindi il controllo di validità confronta i pacchetti **elaborati** dal nodo, non quelli arrivati. |
-| **Come rigirarlo** | `bench_throughput.py --mode compare --generator xdp --egress-cpu auto` (`--frames 64,512,1514`; `--per-class`) |
+| **Metrica** | **Tempo di CPU per pacchetto**: occupazione del core del nodo nella finestra × 1 / elaborati; uno scrittore per coda (1 thread di generatore, 1 core del nodo, uscita su un core suo). |
+| **Risultato** | 2026-09-30: P1 **116**, P1.5 **125**, P2 **293**, P3 **428 ns** di CPU; sopra la baseline +49 / +58 / +226 / +361, come con pktgen (+38 / +53 / +226 / +364). A 64 / 512 / 1514 B P2 e P3 costano uguale entro il 3%. Per classe: FORWARD P1 116–118, P1.5 122–125, P2 259–285, P3 421–432; **DROP +50 ns**: 173 / 177 / 304 / 480 (con il DROP la pagina si restituisce sul core del nodo, con l'inoltro sul core d'uscita). |
+| **Conclusione** | Il nodo tocca solo le intestazioni: il costo è per pacchetto. La porta d'uscita non conta, la decisione DROP sì. I due generatori danno lo stesso costo della rete neurale. |
+| **Limite dichiarato** | ⚠️ Con un thread baseline e rxonly non saturano (il generatore offre 12–15 Mpps): i loro 67 e 40 ns di CPU sono misurati con pochi pacchetti per giro di ricezione e vanno presi con cautela. Le cifre del 28-09 a 3 thread (baseline 141, P1 158, P1.5 161 ns) includevano la contesa sulla coda d'ingresso (E8); P2 e P3 (296, 434) coincidono con il tempo di CPU. |
+| **Come rigirarlo** | `bench_throughput.py --mode compare --generator xdp --egress-cpu auto --gen-cpus 10 --dut-cpus 6` (`--per-class`); `--frames 64,512,1514` |
 
 ### E5 — Latenza end-to-end e bit rate ✅
 
@@ -411,6 +411,19 @@ generatore, DUT e nodo successivo su P-core fisici distinti.
 | **Conclusione** | Il confronto fra pipeline tiene su modelli diversi; la profondità pesa soprattutto su P3. |
 | **Limite dichiarato** | ⚠️ Un giro di misure per modello. Le latenze kernel dei sintetici (`results/models/kernel_battery.csv`) sono state prese a batteria: indicative. |
 | **Come rigirarlo** | `bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6 --model synth:deep`; `bench_bitrate.py --model synth:deep --rounds 3` |
+
+### E8 — Uno scrittore per coda: più thread di generatore peggiorano la misura ✅ ⚠️
+
+| | |
+|---|---|
+| **Ipotesi** | Con i frame XDP il limite di ~7 Mpps di rxonly, baseline, P1 e P1.5 a 3 thread è il tetto del generatore. |
+| **Variabile modificata** | Thread del generatore (1, 2, 3), core e code del nodo (1 o 2), uscita separata o sul nodo; generatore pktgen o `xdp_gen`. |
+| **Metrica** | Pacchetti elaborati, occupazione del core del nodo nella finestra, tempo di CPU per pacchetto. |
+| **Risultato** | **Ipotesi falsa.** Su un core, con 1 / 2 / 3 thread la baseline elabora 12,4 / 7,3 / 7,2 Mpps, rxonly 14,9 / 9,8 / 7,4: più thread, meno elaborati. Su due core (alimentatore): 2 thread, uno per coda, contro 3 thread, due sulla stessa coda: baseline 13,0 contro 7,6 (+72%), P1 +46%, P1.5 +45%, P2 +6%, P3 +1%. Con pktgen l'effetto è ~17 ns per pacchetto su tutte (baseline 278 contro 296 ns di CPU). Con un thread `xdp_gen` spedisce a raffiche e il nodo sta fermo il 12–16% pur respingendo il 70–80%: il costo va letto come tempo di CPU. |
+| **Conclusione** | Il limite era la coda d'ingresso condivisa da più scrittori, che rallenta anche il core del nodo. Regola: un solo scrittore per coda, in ingresso e in uscita. Con una scheda di rete vera la coda la riempie la scheda: un solo scrittore per costruzione. |
+| **Controllo** | `rxonly_fwd` (rxonly che inoltra): a 3 thread 7,53 contro 7,21 Mpps di rxonly; la baseline (7,21) **non** supera rxonly. |
+| **Limite dichiarato** | ⚠️ La serie 1 / 2 / 3 thread su un core è stata presa a batteria (differenze fino al doppio, concordi con le misure con l'alimentatore). La coda di `xdp_gen` è scelta dalla CPU che trasmette (CPU modulo code): è ciò che le misure mostrano, non verificato nel sorgente del kernel. |
+| **Come rigirarlo** | `bench_throughput.py --mode compare --generator xdp --gen-cpus 10,1 --dut-cpus 6,8` contro `--gen-cpus 10,1,3`; `results/generator_contention/summary.csv` |
 
 ---
 
@@ -448,7 +461,7 @@ Dichiarato per non far sembrare coperto ciò che non lo è.
   stesso processore collegati da `veth`: niente NIC, niente DMA, e con pktgen una copia di
   headroom per pacchetto. Le cifre in Mpps sono di questo percorso a 3,5 GHz; per un valore
   su una scheda di rete servono una seconda macchina e una NIC con XDP nativo.
-- **Il costo del nodo di baseline e P1 con frame XDP** (E4): il generatore non li satura.
+- **Il costo del nodo di baseline e rxonly con frame XDP** (E4): con uno scrittore per coda il generatore non li satura; il loro tempo di CPU è indicativo.
 - **Accuratezza del modello.** Il modello non è stato addestrato in questo lavoro. I test
   verificano che il datapath calcoli **la stessa cosa** del riferimento, non che quella
   cosa sia una buona politica di routing.

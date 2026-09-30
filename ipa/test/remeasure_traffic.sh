@@ -73,6 +73,15 @@ for m in checkpoint deep small mixed large; do
 done
 bench bitrate_deep  ipa/test/bench_bitrate.py --model synth:deep --rounds 3 \
     --out "$ROOT/results/models/bitrate_deep"
+# tempo di CPU per pacchetto e uno scrittore per coda (docs/testing.md §10.2, §10.5, §10.6)
+bench cpu_pktgen3   ipa/test/bench_throughput.py --mode compare --rounds 3 \
+    --gen-cpus 10,1,3 --dut-cpus 6 --out "$ROOT/results/cpu_time/pktgen_3thread"
+bench cpu_pktgen1   ipa/test/bench_throughput.py --mode compare --rounds 3 \
+    --gen-cpus 10 --dut-cpus 6 --out "$ROOT/results/cpu_time/pktgen_1thread"
+bench cpu_xdp1      ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
+    --rounds 3 --gen-cpus 10 --dut-cpus 6 --out "$ROOT/results/cpu_time/xdp_1thread"
+bench cpu_xdp_class ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
+    --per-class --rounds 3 --gen-cpus 10 --dut-cpus 6 --out "$ROOT/results/cpu_time/xdp_per_class"
 bench bitrate       ipa/test/bench_bitrate.py --out "$ROOT/results/bitrate_3500"
 bench tp_rates      ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 \
     --rates 0.5,1,1.5,2,2.5,3 --out "$ROOT/results/throughput_rates"
