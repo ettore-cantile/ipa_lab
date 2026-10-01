@@ -1465,7 +1465,7 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
     """
     Heterogeneous-sparse counterpart to run(): a model with an explicit
     per-model feature descriptor (different feature TYPES, not just sizes --
-    the professor's scenario). The IV is built locally from the seeded
+    the target scenario). The IV is built locally from the seeded
     dense_vector maps + the packet TTL + node one-hot; ref_infer_sparse
     rebuilds the same IV and we sweep TTL to exercise the scalar feature.
     """

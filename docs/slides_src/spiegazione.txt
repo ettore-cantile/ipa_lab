@@ -10,14 +10,14 @@ La presentazione racconta il test del datapath su traffico vero, rifatto sul por
 Le domande a cui risponde sono tre:
 1. Quanti pacchetti al secondo regge un nodo, con ciascuna delle versioni del programma?
 1. Con quale traffico lo misuriamo? Ci sono due generatori diversi, pktgen e xdp_gen, e danno numeri diversi per ragioni precise.
-1. Che cosa succede quando il traffico cresce oltre quello che il nodo regge: dove si perdono i pacchetti? È la domanda del relatore, e la risposta arriva nella parte 5.
+1. Che cosa succede quando il traffico cresce oltre quello che il nodo regge: dove si perdono i pacchetti? È la domanda centrale, e la risposta arriva nella parte 5.
 
 Tutte le cifre vengono dallo stesso portatile (Intel Core Ultra 7 155H), con le condizioni della macchina controllate e registrate a ogni misura. La tabella principale con pktgen (slide 12) è del 28 settembre; le misure con xdp_gen e quelle a uno e due core delle slide 13, 14 e 23 sono tutte di una stessa sessione, il 1 ottobre.
 
-== 2 | La domanda del relatore
+== 2 | La domanda
 Se si manda al nodo sempre più traffico, a un certo punto il nodo non ce la fa più. Davanti al nodo c'è una **coda** di 256 posti: i pacchetti che il nodo non ha ancora elaborato aspettano lì, in ordine di arrivo. Finché il nodo è più veloce del traffico la coda resta quasi vuota; quando è più lento la coda si riempie, e i pacchetti che arrivano a coda piena vengono **respinti**, cioè persi.
 
-La slide segue questa catena in quattro passi: il traffico cresce, la coda si riempie, il ritardo cresce (ogni pacchetto aspetta quelli davanti), e alla fine si perde. Il relatore chiede di capire **dove** si perde, perché il punto della perdita dice chi è il collo di bottiglia:
+La slide segue questa catena in quattro passi: il traffico cresce, la coda si riempie, il ritardo cresce (ogni pacchetto aspetta quelli davanti), e alla fine si perde. La domanda è **dove** si perde, perché il punto della perdita dice chi è il collo di bottiglia:
 - se si perde **prima** del programma (il pacchetto non è mai entrato), il programma è troppo lento per il traffico;
 - se si perde **dopo** (il programma lo ha elaborato e deciso di inoltrarlo, ma non arriva a destinazione), il problema è la trasmissione in uscita.
 
@@ -73,7 +73,7 @@ Si poteva scegliere solo fra due strade, entrambe sbagliate:
 - **generatore e nodo su core separati**: perdite dall'8 al 70% anche a traffico bassissimo, cioè si misuravano le pause del core e non il programma;
 - **tutto sullo stesso core**: niente perdite, perché il core non si ferma mentre lavora per sé, ma il core faceva il lavoro del generatore e del nodo insieme, e il limite era sempre il generatore.
 
-La conclusione è che nella macchina virtuale la perdita misurava le assenze del core. Per rispondere alla domanda del relatore serviva una macchina vera.
+La conclusione è che nella macchina virtuale la perdita misurava le assenze del core. Per rispondere alla domanda serviva una macchina vera.
 
 == 7 | La soluzione: il dual boot
 Dal 27 settembre Ubuntu gira direttamente sul portatile. Lo script `host_conditions.py` prepara la macchina prima di ogni misura e la rimette com'era alla fine (anche se la misura si interrompe):

@@ -6,7 +6,7 @@ Pipeline 1 (hardcoded) builds the model's input vector (IV) ON THE NODE from
 information the switch already has locally: some from the packet in transit
 (TTL), some from node/network state (interface up/down, ingress port, current
 node, queue occupancy). Different models may use DIFFERENT SETS of feature
-types (the professor's scenario: M1 might use {link_state, ttl, node}, M2
+types (the target scenario: M1 might use {link_state, ttl, node}, M2
 {ingress_iface, ttl, queue_occupancy}...). The switch as a whole supports the
 union of all registered models' feature types; each generated program builds
 only the subset its model needs.

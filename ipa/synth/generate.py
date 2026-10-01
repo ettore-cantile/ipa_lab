@@ -2,7 +2,7 @@
 generate.py -- build a synthetic scenario: model, weights, inputs, expectations.
 
 Everything is derived from a declared seed, so a scenario is reproducible from
-its descriptor. Nothing here reads the professor's checkpoint.
+its descriptor. Nothing here reads the reference checkpoint.
 
 Artefacts written into <outdir>/, reusing the repo's existing file names and
 formats so that every loader already in the tree consumes them unchanged --

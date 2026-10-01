@@ -2,7 +2,7 @@
 spec.py -- feature semantics and model descriptors for synthetic scenarios.
 
 The point of this package is to make the three eBPF pipelines testable WITHOUT
-the professor's checkpoint. Everything here is generated from a declared seed,
+the reference checkpoint. Everything here is generated from a declared seed,
 so a scenario is reproducible from its descriptor alone.
 
 Feature semantics, not uniform noise

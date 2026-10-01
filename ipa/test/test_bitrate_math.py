@@ -1,7 +1,7 @@
 """bench_bitrate's arithmetic, checked without a kernel.
 
 What can go wrong without anything crashing: a loss attributed to the wrong
-side (the professor's rule inverted), percentages that do not add up, the
+side (the ingress/egress rule inverted), percentages that do not add up, the
 latency not corrected for pktgen's pacing wait, a percentile off by a bucket,
 the latency gate closed by a retried first read, and the AOT counter compiled
 into the object but never pinned (so P1 would run without program 1).
@@ -144,7 +144,7 @@ def _row(tx, rej, rx, fwd=None, hit=None, miss=0, drop=0, secs=0.01,
 
 
 def t_losses():
-    print("[5] perdite e collo di bottiglia (la regola del relatore)")
+    print("[5] perdite e collo di bottiglia (la regola ingresso/uscita)")
     # caso B della richiesta: 10 inviati, 8 al programma, 8 rilanciati
     b = _row(tx=8000, rej=2000, rx=8000, fwd=8000, hit=8000)
     check("B: perdita prima di XDP = inviati - RX",

@@ -1245,7 +1245,7 @@ sì.
 
 ## 11. Al crescere del bit rate: ritardo, ricevuti, rilanciati (`bench_bitrate.py`)
 
-La domanda del relatore: al crescere del bit rate inviato la coda si riempie, il tempo
+La domanda: al crescere del bit rate inviato la coda si riempie, il tempo
 end-to-end cresce e poi si perde; se si perde all'**uscita** del programma il collo di
 bottiglia è trasmissivo, se si perde all'**ingresso** è il programma eBPF. Contare quanti
 pacchetti il programma riceve e quanti ne rilancia, con due programmi sullo stesso XDP: uno

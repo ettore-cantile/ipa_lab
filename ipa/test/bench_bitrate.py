@@ -7,7 +7,7 @@ dove comincia la perdita.
 --------------------------------------------------------------------------
 LA DOMANDA
 --------------------------------------------------------------------------
-Richiesta del relatore: grafico in funzione del bit rate inviato. La coda si
+La richiesta: grafico in funzione del bit rate inviato. La coda si
 riempie, il tempo end-to-end cresce fino a una perdita. Se si perde all'uscita
 del programma il collo di bottiglia e' trasmissivo, se si perde all'ingresso
 e' il programma eBPF. Contare quanti pacchetti il programma riceve e quanti ne
@@ -672,8 +672,8 @@ def _median(vals):
 
 
 def classify(row, floor_pct, threshold=DEFAULT_LOSS_THRESHOLD):
-    """Il collo di bottiglia di UNA riga di sintesi, secondo la regola del
-    relatore, con il pavimento della ricezione tolto.
+    """Il collo di bottiglia di UNA riga di sintesi, secondo la regola
+    ingresso/uscita, con il pavimento della ricezione tolto.
 
     floor_pct: la perdita prima di XDP del solo contatore (rxonly) allo stesso
     rate, o None se rxonly non e' stato misurato."""
