@@ -2255,7 +2255,9 @@ il banco calcola il costo, e non quelli arrivati all'uscita.
 
 Con un solo scrittore per coda anche all'uscita (un core del nodo che inoltra,
 sezione~\ref{sec:scrittore}) il nodo successivo tiene il passo: riceve 12
-milioni di pacchetti al secondo senza perderne.
+milioni di pacchetti al secondo senza perderne. Con due core sul nodo serve una
+coda d'uscita per ciascun core, e un core d'uscita per ciascuna coda: allora
+arrivano tutti, anche 28 milioni al secondo (sezione~\ref{sec:duecore}).
 
 \subsection*{3. Il cavo è virtuale, e tutto sta su un processore}
 
@@ -2446,16 +2448,17 @@ contesi.
 Con due core sul nodo ci sono due code. Con due thread, uno per coda, la baseline
 elabora 13,0 milioni al secondo; con tre thread, due dei quali finiscono sulla
 stessa coda, 7,6. Lo stesso nodo, cambia solo quanti scrivono in ogni coda.
+(Le cifre sono del 30 settembre, con una sola coda d'uscita per i due core: in
+assoluto sono basse anche per la contesa in uscita, sezione~\ref{sec:duecore},
+ma la pagano tutte e due le righe.)
 P1 e P1.5 guadagnano il 45\%, P2 il 6\%, P3 l'1\%: il danno è grande per i
 programmi leggeri e quasi nullo per quelli il cui limite è davvero il programma.
 \end{prima}
 
-Lo stesso succede \textbf{all'uscita}: con due core sul nodo, tutti e due
-inoltrano nelle stesse code verso il nodo successivo, e con la baseline metà dei
-pacchetti si perde dopo il programma anche se il nodo successivo è occupato solo
-al 77\%. Con \texttt{pktgen}, che riempie la coda più lentamente, la contesa
-costa circa 17~ns per pacchetto, uguali per tutte le pipeline: i costi sopra la
-baseline non cambiano.
+Con \texttt{pktgen}, che riempie la coda più lentamente, la contesa costa circa
+17~ns per pacchetto, uguali per tutte le pipeline: i costi sopra la baseline non
+cambiano. Lo stesso vale \textbf{all'uscita}, quando il nodo ha più core: è la
+sezione~\ref{sec:duecore}.
 
 \begin{lezione}
 Un solo scrittore per coda, in ingresso e in uscita: più thread di generatore
@@ -2652,31 +2655,62 @@ leggeri (la baseline passa da 3,31 a 3,40~Mpps, P1 da 2,94 a 3,01), niente di
 misurabile per P2 e P3. Le altre cifre del capitolo restano quelle misurate con
 i contatori di prima.
 
-Lo si verifica dando al nodo due core invece di uno, con una coda d'ingresso
-ciascuno e lo stesso generatore:
+\label{sec:duecore}
+Lo si verifica dando al nodo due core invece di uno, ciascuno con la sua coda
+d'ingresso e la sua coda d'uscita, e con \texttt{pktgen} a quattro thread, due
+per coda d'ingresso:
 
 \begin{center}
 \small
-\begin{tabular}{@{}lrrr@{}}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
-\textbf{Programma} & \textbf{1 core (Mpps)} & \textbf{2 core (Mpps)} & \textbf{rapporto} \\
+\textbf{Programma} & \textbf{1 core (Mpps)} & \textbf{2 core (Mpps)} & \textbf{rapporto} & \textbf{ns per core} \\
 \midrule
-\texttt{rxonly}     & 4,62 & 7,50 & 1,62 \\
-baseline            & 3,40 & 6,50 & 1,91 \\
-P1                  & 3,01 & 5,76 & 1,91 \\
-P1.5                & 2,87 & 5,58 & 1,95 \\
-P2                  & 1,91 & 3,72 & 1,95 \\
-P3                  & 1,49 & 2,95 & 1,98 \\
+\texttt{rxonly}     & 4,62 & 9,41 & 2,04 & 213 \\
+baseline            & 3,40 & 6,72 & 1,98 & 298 \\
+P1                  & 3,01 & 6,02 & 2,00 & 332 \\
+P1.5                & 2,87 & 5,62 & 1,96 & 356 \\
+P2                  & 1,91 & 3,79 & 1,98 & 528 \\
+P3                  & 1,49 & 2,88 & 1,93 & 694 \\
 \bottomrule
-\end{tabular}
+\end{tabular}\\[2pt]
+{\footnotesize\color{soft} 1 core: 28 settembre, tre thread. 2 core: 1 ottobre,
+alimentatore, macchina non disturbata.}
 \end{center}
 
-Con due core ogni pipeline elabora quasi il doppio (fra 1,91 e 1,98 volte): il
-secondo core non rallenta il primo. Il solo contatore cresce meno (1,62) perché
-a 7,5~Mpps il generatore è vicino al suo limite e le due code non ricevono
-esattamente lo stesso carico. Per un nodo con $N$ code vale quindi, in buona
-approssimazione, $N$ volte la capacità misurata su un core, finché generatore e
-scheda reggono.
+Con due core ogni programma elabora il doppio (fra 1,93 e 2,04 volte): il
+secondo core non rallenta il primo, e sopra la baseline ogni core paga quello
+che pagava da solo (+34, +58, +231, +397~ns per P1, P1.5, P2, P3). Con i
+pacchetti grezzi di \texttt{xdp\_gen} il risultato è lo stesso: due core
+elaborano il 95--99\% del doppio, e il tempo di CPU per pacchetto di ogni core
+(68, 117, 127, 298, 434~ns) è quello misurato su un core solo (67, 116, 125,
+293, 428). Per un nodo con $N$ code vale quindi $N$ volte la capacità misurata
+su un core, finché generatore e scheda reggono.
+
+Il raddoppio si vede solo se ogni coda ha un solo scrittore anche
+\textbf{all'uscita}. Fino al 30 settembre il banco dava a ogni porta d'uscita una
+coda sola: il cavo virtuale sceglie la coda dal numero del core che inoltra, e
+con una coda i due core del nodo scrivevano nello stesso anello, svuotato da un
+solo core del nodo successivo.
+
+\begin{prima}[Esempio: la baseline a due core con una coda d'uscita]
+Con \texttt{xdp\_gen} la baseline elaborava 13,15 milioni di pacchetti al secondo
+e al nodo successivo ne arrivavano 4,2: il 49\% si perdeva dopo il programma, e
+ogni core spendeva 152~ns per pacchetto invece di 67. Con tre code d'uscita
+(il core 6 scrive nella 0, il core 8 nella 2) gli elaborati salgono a 19,15, ma
+un core d'uscita solo ne riceve circa 10 milioni e il resto si perde ancora. Con
+un core d'uscita per coda la baseline elabora 28,3 milioni al secondo, arrivano
+tutti, e il costo per core torna a 68~ns. Con \texttt{pktgen}, che arriva a rate
+più bassi, la coda d'uscita condivisa costava 12--20~ns per pacchetto per core:
+i rapporti erano 1,91--1,98 invece di circa 2.
+\end{prima}
+
+Anche il generatore va diviso in parti uguali. Con tre thread \texttt{pktgen}
+su due code una coda riceve da due thread e l'altra da uno solo, circa 2,8
+milioni al secondo: abbastanza per saturare i core dei programmi, non quello di
+\texttt{rxonly}, che ne riceve 4,7. Il solo contatore si fermava così a 7,55
+milioni (1,64 volte), con un core fermo il 40\% del tempo; con quattro thread,
+due per coda, arriva a 9,41 (2,04 volte).
 
 \begin{lezione}
 Per tutte e cinque la perdita è \textbf{all'ingresso}: il collo di bottiglia è il

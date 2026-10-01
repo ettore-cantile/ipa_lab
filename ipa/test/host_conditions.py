@@ -541,6 +541,15 @@ def spare_core(topo, used, allow_cpu0=False):
                                            or 0) for x in c), c[0]))[0]
 
 
+def egress_cpus(egress):
+    """L'uscita come lista di CPU: None -> [], N -> [N], [N, M] -> [N, M]."""
+    if egress is None:
+        return []
+    if isinstance(egress, int):
+        return [egress]
+    return [int(c) for c in egress]
+
+
 def idle_siblings(topo, used):
     """I fratelli SMT dei thread usati: restano a riposo, fuori da tutto."""
     used = set(used)
@@ -566,7 +575,7 @@ class Roles:
     @property
     def used(self):
         return sorted(set(self.dut) | set(self.gen)
-                      | ({self.egress} if self.egress is not None else set()))
+                      | set(egress_cpus(self.egress)))
 
 
 # ==========================================================================
@@ -699,10 +708,9 @@ class HostConditioner:
         self._alive = alive or pid_alive
         self.dut = [int(c) for c in dut]
         self.gen = [int(c) for c in gen]
-        self.egress = None if egress is None else int(egress)
+        self.egress = egress_cpus(egress) or None
         self.bench = sorted(set(self.dut) | set(self.gen)
-                            | ({self.egress} if self.egress is not None
-                               else set()))
+                            | set(egress_cpus(self.egress)))
         self.siblings = idle_siblings(topo, self.bench)
         self.hk = housekeeping(topo, self.bench)
         self.freq = freq
@@ -1755,8 +1763,7 @@ def env_pairs(plan, host=None, monitor=None, paths=None, runner=None,
     dut = list(getattr(plan, "dut", []) or [])
     gen = list(getattr(plan, "gen", []) or [])
     egress = getattr(plan, "egress", None)
-    used = sorted(set(dut) | set(gen) | ({egress} if egress is not None
-                                         else set()))
+    used = sorted(set(dut) | set(gen) | set(egress_cpus(egress)))
     env = []
 
     def add(k, v):
@@ -1767,8 +1774,9 @@ def env_pairs(plan, host=None, monitor=None, paths=None, runner=None,
     add("microcode", _microcode(paths))
     if used:
         add("ruolo_dut", ", ".join(topo.label(c) for c in dut))
-        add("ruolo_uscita", topo.label(egress) if egress is not None
-            else "nessuna CPU sua (softirq sulla CPU del DUT)")
+        add("ruolo_uscita", ", ".join(topo.label(c)
+                                      for c in egress_cpus(egress))
+            if egress is not None else "nessuna CPU sua (softirq sulla CPU del DUT)")
         add("ruolo_generatore", ", ".join(topo.label(c) for c in gen))
         add("fratelli_smt_a_riposo",
             format_cpu_list(idle_siblings(topo, used)) or "nessuno")
@@ -1901,7 +1909,9 @@ def from_args(a, plan, **kw):
 
 
 def parse_egress(spec):
-    """--egress-cpu: "auto", "none" o un numero. None = nessuna CPU sua."""
+    """--egress-cpu: "auto", "none", un numero o una lista (una CPU per coda
+    d'uscita usata, vedi bench_throughput.pin_egress_napi). None = nessuna
+    CPU sua."""
     if spec is None:
         return None
     s = str(spec).strip().lower()
@@ -1910,9 +1920,13 @@ def parse_egress(spec):
     if s == "auto":
         return "auto"
     try:
-        return int(s)
+        cpus = [int(c) for c in s.split(",") if c.strip()]
+        if len(set(cpus)) != len(cpus) or not cpus:
+            raise ValueError
+        return cpus[0] if len(cpus) == 1 else cpus
     except ValueError:
-        sys.exit(f"--egress-cpu: atteso auto, none o un numero di CPU, "
+        sys.exit(f"--egress-cpu: atteso auto, none, un numero di CPU o una "
+                 f"lista senza ripetizioni, "
                  f"ricevuto {spec!r}")
 
 

@@ -63,8 +63,13 @@ bench tp_compare    ipa/test/bench_throughput.py --mode compare --rounds 3 \
     --out "$ROOT/results/throughput_3500"
 bench tp_cores1     ipa/test/bench_throughput.py --mode compare --rounds 3 \
     --gen-cpus 10,1,3 --dut-cpus 6 --out "$ROOT/results/throughput_cores1"
+# Due core: 4 thread pktgen, due per coda d'ingresso (con 3 una coda ne ha
+# uno solo e rxonly non satura il suo core), una coda d'uscita per core
+# (--egress-queues auto). Per xdp_gen un core d'uscita per coda.
 bench tp_cores2     ipa/test/bench_throughput.py --mode compare --rounds 3 \
-    --gen-cpus 10,1,3 --dut-cpus 6,8 --out "$ROOT/results/throughput_cores2"
+    --gen-cpus 10,1,3,5 --dut-cpus 6,8 --out "$ROOT/results/throughput_cores2"
+bench tp_xdp_cores2 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
+    --gen-cpus 10,1 --dut-cpus 6,8 --egress-cpu 3,5 --out "$ROOT/results/throughput_xdp_cores2"
 # modelli diversi dal checkpoint (docs/testing.md §12)
 for m in checkpoint deep small mixed large; do
     ref=$([ "$m" = checkpoint ] && echo checkpoint || echo "synth:$m")

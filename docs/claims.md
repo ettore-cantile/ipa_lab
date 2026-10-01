@@ -387,17 +387,17 @@ generatore, DUT e nodo successivo su P-core fisici distinti.
 | **Risultato** | Pulite fino a: baseline 1,44, P1 e P1.5 1,20, P2 e P3 0,72 Gbit/s; perdono dal punto successivo, all'ingresso (i punti sono spaziati di ~0,24 Gbit/s: P2 e P3 le separa l'inoltro massimo, 1,89 contro 1,50 Mpps). Latenza p50 9–10 µs a basso carico per tutte, 69–194 µs al primo punto in perdita. Latenza minima arrivo → ripartenza a scarico (`--latency`, 512 B): 249 / 282 / 292 / 460 / 584 ns. |
 | **Come rigirarlo** | `bench_bitrate.py --out results/bitrate_3500`; `bench_throughput.py --latency --frames 512 --rounds 3 --repeat 5` |
 
-### E6 — La capacità cresce con i core ✅
+### E6 — La capacità cresce con i core ✅ ⚠️
 
 | | |
 |---|---|
-| **Ipotesi** | Con i contatori per-CPU i core del nodo non si contendono niente di scritto a ogni pacchetto, quindi due code su due core danno circa il doppio. |
-| **Variabile modificata** | Il numero di core e di code del DUT (1 o 2), stesso generatore a 3 thread. |
-| **Metrica** | Pacchetti elaborati al secondo a saturazione, 3 giri. |
-| **Risultato** | 1 → 2 core: baseline 3,40 → 6,50, P1 3,01 → 5,76, P1.5 2,87 → 5,58, P2 1,91 → 3,72, P3 1,49 → 2,95 Mpps: **rapporto 1,91–1,98**. `rxonly` 4,62 → 7,50 (1,62), vicino al tetto del generatore. |
-| **Conclusione** | Il costo misurato su un core è quello da moltiplicare per il numero di code di una scheda con RSS. |
-| **Limite dichiarato** | ⚠️ Solo 1 e 2 core: oltre, questa macchina non ha P-core liberi per generatore e DUT insieme. |
-| **Come rigirarlo** | `bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6` e `--dut-cpus 6,8` |
+| **Ipotesi** | Con i contatori per-CPU i core del nodo non si contendono niente di scritto a ogni pacchetto, quindi due code su due core danno circa il doppio, e il costo per pacchetto per core resta quello di un core. |
+| **Variabile modificata** | Il numero di core e di code del DUT (1 o 2); con due core, il numero di code d'uscita (1 o una per core), i core d'uscita (1 o 2, `xdp_gen`) e i thread pktgen (3 o 4). |
+| **Metrica** | Pacchetti elaborati al secondo a saturazione e tempo di CPU per pacchetto per core, 3 giri. |
+| **Risultato** | pktgen, 4 thread (due per coda d'ingresso), una coda d'uscita per core, 2026-10-01: 1 → 2 core rxonly 4,62 → 9,41, baseline 3,40 → 6,72, P1 3,01 → 6,02, P1.5 2,87 → 5,62, P2 1,91 → 3,79, P3 1,49 → 2,88 Mpps: **rapporto 1,93–2,04**; sopra la baseline per core +34 / +58 / +231 / +397 ns. `xdp_gen`, un thread per coda, una coda e un core d'uscita per core: baseline 28,33, P1 17,05, P1.5 15,81, P2 6,68, P3 4,61 Mpps, **95–99% del doppio**, tempo di CPU per core 68 / 117 / 127 / 298 / 434 ns contro 67 / 116 / 125 / 293 / 428 su un core; nessuna perdita dopo XDP. |
+| **Conclusione** | Il costo misurato su un core è quello da moltiplicare per il numero di code di una scheda con RSS. Il banco lo mostra solo con uno scrittore per coda anche in uscita: con una coda d'uscita condivisa dai due core la contesa costava 12–20 ns per pacchetto per core con pktgen (rapporti 1,91–1,98) e, con `xdp_gen`, un core d'uscita solo si fermava a ~10 Mpps (baseline 13,15 elaborati, 49% perso dopo XDP). Con 3 thread pktgen su 2 code una coda ne riceve uno solo (~2,8 Mpps) e rxonly non satura il suo core (rapporto 1,64). |
+| **Limite dichiarato** | ⚠️ Solo 1 e 2 core: oltre, questa macchina non ha P-core liberi per generatore e DUT insieme. Con `xdp_gen` la baseline satura appena (respinti 2%, il generatore offre 29 Mpps). Il secondo core d'uscita (cpu5) è il fratello SMT della CPU 0, che tiene timer e IRQ non spostabili; `--egress-cpu auto` non lo sceglie e va indicato. |
+| **Come rigirarlo** | `bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6` e `--gen-cpus 10,1,3,5 --dut-cpus 6,8`; `--generator xdp --gen-cpus 10,1 --dut-cpus 6,8 --egress-cpu 3,5`; il confronto 1 coda / 3 code con `--egress-queues 1` (`results/pktgen_cores2/`, `results/generator_contention/xdp_2core_2thread_uscita_*`) |
 
 ### E7 — Sul traffico vero il costo segue la forma del modello ✅ ⚠️
 
@@ -419,8 +419,8 @@ generatore, DUT e nodo successivo su P-core fisici distinti.
 | **Ipotesi** | Con i frame XDP il limite di ~7 Mpps di rxonly, baseline, P1 e P1.5 a 3 thread è il tetto del generatore. |
 | **Variabile modificata** | Thread del generatore (1, 2, 3), core e code del nodo (1 o 2), uscita separata o sul nodo; generatore pktgen o `xdp_gen`. |
 | **Metrica** | Pacchetti elaborati, occupazione del core del nodo nella finestra, tempo di CPU per pacchetto. |
-| **Risultato** | **Ipotesi falsa.** Su un core, con 1 / 2 / 3 thread la baseline elabora 12,4 / 7,3 / 7,2 Mpps, rxonly 14,9 / 9,8 / 7,4: più thread, meno elaborati. Su due core (alimentatore): 2 thread, uno per coda, contro 3 thread, due sulla stessa coda: baseline 13,0 contro 7,6 (+72%), P1 +46%, P1.5 +45%, P2 +6%, P3 +1%. Con pktgen l'effetto è ~17 ns per pacchetto su tutte (baseline 278 contro 296 ns di CPU). Con un thread `xdp_gen` spedisce a raffiche e il nodo sta fermo il 12–16% pur respingendo il 70–80%: il costo va letto come tempo di CPU. |
-| **Conclusione** | Il limite era la coda d'ingresso condivisa da più scrittori, che rallenta anche il core del nodo. Regola: un solo scrittore per coda, in ingresso e in uscita. Con una scheda di rete vera la coda la riempie la scheda: un solo scrittore per costruzione. |
+| **Risultato** | **Ipotesi falsa.** Su un core, con 1 / 2 / 3 thread la baseline elabora 12,4 / 7,3 / 7,2 Mpps, rxonly 14,9 / 9,8 / 7,4: più thread, meno elaborati. Su due core (alimentatore, una coda d'uscita condivisa come allora): 2 thread, uno per coda, contro 3 thread, due sulla stessa coda: baseline 13,0 contro 7,6 (+72%), P1 +46%, P1.5 +45%, P2 +6%, P3 +1%; le cifre assolute contengono anche la contesa in uscita (E6), il confronto fra le due righe no. Con pktgen l'effetto è ~17 ns per pacchetto su tutte (baseline 278 contro 296 ns di CPU). Con un thread `xdp_gen` spedisce a raffiche e il nodo sta fermo il 12–16% pur respingendo il 70–80%: il costo va letto come tempo di CPU. |
+| **Conclusione** | Il limite era la coda d'ingresso condivisa da più scrittori, che rallenta anche il core del nodo. Regola: un solo scrittore per coda, in ingresso e in uscita (in uscita: una coda per core del nodo, E6). Con una scheda di rete vera la coda la riempie la scheda: un solo scrittore per costruzione. |
 | **Controllo** | `rxonly_fwd` (rxonly che inoltra): a 3 thread 7,53 contro 7,21 Mpps di rxonly; la baseline (7,21) **non** supera rxonly. |
 | **Limite dichiarato** | ⚠️ La serie 1 / 2 / 3 thread su un core è stata presa a batteria (differenze fino al doppio, concordi con le misure con l'alimentatore). La coda di `xdp_gen` è scelta dalla CPU che trasmette (CPU modulo code): è ciò che le misure mostrano, non verificato nel sorgente del kernel. |
 | **Come rigirarlo** | `bench_throughput.py --mode compare --generator xdp --gen-cpus 10,1 --dut-cpus 6,8` contro `--gen-cpus 10,1,3`; `results/generator_contention/summary.csv` |
@@ -461,7 +461,7 @@ Dichiarato per non far sembrare coperto ciò che non lo è.
   stesso processore collegati da `veth`: niente NIC, niente DMA, e con pktgen una copia di
   headroom per pacchetto. Le cifre in Mpps sono di questo percorso a 3,5 GHz; per un valore
   su una scheda di rete servono una seconda macchina e una NIC con XDP nativo.
-- **Il costo del nodo di baseline e rxonly con frame XDP** (E4): con uno scrittore per coda il generatore non li satura; il loro tempo di CPU è indicativo.
+- **Il costo del nodo di rxonly con frame XDP** (E4): con uno scrittore per coda il generatore non lo satura; il suo tempo di CPU è indicativo. La baseline satura (appena) solo su due core, dove costa 68 ns per core: conferma i 67 indicativi di un core.
 - **Accuratezza del modello.** Il modello non è stato addestrato in questo lavoro. I test
   verificano che il datapath calcoli **la stessa cosa** del riferimento, non che quella
   cosa sia una buona politica di routing.

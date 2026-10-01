@@ -142,13 +142,23 @@ class NetnsFabric:
       ingress_ifindex kernel ifindex of `ingress`
       ifindex_of      {logical_port: ifindex}
       pass_attached   ports whose peer carries the XDP_PASS stub
+
+    `port_queues` > 1 gives every port pair that many RX/TX queues (the
+    dedicated ingress keeps one). veth_xdp_xmit picks the receiving queue as
+    smp_processor_id() % real_num_rx_queues: with one queue, every CPU that
+    redirects into a port writes into the same ptr_ring under the same
+    producer_lock.
     """
 
     def __init__(self, n_ports: int = 5, prefix: str = DEFAULT_PREFIX,
-                 enable_redirect: bool = True, verbose: bool = True):
+                 enable_redirect: bool = True, verbose: bool = True,
+                 port_queues: int = 1):
         if n_ports < 1:
             raise ValueError("n_ports must be >= 1")
+        if port_queues < 1:
+            raise ValueError("port_queues must be >= 1")
         self.n_ports = n_ports
+        self.port_queues = port_queues
         self.prefix = prefix
         self.enable_redirect = enable_redirect
         self.verbose = verbose
@@ -199,7 +209,11 @@ class NetnsFabric:
         pairs += [(port, self._name(port), self._peer(port))
                   for port in range(self.n_ports)]
         for port, a, b in pairs:
-            _run(["ip", "link", "add", a, "type", "veth", "peer", "name", b])
+            q = [] if port is None or self.port_queues == 1 else \
+                ["numrxqueues", str(self.port_queues),
+                 "numtxqueues", str(self.port_queues)]
+            _run(["ip", "link", "add", a, *q, "type", "veth", "peer",
+                  "name", b, *q])
             # No IPv6 on a fabric interface: the kernel would send MLD and
             # router solicitations on every fresh veth, and that traffic lands
             # in the same captures the test reads its answer from.

@@ -1,7 +1,7 @@
-method,frame,max_rx_pps,max_rx_mbps,max_loss_pct,max_loss_med_pct,max_offered_pps,rx_pkts,tx_pkts,lost_before,lost_after,respinti,respinti_pct,persi_dut,persi_in_coda,persi_dopo,loss_dut_pct,noloss_rx_pps,noloss_gen_bound,noloss_rx_mbps,noloss_loss_pct,zero_rx_pps,lat_p50_ns,lat_min_ns,lat_rx_pps,bottleneck,unreliable,rounds,ns_pkt,ns_pkt_vs_baseline
-baseline,64,6499494,3327.74,29.555,,9195721,1951840,2762421,807920,0,0,29.207,0,0,0,0.0,2604321,False,1333.41,0.013,0,,,6499494,generatore,False,3,153.9,
-p1_static,64,5763167,2950.74,36.846,,9076930,1731200,2727176,993105,0,0,36.445,0,0,0,0.0,2604341,False,1333.42,0.031,0,,,5763167,generatore,False,3,173.5,19.6
-hardcoded,64,5575451,2854.63,39.122,,9085706,1675390,2730201,1057978,0,0,38.716,0,0,0,0.0,2604318,False,1333.41,0.018,0,,,5575451,generatore,False,3,179.4,25.5
-template,64,3722526,1905.93,58.91,,8964796,1118080,2692623,1575849,33,0,58.479,0,0,0,0.002,2604417,False,1333.46,0.007,0,,,3722526,generatore,False,3,268.6,114.7
-modular,64,2953689,1512.29,67.541,,8977836,887303,2696987,1809704,0,0,67.118,0,0,0,0.0,0,False,0,,0,,,2953689,pipeline-ingresso,False,3,338.6,184.7
-rxonly,64,7503663,3841.88,9.422,,8259992,2253563,2480372,227757,0,0,9.174,0,0,0,0.004,2604326,False,1333.42,0.024,0,,,7503663,generatore,False,3,133.3,-20.6
+method,frame,max_rx_pps,max_rx_mbps,ns_cpu,cpu_dut_pct,max_loss_pct,max_loss_med_pct,max_offered_pps,rx_pkts,tx_pkts,lost_before,lost_after,respinti,respinti_pct,persi_dut,persi_in_coda,persi_dopo,loss_dut_pct,noloss_rx_pps,noloss_gen_bound,noloss_rx_mbps,noloss_loss_pct,zero_rx_pps,lat_p50_ns,lat_min_ns,lat_rx_pps,bottleneck,unreliable,rounds,ns_cpu_vs_baseline,ns_pkt,ns_pkt_vs_baseline
+baseline,64,6716347,3438.77,297.8,100.0,38.227,,10800973,2017799,3244947,1227132,0,0,37.823,0,0,0,0.0,2686347,False,1375.41,0.023,0,,,6716347,generatore,False,3,,148.9,
+p1_static,64,6020223,3082.35,332.2,100.0,45.934,,10864098,1809024,3266216,1459562,11,0,44.814,0,0,0,0.0,2686370,False,1375.42,0.037,0,,,6020223,generatore,False,3,34.4,166.1,17.2
+hardcoded,64,5623323,2879.14,355.7,100.0,48.249,,10785865,1689984,3241489,1554405,0,0,47.874,0,0,0,0.0,2686435,False,1375.45,0.025,0,,,5623323,generatore,False,3,57.9,177.8,28.9
+template,64,3785230,1938.04,528.4,100.0,65.941,,11010301,1137344,3308253,2170689,0,0,65.627,0,0,0,0.0,2686369,False,1375.42,0.022,0,,,3785230,generatore,False,3,230.6,264.2,115.3
+modular,64,2880399,1474.76,694.4,100.0,74.191,,10942881,865344,3287515,2422258,0,0,73.73,0,0,0,0.0,2686402,False,1375.44,0.025,0,,,2880399,generatore,False,3,396.6,347.2,198.3
+rxonly,64,9408783,4817.3,212.6,100.0,13.911,,10892213,2826542,3272187,445667,0,0,13.617,0,0,0,0.002,2686394,False,1375.43,0.017,0,,,9408783,generatore,False,3,-85.2,106.3,-42.6

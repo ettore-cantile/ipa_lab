@@ -657,7 +657,7 @@ class CpuPlan:
     @property
     def used(self):
         return sorted(set(self.gen) | set(self.dut)
-                      | ({self.egress} if self.egress is not None else set()))
+                      | set(HC.egress_cpus(self.egress)))
 
     @property
     def idle_siblings(self):
@@ -690,7 +690,8 @@ class CpuPlan:
              f"-> {self.threads} thread kpktgend")
         info(f"CPU DUT (XDP/NAPI) ...... {self._fmt(self.dut)}")
         if self.egress is not None:
-            info(f"CPU uscita (NAPI a valle) {self._fmt([self.egress])}")
+            info(f"CPU uscita (NAPI a valle) "
+                 f"{self._fmt(HC.egress_cpus(self.egress))}")
         if self.idle_siblings:
             info(f"fratelli SMT a riposo ... {fmt(self.idle_siblings)}")
         info(f"CPU lasciate al sistema . {fmt(self.excluded)}")
@@ -743,7 +744,8 @@ def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
 
     want_gen = parse_cpu_list(gen_spec)
     want_dut = parse_cpu_list(dut_spec)
-    fixed_egress = egress_spec if isinstance(egress_spec, int) else None
+    fixed_egress = (egress_spec if isinstance(egress_spec, (int, list))
+                    else None)
     egress = fixed_egress
     auto_roles = (want_gen is None and want_dut is None and topo is not None
                   and topo.structured)
@@ -752,7 +754,7 @@ def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
         roles = HC.plan_roles(
             topo, n_gen=threads, want_egress=(egress_spec == "auto"),
             allow_cpu0=allow_cpu0,
-            exclude=([fixed_egress] if fixed_egress is not None else ()))
+            exclude=HC.egress_cpus(fixed_egress))
         gen, dut = roles["gen"], roles["dut"]
         if egress_spec == "auto":
             egress = roles["egress"]
@@ -794,13 +796,30 @@ def plan_cpus(gen_spec=None, dut_spec=None, threads=None, allow_cpu0=False,
                 notes.append(f"CPU {dropped} chieste per il DUT ma non online: "
                              f"scartate.")
         else:
-            dut = [c for c in pool if c not in gen and c != fixed_egress]
+            dut = [c for c in pool if c not in gen
+                   and c not in HC.egress_cpus(fixed_egress)]
         if egress_spec == "auto":
-            egress = (HC.spare_core(topo, set(gen) | set(dut), allow_cpu0)
-                      if topo is not None else None)
+            # Un core d'uscita per core del DUT: uno solo non svuota le code
+            # di due (2026-10-01, xdp_gen: tetto ~10 Mpps su cpu3, la
+            # baseline ne elaborava 19). Si prende quello che c'e'.
+            found = []
+            while topo is not None and len(found) < len(dut):
+                e = HC.spare_core(topo, set(gen) | set(dut) | set(found),
+                                  allow_cpu0)
+                if e is None:
+                    break
+                found.append(e)
+            egress = (found[0] if len(found) == 1
+                      else found if found else None)
             if egress is None:
                 notes.append("nessun core fisico libero per l'uscita: resta "
                              "in softirq sulla CPU del DUT.")
+            elif len(found) < len(dut):
+                notes.append(f"{len(found)} core d'uscita per {len(dut)} "
+                             f"core del DUT: le code d'uscita di piu' core "
+                             f"del DUT si svuotano sullo stesso core, che "
+                             f"puo' diventare il collo di bottiglia "
+                             f"(--egress-cpu N,M per sceglierli).")
 
     if check_pktgen and os.path.isdir(PKTGEN_DIR):
         missing = [c for c in gen if not pg_thread_exists(c)]
@@ -1329,6 +1348,7 @@ class Generator:
                                        queue_map=qmap))
         if not self.instances:
             raise RuntimeError("nessuna istanza pktgen costruita")
+        _warn_unbalanced_gen(self.instances)
 
     @property
     def names(self):
@@ -3130,7 +3150,8 @@ def run_fair(methods, model_path, frames, delays, count, threads,
     sem, n_out = class_semantics()
     raw = []
 
-    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False,
+                     port_queues=egress_queues(plan)) as fab:
         # --- fase 1: compila e carica tutto. Qui gira clang, una volta sola,
         #     e nessuna misura e' ancora partita.
         print(f"\n{YELLOW}{'=' * 78}{NC}")
@@ -3706,6 +3727,72 @@ def enable_threaded_napi(devs, plan_or_first_cpu=None, ncpu=None):
     return placed
 
 
+def pin_egress_napi(devs, egress, plan):
+    """La NAPI dei veth d'uscita in thread, un core per coda usata.
+
+    Il core i-esimo del DUT scrive nella coda (cpu % code) di ogni veth
+    d'uscita (veth_xdp_xmit); il thread di quella coda va sulla CPU d'uscita
+    i-esima (in giro, se sono meno dei core del DUT). Le code che nessuno usa
+    stanno sulla prima. Con una CPU sola e' enable_threaded_napi com'era.
+
+    Presuppone che l'ordine dei thread (napi id) sia quello delle code: e' cio'
+    che fa veth, ma il kernel non lo promette (vedi _napi_threads). Per questo
+    restituisce anche {pid: (dev, coda, cpu)}: egress_napi_report dice a fine
+    run quali thread hanno lavorato e dove, e se la mappa era sbagliata lo si
+    vede li'.
+
+    Restituisce (placed come enable_threaded_napi, {pid: (dev, coda, cpu,
+    tick iniziali)}, {coda: cpu})."""
+    cpus = HC.egress_cpus(egress)
+    placed = enable_threaded_napi(
+        devs, CpuPlan([], cpus[:1], online_cpus(), []))
+    n_q = egress_queues(plan)
+    queue_cpu = {q: cpus[0] for q in range(n_q)}
+    for i, d in enumerate(plan.dut):
+        queue_cpu[d % n_q] = cpus[i % len(cpus)]
+    threads = {}
+    for dev, _, _ in placed:
+        for q, pid in enumerate(_napi_threads(dev)):
+            cpu = queue_cpu.get(q, cpus[0])
+            if cpu != cpus[0]:
+                r = subprocess.run(["taskset", "-pc", str(cpu), pid],
+                                   capture_output=True, text=True,
+                                   check=False)
+                if r.returncode != 0:
+                    warn(f"{dev}: taskset su cpu{cpu} fallito per il pid "
+                         f"{pid}: la coda {q} resta su cpu{cpus[0]}")
+                    cpu = cpus[0]
+            threads[pid] = (dev, q, cpu, _thread_ticks(pid))
+    return placed, threads, queue_cpu
+
+
+def _thread_ticks(pid):
+    """(utime + stime in tick, ultima CPU) di un thread, o (None, None)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read().rsplit(")", 1)[1].split()
+        return int(st[11]) + int(st[12]), int(st[36])
+    except (OSError, IndexError, ValueError):
+        return None, None
+
+
+def egress_napi_report(threads):
+    """Quali thread d'uscita hanno lavorato, su che CPU: la verifica della
+    mappa coda -> CPU di pin_egress_napi."""
+    hz = os.sysconf("SC_CLK_TCK")
+    rows = []
+    for pid, (dev, q, cpu, (t0, _)) in sorted(threads.items(),
+                                              key=lambda kv: kv[1][:2]):
+        t1, last = _thread_ticks(pid)
+        if t0 is None or t1 is None or t1 - t0 < hz // 10:
+            continue
+        rows.append(f"{dev} coda {q}: {(t1 - t0) / hz:.1f} s di CPU, "
+                    f"pinnato su cpu{cpu}, ultima cpu{last}")
+    print("  -- thread NAPI d'uscita che hanno lavorato (>= 0,1 s) --")
+    for r in rows or ["nessuno sopra 0,1 s"]:
+        print(f"    {r}")
+
+
 def disable_threaded_napi(devs):
     for dev in devs:
         path = f"/sys/class/net/{dev}/threaded"
@@ -3876,6 +3963,57 @@ def make_tg_links(n, gen_queues=1, dut_queues=1):
 DUT_QUEUES = None
 
 
+# Le code d'uscita (ogni coppia veth di porta). La fissa main() da
+# --egress-queues.
+#
+# 1: il comportamento fino al 2026-10-01. Ogni CPU del DUT che fa redirect in
+# una porta scrive nello stesso ptr_ring del peer, sotto lo stesso
+# producer_lock: su 2 core la baseline si fermava a 13,0 Mpps elaborati con
+# 18-26 offerti, rxonly_fwd (solo redirect) a ~15,7 contro i 38,3 di rxonly
+# (results/generator_contention/xdp_2core_2thread_uscita_separata/).
+#
+# None (--egress-queues auto, il default): il minimo numero di code per cui le
+# CPU del DUT cadono in code diverse -- veth_xdp_xmit sceglie la coda come
+# smp_processor_id() % code, quindi con DUT 6,8 due code NON bastano (6 % 2 =
+# 8 % 2). Con un solo core del DUT e' 1: le misure a un core non cambiano.
+EGRESS_QUEUES = None
+
+
+def egress_queues(plan):
+    """Code per ogni veth d'uscita: una coda per CPU del DUT, senza che due
+    CPU cadano nella stessa per via del modulo."""
+    if EGRESS_QUEUES is not None:
+        return EGRESS_QUEUES
+    dut = list(getattr(plan, "dut", None) or [0])
+    n = len(dut)
+    while len({c % n for c in dut}) < len(dut):
+        n += 1
+    return n
+
+
+def _warn_unbalanced_gen(instances):
+    """Avvisa se le code d'ingresso ricevono da un numero diverso di thread
+    pktgen.
+
+    Un thread pktgen offre ~2,8 Mpps, meno di quanto un core del nodo riceve
+    con rxonly (~4,7). Con 3 thread su 2 code una coda ne ha uno solo e il suo
+    core resta in parte fermo: il 2026-10-01, su 2 core, rxonly si fermava a
+    7,55 Mpps (x1,64 su un core) con 3 thread e arrivava a 9,41 (x2,04) con 4,
+    due per coda. Le pipeline piu' pesanti saturano comunque."""
+    per_q = {}
+    for i in instances:
+        if i["queue_map"] is not None:
+            per_q.setdefault(i["queue_map"], []).append(i["cpu"])
+    if len({len(cs) for cs in per_q.values()}) > 1:
+        warn("thread del generatore distribuiti male fra le code "
+             "d'ingresso: "
+             + "; ".join(f"coda {q} <- cpu{','.join(map(str, cs))}"
+                         for q, cs in sorted(per_q.items()))
+             + ". La coda con meno thread riceve meno traffico e il suo core "
+               "puo' non saturare (rxonly e baseline): usa un multiplo del "
+               "numero di code (--gen-cpus).")
+
+
 def _warn_shared_queues(plan):
     """Avvisa se due thread del generatore XDP scrivono nella stessa coda.
 
@@ -3886,9 +4024,11 @@ def _warn_shared_queues(plan):
     da 12,4 a 7,2 Mpps; su due core, 2 thread (uno per coda) contro 3 danno
     13,0 contro 7,6. Le pipeline leggere ne escono sottostimate fino al 70%,
     P2 e P3 entro il 6%. Regola: un thread per coda, su CPU di resto diverso."""
-    if len(plan.dut) > 1:
+    n_e = egress_queues(plan)
+    if len({c % n_e for c in plan.dut}) < len(plan.dut):
         warn(f"{len(plan.dut)} core del nodo inoltrano nelle STESSE code "
-             f"d'uscita (una per veth): due scrittori per coda anche li'. Con "
+             f"d'uscita ({n_e} per veth, --egress-queues): due scrittori per "
+             f"coda anche li'. Con "
              f"le pipeline leggere l'uscita si intasa e il redirect fallisce, "
              f"cioe' il nodo paga lo scarto: misurato il 2026-09-30 su 2 core, "
              f"baseline persa per il 49% dopo XDP con l'uscita occupata al "
@@ -4201,7 +4341,8 @@ def run_method(method, model_path, frames, delays, count, out_rows,
 
     sem, n_out = class_semantics()
     rc = 0
-    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False,
+                     port_queues=egress_queues(plan)) as fab:
         rx_side = (xmit_mode == "netif_receive")
         rx_b, rx_tab, attached = attach_rx_counter(fab)
         info(f"contatore RX su {len(attached)} peer d'uscita (XDP_DROP)")
@@ -4902,7 +5043,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
     sem, n_out = class_semantics()
     raw = []
 
-    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False,
+                     port_queues=egress_queues(plan)) as fab:
         rx_side = (xmit_mode == "netif_receive")
         rx_b, rx_tab, attached = attach_rx_counter(fab)
         info(f"contatore RX su {len(attached)} peer d'uscita (XDP_DROP)")
@@ -4963,19 +5105,24 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 napi_devs = []
                 warn("nessun thread NAPI pinnato: generatore e pipeline "
                      "restano sullo stesso core")
-        egress_napi = []
+        egress_napi, egress_threads = [], {}
         if egress_cpu is not None:
-            eplan = CpuPlan([], [egress_cpu], online_cpus(), [])
-            placed_e = enable_threaded_napi(list(attached), eplan)
+            placed_e, egress_threads, queue_cpu = pin_egress_napi(
+                list(attached), egress_cpu, plan)
             egress_napi = [d for d, _, _ in placed_e]
+            e_cpus = ",".join(str(c) for c in HC.egress_cpus(egress_cpu))
             if egress_napi:
+                n_e = len(queue_cpu)
                 info(f"uscita separata: NAPI dei {len(egress_napi)} veth "
-                     f"d'uscita in thread su cpu{egress_cpu}. Sulla CPU del "
+                     f"d'uscita in thread su cpu{e_cpus} ("
+                     + ", ".join(f"DUT {d} -> coda {d % n_e} -> "
+                                 f"cpu{queue_cpu[d % n_e]}" for d in plan.dut)
+                     + f"). Sulla CPU del "
                      f"DUT resta il lavoro del nodo, dalla ricezione "
                      f"all'inoltro.")
             else:
                 warn(f"uscita NON separata: nessun thread NAPI d'uscita "
-                     f"pinnato su cpu{egress_cpu}; 1/RX contiene anche la "
+                     f"pinnato su cpu{e_cpus}; 1/RX contiene anche la "
                      f"ricezione a valle")
 
         if scenario is not None:
@@ -5128,6 +5275,8 @@ def run_compare(methods, model_path, frames, offered_pps=None,
         pg_reset()
         if napi_devs:
             disable_threaded_napi(napi_devs)
+        if egress_threads:
+            egress_napi_report(egress_threads)
         if egress_napi:
             disable_threaded_napi(egress_napi)
         _class_mix_report({m: loaded[m] for m in alive}, n_out, sem)
@@ -5517,7 +5666,8 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
     rates = list(rates or [int(r * 1e6) for r in DEFAULT_RATES_MPPS])
     raw = []
 
-    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
+    with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False,
+                     port_queues=egress_queues(plan)) as fab:
         print(f"\n{YELLOW}{'=' * 78}{NC}")
         print(f"{YELLOW} Fase 1: compilo e carico le pipeline strumentate "
               f"(nessuna misura in corso){NC}")
@@ -6640,8 +6790,12 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
             add("code_ingresso_dut",
                 f"{rx_q} (generatore su {tx_q} code TX)"
                 if len(plan.gen) > 1 else "1 (ingresso del fabric)")
+        if getattr(plan, "dut", None):
+            n_e = egress_queues(plan)
+            add("code_uscita", f"{n_e} per veth d'uscita (CPU del DUT -> coda "
+                + ", ".join(f"{c}->{c % n_e}" for c in plan.dut) + ")")
     if egress is None and a is not None and \
-            isinstance(getattr(a, "egress_cpu", None), int):
+            isinstance(getattr(a, "egress_cpu", None), (int, list)):
         egress = a.egress_cpu
     if a is not None:
         add("modalita", "latency" if getattr(a, "latency", False) else a.mode)
@@ -6659,7 +6813,8 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
         add("modello_forma", m.shape if m else "dal checkpoint")
         topo = MUT.active_topology() if m else None
         add("scenario", topo["topology"] if topo else "dal checkpoint (trained_on)")
-        add("cpu_uscita", f"separata: cpu{egress}" if egress is not None
+        add("cpu_uscita", "separata: cpu" + ",".join(
+            str(c) for c in HC.egress_cpus(egress)) if egress is not None
             else "stessa del DUT")
         add("warmup_s", a.warmup)
         add("ripetizioni_per_punto", a.repeat)
@@ -7129,6 +7284,13 @@ def main():
                         "NAPI sullo stesso core, alternati dallo scheduler). "
                         "Vedi DUT_QUEUES.")
 
+    g.add_argument("--egress-queues", default="auto", metavar="N|auto",
+                   help="code di ogni veth d'uscita. auto (default): una per "
+                        "CPU del DUT, scelte in modo che due CPU non cadano "
+                        "nella stessa coda (veth la sceglie come CPU modulo "
+                        "code). 1: il comportamento fino al 2026-10-01, tutti "
+                        "i core del DUT nella stessa coda. Vedi EGRESS_QUEUES.")
+
     m = p.add_argument_group("misura")
     m.add_argument("--duration", type=float, default=WINDOW_S, metavar="S",
                    help=f"durata bersaglio di una finestra di misura "
@@ -7171,13 +7333,16 @@ def main():
                         "quindi le classi decise cambiano e il traffico "
                         "esercita piu' porte d'uscita e il percorso DROP. "
                         "Un TTL 1 manda il pacchetto allo stack (scaduto).")
-    m.add_argument("--egress-cpu", default=None, metavar="N|auto",
+    m.add_argument("--egress-cpu", default=None, metavar="N[,M...]|auto",
                    help="solo --mode compare. Sposta la NAPI dei veth "
                         "d'uscita (la ricezione del nodo successivo) sulla "
                         "CPU N, fuori da quelle del DUT: 1/RX diventa il "
                         "costo del nodo dalla ricezione all'inoltro. auto: "
                         "un core fisico suo scelto dal piano, se ne resta "
-                        "uno.")
+                        "uno. Una lista (3,5): un core per coda d'uscita "
+                        "usata, la coda del core i-esimo del DUT sulla CPU "
+                        "i-esima -- con 2 core del DUT una CPU sola non "
+                        "svuota le code (tetto ~10 Mpps, 2026-10-01).")
     m.add_argument("--window", choices=("steady", "count"), default="steady",
                    help="steady (default): rate letti a differenza mentre "
                         "tutte le istanze pktgen trasmettono, poi stop. "
@@ -7247,7 +7412,7 @@ def main():
     # ipa/results/x (lo stesso difetto corretto in bench_bitrate il 26/09).
     if a.out:
         a.out = os.path.abspath(a.out)
-    global WINDOW_MODE, DUT_QUEUES
+    global WINDOW_MODE, DUT_QUEUES, EGRESS_QUEUES
     WINDOW_MODE = a.window
     if a.generator == "xdp" and (a.latency or a.mode != "compare"
                                  or a.window != "steady"):
@@ -7294,16 +7459,25 @@ def main():
     plan = plan_cpus(a.gen_cpus, a.dut_cpus, a.threads, a.allow_cpu0,
                      egress_spec=a.egress_cpu)
     plan.describe()
-    if isinstance(a.egress_cpu, int):
-        if a.egress_cpu in plan.dut:
-            sys.exit(f"--egress-cpu {a.egress_cpu} e' una CPU del DUT: "
+    for e in HC.egress_cpus(a.egress_cpu if a.egress_cpu != "auto"
+                            else None):
+        if e in plan.dut:
+            sys.exit(f"--egress-cpu {e} e' una CPU del DUT: "
                      f"l'uscita resterebbe dove si misura")
-        if a.egress_cpu in plan.gen:
-            sys.exit(f"--egress-cpu {a.egress_cpu} e' una CPU del "
+        if e in plan.gen:
+            sys.exit(f"--egress-cpu {e} e' una CPU del "
                      f"generatore: gli toglierebbe tempo")
-        if a.egress_cpu not in online_cpus():
-            sys.exit(f"--egress-cpu {a.egress_cpu}: CPU non online")
+        if e not in online_cpus():
+            sys.exit(f"--egress-cpu {e}: CPU non online")
     DUT_QUEUES = parse_dut_queues(a.dut_queues, plan)
+    if str(a.egress_queues).strip().lower() != "auto":
+        try:
+            EGRESS_QUEUES = int(a.egress_queues)
+        except ValueError:
+            sys.exit(f"--egress-queues: atteso auto o un numero, ricevuto "
+                     f"{a.egress_queues!r}")
+        if EGRESS_QUEUES < 1:
+            sys.exit("--egress-queues: almeno 1")
 
     # Le condizioni della macchina si applicano dopo il piano (servono i
     # ruoli) e prima di qualunque misura, e si ripristinano comunque vada.
@@ -7346,6 +7520,11 @@ def conditioned(a, plan, body, out_dir=None):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
         log_path = os.path.join(out_dir, "host_monitor.csv")
+        # Il registro lo scrive un processo a parte, che lo tronca quando
+        # parte: fino ad allora env.csv leggerebbe quello di un run
+        # precedente nella stessa cartella (successo il 2026-10-01).
+        if os.path.exists(log_path):
+            os.remove(log_path)
         mon.start_log(log_path)
     HOST_ENV = lambda: HC.env_pairs(
         plan, host=host, monitor=mon,

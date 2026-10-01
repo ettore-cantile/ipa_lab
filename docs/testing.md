@@ -849,7 +849,16 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
 
 - **CPU separate**: i thread `kpktgend_<cpu>` sulle CPU del generatore, il thread NAPI del
   DUT (`/sys/class/net/<dev>/threaded`) pinnato sulla CPU del DUT, l'uscita in softirq sulla
-  CPU del DUT oppure in thread su una CPU sua (`--egress-cpu N|auto`).
+  CPU del DUT oppure in thread su CPU sue (`--egress-cpu N|N,M|auto`): con una lista, la
+  coda d'uscita del core i-esimo del DUT va sulla CPU i-esima; `auto` prende un core fisico
+  libero per ogni core del DUT, finché ce ne sono.
+- **Una coda d'uscita per core del DUT** (`--egress-queues auto`, dal 2026-10-01). Il redirect
+  in un veth sceglie la coda del peer come CPU che inoltra modulo numero di code: con una coda
+  sola due core del DUT scrivono nello stesso `ptr_ring`. `auto` sceglie il numero minimo di
+  code per cui i core del DUT cadono in code diverse (con i core 6 e 8 sono 3: 6 → 0, 8 → 2;
+  con 2 code cadrebbero entrambi nella 0). Con un core del DUT è 1, cioè il fabric di prima:
+  le misure a un core non cambiano. `--egress-queues 1` riproduce il comportamento vecchio.
+  `env.csv` riporta la mappa (`code_uscita`). Perché serve: §10.7.
 - **Una coda d'ingresso per core del DUT** (`--dut-queues auto`): i thread pktgen scrivono
   tutti sulla stessa coda. Con una coda per thread generatore (`--dut-queues gen`) il DUT
   avrebbe più thread NAPI sullo stesso core, e quale coda viene servita lo deciderebbe lo
@@ -859,7 +868,8 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
   scrittori sulla stessa coda rallentano anche il core del nodo che la svuota (§10.6). Con
   pktgen costa ~17 ns per pacchetto a tutte le pipeline (baseline compresa), con i frame XDP
   fino al doppio. Le cifre di §10.2 sono a 3 thread: valori assoluti con quei ~17 ns, costi
-  sopra la baseline invariati.
+  sopra la baseline invariati. Con più core del DUT i thread vanno divisi **in parti uguali**
+  fra le code (thread i → coda i modulo code): il banco avvisa se non lo sono (§10.7).
 - **Tempo di CPU per pacchetto** (colonne `cpu_dut_pct`, `ns_cpu`, `ns_cpu_vs_baseline`):
   l'occupazione dei core del DUT letta da `/proc/stat` **nella stessa lettura** dei contatori
   della finestra stazionaria, × core / elaborati. 1e9 / elaborati è il costo solo se il nodo
@@ -876,7 +886,7 @@ pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] 
   1,50 → 1,49). Sotto `BPF_PROG_TEST_RUN` (29-09) la baseline scende da 18 a 14 ns e perde
   20 istruzioni, i due incrementi atomici; P1.5 / P2 / P3 danno 53 / 200 / 314 contro 52 /
   195 / 315, dentro la variazione fra i run (§ Risultati). Le cifre di traffico nel resto
-  del documento restano quelle del 28-09.
+  del documento restano quelle del 28-09, salvo quelle a due core (§10.2, §10.7: 2026-10-01).
 - **Tre punti di conteggio**: TX (pktgen, più i respinti da `veth_xmit` a coda piena), HIT
   (`pkt_stats[0]` della pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è
   arrivato al programma, HIT − RX ciò che il programma ha elaborato e non è uscito.
@@ -937,31 +947,33 @@ Il costo della rete neurale non cambia; si tengono le cifre a 3 thread perché c
 `rxonly` non satura (il generatore si ferma a 2,84 Mpps) e il tetto di ricezione non si
 misura più.
 
-**Su due core** (`--dut-cpus 6,8`, una coda d'ingresso per core, stesso generatore a 3
-thread; `results/throughput_cores1/` e `results/throughput_cores2/`, 2026-09-28, contatori
-per-CPU):
+**Su due core** (`--dut-cpus 6,8`, una coda d'ingresso e una d'uscita per core, 4 thread
+pktgen, due per coda; `results/throughput_cores1/` del 2026-09-28 e
+`results/throughput_cores2/` del 2026-10-01, alimentatore, macchina non disturbata):
 
 ```bash
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6   --out results/throughput_cores1
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6,8 --out results/throughput_cores2
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3   --dut-cpus 6   --out results/throughput_cores1
+sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3,5 --dut-cpus 6,8 --out results/throughput_cores2
 ```
 
-| pipeline | 1 core (Mpps) | 2 core (Mpps) | rapporto |
-|---|---:|---:|---:|
-| rxonly | 4,62 | 7,50 | 1,62 |
-| baseline | 3,40 | 6,50 | 1,91 |
-| p1_static (P1) | 3,01 | 5,76 | 1,91 |
-| hardcoded (P1.5) | 2,87 | 5,58 | 1,95 |
-| template (P2) | 1,91 | 3,72 | 1,95 |
-| modular (P3) | 1,49 | 2,95 | 1,98 |
+| pipeline | 1 core (Mpps) | 2 core (Mpps) | rapporto | ns di CPU per core, 2 core |
+|---|---:|---:|---:|---:|
+| rxonly | 4,62 | 9,41 | 2,04 | 213 |
+| baseline | 3,40 | 6,72 | 1,98 | 298 |
+| p1_static (P1) | 3,01 | 6,02 | 2,00 | 332 (+34) |
+| hardcoded (P1.5) | 2,87 | 5,62 | 1,96 | 356 (+58) |
+| template (P2) | 1,91 | 3,79 | 1,98 | 528 (+231) |
+| modular (P3) | 1,49 | 2,88 | 1,93 | 694 (+397) |
 
-Le pipeline crescono **quasi linearmente** (1,91–1,98): i core non si contendono niente di
-scritto a ogni pacchetto, e le due code ricevono un carico simile anche con 3 thread
-generatore su 2 code. `rxonly` cresce meno (1,62): a 7,5 Mpps il generatore offre 8,3 Mpps,
-vicino al suo tetto, e la differenza fra le code pesa di più. Nessun throttling, macchina non
-disturbata in entrambe le misure. Il costo per pacchetto per core resta quello di 1 core: il
-numero da riportare per un nodo con N code è ~N × la capacità a 1 core, finché il
-generatore e la scheda reggono.
+**Due core reggono il doppio di uno per tutte le pipeline** (1,93–2,04): i core non si
+contendono niente di scritto a ogni pacchetto (contatori per-CPU), e il costo sopra la
+baseline per core è quello di un core (+34 / +58 / +231 / +397 contro +39 / +56 / +230 /
++376 a 3 thread su un core). Il numero da riportare per un nodo con N code è ~N × la
+capacità a 1 core, finché il generatore e la scheda reggono. Due condizioni del banco
+servono a vederlo (§10.7): **una coda d'uscita per core del DUT** (con una sola, la contesa
+in uscita costa 12–20 ns per pacchetto per core: rapporti 1,91–1,98) e **i thread pktgen in
+parti uguali fra le code** (con 3 thread su 2 code una coda ne riceve uno solo, ~2,8 Mpps, e
+rxonly si ferma a 7,55 Mpps, rapporto 1,64).
 
 ### 10.3 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
 
@@ -1053,10 +1065,10 @@ che con i frame grezzi non ci sono.
   restituisce sul core del nodo, con l'inoltro sul core d'uscita. A 3 thread la differenza
   risultava ~100 ns, gonfiata dalla contesa.
 
-**Il controllo di validità conta gli elaborati, non gli arrivati.** Con più scrittori sulle
-code d'uscita (due core del nodo, §10.6) l'uscita perde dopo XDP; contando gli arrivati la
-baseline sembrerebbe più lenta di P1. `check_validity` confronta `node_pps` (elaborati,
-altrimenti HIT, altrimenti RX).
+**Il controllo di validità conta gli elaborati, non gli arrivati.** Se l'uscita non tiene il
+passo del nodo si perde dopo XDP, e contando gli arrivati la pipeline più veloce sembrerebbe
+la più lenta (è successo con due core e una coda d'uscita, §10.7). `check_validity` confronta
+`node_pps` (elaborati, altrimenti HIT, altrimenti RX), la stessa grandezza del costo.
 
 **La misura del 2026-09-28 a 3 thread** (`results/throughput_xdp/`, 1e9 / elaborati): baseline
 141, P1 158, P1.5 161, P2 296, P3 434 ns, con rxonly a 6,9 Mpps e la baseline sopra (7,1).
@@ -1080,8 +1092,11 @@ batteria, le differenze sono fino al doppio):
 | 2 | 25 | 9,8 | 7,3 | 6,3 |
 | 3 | 39 | 7,4 | 7,2 | 6,2 |
 
-La conferma con l'alimentatore, due core sul nodo (due code), uscita sui core del nodo: 2
-thread, **uno per coda**, contro 3 thread, due dei quali sulla stessa coda:
+La conferma con l'alimentatore, due core sul nodo (due code d'ingresso), uscita sui core del
+nodo: 2 thread, **uno per coda**, contro 3 thread, due dei quali sulla stessa coda. Misura del
+2026-09-30, con **una** coda d'uscita condivisa dai due core (la configurazione di allora):
+le cifre assolute delle pipeline leggere sono basse per la contesa in uscita (§10.7), il
+confronto fra le due righe regge perché la pagano tutte e due:
 
 | Mpps elaborati | rxonly | baseline | P1 | P1.5 | P2 | P3 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -1097,18 +1112,13 @@ il programma. **Con pktgen** l'effetto è piccolo (1 contro 3 thread: baseline 2
 ns, P2 510 contro 526; il nodo è pieno al 100% in entrambi) perché pktgen riempie la coda
 meno in fretta.
 
-**Anche in uscita.** Con due core sul nodo e l'uscita su un core suo, i due core inoltrano
-nelle stesse code d'uscita: la baseline perde il 49% **dopo** XDP con il core d'uscita
-occupato solo al 77% (`results/generator_contention/xdp_2core_2thread_uscita_separata/`).
-Un redirect che trova la coda d'uscita piena fallisce e il pacchetto lo scarta il nodo, che
-ne paga il costo: quei costi (baseline 144, P1 181, P1.5 186 ns di CPU) non sono puliti. Con
-un core solo l'uscita consegna 12 Mpps senza perdite.
-
-**La regola**: un solo scrittore per coda, in ingresso e in uscita. Su questa macchina è
-**1 thread di generatore, 1 core del nodo, uscita su un core suo** (§10.5). Il banco lo
-controlla: con `xdp_gen` avvisa se due thread finiscono sulla stessa coda (la coda si sceglie
-dalla CPU che trasmette, CPU modulo numero di code) e se più core del nodo inoltrano nelle
-stesse code d'uscita.
+**La regola**: un solo scrittore per coda, in ingresso e in uscita. Su un core del nodo è
+**1 thread di generatore, uscita su un core suo** (§10.5). Con N core del nodo: N code
+d'ingresso con lo stesso numero di thread ciascuna, N code d'uscita (`--egress-queues auto`) e,
+con `xdp_gen`, un core d'uscita per coda (`--egress-cpu N,M`), §10.7. Il banco lo controlla:
+avvisa se due thread `xdp_gen` finiscono sulla stessa coda (la coda si sceglie dalla CPU che
+trasmette, CPU modulo numero di code), se i thread pktgen non sono divisi in parti uguali fra
+le code, e se più core del nodo inoltrano nella stessa coda d'uscita.
 
 **Con una scheda di rete vera il problema non c'è.** La coda di ricezione la riempie la
 scheda (DMA), e il core del nodo la svuota: un solo scrittore per costruzione, gli altri host
@@ -1124,7 +1134,86 @@ rxonly: il 7,1 contro 6,9 del 28-09 era una differenza di pochi punti dentro il 
 Con uno scrittore i due non saturano e non si confrontano; la misura pulita è quella per classe
 (§10.5): scartare costa ~50 ns in più.
 
-### 10.7 Latenza arrivo → ripartenza (`--latency`)
+### 10.7 Due core: una coda d'uscita per core, thread in parti uguali (2026-10-01)
+
+**Il problema.** Con due core sul nodo e `xdp_gen` (2 thread, uno per coda d'ingresso, uscita
+su cpu3), il 30-09 baseline, P1 e P1.5 non raddoppiavano e perdevano dopo XDP: la baseline
+elaborava 13,05 Mpps e ne arrivavano 4,26 (`results/generator_contention/
+xdp_2core_2thread_uscita_separata/`). Il generatore non c'entrava: offriva 18–26 Mpps e la
+coda d'ingresso ne respingeva il 28–50%.
+
+**La causa: l'uscita.** Il fabric creava ogni veth d'uscita con una coda. Il redirect sceglie
+la coda del peer come CPU che inoltra modulo numero di code, quindi i due core del nodo
+scrivevano nello stesso `ptr_ring`, e un solo thread NAPI d'uscita lo svuotava. Due effetti:
+
+1. **contesa sul ring**: lucchetto dei produttori e righe di cache passano da un core
+   all'altro a ogni pacchetto, e il costo lo paga il core del nodo nel redirect;
+2. **un core d'uscita solo non basta**: ricevere, contare e restituire la pagina alla
+   page_pool del generatore costa a cpu3 ~70 ns a pacchetto, cioè un tetto di ~10 Mpps; oltre
+   il ring trabocca, il redirect fallisce e il nodo paga anche lo scarto.
+
+Nella stessa sessione rxonly, che non fa redirect, elaborava 38 Mpps; rxonly_fwd, che fa solo
+il redirect, ~15,7: il limite era il redirect verso l'uscita.
+
+**La soluzione, un passo alla volta** (`xdp_gen`, 2 core, Mpps elaborati; ns di CPU per core
+fra parentesi; i primi due run a batteria, il terzo con l'alimentatore, macchina non
+disturbata):
+
+| | 1 coda d'uscita, 1 core d'uscita | 3 code, 1 core d'uscita | **3 code, 2 core d'uscita** | 1 core del nodo (§10.5) |
+|---|---:|---:|---:|---:|
+| baseline | 13,15 (152) | 19,15 (103) | **28,33 (68)** | 12,14 (67, non satura) |
+| P1 | 10,44 (192) | 14,96 (132) | **17,05 (117)** | 7,58 (116) |
+| P1.5 | 10,11 (195) | 14,39 (139) | **15,81 (127)** | 6,77 (125) |
+| P2 | 6,56 (305) | 6,62 (302) | **6,68 (298)** | 3,00 (293) |
+| P3 | 4,65 (430) | 4,59 (436) | **4,61 (434)** | 1,97 (428) |
+| persi dopo XDP, baseline | 49% | 40% | **0,03%** | 0 |
+
+Cartelle: `results/generator_contention/xdp_2core_2thread_uscita_1coda/` e `…_uscita_3code/`,
+`results/throughput_xdp_cores2/`. Con una coda d'uscita per core e un core d'uscita per coda **il costo
+per core coincide con quello di un core** (68 / 117 / 127 / 298 / 434 contro 67 / 116 / 125 /
+293 / 428 ns) e gli elaborati sono il 95–99% del doppio della capacità a un core (2 / ns di
+CPU). Gli arrivati coincidono con gli elaborati. La baseline ora satura (respinti 2%, il
+generatore offre 29 Mpps): la cifra è vicina al tetto del generatore. Il run con 1 coda
+riproduce quello del 30-09 entro l'1%: la batteria non spostava i numeri.
+
+Il banco verifica la mappa coda → core d'uscita a fine run (`thread NAPI d'uscita che hanno
+lavorato`): nel run citato hanno lavorato solo la coda 0 su cpu3 e la coda 2 su cpu5, per
+entrambe le porte usate. Con `--egress-cpu auto` il banco trova su questa macchina un solo core
+d'uscita libero (cpu3: il core di cpu0 resta al sistema) e lo dice; per il secondo si passa
+`--egress-cpu 3,5`.
+
+```bash
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
+    --gen-cpus 10,1 --dut-cpus 6,8 --egress-cpu 3,5 --out results/throughput_xdp_cores2
+```
+
+**Con pktgen l'effetto è piccolo.** Stesso banco della §10.2 a 3 thread, uscita sui core del
+nodo, 1 coda d'uscita contro 3, sequenza A-B-A nella stessa sessione (`results/pktgen_cores2/
+3thread_3code_a`, `3thread_1coda`, `3thread_3code_b`; A e A' entro l'1%, B riproduce il
+28-09 entro l'1,5%):
+
+| Mpps | rxonly | baseline | P1 | P1.5 | P2 | P3 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 coda d'uscita | 7,48 | 6,52 | 5,79 | 5,55 | 3,74 | 2,90 |
+| 3 code d'uscita | 7,55 | 6,92 | 6,15 | 5,84 | 3,87 | 2,95 |
+| guadagno | +1% | +6,2% | +6,2% | +5,4% | +3,4% | +1,8% |
+
+La contesa in uscita costava 12–20 ns per pacchetto per core, uguali per tutte: i costi sopra
+la baseline non cambiano (P1 +38 / +36, P2 +227 / +228 ns per core). rxonly non fa redirect e
+non cambia: è il controllo. L'effetto è più piccolo che con `xdp_gen` perché pktgen arriva a
+rate più bassi.
+
+**I thread pktgen in parti uguali fra le code.** Il thread i scrive nella coda i modulo
+code. Con 3 thread su 2 code la coda 0 riceve da due thread (~5,5 Mpps offerti), la coda 1 da
+uno (~2,8): per le pipeline basta a saturare entrambi i core, per rxonly no, perché un core
+riceve ~4,7 Mpps. Il core della coda 1 resta fermo il 40% del tempo: rxonly elaborava
+4,75 + 2,77 ≈ 7,52 Mpps (misurati 7,55, respinti 9,8% previsti 9,6%), rapporto 1,64 su un
+core. Con 4 thread, due per coda (`--gen-cpus 10,1,3,5`, `results/throughput_cores2/`), le code ricevono lo stesso traffico, i due core sono occupati allo stesso
+modo e rxonly arriva a **9,41 Mpps (2,04)**. Le pipeline perdono il 2–4% rispetto a 3 thread:
+ora tutte e due le code hanno due scrittori (la contesa d'ingresso di §10.6). La tabella di
+§10.2 è a 4 thread.
+
+### 10.8 Latenza arrivo → ripartenza (`--latency`)
 
 ```bash
 sudo python3 ipa/test/bench_throughput.py --latency --frames 512 --rounds 3 --repeat 5 \
