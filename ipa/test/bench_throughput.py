@@ -3998,7 +3998,7 @@ def _warn_unbalanced_gen(instances):
     Un thread pktgen offre ~2,8 Mpps, meno di quanto un core del nodo riceve
     con rxonly (~4,7). Con 3 thread su 2 code una coda ne ha uno solo e il suo
     core resta in parte fermo: il 2026-10-01, su 2 core, rxonly si fermava a
-    7,55 Mpps (x1,64 su un core) con 3 thread e arrivava a 9,41 (x2,04) con 4,
+    7,55 Mpps (x1,61 su un core) con 3 thread e arrivava a 9,29 (x1,98) con 4,
     due per coda. Le pipeline piu' pesanti saturano comunque."""
     per_q = {}
     for i in instances:

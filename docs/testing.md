@@ -948,32 +948,34 @@ Il costo della rete neurale non cambia; si tengono le cifre a 3 thread perché c
 misura più.
 
 **Su due core** (`--dut-cpus 6,8`, una coda d'ingresso e una d'uscita per core, 4 thread
-pktgen, due per coda; `results/throughput_cores1/` del 2026-09-28 e
-`results/throughput_cores2/` del 2026-10-01, alimentatore, macchina non disturbata):
+pktgen, due per coda; `results/throughput_cores1/` e `results/throughput_cores2/`, stessa
+sessione del 2026-10-01, alimentatore, macchina non disturbata, nodo occupato al 100%):
 
 ```bash
 sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3   --dut-cpus 6   --out results/throughput_cores1
 sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3,5 --dut-cpus 6,8 --out results/throughput_cores2
 ```
 
-| pipeline | 1 core (Mpps) | 2 core (Mpps) | rapporto | ns di CPU per core, 2 core |
-|---|---:|---:|---:|---:|
-| rxonly | 4,62 | 9,41 | 2,04 | 213 |
-| baseline | 3,40 | 6,72 | 1,98 | 298 |
-| p1_static (P1) | 3,01 | 6,02 | 2,00 | 332 (+34) |
-| hardcoded (P1.5) | 2,87 | 5,62 | 1,96 | 356 (+58) |
-| template (P2) | 1,91 | 3,79 | 1,98 | 528 (+231) |
-| modular (P3) | 1,49 | 2,88 | 1,93 | 694 (+397) |
+| pipeline | 1 core (Mpps) | 2 core (Mpps) | rapporto | ns di CPU, 1 core | ns di CPU per core, 2 core |
+|---|---:|---:|---:|---:|---:|
+| rxonly | 4,69 | 9,29 | 1,98 | 213 | 215 |
+| baseline | 3,41 | 6,72 | 1,97 | 294 | 298 |
+| p1_static (P1) | 3,00 | 5,96 | 1,99 | 333 (+40) | 335 (+38) |
+| hardcoded (P1.5) | 2,86 | 5,60 | 1,96 | 349 (+56) | 357 (+60) |
+| template (P2) | 1,90 | 3,68 | 1,94 | 527 (+233) | 543 (+246) |
+| modular (P3) | 1,46 | 2,81 | 1,93 | 684 (+391) | 711 (+413) |
 
-**Due core reggono il doppio di uno per tutte le pipeline** (1,93–2,04): i core non si
-contendono niente di scritto a ogni pacchetto (contatori per-CPU), e il costo sopra la
-baseline per core è quello di un core (+34 / +58 / +231 / +397 contro +39 / +56 / +230 /
-+376 a 3 thread su un core). Il numero da riportare per un nodo con N code è ~N × la
-capacità a 1 core, finché il generatore e la scheda reggono. Due condizioni del banco
+**Due core reggono il doppio di uno per tutte le pipeline** (1,93–1,99): i core non si
+contendono niente di scritto a ogni pacchetto (contatori per-CPU). Il costo per core di
+rxonly, baseline, P1 e P1.5 è quello di un core entro 8 ns; P2 e P3 pagano per core il 3–4%
+in più (543 contro 527, 711 contro 684 ns), da cui i loro rapporti un po' più bassi. Il
+numero da riportare per un nodo con N code è ~N × la capacità a 1 core, finché il generatore
+e la scheda reggono. A 1 core i thread sono 3 su una coda (come nelle cifre qui sopra), a 2
+core 2 per coda. Due condizioni del banco
 servono a vederlo (§10.7): **una coda d'uscita per core del DUT** (con una sola, la contesa
 in uscita costa 12–20 ns per pacchetto per core: rapporti 1,91–1,98) e **i thread pktgen in
 parti uguali fra le code** (con 3 thread su 2 code una coda ne riceve uno solo, ~2,8 Mpps, e
-rxonly si ferma a 7,55 Mpps, rapporto 1,64).
+rxonly si ferma a 7,55 Mpps, rapporto 1,61).
 
 ### 10.3 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
 
@@ -1022,27 +1024,29 @@ sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egres
 ```
 
 Costo del nodo = **tempo di CPU per pacchetto** (§10.1): dalla presa dalla coda di ricezione
-alla decisione e al redirect, con l'uscita su una CPU sua (cpu8). 2026-09-30, alimentatore
-collegato, macchina non disturbata (`results/cpu_time/xdp_1thread/`):
+alla decisione e al redirect, con l'uscita su una CPU sua (cpu8). 2026-10-01, stessa sessione
+delle misure a due core (§10.2, §10.7), alimentatore collegato, macchina non disturbata
+(`results/cpu_time/xdp_1thread/`; la misura del 30-09 dava 116 / 125 / 293 / 428 ns, entro
+l'1%):
 
 | | elaborati (Mpps) | respinti | nodo occupato | 1e9 / elaborati | **ns di CPU** |
 |---|---:|---:|---:|---:|---:|
-| rxonly | 15,03 | 1% | 60% | 67 | 40 (non satura) |
-| baseline | 12,14 | 2% | 81% | 82 | 67 (non satura) |
-| p1_static | 7,58 | 26% | 88% | 132 | **116** |
-| hardcoded | 6,77 | 30% | 85% | 148 | **125** |
-| template | 3,00 | 71% | 88% | 334 | **293** |
-| modular | 1,97 | 82% | 84% | 509 | **428** |
+| rxonly | 14,96 | 1% | 60% | 67 | 40 (non satura) |
+| baseline | 12,41 | 1% | 80% | 81 | 65 (non satura) |
+| p1_static | 7,59 | 26% | 87% | 132 | **117** |
+| hardcoded | 7,08 | 29% | 87% | 141 | **124** |
+| template | 2,97 | 71% | 87% | 337 | **292** |
+| modular | 2,01 | 82% | 87% | 498 | **432** |
 
-Costo sopra la baseline: P1 +49, P1.5 +58, P2 +226, P3 +361 ns; con pktgen (§10.2) +38 /
+Costo sopra la baseline: P1 +52, P1.5 +59, P2 +228, P3 +367 ns; con pktgen (§10.2) +38 /
 +53 / +226 / +364. **I due generatori danno lo stesso costo della rete neurale**; la differenza
-assoluta (baseline 296 con pktgen contro 67) è la copia della skb e il percorso dello stack,
+assoluta (baseline 296 con pktgen contro 65) è la copia della skb e il percorso dello stack,
 che con i frame grezzi non ci sono.
 
-- **Il nodo lavora l'84–88% del tempo anche respingendo il 70–80% dei pacchetti.** Un thread
+- **Il nodo lavora l'87% del tempo anche respingendo il 70–80% dei pacchetti.** Un thread
   di `xdp_gen` spedisce a raffiche (256 frame per volta): la raffica riempie la coda e il resto
   viene respinto, fra una raffica e l'altra il nodo svuota la coda e aspetta. 1e9 / elaborati
-  conterebbe l'attesa come lavoro (P2 334 ns invece di 293): per questo il costo è il tempo di
+  conterebbe l'attesa come lavoro (P2 337 ns invece di 292): per questo il costo è il tempo di
   CPU.
 - **Baseline e rxonly non saturano** con un thread (il generatore offre 12–15 Mpps e il nodo li
   prende tutti). Il loro tempo di CPU è misurato ma va preso con cautela: un nodo più veloce
@@ -1051,7 +1055,7 @@ che con i frame grezzi non ci sono.
   saturo). I costi da citare sono quelli delle pipeline che saturano.
 - **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro il 3% su ogni pipeline
   (misura a 3 thread, `results/throughput_xdp_frames/`): il nodo tocca solo le intestazioni.
-- **Per classe** (`results/cpu_time/xdp_per_class/`, stato dei link e TTL cercati per ciascuna
+- **Per classe** (`results/cpu_time/xdp_per_class/`, 2026-09-30, stato dei link e TTL cercati per ciascuna
   delle 6 classi raggiungibili, classe decisa verificata), ns di CPU:
 
   | | classi FORWARD (0–4) | classe DROP (5) | differenza |
@@ -1156,24 +1160,25 @@ Nella stessa sessione rxonly, che non fa redirect, elaborava 38 Mpps; rxonly_fwd
 il redirect, ~15,7: il limite era il redirect verso l'uscita.
 
 **La soluzione, un passo alla volta** (`xdp_gen`, 2 core, Mpps elaborati; ns di CPU per core
-fra parentesi; i primi due run a batteria, il terzo con l'alimentatore, macchina non
-disturbata):
+fra parentesi; i primi due run a batteria, il terzo e l'ultima colonna con l'alimentatore,
+nella stessa sessione del 2026-10-01, macchina non disturbata):
 
 | | 1 coda d'uscita, 1 core d'uscita | 3 code, 1 core d'uscita | **3 code, 2 core d'uscita** | 1 core del nodo (§10.5) |
 |---|---:|---:|---:|---:|
-| baseline | 13,15 (152) | 19,15 (103) | **28,33 (68)** | 12,14 (67, non satura) |
-| P1 | 10,44 (192) | 14,96 (132) | **17,05 (117)** | 7,58 (116) |
-| P1.5 | 10,11 (195) | 14,39 (139) | **15,81 (127)** | 6,77 (125) |
-| P2 | 6,56 (305) | 6,62 (302) | **6,68 (298)** | 3,00 (293) |
-| P3 | 4,65 (430) | 4,59 (436) | **4,61 (434)** | 1,97 (428) |
-| persi dopo XDP, baseline | 49% | 40% | **0,03%** | 0 |
+| baseline | 13,15 (152) | 19,15 (103) | **28,80 (68)** | 12,41 (65, non satura) |
+| P1 | 10,44 (192) | 14,96 (132) | **16,57 (121)** | 7,59 (117) |
+| P1.5 | 10,11 (195) | 14,39 (139) | **15,88 (126)** | 7,08 (124) |
+| P2 | 6,56 (305) | 6,62 (302) | **6,74 (297)** | 2,97 (292) |
+| P3 | 4,65 (430) | 4,59 (436) | **4,55 (439)** | 2,01 (432) |
+| persi dopo XDP, baseline | 49% | 40% | **0,04%** | 0 |
 
 Cartelle: `results/generator_contention/xdp_2core_2thread_uscita_1coda/` e `…_uscita_3code/`,
 `results/throughput_xdp_cores2/`. Con una coda d'uscita per core e un core d'uscita per coda **il costo
-per core coincide con quello di un core** (68 / 117 / 127 / 298 / 434 contro 67 / 116 / 125 /
-293 / 428 ns) e gli elaborati sono il 95–99% del doppio della capacità a un core (2 / ns di
-CPU). Gli arrivati coincidono con gli elaborati. La baseline ora satura (respinti 2%, il
-generatore offre 29 Mpps): la cifra è vicina al tetto del generatore. Il run con 1 coda
+per core è quello di un core entro il 3,5%** (P1 121 contro 117, P1.5 126 contro 124, P2 297
+contro 292, P3 439 contro 432 ns) e gli elaborati di P1–P3 sono il 97–99% del doppio della
+capacità a un core (2 / ns di CPU). Gli arrivati coincidono con gli elaborati. La baseline
+ora satura (respinti 2,5%, il generatore offre 29,6 Mpps): la cifra è vicina al tetto del
+generatore, e i suoi 68 ns per core confermano i 65 indicativi di un core. Il run con 1 coda
 riproduce quello del 30-09 entro l'1%: la batteria non spostava i numeri.
 
 Il banco verifica la mappa coda → core d'uscita a fine run (`thread NAPI d'uscita che hanno
@@ -1207,9 +1212,9 @@ rate più bassi.
 code. Con 3 thread su 2 code la coda 0 riceve da due thread (~5,5 Mpps offerti), la coda 1 da
 uno (~2,8): per le pipeline basta a saturare entrambi i core, per rxonly no, perché un core
 riceve ~4,7 Mpps. Il core della coda 1 resta fermo il 40% del tempo: rxonly elaborava
-4,75 + 2,77 ≈ 7,52 Mpps (misurati 7,55, respinti 9,8% previsti 9,6%), rapporto 1,64 su un
+4,75 + 2,77 ≈ 7,52 Mpps (misurati 7,55, respinti 9,8% previsti 9,6%), rapporto 1,61 su un
 core. Con 4 thread, due per coda (`--gen-cpus 10,1,3,5`, `results/throughput_cores2/`), le code ricevono lo stesso traffico, i due core sono occupati allo stesso
-modo e rxonly arriva a **9,41 Mpps (2,04)**. Le pipeline perdono il 2–4% rispetto a 3 thread:
+modo e rxonly arriva a **9,29 Mpps (1,98)**. Le pipeline perdono il 3–5% rispetto a 3 thread:
 ora tutte e due le code hanno due scrittori (la contesa d'ingresso di §10.6). La tabella di
 §10.2 è a 4 thread.
 

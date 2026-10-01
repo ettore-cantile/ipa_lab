@@ -2101,13 +2101,13 @@ milioni di pacchetti al secondo, ed è così che si usa: un thread per ogni coda
 del nodo (sezione~\ref{sec:scrittore}).
 
 \begin{prima}[Esempio: lo stesso programma con i due generatori]
-P2 costa \textbf{526~ns} di CPU per pacchetto con \texttt{pktgen} e
-\textbf{293~ns} con \texttt{xdp\_gen}. Il programma è lo stesso byte per byte: i
-233~ns di differenza sono la copia della skb e il percorso dello stack, cioè il
-costo del \emph{generatore}, pagato sul core del nodo; per P3 la differenza è la
-stessa (672 contro 428). \emph{Sopra la baseline} invece i due generatori danno
-lo stesso costo della rete neurale: P2 226~ns con tutti e due, P3 364 contro 361,
-P1.5 53 contro 58. Il trasporto cambia, il costo del programma no.
+P2 costa \textbf{527~ns} di CPU per pacchetto con \texttt{pktgen} e
+\textbf{292~ns} con \texttt{xdp\_gen} (stessa sessione, 1 ottobre). Il programma
+è lo stesso byte per byte: i 235~ns di differenza sono la copia della skb e il
+percorso dello stack, cioè il costo del \emph{generatore}, pagato sul core del
+nodo. \emph{Sopra la baseline} invece i due generatori danno quasi lo stesso
+costo della rete neurale: P2 233 contro 228~ns, P1.5 56 contro 59, P1 40 contro
+52. Il trasporto cambia, il costo del programma no.
 \end{prima}
 
 \section{Com'era il test nella macchina virtuale, e com'è adesso}
@@ -2257,7 +2257,7 @@ Con un solo scrittore per coda anche all'uscita (un core del nodo che inoltra,
 sezione~\ref{sec:scrittore}) il nodo successivo tiene il passo: riceve 12
 milioni di pacchetti al secondo senza perderne. Con due core sul nodo serve una
 coda d'uscita per ciascun core, e un core d'uscita per ciascuna coda: allora
-arrivano tutti, anche 28 milioni al secondo (sezione~\ref{sec:duecore}).
+arrivano tutti, anche 29 milioni al secondo (sezione~\ref{sec:duecore}).
 
 \subsection*{3. Il cavo è virtuale, e tutto sta su un processore}
 
@@ -2381,16 +2381,17 @@ alla consegna all'uscita, è:
 \toprule
 \textbf{Pipeline} & \textbf{ns di CPU per pacchetto} & \textbf{sopra la baseline} & \textbf{con \texttt{pktgen}} \\
 \midrule
-P1 & 116 & +49 & +38 \\
-P1.5 & 125 & +58 & +53 \\
-P2 (template) & 293 & +226 & +226 \\
-P3 (modular)  & 428 & +361 & +364 \\
-baseline & 67 & --- & --- \\
+P1 & 117 & +52 & +38 \\
+P1.5 & 124 & +59 & +53 \\
+P2 (template) & 292 & +228 & +226 \\
+P3 (modular)  & 432 & +367 & +364 \\
+baseline & 65 & --- & --- \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} 30 settembre, 3 giri a 64 byte. La baseline, con un
-thread, non satura: il suo valore è indicativo. A 512 e 1\,514 byte P2 e P3
-costano uguale entro il 3\%.}
+{\footnotesize\color{soft} 1 ottobre, 3 giri a 64 byte (il 30 settembre entro
+l'1\%). La colonna \texttt{pktgen} è la tabella del 28 settembre. La baseline,
+con un thread, non satura: il suo valore è indicativo. A 512 e 1\,514 byte P2 e
+P3 costano uguale entro il 3\%.}
 \end{center}
 
 I costi sopra la baseline sono quasi gli stessi dei due generatori: la rete
@@ -2472,9 +2473,9 @@ piena davanti a un nodo troppo lento.
 
 Con un solo thread \texttt{xdp\_gen} spedisce a raffiche: la raffica riempie la
 coda e il resto viene respinto, poi fra una raffica e l'altra il nodo svuota la
-coda e \emph{aspetta}. Il core del nodo lavora così l'84--88\% del tempo, anche
+coda e \emph{aspetta}. Il core del nodo lavora così l'87\% del tempo, anche
 mentre respinge il 70--80\% dei pacchetti. Dividere il tempo per i pacchetti
-elaborati conterebbe anche l'attesa: P2 risulterebbe 334~ns invece di 293.
+elaborati conterebbe anche l'attesa: P2 risulterebbe 337~ns invece di 292.
 
 Per questo il banco misura quanto il core del nodo è occupato, nella stessa
 finestra in cui conta i pacchetti, e dà il costo come \textbf{tempo di CPU per
@@ -2666,25 +2667,26 @@ per coda d'ingresso:
 \toprule
 \textbf{Programma} & \textbf{1 core (Mpps)} & \textbf{2 core (Mpps)} & \textbf{rapporto} & \textbf{ns per core} \\
 \midrule
-\texttt{rxonly}     & 4,62 & 9,41 & 2,04 & 213 \\
-baseline            & 3,40 & 6,72 & 1,98 & 298 \\
-P1                  & 3,01 & 6,02 & 2,00 & 332 \\
-P1.5                & 2,87 & 5,62 & 1,96 & 356 \\
-P2                  & 1,91 & 3,79 & 1,98 & 528 \\
-P3                  & 1,49 & 2,88 & 1,93 & 694 \\
+\texttt{rxonly}     & 4,69 & 9,29 & 1,98 & 215 \\
+baseline            & 3,41 & 6,72 & 1,97 & 298 \\
+P1                  & 3,00 & 5,96 & 1,99 & 335 \\
+P1.5                & 2,86 & 5,60 & 1,96 & 357 \\
+P2                  & 1,90 & 3,68 & 1,94 & 543 \\
+P3                  & 1,46 & 2,81 & 1,93 & 711 \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} 1 core: 28 settembre, tre thread. 2 core: 1 ottobre,
-alimentatore, macchina non disturbata.}
+{\footnotesize\color{soft} Stessa sessione, 1 ottobre, alimentatore, macchina non
+disturbata. 1 core: tre thread; 2 core: quattro, due per coda.}
 \end{center}
 
-Con due core ogni programma elabora il doppio (fra 1,93 e 2,04 volte): il
-secondo core non rallenta il primo, e sopra la baseline ogni core paga quello
-che pagava da solo (+34, +58, +231, +397~ns per P1, P1.5, P2, P3). Con i
+Con due core ogni programma elabora il doppio (fra 1,93 e 1,99 volte): il
+secondo core non rallenta il primo. Per core, il solo contatore, la baseline, P1
+e P1.5 costano quanto su un core entro 8~ns; P2 e P3 il 3--4\% in più (543
+contro 527, 711 contro 684~ns), da cui i loro rapporti un po' più bassi. Con i
 pacchetti grezzi di \texttt{xdp\_gen} il risultato è lo stesso: due core
-elaborano il 95--99\% del doppio, e il tempo di CPU per pacchetto di ogni core
-(68, 117, 127, 298, 434~ns) è quello misurato su un core solo (67, 116, 125,
-293, 428). Per un nodo con $N$ code vale quindi $N$ volte la capacità misurata
+elaborano il 97--99\% del doppio, e il tempo di CPU per pacchetto di ogni core
+(121, 126, 297, 439~ns per P1, P1.5, P2, P3) è quello misurato su un core solo
+(117, 124, 292, 432) entro il 3,5\%. Per un nodo con $N$ code vale quindi $N$ volte la capacità misurata
 su un core, finché generatore e scheda reggono.
 
 Il raddoppio si vede solo se ogni coda ha un solo scrittore anche
@@ -2696,11 +2698,11 @@ solo core del nodo successivo.
 \begin{prima}[Esempio: la baseline a due core con una coda d'uscita]
 Con \texttt{xdp\_gen} la baseline elaborava 13,15 milioni di pacchetti al secondo
 e al nodo successivo ne arrivavano 4,2: il 49\% si perdeva dopo il programma, e
-ogni core spendeva 152~ns per pacchetto invece di 67. Con tre code d'uscita
+ogni core spendeva 152~ns per pacchetto invece di 65. Con tre code d'uscita
 (il core 6 scrive nella 0, il core 8 nella 2) gli elaborati salgono a 19,15, ma
 un core d'uscita solo ne riceve circa 10 milioni e il resto si perde ancora. Con
-un core d'uscita per coda la baseline elabora 28,3 milioni al secondo, arrivano
-tutti, e il costo per core torna a 68~ns. Con \texttt{pktgen}, che arriva a rate
+un core d'uscita per coda la baseline elabora 28,8 milioni al secondo, arrivano
+tutti, e il costo per core torna a 68~ns (65 su un core, indicativo). Con \texttt{pktgen}, che arriva a rate
 più bassi, la coda d'uscita condivisa costava 12--20~ns per pacchetto per core:
 i rapporti erano 1,91--1,98 invece di circa 2.
 \end{prima}
@@ -2709,8 +2711,8 @@ Anche il generatore va diviso in parti uguali. Con tre thread \texttt{pktgen}
 su due code una coda riceve da due thread e l'altra da uno solo, circa 2,8
 milioni al secondo: abbastanza per saturare i core dei programmi, non quello di
 \texttt{rxonly}, che ne riceve 4,7. Il solo contatore si fermava così a 7,55
-milioni (1,64 volte), con un core fermo il 40\% del tempo; con quattro thread,
-due per coda, arriva a 9,41 (2,04 volte).
+milioni (1,61 volte), con un core fermo il 40\% del tempo; con quattro thread,
+due per coda, arriva a 9,29 (1,98 volte).
 
 \begin{lezione}
 Per tutte e cinque la perdita è \textbf{all'ingresso}: il collo di bottiglia è il
