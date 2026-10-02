@@ -33,7 +33,7 @@ GLOSSARY = [
     ("Pipeline", "Una delle versioni del programma che esegue la rete neurale (P1, P1.5, P2, P3)."),
     ("baseline / rxonly", "I due programmi di riferimento: la baseline inoltra senza rete neurale, rxonly riceve e basta."),
     ("Coda", "I 256 posti davanti al nodo dove i pacchetti aspettano. Se è piena, chi arriva è respinto."),
-    ("Coda d'uscita", "La coda del cavo virtuale verso il nodo successivo. Con più core sul nodo ce n'è una per core, svuotata da un core suo (slide 14)."),
+    ("Coda d'uscita", "La coda del cavo virtuale verso il nodo successivo. Con più core sul nodo ce n'è una per core, svuotata da un core suo (slide 12)."),
     ("Capacità", "Quanti pacchetti al secondo il nodo riesce a elaborare al massimo."),
     ("Collo di bottiglia", "Il pezzo più lento della catena: decide quanto traffico passa."),
     ("M/s", "Milioni di pacchetti al secondo."),

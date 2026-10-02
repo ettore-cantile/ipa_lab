@@ -174,6 +174,13 @@ def t_losses():
           "programma", BB.classify(fl, 2.5) == BB.LABEL_PROG)
     check("3% prima di XDP con rxonly a 0 -> programma",
           BB.classify(fl, 0.0) == BB.LABEL_PROG)
+    # nodo non saturo: la stessa perdita con il thread NAPI del DUT al 60%
+    # non e' del programma (baseline a 9-12 Mpps, 2026-10-02)
+    idle = dict(fl, napi_run_pct=60.0)
+    check("perdita prima di XDP col nodo al 60% -> banco, non programma",
+          BB.classify(idle, 0.0) == BB.LABEL_BENCH)
+    check("col nodo al 99,8% -> programma",
+          BB.classify(dict(fl, napi_run_pct=99.8), 0.0) == BB.LABEL_PROG)
     # le percentuali si sommano, la scomposizione torna
     m = _row(tx=9000, rej=1000, rx=8900, fwd=8000, hit=8500, miss=100,
              drop=250)

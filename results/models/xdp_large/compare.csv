@@ -1,0 +1,5 @@
+method,frame,phase,rounds,offered_pps,offered_real_pps,rx_pps,rx_pps_mean,hit_pps,proc_pps,rx_pps_min,rx_pps_max,rx_pps_std,rx_pps_cv_pct,loss_pct,loss_worst,respinti_pct,loss_dut_pct,rx,tx,offered_tx,lost_before,lost_after,rx_mbps,secs,window_mode,pps_spread_pct,unreliable,threads,bottleneck,cpu_dut_pct,ns_cpu
+rxonly,64,saturazione,3,,19678686,19368088,19364762,19368118,19368118,19262104,19464096,82496.4,0.4,1.341,1.778,1.332,0.0,5818950,5818959,5912266,78927,9,9916.46,0.3,steady,1.0,False,1,pipeline-ingresso,79.3,40.9
+baseline,64,saturazione,3,,15145044,15135681,15121602,15137036,15137036,15062149,15166976,43938.1,0.3,0.101,0.24,0.053,0.009,4547454,4547861,4550267,2406,407,7749.47,0.3,steady,0.7,False,1,pipeline-ingresso,100.0,65.9
+p1_static,64,saturazione,3,,11005481,6870711,6849794,6870215,6870215,6798429,6880244,36528.9,0.5,37.938,38.227,37.593,0.0,2063248,2063099,3305512,1242775,0,3517.8,0.3,steady,1.2,False,1,pipeline-ingresso,100.0,145.6
+hardcoded,64,saturazione,3,,10984727,6443143,6459128,6442993,6442993,6433693,6500549,29541.8,0.5,41.87,41.876,40.833,0.0,1935075,1935030,3299053,1347518,0,3298.89,0.3,steady,1.0,False,1,pipeline-ingresso,100.0,155.2

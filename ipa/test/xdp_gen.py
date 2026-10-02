@@ -28,8 +28,28 @@ BPF_PROG_TEST_RUN (claims E2). Il programma generatore RISCRIVE quindi a ogni
 esecuzione le prime HDR_COPY byte (Ethernet, IPv4, UDP e l'inizio del payload)
 da un modello in una mappa.
 
-LIMITE. Niente cadenza: il test_run spinge al massimo. Serve per la capacita'
-(fase saturazione), non per un rate offerto fissato.
+LA CADENZA (2026-10-02). Il test_run spinge al massimo; il ritmo lo tiene il
+programma generatore. Con un intervallo in gen_ctl[0] ogni esecuzione legge
+l'orologio: prima dell'istante previsto il frame viene scartato (XDP_DROP: la
+pagina torna subito alla page_pool, e il giro costa decine di ns), all'istante
+previsto parte e il prossimo e' un intervallo piu' in la'. La spaziatura e'
+quindi uniforme, alla risoluzione di un giro, e non a raffiche: una raffica
+riempirebbe da sola la coda da 256 posti e farebbe perdere pacchetti sotto
+capacita'. Se il thread resta indietro (la chiamata successiva, uno
+scheduling) recupera al piu' CATCHUP frame di fila e poi riparte da adesso --
+pktgen invece trasmette di fila fino a rimettersi in orario, a qualunque
+distanza. Il primo run (2026-10-02, results/bitrate_xdp/) non recuperava
+niente: a ogni fine lotto il thread resta fermo qualche us, e spediva l'80-87%
+del chiesto a rate basso, il 45-65% a rate alto. Il redirect accoda nel veth a gruppi (al piu' 16 frame,
+DEV_MAP_BULK_SIZE, o a fine lotto): a rate alto i frame arrivano a gruppetti
+di quella taglia, a rate basso uno per volta.
+
+IL TIMBRO. Con gen_ctl[2] = 1 il programma scrive in testa al payload
+l'intestazione di pktgen completa -- magic, seq, tv_sec, tv_usec in big-endian,
+CLOCK_REALTIME in microsecondi (bpf_ktime_get_ns + gen_ctl[1], l'offset fra i
+due orologi) -- nell'istante in cui il frame parte. Il contatore d'uscita di
+bench_bitrate la legge senza modifiche, e non serve la correzione per
+l'attesa fra timbro e trasmissione che pktgen richiede.
 
 USO (sonda di fattibilita', confronta i due generatori sulla stessa coppia veth
 e lo stesso ricevitore, nella stessa sessione):
@@ -38,7 +58,9 @@ e lo stesso ricevitore, nella stessa sessione):
 """
 import argparse
 import ctypes as ct
+import errno
 import os
+import signal
 import socket
 import struct
 import sys
@@ -74,8 +96,25 @@ HDR_COPY = 48
 # sedici volte meno spesso.
 CALL_FRAMES = 1 << 20
 BATCH_SIZE = 256
+# LA FINESTRA IN UNA CHIAMATA (2026-10-02). Ogni test_run in modalita' live
+# parte e finisce con una pausa del thread di ~12 ms dentro il kernel
+# (preparazione e smontaggio: dispatcher XDP, page_pool). Con chiamate da
+# CALL_FRAMES frame ce n'erano 2-4 per finestra: il generatore taceva il ~13%
+# del tempo, il DUT svuotava la coda e dormiva (diagnostica in
+# results/diag_xdp/: thread NAPI all'87%, 2-3 sonni per finestra quante le
+# chiamate). Per questo il nodo risultava occupato all'~87% anche a coda
+# piena, e la cadenza spediva l'~80% del chiesto. steady() fa quindi UNA
+# chiamata lunga e la interrompe con un segnale a fine finestra: test_run
+# controlla signal_pending e torna con EINTR. La pausa iniziale cade prima
+# della prima lettura.
+STEADY_CALL_FRAMES = 0xFFFFFFFF
+STOP_SIGNAL = signal.SIGUSR1
+# Frame che la cadenza puo' spedire di fila per rimettersi in orario: quanti
+# il redirect ne accoda comunque insieme (DEV_MAP_BULK_SIZE).
+CATCHUP = 16
 
 PKTGEN_MAGIC = 0xBE9BE955      # net/core/pktgen.c: primo byte 0xBE = model_id
+PKTGEN_HDR_OFF = 14 + 20 + 8   # l'intestazione di pktgen: subito dopo UDP
 
 # sizeof(struct ipa_hdr) nelle pipeline (verify_prog_run.EBPF_BASELINE e
 # compagne): 10 byte fissi + 4 feature x 2 + 1 + 2 output. Un payload piu'
@@ -171,11 +210,43 @@ struct hdr_t { __u8 b[HDR_COPY]; };
 struct mix_t { __u8 ttl; __u8 csum[2]; };
 BPF_ARRAY(gen_hdr, struct hdr_t, 1);
 BPF_ARRAY(gen_mix, struct mix_t, MIX_SLOTS);
-BPF_PERCPU_ARRAY(gen_runs, __u64, 1);   /* tentativi: uno per esecuzione */
+BPF_PERCPU_ARRAY(gen_runs, __u64, 1);   /* tentativi: uno per frame inoltrato */
+/* 0 intervallo fra due frame dello stesso thread, ns (0 = massima spinta);
+ * 1 CLOCK_REALTIME - CLOCK_MONOTONIC, ns; 2 timbro pktgen (1 = si') */
+BPF_ARRAY(gen_ctl, __u64, 3);
+BPF_PERCPU_ARRAY(gen_next, __u64, 1);   /* istante del prossimo frame, ns */
+/* diagnostica della cadenza: 0 giri d'attesa, 1 azzeramenti (indietro oltre
+ * CATCHUP), 2 somma del ritardo di partenza sull'istante previsto, ns */
+BPF_PERCPU_ARRAY(gen_dbg, __u64, 3);
 int xdp_gen(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *end = (void *)(long)ctx->data_end;
-    int k = 0;
+    int k = 0, k_off = 1, k_stamp = 2;
+    __u64 now = 0;
+    __u64 *iv = gen_ctl.lookup(&k);
+    if (iv && *iv) {
+        __u64 *nx = gen_next.lookup(&k);
+        if (!nx) return XDP_DROP;
+        now = bpf_ktime_get_ns();
+        int k_spin = 0, k_reset = 1, k_late = 2;
+        if (now < *nx) {                         /* non ancora: si gira */
+            __u64 *c = gen_dbg.lookup(&k_spin);
+            if (c) *c += 1;
+            return XDP_DROP;
+        }
+        __u64 late = now - *nx;
+        /* indietro: si recuperano al piu' CATCHUP frame di fila, poi si
+         * riparte da adesso */
+        if (late > CATCHUP * *iv) {
+            *nx = now - CATCHUP * *iv;
+            __u64 *c = gen_dbg.lookup(&k_reset);
+            if (c) *c += 1;
+            late = CATCHUP * *iv;
+        }
+        __u64 *ls = gen_dbg.lookup(&k_late);
+        if (ls) *ls += late;
+        *nx += *iv;
+    }
     __u64 *n = gen_runs.lookup(&k);
     if (n) *n += 1;
     if (data + HDR_COPY > end) return XDP_ABORTED;
@@ -192,6 +263,19 @@ int xdp_gen(struct xdp_md *ctx) {
             d[24] = m->csum[0];        /* 14 + 10: iphdr.check */
             d[25] = m->csum[1];
         }
+    }
+    __u64 *st = gen_ctl.lookup(&k_stamp);
+    if (st && *st && n && data + PG_OFF + 16 <= end) {
+        __u64 *off = gen_ctl.lookup(&k_off);
+        if (!now) now = bpf_ktime_get_ns();
+        __u64 us = (now + (off ? *off : 0)) / 1000;
+        __u32 sec = (__u32)(us / 1000000), usec = (__u32)(us % 1000000);
+        __u32 seq = (__u32)*n;
+        __u8 *h = (__u8 *)data + PG_OFF;
+        h[4] = seq >> 24; h[5] = seq >> 16; h[6] = seq >> 8; h[7] = seq;
+        h[8] = sec >> 24; h[9] = sec >> 16; h[10] = sec >> 8; h[11] = sec;
+        h[12] = usec >> 24; h[13] = usec >> 16; h[14] = usec >> 8;
+        h[15] = usec;
     }
     return bpf_redirect(TARGET_IFINDEX, 0);
 }
@@ -229,7 +313,8 @@ class XdpGen:
     rate_estimate = 0
 
     def __init__(self, target_dev, plan, window_s=0.3,
-                 dst_mac="02:00:00:00:00:02", dst_ip="10.0.0.2", ttls=None):
+                 dst_mac="02:00:00:00:00:02", dst_ip="10.0.0.2", ttls=None,
+                 batch_size=BATCH_SIZE):
         from bcc import BPF
         self.target = target_dev
         self.ifindex = socket.if_nametoindex(target_dev)
@@ -238,17 +323,35 @@ class XdpGen:
         self.dst_mac, self.dst_ip = dst_mac, dst_ip
         self.src_mac = _mac_of(target_dev)
         self.ttls = list(ttls or [])
+        # Il lotto del test_run: e' anche ogni quanti frame il redirect
+        # sveglia il DUT (xdp_do_flush a fine lotto -> XDP_XMIT_FLUSH ->
+        # veth sveglia la NAPI; i gruppi da 16 accodati a meta' lotto non la
+        # svegliano) e la taglia della page_pool.
+        if not 1 <= int(batch_size) <= 256:
+            raise ValueError("batch_size: 1..256 (TEST_XDP_MAX_BATCH)")
+        self.batch_size = int(batch_size)
         if len(self.ttls) > MIX_MAX or any(not 1 <= t <= 255
                                            for t in self.ttls):
             raise ValueError(f"ttls: al piu' {MIX_MAX} valori in 1..255")
         self.b = BPF(text=GEN_SRC, cflags=[
             f"-DHDR_COPY={HDR_COPY}", f"-DTARGET_IFINDEX={self.ifindex}",
             f"-DMIX_N={len(self.ttls)}",
-            f"-DMIX_SLOTS={max(1, len(self.ttls))}"])
+            f"-DMIX_SLOTS={max(1, len(self.ttls))}",
+            f"-DPG_OFF={PKTGEN_HDR_OFF}", f"-DCATCHUP={CATCHUP}"])
         self.fn = self.b.load_func("xdp_gen", BPF.XDP)
+        # Il segnale che interrompe la chiamata lunga: serve un gestore (anche
+        # vuoto), altrimenti SIGUSR1 termina il processo. Si installa dal
+        # thread principale, dove nasce il generatore.
+        try:
+            signal.signal(STOP_SIGNAL, lambda *_: None)
+        except ValueError:
+            pass
         self.last_run = None
         self._frame = None
         self.base_ttl = 32
+        # pause fuori da test_run, per thread: ns totali e numero di chiamate
+        self._gap_ns = {c: 0 for c in self.cpus}
+        self._calls = {c: 0 for c in self.cpus}
 
     def set_ttl(self, ttl):
         """Il TTL del frame di base (quello senza --ttl-mix). Serve a
@@ -284,7 +387,23 @@ class XdpGen:
         pass
 
     def delay_for(self, total_pps):
-        return 0                      # nessuna cadenza: solo massima spinta
+        """L'intervallo fra due frame di UN thread, in ns, per `total_pps`
+        in tutto: e' il `delay` che steady() riceve. 0 = massima spinta."""
+        if not total_pps:
+            return 0
+        return max(1, int(round(self.n_inst * 1e9 / float(total_pps))))
+
+    def set_stamp(self, on=True):
+        """Il timbro di pktgen in ogni frame (per la latenza end-to-end)."""
+        self._ctl(2, 1 if on else 0)
+
+    def _ctl(self, i, v):
+        self.b["gen_ctl"][ct.c_int(i)] = ct.c_ulonglong(int(v))
+
+    def _clock_offset(self):
+        """CLOCK_REALTIME - CLOCK_MONOTONIC in ns, per il timbro."""
+        return time.clock_gettime_ns(time.CLOCK_REALTIME) - \
+            time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
     def window_count(self, total_pps, seconds=None):
         return CALL_FRAMES
@@ -315,14 +434,32 @@ class XdpGen:
         return buf
 
     def _test_run(self, buf, size, frames):
+        """Una chiamata. False se interrotta da un segnale (EINTR)."""
         attr = _AttrTestRun(prog_fd=self.fn.fd, data_size_in=size,
                             data_in=ct.cast(buf, ct.c_void_p).value,
                             repeat=frames, flags=BPF_F_TEST_XDP_LIVE_FRAMES,
-                            batch_size=BATCH_SIZE)
+                            batch_size=self.batch_size)
         if _bpf(BPF_PROG_TEST_RUN, attr) < 0:
             e = ct.get_errno()
+            if e == errno.EINTR:
+                return False
             raise OSError(e, f"BPF_PROG_TEST_RUN live frames: "
                              f"{os.strerror(e)}")
+        return True
+
+    def diag(self):
+        """Contatori cumulativi per la diagnostica della cadenza (somme sui
+        thread): giri d'attesa, azzeramenti, ritardo di partenza (ns), pause
+        fuori da test_run (ns), chiamate. Vanno letti nella stessa sonda dei
+        contatori della finestra, che ne fa le differenze."""
+        vals = [self.b["gen_dbg"][ct.c_int(i)] for i in range(3)]
+        out = {}
+        for i, name in enumerate(("gen_spin", "gen_reset", "gen_late_ns")):
+            out[name] = sum(int(vals[i][c]) for c in self.cpus
+                            if c < len(vals[i]))
+        out["gen_gap_ns"] = sum(self._gap_ns.values())
+        out["gen_calls"] = sum(self._calls.values())
+        return out
 
     def _runs(self):
         vals = self.b["gen_runs"][ct.c_int(0)]
@@ -331,6 +468,7 @@ class XdpGen:
     # -- una chiamata per thread (le sonde) ------------------------------
     def run(self, frame, count, delay):
         import bench_throughput as BT
+        self._ctl(0, 0)               # le sonde: massima spinta, `count` frame
         buf = self._set_frame(frame)
         size = self._frame[2]
         before = sum(self._runs().values())
@@ -366,9 +504,8 @@ class XdpGen:
         stimano come tentativi meno HIT del DUT, se la sonda porta `hit`;
         `xmit_ethtool` porta la controprova sui totali di ethtool."""
         import bench_throughput as BT
-        if delay:
-            raise RuntimeError("il generatore XDP non ha cadenza: solo "
-                               "massima spinta (delay 0)")
+        self._ctl(0, delay or 0)
+        self._ctl(1, self._clock_offset())
         seconds = self.window_s if seconds is None else seconds
         buf = self._set_frame(frame)
         size = self._frame[2]
@@ -378,8 +515,14 @@ class XdpGen:
         def loop(cpu):
             try:
                 os.sched_setaffinity(0, {cpu})
+                last = None
                 while not stop.is_set():
-                    self._test_run(buf, size, CALL_FRAMES)
+                    t0 = time.monotonic_ns()
+                    if last is not None:
+                        self._gap_ns[cpu] += t0 - last
+                    self._test_run(buf, size, STEADY_CALL_FRAMES)
+                    last = time.monotonic_ns()
+                    self._calls[cpu] += 1
             except OSError as e:
                 errs.append(e)
                 stop.set()
@@ -420,8 +563,17 @@ class XdpGen:
             vivi = all(t.is_alive() for t in ths)
         finally:
             stop.set()
-            for t in ths:
-                t.join(timeout=5.0)
+            deadline = time.monotonic() + 5.0
+            while any(t.is_alive() for t in ths) and \
+                    time.monotonic() < deadline:
+                for t in ths:
+                    if t.is_alive() and t.ident is not None:
+                        try:
+                            signal.pthread_kill(t.ident, STOP_SIGNAL)
+                        except (ProcessLookupError, OSError):
+                            pass
+                for t in ths:
+                    t.join(timeout=0.02)
         eth1 = xmit_counters(self.target)
         if errs:
             raise RuntimeError(f"generatore XDP: {errs[0]}")
@@ -434,7 +586,11 @@ class XdpGen:
         # Accettati = tutto cio' che il programma del DUT ha elaborato, con
         # qualunque esito (HIT, MISS, DROP): i respinti sono il resto dei
         # tentativi. La controprova e' in `xmit_ethtool`.
-        if "hit" in dut:
+        if "rx_xdp" in dut:
+            # bench_bitrate: il contatore davanti alla pipeline vede tutto
+            # cio' che la coda ha accettato, rxonly compreso.
+            errors = max(0, offered - dut["rx_xdp"])
+        elif "hit" in dut:
             done = dut["hit"] + dut.get("miss", 0) + dut.get("drop", 0)
             errors = max(0, offered - done)
         else:

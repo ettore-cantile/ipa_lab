@@ -1942,17 +1942,23 @@ inoltrare, il contatore all'altro capo marca $T_3$.
 \toprule
 & \textbf{baseline} & \textbf{P1} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
-$T_2-T_1$ (il programma) & 34 ns & 68 & 77 & 228 & 340 \\
-$T_3-T_2$ (redirect, veth, ricezione) & 194--239 & 195--244 & 195--251 & 200--257 & 207--251 \\
+$T_2-T_1$ (il programma) & 26 ns & 60 & 68 & 218 & 327 \\
+$T_3-T_2$ (redirect, veth, ricezione) & 183--211 & 185--211 & 185--230 & 190--236 & 198--236 \\
+$T_3-T_1$ a 50\,000 pacchetti/s & 223 & 261 & 267 & 441 & 592 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-$T_2-T_1$ è piatto sul carico, da 0,5 a 3 milioni di pacchetti al secondo;
-$T_3-T_2$ è un costo comune di circa 195--255~ns che non dipende dalla pipeline.
-Sopra la baseline il solo programma costa +34 / +43 / +194 / +306~ns. La versione
-strumentata aggiunge due letture dell'orologio per pacchetto: se qualcosa, questi
-numeri sono gonfiati.
+Con \texttt{xdp\_gen}, il 2 ottobre. $T_2-T_1$ è piatto sul carico, da 0,5 a 3
+milioni di pacchetti al secondo; $T_3-T_2$ è un costo comune di circa
+185--235~ns che non dipende dalla pipeline; $T_3-T_1$ a basso carico è la
+latenza minima dall'arrivo alla ripartenza. Sopra la baseline il solo programma
+costa +34 / +43 / +192 / +301~ns, come con \texttt{pktgen} (+34 / +43 / +194 /
++306): la copia di \texttt{pktgen} avviene prima di $T_1$, quindi non entra in
+nessuno dei tre intervalli. La versione strumentata aggiunge due letture
+dell'orologio per pacchetto: se qualcosa, questi numeri sono gonfiati. E il
+throughput di questa versione non è una capacità: con l'uscita sullo stesso core
+del nodo la coda respinge già da circa 2,5 milioni al secondo per la baseline.
 
 % ==================================================================
 \chapter{Il test reale: quanto costa un pacchetto al nodo}
@@ -1991,7 +1997,7 @@ frequenza fissa (capitolo \ref{ch:macchina}):
   arr/.style={-{Stealth[length=5pt]},draw=soft,thick},
   lab/.style={font=\scriptsize\color{soft},align=center}
 ]
-\node[box] (g) {generatore\\\footnotesize(CPU 10, 1, 3)};
+\node[box] (g) {generatore\\\footnotesize(\texttt{xdp\_gen}, CPU 10)};
 \node[box,right=10mm of g,text width=16mm] (c1) {coda\\\footnotesize 256 posti};
 \node[dut,right=10mm of c1] (n) {\textbf{nodo}\\\footnotesize programma XDP\\(CPU 6)};
 \node[box,right=10mm of n,text width=16mm] (c2) {coda\\\footnotesize d'uscita};
@@ -2006,14 +2012,15 @@ frequenza fissa (capitolo \ref{ch:macchina}):
 \end{center}
 
 \begin{itemize}
-  \item \textbf{Il generatore} (\texttt{pktgen}, nel kernel) crea pacchetti uguali
-        a quelli veri: stesso formato, stesso header IPA, stesso modello da
-        eseguire. Tre thread, tutti sulla stessa coda del nodo.
+  \item \textbf{Il generatore} (\texttt{xdp\_gen}, sezione~\ref{sec:generatori})
+        crea pacchetti uguali a quelli veri: stesso formato, stesso header IPA,
+        stesso modello da eseguire. Un thread, che scrive nell'unica coda del nodo.
   \item \textbf{La coda d'ingresso} è quella di un \emph{veth}, il cavo virtuale di
         Linux: 256 posti, e la dimensione non si può cambiare.
   \item \textbf{Il nodo} è una delle pipeline caricata in XDP. È l'unica cosa che
         si vuole misurare.
-  \item \textbf{Il nodo successivo} conta i pacchetti arrivati e li butta.
+  \item \textbf{Il nodo successivo} conta i pacchetti arrivati e li butta, su un
+        core suo, così che sul core del nodo resti solo il lavoro del nodo.
 \end{itemize}
 
 Oltre alle cinque pipeline il banco misura, nella stessa sessione,
@@ -2023,22 +2030,15 @@ sotto il quale nessuna pipeline può scendere.
 
 \section{Come si misura, e perché così}
 
-Un numero affidabile richiede cinque accortezze. Nessuna riguarda le pipeline:
+Un numero affidabile richiede quattro accortezze. Nessuna riguarda le pipeline:
 senza, tutte farebbero sembrare il nodo diverso da com'è.
 
 \subsection*{1. La finestra stazionaria}
 
-\texttt{pktgen} si avvia con un comando che \emph{blocca} finché la trasmissione
-non è finita, e il blocco non dura quanto la trasmissione: aspetta sempre 125
-millisecondi fissi prima di partire, i suoi thread si accorgono del via con fino
-a 100~ms di ritardo, e alla fine controlla ogni 100~ms se hanno finito. Dividere
-i pacchetti per la durata del blocco vorrebbe dire contare fino a circa
-\textbf{225~ms di tempo morto} su finestre di misura da 300~ms.
-
-Il banco aspetta che tutti i thread del generatore stiano trasmettendo, lascia
-assestare la coda, legge i contatori, aspetta 300~ms, li rilegge, e solo allora
-ferma il generatore. Il rate è la differenza fra le due letture divisa per il
-tempo fra le due letture.
+Il banco avvia il generatore, aspetta che stia trasmettendo, lascia assestare la
+coda, legge i contatori, aspetta 300~ms, li rilegge, e solo allora ferma il
+generatore. Il rate è la differenza fra le due letture divisa per il tempo fra
+le due letture: l'avvio e l'arresto restano fuori.
 
 \subsection*{2. Letture brevi}
 
@@ -2055,67 +2055,71 @@ perché non svuotava la coda abbastanza in fretta: \textbf{è una perdita del
 nodo}. Il banco conta separatamente i \textbf{respinti} (mai entrati) e i
 \textbf{persi dopo l'ingresso} (entrati ma non usciti).
 
-\subsection*{4. La copia del generatore}
+\subsection*{4. Il tempo di CPU, non il tempo che passa}
 
-\texttt{pktgen} crea i pacchetti come li crea lo stack di rete di Linux, in una
-\emph{skb} con 64 byte liberi davanti; XDP ne vuole 256. Per ogni pacchetto il
-collegamento virtuale lo \textbf{copia} prima di darlo al nodo, e la copia la
-paga il processore del nodo. Su una scheda di rete con XDP nativo non esiste. Per
-toglierla c'è un secondo generatore (\texttt{ipa/test/xdp\_gen.py}), che crea
-pacchetti già grezzi con \texttt{BPF\_PROG\_TEST\_RUN} in modalità \emph{live
-frames}.
+Il banco misura anche quanto il core del nodo è occupato, nella stessa finestra in
+cui conta i pacchetti, e dà il costo come \textbf{tempo di CPU per pacchetto}:
+occupazione per il tempo diviso i pacchetti. Se il nodo lavora il 100\% del tempo
+coincide con 1 diviso la capacità; se a tratti aspetta, toglie l'attesa. Con
+\texttt{xdp\_gen} il nodo lavora al 100\%, e le due misure coincidono.
 
-\subsection*{5. Un core per il nodo successivo, una coda per il nodo}
-
-Il contatore d'uscita gira su un core suo, così che sul core del nodo resti solo
-il lavoro del nodo. E il nodo ha \textbf{una sola coda d'ingresso}, servita da un
-solo thread: con una coda per ogni thread del generatore il nodo avrebbe più
-thread sullo stesso core, e quale coda viene servita lo deciderebbe lo scheduler
---- a pieno carico ognuno terrebbe il core per millisecondi mentre le altre code
-traboccano.
-
-\section{I due generatori}
+\section{Il generatore}
 \label{sec:generatori}
 
-Il banco ha due modi di produrre traffico, e servono tutti e due.
+\subsection*{\texttt{xdp\_gen}: pacchetti come da una scheda di rete}
 
-\subsection*{\texttt{pktgen}: il traffico come lo produce Linux}
+Il generatore (\texttt{ipa/test/xdp\_gen.py}) consegna al cavo virtuale pacchetti
+già nel formato di XDP, con \texttt{BPF\_PROG\_TEST\_RUN} in modalità \emph{live
+frames}: il kernel li prepara in una sua riserva di pagine, con i 256 byte liberi
+davanti che XDP vuole, e li spedisce davvero. Niente skb e niente copia: il
+pacchetto arriva al nodo come arriverebbe da una scheda di rete con XDP nativo, e
+il nodo paga solo il proprio lavoro. Un solo thread offre fino a circa 19 milioni
+di pacchetti al secondo, ed è così che si usa: un thread per ogni coda del nodo
+(sezione~\ref{sec:scrittore}).
 
-\texttt{pktgen} è un modulo del kernel che fabbrica pacchetti come li fabbrica
-lo stack di rete: ognuno è una \emph{skb}, la struttura con cui Linux descrive un
-pacchetto, con 64 byte liberi davanti ai dati. XDP però ne vuole 256, quindi il
-cavo virtuale, prima di consegnare il pacchetto al nodo, lo \textbf{ricopia} in
-una pagina nuova. È un lavoro che il nodo paga, e che su una scheda di rete con
-XDP nativo non esisterebbe.
+Ogni misura è \textbf{una sola chiamata} al kernel, interrotta da un segnale a
+fine finestra. Ogni chiamata, infatti, parte e finisce con una pausa del
+generatore di circa 12~ms dentro il kernel. Fino al 1 ottobre ce n'erano due o
+tre per finestra: il generatore taceva il 13\% del tempo, il nodo svuotava la
+coda e dormiva, e risultava occupato all'87\% anche a coda piena. Lo si
+attribuiva a ``raffiche'' del generatore. La causa l'hanno mostrata le statistiche
+di scheduling del thread del nodo: dormiva tante volte quante erano le chiamate.
 
-Tre thread su tre core offrono circa 5,7 milioni di pacchetti al secondo; la
-coda del nodo ne accetta circa 4,6 (quanto regge \texttt{rxonly}, il programma
-che riceve e butta).
+\subsection*{Il ritmo e il timbro}
 
-\subsection*{\texttt{xdp\_gen}: pacchetti già grezzi}
+Per il test al crescere del traffico (sezione~\ref{sec:bitrate}) serve un ritmo
+fissato, e \texttt{xdp\_gen} non ne ha uno suo: spinge al massimo. Il ritmo lo
+tiene il suo programma, che a ogni giro guarda l'orologio: se non è ancora il
+momento scarta il pacchetto (la pagina torna subito alla riserva) e riprova;
+quando è il momento lo spedisce, e fissa il prossimo istante un intervallo più in
+là. I pacchetti partono a distanza regolare, non a raffiche: una raffica da 256
+riempirebbe da sola la coda e farebbe perdere pacchetti sotto capacità. Nello
+stesso istante il programma scrive nel pacchetto un timbro con l'ora di partenza,
+e il nodo successivo misura il ritardo. Il ritmo è esatto fino a circa 11 milioni
+di pacchetti al secondo (a 12 ne parte il 98\%).
 
-Il secondo generatore (\texttt{ipa/test/xdp\_gen.py}) consegna al cavo virtuale
-pacchetti già nel formato di XDP, con \texttt{BPF\_PROG\_TEST\_RUN} in modalità
-\emph{live frames}: niente skb, niente copia. Un solo thread offre 12--15
-milioni di pacchetti al secondo, ed è così che si usa: un thread per ogni coda
-del nodo (sezione~\ref{sec:scrittore}).
+\subsection*{L'alternativa: \texttt{pktgen}}
+
+\texttt{pktgen} è il generatore del kernel: fabbrica i pacchetti come lo stack di
+rete, in una \emph{skb} con 64 byte liberi davanti, e il cavo virtuale li
+\textbf{ricopia} in una pagina nuova prima di consegnarli al nodo. La copia la
+paga il nodo, e su una scheda vera non esisterebbe.
 
 \begin{prima}[Esempio: lo stesso programma con i due generatori]
-P2 costa \textbf{527~ns} di CPU per pacchetto con \texttt{pktgen} e
-\textbf{292~ns} con \texttt{xdp\_gen} (stessa sessione, 1 ottobre). Il programma
-è lo stesso byte per byte: i 235~ns di differenza sono la copia della skb e il
-percorso dello stack, cioè il costo del \emph{generatore}, pagato sul core del
-nodo. \emph{Sopra la baseline} invece i due generatori danno quasi lo stesso
-costo della rete neurale: P2 233 contro 228~ns, P1.5 56 contro 59, P1 40 contro
-52. Il trasporto cambia, il costo del programma no.
+P2 costa \textbf{529~ns} per pacchetto con \texttt{pktgen} e \textbf{293~ns} con
+\texttt{xdp\_gen}: i 236~ns di differenza sono la copia della skb e il percorso
+dello stack, uguali per tutte le pipeline (da 225 a 250~ns). \emph{Sopra la
+baseline} invece i due generatori danno lo stesso costo della rete neurale:
+$+226$ contro $+227$~ns per P2, $+53$ contro $+58$ per P1.5. Il trasporto cambia,
+il costo del programma no: \texttt{pktgen} resta un controllo.
 \end{prima}
 
 \section{Com'era il test nella macchina virtuale, e com'è adesso}
 
 Fino al 26 settembre questi banchi giravano in una macchina virtuale VirtualBox
-a quattro core virtuali. Dal 27 girano su Ubuntu installato direttamente sul
-portatile, in dual boot. Il programma misurato è lo stesso; è cambiato tutto
-quello che gli sta intorno.
+a quattro core virtuali, con \texttt{pktgen}. Dal 27 girano su Ubuntu installato
+direttamente sul portatile, in dual boot. Il programma misurato è lo stesso; è
+cambiato tutto quello che gli sta intorno.
 
 \subsection*{Il problema della macchina virtuale: il cassiere che sparisce}
 
@@ -2150,60 +2154,60 @@ Nella macchina virtuale questo dava due strade, entrambe cattive:
 
 Si usava la seconda, sottraendo la baseline per togliere il costo del
 generatore. Il risultato, su quattro esecuzioni identiche nell'arco di
-mezz'ora:
+mezz'ora, accanto a quello di oggi:
 
 \begin{center}
 \small
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
 & \multicolumn{2}{c}{\textbf{macchina virtuale} (18 settembre)} &
-  \multicolumn{2}{c}{\textbf{dual boot} (28 settembre)} \\
+  \multicolumn{2}{c}{\textbf{dual boot} (2 ottobre)} \\
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
 \textbf{sopra la baseline} & \textbf{costo} & \textbf{variazione} &
 \textbf{costo} & \textbf{variazione} \\
 \midrule
-P1 statica & $\sim$82 ns  & 160\% & 38 ns  & 0,5\% \\
-P1.5       & $\sim$116 ns & 104\% & 53 ns  & 0,6\% \\
-P2         & $\sim$430 ns & 19\%  & 226 ns & 0,5\% \\
-P3         & $\sim$670 ns & 15\%  & 364 ns & 0,3\% \\
+P1 statica & $\sim$82 ns  & 160\% & 49 ns  & 2,2\% \\
+P1.5       & $\sim$116 ns & 104\% & 58 ns  & 4,3\% \\
+P2         & $\sim$430 ns & 19\%  & 227 ns & 2,9\% \\
+P3         & $\sim$670 ns & 15\%  & 350 ns & 3,6\% \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} Macchina virtuale: generatore e nodo sullo stesso core,
-512 byte, variazione = (massimo $-$ minimo)/media su quattro esecuzioni. Dual boot:
-core separati, 64 byte, variazione fra i giri della stessa sessione.}
+{\footnotesize\color{soft} Macchina virtuale: \texttt{pktgen}, generatore e nodo
+sullo stesso core, 512 byte. Dual boot: \texttt{xdp\_gen}, core separati, 64 byte.
+Variazione = (massimo $-$ minimo)/mediana fra le esecuzioni.}
 \end{center}
 
-Le cifre assolute delle due colonne \textbf{non si confrontano}: nella macchina
-virtuale la frequenza del processore era quella che capitava, e il metodo era
-diverso. Si confronta la \textbf{variazione}. Per P1 e P1.5 era più grande del
-valore stesso: una volta P1 costava 164~ns, un'altra 32. Il loro ordine si
-invertiva da un'esecuzione all'altra, e l'unica cosa onesta da scrivere era
-``stanno sotto i 200~ns e non si distinguono''. Oggi variano meno dell'1\%, e
-la differenza fra le due --- 15~ns --- si misura.
+Le cifre assolute delle due colonne \textbf{non si confrontano}: generatore,
+frequenza e taglia erano diversi. Si confronta la \textbf{variazione}. Per P1 e
+P1.5 era più grande del valore stesso: una volta P1 costava 164~ns, un'altra 32.
+Il loro ordine si invertiva da un'esecuzione all'altra, e l'unica cosa onesta da
+scrivere era ``stanno sotto i 200~ns e non si distinguono''. Oggi variano di pochi
+punti, e la differenza fra le due --- 9~ns --- si misura.
 
 \subsection*{Che cosa ha cambiato il dual boot}
 
 \begin{itemize}
-  \item \textbf{Core veri, ognuno col suo compito.} Generatore sui core 10, 1 e 3,
-        nodo sul core 6, nodo successivo sull'8. Nessun altro processo, nessuna
+  \item \textbf{Core veri, ognuno col suo compito.} Generatore sul core 10, nodo
+        sul core 6, nodo successivo sull'8. Nessun altro processo, nessuna
         interruzione e nessun thread del kernel sul core del nodo (capitolo
         \ref{ch:macchina}).
   \item \textbf{Il core del nodo non dorme mai.} Gli stati di sonno profondi sono
         spenti: il risveglio dal più profondo costa 310 microsecondi, più dei 170
         che la coda concede. Nella macchina virtuale anche sotto capacità si
         respingeva l'1--2\% dei pacchetti; oggi \textbf{zero}.
-  \item \textbf{Frequenza fissa e misurata}: 3\,494--3\,495~MHz sul core del nodo
+  \item \textbf{Frequenza fissa e misurata}: 3\,494--3\,505~MHz sul core del nodo
         durante ogni misura di traffico, letta dai contatori del processore.
   \item \textbf{Si possono separare i core senza perdere}, quindi il generatore non
         è più dentro la misura: il ritmo a cui il nodo satura è quello del nodo.
 \end{itemize}
 
-\begin{prima}[Esempio: lo stesso punto misurato tre volte]
+\begin{prima}[Esempio: lo stesso punto misurato più volte]
 Nella macchina virtuale, il banco del bit rate ha misurato lo stesso punto ---
 stessa pipeline, stesso ritmo --- in tre giri diversi, e ha perso il
 \textbf{58\%}, lo \textbf{0,2\%} e il \textbf{7,7\%} dei pacchetti. Tre risposte
 diverse alla stessa domanda: nessuna era una misura del programma. Sul dual boot,
-cinque giri allo stesso punto danno lo stesso inoltro massimo entro lo 0,4--2\%.
+cinque giri allo stesso punto danno lo stesso inoltro in genere entro lo 0,1\%, al
+massimo entro il 6\% vicino al punto in cui la pipeline smette di reggere.
 \end{prima}
 
 \section{I limiti del test, con esempi}
@@ -2216,48 +2220,39 @@ e quali no.
 \subsection*{1. Il generatore può non bastare, o intralciare}
 
 Se il nodo è più veloce di quanto il generatore riesca a produrre, il banco
-misura il generatore: con un thread, \texttt{pktgen} si ferma a 2,8 milioni di
-pacchetti al secondo e \texttt{xdp\_gen} a 12--15. Aggiungere thread sembra la
-soluzione, ma più thread che scrivono nella \emph{stessa} coda si intralciano, e
-rallentano anche il nodo che la svuota: è la sezione~\ref{sec:scrittore}.
+misura il generatore. Un thread di \texttt{xdp\_gen} offre circa 19 milioni di
+pacchetti al secondo a massima spinta, circa 12 a ritmo fissato e circa 9 a ritmo
+fissato quando i pacchetti vengono inoltrati: per questo su un core
+\texttt{rxonly} non arriva mai al suo limite, la baseline ci arriva appena, e
+sulle curve del bit rate la baseline non lo raggiunge (da 9 milioni perde l'1\%
+con il nodo al 60\%: è il banco, e il test lo riconosce dall'occupazione del
+nodo). Aggiungere thread
+sembra la soluzione, ma più thread che scrivono nella \emph{stessa} coda si
+intralciano, e rallentano anche il nodo che la svuota: è la
+sezione~\ref{sec:scrittore}.
 
-\begin{prima}[Esempio: il ``tetto del generatore'' che non era del generatore]
-Con \texttt{xdp\_gen} a tre thread \texttt{rxonly} arrivava a 6,89 milioni al
-secondo, la baseline a 7,11, P1 a 6,34, P1.5 a 6,23: tutti contro un soffitto di
-circa 7 milioni. Sembrava il limite del generatore. Invece, con un thread solo, la
-baseline elabora 12,4 milioni e \texttt{rxonly} 14,9: il soffitto era la coda
-condivisa da tre scrittori. P2 e P3, che saturano molto prima, non ne risentivano.
-\end{prima}
+\subsection*{2. Contare all'uscita può sottostimare il nodo}
 
-Con \texttt{pktgen} l'effetto è piccolo (circa 17~ns per pacchetto, uguali per
-tutte le pipeline) e tutte e cinque saturano: è per questo che la tabella
-principale del capitolo viene da \texttt{pktgen} a tre thread, dove anche
-\texttt{rxonly} satura.
-
-\subsection*{2. Contare all'uscita sottostima il nodo}
-
-Il nodo successivo, che conta i pacchetti arrivati, ha un core solo, e anche lui
-ha un tetto: circa 4,4--4,9 milioni al secondo con \texttt{xdp\_gen}. Se si
-misura il nodo contando \emph{ciò che arriva dall'altra parte}, quando il nodo è
-più veloce dell'uscita si misura l'uscita.
+Il nodo successivo, che conta i pacchetti arrivati, ha i suoi core e i suoi
+tetti. Se si misura il nodo contando \emph{ciò che arriva dall'altra parte},
+quando il nodo è più veloce dell'uscita si misura l'uscita.
 
 \begin{prima}[Esempio: la baseline che sembrava lenta]
-Con \texttt{xdp\_gen} la baseline \emph{elabora} 7,1 milioni di pacchetti al
-secondo, ma all'altra parte ne arrivano 4,4. P1 ne elabora 6,3 e ne arrivano 4,8.
-Contando gli arrivi, la baseline sembra più lenta di P1 --- impossibile, perché
-fa strettamente meno lavoro. Più pacchetti la baseline spinge verso l'uscita, più
-l'uscita, già satura, ne perde.
+Con due core sul nodo e una sola coda d'uscita (1 ottobre), la baseline
+\emph{elaborava} 13,15 milioni di pacchetti al secondo, ma all'altra parte ne
+arrivavano 4,2; P2 ne elaborava 6,6 e ne arrivavano 6,6. Contando gli arrivi, la
+baseline sarebbe sembrata più lenta di P2 --- impossibile, perché fa strettamente
+meno lavoro.
 
 Per questo il controllo di validità del banco (``la baseline dev'essere la più
 veloce'') conta i pacchetti \emph{elaborati dal nodo}, la stessa misura con cui
 il banco calcola il costo, e non quelli arrivati all'uscita.
 \end{prima}
 
-Con un solo scrittore per coda anche all'uscita (un core del nodo che inoltra,
-sezione~\ref{sec:scrittore}) il nodo successivo tiene il passo: riceve 12
-milioni di pacchetti al secondo senza perderne. Con due core sul nodo serve una
-coda d'uscita per ciascun core, e un core d'uscita per ciascuna coda: allora
-arrivano tutti, anche 29 milioni al secondo (sezione~\ref{sec:duecore}).
+Con un solo scrittore per coda anche all'uscita il nodo successivo tiene il passo:
+con due core sul nodo serve una coda d'uscita per ciascun core, e un core d'uscita
+per ciascuna coda; allora arrivano tutti, anche 29 milioni al secondo
+(sezione~\ref{sec:duecore}).
 
 \subsection*{3. Il cavo è virtuale, e tutto sta su un processore}
 
@@ -2267,11 +2262,10 @@ successivo, non scrivere un descrittore di trasmissione. Generatore, nodo e nodo
 successivo sono core dello stesso chip e condividono cache e memoria. Il portatile
 non ha una scheda di rete cablata che supporti XDP nativo.
 
-Esempio: 217~ns per pacchetto di sola ricezione con \texttt{pktgen} e 145 con
-\texttt{xdp\_gen} sono il prezzo \emph{di questo percorso}. Su una scheda vera
-sarebbero altri numeri, e le cifre assolute di questo capitolo con loro. I
-\textbf{confronti} fra pipeline no: il percorso è lo stesso per tutte, e si
-sottrae.
+Esempio: i 66~ns per pacchetto della baseline sono il prezzo \emph{di questo
+percorso}. Su una scheda vera sarebbero altri numeri, e le cifre assolute di
+questo capitolo con loro. I \textbf{confronti} fra pipeline no: il percorso è lo
+stesso per tutte, e si sottrae.
 
 \subsection*{4. Un solo tipo di pacchetto per volta}
 
@@ -2281,133 +2275,96 @@ salti, la cache), e un traffico misto costerebbe un po' di più. Le classi si
 misurano una alla volta, ed è così che si è visto che scartare costa più che
 inoltrare.
 
-\subsection*{5. Le latenze si leggono solo al minimo}
+\subsection*{5. Il ritardo a basso carico contiene il generatore}
 
-Il tempo di attraversamento si raccoglie in un istogramma a potenze di due: i
-percentili sono il bordo superiore della casella, con risoluzione di un fattore
-2. Esempio: la mediana a basso carico è ``1\,024~ns'' per baseline, P1 e P1.5 e
-``2\,048~ns'' per P2 e P3 --- due caselle, non due misure. Il \textbf{minimo}
-invece è esatto (249, 282, 292, 460, 584~ns), ed è l'unico che si cita.
+\texttt{xdp\_gen} spedisce a lotti di 256 frame, e il nodo viene svegliato a fine
+lotto: a basso carico un pacchetto può aspettare fino a una dozzina di
+microsecondi prima che il nodo lo veda, e la mediana del ritardo, 17--19~µs,
+contiene quell'attesa. Con lotti da 32 scende a 3--6~µs, ma il generatore regge il
+ritmo solo fino a 2,5 milioni di pacchetti al secondo. Il salto del ritardo a coda
+piena, che è ciò che il test cerca, non cambia.
 
 \subsection*{6. Il punto esatto in cui comincia la perdita è instabile}
 
-Il banco cerca anche il ritmo più alto a perdita nulla, restringendo per
-tentativi. Quella ricerca oscilla: fra un giro e l'altro dà valori diversi fino
-al 64\%, perché al confine basta un'esitazione di pochi microsecondi per perdere
-un pacchetto. La saturazione invece varia fra lo 0,2 e il 2\%. Si citano quindi la
-saturazione e il carico comune, non il confine; il bit rate lo descrive per
-gradini (sezione seguente).
+Al confine fra ``regge'' e ``perde'' basta un'esitazione di pochi microsecondi per
+perdere un pacchetto: lo stesso punto, ripetuto, varia fino al 6\%, mentre la
+saturazione varia di 1--3\%. Si citano quindi la saturazione e i gradini della
+scala, non il confine esatto.
 
 \subsection*{7. Il portatile scalda}
 
 Oltre 3,5~GHz non regge una misura intera, e anche a 3,5 capita che il
 processore nel suo insieme tocchi per un attimo la soglia di temperatura, di
-solito mentre clang compila sugli altri core. Il banco lo registra: il 28
-settembre è successo 3 volte durante la misura della latenza e mai durante quelle
-di throughput e di bit rate, e il core del nodo è rimasto a 3\,495~MHz per tutto
-il tempo.
+solito mentre clang compila sugli altri core. Il banco lo registra e conta le
+finestre disturbate: nelle misure del 2 ottobre sono 3 su 360, e il core del nodo
+è rimasto a 3\,500~MHz.
 
 \section{Il risultato: quanto regge il nodo}
 
-Con \texttt{pktgen}, pacchetti da 64 byte, tre giri per tre ripetizioni:
+Con \texttt{xdp\_gen}, un core del nodo, pacchetti da 64 byte, tre giri:
 
 \begin{center}
 \small
-\begin{tabular}{@{}lrrr@{}}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
-\textbf{Pipeline} & \textbf{milioni di pacchetti/s} & \textbf{variazione fra i giri}
-& \textbf{sopra la baseline} \\
+\textbf{Pipeline} & \textbf{milioni di pacchetti/s} & \textbf{ns per pacchetto}
+& \textbf{variazione fra i giri} & \textbf{sopra la baseline} \\
 \midrule
-solo ricezione (\texttt{rxonly}) & 4,61 & 0,2\% & --- \\
-baseline (nessuna rete)  & 3,31 & 0,9\% & --- \\
-P1 statica               & 2,94 & 0,5\% & $+38$ ns \\
-P1.5 (hardcoded)         & 2,81 & 0,6\% & $+53$ ns \\
-P2 (template)            & 1,89 & 0,5\% & $+226$ ns \\
-P3 (modular)             & 1,50 & 0,3\% & $+364$ ns \\
+solo ricezione (\texttt{rxonly}) & 19,11 & $\approx 40$ & 1,6\% & --- \\
+baseline (nessuna rete)  & 15,13 & 66 & 1,5\% & --- \\
+P1 statica               & 8,69 & 115 & 1,3\% & $+49$ ns \\
+P1.5 (hardcoded)         & 8,07 & 124 & 1,2\% & $+58$ ns \\
+P2 (template)            & 3,41 & 293 & 2,3\% & $+227$ ns \\
+P3 (modular)             & 2,41 & 416 & 3,1\% & $+350$ ns \\
 \bottomrule
-\end{tabular}
+\end{tabular}\\[2pt]
+{\footnotesize\color{soft} 2 ottobre, nodo occupato al 100\% (77\% per
+\texttt{rxonly}, che non satura: il suo valore è indicativo). La baseline satura
+appena: il generatore ne offre 15,1 milioni al secondo.}
 \end{center}
 
 \begin{lezione}
 La \textbf{baseline} riceve, legge l'intestazione, decrementa il TTL e inoltra.
 Tutto ciò che le pipeline aggiungono sopra è \textbf{il costo della rete
-neurale}: circa 40--50~ns quando i pesi sono scritti nel programma (P1, P1.5),
-circa 220~ns quando la forma della rete è letta da una tabella (P2), circa 370~ns
+neurale}: circa 50--60~ns quando i pesi sono scritti nel programma (P1, P1.5),
+circa 230~ns quando la forma della rete è letta da una tabella (P2), circa 350~ns
 quando anche la profondità lo è (P3).
 \end{lezione}
 
-Come si legge la colonna di destra, con un esempio. La baseline regge 3,31
-milioni di pacchetti al secondo, cioè spende $10^9 / 3{,}31 \cdot 10^6 = 302$~ns
-per pacchetto; P2 ne regge 1,89 milioni, cioè 529~ns. La differenza, con le
-cifre non arrotondate $528{,}6 - 302{,}5 = 226$~ns, è il tempo che P2 spende a eseguire la rete
-neurale: tutto il resto --- ricevere, leggere l'intestazione, inoltrare --- lo
-fanno tutte e due allo stesso modo.
+Come si legge la colonna di destra, con un esempio. La baseline regge 15,13
+milioni di pacchetti al secondo, cioè spende $10^9 / 15{,}13 \cdot 10^6 = 66$~ns
+per pacchetto; P2 ne regge 3,41 milioni, cioè 293~ns. La differenza, $293 - 66 =
+227$~ns, è il tempo che P2 spende a eseguire la rete neurale: tutto il resto ---
+ricevere, leggere l'intestazione, inoltrare --- lo fanno tutte e due allo stesso
+modo. P3 varia più delle altre fra una sessione e l'altra: 416~ns qui, fino a
+460 in un'altra sessione dello stesso giorno.
 
-E sotto la capacità? Offrendo a tutte lo stesso carico --- 1,37 milioni di
-pacchetti al secondo, il 91\% di quanto regge la più lenta --- \textbf{nessuna
-pipeline respinge un solo pacchetto}, e fra ingresso e uscita se ne perdono al
-massimo lo 0,02\%. Un nodo sotto la sua capacità consegna tutto.
+E sotto la capacità? Sulle curve del bit rate (sezione~\ref{sec:bitrate}), finché
+il traffico resta sotto la capacità di una pipeline \textbf{nessun pacchetto
+viene respinto} (al massimo lo 0,02\%). Un nodo sotto la sua capacità consegna
+tutto.
 
 \subsection*{P1 e P1.5 si separano}
 
-2,94 contro 2,81 milioni al secondo, con variazioni fra i giri dello 0,5 e dello
-0,6\%: congelare il nodo vale circa 15 nanosecondi sul percorso vero ($340$
-contro $356$~ns per pacchetto). Piccolo, ma fuori dal rumore. Lo stesso ordine lo
-danno il banco del bit rate (2,94 contro 2,84) e il cronometro del solo
-programma (68 contro 77~ns).
+8,69 contro 8,07 milioni al secondo, con variazioni fra i giri dell'1,3 e
+dell'1,2\%: congelare il nodo vale circa 9 nanosecondi sul percorso vero ($115$
+contro $124$~ns per pacchetto). Piccolo, ma fuori dal rumore.
 
-\subsection*{La ReLU senza bivio, sul traffico vero}
-
-Nel banco a pacchetto ripetuto P1 ha perso circa 5~ns con la ReLU senza bivio
-(capitolo \ref{ch:relu}). Qui no: sopra la baseline P1 costava 38~ns il 27
-settembre e costa 38~ns oggi, P1.5 53 e 53. Il motivo è il predittore dei salti
-del processore: quando lo stesso pacchetto passa milioni di volte di fila impara
-da che parte va ogni bivio, e un bivio indovinato costa quasi niente --- per
-questo toglierlo, nel banco, sembrava un costo. Sul percorso vero il resto del
-lavoro (ricevere, copiare, inoltrare) pesa molto di più, e la differenza sparisce
-nel rumore.
-
-\section{Il costo del nodo, con pacchetti grezzi}
-
-Con il generatore a pacchetti grezzi (\texttt{xdp\_gen}, sezione
-\ref{sec:generatori}), un thread solo, un core del nodo e il nodo successivo su
-un core suo --- uno scrittore per coda, sezione~\ref{sec:scrittore} --- il
-tempo di CPU che il nodo spende per ogni pacchetto, dalla presa del pacchetto
-alla consegna all'uscita, è:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-\textbf{Pipeline} & \textbf{ns di CPU per pacchetto} & \textbf{sopra la baseline} & \textbf{con \texttt{pktgen}} \\
-\midrule
-P1 & 117 & +52 & +38 \\
-P1.5 & 124 & +59 & +53 \\
-P2 (template) & 292 & +228 & +226 \\
-P3 (modular)  & 432 & +367 & +364 \\
-baseline & 65 & --- & --- \\
-\bottomrule
-\end{tabular}\\[2pt]
-{\footnotesize\color{soft} 1 ottobre, 3 giri a 64 byte (il 30 settembre entro
-l'1\%). La colonna \texttt{pktgen} è la tabella del 28 settembre. La baseline,
-con un thread, non satura: il suo valore è indicativo. A 512 e 1\,514 byte P2 e
-P3 costano uguale entro il 3\%.}
-\end{center}
-
-I costi sopra la baseline sono quasi gli stessi dei due generatori: la rete
-neurale costa lo stesso, comunque arrivi il pacchetto.
+\subsection*{Da che cosa il costo non dipende}
 
 \begin{itemize}
   \item \textbf{La taglia del pacchetto non conta}: a 64, 512 e 1\,514 byte il costo
-        è lo stesso entro il 3\%. Il nodo guarda solo l'intestazione.
-  \item \textbf{La porta d'uscita non conta}: le cinque classi che inoltrano costano
-        uguale entro l'11\%.
+        è lo stesso entro il 2,5\%. Il nodo guarda solo l'intestazione.
+  \item \textbf{La porta d'uscita conta poco}: le cinque classi che inoltrano costano
+        uguale entro il 4\% per P1, P1.5 e P3, entro il 12\% per P2.
   \item \textbf{Scartare costa di più che inoltrare}: la classe DROP costa circa
-        50~ns in più delle altre (P1 173 contro 117, P1.5 177 contro 124, P3 480
-        contro 427). Quando il pacchetto viene scartato la sua pagina di memoria
+        50~ns in più delle altre (P1 168 contro 114--119, P1.5 180 contro
+        122--126, P3 473 contro 423--432). Quando il pacchetto viene scartato la sua pagina di memoria
         si restituisce sul core del nodo; quando viene inoltrato, su quello del
         nodo successivo. È un effetto del banco, non della pipeline.
 \end{itemize}
+
+{\footnotesize\color{soft} Taglia e classi: misure del 2 ottobre, in tempo di CPU.}
 
 \section{Uno scrittore per coda}
 \label{sec:scrittore}
@@ -2434,8 +2391,9 @@ limite è del generatore, più thread lo alzano.
 \bottomrule
 \end{tabular}\\[2pt]
 {\footnotesize\color{soft} Milioni di pacchetti elaborati al secondo, un core del
-nodo, \texttt{xdp\_gen}. Misura presa a batteria: le differenze arrivano al
-doppio, e le misure con l'alimentatore qui sotto dicono la stessa cosa.}
+nodo, 30 settembre: misura presa a batteria e con il generatore che ancora si
+fermava a ogni chiamata, quindi bassa in assoluto. Il confronto fra le righe
+regge.}
 \end{center}
 
 Il limite non era né il generatore né il programma: era \textbf{la coda}. Tre
@@ -2443,23 +2401,8 @@ thread scrivono nella stessa coda da 256 posti, e per farlo devono passarsi un
 lucchetto e le stesse righe di cache; il core del nodo, che dalla stessa coda
 legge, ne subisce il rallentamento. È come una cassa dove tre fornitori scaricano
 merce nello stesso punto: il cassiere non lavora peggio, ma gli spazi sono
-contesi.
-
-\begin{prima}[La prova con due code]
-Con due core sul nodo ci sono due code. Con due thread, uno per coda, la baseline
-elabora 13,0 milioni al secondo; con tre thread, due dei quali finiscono sulla
-stessa coda, 7,6. Lo stesso nodo, cambia solo quanti scrivono in ogni coda.
-(Le cifre sono del 30 settembre, con una sola coda d'uscita per i due core: in
-assoluto sono basse anche per la contesa in uscita, sezione~\ref{sec:duecore},
-ma la pagano tutte e due le righe.)
-P1 e P1.5 guadagnano il 45\%, P2 il 6\%, P3 l'1\%: il danno è grande per i
-programmi leggeri e quasi nullo per quelli il cui limite è davvero il programma.
-\end{prima}
-
-Con \texttt{pktgen}, che riempie la coda più lentamente, la contesa costa circa
-17~ns per pacchetto, uguali per tutte le pipeline: i costi sopra la baseline non
-cambiano. Lo stesso vale \textbf{all'uscita}, quando il nodo ha più core: è la
-sezione~\ref{sec:duecore}.
+contesi. Il danno è grande per i programmi leggeri e quasi nullo per quelli il
+cui limite è davvero il programma: P2 e P3 non ne risentono.
 
 \begin{lezione}
 Un solo scrittore per coda, in ingresso e in uscita: più thread di generatore
@@ -2469,30 +2412,8 @@ degli altri host arrivano in fila sul cavo. Resta quello che conta, la coda
 piena davanti a un nodo troppo lento.
 \end{lezione}
 
-\subsection*{Il tempo di CPU, non il tempo che passa}
-
-Con un solo thread \texttt{xdp\_gen} spedisce a raffiche: la raffica riempie la
-coda e il resto viene respinto, poi fra una raffica e l'altra il nodo svuota la
-coda e \emph{aspetta}. Il core del nodo lavora così l'87\% del tempo, anche
-mentre respinge il 70--80\% dei pacchetti. Dividere il tempo per i pacchetti
-elaborati conterebbe anche l'attesa: P2 risulterebbe 337~ns invece di 292.
-
-Per questo il banco misura quanto il core del nodo è occupato, nella stessa
-finestra in cui conta i pacchetti, e dà il costo come \textbf{tempo di CPU per
-pacchetto}: occupazione per il tempo diviso i pacchetti. Con \texttt{pktgen} il
-nodo è occupato al 100\% e le due cose coincidono: le cifre della tabella
-principale sono tempi di CPU veri.
-
-\begin{prima}[Scartare o inoltrare]
-Un gemello di \texttt{rxonly} che invece di scartare inoltra, nella stessa
-sessione a tre thread, elabora il 4\% in più (7,53 contro 7,21 milioni al
-secondo); la baseline, 7,21, \emph{non} supera \texttt{rxonly}. Il ``baseline più
-veloce di \texttt{rxonly}'' del 28 settembre era una differenza di pochi punti
-dentro la coda contesa. La misura pulita è quella per classe: scartare costa al
-nodo circa 50~ns in più che inoltrare.
-\end{prima}
-
 \section{Al crescere del bit rate}
+\label{sec:bitrate}
 
 La domanda: al crescere del traffico offerto la coda si riempie, il
 tempo di attraversamento cresce, e poi si perde. Se si perde \emph{all'ingresso}
@@ -2512,7 +2433,7 @@ pipeline usano già:
               inner sep=5pt,font=\scriptsize,align=center},
   arr/.style={-{Stealth[length=4pt]},draw=soft,thick}
 ]
-\node[box] (g) {generatore\\(pktgen)};
+\node[box] (g) {generatore\\(\texttt{xdp\_gen})};
 \node[box,right=11mm of g,draw=accent] (c) {programma 1\\conta e basta\\\texttt{ing\_count += 1}};
 \node[box,right=11mm of c,draw=accent] (p) {programma 2\\la pipeline};
 \node[box,right=14mm of p] (n) {nodo successivo\\conta e misura\\il ritardo};
@@ -2530,10 +2451,11 @@ programma XDP nell'aggancio nativo: è come è fatto XDP, non un limite di quest
 progetto. I modi di averne più di uno sono tutti catene. Quello standard è
 \texttt{libxdp}, che aggancia un programma \emph{dispatcher} con alcuni posti
 liberi e ci inserisce gli altri; quello usato qui è il salto fra programmi
-(\emph{tail call}) che le pipeline già usano, senza dipendenze in più. (Per il
-punto di aggancio di \texttt{tc} i kernel dal 6.6 hanno anche una lista nativa di
-programmi; per XDP no.) Il costo del salto in più si misura, più sotto: pochi
-nanosecondi, dentro il rumore.
+(\emph{tail call}) che le pipeline già usano, senza dipendenze in più. Il salto in
+più costa da $-1$ a $+2$~ns, dentro la variazione fra le ripetizioni: il kernel
+tiene il tempo di ogni programma attaccato, e lo si misura con e senza il
+contatore davanti.
+
 Così si hanno tre conteggi per ogni valore di traffico: \textbf{inviati} (dal
 generatore), \textbf{ricevuti} (dal programma 1) e \textbf{inoltrati} (arrivati
 al nodo successivo). Inviati meno ricevuti è la perdita \emph{prima} del
@@ -2541,10 +2463,10 @@ programma; ricevuti meno inoltrati quella \emph{dopo}. Un terzo metodo,
 \texttt{rxonly}, è il contatore da solo: dice quanto regge la sola ricezione allo
 stesso ritmo, e separa il collo del programma da quello del banco.
 
-Il banco misura tredici valori di traffico, da 0,12 a 3~Gbit/s a pacchetti da 64
-byte, calibrati sul tetto di ricezione della macchina, cinque giri ciascuno. Il
-ritardo è quello di tutto il percorso: dal timbro che il generatore scrive nel
-pacchetto all'arrivo al nodo successivo.
+Il banco misura sedici valori di traffico, da 0,5 a 12 milioni di pacchetti al
+secondo (da 0,26 a 6,1~Gbit/s a pacchetti da 64 byte), cinque giri ciascuno. Il
+ritardo è quello di tutto il percorso: dal timbro che \texttt{xdp\_gen} scrive nel
+pacchetto quando lo spedisce all'arrivo al nodo successivo.
 
 \subsection*{Ricevuti e inoltrati}
 
@@ -2555,20 +2477,25 @@ pacchetto all'arrivo al nodo successivo.
 Ogni pannello ha tre curve. Finché il nodo regge sono sovrapposte: tutto ciò
 che si invia viene ricevuto e inoltrato. Oltre il suo limite la linea grigia
 (inviati) continua a salire e le altre due si fermano \textbf{insieme}, alla
-capacità della pipeline: 3,3 milioni al secondo per la baseline, 2,9 per P1,
-1,9 per P2, 1,5 per P3. Che ricevuti e inoltrati restino sovrapposte è la
-risposta alla domanda: \textbf{il programma rilancia tutto ciò che riceve}, e ciò
-che manca non è mai entrato.
+capacità della pipeline: 8,64 milioni al secondo per P1, 8,06 per P1.5, 3,48 per
+P2, 2,33 per P3, la stessa cifra del test di saturazione (8,69, 8,07, 3,41 e 2,41)
+entro il 3\%; al ginocchio il nodo lavora il 99,6--99,9\% del tempo. La baseline è
+un caso a parte: da 9 milioni al secondo perde circa l'1\%, ma con il nodo al 60\%.
+Il nodo ha tempo libero, quindi il limite è del banco: quando i pacchetti vengono
+inoltrati \texttt{xdp\_gen} non ne manda più di circa 9 milioni al secondo, e i
+suoi lotti da 256 trovano a volte la coda non ancora vuota. La capacità della
+baseline resta quella del test di saturazione, 15,1 milioni. Che ricevuti
+e inoltrati restino sovrapposte è la risposta alla domanda: \textbf{il programma
+rilancia tutto ciò che riceve}, e ciò che manca non è mai entrato.
 
 \begin{center}
 \includegraphics[width=\textwidth]{figures/bitrate_loss.pdf}
 \end{center}
 
-La stessa cosa come perdita: la curva blu (persi prima di XDP) sale, la rossa
-(persi dentro la pipeline o all'uscita) resta a zero, al massimo lo 0,02\% degli
-inviati. La linea grigia è il solo contatore: comincia a perdere solo oltre
-2,4~Gbit/s, molto dopo le pipeline, quindi la loro perdita non è della
-ricezione ma del programma.
+La stessa cosa come perdita: la curva dei persi prima di XDP sale, quella dei
+persi dentro la pipeline o all'uscita resta a zero, al massimo lo 0,04\% degli
+inviati. Il solo contatore non perde fino a 11 milioni al secondo: la perdita
+delle pipeline non è della ricezione ma del programma.
 
 \begin{center}
 \small
@@ -2576,24 +2503,22 @@ ricezione ma del programma.
 \toprule
 \textbf{Pipeline} & \textbf{pulita fino a} & \textbf{perde da} & \textbf{inoltro massimo} \\
 \midrule
-baseline   & 1,44 Gbit/s & 1,68 Gbit/s & 3,34 M/s \\
-P1 statica & 1,20 & 1,44 & 2,94 \\
-P1.5       & 1,20 & 1,44 & 2,84 \\
-P2         & 0,72 & 0,96 & 1,89 \\
-P3         & 0,72 & 0,96 & 1,50 \\
+baseline   & 4,05 Gbit/s & ---$^*$ & 8,89$^*$ M/s \\
+P1 statica & 4,04 & 4,56 & 8,64 \\
+P1.5       & 3,55 & 4,08 & 8,06 \\
+P2         & 1,54 & 1,79 & 3,48 \\
+P3         & 1,02 & 1,28 & 2,33 \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} pacchetti da 64 byte; bit rate misurato sul collegamento; 28 settembre}
+{\footnotesize\color{soft} pacchetti da 64 byte; bit rate misurato sul collegamento; 2 ottobre.
+$^*$ baseline: oltre 8,6 M/s il limite è del banco, non del programma}
 \end{center}
 
-Le prime due colonne sono \textbf{gradini}, non soglie esatte. I tredici valori
-sono spaziati di circa 0,24~Gbit/s, e ``pulita fino a 0,72, perde da 0,96'' vuol
-dire che la perdita comincia da qualche parte fra i due. Esempio: P2 inoltra al
-massimo 1,89 milioni di pacchetti al secondo, cioè
-$1{,}89\cdot10^6 \times 64 \times 8 \approx 0{,}97$~Gbit/s; il gradino da 0,96
-cade proprio sul suo limite, e perde. P3 (1,50 milioni, $\approx 0{,}77$~Gbit/s)
-perde allo stesso gradino, pur essendo più lenta: fra 0,72 e 0,96 non c'è un
-valore intermedio che le separi. A distinguerle è la terza colonna.
+Le prime due colonne sono \textbf{gradini}, non soglie esatte: ``pulita fino a
+1,54, perde da 1,79'' vuol dire che la perdita comincia da qualche parte fra i
+due. Esempio: P2 inoltra al massimo 3,48 milioni di pacchetti al secondo, cioè
+$3{,}48\cdot10^6 \times 64 \times 8 \approx 1{,}78$~Gbit/s, proprio fra i due
+gradini.
 
 \subsection*{Il ritardo}
 
@@ -2601,25 +2526,15 @@ valore intermedio che le separi. A distinguerle è la terza colonna.
 \includegraphics[width=\textwidth]{figures/bitrate_latency.pdf}
 \end{center}
 
-Il ritardo fa quello che la domanda prevede: resta di pochi microsecondi finché
-il nodo regge, poi \textbf{salta di un ordine di grandezza} esattamente dove la
-pipeline comincia a perdere (marcatori vuoti), e da lì resta piatto. Il salto è
-la coda d'ingresso che si riempie: 256 posti davanti a un programma che serve un
-pacchetto ogni 300--670~ns fanno fra 80 e 170 microsecondi di attesa, vicino al
-livello a cui le curve si fermano --- circa 85~µs per la baseline, 100 per P1,
-150 per P2, 190 per P3; il resto è il percorso fino al nodo successivo. Oltre, la
-coda non può crescere: è piena, e ciò che arriva in più viene respinto. Il ritardo si ferma e cresce la perdita.
-
-\begin{prima}[Un dettaglio a basso carico]
-Al valore più basso (0,12~Gbit/s) la mediana è di circa 9~µs, più che a
-0,5~Gbit/s (3--5~µs): la curva scende prima di salire. Non è la correzione per
-l'attesa del generatore, che a quel ritmo vale 12~µs ed è quasi uguale alla
-distanza fra due pacchetti dello stesso thread. Il minimo resta intorno a
-1~µs a tutti i ritmi. La spiegazione più probabile, \textbf{non verificata}: con
-poco traffico i core del percorso che il banco non tiene svegli --- il nodo
-successivo --- vanno a dormire, e una parte dei pacchetti aspetta il loro
-risveglio. Non tocca la conclusione, che sta nel salto a destra.
-\end{prima}
+Il ritardo fa quello che la domanda prevede: resta di qualche decina di
+microsecondi finché il nodo regge, poi \textbf{salta} esattamente dove la pipeline
+comincia a perdere (marcatori vuoti), e da lì resta piatto. Il salto è la coda
+d'ingresso che si riempie: 256 posti davanti a un programma che serve un
+pacchetto ogni 116~ns (P1), 124 (P1.5), 287 (P2) o 429 (P3) fanno 30, 32, 74 e
+110 microsecondi di attesa; le curve si fermano a circa 34, 36, 83 e 125~µs, e il
+resto è il percorso fino al nodo successivo. La baseline non riempie mai la coda. Oltre, la coda non può crescere: è piena, e ciò che arriva in più
+viene respinto. Il ritardo si ferma e cresce la perdita. A basso carico la mediana
+contiene l'attesa nel generatore (sezione~\ref{sec:limiti}, punto 5).
 
 \subsection*{Perché il collo di bottiglia è il programma}
 
@@ -2632,11 +2547,12 @@ all'ingresso è quindi il segno di un nodo più lento del traffico, e il nodo è
 suo programma.
 
 Resta da escludere che il limite sia la sola ricezione, che gira sullo stesso
-core. Lo dice \texttt{rxonly}, il contatore da solo: regge fino a circa
-2,4~Gbit/s, e a 3~Gbit/s perde il 21\%. Allo stesso ritmo la baseline perde il
-44\%, P2 il 68\%, P3 il 74\%: la perdita \emph{in più} rispetto al solo
-contatore (23, 47 e 54 punti) è del programma, e cresce con il suo costo.
-L'uscita invece non limita mai: dopo il programma si perde lo 0,002\% al massimo.
+core. Lo dice \texttt{rxonly}, il contatore da solo: fino a 11 milioni di
+pacchetti al secondo \textbf{non perde niente}, perché senza la copia la sola
+ricezione regge circa 19 milioni. Al traffico più alto P1 perde il 7\%, P1.5 il
+9\%, P2 il 61\%, P3 il 76\%: la perdita è del programma, e cresce con il suo costo.
+L'uscita invece non limita: dopo il programma si perde lo 0,04\% al massimo, e
+anche quello è rumore di lettura (negativo in 159 finestre su 400).
 
 Due precisazioni. Per la baseline il ``programma'' è quasi solo lettura
 dell'intestazione e redirect: il suo limite è il costo fisso di un nodo XDP, non
@@ -2645,49 +2561,37 @@ per misurare il costo per core: una scheda di rete vera distribuisce i pacchetti
 su più code e più core (RSS), e la capacità del nodo cresce con il numero di
 core, mentre il costo per pacchetto resta quello misurato qui.
 
+\label{sec:duecore}
 Perché la capacità cresca davvero con i core, i core non devono contendersi
 niente di scritto a ogni pacchetto. Per questo i contatori delle pipeline
 (pacchetti inoltrati, persi, scartati, e uno per classe) sono \textbf{per-core}:
 ogni core incrementa la sua copia, senza istruzioni atomiche, e chi legge somma
-le copie. Un contatore unico incrementato da più core costringerebbe i core a
-passarsi a ogni pacchetto la stessa riga di cache.
-Su un core solo il guadagno è piccolo: circa 8~ns per pacchetto per i programmi
-leggeri (la baseline passa da 3,31 a 3,40~Mpps, P1 da 2,94 a 3,01), niente di
-misurabile per P2 e P3. Le altre cifre del capitolo restano quelle misurate con
-i contatori di prima.
-
-\label{sec:duecore}
-Lo si verifica dando al nodo due core invece di uno, ciascuno con la sua coda
-d'ingresso e la sua coda d'uscita, e con \texttt{pktgen} a quattro thread, due
-per coda d'ingresso:
+le copie. Lo si verifica dando al nodo due core invece di uno, ciascuno con la sua
+coda d'ingresso, il suo thread di \texttt{xdp\_gen}, la sua coda d'uscita e il suo
+core d'uscita:
 
 \begin{center}
 \small
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-\textbf{Programma} & \textbf{1 core (Mpps)} & \textbf{2 core (Mpps)} & \textbf{rapporto} & \textbf{ns per core} \\
+\textbf{Programma} & \textbf{1 core (Mpps)} & \textbf{2 core (Mpps)} & \textbf{del doppio} & \textbf{ns per core} \\
 \midrule
-\texttt{rxonly}     & 4,69 & 9,29 & 1,98 & 215 \\
-baseline            & 3,41 & 6,72 & 1,97 & 298 \\
-P1                  & 3,00 & 5,96 & 1,99 & 335 \\
-P1.5                & 2,86 & 5,60 & 1,96 & 357 \\
-P2                  & 1,90 & 3,68 & 1,94 & 543 \\
-P3                  & 1,46 & 2,81 & 1,93 & 711 \\
+baseline            & 15,13 & 29,20 & 96\% & 67 \\
+P1                  & 8,69  & 16,84 & 97\% & 119 \\
+P1.5                & 8,07  & 15,72 & 97\% & 127 \\
+P2                  & 3,41  & 6,74  & 99\% & 297 \\
+P3                  & 2,41  & 4,58  & 95\% & 436 \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} Stessa sessione, 1 ottobre, alimentatore, macchina non
-disturbata. 1 core: tre thread; 2 core: quattro, due per coda.}
+{\footnotesize\color{soft} Stessa sessione, 2 ottobre, alimentatore, macchina non
+disturbata. \texttt{rxonly} non satura né su uno né su due core.}
 \end{center}
 
-Con due core ogni programma elabora il doppio (fra 1,93 e 1,99 volte): il
-secondo core non rallenta il primo. Per core, il solo contatore, la baseline, P1
-e P1.5 costano quanto su un core entro 8~ns; P2 e P3 il 3--4\% in più (543
-contro 527, 711 contro 684~ns), da cui i loro rapporti un po' più bassi. Con i
-pacchetti grezzi di \texttt{xdp\_gen} il risultato è lo stesso: due core
-elaborano il 97--99\% del doppio, e il tempo di CPU per pacchetto di ogni core
-(121, 126, 297, 439~ns per P1, P1.5, P2, P3) è quello misurato su un core solo
-(117, 124, 292, 432) entro il 3,5\%. Per un nodo con $N$ code vale quindi $N$ volte la capacità misurata
-su un core, finché generatore e scheda reggono.
+Con due core ogni programma elabora il doppio (95--99\%): il secondo core non
+rallenta il primo, e il costo per core di baseline, P1, P1.5 e P2 è quello di un
+core solo entro 4~ns; P3 paga 436 contro 416, dentro la sua variazione fra
+sessioni. Per un nodo con $N$ code vale quindi $N$ volte la capacità misurata su
+un core, finché generatore e scheda reggono.
 
 Il raddoppio si vede solo se ogni coda ha un solo scrittore anche
 \textbf{all'uscita}. Fino al 30 settembre il banco dava a ogni porta d'uscita una
@@ -2696,34 +2600,22 @@ con una coda i due core del nodo scrivevano nello stesso anello, svuotato da un
 solo core del nodo successivo.
 
 \begin{prima}[Esempio: la baseline a due core con una coda d'uscita]
-Con \texttt{xdp\_gen} la baseline elaborava 13,15 milioni di pacchetti al secondo
-e al nodo successivo ne arrivavano 4,2: il 49\% si perdeva dopo il programma, e
-ogni core spendeva 152~ns per pacchetto invece di 65. Con tre code d'uscita
-(il core 6 scrive nella 0, il core 8 nella 2) gli elaborati salgono a 19,15, ma
-un core d'uscita solo ne riceve circa 10 milioni e il resto si perde ancora. Con
-un core d'uscita per coda la baseline elabora 28,8 milioni al secondo, arrivano
-tutti, e il costo per core torna a 68~ns (65 su un core, indicativo). Con \texttt{pktgen}, che arriva a rate
-più bassi, la coda d'uscita condivisa costava 12--20~ns per pacchetto per core:
-i rapporti erano 1,91--1,98 invece di circa 2.
+La baseline elaborava 13,15 milioni di pacchetti al secondo e al nodo successivo
+ne arrivavano 4,2: il 49\% si perdeva dopo il programma, e ogni core spendeva
+152~ns per pacchetto invece di 66 (misure del 1 ottobre, da leggere come
+confronto). Con tre code d'uscita (il core 6 scrive nella 0, il core 8 nella 2)
+gli elaborati salivano a 19,15, ma un core d'uscita solo ne riceveva circa 10
+milioni e il resto si perdeva ancora. Con un core d'uscita per coda la baseline
+elabora 29,2 milioni al secondo, arrivano tutti, e il costo per core torna a
+67~ns.
 \end{prima}
-
-Anche il generatore va diviso in parti uguali. Con tre thread \texttt{pktgen}
-su due code una coda riceve da due thread e l'altra da uno solo, circa 2,8
-milioni al secondo: abbastanza per saturare i core dei programmi, non quello di
-\texttt{rxonly}, che ne riceve 4,7. Il solo contatore si fermava così a 7,55
-milioni (1,61 volte), con un core fermo il 40\% del tempo; con quattro thread,
-due per coda, arriva a 9,29 (1,98 volte).
 
 \begin{lezione}
 Per tutte e cinque la perdita è \textbf{all'ingresso}: il collo di bottiglia è il
-programma eBPF, non la trasmissione. Il ritardo cresce fino a una perdita, come
-previsto, e si ferma al livello della coda piena.
+programma eBPF, non la trasmissione, e la sola ricezione non perde affatto. Il
+ritardo cresce fino a una perdita, come previsto, e si ferma al livello della coda
+piena.
 \end{lezione}
-
-Il primo programma della catena costa poco, e si misura invece di supporlo: il
-kernel tiene il tempo di ogni programma attaccato, e con e senza il contatore
-davanti la differenza va da $-2$ a $+5$~ns, entro la variazione fra le
-ripetizioni della misura stessa.
 
 \section{Che cosa questo numero non dice}
 
@@ -2902,12 +2794,12 @@ sul test con il generatore è nel capitolo \ref{ch:reale}):
 \midrule
 programma da solo, latenza (baseline / P1 / P2 / P3) & 28 / 76 / 311 / 445 ns & 18 / 52 / 195 / 315 ns \\
 \quad dispersione fra le prove & 13--30\% & 2--6\% \\
-costo della rete su traffico vero, sopra la baseline & P2 $\sim$430, P3 $\sim$670 ns; P1 e P1.5 non misurabili & 38 / 53 / 226 / 364 ns \\
-\quad variazione fra i run & 15--19\% per P2 e P3, oltre il 100\% per P1 e P1.5 & 0,2--0,9\% fra i giri \\
+costo della rete su traffico vero, sopra la baseline & P2 $\sim$430, P3 $\sim$670 ns; P1 e P1.5 non misurabili & 49 / 58 / 227 / 350 ns \\
+\quad variazione fra i run & 15--19\% per P2 e P3, oltre il 100\% per P1 e P1.5 & 2--4\% fra i giri \\
 respinti con il nodo sotto capacità & 1--2\% anche per il solo contatore & zero \\
-bit rate: lo stesso punto in giri diversi & 58\% / 0,2\% / 7,7\% di perdita & inoltro massimo entro lo 0,4--2\% \\
-P1 contro P1.5 & indistinguibili, l'ordine si inverte fra i run & 2,94 contro 2,81 M/s, sempre nello stesso ordine \\
-P3, costo per strato in più & $\sim$70 ns & $\sim$53 ns \\
+bit rate: lo stesso punto in giri diversi & 58\% / 0,2\% / 7,7\% di perdita & in genere entro lo 0,1\%, al massimo 6\% \\
+P1 contro P1.5 & indistinguibili, l'ordine si inverte fra i run & 8,69 contro 8,07 M/s, sempre nello stesso ordine \\
+P3, costo per strato in più & $\sim$70 ns & $\sim$30 ns \\
 frequenza del core & né visibile né controllabile & fissa e misurata: 3\,494 MHz \\
 \bottomrule
 \end{tabular}
@@ -3152,9 +3044,12 @@ va per la strada nuova. Confrontato con la strada di sempre:
   \item il sorgente di P1 e la foglia di P2 sono identici \emph{byte per byte};
   \item il riferimento generico, che la strada nuova usa per tutti, coincide con
         quello scritto per il 65-4-4-7 su 20\,000 ingressi;
-  \item sul traffico vero: 3,37 / 2,98 / 2,81 / 1,87 / 1,47~Mpps contro
-        3,40 / 3,01 / 2,87 / 1,91 / 1,49 del giorno prima. Anche la baseline,
-        che nessun modello tocca, perde l'1\%: è variazione fra sessioni.
+  \item sul traffico vero, con \texttt{xdp\_gen}: 15,07 / 8,44 / 8,01 / 3,43 /
+        2,18~Mpps contro 15,13 / 8,69 / 8,07 / 3,41 / 2,41 della strada di sempre,
+        in un'altra sessione dello stesso giorno. Baseline, P1.5 e P2 entro
+        l'1\%, P1 entro il 3\%; P3 il 10\% in meno, ed è la pipeline che varia di
+        più fra una sessione e l'altra (416--460~ns). Con \texttt{pktgen} le due
+        strade davano P3 entro l'1\%.
 \end{itemize}
 
 E la correttezza sui modelli nuovi:
@@ -3167,9 +3062,9 @@ E la correttezza sui modelli nuovi:
 
 \section{I risultati}
 
-Sul traffico vero, un core, stesso banco del capitolo~\ref{ch:reale}. Milioni
-di pacchetti al secondo e, fra parentesi, i nanosecondi per pacchetto in più
-rispetto alla baseline:
+Sul traffico vero, un core, \texttt{xdp\_gen}, stesso banco del
+capitolo~\ref{ch:reale} (2 ottobre). Milioni di pacchetti al secondo e, fra
+parentesi, i nanosecondi per pacchetto in più rispetto alla baseline:
 
 \begin{center}
 \small
@@ -3177,25 +3072,26 @@ rispetto alla baseline:
 \toprule
 \textbf{Modello} & \textbf{forma} & \textbf{baseline} & \textbf{P1} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
-checkpoint & 65-4-4-7   & 3,37 & 2,98 (+39) & 2,81 (+58) & 1,87 (+237) & 1,47 (+385) \\
-deep       & 65-4-4-4-7 & 3,31 & 2,87 (+46) & 2,76 (+60) & 1,78 (+261) & 1,35 (+438) \\
-small      & 15-4-4     & 3,30 & 3,01 (+29) & 2,88 (+45) & 2,11 (+172) & 1,74 (+271) \\
-mixed      & 18-6-5     & 3,28 & 3,02 (+27) & 2,90 (+40) & 2,06 (+181) & 1,67 (+293) \\
-large      & 117-8-8-9  & 3,30 & 2,61 (+80) & 2,54 (+90) & --- & --- \\
+checkpoint & 65-4-4-7   & 15,07 & 8,44 (+52) & 8,01 (+58) & 3,43 (+225) & 2,18 (+393) \\
+deep       & 65-4-4-4-7 & 15,13 & 8,43 (+53) & 7,76 (+63) & 3,08 (+258) & 2,04 (+423) \\
+small      & 15-4-4     & 14,97 & 9,93 (+34) & 9,20 (+42) & 4,34 (+164) & 3,01 (+265) \\
+mixed      & 18-6-5     & 15,28 & 9,39 (+42) & 8,97 (+47) & 4,17 (+175) & 2,87 (+283) \\
+large      & 117-8-8-9  & 15,14 & 6,87 (+80) & 6,44 (+89) & --- & --- \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 Tre cose si leggono subito.
 \begin{itemize}
-  \item \textbf{Uno strato in più costa soprattutto a P3}: \texttt{deep} ha uno
-        strato più del checkpoint e costa +24~ns su P2, +53~ns su P3, +7~ns su
-        P1. P3 paga ogni strato con un salto fra programmi e una lettura dei
-        suoi pesi; P1 ha tutto dentro lo stesso programma.
-  \item \textbf{Ingressi più piccoli abbassano P2 e P3} di 60--110~ns: il primo
+  \item \textbf{Uno strato in più costa a P2 e P3, non a P1}: \texttt{deep} ha uno
+        strato più del checkpoint e costa +33~ns su P2, +30~ns su P3, +1~ns su
+        P1 (nel kernel +24 e +44). P2 e P3 leggono i pesi dello strato in più da
+        tabella, e P3 ci aggiunge un salto fra programmi; P1 ha tutto dentro lo
+        stesso programma.
+  \item \textbf{Ingressi più piccoli abbassano P2 e P3} di 50--130~ns: il primo
         strato, che è il più largo, scorre meno colonne.
-  \item \textbf{Un ingresso più grande pesa su P1}: \texttt{large} costa a P1 il
-        doppio del checkpoint, 80~ns contro 39.
+  \item \textbf{Un ingresso più grande pesa su P1}: \texttt{large} costa a P1
+        80~ns contro 52 del checkpoint.
 \end{itemize}
 
 Nel kernel, con \texttt{BPF\_PROG\_TEST\_RUN}, si vede anche una cosa che il
@@ -3206,16 +3102,18 @@ hanno la stessa forma: P2 e P3 costano uguale per tutti (194--198 e
 compilazione) a 51. Queste latenze però sono state prese col portatile a
 batteria: sono indicative finché non si rimisurano con l'alimentatore.
 
-Il bit rate su \texttt{deep} ripete il comportamento del checkpoint: per tutte
-le pipeline la perdita comincia \emph{all'ingresso}, quindi il collo di
-bottiglia resta il programma eBPF. Cambia solo dove: P3 è pulita fino a
-0,48~Gbit/s invece che 0,72, perché lo strato in più la porta sotto 1,41~Mpps.
+Il bit rate su \texttt{deep}, con \texttt{xdp\_gen}, ripete il comportamento del
+checkpoint: per tutte le pipeline la perdita comincia \emph{all'ingresso} (dopo
+il programma al massimo lo 0,04\%), quindi il collo di bottiglia resta il
+programma eBPF. Cambia solo dove: P3 è pulita fino a 1,5 milioni di pacchetti al
+secondo e perde da 2, P2 fino a 3 e perde da 3,5, P1.5 perde da 8; baseline e P1
+restano pulite fino alla fine della scala.
 
 \begin{lezione}
 Il confronto fra le pipeline non è una proprietà del checkpoint: su cinque
 modelli l'ordine P1 $<$ P1.5 $<$ P2 $<$ P3 resta lo stesso, e i costi si spostano
-come ci si aspetta dalla forma. La profondità pesa soprattutto su P3,
-l'ampiezza dell'ingresso su P1.
+come ci si aspetta dalla forma. La profondità pesa su P2 e P3, l'ampiezza
+dell'ingresso su tutte, e su P1 più che altrove.
 \end{lezione}
 
 \section{Che cosa non fa ancora}
@@ -3242,9 +3140,9 @@ l'ampiezza dell'ingresso su P1.
 & \textbf{baseline} & \textbf{P1 statica} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
 \multicolumn{6}{@{}l}{\emph{Il nodo su traffico vero (capitolo \ref{ch:reale}), 64 byte}} \\
-milioni di pacchetti al secondo & 3,31 & 2,94 & 2,81 & 1,89 & 1,50 \\
-costo della rete (sopra la baseline) & --- & 38 ns & 53 ns & 226 ns & 364 ns \\
-pulita fino a (bit rate) & 1,44 & 1,20 & 1,20 & 0,72 & 0,72 Gbit/s \\
+milioni di pacchetti al secondo (\texttt{xdp\_gen}) & 15,13 & 8,69 & 8,07 & 3,41 & 2,41 \\
+costo della rete (sopra la baseline) & --- & 49 ns & 58 ns & 227 ns & 350 ns \\
+pulita fino a (bit rate) & $\geq$ 4,05 & $\geq$ 4,05 & 3,55 & 1,54 & 1,02 Gbit/s \\
 \addlinespace
 \multicolumn{6}{@{}l}{\emph{Il solo programma}} \\
 $T_2-T_1$ sul percorso vero (minimo) & 34 ns & 68 ns & 77 ns & 228 ns & 340 ns \\
@@ -3317,7 +3215,8 @@ Linux con BCC installato; per l'oggetto AOT di P1 anche
 \begin{lstlisting}
 sudo apt install clang libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev
 \end{lstlisting}
-Il generatore di traffico (\texttt{pktgen}) il banco lo carica da sé.
+Il generatore (\texttt{xdp\_gen}) è uno script del repository; il modulo
+\texttt{pktgen}, per l'alternativa, il banco lo carica da sé.
 \end{prima}
 
 \section{La macchina}
@@ -3370,11 +3269,7 @@ sudo python3 ipa/test/test_model_source.py --kernel
 sudo python3 ipa/test/host_conditions.py --run -- \
      python3 ipa/test/test_suite.py --only kernel --model synth:deep
 sudo python3 ipa/test/test_fabric.py --model synth:small -q
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 \
-     --gen-cpus 10,1,3 --dut-cpus 6 --model synth:deep \
-     --out results/models/throughput_deep
-sudo python3 ipa/test/bench_bitrate.py --model synth:deep --rounds 3 \
-     --out results/models/bitrate_deep
+bash ipa/test/remeasure_xdp.sh modelli      # i cinque modelli con xdp_gen
 \end{lstlisting}
 
 \section{Datapath reale: il pacchetto attraversa davvero}
@@ -3403,23 +3298,24 @@ sudo python3 ipa/test/host_conditions.py --run -- \
 \section{Il test reale}
 
 \begin{lstlisting}
-# throughput a saturazione e a carico comune (pktgen)
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 \
-     --out results/throughput_3500
+# tutte le misure con xdp_gen: uno e due core, curve del bit rate, modelli
+bash ipa/test/remeasure_xdp.sh
 
 # il bit rate crescente: latenza, ricevuti, inoltrati, dove si perde
-sudo python3 ipa/test/bench_bitrate.py --out results/bitrate_3500
-python3 ipa/test/bench_bitrate.py --report results/bitrate_3500
+sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 \
+     --dut-cpus 6 --rates 0.5,1,1.5,2,2.5,3,3.5,4,5,6,7,8 --out results/bitrate_xdp
+python3 ipa/test/bench_bitrate.py --report results/bitrate_xdp
 
 # le tre marcature T1/T2/T3 su una scala di rate
-sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 \
-     --rounds 3 --rates 0.5,1,1.5,2,2.5,3
+sudo python3 ipa/test/bench_throughput.py --mode rates --gen-cpus 10 \
+     --dut-cpus 6 --frames 64 --rounds 3 --rates 0.05,0.5,1,1.5,2,2.5,3
 
-# pacchetti grezzi, nodo successivo su un core suo; per classe
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
-     --egress-cpu auto --rounds 5
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
-     --egress-cpu auto --per-class --rounds 3
+# per classe e per taglia (xdp_gen e' il default, uscita su un core suo)
+sudo python3 ipa/test/bench_throughput.py --mode compare --gen-cpus 10 \
+     --dut-cpus 6 --per-class --rounds 3
+sudo python3 ipa/test/bench_throughput.py --mode compare --gen-cpus 10 \
+     --dut-cpus 6 --frames 64,512,1514 --rounds 3
+# oppure tutto insieme: bash ipa/test/remeasure_xdp.sh nuove
 
 # la finestra di misura e le formule, verificate senza kernel
 python3 ipa/test/test_steady_window.py

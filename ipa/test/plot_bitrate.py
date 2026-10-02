@@ -88,8 +88,15 @@ def _series(rows, method, ykey):
     return sorted(pts, key=lambda p: p[0])
 
 
+def _bench(r):
+    """Perdita col nodo non saturo: del banco, non del programma
+    (bench_bitrate.LABEL_BENCH)."""
+    return str(r.get("bottleneck") or "").startswith("banco")
+
+
 def _lossy(r):
-    return r.get("bottleneck") not in (None, "", "nessuna", "riferimento")
+    return r.get("bottleneck") not in (None, "", "nessuna", "riferimento") \
+        and not _bench(r)
 
 
 def _onset(rows, method):
@@ -98,7 +105,7 @@ def _onset(rows, method):
     finestra disturbata, non l'inizio della perdita."""
     pts = sorted((r for r in rows if r["method"] == method),
                  key=lambda r: r["rate_requested_pps"])
-    lossy = [_lossy(r) for r in pts]
+    lossy = [_lossy(r) or _bench(r) for r in pts]
     return next((pts[i] for i in range(len(pts)) if all(lossy[i:])), None)
 
 
@@ -162,8 +169,11 @@ def fig_latency(plt, rows, frame, out_dir, suffix):
                fontsize=8, bbox_to_anchor=(0.5, 1.08), labelcolor=INK)
     fig.suptitle(f"Latenza end-to-end contro bit rate inviato — frame {frame} B",
                  fontsize=11, color=INK, x=0.01, ha="left", y=1.14)
-    fig.text(0.01, -0.04, "Timbro di pktgen -> nodo successivo, corretto per "
-             "l'attesa di pktgen; mediana fra i giri. Scala logaritmica.",
+    stamp = ("Timbro di xdp_gen all'invio -> nodo successivo, nessuna "
+             "correzione" if GENERATOR == "xdp" else
+             "Timbro di pktgen -> nodo successivo, corretto per l'attesa di "
+             "pktgen")
+    fig.text(0.01, -0.04, f"{stamp}; mediana fra i giri. Scala logaritmica.",
              fontsize=7.5, color=INK2, ha="left")
     paths = _save(fig, out_dir, f"bitrate_latency{suffix}")
     plt.close(fig)
@@ -215,7 +225,8 @@ def fig_pps(plt, rows, frame, out_dir, suffix):
             x = on["bitrate_sent_gbps"]
             ax.axvline(x, color=INK2, linewidth=0.8, zorder=0)
             right = x > 0.75 * xmax
-            ax.text(x, 0.98, ("perde da qui " if right else " perde da qui"),
+            what = "limite del banco" if _bench(on) else "perde da qui"
+            ax.text(x, 0.98, (f"{what} " if right else f" {what}"),
                     transform=ax.get_xaxis_transform(), fontsize=7,
                     color=INK2, va="top", ha=("right" if right else "left"))
         ax.set_title(TITLE.get(m, m), fontsize=9, color=INK, loc="left")
@@ -293,8 +304,25 @@ def fig_loss(plt, rows, frame, out_dir, suffix):
     return paths
 
 
+# Il generatore del run (da env.csv): cambia la didascalia della latenza.
+GENERATOR = "pktgen"
+
+
+def _generator_of(out_dir):
+    try:
+        with open(os.path.join(out_dir, "env.csv"), newline="") as f:
+            for row in csv.reader(f):
+                if len(row) >= 2 and row[0] == "generatore":
+                    return row[1]
+    except OSError:
+        pass
+    return "pktgen"
+
+
 def plot_all(out_dir):
     """Tutte le figure per tutte le taglie di frame; restituisce i file."""
+    global GENERATOR
+    GENERATOR = _generator_of(out_dir)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

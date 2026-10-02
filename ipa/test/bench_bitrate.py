@@ -39,13 +39,13 @@ MISS) e i fallimenti dell'uscita, e il test li conta separatamente.
 --------------------------------------------------------------------------
 IL BANCO: quello di bench_throughput, non uno nuovo
 --------------------------------------------------------------------------
-Stesso fabric veth (netns_fabric), stesso generatore (pktgen su CPU dedicate,
-`delay` per istanza), stessa finestra stazionaria (Generator.steady), stesse
+Stesso fabric veth (netns_fabric), stesso generatore (xdp_gen per default,
+pktgen con --generator pktgen; vedi CON XDP_GEN), stessa finestra stazionaria (Generator.steady), stesse
 pipeline caricate da build_pipeline -- gli oggetti di produzione, NON le build
 strumentate di `--mode rates`: nessuna riga del loro codice cambia. Il modulo
 usa bench_throughput come libreria e non lo modifica.
 
-    pktgen (cpu gen) --veth ipatg0p->ipatg0--> [XDP: contatore -> pipeline]
+    xdp_gen (cpu gen) --veth ipatg0p->ipatg0--> [XDP: contatore -> pipeline]
         --bpf_redirect--> ipaN --veth--> ipaNp [XDP: contatore d'uscita]
 
 --------------------------------------------------------------------------
@@ -194,12 +194,31 @@ USCITE (in --out)
 --------------------------------------------------------------------------
 USO
 --------------------------------------------------------------------------
-    sudo python3 ipa/test/bench_bitrate.py --out results/bitrate
-    sudo python3 ipa/test/bench_bitrate.py --bitrates 0.5,1,1.5,2,2.5 \\
+    sudo python3 ipa/test/bench_bitrate.py --gen-cpus 10 --dut-cpus 6 \\
+        --out results/bitrate_xdp                       # xdp_gen, 0,5-8 Mpps
+    sudo python3 ipa/test/bench_bitrate.py --generator pktgen --bitrates 0.5,1,1.5,2,2.5 \\
         --method rxonly,baseline,p1_static,template --rounds 5 --out results/bitrate
     python3 ipa/test/plot_bitrate.py results/bitrate      # i grafici, anche altrove
 
-Serve Linux, root, BCC, clang (per P1/P1.5) e il modulo pktgen.
+Serve Linux, root, BCC, clang (per P1/P1.5) e, solo con --generator pktgen,
+il modulo pktgen.
+
+--------------------------------------------------------------------------
+CON XDP_GEN (il default dal 2026-10-02)
+--------------------------------------------------------------------------
+Frame XDP grezzi invece degli skb di pktgen: niente copia di headroom sul DUT,
+come da una NIC con XDP nativo. La cadenza e il timbro li fa il programma
+generatore (xdp_gen.py: un frame all'istante previsto, gli altri giri
+scartati; intestazione pktgen scritta all'invio, quindi nessuna correzione
+per l'attesa). Un thread per coda d'ingresso (senza --gen-cpus, uno per CPU
+del DUT); senza scala, XDP_RATES_MPPS. Cadenza precisa fino a ~8 Mpps
+per thread: su un core baseline, P1 e rxonly non arrivano al loro limite.
+--xdp-batch fissa il lotto del test_run: a fine lotto il redirect sveglia il
+DUT, e con 256 un frame puo' aspettare nel generatore fino a ~12 us, che il
+ritardo a basso carico conta (16-19 us contro 4-6 con 32). Con 32 la cadenza
+regge solo fino a ~2,5 Mpps. Le colonne napi_* e gen_* sono la diagnostica
+che ha trovato la pausa di ogni chiamata test_run (results/diag_xdp/ contro
+results/diag_xdp_lunga/).
 """
 import argparse
 import contextlib
@@ -219,6 +238,11 @@ for _p in (SHARED, HERE):
 
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
+
+# La scala di default con xdp_gen, in Mpps: fino a dove la cadenza di un
+# thread e' esatta (~11-12 Mpps, results/xdp_cadenza_test/, docs/testing.md
+# §11.4).
+XDP_RATES_MPPS = (0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 
 # La scala fissa di ripiego, in Gbit/s a 64 byte, se la calibrazione non
 # riesce. Il default e' la scala CALIBRATA (auto_rates): le capacita'
@@ -286,6 +310,14 @@ LABEL_NONE = "nessuna"
 LABEL_PROG = "ingresso: programma eBPF"
 LABEL_IN_UNSPLIT = "ingresso: programma o ricezione (manca rxonly)"
 LABEL_OUT = "uscita: trasmissivo"
+LABEL_BENCH = "banco: nodo non saturo"
+# Sotto questa occupazione del thread NAPI del DUT (napi_run_pct, mediana dei
+# giri) una perdita all'ingresso non e' del programma: il nodo ha tempo libero
+# e la coda trabocca per altro (lotto del generatore piu' grande dello spazio
+# libero nella coda, generatore frenato dall'inoltro). Misurato il
+# 2026-10-02: baseline a 9-12 Mpps con il nodo al 59-61%, perdita prima di
+# XDP ~1%; P1 e P1.5 alla loro capacita' al 99,6-99,9%.
+NAPI_SATURATED_PCT = 90.0
 LABEL_REF = "riferimento"
 
 # ==========================================================================
@@ -575,6 +607,52 @@ def latency_stats(lat, spin_us, mask):
     return out
 
 
+def napi_sched(pids):
+    """Statistiche di scheduling cumulative dei thread NAPI del DUT: tempo
+    in esecuzione e in attesa della CPU (ns, /proc/<pid>/schedstat), cambi di
+    contesto volontari (il thread va a dormire: coda vuota o NAPI completata)
+    e involontari (qualcun altro prende il core)."""
+    out = dict(napi_run_ns=0, napi_wait_ns=0, napi_vol_cs=0, napi_invol_cs=0)
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/schedstat") as f:
+                run, wait, _ = (int(x) for x in f.read().split()[:3])
+            out["napi_run_ns"] += run
+            out["napi_wait_ns"] += wait
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("voluntary_ctxt_switches"):
+                        out["napi_vol_cs"] += int(line.split()[1])
+                    elif line.startswith("nonvoluntary_ctxt_switches"):
+                        out["napi_invol_cs"] += int(line.split()[1])
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def diag_columns(d, secs, sent):
+    """Le colonne diagnostiche di una finestra dalle differenze dei contatori
+    di napi_sched e XdpGen.diag (assenti: colonne vuote)."""
+    ns = secs * 1e9
+    out = {}
+    if "napi_run_ns" in d:
+        out.update(
+            napi_run_pct=round(100.0 * d["napi_run_ns"] / ns, 2),
+            napi_wait_pct=round(100.0 * d["napi_wait_ns"] / ns, 2),
+            napi_sleeps_per_ms=round(d["napi_vol_cs"] / (secs * 1e3), 3),
+            napi_preempt_per_ms=round(d["napi_invol_cs"] / (secs * 1e3), 3))
+    if "gen_spin" in d:
+        out.update(
+            gen_spin_per_sent=(round(d["gen_spin"] / sent, 2) if sent
+                               else None),
+            gen_resets=int(d["gen_reset"]),
+            gen_late_mean_ns=(round(d["gen_late_ns"] / sent, 1) if sent
+                              else None),
+            gen_gap_pct=round(100.0 * d["gen_gap_ns"] / ns, 3),
+            gen_calls=int(d["gen_calls"]))
+    return out
+
+
 def window_row(method, frame, rnd, rate_req_pps, delay_ns, gen_threads, secs,
                wall_s, tx, rejected, d, lat, mask, idle_ok=True, host=None):
     """Una finestra stazionaria -> una riga. `d` sono le DIFFERENZE dei
@@ -606,6 +684,7 @@ def window_row(method, frame, rnd, rate_req_pps, delay_ns, gen_threads, secs,
         loss_before_xdp_pct=pct(sent - rx, sent),
         rejected_pct=pct(int(rejected), sent),
         reference=ref)
+    row.update(diag_columns(d, secs, sent))
     row["gen_limited"] = bool(rate_req_pps and
                               row["sent_pps"] < GEN_LIMITED_FRACTION
                               * rate_req_pps)
@@ -661,7 +740,8 @@ MEDIAN_KEYS = (
     "e2e_latency_p99_us", "e2e_latency_mean_us", "e2e_latency_min_us",
     "e2e_latency_max_us", "e2e_latency_p50_raw_us", "e2e_samples",
     "e2e_spin_correction_us", "duration_s", "point_wall_s",
-    "host_dut_mhz", "host_dut_busy_pct", "host_pkg_temp_c")
+    "host_dut_mhz", "host_dut_busy_pct", "host_pkg_temp_c",
+    "napi_run_pct")
 SPREAD_KEYS = ("sent_pps", "rx_pps", "forwarded_pps", "bitrate_sent_gbps",
                "e2e_latency_p50_us", "e2e_latency_p99_us")
 
@@ -686,6 +766,9 @@ def classify(row, floor_pct, threshold=DEFAULT_LOSS_THRESHOLD):
         return LABEL_NONE
     if after > threshold and after > excess:
         return LABEL_OUT
+    napi = row.get("napi_run_pct")
+    if napi is not None and napi < NAPI_SATURATED_PCT:
+        return LABEL_BENCH
     return LABEL_PROG if floor_pct is not None else LABEL_IN_UNSPLIT
 
 
@@ -1026,7 +1109,8 @@ def calibrate_scale(B, window, use, alive, frame):
 # ==========================================================================
 def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 window_s, lat_target=LAT_TARGET_SAMPLES, egress_cpu=None,
-                overhead_reps=OVERHEAD_REPS, save=None, hostmon=None):
+                overhead_reps=OVERHEAD_REPS, save=None, hostmon=None,
+                generator="pktgen", xdp_batch=None):
     """Tutte le pipeline, stesso fabric e stesso generatore, a rate crescente.
     Restituisce (righe grezze, righe del costo del contatore, note).
 
@@ -1038,7 +1122,11 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
 
     `hostmon`: host_conditions.HostMonitor. Legge la macchina prima che
     pktgen parta e dopo che si e' fermato -- mai durante: le letture di MSR
-    sono IPI verso il DUT -- e ogni riga porta le colonne host_*."""
+    sono IPI verso il DUT -- e ogni riga porta le colonne host_*.
+
+    `generator`: "pktgen" (skb, `delay` di pktgen, correzione per la sua
+    attesa) o "xdp" (xdp_gen: frame XDP grezzi, cadenza e timbro nel
+    programma generatore, nessuna correzione)."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -1086,12 +1174,16 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                         attach_xdp(cnt["b"], cnt["fn"], dev)
 
         idle_ok = [True]
+        dut_napi = []           # pid dei thread NAPI d'ingresso del DUT
 
         def reader(m, direct=False):
             setup, cnt = loaded[m]
 
             def read():
                 d = dict(fwd=_percpu_total(rx_tab, 0))
+                if generator == "xdp":
+                    d.update(gen.diag())
+                d.update(napi_sched(dut_napi))
                 idle = pktgen_idle_us(B, gen.names) if idle_ok[0] else 0
                 d["idle_us"] = idle or 0
                 if not direct:
@@ -1141,20 +1233,36 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
             for setup, _ in loaded.values():
                 if setup is not None:
                     B._map_extra_ingress(setup, ing.ifindexes)
-            gen = B.Generator(ing.gen_devs[:1], plan, window_s=window_s,
-                              warmup_s=0.0, window_mode="steady").attach()
-            if pktgen_idle_us(B, gen.names) is None:
+            if generator == "xdp":
+                from xdp_gen import XdpGen
+                kw = {"batch_size": xdp_batch} if xdp_batch else {}
+                gen = XdpGen(ing.gen_devs[0], plan, window_s=window_s,
+                             **kw).attach()
+                B.info(f"xdp_gen: lotto da {gen.batch_size} frame (il DUT si "
+                       f"sveglia a fine lotto)")
+                gen.set_stamp(True)
+                B._warn_shared_queues(plan)
+                # Il timbro e' scritto nell'istante in cui il frame parte:
+                # non c'e' attesa da togliere.
                 idle_ok[0] = False
-                B.warn("pktgen non espone `idle` in /proc/net/pktgen: la "
-                       "latenza NON e' corretta per l'attesa fra timbro e "
-                       "trasmissione, e a rate basso e' sovrastimata di "
-                       "circa il delay")
-            notes["idle_correction"] = idle_ok[0]
+                notes["idle_correction"] = "non serve"
+            else:
+                gen = B.Generator(ing.gen_devs[:1], plan, window_s=window_s,
+                                  warmup_s=0.0, window_mode="steady").attach()
+                if pktgen_idle_us(B, gen.names) is None:
+                    idle_ok[0] = False
+                    B.warn("pktgen non espone `idle` in /proc/net/pktgen: la "
+                           "latenza NON e' corretta per l'attesa fra timbro "
+                           "e trasmissione, e a rate basso e' sovrastimata "
+                           "di circa il delay")
+                notes["idle_correction"] = idle_ok[0]
 
             # Il primo attach crea la NAPI; solo dopo si mette in thread.
             use(next(iter(loaded)))
             napi_devs = list(ing.dut_devs)
             placed = B.enable_threaded_napi(napi_devs, plan)
+            for dv in napi_devs:
+                dut_napi.extend(int(x) for x in B._napi_threads(dv))
             if placed:
                 B.info("NAPI d'ingresso in thread: " + ", ".join(
                     f"{dv}({nt})->cpu{','.join(map(str, cs))}"
@@ -1604,6 +1712,19 @@ def main(argv=None):
                    help="code d'ingresso del DUT: auto (default) una per CPU "
                         "del DUT; gen una per thread generatore (storico). "
                         "Vedi bench_throughput.DUT_QUEUES")
+    p.add_argument("--generator", choices=("pktgen", "xdp"), default="xdp",
+                   help="xdp (default): xdp_gen, frame XDP grezzi come da una "
+                        "NIC con XDP nativo, cadenza e timbro nel programma "
+                        "generatore. Un thread per coda d'ingresso: senza "
+                        "--gen-cpus ne' --threads, uno per CPU del DUT; "
+                        "senza scala, i rate di XDP_RATES_MPPS (la cadenza "
+                        "regge fino a ~11-12 Mpps per thread). pktgen: skb, con "
+                        "la copia di headroom sul DUT")
+    p.add_argument("--xdp-batch", type=int, default=None, metavar="N",
+                   help="con --generator xdp: frame per lotto del test_run "
+                        "(1-256, default 256). A fine lotto il redirect "
+                        "sveglia il DUT; un lotto piu' piccolo lo sveglia piu' "
+                        "spesso ma rimpicciolisce la page_pool")
     p.add_argument("--out", default=None, help="cartella dei risultati")
     p.add_argument("--no-plot", action="store_true",
                    help="non disegnare i grafici a fine run")
@@ -1658,10 +1779,11 @@ def main(argv=None):
             B.pg_stop()
             B.pg_reset()
         return 0
-    if not B.pg_available():
+    if a.generator == "pktgen" and not B.pg_available():
         sys.exit(f"{B.PKTGEN_DIR} non c'e' e `modprobe pktgen` non l'ha "
                  f"creato: questo kernel non ha il modulo.")
-    B.pg_reset()
+    if B.pg_available():
+        B.pg_reset()
 
     methods = ([REFERENCE] + list(PIPELINES) if a.method == "all"
                else [m.strip() for m in a.method.split(",") if m.strip()])
@@ -1670,6 +1792,13 @@ def main(argv=None):
         sys.exit(f"--method: sconosciuti {bad}; validi: all, {REFERENCE}, "
                  f"{', '.join(PIPELINES)}")
     frames = [int(x) for x in _parse_list(a.frames, "--frames")]
+    if a.generator == "xdp" and not a.rates and not a.bitrates:
+        # La scala calibrata sul tetto di ricezione con xdp_gen andrebbe a
+        # ~19 Mpps, oltre la cadenza di un thread: si usa la scala fissa.
+        a.rates = ",".join(f"{x:g}" for x in XDP_RATES_MPPS)
+    if a.generator == "xdp" and a.gen_cpus is None and a.threads is None:
+        # uno scrittore per coda (docs/testing.md §10.3)
+        a.threads = len(B.parse_cpu_list(a.dut_cpus) or [None])
     scale_spec = (a.bitrates or "auto").strip().lower() if not a.rates \
         else "rates"
     if scale_spec == "auto":
@@ -1705,7 +1834,7 @@ def main(argv=None):
     envargs = argparse.Namespace(
         mode="bitrate", no_threaded_napi=False, gen_topology="shared",
         xmit_mode="start_xmit", duration=window_s, window="steady",
-        generator="pktgen", ttl_mix=None, egress_cpu=plan.egress,
+        generator=a.generator, ttl_mix=None, egress_cpu=plan.egress,
         warmup=0.0, repeat=1, rounds=a.rounds,
         loss_threshold=a.loss_threshold, clone_skb=0, burst=0)
 
@@ -1714,10 +1843,16 @@ def main(argv=None):
         env += [("scala", scale_desc),
                 ("soglia_perdita_origine", threshold_why),
                 ("latenza", "timbro pktgen -> contatore del nodo successivo, "
-                            "celle da 1 us, corretta per l'attesa di pktgen"),
+                            "celle da 1 us, corretta per l'attesa di pktgen"
+                 if a.generator == "pktgen" else
+                 "timbro di xdp_gen all'invio (formato pktgen) -> contatore "
+                 "del nodo successivo, celle da 1 us, nessuna correzione"),
+
                 ("latenza_campioni_per_finestra", a.lat_samples),
                 ("contatore_ingresso", "programma 1 (per-CPU) -> tail call -> "
                                        "pipeline di produzione")]
+        if a.generator == "xdp":
+            env.append(("xdp_lotto", a.xdp_batch or "256 (default)"))
         env += list(extra)
         return env
 
@@ -1740,7 +1875,8 @@ def main(argv=None):
             raw, over, notes = run_bitrate(
                 B, methods, model_path, frames, rates_of, plan, a.rounds,
                 window_s, lat_target=a.lat_samples, egress_cpu=plan.egress,
-                overhead_reps=a.overhead_reps, save=save, hostmon=hostmon)
+                overhead_reps=a.overhead_reps, save=save, hostmon=hostmon,
+                generator=a.generator, xdp_batch=a.xdp_batch)
         finally:
             if out_dir and os.path.isdir(out_dir):
                 B._give_back(out_dir)
@@ -1773,6 +1909,8 @@ def main(argv=None):
                 ("scala_usata", notes.get("scala", scale_desc)),
                 ("finestre_macchina_disturbata", f"{disturbed}/{len(raw)}"),
                 ("correzione_attesa_pktgen",
+                 "non serve (xdp_gen timbra all'invio)"
+                 if notes.get("idle_correction") == "non serve" else
                  "si" if notes.get("idle_correction") else "NO: idle assente"),
                 ("costo_contatore_da",
                  "statistiche BPF del kernel + throughput"

@@ -5,17 +5,17 @@ Tre pipeline (P1 hardcoded, P2 template, P3 modular) verificate su due piani:
 - **userspace** (numerico, PyTorch/NumPy e il C di P1 valutato dal testo) — estrazione dei pesi,
   quantizzazione, semantica delle classi, modelli sintetici, formule dei banchi;
 - **kernel** — `BPF_PROG_TEST_RUN` sui programmi XDP reali (istruzioni, latenza, lookup,
-  memoria, dispatch) e **traffico vero** su un fabric `veth` con XDP nativo (pktgen o frame
-  XDP grezzi, contatori all'ingresso e all'uscita).
+  memoria, dispatch) e **traffico vero** su un fabric `veth` con XDP nativo (frame XDP grezzi
+  da `xdp_gen`, pktgen come alternativa; contatori all'ingresso e all'uscita).
 
 Tutti gli script di test vivono sotto `ipa/test/`; i comandi si eseguono dalla radice del
 repository. Il motore sta in `ipa/`; i dati della topologia su cui il checkpoint depositato è
 stato addestrato stanno in `topologies/germany50/`.
 
-**Le cifre di questo documento sono state misurate il 2026-09-28**, con la ReLU senza salto
-di §8, sulla macchina e nelle condizioni descritte in §0,
-con `ipa/test/remeasure_all.sh` e
-`ipa/test/remeasure_traffic.sh` (log in `/tmp/ipa_logs/`, `$IPA_LOG_DIR` per cambiarlo).
+**Le cifre di questo documento sono state misurate il 2026-09-28** (il traffico vero con
+`xdp_gen`, §10–§12, il 2026-10-02), con la ReLU senza salto di §8, sulla macchina e nelle
+condizioni descritte in §0, con `ipa/test/remeasure_all.sh`, `ipa/test/remeasure_traffic.sh`
+e `ipa/test/remeasure_xdp.sh` (log in `/tmp/ipa_logs/`, `$IPA_LOG_DIR` per cambiarlo).
 
 ---
 
@@ -120,7 +120,8 @@ sudo python3 ipa/test/test_host_kernel.py            # sul kernel vero: applica,
 sudo python3 ipa/test/test_host_kernel.py --bench    # + un giro corto di bench_bitrate
 
 bash ipa/test/remeasure_all.sh                      # tutte le misure BPF_PROG_TEST_RUN (~15 min)
-bash ipa/test/remeasure_traffic.sh                   # tutte le misure di traffico (~15 min)
+bash ipa/test/remeasure_xdp.sh                       # traffico vero con xdp_gen: 1 e 2 core, curve, modelli (~15 min)
+bash ipa/test/remeasure_traffic.sh                   # traffico con pktgen, semantica, soffitti (~15 min)
 ```
 
 `test_host_kernel.py` sul kernel vero: **25/25** con `--bench`. Rilegge dal kernel governor,
@@ -836,187 +837,70 @@ lo so", non "sono il nodo 0").
 ## 10. Throughput end-to-end (`bench_throughput.py`)
 
 Le cifre di throughput delle sezioni precedenti sono `1/latenza` sotto `BPF_PROG_TEST_RUN`:
-picchi teorici. Qui pktgen (in-kernel) o frame XDP grezzi generano traffico vero, la
-pipeline XDP lo elabora e lo redirige, e un contatore XDP sull'interfaccia d'uscita conta
-quanti sono arrivati.
+picchi teorici. Qui un generatore produce traffico vero, la pipeline XDP lo elabora e lo
+redirige, e un contatore XDP sull'interfaccia d'uscita conta quanti sono arrivati. Il
+generatore è **`xdp_gen`** (`ipa/test/xdp_gen.py`): frame XDP grezzi da `BPF_PROG_TEST_RUN` in
+modalità live frames, consegnati al DUT come da una NIC con XDP nativo. L'alternativa,
+pktgen, è in §10.5.
 
 ### 10.1 Il banco
 
 ```
-pktgen (cpu10, cpu1, cpu3) ──veth ipatg0p→ipatg0──► [XDP: pipeline] (DUT, cpu6)
-    ──bpf_redirect──► ipaN ──veth──► ipaNp [XDP: contatore d'uscita]
+xdp_gen (cpu10) ──veth ipatg0p→ipatg0──► [XDP: pipeline] (DUT, cpu6)
+    ──bpf_redirect──► ipaN ──veth──► ipaNp [XDP: contatore d'uscita] (cpu8)
 ```
 
-- **CPU separate**: i thread `kpktgend_<cpu>` sulle CPU del generatore, il thread NAPI del
-  DUT (`/sys/class/net/<dev>/threaded`) pinnato sulla CPU del DUT, l'uscita in softirq sulla
-  CPU del DUT oppure in thread su CPU sue (`--egress-cpu N|N,M|auto`): con una lista, la
-  coda d'uscita del core i-esimo del DUT va sulla CPU i-esima; `auto` prende un core fisico
-  libero per ogni core del DUT, finché ce ne sono.
-- **Una coda d'uscita per core del DUT** (`--egress-queues auto`, dal 2026-10-01). Il redirect
-  in un veth sceglie la coda del peer come CPU che inoltra modulo numero di code: con una coda
-  sola due core del DUT scrivono nello stesso `ptr_ring`. `auto` sceglie il numero minimo di
-  code per cui i core del DUT cadono in code diverse (con i core 6 e 8 sono 3: 6 → 0, 8 → 2;
-  con 2 code cadrebbero entrambi nella 0). Con un core del DUT è 1, cioè il fabric di prima:
-  le misure a un core non cambiano. `--egress-queues 1` riproduce il comportamento vecchio.
-  `env.csv` riporta la mappa (`code_uscita`). Perché serve: §10.7.
-- **Una coda d'ingresso per core del DUT** (`--dut-queues auto`): i thread pktgen scrivono
-  tutti sulla stessa coda. Con una coda per thread generatore (`--dut-queues gen`) il DUT
-  avrebbe più thread NAPI sullo stesso core, e quale coda viene servita lo deciderebbe lo
-  scheduler: a pieno carico ogni thread tiene la CPU per una fetta intera (millisecondi)
-  mentre le altre code (256 descrittori) traboccano. `veth` è LLTX e il `ptr_ring` serializza
-  i produttori col suo `producer_lock`. **La contesa non la paga solo il generatore**: più
-  scrittori sulla stessa coda rallentano anche il core del nodo che la svuota (§10.6). Con
-  pktgen costa ~17 ns per pacchetto a tutte le pipeline (baseline compresa), con i frame XDP
-  fino al doppio. Le cifre di §10.2 sono a 3 thread: valori assoluti con quei ~17 ns, costi
-  sopra la baseline invariati. Con più core del DUT i thread vanno divisi **in parti uguali**
-  fra le code (thread i → coda i modulo code): il banco avvisa se non lo sono (§10.7).
+- **CPU separate**: il thread di `xdp_gen` pinnato sulla CPU del generatore, il thread NAPI
+  del DUT (`/sys/class/net/<dev>/threaded`) pinnato sulla CPU del DUT, l'uscita in thread su
+  CPU sue (`--egress-cpu N|N,M|auto`): con una lista, la coda d'uscita del core i-esimo del DUT
+  va sulla CPU i-esima; `auto` prende un core fisico libero per ogni core del DUT, finché ce ne
+  sono (su questa macchina uno solo, cpu3 o cpu8: il core di cpu0 resta al sistema).
+- **Una coda d'ingresso e un thread di generatore per core del DUT** (`--dut-queues auto`). Il
+  redirect di `xdp_gen` nel veth sceglie la coda del DUT come CPU che trasmette modulo numero
+  di code: un thread per coda, su CPU di resto diverso. Più scrittori sulla stessa coda
+  (`veth` è LLTX, il `ptr_ring` serializza i produttori col suo `producer_lock`) la svuotano
+  più lentamente e rallentano anche il core del nodo (§10.3). Il banco avvisa se due thread
+  cadono nella stessa coda.
+- **Una coda d'uscita per core del DUT** (`--egress-queues auto`, dal 2026-10-01). Stessa
+  regola in uscita: `auto` sceglie il numero minimo di code per cui i core del DUT cadono in
+  code diverse (con i core 6 e 8 sono 3: 6 → 0, 8 → 2; con 2 code cadrebbero entrambi nella
+  0). Con un core del DUT è 1. `--egress-queues 1` riproduce il comportamento vecchio.
+  `env.csv` riporta la mappa (`code_uscita`). Perché serve: §10.4.
+- **Una chiamata per finestra** (dal 2026-10-02). Ogni chiamata a `test_run` in modalità live
+  parte e finisce con una pausa del thread di ~12 ms dentro il kernel. Con chiamate da 2^20
+  frame ce n'erano 2–4 per finestra: il generatore taceva il ~13% del tempo, il DUT svuotava
+  la coda e dormiva, e risultava occupato all'~87% anche a coda piena (fino al 2026-10-01
+  questo documento lo attribuiva a "raffiche" del generatore: era sbagliato). Lo hanno
+  mostrato le statistiche di scheduling del thread NAPI del DUT (§11.7). Ora la finestra è una
+  sola chiamata, interrotta da un segnale a fine misura (`STEADY_CALL_FRAMES`).
 - **Tempo di CPU per pacchetto** (colonne `cpu_dut_pct`, `ns_cpu`, `ns_cpu_vs_baseline`):
   l'occupazione dei core del DUT letta da `/proc/stat` **nella stessa lettura** dei contatori
-  della finestra stazionaria, × core / elaborati. 1e9 / elaborati è il costo solo se il nodo
-  lavora il 100% del tempo; con pktgen è così, con un solo thread di `xdp_gen` no (§10.6). La
-  diagnostica è attiva per default (`--no-diag` la spegne); risoluzione ~3% (un jiffy di 10
-  ms su ~300 ms di finestra).
+  della finestra stazionaria, × core / elaborati. Con il DUT al 100% coincide con
+  1e9 / elaborati, ed è così in tutte le misure di questa sezione. La diagnostica è attiva per
+  default (`--no-diag` la spegne); risoluzione ~3% (un jiffy di 10 ms su ~300 ms di finestra).
 - **Contatori per-CPU**: `pkt_stats` e `cls_stats`, in tutte le pipeline e nella baseline,
   sono `PERCPU_ARRAY`: ogni core incrementa la sua copia, senza istruzioni atomiche e senza
   contendersi una riga di cache quando i pacchetti arrivano su più code. I lettori sommano i
-  core (`ipa/stats_maps.py`).
-  Su un core solo il cambio vale poco: rispetto a `results/throughput_3500/` (stesso banco,
-  contatori atomici) baseline, P1 e P1.5 guadagnano ~8 ns per pacchetto (3,31 → 3,40,
-  2,94 → 3,01, 2,81 → 2,87 Mpps), P2 e P3 restano entro la dispersione (1,89 → 1,91,
-  1,50 → 1,49). Sotto `BPF_PROG_TEST_RUN` (29-09) la baseline scende da 18 a 14 ns e perde
-  20 istruzioni, i due incrementi atomici; P1.5 / P2 / P3 danno 53 / 200 / 314 contro 52 /
-  195 / 315, dentro la variazione fra i run (§ Risultati). Le cifre di traffico nel resto
-  del documento restano quelle del 28-09, salvo quelle a due core (§10.2, §10.7: 2026-10-01).
-- **Tre punti di conteggio**: TX (pktgen, più i respinti da `veth_xmit` a coda piena), HIT
-  (`pkt_stats[0]` della pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è
-  arrivato al programma, HIT − RX ciò che il programma ha elaborato e non è uscito.
-- **Finestra stazionaria** (default): i rate sono differenze fra due letture dei contatori
-  fatte mentre tutte le istanze pktgen trasmettono (lettura sotto 3 ms, rifatta se più
-  lunga), poi stop. Avvio, sfasamento dei thread e coda finale restano fuori.
-- **model_id 190**: pktgen scrive la propria intestazione (magic `0xbe9be955`) subito dopo
-  UDP, dove il dispatcher legge `ipa->model_id`. Il modello è registrato anche su 190 e una
-  sonda verifica HIT prima di misurare.
-- **La copia di headroom**: XDP su veth pretende 256 byte davanti al pacchetto, gli skb di
-  pktgen ne hanno 64, quindi `veth_xdp_rcv_skb` copia ogni pacchetto prima del programma.
-  Con `--generator xdp` (frame XDP grezzi da `BPF_PROG_TEST_RUN` live frames, `xdp_gen.py`)
-  la copia non c'è, come da una NIC con XDP nativo.
+  core (`ipa/stats_maps.py`). Sotto `BPF_PROG_TEST_RUN` (29-09) la baseline scende da 18 a 14
+  ns e perde 20 istruzioni, i due incrementi atomici; P1.5 / P2 / P3 danno 53 / 200 / 314
+  contro 52 / 195 / 315, dentro la variazione fra i run (§ Risultati).
+- **Tre punti di conteggio**: TX (tentativi del generatore), HIT (`pkt_stats[0]` della
+  pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è arrivato al programma, HIT − RX
+  ciò che il programma ha elaborato e non è uscito.
+- **Finestra stazionaria**: i rate sono differenze fra due letture dei contatori fatte mentre
+  il generatore trasmette (lettura sotto 3 ms, rifatta se più lunga), poi stop. Avvio e coda
+  finale restano fuori.
+- **model_id 190**: il generatore scrive in testa al payload l'intestazione di pktgen (magic
+  `0xbe9be955`), dove il dispatcher legge `ipa->model_id`. Il modello è registrato anche su
+  190 e una sonda verifica HIT prima di misurare.
 - **La coda del veth**: `VETH_RING_SIZE` = 256 descrittori, non configurabile su questo
   kernel (`ethtool -g` non la espone).
 
-### 10.2 Confronto a saturazione e a carico comune (`--mode compare`)
+### 10.2 Saturazione con xdp_gen (`--mode compare --generator xdp`)
 
 ```bash
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --out results/throughput_3500
-```
-
-3 giri × 3 ripetizioni, 64 B, uscita sulla CPU del DUT, `results/throughput_3500/`
-(2026-09-28, con `ipa_relu`):
-
-| pipeline | saturazione (Mpps) | [min–max] | variazione | a 1,375 Mpps offerti |
-|---|---:|---|---:|---|
-| rxonly (sola ricezione) | 4,61 | 4,60–4,62 | 0,2% | nessun respinto |
-| baseline | 3,31 | 3,24–3,31 | 0,9% | nessun respinto |
-| p1_static (P1) | 2,94 | 2,93–2,96 | 0,5% | nessun respinto |
-| hardcoded (P1.5) | 2,81 | 2,78–2,82 | 0,6% | nessun respinto |
-| template (P2) | 1,89 | 1,88–1,90 | 0,5% | nessun respinto |
-| modular (P3) | 1,50 | 1,50–1,51 | 0,3% | nessun respinto |
-
-Controllo di validità PASS (la baseline è la più veloce). A carico comune — 91% di quanto
-consegna la più lenta — tutte e sei consegnano tutto: **nessun pacchetto respinto sotto
-capacità**. Perdita totale ≤ 0,02% in ogni riga. Macchina: nessun evento di throttling,
-DUT a 3 494 MHz.
-
-**P1 e P1.5 si separano**: 2,94 contro 2,81 Mpps, con dispersioni dello 0,5% e dello 0,6%.
-L'ordine P1 < P1.5 < P2 < P3 in costo per pacchetto regge in ogni giro. Costo sopra la
-baseline (1/RX): **+38 / +53 / +226 / +364 ns**. Il 2026-09-27, prima di `ipa_relu`:
-+38 / +53 / +224 / +368. Sul traffico vero la ReLU senza salto non costa niente di
-misurabile, anche per P1 (sotto `BPF_PROG_TEST_RUN` le costava ~9 ns, § Risultati).
-
-**Tempo di CPU e thread del generatore** (2026-09-30, `results/cpu_time/pktgen_3thread/` e
-`pktgen_1thread/`). Con pktgen il core del nodo è occupato al **100%** in saturazione, quindi
-1e9 / elaborati è il tempo di CPU per pacchetto e le cifre qui sopra valgono come costi. A 3
-thread sulla stessa coda contengono però ~17 ns di contesa (§10.6), uguali per tutte:
-
-| ns di CPU per pacchetto | baseline | P1 | P1.5 | P2 | P3 |
-|---|---:|---:|---:|---:|---:|
-| 3 thread (queste cifre) | 296 | 335 | 352 | 526 | 672 |
-| 1 thread (uno scrittore per coda) | 278 | 315 | 335 | 510 | 661 |
-| sopra la baseline, 3 / 1 thread | — | +39 / +38 | +56 / +57 | +230 / +232 | +376 / +383 |
-
-Il costo della rete neurale non cambia; si tengono le cifre a 3 thread perché con un thread
-`rxonly` non satura (il generatore si ferma a 2,84 Mpps) e il tetto di ricezione non si
-misura più.
-
-**Su due core** (`--dut-cpus 6,8`, una coda d'ingresso e una d'uscita per core, 4 thread
-pktgen, due per coda; `results/throughput_cores1/` e `results/throughput_cores2/`, stessa
-sessione del 2026-10-01, alimentatore, macchina non disturbata, nodo occupato al 100%):
-
-```bash
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3   --dut-cpus 6   --out results/throughput_cores1
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3,5 --dut-cpus 6,8 --out results/throughput_cores2
-```
-
-| pipeline | 1 core (Mpps) | 2 core (Mpps) | rapporto | ns di CPU, 1 core | ns di CPU per core, 2 core |
-|---|---:|---:|---:|---:|---:|
-| rxonly | 4,69 | 9,29 | 1,98 | 213 | 215 |
-| baseline | 3,41 | 6,72 | 1,97 | 294 | 298 |
-| p1_static (P1) | 3,00 | 5,96 | 1,99 | 333 (+40) | 335 (+38) |
-| hardcoded (P1.5) | 2,86 | 5,60 | 1,96 | 349 (+56) | 357 (+60) |
-| template (P2) | 1,90 | 3,68 | 1,94 | 527 (+233) | 543 (+246) |
-| modular (P3) | 1,46 | 2,81 | 1,93 | 684 (+391) | 711 (+413) |
-
-**Due core reggono il doppio di uno per tutte le pipeline** (1,93–1,99): i core non si
-contendono niente di scritto a ogni pacchetto (contatori per-CPU). Il costo per core di
-rxonly, baseline, P1 e P1.5 è quello di un core entro 8 ns; P2 e P3 pagano per core il 3–4%
-in più (543 contro 527, 711 contro 684 ns), da cui i loro rapporti un po' più bassi. Il
-numero da riportare per un nodo con N code è ~N × la capacità a 1 core, finché il generatore
-e la scheda reggono. A 1 core i thread sono 3 su una coda (come nelle cifre qui sopra), a 2
-core 2 per coda. Due condizioni del banco
-servono a vederlo (§10.7): **una coda d'uscita per core del DUT** (con una sola, la contesa
-in uscita costa 12–20 ns per pacchetto per core: rapporti 1,91–1,98) e **i thread pktgen in
-parti uguali fra le code** (con 3 thread su 2 code una coda ne riceve uno solo, ~2,8 Mpps, e
-rxonly si ferma a 7,55 Mpps, rapporto 1,61).
-
-### 10.3 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
-
-```bash
-sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 \
-    --rates 0.5,1,1.5,2,2.5,3 --out results/throughput_rates
-```
-
-Build **strumentata**: il dispatcher marca T1, il programma marca T2 subito prima di
-`bpf_redirect`, il contatore d'uscita T3. Minimi per finestra, mediana fra tre giri, ns:
-
-| | T2−T1 (pipeline) | T3−T2 (redirect + veth + NAPI) | sostenibile (perdita totale ≤ 0,1%) |
-|---|---:|---:|---|
-| baseline | 34–35 | 194–239 | ≥ 2,0 Mpps |
-| p1_static | 68–69 | 195–244 | ≥ 2,0 Mpps |
-| hardcoded | 77–78 | 195–251 | ≥ 2,0 Mpps |
-| template | 228–233 | 200–257 | ≥ 1,5 Mpps |
-| modular | 340–348 | 207–251 | ≥ 1,0 Mpps |
-
-Il trasporto è un costo comune di ~195–255 ns che non dipende dalla pipeline; T2−T1 è
-piatto sul rate. Sopra la baseline la sola pipeline costa **+34 / +43 / +194 / +306 ns**.
-Sotto capacità i respinti restano allo 0,00–0,02%. I "sostenibili" sono gradini della scala
-(0,5 Mpps): contando solo la perdita dopo l'ingresso salgono a 2,42 / 2,25 / 2,18 / 1,59 /
-1,31 Mpps. La build strumentata aggiunge due letture dell'orologio e due scritture per
-pacchetto: il suo throughput è più basso di quello di produzione (§10.2).
-
-### 10.4 Il tetto di sola ricezione (`--mode generator`)
-
-```bash
-sudo python3 ipa/test/bench_throughput.py --mode generator --frames 64 --rounds 5 \
-    --rates 8,10,12,15,20,25 --out results/throughput_generator
-```
-
-Contatore che scarta all'ingresso, nessuna pipeline: il generatore offre ~5,7 Mpps, il DUT ne
-riceve **4,50–4,71** (30 finestre). È lo stesso tetto che `rxonly` misura dentro `--mode
-compare` (4,61): la baseline sta al 72% del tetto di ricezione, P3 al 33%.
-
-### 10.5 Frame XDP grezzi: il costo del nodo (`--generator xdp`)
-
-```bash
-# uno scrittore per coda: un thread di generatore, un core del nodo, uscita su un core suo
+bash ipa/test/remeasure_xdp.sh        # uno e due core, curve del bit rate, modelli (~15 min)
+# un core, un thread di generatore, uscita su un core suo
 sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
     --rounds 3 --gen-cpus 10 --dut-cpus 6 --out results/cpu_time/xdp_1thread
 sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
@@ -1024,71 +908,70 @@ sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egres
 ```
 
 Costo del nodo = **tempo di CPU per pacchetto** (§10.1): dalla presa dalla coda di ricezione
-alla decisione e al redirect, con l'uscita su una CPU sua (cpu8). 2026-10-01, stessa sessione
-delle misure a due core (§10.2, §10.7), alimentatore collegato, macchina non disturbata
-(`results/cpu_time/xdp_1thread/`; la misura del 30-09 dava 116 / 125 / 293 / 428 ns, entro
-l'1%):
+alla decisione e al redirect, con l'uscita su una CPU sua (cpu8). 2026-10-02, stessa
+sessione delle misure a due core (§10.4) e delle curve (§11.6), alimentatore, macchina non
+disturbata (`results/cpu_time/xdp_1thread/`):
 
-| | elaborati (Mpps) | respinti | nodo occupato | 1e9 / elaborati | **ns di CPU** |
-|---|---:|---:|---:|---:|---:|
-| rxonly | 14,96 | 1% | 60% | 67 | 40 (non satura) |
-| baseline | 12,41 | 1% | 80% | 81 | 65 (non satura) |
-| p1_static | 7,59 | 26% | 87% | 132 | **117** |
-| hardcoded | 7,08 | 29% | 87% | 141 | **124** |
-| template | 2,97 | 71% | 87% | 337 | **292** |
-| modular | 2,01 | 82% | 87% | 498 | **432** |
+| | elaborati (Mpps) | variazione fra i giri | respinti | nodo occupato | **ns di CPU** | sopra la baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| rxonly | 19,11 | 1,6% | 1% | 77% | 40 (non satura) | — |
+| baseline | 15,13 | 1,5% | 0,03% | 100% | **66** (satura appena) | — |
+| p1_static | 8,69 | 1,3% | 24% | 100% | **115** | **+49** |
+| hardcoded | 8,07 | 1,2% | 27% | 100% | **124** | **+58** |
+| template | 3,41 | 2,4% | 71% | 100% | **293** | **+227** |
+| modular | 2,41 | 3,2% | 81% | 100% | **416** | **+350** |
 
-Costo sopra la baseline: P1 +52, P1.5 +59, P2 +228, P3 +367 ns; con pktgen (§10.2) +38 /
-+53 / +226 / +364. **I due generatori danno lo stesso costo della rete neurale**; la differenza
-assoluta (baseline 296 con pktgen contro 65) è la copia della skb e il percorso dello stack,
-che con i frame grezzi non ci sono.
+**Il nodo lavora il 100% del tempo, e 1e9 / elaborati coincide con il tempo di CPU.** Le
+mediane variano fra i giri dell'1–3%. Controllo di validità PASS
+(la baseline è la più veloce delle pipeline). **P1 e P1.5 si separano**: 8,69 contro 8,07
+Mpps, ~9 ns. L'ordine P1 < P1.5 < P2 < P3 regge in ogni giro.
 
-- **Il nodo lavora l'87% del tempo anche respingendo il 70–80% dei pacchetti.** Un thread
-  di `xdp_gen` spedisce a raffiche (256 frame per volta): la raffica riempie la coda e il resto
-  viene respinto, fra una raffica e l'altra il nodo svuota la coda e aspetta. 1e9 / elaborati
-  conterebbe l'attesa come lavoro (P2 337 ns invece di 292): per questo il costo è il tempo di
-  CPU.
-- **Baseline e rxonly non saturano** con un thread (il generatore offre 12–15 Mpps e il nodo li
-  prende tutti). Il loro tempo di CPU è misurato ma va preso con cautela: un nodo più veloce
-  del generatore trova pochi pacchetti per giro di ricezione, e le spese fisse del giro si
-  dividono su meno pacchetti (con pktgen a un thread `rxonly` risulta 339 ns contro 217
-  saturo). I costi da citare sono quelli delle pipeline che saturano.
-- **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro il 3% su ogni pipeline
-  (misura a 3 thread, `results/throughput_xdp_frames/`): il nodo tocca solo le intestazioni.
-- **Per classe** (`results/cpu_time/xdp_per_class/`, 2026-09-30, stato dei link e TTL cercati per ciascuna
-  delle 6 classi raggiungibili, classe decisa verificata), ns di CPU:
+- **La baseline satura appena**: il generatore ne offre 15,13 Mpps, quanti il nodo ne regge
+  (1 / 66 ns = 15,1). **rxonly non satura** (il nodo è al 77%): il suo tempo di CPU è misurato
+  con meno pacchetti per giro di ricezione, ed è indicativo.
+- **P3 varia fra sessioni** più delle altre: 416 ns qui, 436–460 in altre sessioni dello
+  stesso giorno (§10.4, §12.3).
+- **Sotto capacità nessun respinto**: lo mostrano le curve (§11.6, ≤ 0,02%).
+- **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro il 2,5% su ogni
+  pipeline (2026-10-02, un thread, `results/throughput_xdp_frames/`): P1 113–115, P1.5 122,
+  P2 299–302, P3 421–431 ns. Il nodo tocca solo le intestazioni.
+- **Per classe** (`results/cpu_time/xdp_per_class/`, 2026-10-02, stato dei link e TTL cercati
+  per ciascuna delle 6 classi raggiungibili, classe decisa verificata), ns di CPU:
 
   | | classi FORWARD (0–4) | classe DROP (5) | differenza |
   |---|---:|---:|---:|
-  | P1 | 116–118 | 173 | +55 |
-  | P1.5 | 122–125 | 177 | +53 |
-  | P2 | 259–285 | 304 | +20–45 |
-  | P3 | 421–432 | 480 | +50 |
+  | P1 | 114–119 | 168 | +49–54 |
+  | P1.5 | 122–126 | 180 | +55–58 |
+  | P2 | 256–286 | 309 | +23–52 |
+  | P3 | 423–432 | 473 | +41–50 |
 
-  **Scartare costa ~50 ns più che inoltrare.** Con il DROP la pagina del pacchetto si
-  restituisce sul core del nodo, con l'inoltro sul core d'uscita. A 3 thread la differenza
-  risultava ~100 ns, gonfiata dalla contesa.
+  **Scartare costa ~50 ns più che inoltrare**, come nella misura del 30-09 (+55 / +53 /
+  +20–45 / +50). Durante il run il pacchetto ha registrato 3 eventi di throttling e la CPU del
+  generatore è scesa a 3,4 GHz: il banco ha marcato il run, ma la CPU del DUT è rimasta a
+  3,5 GHz e il costo è tempo di CPU del DUT. Con il DROP la pagina del pacchetto si
+  restituisce sul core del nodo, con l'inoltro sul core d'uscita.
 
 **Il controllo di validità conta gli elaborati, non gli arrivati.** Se l'uscita non tiene il
 passo del nodo si perde dopo XDP, e contando gli arrivati la pipeline più veloce sembrerebbe
-la più lenta (è successo con due core e una coda d'uscita, §10.7). `check_validity` confronta
+la più lenta (è successo con due core e una coda d'uscita, §10.4). `check_validity` confronta
 `node_pps` (elaborati, altrimenti HIT, altrimenti RX), la stessa grandezza del costo.
 
-**La misura del 2026-09-28 a 3 thread** (`results/throughput_xdp/`, 1e9 / elaborati): baseline
-141, P1 158, P1.5 161, P2 296, P3 434 ns, con rxonly a 6,9 Mpps e la baseline sopra (7,1).
-P2 e P3 coincidono con il tempo di CPU di oggi (il nodo era pieno); **baseline, P1 e P1.5
-no**: il "tetto di ~7 Mpps" non era del generatore ma della coda d'ingresso condivisa da tre
-scrittori (§10.6), e le loro cifre includevano la contesa.
+**Le misure di prima** (30-09 e 01-10) davano gli stessi tempi di CPU (116–117 / 124–125 /
+292–293 / 428–432 ns) ma Mpps più bassi del ~13% (7,59 / 7,08 / 2,97 / 2,01), il tempo in
+cui il generatore taceva (§10.1). Quelle del 28-09 a 3 thread (`results/throughput_xdp/`)
+contenevano anche la contesa della coda d'ingresso (§10.3).
 
-### 10.6 Uno scrittore per coda (2026-09-30)
+### 10.3 Uno scrittore per coda (2026-09-30)
 
-**La domanda.** Con i frame XDP e 3 thread di generatore rxonly, baseline, P1 e P1.5 si
-fermavano tutte intorno a 7 Mpps, con il generatore che offriva 34–39 Mpps e l'80% respinto.
-Era il tetto del generatore o del nodo?
+**La domanda.** Con 3 thread di `xdp_gen` rxonly, baseline, P1 e P1.5 si fermavano tutte
+intorno a 7 Mpps, con il generatore che offriva 34–39 Mpps e l'80% respinto. Era il tetto del
+generatore o del nodo?
 
 **Nessuno dei due: la coda condivisa.** Con meno thread il nodo elabora **di più**
 (`results/generator_contention/summary.csv`; un core, uscita separata; queste tre righe a
-batteria, le differenze sono fino al doppio):
+batteria). Tutte le cifre di questa sezione sono del 30-09, con il generatore che taceva il
+~13% del tempo a ogni chiamata (§10.1): in assoluto sono basse, il confronto fra le righe
+regge perché lo pagano tutte:
 
 | thread del generatore | offerti (rxonly) | rxonly | baseline | P1.5 |
 |---|---:|---:|---:|---:|
@@ -1096,11 +979,9 @@ batteria, le differenze sono fino al doppio):
 | 2 | 25 | 9,8 | 7,3 | 6,3 |
 | 3 | 39 | 7,4 | 7,2 | 6,2 |
 
-La conferma con l'alimentatore, due core sul nodo (due code d'ingresso), uscita sui core del
-nodo: 2 thread, **uno per coda**, contro 3 thread, due dei quali sulla stessa coda. Misura del
-2026-09-30, con **una** coda d'uscita condivisa dai due core (la configurazione di allora):
-le cifre assolute delle pipeline leggere sono basse per la contesa in uscita (§10.7), il
-confronto fra le due righe regge perché la pagano tutte e due:
+La conferma con l'alimentatore, due core sul nodo (due code d'ingresso), con **una** coda
+d'uscita condivisa (la configurazione di allora, §10.4): 2 thread, **uno per coda**, contro 3
+thread, due dei quali sulla stessa coda:
 
 | Mpps elaborati | rxonly | baseline | P1 | P1.5 | P2 | P3 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -1112,17 +993,13 @@ Più scrittori nella stessa coda (il `ptr_ring` del veth: lucchetto dei produtto
 cache condivise) la svuotano più lentamente, e il costo per pacchetto sale anche per il core
 del nodo: a 3 thread rxonly spende ~130 ns di CPU per pacchetto, con uno scrittore 40. Il
 danno è grande per le pipeline leggere e trascurabile per P2 e P3, il cui limite è comunque
-il programma. **Con pktgen** l'effetto è piccolo (1 contro 3 thread: baseline 278 contro 296
-ns, P2 510 contro 526; il nodo è pieno al 100% in entrambi) perché pktgen riempie la coda
-meno in fretta.
+il programma.
 
 **La regola**: un solo scrittore per coda, in ingresso e in uscita. Su un core del nodo è
-**1 thread di generatore, uscita su un core suo** (§10.5). Con N core del nodo: N code
-d'ingresso con lo stesso numero di thread ciascuna, N code d'uscita (`--egress-queues auto`) e,
-con `xdp_gen`, un core d'uscita per coda (`--egress-cpu N,M`), §10.7. Il banco lo controlla:
-avvisa se due thread `xdp_gen` finiscono sulla stessa coda (la coda si sceglie dalla CPU che
-trasmette, CPU modulo numero di code), se i thread pktgen non sono divisi in parti uguali fra
-le code, e se più core del nodo inoltrano nella stessa coda d'uscita.
+**1 thread di generatore, uscita su un core suo** (§10.2). Con N core del nodo: N code
+d'ingresso con un thread ciascuna, N code d'uscita (`--egress-queues auto`) e un core
+d'uscita per coda (`--egress-cpu N,M`), §10.4. Il banco lo controlla: avvisa se due thread
+finiscono sulla stessa coda e se più core del nodo inoltrano nella stessa coda d'uscita.
 
 **Con una scheda di rete vera il problema non c'è.** La coda di ricezione la riempie la
 scheda (DMA), e il core del nodo la svuota: un solo scrittore per costruzione, gli altri host
@@ -1133,12 +1010,10 @@ all'ingresso di §11. Con RSS ogni coda ha il suo core e sempre un solo scrittor
 **Scartare contro inoltrare.** `rxonly_fwd` è `rxonly` che all'ultima istruzione inoltra
 invece di scartare (`--method rxonly,rxonly_fwd`). A 3 thread, stessa sessione, 5 giri,
 alimentatore: rxonly 7,21 Mpps, rxonly_fwd 7,53 (+4%), baseline 7,21
-(`results/generator_contention/drop_contro_inoltro_alimentatore/`). La baseline **non** supera
-rxonly: il 7,1 contro 6,9 del 28-09 era una differenza di pochi punti dentro il regime conteso.
-Con uno scrittore i due non saturano e non si confrontano; la misura pulita è quella per classe
-(§10.5): scartare costa ~50 ns in più.
+(`results/generator_contention/drop_contro_inoltro_alimentatore/`): dentro il regime conteso
+non si confrontano. La misura pulita è quella per classe (§10.2): scartare costa ~50 ns in più.
 
-### 10.7 Due core: una coda d'uscita per core, thread in parti uguali (2026-10-01)
+### 10.4 Due core: una coda e un core d'uscita per core
 
 **Il problema.** Con due core sul nodo e `xdp_gen` (2 thread, uno per coda d'ingresso, uscita
 su cpu3), il 30-09 baseline, P1 e P1.5 non raddoppiavano e perdevano dopo XDP: la baseline
@@ -1159,86 +1034,116 @@ scrivevano nello stesso `ptr_ring`, e un solo thread NAPI d'uscita lo svuotava. 
 Nella stessa sessione rxonly, che non fa redirect, elaborava 38 Mpps; rxonly_fwd, che fa solo
 il redirect, ~15,7: il limite era il redirect verso l'uscita.
 
-**La soluzione, un passo alla volta** (`xdp_gen`, 2 core, Mpps elaborati; ns di CPU per core
-fra parentesi; i primi due run a batteria, il terzo e l'ultima colonna con l'alimentatore,
-nella stessa sessione del 2026-10-01, macchina non disturbata):
+**La soluzione, un passo alla volta** (2 core, Mpps elaborati; ns di CPU per core fra
+parentesi). Le prime due colonne sono del 2026-10-01, a batteria e con il generatore che
+taceva il ~13% del tempo: valgono come confronto fra loro, non in assoluto. Le ultime due sono
+del 2026-10-02, stessa sessione, alimentatore, macchina non disturbata:
 
-| | 1 coda d'uscita, 1 core d'uscita | 3 code, 1 core d'uscita | **3 code, 2 core d'uscita** | 1 core del nodo (§10.5) |
+| | 1 coda d'uscita, 1 core d'uscita | 3 code, 1 core d'uscita | **3 code, 2 core d'uscita** | 1 core del nodo (§10.2) |
 |---|---:|---:|---:|---:|
-| baseline | 13,15 (152) | 19,15 (103) | **28,80 (68)** | 12,41 (65, non satura) |
-| P1 | 10,44 (192) | 14,96 (132) | **16,57 (121)** | 7,59 (117) |
-| P1.5 | 10,11 (195) | 14,39 (139) | **15,88 (126)** | 7,08 (124) |
-| P2 | 6,56 (305) | 6,62 (302) | **6,74 (297)** | 2,97 (292) |
-| P3 | 4,65 (430) | 4,59 (436) | **4,55 (439)** | 2,01 (432) |
-| persi dopo XDP, baseline | 49% | 40% | **0,04%** | 0 |
+| baseline | 13,15 (152) | 19,15 (103) | **29,20 (67)** | 15,13 (66) |
+| P1 | 10,44 (192) | 14,96 (132) | **16,84 (119)** | 8,69 (115) |
+| P1.5 | 10,11 (195) | 14,39 (139) | **15,72 (127)** | 8,07 (124) |
+| P2 | 6,56 (305) | 6,62 (302) | **6,74 (297)** | 3,41 (293) |
+| P3 | 4,65 (430) | 4,59 (436) | **4,58 (436)** | 2,41 (416) |
+| persi dopo XDP, baseline | 49% | 40% | **≤ 0,04%** | 0 |
 
 Cartelle: `results/generator_contention/xdp_2core_2thread_uscita_1coda/` e `…_uscita_3code/`,
-`results/throughput_xdp_cores2/`. Con una coda d'uscita per core e un core d'uscita per coda **il costo
-per core è quello di un core entro il 3,5%** (P1 121 contro 117, P1.5 126 contro 124, P2 297
-contro 292, P3 439 contro 432 ns) e gli elaborati di P1–P3 sono il 97–99% del doppio della
-capacità a un core (2 / ns di CPU). Gli arrivati coincidono con gli elaborati. La baseline
-ora satura (respinti 2,5%, il generatore offre 29,6 Mpps): la cifra è vicina al tetto del
-generatore, e i suoi 68 ns per core confermano i 65 indicativi di un core. Il run con 1 coda
-riproduce quello del 30-09 entro l'1%: la batteria non spostava i numeri.
+`results/throughput_xdp_cores2/`. Con una coda d'uscita per core e un core d'uscita per coda
+**due core elaborano il 95–99% del doppio di uno** (baseline 96%, P1 97%, P1.5 97%, P2 99%,
+P3 95%) e il costo per core è quello di un core entro 4 ns per baseline, P1, P1.5 e P2; P3
+paga 20 ns in più (436 contro 416), dentro la sua variazione fra sessioni. Gli arrivati
+coincidono con gli elaborati; la baseline satura (respinti 1,8%, il generatore offre 29,8
+Mpps). Il numero da riportare per un nodo con N code è ~N × la capacità a 1 core, finché il
+generatore e la scheda reggono.
 
 Il banco verifica la mappa coda → core d'uscita a fine run (`thread NAPI d'uscita che hanno
 lavorato`): nel run citato hanno lavorato solo la coda 0 su cpu3 e la coda 2 su cpu5, per
 entrambe le porte usate. Con `--egress-cpu auto` il banco trova su questa macchina un solo core
-d'uscita libero (cpu3: il core di cpu0 resta al sistema) e lo dice; per il secondo si passa
-`--egress-cpu 3,5`.
+d'uscita libero e lo dice; per il secondo si passa `--egress-cpu 3,5`.
 
 ```bash
 sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
     --gen-cpus 10,1 --dut-cpus 6,8 --egress-cpu 3,5 --out results/throughput_xdp_cores2
 ```
 
-**Con pktgen l'effetto è piccolo.** Stesso banco della §10.2 a 3 thread, uscita sui core del
-nodo, 1 coda d'uscita contro 3, sequenza A-B-A nella stessa sessione (`results/pktgen_cores2/
-3thread_3code_a`, `3thread_1coda`, `3thread_3code_b`; A e A' entro l'1%, B riproduce il
-28-09 entro l'1,5%):
+### 10.5 L'alternativa: pktgen
 
-| Mpps | rxonly | baseline | P1 | P1.5 | P2 | P3 |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 coda d'uscita | 7,48 | 6,52 | 5,79 | 5,55 | 3,74 | 2,90 |
-| 3 code d'uscita | 7,55 | 6,92 | 6,15 | 5,84 | 3,87 | 2,95 |
-| guadagno | +1% | +6,2% | +6,2% | +5,4% | +3,4% | +1,8% |
+`--generator pktgen` (default solo di `--latency`, `--mode saturate` e `--mode generator`,
+che lo richiedono) usa i thread
+`kpktgend_<cpu>` del kernel. pktgen crea skb con 64 byte di headroom; XDP su veth ne pretende
+256, quindi `veth_xdp_rcv_skb` **copia** ogni pacchetto prima del programma, sul core del
+nodo. Su una NIC con XDP nativo la copia non c'è: per questo il banco usa `xdp_gen`.
 
-La contesa in uscita costava 12–20 ns per pacchetto per core, uguali per tutte: i costi sopra
-la baseline non cambiano (P1 +38 / +36, P2 +227 / +228 ns per core). rxonly non fa redirect e
-non cambia: è il controllo. L'effetto è più piccolo che con `xdp_gen` perché pktgen arriva a
-rate più bassi.
+In sintesi (misure del 28-09 e del 01-10, `results/throughput_3500/`,
+`results/cpu_time/pktgen_*`, `results/throughput_cores1/` e `…cores2/`, `results/pktgen_cores2/`):
 
-**I thread pktgen in parti uguali fra le code.** Il thread i scrive nella coda i modulo
-code. Con 3 thread su 2 code la coda 0 riceve da due thread (~5,5 Mpps offerti), la coda 1 da
-uno (~2,8): per le pipeline basta a saturare entrambi i core, per rxonly no, perché un core
-riceve ~4,7 Mpps. Il core della coda 1 resta fermo il 40% del tempo: rxonly elaborava
-4,75 + 2,77 ≈ 7,52 Mpps (misurati 7,55, respinti 9,8% previsti 9,6%), rapporto 1,61 su un
-core. Con 4 thread, due per coda (`--gen-cpus 10,1,3,5`, `results/throughput_cores2/`), le code ricevono lo stesso traffico, i due core sono occupati allo stesso
-modo e rxonly arriva a **9,29 Mpps (1,98)**. Le pipeline perdono il 3–5% rispetto a 3 thread:
-ora tutte e due le code hanno due scrittori (la contesa d'ingresso di §10.6). La tabella di
-§10.2 è a 4 thread.
+- **Capacità a un core**, 3 thread: rxonly 4,61, baseline 3,31, P1 2,94, P1.5 2,81, P2 1,89,
+  P3 1,50 Mpps (302 / 340 / 356 / 529 / 666 ns). Tutte saturano, rxonly compreso: il tetto di
+  sola ricezione con la copia è ~4,6 Mpps (`--mode generator`: 4,50–4,71).
+- **Sopra la baseline** +38 / +53 / +226 / +364 ns, come con `xdp_gen` entro la variazione fra
+  sessioni; in assoluto la copia e il percorso della skb costano 225–250 ns in più per tutte.
+- **Thread**: con 3 thread sulla stessa coda la contesa costa ~17 ns per pacchetto a tutte
+  (baseline 296 contro 278 ns con un thread); con un thread rxonly non satura (2,84 Mpps).
+- **Due core**: con 4 thread, due per coda, e una coda d'uscita per core, 1,93–1,99 volte un
+  core; con 3 thread su 2 code una coda ne riceve uno solo (~2,8 Mpps) e rxonly si ferma a
+  1,61 volte (il banco avvisa se i thread non sono divisi in parti uguali). La coda d'uscita
+  condivisa costava 12–20 ns per pacchetto per core.
+- **Carico comune** (solo pktgen ha la cadenza a `delay`): a 1,375 Mpps, il 91% della più
+  lenta, nessun respinto per nessuna pipeline.
 
-### 10.8 Latenza arrivo → ripartenza (`--latency`)
+### 10.6 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
+
+```bash
+sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 \
+    --gen-cpus 10 --dut-cpus 6 --rates 0.05,0.5,1,1.5,2,2.5,3 \
+    --out results/throughput_rates_xdp                       # xdp_gen (default)
+```
+
+Build **strumentata**: il dispatcher marca T1, il programma marca T2 subito prima di
+`bpf_redirect`, il contatore d'uscita T3. I timbri stanno in mappe per-CPU, quindi l'uscita
+resta in softirq sulla CPU del DUT (niente `--egress-cpu`). T3−T1 al rate più basso è la
+latenza minima arrivo → ripartenza di §10.7.
+
+Con `xdp_gen` (2026-10-02, `results/throughput_rates_xdp/`), minimi per finestra, mediana fra
+tre giri, da 0,5 a 3 Mpps:
+
+| | baseline | P1 | P1.5 | P2 | P3 |
+|---|---:|---:|---:|---:|---:|
+| T2−T1, la sola pipeline (ns) | **26** | **60–61** | **68–69** | **217–224** | **325–335** |
+| sopra la baseline | — | +34 | +43 | +192 | +301 |
+| T3−T2, redirect + veth + ricezione (ns) | 183–211 | 185–211 | 185–230 | 190–236 | 198–236 |
+| T3−T1 a 50 kpps, latenza minima (ns) | 223 | 261 | 267 | 441 | 592 |
+
+T2−T1 è piatto sul rate (a 50 kpps qualche ns in più: cache più fredda). Il trasporto T3−T2
+è un costo comune di ~185–235 ns che non dipende dalla pipeline. Con pktgen (28-09,
+`results/throughput_rates/`): T2−T1 34–35 / 68–69 / 77–78 / 228–233 / 340–348, sopra la
+baseline **+34 / +43 / +194 / +306**, cioè le stesse differenze; T3−T2 ~195–255 ns. La copia
+di headroom di pktgen avviene **prima** di T1 (in `veth_xdp_rcv_skb`, prima del programma),
+quindi non è in nessuno dei tre intervalli: con `xdp_gen` T2−T1 è più basso di 8–17 ns
+in assoluto, probabilmente perché la copia non sporca più la cache.
+
+**Il throughput di questa modalità non è una capacità.** Con la build strumentata e l'uscita
+sulla CPU del DUT la coda d'ingresso respinge già da ~2,5 Mpps per la baseline, 2,3 per P1,
+1,6 per P2, 1,3 per P3, con tutti e due i generatori (con pktgen 2,4 / 2,2 / 1,6 / 1,3). Le
+capacità sono quelle di §10.2. La build strumentata aggiunge due letture dell'orologio e
+due scritture per pacchetto.
+
+### 10.7 Latenza arrivo → ripartenza (`--latency`)
 
 ```bash
 sudo python3 ipa/test/bench_throughput.py --latency --frames 512 --rounds 3 --repeat 5 \
     --out results/throughput_latency
 ```
 
-Build strumentata: il dispatcher marca l'arrivo, il programma d'uscita rilegge e sottrae.
-Latenza minima **a scarico** (50 kpps, nessuna coda), mediana fra tre giri:
-
-| | baseline | p1_static | hardcoded | template | modular |
-|---|---:|---:|---:|---:|---:|
-| min (ns) | 249 | 282 | 292 | 460 | 584 |
-| sopra la baseline | — | +33 | +43 | +211 | +335 |
-
-Solo la colonna `min` è una misura: p50 e p99 vengono da un istogramma `bpf_log2l` (bucket a
-potenze di due) e cadono negli stessi due bucket per tutte le pipeline (1 024 ns per
-baseline e P1, 2 048 per P2 e P3). Il minimo a scarico varia al massimo del 5% fra i giri.
-La **ricerca del rate a perdita nulla** invece disperde oltre il 25% fra i giri (fino al
-64%), perché al confine basta un'esitazione di pochi µs per perdere un pacchetto: il banco
-la segnala con `rc=1` e non è una cifra citabile; la saturazione (§10.2) e il carico comune
+Build strumentata, solo con pktgen: il dispatcher marca l'arrivo, il programma d'uscita
+rilegge e sottrae. Con `xdp_gen` la stessa cifra è T3−T1 al rate più basso di `--mode rates`
+(§10.6): **223 / 261 / 267 / 441 / 592 ns**, sopra la baseline +38 / +44 / +218 / +369.
+Con pktgen, latenza minima **a scarico** (50 kpps, 512 B, nessuna coda), mediana fra tre
+giri: 249 / 282 / 292 / 460 / 584 ns (sopra la baseline +33 / +43 / +211 / +335). Solo il minimo è una
+misura: p50 e p99 vengono da un istogramma a potenze di due. La **ricerca del rate a perdita
+nulla** disperde oltre il 25% fra i giri (fino al 64%), perché al confine basta
+un'esitazione di pochi µs per perdere un pacchetto: non è una cifra citabile; la saturazione
 sì.
 
 ---
@@ -1249,7 +1154,8 @@ La domanda: al crescere del bit rate inviato la coda si riempie, il tempo
 end-to-end cresce e poi si perde; se si perde all'**uscita** del programma il collo di
 bottiglia è trasmissivo, se si perde all'**ingresso** è il programma eBPF. Contare quanti
 pacchetti il programma riceve e quanti ne rilancia, con due programmi sullo stesso XDP: uno
-che conta soltanto, uno con la pipeline.
+che conta soltanto, uno con la pipeline. Il generatore è `xdp_gen` (`--generator xdp`), con
+cadenza e timbro nel suo programma (§11.4).
 
 ### 11.1 Come si legge su XDP
 
@@ -1285,13 +1191,14 @@ slot vuoto: conta e scarta.
 
 Il costo della catena si misura: la fase finale porta ogni pipeline a rate massimo con e
 senza contatore davanti e legge dal kernel il tempo del programma attaccato
-(`kernel.bpf_stats_enabled`, `run_time_ns / run_cnt`, tail call comprese).
+(`kernel.bpf_stats_enabled`, `run_time_ns / run_cnt`, tail call comprese). Con `xdp_gen`:
+da −1,4 a +2,4 ns, dentro la dispersione.
 
 ### 11.3 Contatori e formule
 
 | grandezza | dove si conta |
 |---|---|
-| inviati | pktgen: `pkts-sofar` + `errors` (respinti a coda d'ingresso piena) |
+| inviati | tentativi del generatore (`gen_runs` di `xdp_gen`) |
 | ricevuti da XDP | `ing_count[0]`, programma 1 |
 | decisioni | `pkt_stats[0..2]` della pipeline (HIT, MISS, DROP) |
 | inoltrati | `rx_count` sul nodo successivo |
@@ -1307,85 +1214,130 @@ bitrate_sent     = inviati / duration_s × frame × 8     (frame senza FCS: byte
 
 **Collo di bottiglia**: la perdita prima di XDP della pipeline meno quella di `rxonly` allo
 stesso rate, contro la perdita all'uscita, con soglia `--loss-threshold` (default **0,1
-punti**: sotto capacità `rxonly` perde lo 0,01–0,03%). **Inizio della perdita**: il rate più
-basso da cui *tutti* i rate più alti perdono; una riga in perdita seguita da righe pulite è
-"sporadica". Finestre marcate: `gen_limited` (generatore sotto il 95% del chiesto),
-`gen_burst` (oltre il 105%), `host_disturbed` (§0.3).
+punti**). **Inizio della perdita**: il rate più basso da cui *tutti* i rate più alti perdono;
+una riga in perdita seguita da righe pulite è "sporadica". Finestre marcate: `gen_limited`
+(generatore sotto il 95% del chiesto), `gen_burst` (oltre il 105%), `host_disturbed` (§0.3).
+Le colonne diagnostiche `napi_*` (scheduling del thread NAPI del DUT) e `gen_*` (cadenza di
+`xdp_gen`) sono in `bitrate_raw.csv` (§11.7).
 
-### 11.4 La latenza end-to-end
+### 11.4 Cadenza, timbro e latenza end-to-end
 
-pktgen scrive in ogni pacchetto, dopo UDP, magic, seq, `tv_sec` e `tv_usec`: l'istante in cui
-ha costruito il pacchetto (`CLOCK_REALTIME`, µs). Il programma d'uscita lo confronta col
-proprio orologio:
+**La cadenza.** `xdp_gen` spinge al massimo; il ritmo lo tiene il suo programma: a ogni giro
+legge l'orologio, prima dell'istante previsto scarta il frame (la pagina torna al pool, il giro
+costa ~60 ns), poi lo spedisce e fissa il prossimo istante un intervallo più in là.
+Spaziatura uniforme, non a raffiche (una raffica da 256 riempirebbe da sola la coda); dopo
+una pausa recupera al più 16 frame di fila. Precisa fino a ~11 Mpps per thread (98% a 12,
+tetto ~12,7: `results/xdp_cadenza_test/`).
+
+**Il timbro.** Nell'istante in cui il frame parte il programma scrive l'intestazione di pktgen
+dopo UDP: magic, seq, `tv_sec`, `tv_usec` (`CLOCK_REALTIME`, µs). Il programma d'uscita la
+confronta col proprio orologio:
 
 ```
 lat_us = floor((bpf_ktime_get_ns() + off) / 1000) − (tv_sec·10⁶ + tv_usec)
 off    = CLOCK_REALTIME − CLOCK_MONOTONIC, letto prima di ogni punto
 ```
 
-Il percorso misurato è tutto il nodo, **attesa in coda compresa**. pktgen timbra il pacchetto
-e poi aspetta il momento di trasmetterlo: quell'attesa, accumulata nel suo contatore `idle`,
-si sottrae per pacchetto (`e2e_spin_correction_us`); i valori non corretti restano nel CSV.
-Istogramma a celle da 1 µs fino a 1 024 µs, poi da 64 µs fino a 65,5 ms, più il trabocco; si
-cronometra un arrivo ogni `mask+1` (circa `--lat-samples`, 20 000 per finestra).
+Il percorso misurato è tutto il nodo, **attesa in coda compresa**. Il timbro coincide con
+l'invio, quindi non serve correzione (con pktgen, che timbra e poi aspetta, si sottrae la sua
+attesa: `e2e_spin_correction_us`). Istogramma a celle da 1 µs fino a 1 024 µs, poi da 64 µs
+fino a 65,5 ms, più il trabocco; si cronometra un arrivo ogni `mask+1` (circa
+`--lat-samples`, 20 000 per finestra).
+
+**Il lotto** (`--xdp-batch`, default 256): a fine lotto il redirect sveglia il DUT
+(`xdp_do_flush` → `XDP_XMIT_FLUSH`). A basso carico un frame può aspettare nel generatore
+fino alla fine del lotto, ~12 µs: la mediana del ritardo a basso carico è 17–19 µs con 256,
+3–6 µs con 32. Con 32 la cadenza regge solo fino a ~2,5 Mpps.
 
 ### 11.5 Comandi e uscite
 
 ```bash
-sudo python3 ipa/test/bench_bitrate.py --out results/bitrate_3500        # tutte, 5 giri (~5 min)
-sudo python3 ipa/test/bench_bitrate.py --method rxonly,baseline,template --rounds 1 \
-    --overhead-reps 0 --no-plot --out /tmp/br                              # un giro corto
-python3 ipa/test/plot_bitrate.py results/bitrate_3500                      # i grafici
-python3 ipa/test/bench_bitrate.py --report results/bitrate_3500            # riepilogo dai CSV
+sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 \
+    --out results/bitrate_xdp              # 0,5-12 Mpps (XDP_RATES_MPPS), 5 giri (~7 min)
+sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 \
+    --rates 0.25,0.5,1,1.5,2 --xdp-batch 32 --overhead-reps 0 \
+    --out results/bitrate_xdp_lotto32                                       # basso carico
+python3 ipa/test/plot_bitrate.py results/bitrate_xdp                        # i grafici
+python3 ipa/test/bench_bitrate.py --report results/bitrate_xdp              # riepilogo dai CSV
 ```
 
-- **Scala** (`--bitrates`): default `auto`, calibrata all'inizio su `rxonly` a massima spinta:
-  frazioni 0,05–1,25 del tetto di ricezione, fermate al 95% del tetto del generatore.
-  Oppure una lista in Gbit/s, o `--rates` in Mpps.
+- **Scala**: `--rates` in Mpps (con `xdp_gen` il default è 0,5–12 Mpps, `XDP_RATES_MPPS`: la cadenza si ferma a ~12), oppure
+  `--bitrates` in Gbit/s, oppure `auto`, calibrata su `rxonly` a massima spinta.
 - **Uscita**: `--egress-cpu auto` (default) mette la ricezione del nodo successivo su un core
   fisico suo; `none` la lascia in softirq sulla CPU del DUT.
-- **Code**: `--dut-queues auto` (una per CPU del DUT, §10.1).
+- **Con pktgen** (`--generator pktgen`; il default è `xdp_gen`): stessa uscita, latenza corretta
+  per l'attesa di pktgen; la sola ricezione regge ~4,6 Mpps.
 
 | file | contenuto |
 |---|---|
-| `bitrate_raw.csv` | una riga per (metodo, rate, giro), riscritta dopo ogni finestra: conteggi, perdite scomposte, latenze, colonne `host_*` |
+| `bitrate_raw.csv` | una riga per (metodo, rate, giro), riscritta dopo ogni finestra: conteggi, perdite scomposte, latenze, diagnostica, colonne `host_*` |
 | `bitrate.csv` | mediana fra i giri, min/max, pavimento `rxonly`, collo di bottiglia, giri disturbati |
 | `bitrate_overhead*.csv` | costo del contatore: ns del programma (statistiche BPF) e dal throughput |
 | `host_monitor.csv` | la macchina al secondo |
-| `env.csv` | macchina, condizioni, scala usata, soglia |
-| `bitrate_latency`, `bitrate_pps`, `bitrate_loss` (.png/.pdf) | latenza (p50, p99), pacchetti/s, perdita; git li ignora, si rifanno dai CSV con `plot_bitrate.py` |
+| `env.csv` | macchina, condizioni, scala usata, soglia, generatore, lotto |
+| `bitrate_latency`, `bitrate_pps`, `bitrate_loss` (.png/.pdf) | latenza (p50, p99), pacchetti/s, perdita; si rifanno dai CSV con `plot_bitrate.py` |
 
-### 11.6 Risultati (`results/bitrate_3500/`)
+### 11.6 Risultati (`results/bitrate_xdp/`, 2026-10-02)
 
-6 metodi, 5 giri, 13 punti di scala (tetto di ricezione calibrato 4,68 Mpps = 2,40 Gbit/s a
-64 B, generatore 6,13 Mpps), 390 finestre. DUT a 3 494 MHz, nessun evento di throttling né
-sui core né sul pacchetto, nessuna finestra disturbata o con burst del generatore.
+6 metodi, 16 punti da 0,5 a 12 Mpps, 5 giri, 480 finestre, nessuna disturbata (sessione del
+pomeriggio, dopo quella di §10.2). Cadenza esatta fino a 11 Mpps; a 12 ne parte il 98%
+(`results/xdp_cadenza_test/`: con un thread la cadenza si ferma a ~12,7 Mpps).
 
-| pipeline | inoltro max (Mpps, mediana 5 giri) | variazione | pulita fino a | perde da |
-|---|---:|---:|---|---|
-| rxonly | 4,67 | 1,5% | — | — |
-| baseline | 3,34 | 2,1% | 1,44 Gbit/s | 1,68 Gbit/s |
-| p1_static | 2,94 | 2,5% | 1,20 Gbit/s | 1,44 Gbit/s |
-| hardcoded | 2,84 | 2,0% | 1,20 Gbit/s | 1,44 Gbit/s |
-| template | 1,89 | 1,6% | 0,72 Gbit/s | 0,96 Gbit/s |
-| modular | 1,50 | 2,1% | 0,72 Gbit/s | 0,96 Gbit/s |
+| pipeline | inoltro max (Mpps) | 1 / ns di CPU (§10.2) | pulita fino a | perde da | ritardo a coda piena (p50) |
+|---|---:|---:|---|---|---:|
+| rxonly | ≥ 11,7 | — | 11 Mpps | 12 Mpps (0,3%) | — |
+| baseline | 8,89* | 15,1 | 8 Mpps (4,05 Gbit/s) | *banco, nodo al 60%* | — |
+| p1_static | 8,64 | 8,69 | 8 Mpps (4,04 Gbit/s) | 9 Mpps (4,56 Gbit/s) | 33–34 µs |
+| hardcoded | 8,06 | 8,07 | 7 Mpps (3,55 Gbit/s) | 8 Mpps (4,08 Gbit/s) | 35–36 µs |
+| template | 3,48 | 3,41 | 3 Mpps (1,54 Gbit/s) | 3,5 Mpps (1,79 Gbit/s) | 80–84 µs |
+| modular | 2,33 | 2,41 | 2 Mpps (1,02 Gbit/s) | 2,5 Mpps (1,28 Gbit/s) | 120–132 µs |
 
-"Pulita fino a" e "perde da" sono **punti della scala**, spaziati di ~0,24 Gbit/s: la soglia
-vera sta fra i due. P2 inoltra al massimo 1,89 Mpps ≈ 0,97 Gbit/s a 64 B, e il punto da
-0,96 cade sul suo limite; P3 (1,50 Mpps ≈ 0,77 Gbit/s) perde allo stesso punto perché fra
-0,72 e 0,96 la scala non ha valori. Le separa l'inoltro massimo. La scala si calibra a ogni
-sessione sul tetto di `rxonly`, quindi i punti cambiano da un run all'altro.
+"Pulita fino a" e "perde da" sono **punti della scala**: la soglia vera sta fra i due (P2:
+3,48 Mpps = 1,78 Gbit/s a 64 B).
 
-- Per tutte e sei la perdita è **prima di XDP**: il collo di bottiglia è il programma eBPF.
-  Dopo XDP al massimo lo 0,02% degli inviati.
-- Latenza p50 al rate più basso 9–10 µs per tutte; all'ultimo punto pulito 6–30 µs; al primo
-  in perdita 69–194 µs (la coda d'ingresso piena).
-- **Costo del contatore** (statistiche BPF del kernel, tempo del programma attaccato):
-  baseline 28,0 → 29,9 ns (+2,0), P1 68,0 → 70,3 (+2,3), P1.5 78,6 → 81,1 (+2,5), P2
-  242,7 → 248,0 (+5,3), P3 380,4 → 378,5 (−1,9, dentro la dispersione di 10–15 ns).
-- I due banchi concordano: `bench_throughput` (§10.2) dà cifre entro l'1% (3,31 contro 3,34
-  per la baseline, 1,50 e 1,50 per P3), con la stessa macchina ma l'uscita sulla CPU del DUT
-  e nessun contatore davanti.
+- **Tutte e quattro le pipeline saturano sulla curva**, e si fermano alla capacità del nodo:
+  P1 8,64 contro 8,69, P1.5 8,06 contro 8,07, P2 3,48 contro 3,41, P3 2,33 contro 2,41 (entro
+  il 3%, sessioni diverse). Al ginocchio il thread NAPI del DUT lavora il 99,6–99,9% del tempo.
+- Per le pipeline la perdita è **prima di XDP**: il collo di bottiglia è il programma eBPF.
+  Dopo XDP al massimo lo 0,04% degli inviati, rumore di lettura (negativo in 159 finestre su
+  400, media 0,009%). Sotto capacità nessuna perdita (≤ 0,05%).
+- **\*La baseline non è un limite del programma.** Da 9 Mpps perde ~1% prima di XDP e 0,1–0,2%
+  dopo, ma il suo thread NAPI lavora il 59–61% del tempo e dorme 25–30 volte al ms: il nodo ha
+  tempo libero. Con l'inoltro il generatore non va oltre ~9 Mpps (rxonly, che non inoltra,
+  arriva a 11,7), e i lotti da 256 trovano la coda non del tutto vuota. Il banco lo classifica
+  come `banco: nodo non saturo` (`napi_run_pct` sotto il 90%, `NAPI_SATURATED_PCT`). La sua
+  capacità resta quella di §10.2.
+- **rxonly non perde fino a 11 Mpps**; a 12 perde lo 0,3%, dove il generatore stesso cede.
+  Tutta la perdita delle pipeline è del programma: al traffico più alto P3 76%, P2 61%, P1.5 9%,
+  P1 7%.
+- **Il ritardo a coda piena segue 256 ÷ capacità** più il tratto fino al nodo successivo: P1
+  30 µs previsti contro 33–34, P1.5 32 contro 35–36, P2 74 contro 80–84, P3 110 contro
+  120–132. A basso carico 17–19 µs con il lotto da 256 (attesa nel generatore, §11.4), 3–6 µs
+  con 32 (`results/bitrate_xdp_lotto32/`).
+- **Quando la coda respinge, il generatore rallenta**: oltre il ginocchio si chiedono fino a
+  12 Mpps e ne partono 8,7–9,4.
+- Con pktgen (`results/bitrate_3500/`, 28-09) la risposta era la stessa, con capacità più basse
+  (3,34 / 2,94 / 2,84 / 1,89 / 1,50 Mpps) e un pavimento di rxonly del 21% al traffico più
+  alto, perché con la copia la sola ricezione regge ~4,6 Mpps.
+
+### 11.7 Come si è arrivati a una misura pulita
+
+Il primo run con `xdp_gen` spediva l'80–87% del richiesto e il nodo, a coda piena, lavorava
+all'~80%. Le colonne diagnostiche di `bitrate_raw.csv` hanno separato le cause
+(`results/diag_xdp/` prima, `results/diag_xdp_lunga/` dopo):
+
+| a coda piena (P2, P3) | 2–4 chiamate per finestra | 1 chiamata per finestra |
+|---|---:|---:|
+| thread NAPI del DUT in esecuzione (`napi_run_pct`) | 86–89% | 100% |
+| sonni per finestra (`napi_sleeps_per_ms` × 300) | 2–3 | 0 |
+| attesa del core (`napi_wait_pct`) | ~0 | ~0 |
+| inviati / richiesti, a ritmo basso | 80–89% | 100% |
+
+Il nodo non veniva interrotto da nessuno e dormiva tante volte quante erano le chiamate
+`test_run`: la pausa di ~12 ms di ogni chiamata (§10.1). Con una chiamata per finestra il
+ritmo è esatto fino a ~11 Mpps e il nodo lavora al 100%. Il lotto da 32 invece aveva tolto il
+ritardo a basso carico (§11.4) ma non il core fermo: due cause diverse, distinte dalla
+diagnostica.
 
 ---
 
@@ -1458,12 +1410,14 @@ sudo python3 ipa/test/test_model_source.py --kernel      # ogni scenario x model
 sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p2
 sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/test_suite.py --only kernel --model synth:deep
 sudo python3 ipa/test/test_fabric.py --model synth:small -q
-sudo python3 ipa/test/bench_throughput.py --mode compare --rounds 3 --gen-cpus 10,1,3 --dut-cpus 6 \
-     --model synth:deep --out results/models/throughput_deep
-sudo python3 ipa/test/bench_bitrate.py --model synth:deep --rounds 3 --out results/models/bitrate_deep
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto --rounds 3 \
+     --gen-cpus 10 --dut-cpus 6 --model synth:deep --out results/models/xdp_deep
+sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 --model synth:deep \
+     --rates 0.5,1,1.5,2,2.5,3,3.5,4,5,6,7,8 --rounds 3 --out results/models/bitrate_xdp_deep
+bash ipa/test/remeasure_xdp.sh modelli                   # tutti i modelli, ~5 min
 ```
 
-### 12.3 Risultati (2026-09-29)
+### 12.3 Risultati (2026-09-29; traffico vero 2026-10-02)
 
 **Correttezza**, tutto PASS:
 
@@ -1479,26 +1433,30 @@ ipa_ttl16 2–5, small 0–3, mixed 0–3, large 1, 4, 6, 8, deep 0, 1, 4, spars
 Per ipa_like, deep, sparse, small e ones sono tutte le classi che il modello decide su
 200 000 ingressi casuali: le altre i suoi pesi non le producono mai.
 
-**Traffico vero**, `bench_throughput --mode compare`, 1 core (cpu6), generatore 10,1,3,
-3 giri, macchina non disturbata, controllo di validità PASS in ogni run
-(`results/models/throughput_*/`). Mpps a saturazione, fra parentesi ns/pacchetto sopra
-la baseline:
+**Traffico vero**, `bench_throughput --mode compare --generator xdp`, 1 core (cpu6), un
+thread di generatore (cpu10), uscita su un core suo, 3 giri, 2026-10-02, alimentatore,
+macchina non disturbata, controllo di validità PASS in ogni run (`results/models/xdp_*/`).
+Mpps elaborati, fra parentesi ns di CPU sopra la baseline (il nodo è al 100% in ogni riga):
 
 | modello | forma | baseline | P1 | P1.5 | P2 | P3 |
 |---|---|---:|---:|---:|---:|---:|
-| checkpoint | 65-4-4-7 | 3,37 | 2,98 (+39) | 2,81 (+58) | 1,87 (+237) | 1,47 (+385) |
-| deep | 65-4-4-4-7 | 3,31 | 2,87 (+46) | 2,76 (+60) | 1,78 (+261) | 1,35 (+438) |
-| small | 15-4-4 | 3,30 | 3,01 (+29) | 2,88 (+45) | 2,11 (+172) | 1,74 (+271) |
-| mixed | 18-6-5 | 3,28 | 3,02 (+27) | 2,90 (+40) | 2,06 (+181) | 1,67 (+293) |
-| large | 117-8-8-9 | 3,30 | 2,61 (+80) | 2,54 (+90) | N/A | N/A |
+| checkpoint | 65-4-4-7 | 15,07 | 8,44 (+52) | 8,01 (+59) | 3,43 (+225) | 2,18 (+393) |
+| deep | 65-4-4-4-7 | 15,13 | 8,42 (+53) | 7,76 (+63) | 3,08 (+258) | 2,04 (+423) |
+| small | 15-4-4 | 14,97 | 9,93 (+34) | 9,20 (+42) | 4,34 (+164) | 3,01 (+265) |
+| mixed | 18-6-5 | 15,28 | 9,39 (+42) | 8,97 (+47) | 4,17 (+175) | 2,87 (+283) |
+| large | 117-8-8-9 | 15,14 | 6,87 (+80) | 6,44 (+89) | N/A | N/A |
 
-Il checkpoint per la strada nuova dà 3,37 / 2,98 / 2,81 / 1,87 / 1,47 contro 3,40 / 3,01
-/ 2,87 / 1,91 / 1,49 del 28-09: i programmi sono identici, e anche la baseline, che non
-esegue modelli, perde l'1%. È variazione fra sessioni.
+Il checkpoint coincide con §10.2 entro l'1–3% per baseline, P1, P1.5 e P2; P3 dà 460 ns
+contro 416, la sua variazione fra sessioni (§10.2). Con pktgen (29-09,
+`results/models/throughput_*/`) le differenze sopra la baseline erano le stesse entro
+~15 ns.
 
-**Bit rate** su deep (`results/models/bitrate_deep/`): perdita sempre all'ingresso; pulite
-fino a baseline 1,44, P1 1,44, P1.5 1,20, P2 0,72, P3 0,48 Gbit/s (col checkpoint P3 era
-pulita fino a 0,72: lo strato in più la porta sotto 1,41 Mpps).
+**Bit rate** su deep (`results/models/bitrate_xdp_deep/`, 3 giri): perdita sempre
+all'ingresso, dopo XDP al massimo lo 0,04%. Baseline e P1 pulite fino all'ultimo punto
+(~4,06 Gbit/s), P1.5 fino a 3,55 Gbit/s (perde da 7,9 Mpps), P2 fino a 1,54 (inoltro max
+3,08 Mpps), P3 fino a 0,77 (inoltro max 2,08 Mpps). A coda piena il ritardo è 88–96 µs per
+P2 e 134–145 per P3, di nuovo 256 ÷ capacità (83 e 125 µs) più il tratto d'uscita. Col
+checkpoint P3 era pulita fino a 1,02 Gbit/s: lo strato in più la porta sotto 2 Mpps.
 
 **Kernel** (`BPF_PROG_TEST_RUN`), ns/pacchetto, `results/models/kernel_battery.csv`:
 misurate sotto `host_conditions` ma **a batteria**, quindi indicative finché non si
@@ -1509,8 +1467,8 @@ rimisurano con l'alimentatore. Baseline 14–15 ovunque; P1.5 / P2 / P3: checkpo
 **Che cosa dicono**: P2 e P3 costano per la **forma**, non per i pesi (checkpoint,
 ipa_like, ipa_ttl16 e sparse hanno la stessa forma e lo stesso costo); P1 per i **valori**
 dei pesi (sparse, stessa forma, 38 ns contro 51). Uno strato in più costa circa +24 ns a
-P2 e +45–53 ns a P3, sia nel kernel sia sul traffico vero; ingressi più piccoli
-abbassano P2 e P3 di 60–110 ns.
+P2 e +44 ns a P3 nel kernel, +33 e +30 sul traffico vero (P3 dentro la sua variazione fra
+sessioni); ingressi più piccoli abbassano P2 e P3 di 50–130 ns.
 
 ## Note e limiti
 
@@ -1522,8 +1480,8 @@ abbassano P2 e P3 di 60–110 ns.
   1 097 pesi oltre `MAX_WEIGHT_ENTRIES` in P2).
 - **Azione uniforme**: `argmax → class_action → porta logica → mac_table → bpf_redirect`.
 - **Tutto sta su una macchina**: generatore, DUT e nodo successivo sono core diversi dello
-  stesso processore, collegati da `veth`. Il costo del veth (e, con pktgen, della copia di
-  headroom) è dentro le cifre. Niente NIC, niente DMA: nessuna scheda cablata su questa
+  stesso processore, collegati da `veth`. Il costo del veth è dentro le cifre (con pktgen anche
+  la copia di headroom, che `xdp_gen` evita). Niente NIC, niente DMA: nessuna scheda cablata su questa
   macchina supporta XDP nativo. Il confronto fra pipeline regge; le cifre assolute sono di
   questo percorso, a 3,5 GHz.
 - **Nessun isolamento dal boot**: `isolcpus`, `nohz_full` e `rcu_nocbs` richiedono parametri

@@ -686,8 +686,8 @@ class CpuPlan:
         if self.topo:
             info(f"topologia ............... {self.topo.summary()}")
         info(f"CPU online .............. {fmt(self.online)}")
-        info(f"CPU generatore (pktgen) . {self._fmt(self.gen)}  "
-             f"-> {self.threads} thread kpktgend")
+        info(f"CPU generatore .......... {self._fmt(self.gen)}  "
+             f"-> {self.threads} thread")
         info(f"CPU DUT (XDP/NAPI) ...... {self._fmt(self.dut)}")
         if self.egress is not None:
             info(f"CPU uscita (NAPI a valle) "
@@ -5021,7 +5021,7 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                 threaded_napi=True, diag_enabled=False, window_s=WINDOW_S,
                 warmup_s=DEFAULT_WARMUP_S, clone=0, burst=0,
                 generator="pktgen", egress_cpu=None, ttl_mix=None,
-                scenario=None):
+                scenario=None, xdp_batch=None):
     """Tutte le pipeline, stesso fabric, stesso generatore, stesso rate.
 
     generator="xdp": frame XDP grezzi (xdp_gen.XdpGen, BPF_PROG_TEST_RUN in
@@ -5070,9 +5070,10 @@ def run_compare(methods, model_path, frames, offered_pps=None,
             _map_extra_ingress(setup, ing.ifindexes)
         gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
         if generator == "xdp":
-            from xdp_gen import XdpGen
+            from xdp_gen import XdpGen, BATCH_SIZE
             gen = XdpGen(gen_devs[0], plan, window_s=window_s,
-                         ttls=ttl_mix).attach()
+                         ttls=ttl_mix,
+                         batch_size=xdp_batch or BATCH_SIZE).attach()
             _warn_shared_queues(plan)
         else:
             gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
@@ -5650,13 +5651,20 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
               threads=1, plan=None, threaded_napi=True,
               xmit_mode="start_xmit", threshold=DEFAULT_LOSS_THRESHOLD,
               window_s=WINDOW_S, warmup_s=DEFAULT_WARMUP_S,
-              topology="shared", clone=0, burst=0):
+              topology="shared", clone=0, burst=0, generator="pktgen",
+              xdp_batch=None):
     """Tutte le pipeline, stesso fabric e stesso generatore, a rate crescente.
 
     Usa le build STRUMENTATE: sono le uniche che portano T1, T2 e T3, quindi i
     numeri di throughput qui sono un limite INFERIORE di quelli di produzione.
     Il confronto fra pipeline resta valido perche' tutte pagano la stessa
     strumentazione.
+
+    generator="xdp": frame XDP grezzi da xdp_gen, con la cadenza nel suo
+    programma. I tre timbri sono tutti nel DUT e nel nodo successivo, quindi
+    la strumentazione e' la stessa; cambia il trasporto, senza la copia di
+    headroom della skb. T3 - T1 a basso rate e' la latenza minima arrivo ->
+    ripartenza di --latency.
     """
     from netns_fabric import NetnsFabric
     from common import attach_xdp
@@ -5688,9 +5696,15 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
         for setup in loaded.values():
             _map_extra_ingress(setup, ing.ifindexes)
         gen_devs = ing.gen_devs if ing.topology == "links" else ing.gen_devs[:1]
-        gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
-                        topology=ing.topology, clone=clone, burst=burst,
-                        window_s=window_s, warmup_s=warmup_s).attach()
+        if generator == "xdp":
+            from xdp_gen import XdpGen, BATCH_SIZE
+            gen = XdpGen(gen_devs[0], plan, window_s=window_s,
+                         batch_size=xdp_batch or BATCH_SIZE).attach()
+            _warn_shared_queues(plan)
+        else:
+            gen = Generator(gen_devs, plan, xmit_mode=xmit_mode,
+                            topology=ing.topology, clone=clone, burst=burst,
+                            window_s=window_s, warmup_s=warmup_s).attach()
 
         def use(method):
             """Questa pipeline sull'ingresso, e il SUO contatore sulle uscite.
@@ -5863,7 +5877,8 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                           f"{_fmt_ns(row['xport_min_ns']):>7s}")
 
         gen.detach()
-        pg_reset()
+        if generator != "xdp":
+            pg_reset()
         if napi_devs:
             disable_threaded_napi(napi_devs)
         ing.cleanup()
@@ -7314,13 +7329,21 @@ def main():
                         "piu' lento consegna a massima spinta. Che a quel "
                         "rate nessuna perda lo verifica la fase stessa.")
     m.add_argument("--generator", choices=("pktgen", "xdp"),
-                   default="pktgen",
-                   help="solo --mode compare. pktgen (default): skb, che il "
-                        "veth copia per dare a XDP l'headroom -- costo del "
-                        "trasporto sul DUT. xdp: frame XDP grezzi da "
-                        "BPF_PROG_TEST_RUN live frames (ipa/test/xdp_gen.py), "
-                        "come da una NIC con XDP nativo; niente cadenza, "
-                        "quindi solo la fase saturazione.")
+                   default=None,
+                   help="xdp (default in --mode compare e rates): frame XDP "
+                        "grezzi da BPF_PROG_TEST_RUN live frames "
+                        "(ipa/test/xdp_gen.py), come da una NIC con XDP "
+                        "nativo; senza altre indicazioni un thread per CPU "
+                        "del DUT e, in compare, uscita su un core suo "
+                        "(--egress-cpu auto). In compare solo la fase "
+                        "saturazione. pktgen (default di --latency, "
+                        "saturate e generator, che lo richiedono): skb, che "
+                        "il veth copia per dare a XDP l'headroom -- costo "
+                        "del trasporto sul DUT.")
+    m.add_argument("--xdp-batch", type=int, default=None, metavar="N",
+                   help="con --generator xdp: frame per lotto del test_run "
+                        "(1-256, default 256). A fine lotto il redirect "
+                        "sveglia il DUT.")
     m.add_argument("--per-class", action="store_true",
                    help="solo --mode compare --generator xdp: una sessione "
                         "per ogni classe che il modello raggiunge (stato dei "
@@ -7414,9 +7437,23 @@ def main():
         a.out = os.path.abspath(a.out)
     global WINDOW_MODE, DUT_QUEUES, EGRESS_QUEUES
     WINDOW_MODE = a.window
-    if a.generator == "xdp" and (a.latency or a.mode != "compare"
-                                 or a.window != "steady"):
-        sys.exit("--generator xdp: solo --mode compare a finestra steady")
+    # Il generatore: xdp_gen dove il banco lo supporta, pktgen altrove.
+    xdp_ok = not a.latency and a.mode in ("compare", "rates")
+    if a.generator is None:
+        a.generator = "xdp" if xdp_ok and a.window == "steady" else "pktgen"
+        if a.generator == "xdp":
+            # Uno scrittore per coda (docs/testing.md §10.3): un thread per
+            # CPU del DUT; e in compare l'uscita su un core suo (§10.2).
+            if a.gen_cpus is None and a.threads is None:
+                a.threads = len(parse_cpu_list(a.dut_cpus) or [None])
+            if a.mode == "compare" and a.egress_cpu is None:
+                a.egress_cpu = "auto"
+    if a.generator == "xdp" and (not xdp_ok or a.window != "steady"):
+        sys.exit("--generator xdp: solo --mode compare o rates, a finestra "
+                 "steady (la latenza minima di --latency e' T3-T1 di "
+                 "--mode rates a basso rate)")
+    if a.xdp_batch is not None and a.generator != "xdp":
+        sys.exit("--xdp-batch: solo con --generator xdp")
     if a.egress_cpu is not None and (a.latency or a.mode != "compare"):
         sys.exit("--egress-cpu: solo --mode compare")
     if a.per_class and (a.generator != "xdp" or a.mode != "compare"
@@ -7442,7 +7479,7 @@ def main():
             pg_reset()
         return 0
 
-    if not pg_available():
+    if a.generator == "pktgen" and not pg_available():
         sys.exit(f"{PKTGEN_DIR} non c'e' e `modprobe pktgen` non l'ha "
                  f"creato: questo kernel non ha il modulo.")
     if a.repeat <= 1:
@@ -7451,7 +7488,8 @@ def main():
              "rende confrontabili due pipeline su questa macchina -- si "
              "spengono. Le righe che ne escono non sono confrontabili fra "
              "metodi; servono solo a vedere se il banco gira.")
-    pg_reset()
+    if pg_available():
+        pg_reset()
 
     # Il piano CPU si fa PRIMA di qualunque misura e si stampa: e' la
     # configurazione da cui dipende tutto il resto, e va letta insieme ai
@@ -7674,7 +7712,8 @@ def _main_run(a, plan):
             plan=plan, threaded_napi=not a.no_threaded_napi,
             xmit_mode=a.xmit_mode, threshold=a.loss_threshold,
             window_s=a.duration, warmup_s=a.warmup, topology=a.gen_topology,
-            clone=a.clone_skb, burst=a.burst)
+            clone=a.clone_skb, burst=a.burst, generator=a.generator,
+            xdp_batch=a.xdp_batch)
         if a.out and raw:
             os.makedirs(a.out, exist_ok=True)
             _write_csv(os.path.join(a.out, "rates_raw.csv"), raw)
@@ -7696,7 +7735,8 @@ def _main_run(a, plan):
             window_s=a.duration, warmup_s=a.warmup, clone=a.clone_skb,
             burst=a.burst, generator=a.generator,
             egress_cpu=plan.egress,
-            ttl_mix=(parse_cpu_list(a.ttl_mix) if a.ttl_mix else None))
+            ttl_mix=(parse_cpu_list(a.ttl_mix) if a.ttl_mix else None),
+            xdp_batch=a.xdp_batch)
         # Il controllo "la baseline e' la piu' veloce" ha senso solo dove
         # l'RX e' una capacita', cioe' a massima spinta: nella fase confronto
         # tutte consegnano lo stesso rate per costruzione.
