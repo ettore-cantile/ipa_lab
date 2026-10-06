@@ -12,10 +12,14 @@ Tutti gli script di test vivono sotto `ipa/test/`; i comandi si eseguono dalla r
 repository. Il motore sta in `ipa/`; i dati della topologia su cui il checkpoint depositato è
 stato addestrato stanno in `topologies/germany50/`.
 
-**Le cifre di questo documento sono state misurate il 2026-09-28** (il traffico vero con
-`xdp_gen`, §10–§12, il 2026-10-02), con la ReLU senza salto di §8, sulla macchina e nelle
-condizioni descritte in §0, con `ipa/test/remeasure_all.sh`, `ipa/test/remeasure_traffic.sh`
-e `ipa/test/remeasure_xdp.sh` (log in `/tmp/ipa_logs/`, `$IPA_LOG_DIR` per cambiarlo).
+**Le cifre di questo documento vengono dalla campagna del 2026-10-06**
+(`results/campagna_2026-10-06/`, sintesi in `sintesi.md`, log in `log/`), sulla macchina e
+nelle condizioni descritte in §0, con due script: `ipa/test/remeasure_campagna.sh` (il
+traffico vero con `xdp_gen`, sui P-core, sugli E-core e sui LP E-core, e gli assi sotto
+traffico) e `ipa/test/remeasure_all.sh` (tutto quello che non usa traffico vero, che la
+campagna chiama nella sezione `kernel`). Le misure di traffico a un core e a due core sono
+con l'alimentatore; gli assi sotto traffico (§10.8) e le misure `BPF_PROG_TEST_RUN` a
+batteria, con la frequenza del banco misurata a 3,48–3,50 GHz e nessun throttling.
 
 ---
 
@@ -64,6 +68,12 @@ Tutto reversibile e tutto scritto in `env.csv` accanto ai numeri.
 Con il piano automatico: **DUT cpu6, uscita cpu8, generatore cpu10, cpu1, cpu3**; fratelli a
 riposo 2, 4, 7, 9, 11; sistema 0, 5, 12-21.
 
+**I moduli degli E-core.** "Fratelli a riposo" sono tutte le CPU che dividono la L2 con una
+CPU del banco (`cache/index2/shared_cpu_list`). Su un P-core è il fratello SMT; su un E-core
+sono gli altri tre core del modulo (12-15, 16-19), che dividono con lui anche la frequenza.
+Con il nodo su cpu12 restano a riposo 13-15: frequenza fissata con il banco, nessun
+processo, nessun IRQ (§10.8).
+
 **Il ripristino.** Ogni valore si salva in `/run/ipa-bench/host_state.json` prima di
 cambiarlo. A fine run (anche con Ctrl-C, SIGTERM, SIGHUP o un'eccezione) si riscrive tutto
 all'indietro. Un run ucciso con SIGKILL lascia il file: il run successivo ripristina per
@@ -84,28 +94,24 @@ MHz. Per questo il riferimento del monitor è sempre la frequenza **misurata** a
 
 ### 0.4 Perché 3500 MHz
 
-`bench_bitrate` (rxonly, baseline, template), inoltro massimo in Mpps a 64 B, un giro da
-30 s per frequenza, più due run completi (6 metodi, 5 giri, ~5 minuti):
+Un giro da 30 s di `bench_bitrate` per frequenza, più due run completi (6 metodi, 5 giri,
+~5 minuti), con il monitor di §0.3 acceso:
 
-| frequenza reale | rxonly | baseline | template | finestre disturbate | throttling | temp. |
-|---|---:|---:|---:|---|---|---|
-| 2,0 GHz | 2,65 | 2,00 | 1,14 | 0/39 | 0 | 53 °C |
-| 3,0 GHz | 3,93 | 2,89 | 1,66 | 0/39 | 0 | 47 °C |
-| 3,5 GHz | 4,37 | 3,22 | 1,86 | 0/39 | 0 | 55 °C |
-| 4,0 GHz | 4,84 | 3,55 | 2,09 | 0/39 | 0 | 61 °C |
-| 4,5 GHz | 5,17 | 3,54 | 2,04 | **28/39** | 8 930 eventi | 65 °C |
-| **run completo 4,0 GHz** | 4,87 | 3,56 | 2,07 | **11/260** | 219 sul **DUT** | registro fino a **98 °C** |
-| **run completo 3,5 GHz** | 4,39 | 3,18 | 1,86 | **1/390** | 2 di pacchetto | registro max 85 °C |
+| frequenza reale | finestre disturbate | throttling | temperatura |
+|---|---|---|---|
+| 2,0 – 4,0 GHz, 30 s | 0/39 | 0 | 47–61 °C |
+| 4,5 GHz, 30 s | **28/39** | 8 930 eventi | 65 °C |
+| **run completo 4,0 GHz** | **11/260** | 219 sul **DUT** | registro fino a **98 °C** |
+| **run completo 3,5 GHz** | **1/390** | 2 di pacchetto | registro max 85 °C |
 
-A 4,5 GHz il throughput smette di crescere e l'inizio della perdita del template arretra. A
-4 GHz un run da 30 s è pulito, uno da 5 minuti no: il pacchetto arriva a 98 °C dopo ~100 s.
-**3500 MHz è la frequenza più alta che la macchina regge per un run intero.**
+A 4,5 GHz il throughput smette di crescere. A 4 GHz un run da 30 s è pulito, uno da 5
+minuti no: il pacchetto arriva a 98 °C dopo ~100 s. **3500 MHz è la frequenza più alta che
+la macchina regge per un run intero.**
 
 La frequenza pesa quasi in proporzione, ma non del tutto: da 3 a 4 GHz il throughput sale
-del 23% invece del 33%, e i cicli per pacchetto crescono dell'8–13% fra 2 e 4 GHz (la
-uncore è fissa, la cache condivisa e la memoria non accelerano con il core). Il **rapporto
-fra pipeline** invece no: template/baseline vale 0,57–0,59 a ogni frequenza pulita. Le cifre
-assolute vanno citate insieme alla loro frequenza.
+del 23% invece del 33%, perché la uncore è fissa e la cache condivisa e la memoria non
+accelerano con il core. Il **rapporto fra pipeline** resta lo stesso a ogni frequenza pulita.
+Le cifre assolute vanno citate insieme alla loro frequenza e al tipo di core (§10.8).
 
 ### 0.5 Comandi
 
@@ -115,13 +121,13 @@ sudo python3 ipa/test/host_conditions.py --restore   # dopo un run ucciso
 # un comando qualunque sul core del DUT, a condizioni applicate
 sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/test_suite.py --only kernel
 
-python3 ipa/test/test_host_conditions.py             # 93 controlli su un /sys finto, niente root
+python3 ipa/test/test_host_conditions.py             # 95 controlli su un /sys finto, niente root
 sudo python3 ipa/test/test_host_kernel.py            # sul kernel vero: applica, misura, ripristina
 sudo python3 ipa/test/test_host_kernel.py --bench    # + un giro corto di bench_bitrate
 
-bash ipa/test/remeasure_all.sh                      # tutte le misure BPF_PROG_TEST_RUN (~15 min)
-bash ipa/test/remeasure_xdp.sh                       # traffico vero con xdp_gen: 1 e 2 core, curve, modelli (~15 min)
-bash ipa/test/remeasure_traffic.sh                   # traffico con pktgen, semantica, soffitti (~15 min)
+bash ipa/test/remeasure_campagna.sh                 # tutto (~1 h): traffico su P/E/LP E-core, assi, kernel
+bash ipa/test/remeasure_campagna.sh pcore ecore lpe # solo il traffico a massima spinta e le curve
+bash ipa/test/remeasure_all.sh                      # solo BPF_PROG_TEST_RUN, fabric, modelli sintetici (~20 min)
 ```
 
 `test_host_kernel.py` sul kernel vero: **25/25** con `--bench`. Rilegge dal kernel governor,
@@ -149,11 +155,16 @@ python3 ipa/test/test_suite.py --only extract     # coerenza pesi / weights.json
 
 python3 ipa/test/test_class_semantics.py          # 69 controlli, cinque layout di classi
 python3 ipa/test/test_synth.py                    # 60 controlli sui modelli sintetici (58 senza torch)
-python3 ipa/test/test_bitrate_math.py             # 98: formule e attribuzione di bench_bitrate
-python3 ipa/test/test_steady_window.py            # 18: la finestra stazionaria
-python3 ipa/test/test_host_conditions.py          # 93: ruoli, applicazione e ripristino
+python3 ipa/test/test_bitrate_math.py             # 100: formule e attribuzione di bench_bitrate
+python3 ipa/test/test_steady_window.py            # 18: la finestra stazionaria (vedi sotto)
+python3 ipa/test/test_host_conditions.py          # 95: ruoli, moduli E-core, applicazione e ripristino
 python3 ipa/test/test_model_source.py             # 62: modelli, scenari, compatibilita', limiti delle pipeline
 ```
+
+`test_steady_window` simula pktgen e i contatori del DUT con orologi veri: il controllo
+"`loss_dut_pct` ~ 0 entro la coda in volo" (soglia 0,1%) esce a 0,11–0,16% su questa
+macchina, perché fra la lettura del generatore e quella del DUT passa un tempo variabile.
+È un limite della simulazione, non del banco: 17/18.
 
 ---
 
@@ -220,15 +231,14 @@ controllo negativo morde e la condizione "slot assenti a 0" è portante.
 
 | porte presenti | 2 | 3 | 4 | 5 | 6 |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` istruzioni | 579 | 599 | 615 | 639 | 663 |
-| `p1_static` latenza (ns) | 37 | 38 | 39 | 39 | 41 |
+| `p1_static` istruzioni | 534 | 554 | 570 | 594 | 618 |
+| `p1_static` latenza (ns) | 37 | 38 | 39 | 39 | 40 |
 
-**21 istruzioni per porta**, lineare; grado 2 contro grado 6: −12,7% di istruzioni e
-**−4 ns** (−10%), con la latenza monotona. Fra grado 6 e grado 2 spariscono 16
+**~21 istruzioni per porta**, lineare; grado 2 contro grado 6: −14% di istruzioni e
+**−3 ns** (−8%), con la latenza monotona. Fra grado 6 e grado 2 spariscono 16
 moltiplicazioni-accumulo, circa 4,6 ns a 3,5 GHz se ne costasse una per ciclo: la misura
-li vede. Il controllo regge:
-`hardcoded` 1 090, `template` 15 142, `modular` 12 394 istruzioni e latenze piatte (46–47,
-187–189, 306–309 ns) su tutti e cinque i punti.
+li vede. Il controllo regge: `hardcoded` 1 045, `template` 15 089, `modular` 12 288
+istruzioni e latenze piatte (45–46, 188–193, 309–310 ns) su tutti e cinque i punti.
 
 ### Verifier standalone e semantica per modello
 
@@ -325,24 +335,18 @@ sudo python3 ipa/link_state_monitor.py --ifaces eth0 eth1 eth2 eth3 eth4 eth5
 
 ## 5. Costo di aggiunta modello
 
-Installare un modello nuovo su un nodo in servizio (`update_ms` di `bench_scaling`, §9): P1
-carica l'oggetto AOT già compilato, **0,7–2,1 ms** (§ Risultati: `open` 0,09 + verifica e JIT
-1,03 ms sul modello standard), e clang (~76 ms) gira una volta sulla macchina di build; P2 e P3
-scrivono in mappa pesi, descrittore e semantica, **10–12 ms**, senza compilare niente.
+Installare un modello nuovo su un nodo in servizio (`update_ms` di `bench_scaling`, §9):
+
+| pipeline | sul nodo | una volta, fuori dal nodo o all'avvio |
+|---|---|---|
+| P1, P1.5 | carica l'oggetto AOT già compilato: **0,4–2,2 ms** (sul modello standard `open` 0,08 + verifica e JIT 0,97 ms) | clang, **57–121 ms**, sulla macchina di build |
+| P2 | scrive in mappa pesi, descrittore e semantica: **10–12 ms** | BCC compila il programma generico: ~1,5 s |
+| P3 | come P2: **10–11 ms** | ~1,2 s |
+
+Nessun compilatore sul nodo per nessuna pipeline. La differenza che resta è qualitativa: P1
+vuole un compilatore (sulla macchina di build) per ogni modello nuovo, P2 e P3 nessuno.
 Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (3 modelli dell'architettura 65-4-4-7),
 `MAX_LAYER_WEIGHT_ENTRIES=2048` in P3 (6).
-
----|---:|---:|---:|---|
-| hardcoded (BCC) | — | 75,6 | 78,9 | ricompilazione completa: BCC ~74 ms, caricamento ~2 ms |
-| template | 1 516 ms | **0,505** | 0,695 | una `bpf_map_update_elem` sul blocco pesi |
-| modular | 1 194 ms | **0,410** | 0,616 | una `bpf_map_update_elem` sul blocco pesi |
-
-Ricompilare P1 con BCC costa 150-190× una scrittura in mappa. Ma il deploy di P1 è l'oggetto
-AOT: sul nodo si paga solo il caricamento, **1,12 ms** (`open` 0,09 + verifica e JIT 1,03;
-§ Risultati), e clang (76 ms) gira una volta sulla macchina di build. Si riporta il minimo:
-con 3 modelli la media è dominata dal primo add, che paga il primo accesso alle pagine di
-una mappa appena creata. Limiti: `MAX_WEIGHT_ENTRIES=1024` in P2 (3 modelli di questa
-architettura), `MAX_LAYER_WEIGHT_ENTRIES=2048` in P3 (6).
 
 ---
 
@@ -362,45 +366,37 @@ sia centrato (lo scarto è stampato). Quattro descrittori (`default` 2 one-hot,
 trial. Ogni cella in un subprocess: un abort di clang o un rifiuto del verificatore marca
 solo quella cella.
 
-Misurato il 2026-09-28, con `ipa_relu` (§8).
-
 **Tier A (~300 pesi)**, ns/pacchetto:
 
 | descrittore | n_in | larga | 2 layer | 4 layer | 8 layer |
 |---|---:|---:|---:|---:|---:|
-| `default` (2 one-hot) | 65 | **39** | 46 | 49 | 64 (+64%) |
-| `no_onehot` (0) | 11 | 93 | 88 | 83 | **81 (−13%)** |
-| `small_onehot` (1 piccola) | 13 | 81 | **71** | 79 | 84 |
+| `default` (2 one-hot) | 65 | **39** | 44 | 48 | 62 (+59%) |
+| `big_onehot` (1 grande) | 59 | **33** | 40 | 50 | 56 (+70%) |
+| `small_onehot` (1 piccola) | 13 | 83 | **72** | 82 | 86 |
+| `no_onehot` (0) | 11 | 93 | 90 | 85 | **83 (−11%)** |
 
 **Tier B (~1 200 pesi)**, ns/pacchetto:
 
 | descrittore | n_in | larga | 2 layer | 4 layer | 8 layer |
 |---|---:|---:|---:|---:|---:|
-| `default` (2 one-hot) | 65 | **110** | 150 | 176 | 219 (+99%) |
-| `no_onehot` (0) | 11 | *stack* | *stack* | 320 | **291 (−9%)** |
-| `small_onehot` (1 piccola) | 13 | *stack* | 295 | **286** | 288 |
+| `default` (2 one-hot) | 65 | **105** | 145 | 165 | 211 (+101%) |
+| `big_onehot` (1 grande) | 59 | **116** | 139 | 166 | 209 (+80%) |
+| `small_onehot` (1 piccola) | 13 | *stack* | 302 | 291 | **286** |
+| `no_onehot` (0) | 11 | *stack* | *stack* | 330 | **295 (−11%)** |
 
-(`big_onehot` nel log `depth_vs_width.log` di `remeasure_all.sh`.) *stack*: clang si ferma
-(abort di LLVM, stack eBPF oltre 512 byte). **Tier C (~4 700 pesi)**: nessuna forma
-compila, per lo stesso motivo.
-
-**Fino al 2026-09-27** il tier B su `default` caricava solo la forma a 8 strati (230 ns):
-larga, 2 e 4 strati venivano **rifiutate dal verificatore** (`BPF program is too large.
-Processed 1000001 insn`, `E2BIG`), e su `small_onehot` non caricava nemmeno la larga del
-tier A. La causa era la stessa di P2 (§8): un salto condizionale per ogni ReLU. Con
-`ipa_relu` il verificatore percorre 5 698–8 516 istruzioni sul tier B, e il limite che
-resta è lo stack.
+*stack*: clang si ferma (abort di LLVM, stack eBPF oltre 512 byte). **Tier C (~4 700
+pesi)**: nessuna forma compila, per lo stesso motivo.
 
 **Che cosa dicono.**
-1. Con un ingresso grande e dominato da one-hot (`default`, il caso di IPA) allargare batte
-   approfondire: +64% a 8 strati a 300 pesi, il doppio a 1 200.
+1. Con un ingresso grande e dominato da one-hot (`default`, `big_onehot`, il caso di IPA)
+   allargare batte approfondire: +59–70% a 8 strati a 300 pesi, +80–100% a 1 200.
 2. Con un ingresso piccolo e denso (`no_onehot`) è il contrario: la versione a 8 strati è
-   **più veloce del 13%** e più piccola (1 368 contro 1 535 istruzioni). Una one-hot costa
-   poco perché il datapath ne legge una colonna; un ingresso denso moltiplica le letture per
-   la larghezza del primo strato. La risposta dipende da com'è fatto il vettore d'ingresso.
-3. Con la ReLU senza salto le forme profonde pagano più di prima (8×3 a 300 pesi: 50 →
-   64 ns): ogni neurone nascosto aggiunge tre istruzioni sempre eseguite, mentre sotto
-   `BPF_PROG_TEST_RUN` il salto di prima era sempre predetto. La conclusione 1 si rafforza.
+   **più veloce dell'11%** e più piccola (1 323 contro 1 490 istruzioni a 300 pesi). Una
+   one-hot costa poco perché il datapath ne legge una colonna; un ingresso denso moltiplica
+   le letture per la larghezza del primo strato. La risposta dipende da com'è fatto il
+   vettore d'ingresso.
+3. Ogni neurone nascosto aggiunge tre istruzioni sempre eseguite (la ReLU senza salto,
+   §8): le forme profonde le pagano tutte.
 4. Oltre ~1 200 pesi il limite di P1 è lo stack, e ci arriva prima la forma larga (più
    valori intermedi vivi insieme).
 
@@ -417,8 +413,8 @@ sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_tailcal
 
 | variante | min | mediana | max (ns) |
 |---|---:|---:|---:|
-| baseline (0 tail call) | 10 | 10 | 11 |
-| baseline + 1 tail call | 11 | 12 | 13 |
+| baseline (0 tail call) | 9 | 10 | 12 |
+| baseline + 1 tail call | 10 | 11 | 11 |
 
 **+1 ns per salto.** Il salto in sé costa quasi niente: quello che P3 paga per strato (§9) è
 il resto — le letture di mappa che ricostruiscono il contesto a ogni hop.
@@ -431,34 +427,30 @@ il resto — le letture di mappa che ricostruiscono il contesto a ogni hop.
 compilati separatamente, verificati contro `ref_infer_sparse` (5/5 ciascuna); P2 65-6-5-7 e
 P3 65-5-6-4-7 registrati **insieme** al modello reale nello stesso oggetto (PASS).
 
-**Il limite di profondità di P2, e la sua causa.** Fino al 2026-09-28 P2 caricava solo foglie
-con **al più due strati nascosti**: da tre in su `arch_generic_2layer` veniva rifiutato
-(`BPF program is too large. Processed 1000001 insn`, `E2BIG`). Il programma non era troppo
-lungo (16–18 000 istruzioni): era il verificatore a percorrerne molte volte gli stessi
-blocchi. La ReLU scritta `x > 0 ? x : 0` diventava un salto condizionale per neurone, e
-il verificatore esplorava entrambi i lati di ciascuno senza riuscire a riunirli.
-`diag_verifier.py` lo misura con le statistiche del verificatore (`log_level = 4`):
+**Perché la ReLU non ha salti.** Scritta `x > 0 ? x : 0`, la ReLU diventa un salto
+condizionale per neurone, e il verificatore esplora entrambi i lati di ciascuno senza
+riuscire a riunirli: a tre strati nascosti `arch_generic_2layer` di P2 verrebbe rifiutato
+(`BPF program is too large. Processed 1000001 insn`, `E2BIG`) pur avendo solo 16–18 000
+istruzioni. `ipa_relu` calcola `x & ~(x >> 63)`: nessun salto, stesso risultato bit per bit.
+Una barriera `asm volatile("")` impedisce a clang di riconoscere `smax(x, 0)` e di rifarne
+un salto (senza, i salti tornano tutti). `diag_verifier.py` confronta le due scritture con
+le statistiche del verificatore (`log_level = 4`):
 
 ```bash
-sudo python3 ipa/test/diag_verifier.py      # variante `attuale` contro `salto` (la ReLU di prima)
+sudo python3 ipa/test/diag_verifier.py      # variante `attuale` contro `salto`
 ```
 
 | P2, istruzioni percorse (limite 1 000 000) | 1 strato | 2 | 3 | 4 | 5 | 6 |
 |---|---:|---:|---:|---:|---:|---:|
-| ReLU con salto (prima) | 799 563 | 417 292 | *rifiutato* | *rifiutato* | *rifiutato* | *rifiutato* |
+| ReLU con salto (`salto`) | 799 563 | 417 292 | *rifiutato* | *rifiutato* | *rifiutato* | *rifiutato* |
 | ReLU senza salto (`ipa_relu`) | 120 452 | 120 557 | 127 906 | 127 738 | 134 413 | 136 642 |
 
-P3 caricava anche prima; con la stessa `ipa_relu` (per un confronto alla pari fra le tre
-pipeline) `layer_hidden` passa da 186 489 a 27 979 istruzioni percorse, `layer_first` da
-27 183 a 26 755 (`diag_verifier.py --only p3`).
+In P3 la stessa scelta porta `layer_hidden` da 186 489 a 27 979 istruzioni percorse e
+`layer_first` da 27 183 a 26 755 (`diag_verifier.py --only p3`). Tutte e tre le pipeline usano
+`ipa_relu`.
 
-Già a uno strato P2 usava l'80% del limite: il margine era minimo, e per questo il confine
-si spostava fra macchine e versioni del kernel. `ipa_relu` calcola `x & ~(x >> 63)`: nessun
-salto, stesso risultato bit per bit. Una barriera `asm volatile("")` impedisce a clang di
-riconoscere `smax(x, 0)` e di rifarne un salto (senza, i salti tornano tutti).
-
-**Il limite di profondità di oggi** (larghezza 4, descrittore default). Il verificatore non è
-più il vincolo: 154 811 istruzioni percorse a 10 strati, 201 528 a 20 (~4 700 per strato).
+**Il limite di profondità** (larghezza 4, descrittore default). Il verificatore non è il
+vincolo: 154 811 istruzioni percorse a 10 strati, 201 528 a 20 (~4 700 per strato).
 Il primo muro è la **distanza di salto**: le istruzioni di salto eBPF hanno un offset a
 16 bit (±32 767 istruzioni), e i controlli iniziali che escono con `XDP_PASS` saltano fino in
 fondo al programma. A 20 strati il leaf ha 32 388 istruzioni e compila; a 37 e 50 clang si
@@ -504,7 +496,6 @@ model_id ─► arch_registry / layer_registry   (lookup hash)
 
 ```bash
 sudo python3 ipa/test/verify_per_model_semantics.py [--pipeline p2|p3]
-bash ipa/test/remeasure_traffic.sh     # contiene il confronto con l'albero precedente
 ```
 
 **Correttezza: 53/53** su P2 e P3 (casi A–F, ricaricamento R, rimozione). Controllo
@@ -546,6 +537,12 @@ diverse**.
 sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_scaling.py --axis all --out results/
 sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/bench_scaling.py --axis campaign --out results/
 python3 ipa/test/bench_scaling.py --plot results/        # le figure (basta matplotlib)
+```
+
+I CSV citati in questa sezione sono in `results/campagna_2026-10-06/kernel/`
+(`scaling_<asse>.csv`, `model_scaling_test_suite.csv`).
+
+```bash
 sudo python3 ipa/test/bench_scaling.py --verify          # 80/80: la P1 congelata decide come la P1.5
 ```
 
@@ -571,12 +568,12 @@ varia oltre 2× lungo un asse, lo scarto è la macchina.
 
 | | 10 | 25 | 52 | 75 | 100 |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` istruzioni | 647 | 656 | 663 | 647 | 648 |
-| `hardcoded` istruzioni | 776 | 869 | 1 090 | 1 488 | 1 718 |
-| `p1_static` ns | 41 | 40 | 41 | 41 | 38 |
-| `hardcoded` ns | 48 | 45 | 46 | 47 | 45 |
-| `template` ns | 188 | 186 | 188 | 187 | 187 |
-| `modular` ns | 310 | 310 | 307 | 309 | 311 |
+| `p1_static` istruzioni | 602 | 611 | 618 | 602 | 603 |
+| `hardcoded` istruzioni | 731 | 824 | 1 045 | 1 443 | 1 673 |
+| `p1_static` ns | 40 | 40 | 41 | 42 | 39 |
+| `hardcoded` ns | 46 | 45 | 46 | 47 | 46 |
+| `template` ns | 189 | 188 | 192 | 188 | 189 |
+| `modular` ns | 310 | 312 | 312 | 317 | 317 |
 
 La taglia della rete entra nel programma solo in P1.5 (lo `switch` sulla one-hot del nodo si
 srotola); congelando il nodo la dipendenza sparisce. A runtime nessuna pendenza: una one-hot
@@ -586,26 +583,26 @@ legge una sola colonna di pesi qualunque sia la sua larghezza.
 
 | | 1 | 2 | 3 | 4 | 5 | 6 |
 |---|---:|---:|---:|---:|---:|---:|
-| `p1_static` ns | 33 | 41 | 46 | 51 | 56 | 60 |
-| `hardcoded` ns | 40 | 46 | 51 | 57 | 62 | 68 |
-| `template` ns | 166 | 187 | 213 | 235 | 266 | 289 |
-| `modular` ns | 249 | 310 | 358 | 423 | 470 | 513 |
-| `template` istruzioni | 14 657 | 15 142 | 16 866 | 16 998 | 17 992 | 18 990 |
-| `modular` istruzioni | 12 394 | 12 394 | 12 394 | 12 394 | 12 394 | 12 394 |
+| `p1_static` ns | 33 | 41 | 46 | 50 | 56 | 61 |
+| `hardcoded` ns | 40 | 46 | 51 | 57 | 61 | 67 |
+| `template` ns | 171 | 193 | 220 | 241 | 270 | 300 |
+| `modular` ns | 260 | 317 | 370 | 422 | 467 | 524 |
+| `template` istruzioni | 14 604 | 15 089 | 16 813 | 16 945 | 17 939 | 18 937 |
+| `modular` istruzioni | 12 288 | 12 288 | 12 288 | 12 288 | 12 288 | 12 288 |
 
 **P3 ~53 ns per strato a istruzioni identiche**: srotola un layer generico e ci rientra con
 un tail call, quindi la profondità non entra nel programma e si paga in tempo (tail call e
-letture di mappa). **P2 ~25 ns per strato** e ~870 istruzioni: lo strato in più è codice in
-linea. Fino al 2026-09-27 P2 oltre due strati non caricava (§8). P1 ~5 ns per strato.
+letture di mappa). **P2 ~26 ns per strato** e ~870 istruzioni: lo strato in più è codice in
+linea. P1 ~6 ns per strato.
 
 **`width`** (neuroni per hidden layer 2 → 8):
 
 | | 2 | 4 | 6 | 8 |
 |---|---:|---:|---:|---:|
-| `p1_static` | 27 | 42 | 51 | 67 |
-| `hardcoded` | 34 | 47 | 61 | 75 |
-| `template` | 174 | 190 | 201 | 212 |
-| `modular` | 279 | 306 | 341 | 383 |
+| `p1_static` | 26 | 41 | 52 | 68 |
+| `hardcoded` | 34 | 46 | 60 | 75 |
+| `template` | 178 | 192 | 203 | 216 |
+| `modular` | 280 | 314 | 343 | 386 |
 
 Allargare i layer nascosti si paga su tutte: *la rete può crescere quanto vuole, il modello
 no.*
@@ -614,69 +611,70 @@ no.*
 
 | | 1 | 2 | 3 | 4 | 5 |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` | 52 | 54 | 55 | 67 | 66 |
-| `hardcoded` | 60 | 65 | 62 | 75 | 71 |
-| `template` | 169 | 189 | 206 | 261 | **268 (+59%)** |
-| `modular` | 274 | 321 | 355 | 443 | **471 (+72%)** |
+| `p1_static` | 56 | 54 | 57 | 67 | 68 |
+| `hardcoded` | 62 | 64 | 63 | 72 | 71 |
+| `template` | 175 | 190 | 207 | 254 | **268 (+53%)** |
+| `modular` | 284 | 328 | 358 | 445 | **490 (+73%)** |
 
-A parità di parametri le due P1 crescono poco e non in modo monotono (circa +25% fra gli
-estremi); P2 cresce del 59% e P3, a istruzioni identiche in tutti e cinque i punti, del 72%.
+A parità di parametri le due P1 crescono poco e non in modo monotono (+15–20% fra gli
+estremi); P2 cresce del 53% e P3, a istruzioni identiche in tutti e cinque i punti, del 73%.
 
 **`descriptor`** — istruzioni:
 
 | | default | no_onehot | small_onehot | big_onehot |
 |---|---:|---:|---:|---:|
-| `p1_static` | 663 | 656 | 649 | 563 |
-| `hardcoded` | 1 090 | 656 | 649 | 976 |
-| `template` / `modular` | 15 142 / 12 394 | ← | ← | ← |
+| `p1_static` | 618 | 611 | 604 | 518 |
+| `hardcoded` | 1 045 | 611 | 604 | 931 |
+| `template` / `modular` | 15 089 / 12 288 | ← | ← | ← |
 
 Cambiare la composizione del vettore d'ingresso ricompila P1, mentre P2 e P3 leggono il
 descrittore da `model_desc`. È anche il **controllo** della specializzazione: dove il
-descrittore non dichiara la feature `node` le due P1 sono identiche alla cifra (656/656,
-649/649); dove la dichiara divergono.
+descrittore non dichiara la feature `node` le due P1 sono identiche alla cifra (611/611,
+604/604); dove la dichiara divergono.
 
 **`sparsity`** (frazione di pesi zero):
 
 | | 0% | 25% | 50% | 75% | 90% |
 |---|---:|---:|---:|---:|---:|
-| `p1_static` istruzioni | 663 | 609 | 529 | 446 | **263** |
-| `hardcoded` istruzioni | 1 090 | 968 | 885 | 717 | **357** |
-| `p1_static` ns | 41 | 36 | 30 | 24 | 19 |
-| `hardcoded` ns | 47 | 42 | 35 | 31 | 26 |
-| `template` / `modular` ns | 189 / 307 | 186 / 307 | 186 / 311 | 188 / 310 | 188 / 310 |
+| `p1_static` istruzioni | 618 | 564 | 484 | 401 | **243** |
+| `hardcoded` istruzioni | 1 045 | 923 | 840 | 672 | **337** |
+| `p1_static` ns | 40 | 36 | 28 | 23 | 19 |
+| `hardcoded` ns | 45 | 41 | 35 | 31 | 25 |
+| `template` / `modular` ns | 188 / 307 | 187 / 310 | 187 / 310 | 187 / 311 | 188 / 310 |
 
 I pesi di P1 sono letterali nel C, quindi clang cancella i prodotti per zero: al 90% di zeri
 P1 perde più di metà della latenza, mentre per P2/P3 uno zero è un byte in mappa come un
 altro. Le due P1 convergono (il divario scende da 427 a 94 istruzioni): sparsità e nodo
-congelato sono due strade alla stessa riduzione.
+congelato sono due strade alla stessa riduzione. Sotto traffico vero lo stesso (§10.8): al
+90% di zeri P1 passa da 113 a 95 ns di CPU per pacchetto, P2 e P3 restano fermi.
 
 ### Congelare il nodo: P1 specializzata contro P1.5
 
 | | 10 nodi | 52 nodi (Germany50) | 100 nodi |
 |---|---:|---:|---:|
-| istruzioni `p1_static` / `hardcoded` | 647 / 776 | 663 / 1 090 (−39%) | 648 / 1 718 (−62%) |
-| codice nativo (B) | 2 884 / 3 507 | 2 929 / 5 294 (−45%) | 2 867 / 8 507 (−66%) |
-| latenza (ns) | 41 / 48 | 41 / 46 (−11%) | 38 / 45 (−16%) |
+| istruzioni `p1_static` / `hardcoded` | 602 / 731 | 618 / 1 045 (−41%) | 603 / 1 673 (−64%) |
+| codice nativo (B) | 2 709 / 3 332 | 2 754 / 5 112 (−46%) | 2 692 / 8 325 (−68%) |
+| latenza (ns) | 40 / 46 | 41 / 46 (−11%) | 39 / 46 (−15%) |
 
 La riga della specializzata è **piatta**: la feature più grossa del modello (52 dei 65
 ingressi, 208 dei 319 pesi) smette di dipendere dalla taglia della rete. In tempo il
 guadagno c'è ma è piccolo (5–7 ns): lo `switch` ha N casi ma ne esegue uno. Il prezzo è un
-binario per nodo: `build_ms` ~70 ms (p1_static) e ~80-120 ms (hardcoded) per compilazione,
+binario per nodo: `build_ms` ~70 ms (p1_static) e ~75-115 ms (hardcoded) per compilazione,
 N volte su una rete di N nodi. Aggiornare il modello sul nodo (oggetto AOT già compilato)
 costa ~1 ms per entrambe.
 
 ### Aggiornare il modello
 
-`update_ms` (installare un modello nuovo su un nodo in servizio): P1 e P1.5 **0,7–2,1 ms**
+`update_ms` (installare un modello nuovo su un nodo in servizio): P1 e P1.5 **0,4–2,2 ms**
 (caricamento dell'oggetto AOT), P2 e P3 **10–12 ms** (scritture in mappa, compresa la
-semantica). `build_ms` (una volta): P1 66–120 ms di clang sulla macchina di build, P2
-~1,5 s e P3 ~1,2 s di BCC all'avvio del nodo. Con l'oggetto precompilato non c'è più un
-divario di ordini di grandezza a favore di P2/P3: resta la differenza qualitativa, P1
-richiede un compilatore (fuori dal nodo) per ogni modello nuovo.
+semantica). `build_ms` (una volta): P1 57–121 ms di clang sulla macchina di build, P2
+~1,5 s e P3 ~1,2 s di BCC all'avvio del nodo. Nessun divario di ordini di grandezza fra le
+pipeline: resta la differenza qualitativa, P1 richiede un compilatore (fuori dal nodo) per
+ogni modello nuovo (§5).
 
 ### Campagna sulle architetture (`--axis campaign`)
 
-Quattro assi, cinque pipeline inclusa la baseline, un CSV: `results/model_scaling_test_suite.csv`.
+Quattro assi, cinque pipeline inclusa la baseline, un CSV: `model_scaling_test_suite.csv`.
 
 | Asse | Valori | Cosa muove |
 |---|---|---|
@@ -689,41 +687,40 @@ Retta ai minimi quadrati sui quattro assi insieme:
 
 | Pipeline | ns / MAC **eseguita** | r² | ns / MAC nominale | r² |
 |---|---:|---:|---:|---:|
-| p1_static | 0,287 | **0,99** | 0,070 | 0,62 |
-| hardcoded | 0,290 | **0,98** | 0,076 | 0,70 |
-| template | 0,548 | 0,71 | 0,085 | 0,22 |
-| modular | 1,175 | **0,91** | 0,098 | 0,08 |
+| p1_static | 0,287 | **0,99** | 0,071 | 0,63 |
+| hardcoded | 0,292 | **0,98** | 0,076 | 0,69 |
+| template | 0,574 | 0,71 | 0,092 | 0,24 |
+| modular | 1,195 | **0,92** | 0,106 | 0,10 |
 
 Con le MAC nominali il modello spiega poco; con quelle **eseguite** i quattro assi
 collassano sulla stessa retta. Una one-hot occupa `size` colonne nella matrice dei pesi ma
-nel datapath ne attiva una: contarla come `size × h1` sovrastima. **P3 costa 4,1× P1 per
+nel datapath ne attiva una: contarla come `size × h1` sovrastima. **P3 costa 4,2× P1 per
 MAC eseguita**: il prezzo di leggere i pesi da una tabella invece che averli come letterali.
 Il template ha r² più basso perché ha un costo fisso alto rispetto alla pendenza, e il suo
 residuo più grande sta su `width_camp`, dove i neuroni oltre la larghezza del modello
 vengono calcolati comunque fino al soffitto.
 
 L'asse `iv_onehot` lo mostra direttamente: n_in ×4, pesi ×2,4, latenza piatta su tutte
-(p1_static 65/65/64, hardcoded 65/64/64, template 170/170/169, modular 363/367/367 ns) mentre
-le istruzioni di P1 vanno da 1 144 a 1 632.
+(p1_static e hardcoded 65/63/64, template 169/168/170, modular 361/364/367 ns) mentre le
+istruzioni di P1 vanno da 1 099 a 1 587.
 
 I muri: larghezza 16 e 32 su P2/P3 sfondano `T2_MAX_H1`/`ML1_MAX_H1` = 8 e il banco segna
 `RIFIUTATO` prima di compilare (P3 risponderebbe `XDP_PASS` a runtime, cioè una misura di un
-programma che non calcola). Larghezza 32 su P1 non compila (stack). Fino al 2026-09-27
-anche larghezza 16 su P1 era rifiutata dal verificatore: con `ipa_relu` carica (166 ns
-p1_static, 170 hardcoded).
+programma che non calcola). Larghezza 16 su P1 carica (166 ns p1_static, 171 hardcoded);
+larghezza 32 non compila (stack).
 
-**Calibrazione contro la suite kernel**, stesso modello 65-4-4-7: campagna 18 / 46 / 190 /
-305 ns contro `test_suite` 18 / 52 / 195 / 315 ns (baseline, hardcoded, template, modular):
-entro 0 / −12%, sempre nello stesso verso, e i programmi non sono identici (pesi sintetici
-contro pesi del modello: 1 090 contro 1 064 istruzioni per P1.5).
+**Calibrazione contro la suite kernel**, stesso modello 65-4-4-7: campagna 14 / 45 / 187 /
+308 ns contro `test_suite` 14 / 52 / 194 / 318 ns (baseline, hardcoded, template, modular):
+entro 0 / −13%, sempre nello stesso verso, e i programmi non sono identici (pesi sintetici
+contro pesi del modello: 1 045 contro 1 019 istruzioni per P1.5).
 
 ---
 
 ## Risultati (kernel, `test_suite.py --only kernel`, modello 65→4→4→7, scala 24)
 
-Un solo run, un solo stato del codice (2026-09-29: `ipa_relu` §8, contatori per-CPU §10.1),
-sotto `host_conditions`, alimentatore collegato, DUT a 3 493 MHz; minimo su 7 trial con
-p50/max. P1 è la specializzata (nodo 7 compilato dentro), P1.5 l'oggetto che si deploya.
+Un solo run (campagna del 2026-10-06, sezione `kernel`), sotto `host_conditions`, DUT a
+3,49 GHz misurati, a batteria senza throttling; minimo su 7 trial con p50/max. P1 è la
+specializzata (nodo 7 compilato dentro), P1.5 l'oggetto che si deploya.
 
 | Metrica | baseline | P1 (p1_static) | P1.5 hardcoded | P2 template | P3 modular |
 |---|---:|---:|---:|---:|---:|
@@ -732,11 +729,11 @@ p50/max. P1 è la specializzata (nodo 7 compilato dentro), P1.5 l'oggetto che si
 | Tail call / pacchetto | 0 | 1 | 1 | 1 | **3** |
 | Map lookup / pacchetto | 3 | 5 | 6 | 11 | **29** |
 | Memoria mappe (byte) | 1 960 | 4 196 | 4 196 | 147 624 | 177 452 |
-| **Latenza min (ns/pkt)** | **14** | **48** | **53** | **200** | **314** |
-| ...p50 | 14 | 48 | 53 | 200 | 317 |
-| ...max | 15 | 48 | 54 | 201 | 320 |
-| ...spread (max−min)/min | 7% | 0% | 2% | 0% | 2% |
-| Throughput teorico (Mpps, 1/latenza) | 71,4 | 20,8 | 18,9 | 5,0 | 3,2 |
+| **Latenza min (ns/pkt)** | **14** | **46** | **52** | **194** | **318** |
+| ...p50 | 15 | 47 | 52 | 195 | 324 |
+| ...max | 15 | 47 | 52 | 196 | 327 |
+| ...spread (max−min)/min | 7% | 2% | 0% | 1% | 3% |
+| Throughput teorico (Mpps, 1/latenza) | 71,4 | 21,7 | 19,2 | 5,2 | 3,1 |
 
 | | dispatcher | leaf |
 |---|---|---|
@@ -749,22 +746,19 @@ p50/max. P1 è la specializzata (nodo 7 compilato dentro), P1.5 l'oggetto che si
 Correttezza, stesso run: dispatch TTL 2-6 **5/5** su tutte e quattro (P1, col nodo 7 compilato
 dentro, decide la classe 1; le altre, senza nodo, la 2); TTL (decremento + checksum +
 scadenza) **2/2** su tutte e quattro; `link_state` reroute **15/30** casi di link-down
-cambiano uscita; architetture alternative PASS. Aggiornamento del modello di P1 sul nodo
-(open + caricamento dell'oggetto AOT): **0,6–0,9 ms**.
+cambiano uscita; architetture alternative (P1 65-8-7 e 65-4-4-4-7, P2 65-6-5-7, P3
+65-5-6-4-7) PASS. Aggiornamento del modello di P1 sul nodo (open + caricamento dell'oggetto
+AOT): **0,6–0,9 ms**.
 
 **P1 contro P1.5**: 413 istruzioni in meno (lo switch sui 52 nodi della one-hot sparisce),
-una lettura di tabella in meno (`node_id`), **5 ns** in meno. L'analisi parametrica, con
-pesi sintetici, dava 5–9 ns (§9).
-
-**Rispetto al 2026-09-28** (18 / 52 / 195 / 315 ns, contatori atomici): la baseline perde 20
-istruzioni e 4 ns, cioè i due incrementi atomici di `pkt_stats` e `cls_stats`; P1.5, P2 e P3
-cambiano di +1 / +5 / −1 ns, dentro la variazione fra i run. La memoria delle mappe per-CPU
-si conta una volta per CPU (22): da qui 1 960 byte per la baseline contro 280.
+una lettura di tabella in meno (`node_id`), **6 ns** in meno. L'analisi parametrica, con
+pesi sintetici, dà 5–7 ns (§9). La memoria delle mappe per-CPU si conta una volta per CPU
+(22): da qui 1 960 byte per la baseline.
 
 ### La dimensione non predice la velocità
 
-**P3 ha il 19% di istruzioni in meno di P2 ed è il 57% più lento** (12 288 contro 15 089;
-314 contro 200 ns). Le righe che lo spiegano: **3 tail call** contro 1, **29 lookup** contro
+**P3 ha il 19% di istruzioni in meno di P2 ed è il 64% più lento** (12 288 contro 15 089;
+318 contro 194 ns). Le righe che lo spiegano: **3 tail call** contro 1, **29 lookup** contro
 11. Il conteggio `xlated` misura quanto è grande il programma, non quanto lavora.
 
 P2 è più grande perché tiene la rete intera in un programma: `arch_generic_2layer` srotola
@@ -775,9 +769,10 @@ letture di `scratch_meta`, `scratch_acts`, `layer_shapes`, i pesi).
 
 Le istruzioni sono un conteggio **statico**: in P1.5 lo switch della one-hot `node` ha 52
 casi e ne esegue uno, e con i pesi letterali clang cancella i prodotti per zero e trasforma
-in shift le potenze di due. 1 019 istruzioni in 53 ns sarebbero 5,5 istruzioni per ciclo a
+in shift le potenze di due. 1 019 istruzioni in 52 ns sarebbero 5,6 istruzioni per ciclo a
 3,5 GHz, sopra ogni processore reale: il percorso eseguito è una frazione del conteggio. In
-P1 lo switch non c'è più (606 istruzioni).
+P1 lo switch non c'è (606 istruzioni). I contatori hardware del traffico vero (§10.8) dicono
+quante istruzioni si eseguono davvero.
 
 ### I soffitti compilati e il verificatore
 
@@ -795,10 +790,9 @@ chieda più slot di coda di quanti il datapath ne compili, invece di troncarlo.
 **Istruzioni e complessità di verifica sono valute diverse.** Il verificatore percorre ogni
 cammino del corpo srotolato, e il costo cresce col **prodotto** dei soffitti: con soffitti
 larghi (`8 × 4 × 128`) P2 si ferma a `processed 1000001 insns (limit 1000000)` con ~14 900
-istruzioni, cioè dentro il limite di dimensione ma oltre quello di complessità. È lo stesso
-limite che fino al 2026-09-27 fermava P2 oltre due strati nascosti (§8) e P1 oltre ~300 pesi
-(§6), prima della ReLU senza salto. Questi limiti sono scogliere, non pendenze: un soffitto
-si cambia e **si rimisura**.
+istruzioni, cioè dentro il limite di dimensione ma oltre quello di complessità: lo stesso
+limite che una ReLU con il salto farebbe toccare a P2 già a tre strati (§8). Questi limiti
+sono scogliere, non pendenze: un soffitto si cambia e **si rimisura**.
 
 BCC riporta i rifiuti come `Program too large (N insns), at most 4096 insns`: il 4096 è una
 costante vecchia nella stringa d'errore di BCC (P2 carica a ~15 000). Va letto come "il
@@ -818,10 +812,10 @@ fa 5, perché il nodo è compilato dentro.
 
 | | |
 |---|---|
-| build offline (clang → `.o`) | 75,8 ms, una volta, sulla macchina di build |
-| deploy sul nodo | **1,12 ms** (`open` 0,09 + verifica e JIT 1,03) |
-| istruzioni | 1 019 (dispatch 29 + modello 990; 1 064 prima dei contatori per-CPU) |
-| latenza | **51 ns/pkt** (percorso d'inoltro, retval 4), come in `test_suite` (52–53) |
+| build offline (clang → `.o`) | 78 ms, una volta, sulla macchina di build |
+| deploy sul nodo | **1,06 ms** (`open` 0,08 + verifica e JIT 0,97) |
+| istruzioni | 1 019 (dispatch 29 + modello 990) |
+| latenza | **52 ns/pkt** (percorso d'inoltro, retval 4), come in `test_suite` |
 
 La strength reduction sui pesi letterali resta dentro l'oggetto, quindi il costo per pacchetto
 non peggiora, e il compilatore sparisce dal nodo.
@@ -861,29 +855,27 @@ xdp_gen (cpu10) ──veth ipatg0p→ipatg0──► [XDP: pipeline] (DUT, cpu6)
   (`veth` è LLTX, il `ptr_ring` serializza i produttori col suo `producer_lock`) la svuotano
   più lentamente e rallentano anche il core del nodo (§10.3). Il banco avvisa se due thread
   cadono nella stessa coda.
-- **Una coda d'uscita per core del DUT** (`--egress-queues auto`, dal 2026-10-01). Stessa
-  regola in uscita: `auto` sceglie il numero minimo di code per cui i core del DUT cadono in
+- **Una coda d'uscita per core del DUT** (`--egress-queues auto`). Stessa regola in uscita: `auto` sceglie il numero minimo di code per cui i core del DUT cadono in
   code diverse (con i core 6 e 8 sono 3: 6 → 0, 8 → 2; con 2 code cadrebbero entrambi nella
-  0). Con un core del DUT è 1. `--egress-queues 1` riproduce il comportamento vecchio.
-  `env.csv` riporta la mappa (`code_uscita`). Perché serve: §10.4.
-- **Una chiamata per finestra** (dal 2026-10-02). Ogni chiamata a `test_run` in modalità live
-  parte e finisce con una pausa del thread di ~12 ms dentro il kernel. Con chiamate da 2^20
-  frame ce n'erano 2–4 per finestra: il generatore taceva il ~13% del tempo, il DUT svuotava
-  la coda e dormiva, e risultava occupato all'~87% anche a coda piena (fino al 2026-10-01
-  questo documento lo attribuiva a "raffiche" del generatore: era sbagliato). Lo hanno
-  mostrato le statistiche di scheduling del thread NAPI del DUT (§11.7). Ora la finestra è una
-  sola chiamata, interrotta da un segnale a fine misura (`STEADY_CALL_FRAMES`).
+  0). Con un core del DUT è 1. `env.csv` riporta la mappa (`code_uscita`). Perché serve:
+  §10.4.
+- **Una chiamata per finestra.** Ogni chiamata a `test_run` in modalità live parte e finisce
+  con una pausa del thread di ~12 ms dentro il kernel: con più chiamate per finestra il
+  generatore tacerebbe una parte del tempo e il DUT svuoterebbe la coda e dormirebbe. La
+  finestra è quindi una sola chiamata, interrotta da un segnale a fine misura
+  (`STEADY_CALL_FRAMES`); le statistiche di scheduling del thread NAPI del DUT
+  (`napi_run_pct`, §11.3) confermano che a coda piena il nodo lavora il 100% del tempo.
 - **Tempo di CPU per pacchetto** (colonne `cpu_dut_pct`, `ns_cpu`, `ns_cpu_vs_baseline`):
   l'occupazione dei core del DUT letta da `/proc/stat` **nella stessa lettura** dei contatori
   della finestra stazionaria, × core / elaborati. Con il DUT al 100% coincide con
   1e9 / elaborati, ed è così in tutte le misure di questa sezione. La diagnostica è attiva per
   default (`--no-diag` la spegne); risoluzione ~3% (un jiffy di 10 ms su ~300 ms di finestra).
+- **Istruzioni e cicli per pacchetto** (colonne `instr_pkt`, `cycles_pkt`, `ipc`, …): i
+  contatori hardware dei core del nodo e dell'uscita, nella stessa lettura (§10.8).
 - **Contatori per-CPU**: `pkt_stats` e `cls_stats`, in tutte le pipeline e nella baseline,
   sono `PERCPU_ARRAY`: ogni core incrementa la sua copia, senza istruzioni atomiche e senza
   contendersi una riga di cache quando i pacchetti arrivano su più code. I lettori sommano i
-  core (`ipa/stats_maps.py`). Sotto `BPF_PROG_TEST_RUN` (29-09) la baseline scende da 18 a 14
-  ns e perde 20 istruzioni, i due incrementi atomici; P1.5 / P2 / P3 danno 53 / 200 / 314
-  contro 52 / 195 / 315, dentro la variazione fra i run (§ Risultati).
+  core (`ipa/stats_maps.py`).
 - **Tre punti di conteggio**: TX (tentativi del generatore), HIT (`pkt_stats[0]` della
   pipeline), RX (contatore d'uscita). TX − HIT è ciò che non è arrivato al programma, HIT − RX
   ciò che il programma ha elaborato e non è uscito.
@@ -899,101 +891,66 @@ xdp_gen (cpu10) ──veth ipatg0p→ipatg0──► [XDP: pipeline] (DUT, cpu6)
 ### 10.2 Saturazione con xdp_gen (`--mode compare --generator xdp`)
 
 ```bash
-bash ipa/test/remeasure_xdp.sh        # uno e due core, curve del bit rate, modelli (~15 min)
+bash ipa/test/remeasure_campagna.sh pcore       # tutte le misure di questa sezione sul P-core
 # un core, un thread di generatore, uscita su un core suo
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
-    --rounds 3 --gen-cpus 10 --dut-cpus 6 --out results/cpu_time/xdp_1thread
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto \
-    --per-class --rounds 3 --gen-cpus 10 --dut-cpus 6 --out results/cpu_time/xdp_per_class
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
+    --gen-cpus 10 --dut-cpus 6 --egress-cpu 8 --out results/pcore_compare
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
+    --gen-cpus 10 --dut-cpus 6 --egress-cpu 8 --per-class --out results/pcore_per_class
 ```
 
 Costo del nodo = **tempo di CPU per pacchetto** (§10.1): dalla presa dalla coda di ricezione
-alla decisione e al redirect, con l'uscita su una CPU sua (cpu8). 2026-10-02, stessa
-sessione delle misure a due core (§10.4) e delle curve (§11.6), alimentatore, macchina non
-disturbata (`results/cpu_time/xdp_1thread/`):
+alla decisione e al redirect, con l'uscita su una CPU sua (cpu8). Nodo su cpu6 a 3,5 GHz,
+alimentatore, macchina non disturbata (`results/campagna_2026-10-06/pcore/compare/`):
 
-| | elaborati (Mpps) | variazione fra i giri | respinti | nodo occupato | **ns di CPU** | sopra la baseline |
-|---|---:|---:|---:|---:|---:|---:|
-| rxonly | 19,11 | 1,6% | 1% | 77% | 40 (non satura) | — |
-| baseline | 15,13 | 1,5% | 0,03% | 100% | **66** (satura appena) | — |
-| p1_static | 8,69 | 1,3% | 24% | 100% | **115** | **+49** |
-| hardcoded | 8,07 | 1,2% | 27% | 100% | **124** | **+58** |
-| template | 3,41 | 2,4% | 71% | 100% | **293** | **+227** |
-| modular | 2,41 | 3,2% | 81% | 100% | **416** | **+350** |
+| | elaborati (Mpps) | respinti | nodo occupato | **ns di CPU** | sopra la baseline | cicli / pk | istruzioni / pk | IPC |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| rxonly | 19,47 | 1% | 79% | 41 (non satura) | — | 161 | 384 | 2,4 |
+| baseline | 15,27 | 0,4% | 100% | **66** | — | 225 | 606 | 2,7 |
+| p1_static | 8,56 | 26% | 100% | **117** | **+51** | 402 | 1 220 | 3,0 |
+| hardcoded | 8,04 | 29% | 100% | **124** | **+58** | 432 | 1 426 | 3,3 |
+| template | 3,45 | 71% | 100% | **290** | **+224** | 1 013 | 4 556 | 4,5 |
+| modular | 2,36 | 81% | 100% | **425** | **+359** | 1 483 | 6 573 | 4,4 |
 
-**Il nodo lavora il 100% del tempo, e 1e9 / elaborati coincide con il tempo di CPU.** Le
-mediane variano fra i giri dell'1–3%. Controllo di validità PASS
-(la baseline è la più veloce delle pipeline). **P1 e P1.5 si separano**: 8,69 contro 8,07
-Mpps, ~9 ns. L'ordine P1 < P1.5 < P2 < P3 regge in ogni giro.
+**Il nodo lavora il 100% del tempo, e 1e9 / elaborati coincide con il tempo di CPU.** I
+cicli per pacchetto coincidono con ns × 3,5 GHz (baseline 225 contro 231, P3 1 483 contro
+1 487). Controllo di validità PASS (la baseline è la più veloce delle pipeline); l'ordine
+P1 < P1.5 < P2 < P3 regge in ogni giro.
 
-- **La baseline satura appena**: il generatore ne offre 15,13 Mpps, quanti il nodo ne regge
-  (1 / 66 ns = 15,1). **rxonly non satura** (il nodo è al 77%): il suo tempo di CPU è misurato
-  con meno pacchetti per giro di ricezione, ed è indicativo.
-- **P3 varia fra sessioni** più delle altre: 416 ns qui, 436–460 in altre sessioni dello
-  stesso giorno (§10.4, §12.3).
-- **Sotto capacità nessun respinto**: lo mostrano le curve (§11.6, ≤ 0,02%).
-- **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro il 2,5% su ogni
-  pipeline (2026-10-02, un thread, `results/throughput_xdp_frames/`): P1 113–115, P1.5 122,
-  P2 299–302, P3 421–431 ns. Il nodo tocca solo le intestazioni.
-- **Per classe** (`results/cpu_time/xdp_per_class/`, 2026-10-02, stato dei link e TTL cercati
-  per ciascuna delle 6 classi raggiungibili, classe decisa verificata), ns di CPU:
+- **La baseline satura appena**: il generatore ne offre 15,3 Mpps, quanti il nodo ne regge.
+  **rxonly non satura** (il nodo è al 79%): il suo tempo di CPU è indicativo.
+- **P3 varia fra sessioni** più delle altre: lo stesso 65-4-4-7 dà 416–445 ns in misure
+  diverse della stessa giornata (§10.8), con IPC fra 4,2 e 4,5.
+- **Sotto capacità nessun respinto**: lo mostrano le curve (§11.6).
+- **Taglia del frame**: 64 / 512 / 1514 B danno lo stesso costo entro l'1% su ogni pipeline
+  (`pcore/frames/`): baseline 65–66, P1 118–120, P1.5 126–127, P2 284–287, P3 418–419 ns.
+  Il nodo tocca solo le intestazioni.
+- **Per classe** (`pcore/per_class/`, stato dei link e TTL cercati per ciascuna delle 6 classi
+  raggiungibili, classe decisa verificata), ns di CPU:
 
   | | classi FORWARD (0–4) | classe DROP (5) | differenza |
   |---|---:|---:|---:|
-  | P1 | 114–119 | 168 | +49–54 |
-  | P1.5 | 122–126 | 180 | +55–58 |
-  | P2 | 256–286 | 309 | +23–52 |
-  | P3 | 423–432 | 473 | +41–50 |
+  | P1 | 118–120 | 166 | +46–48 |
+  | P1.5 | 124–127 | 176 | +49–52 |
+  | P2 | 245–274 | 304 | +30–59 |
+  | P3 | 416–426 | 467 | +41–51 |
 
-  **Scartare costa ~50 ns più che inoltrare**, come nella misura del 30-09 (+55 / +53 /
-  +20–45 / +50). Durante il run il pacchetto ha registrato 3 eventi di throttling e la CPU del
-  generatore è scesa a 3,4 GHz: il banco ha marcato il run, ma la CPU del DUT è rimasta a
-  3,5 GHz e il costo è tempo di CPU del DUT. Con il DROP la pagina del pacchetto si
-  restituisce sul core del nodo, con l'inoltro sul core d'uscita.
+  **Scartare costa ~50 ns più che inoltrare.** Con il DROP la pagina del pacchetto si
+  restituisce sul core del nodo, con l'inoltro sul core d'uscita. L'IPC dello scarto è più
+  basso (P1 1,8 contro 2,9–3,0).
 
 **Il controllo di validità conta gli elaborati, non gli arrivati.** Se l'uscita non tiene il
 passo del nodo si perde dopo XDP, e contando gli arrivati la pipeline più veloce sembrerebbe
-la più lenta (è successo con due core e una coda d'uscita, §10.4). `check_validity` confronta
-`node_pps` (elaborati, altrimenti HIT, altrimenti RX), la stessa grandezza del costo.
+la più lenta. `check_validity` confronta `node_pps` (elaborati, altrimenti HIT, altrimenti
+RX), la stessa grandezza del costo.
 
-**Le misure di prima** (30-09 e 01-10) davano gli stessi tempi di CPU (116–117 / 124–125 /
-292–293 / 428–432 ns) ma Mpps più bassi del ~13% (7,59 / 7,08 / 2,97 / 2,01), il tempo in
-cui il generatore taceva (§10.1). Quelle del 28-09 a 3 thread (`results/throughput_xdp/`)
-contenevano anche la contesa della coda d'ingresso (§10.3).
+### 10.3 Uno scrittore per coda
 
-### 10.3 Uno scrittore per coda (2026-09-30)
-
-**La domanda.** Con 3 thread di `xdp_gen` rxonly, baseline, P1 e P1.5 si fermavano tutte
-intorno a 7 Mpps, con il generatore che offriva 34–39 Mpps e l'80% respinto. Era il tetto del
-generatore o del nodo?
-
-**Nessuno dei due: la coda condivisa.** Con meno thread il nodo elabora **di più**
-(`results/generator_contention/summary.csv`; un core, uscita separata; queste tre righe a
-batteria). Tutte le cifre di questa sezione sono del 30-09, con il generatore che taceva il
-~13% del tempo a ogni chiamata (§10.1): in assoluto sono basse, il confronto fra le righe
-regge perché lo pagano tutte:
-
-| thread del generatore | offerti (rxonly) | rxonly | baseline | P1.5 |
-|---|---:|---:|---:|---:|
-| 1 | 15 | 14,9 | 12,4 | 6,9 |
-| 2 | 25 | 9,8 | 7,3 | 6,3 |
-| 3 | 39 | 7,4 | 7,2 | 6,2 |
-
-La conferma con l'alimentatore, due core sul nodo (due code d'ingresso), con **una** coda
-d'uscita condivisa (la configurazione di allora, §10.4): 2 thread, **uno per coda**, contro 3
-thread, due dei quali sulla stessa coda:
-
-| Mpps elaborati | rxonly | baseline | P1 | P1.5 | P2 | P3 |
-|---|---:|---:|---:|---:|---:|---:|
-| 2 thread (uno per coda) | 39,4 | 13,0 | 10,0 | 9,5 | 4,7 | 3,4 |
-| 3 thread (due su una coda) | 29,0 | 7,6 | 6,8 | 6,6 | 4,4 | 3,4 |
-| guadagno | +36% | +72% | +46% | +45% | +6% | +1% |
-
-Più scrittori nella stessa coda (il `ptr_ring` del veth: lucchetto dei produttori e righe di
-cache condivise) la svuotano più lentamente, e il costo per pacchetto sale anche per il core
-del nodo: a 3 thread rxonly spende ~130 ns di CPU per pacchetto, con uno scrittore 40. Il
-danno è grande per le pipeline leggere e trascurabile per P2 e P3, il cui limite è comunque
-il programma.
+Il redirect di `xdp_gen` nel veth sceglie la coda del DUT come CPU che trasmette modulo
+numero di code. Più thread sulla stessa coda (`veth` è LLTX, il `ptr_ring` serializza i
+produttori col suo `producer_lock`) la svuotano più lentamente: lucchetto dei produttori e
+righe di cache condivise passano da un core all'altro a ogni pacchetto, e il costo per
+pacchetto sale anche per il core del nodo, tanto più quanto la pipeline è leggera.
 
 **La regola**: un solo scrittore per coda, in ingresso e in uscita. Su un core del nodo è
 **1 thread di generatore, uscita su un core suo** (§10.2). Con N core del nodo: N code
@@ -1002,149 +959,229 @@ d'uscita per coda (`--egress-cpu N,M`), §10.4. Il banco lo controlla: avvisa se
 finiscono sulla stessa coda e se più core del nodo inoltrano nella stessa coda d'uscita.
 
 **Con una scheda di rete vera il problema non c'è.** La coda di ricezione la riempie la
-scheda (DMA), e il core del nodo la svuota: un solo scrittore per costruzione, gli altri host
-arrivano in fila sul cavo. Resta il fenomeno che conta: se il nodo è più lento del traffico
-la coda si riempie e la scheda scarta (`rx_missed` in `ethtool -S`), cioè la perdita
-all'ingresso di §11. Con RSS ogni coda ha il suo core e sempre un solo scrittore.
-
-**Scartare contro inoltrare.** `rxonly_fwd` è `rxonly` che all'ultima istruzione inoltra
-invece di scartare (`--method rxonly,rxonly_fwd`). A 3 thread, stessa sessione, 5 giri,
-alimentatore: rxonly 7,21 Mpps, rxonly_fwd 7,53 (+4%), baseline 7,21
-(`results/generator_contention/drop_contro_inoltro_alimentatore/`): dentro il regime conteso
-non si confrontano. La misura pulita è quella per classe (§10.2): scartare costa ~50 ns in più.
+scheda (DMA), e il core del nodo la svuota: un solo scrittore per costruzione. Resta il
+fenomeno che conta: se il nodo è più lento del traffico la coda si riempie e la scheda
+scarta (`rx_missed` in `ethtool -S`), cioè la perdita all'ingresso di §11. Con RSS ogni
+coda ha il suo core e sempre un solo scrittore.
 
 ### 10.4 Due core: una coda e un core d'uscita per core
 
-**Il problema.** Con due core sul nodo e `xdp_gen` (2 thread, uno per coda d'ingresso, uscita
-su cpu3), il 30-09 baseline, P1 e P1.5 non raddoppiavano e perdevano dopo XDP: la baseline
-elaborava 13,05 Mpps e ne arrivavano 4,26 (`results/generator_contention/
-xdp_2core_2thread_uscita_separata/`). Il generatore non c'entrava: offriva 18–26 Mpps e la
-coda d'ingresso ne respingeva il 28–50%.
-
-**La causa: l'uscita.** Il fabric creava ogni veth d'uscita con una coda. Il redirect sceglie
-la coda del peer come CPU che inoltra modulo numero di code, quindi i due core del nodo
-scrivevano nello stesso `ptr_ring`, e un solo thread NAPI d'uscita lo svuotava. Due effetti:
-
-1. **contesa sul ring**: lucchetto dei produttori e righe di cache passano da un core
-   all'altro a ogni pacchetto, e il costo lo paga il core del nodo nel redirect;
-2. **un core d'uscita solo non basta**: ricevere, contare e restituire la pagina alla
-   page_pool del generatore costa a cpu3 ~70 ns a pacchetto, cioè un tetto di ~10 Mpps; oltre
-   il ring trabocca, il redirect fallisce e il nodo paga anche lo scarto.
-
-Nella stessa sessione rxonly, che non fa redirect, elaborava 38 Mpps; rxonly_fwd, che fa solo
-il redirect, ~15,7: il limite era il redirect verso l'uscita.
-
-**La soluzione, un passo alla volta** (2 core, Mpps elaborati; ns di CPU per core fra
-parentesi). Le prime due colonne sono del 2026-10-01, a batteria e con il generatore che
-taceva il ~13% del tempo: valgono come confronto fra loro, non in assoluto. Le ultime due sono
-del 2026-10-02, stessa sessione, alimentatore, macchina non disturbata:
-
-| | 1 coda d'uscita, 1 core d'uscita | 3 code, 1 core d'uscita | **3 code, 2 core d'uscita** | 1 core del nodo (§10.2) |
-|---|---:|---:|---:|---:|
-| baseline | 13,15 (152) | 19,15 (103) | **29,20 (67)** | 15,13 (66) |
-| P1 | 10,44 (192) | 14,96 (132) | **16,84 (119)** | 8,69 (115) |
-| P1.5 | 10,11 (195) | 14,39 (139) | **15,72 (127)** | 8,07 (124) |
-| P2 | 6,56 (305) | 6,62 (302) | **6,74 (297)** | 3,41 (293) |
-| P3 | 4,65 (430) | 4,59 (436) | **4,58 (436)** | 2,41 (416) |
-| persi dopo XDP, baseline | 49% | 40% | **≤ 0,04%** | 0 |
-
-Cartelle: `results/generator_contention/xdp_2core_2thread_uscita_1coda/` e `…_uscita_3code/`,
-`results/throughput_xdp_cores2/`. Con una coda d'uscita per core e un core d'uscita per coda
-**due core elaborano il 95–99% del doppio di uno** (baseline 96%, P1 97%, P1.5 97%, P2 99%,
-P3 95%) e il costo per core è quello di un core entro 4 ns per baseline, P1, P1.5 e P2; P3
-paga 20 ns in più (436 contro 416), dentro la sua variazione fra sessioni. Gli arrivati
-coincidono con gli elaborati; la baseline satura (respinti 1,8%, il generatore offre 29,8
-Mpps). Il numero da riportare per un nodo con N code è ~N × la capacità a 1 core, finché il
-generatore e la scheda reggono.
-
-Il banco verifica la mappa coda → core d'uscita a fine run (`thread NAPI d'uscita che hanno
-lavorato`): nel run citato hanno lavorato solo la coda 0 su cpu3 e la coda 2 su cpu5, per
-entrambe le porte usate. Con `--egress-cpu auto` il banco trova su questa macchina un solo core
-d'uscita libero e lo dice; per il secondo si passa `--egress-cpu 3,5`.
+Il redirect sceglie anche la coda d'uscita come CPU che inoltra modulo numero di code: con
+una coda sola i due core del nodo scriverebbero nello stesso `ptr_ring`, svuotato da un solo
+thread NAPI d'uscita, che per ricevere, contare e restituire la pagina alla page_pool del
+generatore spende ~70 ns a pacchetto. Per questo ogni core del nodo ha la sua coda d'uscita
+(`--egress-queues auto`) e la sua CPU d'uscita.
 
 ```bash
 sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
-    --gen-cpus 10,1 --dut-cpus 6,8 --egress-cpu 3,5 --out results/throughput_xdp_cores2
+    --gen-cpus 10,1 --dut-cpus 6,8 --egress-cpu 3,5 --out results/pcore_cores2      # 2 P-core
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
+    --gen-cpus 10,1 --dut-cpus 12,16 --egress-cpu 6,8 --out results/ecore_cores2    # 2 E-core
 ```
+
+Mpps elaborati (`pcore/cores2/`, `ecore/cores2/`), ns di CPU per core fra parentesi:
+
+| | 1 P-core | **2 P-core** | % del doppio | 1 E-core | **2 E-core** | % del doppio |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 15,27 (66) | **29,11 (67)** | 95 | 9,39 (106) | **19,09 (105)** | 102 |
+| P1 | 8,56 (117) | **17,46 (114)** | 102 | 6,35 (158) | **12,74 (157)** | 100 |
+| P1.5 | 8,04 (124) | **16,19 (124)** | 101 | 5,84 (171) | **11,71 (171)** | 100 |
+| P2 | 3,45 (290) | **6,63 (301)** | 96 | 2,83 (354) | **5,60 (357)** | 99 |
+| P3 | 2,36 (425) | **4,60 (434)** | 98 | 1,94 (515) | **3,84 (521)** | 99 |
+
+**Due core elaborano il 95–102% del doppio di uno**, e il costo per core è quello di un core
+entro 11 ns. Il numero da riportare per un nodo con N code è ~N × la capacità a 1 core,
+finché il generatore e la scheda reggono. Il banco verifica la mappa coda → core d'uscita a
+fine run (`thread NAPI d'uscita che hanno lavorato`). rxonly su due E-core dà il 117% del
+doppio: riguarda solo il riferimento di sola ricezione, il più variabile fra i giri (11%).
 
 ### 10.5 L'alternativa: pktgen
 
-`--generator pktgen` (default solo di `--latency`, `--mode saturate` e `--mode generator`,
-che lo richiedono) usa i thread
-`kpktgend_<cpu>` del kernel. pktgen crea skb con 64 byte di headroom; XDP su veth ne pretende
-256, quindi `veth_xdp_rcv_skb` **copia** ogni pacchetto prima del programma, sul core del
-nodo. Su una NIC con XDP nativo la copia non c'è: per questo il banco usa `xdp_gen`.
-
-In sintesi (misure del 28-09 e del 01-10, `results/throughput_3500/`,
-`results/cpu_time/pktgen_*`, `results/throughput_cores1/` e `…cores2/`, `results/pktgen_cores2/`):
-
-- **Capacità a un core**, 3 thread: rxonly 4,61, baseline 3,31, P1 2,94, P1.5 2,81, P2 1,89,
-  P3 1,50 Mpps (302 / 340 / 356 / 529 / 666 ns). Tutte saturano, rxonly compreso: il tetto di
-  sola ricezione con la copia è ~4,6 Mpps (`--mode generator`: 4,50–4,71).
-- **Sopra la baseline** +38 / +53 / +226 / +364 ns, come con `xdp_gen` entro la variazione fra
-  sessioni; in assoluto la copia e il percorso della skb costano 225–250 ns in più per tutte.
-- **Thread**: con 3 thread sulla stessa coda la contesa costa ~17 ns per pacchetto a tutte
-  (baseline 296 contro 278 ns con un thread); con un thread rxonly non satura (2,84 Mpps).
-- **Due core**: con 4 thread, due per coda, e una coda d'uscita per core, 1,93–1,99 volte un
-  core; con 3 thread su 2 code una coda ne riceve uno solo (~2,8 Mpps) e rxonly si ferma a
-  1,61 volte (il banco avvisa se i thread non sono divisi in parti uguali). La coda d'uscita
-  condivisa costava 12–20 ns per pacchetto per core.
-- **Carico comune** (solo pktgen ha la cadenza a `delay`): a 1,375 Mpps, il 91% della più
-  lenta, nessun respinto per nessuna pipeline.
+`--generator pktgen` (richiesto da `--latency`, `--mode saturate` e `--mode generator`) usa i
+thread `kpktgend_<cpu>` del kernel. pktgen crea skb con 64 byte di headroom; XDP su veth ne
+pretende 256, quindi `veth_xdp_rcv_skb` **copia** ogni pacchetto prima del programma, sul
+core del nodo, e la sola ricezione si ferma intorno a 4,6 Mpps. Su una NIC con XDP nativo la
+copia non c'è: per questo il banco usa `xdp_gen`, e le cifre di questo documento sono tutte
+con `xdp_gen`.
 
 ### 10.6 Tre marcature: la pipeline separata dal trasporto (`--mode rates`)
 
 ```bash
-sudo python3 ipa/test/bench_throughput.py --mode rates --frames 64 --rounds 3 \
-    --gen-cpus 10 --dut-cpus 6 --rates 0.05,0.5,1,1.5,2,2.5,3 \
-    --out results/throughput_rates_xdp                       # xdp_gen (default)
+sudo python3 ipa/test/bench_throughput.py --mode rates --generator xdp --frames 64 --rounds 3 \
+    --gen-cpus 10 --dut-cpus 6 --rates 0.05,0.5,1,1.5,2,2.5,3 --out results/pcore_rates
 ```
 
 Build **strumentata**: il dispatcher marca T1, il programma marca T2 subito prima di
 `bpf_redirect`, il contatore d'uscita T3. I timbri stanno in mappe per-CPU, quindi l'uscita
 resta in softirq sulla CPU del DUT (niente `--egress-cpu`). T3−T1 al rate più basso è la
-latenza minima arrivo → ripartenza di §10.7.
+latenza minima arrivo → ripartenza.
 
-Con `xdp_gen` (2026-10-02, `results/throughput_rates_xdp/`), minimi per finestra, mediana fra
-tre giri, da 0,5 a 3 Mpps:
+Minimi per finestra, mediana fra tre giri, da 0,5 a 3 Mpps (`pcore/rates/`, `ecore/rates/`):
 
 | | baseline | P1 | P1.5 | P2 | P3 |
 |---|---:|---:|---:|---:|---:|
-| T2−T1, la sola pipeline (ns) | **26** | **60–61** | **68–69** | **217–224** | **325–335** |
-| sopra la baseline | — | +34 | +43 | +192 | +301 |
-| T3−T2, redirect + veth + ricezione (ns) | 183–211 | 185–211 | 185–230 | 190–236 | 198–236 |
-| T3−T1 a 50 kpps, latenza minima (ns) | 223 | 261 | 267 | 441 | 592 |
+| T2−T1, la sola pipeline, P-core (ns) | **26** | **60** | **69** | **216** | **331** |
+| sopra la baseline | — | +34 | +43 | +190 | +305 |
+| T3−T2, redirect + veth + ricezione (ns) | 206 | 207 | 208 | 218 | 222 |
+| T3−T1 a 50 kpps, latenza minima (ns) | 221 | 259 | 274 | 442 | 609 |
+| T2−T1 su E-core (ns) | 28 | 72 | 84 | 266 | 434 |
+| T3−T2 su E-core (ns) | 240 | 243 | 240 | 253 | 256 |
+| T3−T1 a 50 kpps su E-core (ns) | 282 | 329 | 346 | 555 | 727 |
 
-T2−T1 è piatto sul rate (a 50 kpps qualche ns in più: cache più fredda). Il trasporto T3−T2
-è un costo comune di ~185–235 ns che non dipende dalla pipeline. Con pktgen (28-09,
-`results/throughput_rates/`): T2−T1 34–35 / 68–69 / 77–78 / 228–233 / 340–348, sopra la
-baseline **+34 / +43 / +194 / +306**, cioè le stesse differenze; T3−T2 ~195–255 ns. La copia
-di headroom di pktgen avviene **prima** di T1 (in `veth_xdp_rcv_skb`, prima del programma),
-quindi non è in nessuno dei tre intervalli: con `xdp_gen` T2−T1 è più basso di 8–17 ns
-in assoluto, probabilmente perché la copia non sporca più la cache.
+T2−T1 è piatto sul rate (a 50 kpps qualche ns in più: cache più fredda). Il trasporto T3−T2 è
+un costo comune di ~210 ns sul P-core (~245 sull'E-core) che non dipende dalla pipeline. Sul
+E-core la sola pipeline costa dal 7% (baseline) al 31% (P3) in più.
 
 **Il throughput di questa modalità non è una capacità.** Con la build strumentata e l'uscita
-sulla CPU del DUT la coda d'ingresso respinge già da ~2,5 Mpps per la baseline, 2,3 per P1,
-1,6 per P2, 1,3 per P3, con tutti e due i generatori (con pktgen 2,4 / 2,2 / 1,6 / 1,3). Le
-capacità sono quelle di §10.2. La build strumentata aggiunge due letture dell'orologio e
-due scritture per pacchetto.
+sulla CPU del DUT la coda d'ingresso respinge a rate più bassi che in §10.2. Le capacità sono
+quelle di §10.2; la build strumentata aggiunge due letture dell'orologio e due scritture per
+pacchetto.
 
-### 10.7 Latenza arrivo → ripartenza (`--latency`)
+### 10.7 Latenza arrivo → ripartenza
+
+Con `xdp_gen` è T3−T1 al rate più basso di `--mode rates` (§10.6): **221 / 259 / 274 / 442 /
+609 ns** sul P-core, sopra la baseline +38 / +53 / +221 / +388. `--latency` è il percorso con
+pktgen (build strumentata, il dispatcher marca l'arrivo, il programma d'uscita rilegge e
+sottrae). Solo il minimo è una misura: p50 e p99 vengono da un istogramma a potenze di due.
+La **ricerca del rate a perdita nulla** disperde oltre il 25% fra i giri, perché al confine
+basta un'esitazione di pochi µs per perdere un pacchetto: non è una cifra citabile; la
+saturazione sì.
+
+### 10.8 Il nodo sui core lenti, e le istruzioni per ciclo
+
+**La domanda.** Quanto cambiano capacità e saturazione se il nodo gira su un E-core
+(Crestmont) o su un LP E-core invece che su un P-core (Redwood Cove)? E perché: più cicli
+per pacchetto a parità di istruzioni (IPC più basso), o anche più istruzioni?
+
+**Il disegno: cambia solo il core del nodo.** Generatore (cpu10) e uscita (cpu8) restano su
+P-core a 3500 MHz in tutte le configurazioni a un core: il generatore satura qualunque nodo, e
+l'uscita non diventa il collo di bottiglia. L'E-core gira alla **stessa frequenza** del P-core
+(3500 MHz; il suo massimo è 3800), quindi il rapporto fra le capacità è il rapporto fra i
+cicli per pacchetto. Il LP E-core (fuori dalla L3, sul tile SoC) si ferma al suo massimo, 2500
+MHz: `host_conditions` taglia la frequenza chiesta al massimo del core.
+
+| | nodo | uscita | generatore | a riposo |
+|---|---|---|---|---|
+| P-core | cpu6 | cpu8 | cpu10 | 7, 9, 11 |
+| E-core | cpu12 | cpu8 | cpu10 | 9, 11, **13-15** |
+| LP E-core | cpu20 | cpu8 | cpu10 | 9, 11, **21** |
+| 2 P-core | cpu6, 8 | cpu3, 5 | cpu10, 1 | fratelli SMT |
+| 2 E-core | cpu12, 16 (un modulo ciascuno) | cpu6, 8 | cpu10, 1 | 13-15, 17-19, fratelli SMT |
+
+I compagni di modulo degli E-core restano a riposo (§0.3): dividono L2 e frequenza con il
+nodo.
+
+**Istruzioni e cicli per pacchetto** (`ipa/test/hw_counters.py`). Un contatore hardware per
+(CPU, evento) sui core del nodo e dell'uscita, in tutta la CPU (`perf_event_open`, pid −1,
+utente + kernel, *pinned*): conta il thread NAPI, il programma XDP, gli interrupt, cioè
+quello che il tempo di CPU attribuisce al pacchetto. Sui processori ibridi l'evento si apre
+sul PMU del tipo di core (`cpu_core` / `cpu_atom`). Si legge **nella stessa lettura** dei
+contatori dei pacchetti della finestra stazionaria, come `/proc/stat`. Con il watchdog NMI
+spento nessun evento è multiplexato; uno multiplexato si scarta. Colonne in `compare.csv`,
+`throughput_summary.csv`, `per_class.csv` e `bitrate.csv`:
+
+| colonna | |
+|---|---|
+| `instr_pkt` | istruzioni per pacchetto elaborato, sui core del nodo |
+| `cycles_pkt` | cicli non fermi per pacchetto: a frequenza fissa = ns di CPU × GHz |
+| `ipc` | istruzioni per ciclo |
+| `llc_miss_pkt`, `br_miss_pkt` | mancate dell'ultimo livello di cache, salti previsti male |
+| `dut_ghz_busy` | cicli / (durata × core): frequenza × occupazione; al 100% è la controprova di APERF/MPERF |
+| `egress_cycles_pkt`, `egress_ipc` | lo stesso per il core d'uscita, per pacchetto elaborato |
+
+Valgono dove il nodo è saturo: sotto, i cicli contano anche l'attesa in POLL fra un pacchetto
+e l'altro (le curve di §11 le riportano per ogni rate, da leggere solo oltre il ginocchio).
+`--no-hw` li spegne. Le istruzioni per pacchetto non sono quelle del verificatore (§2): ci
+sono dentro anche ricezione veth, redirect e restituzione della pagina.
+
+**Risultati** (`results/campagna_2026-10-06/{pcore,ecore,lpe}/compare/`, alimentatore,
+frequenza misurata 3 496 / 3 493 / 2 498 MHz):
+
+| | P-core Mpps | E-core Mpps | LP E-core Mpps | E/P | ns CPU P / E / LP E | istruzioni / pk | IPC P / E / LP E |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rxonly | 19,47 | 12,78 | 4,11* | 0,66 | 41 / 78 / 176 | 384 / 368 / 398 | 2,4 / 1,4 / 0,9 |
+| baseline | 15,27 | 9,39 | 3,29* | 0,61 | 66 / 106 / 283 | 606 / 607 / 620 | 2,7 / 1,7 / 0,8 |
+| P1 | 8,56 | 6,35 | 3,10 | 0,74 | 117 / 158 / 322 | 1 220 / 1 223 / 1 225 | 3,0 / 2,3 / 1,5 |
+| P1.5 | 8,04 | 5,84 | 2,91 | 0,73 | 124 / 171 / 343 | 1 426 / 1 430 / 1 432 | 3,3 / 2,4 / 1,7 |
+| P2 | 3,45 | 2,83 | 1,57 | 0,82 | 290 / 354 / 636 | 4 556 / 4 556 / 4 557 | 4,5 / 3,7 / 2,9 |
+| P3 | 2,36 | 1,94 | 1,10 | 0,82 | 425 / 515 / 908 | 6 573 / 6 573 / 6 576 | 4,4 / 3,7 / 2,9 |
+
+\* rxonly e baseline sul LP E-core non saturano (nodo al 72% e al 93%): il generatore offre
+solo 4,1 e 3,3 Mpps. Le loro cifre sono un limite inferiore della capacità.
+
+**Che cosa dicono.**
+1. **Le istruzioni per pacchetto sono le stesse su ogni core** (entro il 2%): il codice
+   eseguito non cambia. Cambiano i cicli, cioè l'IPC.
+2. **L'E-core paga soprattutto la parte fissa del nodo.** Ricezione veth, redirect e
+   restituzione della pagina (la baseline) hanno IPC 2,7 sul P-core e 1,7 sull'E-core: +60%
+   di tempo. L'aritmetica lineare della rete neurale tiene IPC alti su entrambi (P3 4,4 e
+   3,7): l'inferenza di P3 sopra la baseline costa solo il 14% in più (409 contro 359 ns).
+   Per questo il rapporto di capacità sale da 0,61 (baseline) a 0,82 (P2, P3).
+3. **Il LP E-core** è fuori dalla L3: ha 14–19 mancate dell'ultimo livello di cache per
+   pacchetto (P-core ed E-core ~0), perché i pacchetti scritti dal generatore gli arrivano
+   dalla memoria. Con 2,5 GHz e IPC 0,8–2,9 regge il 36–47% del P-core sulle pipeline.
+4. **Due E-core reggono il doppio di uno** (99–102%, §10.4), come due P-core.
+
+**Saturazione** (le curve di §11.6 sull'E-core): stesso andamento del P-core, con il
+ginocchio alla capacità dell'E-core (P1 6,2, P1.5 5,8, P2 2,8, P3 1,9 Mpps inoltrati) e la
+perdita sempre all'ingresso. A basso carico il ritardo mediano è 12–16 µs, a coda piena
+29–148 µs.
+
+**Gli assi parametrici sotto traffico** (`ipa/test/traffic_models.py`). Larghezza (65-v-v-7,
+v = 2…8), profondità (65-4×d-7, d = 1…6), pari pesi (le cinque forme a ~592 pesi di §9) e
+sparsità (65-4-4-7 al 0 / 50 / 90 % di pesi a zero) sono cartelle di modello sintetico,
+stesso descrittore del checkpoint, che `bench_throughput --model <cartella>` misura con
+`xdp_gen`. Il seme è lo stesso per tutti i punti, salvo dove quel seme dà un modello che
+decide DROP in ogni stato dei link per il pacchetto del generatore (width_6, depth_4,
+isoparam_3: seme successivo). L'asse dei nodi resta a `BPF_PROG_TEST_RUN` (§9). ns di CPU
+per pacchetto (`assi_Pcore/`, `assi_Ecore/`), P-core / E-core:
+
+| profondità | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| P1 | 113 / 148 | 116 / 156 | 119 / 160 | 124 / 166 | 125 / 170 | 132 / 176 |
+| P1.5 | 121 / 162 | 128 / 170 | 131 / 176 | 132 / 182 | 134 / 183 | 138 / 189 |
+| P2 | 264 / 328 | 287 / 355 | 329 / 394 | 344 / 403 | 368 / 442 | 396 / 470 |
+| P3 | 351 / 447 | 421 / 517 | 486 / 591 | 545 / 665 | 595 / 730 | 652 / 801 |
+
+| larghezza | 2 | 4 | 6 | 8 |
+|---|---:|---:|---:|---:|
+| P1 | 104 / 142 | 115 / 156 | 124 / 168 | 145 / 187 |
+| P1.5 | 114 / 155 | 124 / 170 | 138 / 181 | 158 / 199 |
+| P2 | 282 / 340 | 295 / 359 | 301 / 372 | 315 / 394 |
+| P3 | 391 / 496 | 445 / 519 | 452 / 555 | 496 / 588 |
+
+| pari pesi (strati) | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| P1 | 128 / 173 | 125 / 169 | 130 / 172 | 135 / 182 | 135 / 183 |
+| P1.5 | 137 / 183 | 141 / 185 | 144 / 186 | 148 / 195 | 147 / 194 |
+| P2 | 276 / 340 | 299 / 365 | 318 / 379 | 368 / 439 | 373 / 446 |
+| P3 | 380 / 476 | 433 / 537 | 480 / 595 | 581 / 705 | 607 / 740 |
+
+| pesi a zero | 0% | 50% | 90% |
+|---|---:|---:|---:|
+| P1 | 113 / 154 | 104 / 143 | 95 / 132 |
+| P1.5 | 120 / 168 | 112 / 157 | 106 / 143 |
+| P2 | 295 / 357 | 298 / 354 | 298 / 355 |
+| P3 | 420 / 517 | 424 / 523 | 423 / 514 |
+
+La baseline resta a 64–67 ns (P-core) e 105–107 ns (E-core) in ogni punto. Gli andamenti
+sono quelli di §9 più il costo fisso del nodo: P3 paga **~60 ns per strato** (~70
+sull'E-core), P2 ~26; a parità di pesi P2 sale del 35% e P3 del 60% da 1 a 5 strati, le P1
+restano quasi ferme; i pesi a zero accelerano solo P1 e P1.5. Le istruzioni per pacchetto
+lo confermano: P3 cresce di esattamente **1 096 istruzioni per strato** (5 488 → 10 952), su
+entrambi i tipi di core; P2 di 300–600 a strato, a passi irregolari perché srotola e
+ricompila; a pesi a zero le istruzioni di P1 scendono da 1 210 a 939 e quelle di P2 e P3 non
+cambiano. Sull'E-core ogni punto costa il 20–35% in più.
 
 ```bash
-sudo python3 ipa/test/bench_throughput.py --latency --frames 512 --rounds 3 --repeat 5 \
-    --out results/throughput_latency
+bash ipa/test/remeasure_campagna.sh ecore lpe    # capacità, due core, tre marcature, curve
+ASSI_CORES=P bash ipa/test/remeasure_campagna.sh assi
+ASSI_SOLO="width_6 depth_4" bash ipa/test/remeasure_campagna.sh assi     # solo alcuni punti
+python3 ipa/test/campaign_report.py results/campagna_2026-10-06 > sintesi.md
+sudo python3 ipa/test/hw_counters.py --cpu 6,12,20 --seconds 1    # i contatori, a mano
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
+    --gen-cpus 10 --dut-cpus 12 --egress-cpu 8 --out results/ecore_compare
 ```
-
-Build strumentata, solo con pktgen: il dispatcher marca l'arrivo, il programma d'uscita
-rilegge e sottrae. Con `xdp_gen` la stessa cifra è T3−T1 al rate più basso di `--mode rates`
-(§10.6): **223 / 261 / 267 / 441 / 592 ns**, sopra la baseline +38 / +44 / +218 / +369.
-Con pktgen, latenza minima **a scarico** (50 kpps, 512 B, nessuna coda), mediana fra tre
-giri: 249 / 282 / 292 / 460 / 584 ns (sopra la baseline +33 / +43 / +211 / +335). Solo il minimo è una
-misura: p50 e p99 vengono da un istogramma a potenze di due. La **ricerca del rate a perdita
-nulla** disperde oltre il 25% fra i giri (fino al 64%), perché al confine basta
-un'esitazione di pochi µs per perdere un pacchetto: non è una cifra citabile; la saturazione
-sì.
 
 ---
 
@@ -1192,7 +1229,7 @@ slot vuoto: conta e scarta.
 Il costo della catena si misura: la fase finale porta ogni pipeline a rate massimo con e
 senza contatore davanti e legge dal kernel il tempo del programma attaccato
 (`kernel.bpf_stats_enabled`, `run_time_ns / run_cnt`, tail call comprese). Con `xdp_gen`:
-da −1,4 a +2,4 ns, dentro la dispersione.
+da −3,3 a +2,1 ns, dentro la dispersione.
 
 ### 11.3 Contatori e formule
 
@@ -1218,7 +1255,7 @@ punti**). **Inizio della perdita**: il rate più basso da cui *tutti* i rate pi�
 una riga in perdita seguita da righe pulite è "sporadica". Finestre marcate: `gen_limited`
 (generatore sotto il 95% del chiesto), `gen_burst` (oltre il 105%), `host_disturbed` (§0.3).
 Le colonne diagnostiche `napi_*` (scheduling del thread NAPI del DUT) e `gen_*` (cadenza di
-`xdp_gen`) sono in `bitrate_raw.csv` (§11.7).
+`xdp_gen`) sono in `bitrate_raw.csv` (§10.1).
 
 ### 11.4 Cadenza, timbro e latenza end-to-end
 
@@ -1226,8 +1263,8 @@ Le colonne diagnostiche `napi_*` (scheduling del thread NAPI del DUT) e `gen_*` 
 legge l'orologio, prima dell'istante previsto scarta il frame (la pagina torna al pool, il giro
 costa ~60 ns), poi lo spedisce e fissa il prossimo istante un intervallo più in là.
 Spaziatura uniforme, non a raffiche (una raffica da 256 riempirebbe da sola la coda); dopo
-una pausa recupera al più 16 frame di fila. Precisa fino a ~11 Mpps per thread (98% a 12,
-tetto ~12,7: `results/xdp_cadenza_test/`).
+una pausa recupera al più 16 frame di fila. Precisa fino a ~11 Mpps per thread (a 12 Mpps
+chiesti ne partono 11,9 con rxonly, a 9,0–9,5 quando la coda respinge).
 
 **Il timbro.** Nell'istante in cui il frame parte il programma scrive l'intestazione di pktgen
 dopo UDP: magic, seq, `tv_sec`, `tv_usec` (`CLOCK_REALTIME`, µs). Il programma d'uscita la
@@ -1246,27 +1283,23 @@ fino a 65,5 ms, più il trabocco; si cronometra un arrivo ogni `mask+1` (circa
 
 **Il lotto** (`--xdp-batch`, default 256): a fine lotto il redirect sveglia il DUT
 (`xdp_do_flush` → `XDP_XMIT_FLUSH`). A basso carico un frame può aspettare nel generatore
-fino alla fine del lotto, ~12 µs: la mediana del ritardo a basso carico è 17–19 µs con 256,
-3–6 µs con 32. Con 32 la cadenza regge solo fino a ~2,5 Mpps.
+fino alla fine del lotto, ~12 µs: per questo la mediana del ritardo a basso carico è 17–19 µs
+sul P-core. Un lotto più piccolo toglie quell'attesa, ma la cadenza regge rate più bassi.
 
 ### 11.5 Comandi e uscite
 
 ```bash
 sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 \
-    --out results/bitrate_xdp              # 0,5-12 Mpps (XDP_RATES_MPPS), 5 giri (~7 min)
-sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 \
-    --rates 0.25,0.5,1,1.5,2 --xdp-batch 32 --overhead-reps 0 \
-    --out results/bitrate_xdp_lotto32                                       # basso carico
-python3 ipa/test/plot_bitrate.py results/bitrate_xdp                        # i grafici
-python3 ipa/test/bench_bitrate.py --report results/bitrate_xdp              # riepilogo dai CSV
+    --egress-cpu 8 --out results/pcore_bitrate   # 0,5-12 Mpps (XDP_RATES_MPPS), 5 giri (~5 min)
+python3 ipa/test/plot_bitrate.py results/pcore_bitrate                      # i grafici
+python3 ipa/test/bench_bitrate.py --report results/pcore_bitrate            # riepilogo dai CSV
 ```
 
 - **Scala**: `--rates` in Mpps (con `xdp_gen` il default è 0,5–12 Mpps, `XDP_RATES_MPPS`: la cadenza si ferma a ~12), oppure
   `--bitrates` in Gbit/s, oppure `auto`, calibrata su `rxonly` a massima spinta.
 - **Uscita**: `--egress-cpu auto` (default) mette la ricezione del nodo successivo su un core
   fisico suo; `none` la lascia in softirq sulla CPU del DUT.
-- **Con pktgen** (`--generator pktgen`; il default è `xdp_gen`): stessa uscita, latenza corretta
-  per l'attesa di pktgen; la sola ricezione regge ~4,6 Mpps.
+- **Contatori hardware**: colonne `instr_pkt`, `cycles_pkt`, `ipc` per finestra (§10.8).
 
 | file | contenuto |
 |---|---|
@@ -1277,75 +1310,52 @@ python3 ipa/test/bench_bitrate.py --report results/bitrate_xdp              # ri
 | `env.csv` | macchina, condizioni, scala usata, soglia, generatore, lotto |
 | `bitrate_latency`, `bitrate_pps`, `bitrate_loss` (.png/.pdf) | latenza (p50, p99), pacchetti/s, perdita; si rifanno dai CSV con `plot_bitrate.py` |
 
-### 11.6 Risultati (`results/bitrate_xdp/`, 2026-10-02)
+### 11.6 Risultati (`results/campagna_2026-10-06/pcore/bitrate/`, `ecore/bitrate/`)
 
-6 metodi, 16 punti da 0,5 a 12 Mpps, 5 giri, 480 finestre, nessuna disturbata (sessione del
-pomeriggio, dopo quella di §10.2). Cadenza esatta fino a 11 Mpps; a 12 ne parte il 98%
-(`results/xdp_cadenza_test/`: con un thread la cadenza si ferma a ~12,7 Mpps).
+6 metodi, 16 punti da 0,5 a 12 Mpps, 5 giri. Cadenza esatta fino a 11 Mpps; a 12 ne parte il
+98% (con un thread la cadenza si ferma a ~12,7 Mpps). **P-core**:
 
 | pipeline | inoltro max (Mpps) | 1 / ns di CPU (§10.2) | pulita fino a | perde da | ritardo a coda piena (p50) |
 |---|---:|---:|---|---|---:|
-| rxonly | ≥ 11,7 | — | 11 Mpps | 12 Mpps (0,3%) | — |
-| baseline | 8,89* | 15,1 | 8 Mpps (4,05 Gbit/s) | *banco, nodo al 60%* | — |
-| p1_static | 8,64 | 8,69 | 8 Mpps (4,04 Gbit/s) | 9 Mpps (4,56 Gbit/s) | 33–34 µs |
-| hardcoded | 8,06 | 8,07 | 7 Mpps (3,55 Gbit/s) | 8 Mpps (4,08 Gbit/s) | 35–36 µs |
-| template | 3,48 | 3,41 | 3 Mpps (1,54 Gbit/s) | 3,5 Mpps (1,79 Gbit/s) | 80–84 µs |
-| modular | 2,33 | 2,41 | 2 Mpps (1,02 Gbit/s) | 2,5 Mpps (1,28 Gbit/s) | 120–132 µs |
+| rxonly | ≥ 11,9 | — | 11 Mpps | 12 Mpps (0,1%) | — |
+| baseline | 9,02* | 15,3 | 8 Mpps (4,05 Gbit/s) | *banco, nodo al 60%* | — |
+| p1_static | 8,66 | 8,56 | 8 Mpps (4,04 Gbit/s) | 9 Mpps (4,56 Gbit/s) | 34–35 µs |
+| hardcoded | 8,17 | 8,04 | 8 Mpps (4,08 Gbit/s) | 9 Mpps (4,56 Gbit/s) | 35–36 µs |
+| template | 3,45 | 3,45 | 3 Mpps (1,54 Gbit/s) | 3,5 Mpps (1,79 Gbit/s) | 78–86 µs |
+| modular | 2,37 | 2,36 | 2 Mpps (1,02 Gbit/s) | 2,5 Mpps (1,28 Gbit/s) | 116–126 µs |
 
 "Pulita fino a" e "perde da" sono **punti della scala**: la soglia vera sta fra i due (P2:
-3,48 Mpps = 1,78 Gbit/s a 64 B).
+3,45 Mpps = 1,77 Gbit/s a 64 B). **E-core**: inoltro massimo baseline 9,34, P1 6,24, P1.5
+5,81, P2 2,81, P3 1,93 Mpps, pulite fino a 9 / 6 / 5 / 2,5 / 1,5 Mpps, ritardo a coda piena
+29 / 45 / 49 / 103 / 148 µs. **LP E-core** (3 giri): P1 2,94, P1.5 2,90, P2 1,66, P3 1,18
+Mpps.
 
-- **Tutte e quattro le pipeline saturano sulla curva**, e si fermano alla capacità del nodo:
-  P1 8,64 contro 8,69, P1.5 8,06 contro 8,07, P2 3,48 contro 3,41, P3 2,33 contro 2,41 (entro
-  il 3%, sessioni diverse). Al ginocchio il thread NAPI del DUT lavora il 99,6–99,9% del tempo.
+- **Tutte e quattro le pipeline saturano sulla curva**, e si fermano alla capacità del nodo
+  misurata a massima spinta (§10.2, §10.8), entro il 2%. Al ginocchio il thread NAPI del DUT
+  lavora il 99,5–100% del tempo.
 - Per le pipeline la perdita è **prima di XDP**: il collo di bottiglia è il programma eBPF.
-  Dopo XDP al massimo lo 0,04% degli inviati, rumore di lettura (negativo in 159 finestre su
-  400, media 0,009%). Sotto capacità nessuna perdita (≤ 0,05%).
-- **\*La baseline non è un limite del programma.** Da 9 Mpps perde ~1% prima di XDP e 0,1–0,2%
-  dopo, ma il suo thread NAPI lavora il 59–61% del tempo e dorme 25–30 volte al ms: il nodo ha
-  tempo libero. Con l'inoltro il generatore non va oltre ~9 Mpps (rxonly, che non inoltra,
-  arriva a 11,7), e i lotti da 256 trovano la coda non del tutto vuota. Il banco lo classifica
-  come `banco: nodo non saturo` (`napi_run_pct` sotto il 90%, `NAPI_SATURATED_PCT`). La sua
-  capacità resta quella di §10.2.
-- **rxonly non perde fino a 11 Mpps**; a 12 perde lo 0,3%, dove il generatore stesso cede.
-  Tutta la perdita delle pipeline è del programma: al traffico più alto P3 76%, P2 61%, P1.5 9%,
-  P1 7%.
+  Dopo XDP al massimo lo 0,04% degli inviati, rumore di lettura. Sotto capacità nessuna
+  perdita (≤ 0,05%).
+- **\*La baseline non è un limite del programma.** Da 9 Mpps perde ~1,3% prima di XDP e
+  0,1–0,2% dopo, ma il suo thread NAPI lavora il 59–62% del tempo: il nodo ha tempo libero.
+  Con l'inoltro il generatore non va oltre ~9 Mpps (rxonly, che non inoltra, arriva a 11,9).
+  Il banco lo classifica come `banco: nodo non saturo` (`napi_run_pct` sotto il 90%,
+  `NAPI_SATURATED_PCT`). La sua capacità resta quella di §10.2. Sull'E-core, dove la
+  capacità della baseline (9,4 Mpps) sta sotto il tetto del generatore, la baseline satura
+  anche sulla curva.
+- **rxonly non perde fino a 11 Mpps**; a 12 perde lo 0,1%, dove il generatore stesso cede.
+  Tutta la perdita delle pipeline è del programma: al traffico più alto P3 76%, P2 63%, P1.5
+  9%, P1 7% sul P-core.
 - **Il ritardo a coda piena segue 256 ÷ capacità** più il tratto fino al nodo successivo: P1
-  30 µs previsti contro 33–34, P1.5 32 contro 35–36, P2 74 contro 80–84, P3 110 contro
-  120–132. A basso carico 17–19 µs con il lotto da 256 (attesa nel generatore, §11.4), 3–6 µs
-  con 32 (`results/bitrate_xdp_lotto32/`).
+  30 µs previsti contro 34–35, P1.5 32 contro 35–36, P2 74 contro 78–86, P3 108 contro
+  116–126. A basso carico 17–19 µs (attesa a fine lotto nel generatore, §11.4).
 - **Quando la coda respinge, il generatore rallenta**: oltre il ginocchio si chiedono fino a
-  12 Mpps e ne partono 8,7–9,4.
-- Con pktgen (`results/bitrate_3500/`, 28-09) la risposta era la stessa, con capacità più basse
-  (3,34 / 2,94 / 2,84 / 1,89 / 1,50 Mpps) e un pavimento di rxonly del 21% al traffico più
-  alto, perché con la copia la sola ricezione regge ~4,6 Mpps.
-
-### 11.7 Come si è arrivati a una misura pulita
-
-Il primo run con `xdp_gen` spediva l'80–87% del richiesto e il nodo, a coda piena, lavorava
-all'~80%. Le colonne diagnostiche di `bitrate_raw.csv` hanno separato le cause
-(`results/diag_xdp/` prima, `results/diag_xdp_lunga/` dopo):
-
-| a coda piena (P2, P3) | 2–4 chiamate per finestra | 1 chiamata per finestra |
-|---|---:|---:|
-| thread NAPI del DUT in esecuzione (`napi_run_pct`) | 86–89% | 100% |
-| sonni per finestra (`napi_sleeps_per_ms` × 300) | 2–3 | 0 |
-| attesa del core (`napi_wait_pct`) | ~0 | ~0 |
-| inviati / richiesti, a ritmo basso | 80–89% | 100% |
-
-Il nodo non veniva interrotto da nessuno e dormiva tante volte quante erano le chiamate
-`test_run`: la pausa di ~12 ms di ogni chiamata (§10.1). Con una chiamata per finestra il
-ritmo è esatto fino a ~11 Mpps e il nodo lavora al 100%. Il lotto da 32 invece aveva tolto il
-ritardo a basso carico (§11.4) ma non il core fermo: due cause diverse, distinte dalla
-diagnostica.
-
----
+  12 Mpps e ne partono meno.
 
 ## 12. Modelli e scenari diversi dal checkpoint (`--model`, `--topology`)
 
 Tutti i test e i banchi del kernel e del traffico vero accettano un modello e una rete
-diversi dal checkpoint depositato. Senza `--model` fanno esattamente quello che facevano
-prima, per le stesse righe di codice.
+diversi dal checkpoint depositato. Senza `--model` usano il checkpoint.
 
 ### 12.1 Scenario, modello, compatibilità
 
@@ -1385,10 +1395,9 @@ prima, per le stesse righe di codice.
 - `ipa/test/model_under_test.py` tiene il modello scelto; `load_weights`, `setup_*`,
   `ref_infer` e `count_lookups` di `verify_prog_run` lo seguono passando per
   `ipa/test/pipeline_setup.py`, i costruttori comuni di baseline, P1, P1.5, P2 e P3 (gli
-  stessi che usa `verify_synth_kernel`). `--model checkpoint` manda il checkpoint per la
-  strada nuova: pesi, scala, semantica e riferimento sono identici a quelli della strada
-  vecchia (3000/3000 decisioni e logit), i sorgenti di P1 e della foglia di P2 identici
-  byte per byte.
+  stessi che usa `verify_synth_kernel`). `--model checkpoint` e nessun `--model` danno pesi,
+  scala, semantica e riferimento identici (3000/3000 decisioni e logit), e sorgenti di P1 e
+  della foglia di P2 identici byte per byte.
 - **Riferimento**: quello generico (`ref_infer_sparse`), uguale a quello del 65-4-4-7 su
   20 000 ingressi casuali, classe e logit.
 - **Azione della classe**: con un modello la verifica per TTL controlla anche l'azione:
@@ -1402,73 +1411,59 @@ prima, per le stesse righe di codice.
   lo stampa (`large`: `00111000` → classe 4). Si misura sempre un inoltro.
 - **Saltati con un messaggio**: extract e quant (riguardano il `.pt` addestrato), le
   architetture alternative della suite (forme proprie), il deploy AOT di `test_fabric`
-  (si costruisce da un checkpoint), `--mode rates` e `--latency` (build strumentate, per
-  ora solo col checkpoint).
+  (si costruisce da un checkpoint), `--mode rates` e `--latency` (build strumentate, solo
+  col checkpoint).
 
 ```bash
 sudo python3 ipa/test/test_model_source.py --kernel      # ogni scenario x modello x pipeline
 sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p2
 sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/test_suite.py --only kernel --model synth:deep
 sudo python3 ipa/test/test_fabric.py --model synth:small -q
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu auto --rounds 3 \
-     --gen-cpus 10 --dut-cpus 6 --model synth:deep --out results/models/xdp_deep
-sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 --model synth:deep \
-     --rates 0.5,1,1.5,2,2.5,3,3.5,4,5,6,7,8 --rounds 3 --out results/models/bitrate_xdp_deep
-bash ipa/test/remeasure_xdp.sh modelli                   # tutti i modelli, ~5 min
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu 8 --rounds 3 \
+     --gen-cpus 10 --dut-cpus 6 --model synth:deep --out results/deep_compare
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --egress-cpu 8 --rounds 3 \
+     --gen-cpus 10 --dut-cpus 6 --model ipa/synth/traffic/depth_3 --out results/depth_3
 ```
 
-### 12.3 Risultati (2026-09-29; traffico vero 2026-10-02)
+### 12.3 Risultati
 
-**Correttezza**, tutto PASS:
+**Correttezza** (campagna del 2026-10-06), tutto PASS:
 
 | controllo | esito |
 |---|---|
 | `test_model_source --kernel`: 6 scenari × modelli compatibili × 5 pipeline, 40 ingressi ciascuna, model_id 0 e 190 | 110/110; large su P2/P3 N/A |
-| `verify_synth_kernel --all`, P1 / P2 / P3 | 8/8, 7/7 + large N/A, 7/7 + large N/A |
+| `verify_synth_kernel --all --pipeline p1` | 8/8, 300/300 decisioni identiche per modello |
 | suite kernel con `--model`, 9 modelli | PASS su tutti |
-| `test_fabric --model`, 9 modelli | tutti i controlli PASS |
+| `verify_per_model_semantics` | 53/53 |
+
+`remeasure_all.sh` fa anche `verify_synth_kernel` su P2 e P3 (7/7 più large N/A ciascuna),
+`test_fabric --model` sui 9 modelli e lo sweep delle topologie.
 
 Classi consegnate dal fabric con la ricerca allargata: checkpoint 0–5, ipa_like e
 ipa_ttl16 2–5, small 0–3, mixed 0–3, large 1, 4, 6, 8, deep 0, 1, 4, sparse 1, 5, ones 0.
 Per ipa_like, deep, sparse, small e ones sono tutte le classi che il modello decide su
 200 000 ingressi casuali: le altre i suoi pesi non le producono mai.
 
-**Traffico vero**, `bench_throughput --mode compare --generator xdp`, 1 core (cpu6), un
-thread di generatore (cpu10), uscita su un core suo, 3 giri, 2026-10-02, alimentatore,
-macchina non disturbata, controllo di validità PASS in ogni run (`results/models/xdp_*/`).
-Mpps elaborati, fra parentesi ns di CPU sopra la baseline (il nodo è al 100% in ogni riga):
+**Kernel** (`BPF_PROG_TEST_RUN`, suite con `--model`), ns/pacchetto, minimo su 7 prove,
+baseline 14–15 ovunque:
 
-| modello | forma | baseline | P1 | P1.5 | P2 | P3 |
-|---|---|---:|---:|---:|---:|---:|
-| checkpoint | 65-4-4-7 | 15,07 | 8,44 (+52) | 8,01 (+59) | 3,43 (+225) | 2,18 (+393) |
-| deep | 65-4-4-4-7 | 15,13 | 8,42 (+53) | 7,76 (+63) | 3,08 (+258) | 2,04 (+423) |
-| small | 15-4-4 | 14,97 | 9,93 (+34) | 9,20 (+42) | 4,34 (+164) | 3,01 (+265) |
-| mixed | 18-6-5 | 15,28 | 9,39 (+42) | 8,97 (+47) | 4,17 (+175) | 2,87 (+283) |
-| large | 117-8-8-9 | 15,14 | 6,87 (+80) | 6,44 (+89) | N/A | N/A |
-
-Il checkpoint coincide con §10.2 entro l'1–3% per baseline, P1, P1.5 e P2; P3 dà 460 ns
-contro 416, la sua variazione fra sessioni (§10.2). Con pktgen (29-09,
-`results/models/throughput_*/`) le differenze sopra la baseline erano le stesse entro
-~15 ns.
-
-**Bit rate** su deep (`results/models/bitrate_xdp_deep/`, 3 giri): perdita sempre
-all'ingresso, dopo XDP al massimo lo 0,04%. Baseline e P1 pulite fino all'ultimo punto
-(~4,06 Gbit/s), P1.5 fino a 3,55 Gbit/s (perde da 7,9 Mpps), P2 fino a 1,54 (inoltro max
-3,08 Mpps), P3 fino a 0,77 (inoltro max 2,08 Mpps). A coda piena il ritardo è 88–96 µs per
-P2 e 134–145 per P3, di nuovo 256 ÷ capacità (83 e 125 µs) più il tratto d'uscita. Col
-checkpoint P3 era pulita fino a 1,02 Gbit/s: lo strato in più la porta sotto 2 Mpps.
-
-**Kernel** (`BPF_PROG_TEST_RUN`), ns/pacchetto, `results/models/kernel_battery.csv`:
-misurate sotto `host_conditions` ma **a batteria**, quindi indicative finché non si
-rimisurano con l'alimentatore. Baseline 14–15 ovunque; P1.5 / P2 / P3: checkpoint 51 /
-198 / 322, ipa_like 51 / 194 / 314, sparse 38 / 196 / 312, deep 57 / 222 / 366, small 36 /
-133 / 221, mixed 43 / 152 / 253, ones 28 / 126 / 209, large 75 / – / –.
+| modello | forma | P1 | P1.5 | P2 | P3 |
+|---|---|---:|---:|---:|---:|
+| checkpoint | 65-4-4-7 | 46 | 51 | 197 | 318 |
+| ipa_like | 65-4-4-7 | 47 | 51 | 194 | 309 |
+| ipa_ttl16 | 65-4-4-7 | 40 | 46 | 197 | 310 |
+| sparse | 65-4-4-7 | 31 | 38 | 197 | 314 |
+| deep | 65-4-4-4-7 | 52 | 56 | 226 | 375 |
+| small | 15-4-4 | 30 | 37 | 139 | 226 |
+| mixed | 18-6-5 | 36 | 43 | 155 | 257 |
+| ones | 11-2-3 | 23 | 28 | 129 | 217 |
+| large | 117-8-8-9 | 71 | 76 | N/A | N/A |
 
 **Che cosa dicono**: P2 e P3 costano per la **forma**, non per i pesi (checkpoint,
-ipa_like, ipa_ttl16 e sparse hanno la stessa forma e lo stesso costo); P1 per i **valori**
-dei pesi (sparse, stessa forma, 38 ns contro 51). Uno strato in più costa circa +24 ns a
-P2 e +44 ns a P3 nel kernel, +33 e +30 sul traffico vero (P3 dentro la sua variazione fra
-sessioni); ingressi più piccoli abbassano P2 e P3 di 50–130 ns.
+ipa_like, ipa_ttl16 e sparse hanno la stessa forma e lo stesso costo, entro 10 ns); P1 per i
+**valori** dei pesi (sparse, stessa forma, 31 ns contro 46). Uno strato in più costa circa
++29 ns a P2 e +57 ns a P3; ingressi più piccoli abbassano P2 e P3 di 40–100 ns. Sotto
+traffico vero gli stessi andamenti sono negli assi di §10.8.
 
 ## Note e limiti
 
@@ -1480,10 +1475,10 @@ sessioni); ingressi più piccoli abbassano P2 e P3 di 50–130 ns.
   1 097 pesi oltre `MAX_WEIGHT_ENTRIES` in P2).
 - **Azione uniforme**: `argmax → class_action → porta logica → mac_table → bpf_redirect`.
 - **Tutto sta su una macchina**: generatore, DUT e nodo successivo sono core diversi dello
-  stesso processore, collegati da `veth`. Il costo del veth è dentro le cifre (con pktgen anche
-  la copia di headroom, che `xdp_gen` evita). Niente NIC, niente DMA: nessuna scheda cablata su questa
-  macchina supporta XDP nativo. Il confronto fra pipeline regge; le cifre assolute sono di
-  questo percorso, a 3,5 GHz.
+  stesso processore, collegati da `veth`. Il costo del veth è dentro le cifre. Niente NIC,
+  niente DMA: nessuna scheda cablata su questa macchina supporta XDP nativo. Il confronto fra
+  pipeline regge; le cifre assolute sono di questo percorso, a 3,5 GHz, e del tipo di core
+  del nodo (§10.8).
 - **Nessun isolamento dal boot**: `isolcpus`, `nohz_full` e `rcu_nocbs` richiedono parametri
   di boot. Le CPU del banco restano soggette al tick e ai callback RCU; il resto
   dell'isolamento è a runtime (§0.3).

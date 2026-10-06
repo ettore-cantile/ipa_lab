@@ -8,7 +8,10 @@ __pycache__/
 ~$*
 *.tmp
 
-# Generated AOT artefacts (gen_full_c.py writes both).
+# Generated AOT artefacts: gen_full_c.py writes the C source and the header,
+# `make` (in ipa/poc_aot/) regenerates them when missing and builds the rest.
+ipa/poc_aot/nn_aot_arch.bpf.c
+ipa/poc_aot/nn_aot_meta.h
 ipa/poc_aot/nn_aot_arch.o
 ipa/poc_aot/loader_aot
 
@@ -16,6 +19,7 @@ ipa/poc_aot/loader_aot
 # one of these byte-identically (seed 20260916); test_synth.py generates its own
 # into temp dirs and never reads this tree. 42 files / 4.4 MB of pure output.
 ipa/synth/scenarios/
+ipa/synth/traffic/
 
 # LaTeX build artefacts. The .tex is the source and the .pdf is tracked (it is
 # what gets read); everything pdflatex writes in between is regenerable by
@@ -25,9 +29,11 @@ docs/*.log
 docs/*.out
 docs/*.toc
 
-# results/ keeps only the measurements: CSV files. Plots, logs and Markdown
-# reports are regenerated from them (bench_scaling.py --plot, plot_bitrate.py,
-# bench_bitrate.py --report); the plots the notebook uses live in docs/figures/.
+# results/ keeps one folder per measurement campaign (remeasure_campagna.sh):
+# the CSV files and the campaign summary (sintesi.md). Plots, logs and reports
+# are regenerated from the CSVs (bench_scaling.py --plot, plot_bitrate.py,
+# campaign_report.py); the plots the docs use live in docs/figures/.
 results/**/*
 !results/**/
 !results/**/*.csv
+!results/**/sintesi.md

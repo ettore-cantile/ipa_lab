@@ -45,8 +45,9 @@ def make_weights(mspec: ModelSpec) -> List[float]:
     weight_init:
       uniform  U(-b, b) with b = 1/sqrt(fan_in)
       normal   N(0, b)
-      sparse   uniform, then ~70% of entries zeroed -- exercises Pipeline 1's
-               strength reduction, which folds away multiplications by zero
+      sparse   uniform, then a fraction `sparsity` of the weights zeroed
+               (~70% by default) -- exercises Pipeline 1's strength
+               reduction, which folds away multiplications by zero
       ones     every weight 1.0, biases 0. A degenerate but fully predictable
                model: useful as a smoke test where the expected output can be
                computed by hand.
@@ -61,7 +62,8 @@ def make_weights(mspec: ModelSpec) -> List[float]:
             elif mspec.weight_init == "normal":
                 w.append(rng.gauss(0.0, b))
             elif mspec.weight_init == "sparse":
-                w.append(0.0 if rng.random() < 0.7 else rng.uniform(-b, b))
+                w.append(0.0 if rng.random() < mspec.sparsity
+                         else rng.uniform(-b, b))
             else:                                    # ones
                 w.append(1.0)
         for _ in range(n_out):

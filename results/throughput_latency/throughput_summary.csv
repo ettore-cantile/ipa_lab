@@ -1,6 +1,0 @@
-method,frame,max_rx_pps,max_rx_mbps,max_loss_pct,max_loss_med_pct,max_offered_pps,rx_pkts,tx_pkts,lost_before,lost_after,respinti,respinti_pct,persi_dut,persi_in_coda,persi_dopo,loss_dut_pct,noloss_rx_pps,noloss_gen_bound,noloss_rx_mbps,noloss_loss_pct,zero_rx_pps,lat_p50_ns,lat_min_ns,lat_rx_pps,bottleneck,unreliable,rounds,ns_pkt,ns_pkt_vs_baseline
-baseline,512,2161415,8853.2,68.851,,0,0,0,0,0,0,68.839,0,0,0,0,1975324,False,8090.9,0.0,1975324,1024,249,50003,generatore,False,3,462.7,
-p1_static,512,1965868,8052.2,72.002,,0,0,0,0,0,0,72.009,0,0,0,0,1486926,False,6090.5,0.0,1486926,1024,282,50001,generatore,False,3,508.7,46.0
-hardcoded,512,1922604,7875.0,72.685,,0,0,0,0,0,0,72.687,0,0,0,0,1769086,False,7246.2,0.0,1769086,1024,292,50004,generatore,False,3,520.1,57.4
-template,512,1431510,5863.5,80.506,,0,0,0,0,0,0,80.505,0,0,0,0,1403263,False,5747.8,0.0,1403263,2048,460,50000,generatore,False,3,698.6,235.9
-modular,512,1220048,4997.3,0.0,,0,0,0,0,0,0,0.0,0,0,0,0,1220048,False,4997.3,0.0,1220048,2048,584,50004,generatore,False,3,819.6,356.9

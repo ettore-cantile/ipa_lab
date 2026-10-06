@@ -359,6 +359,12 @@ class Topology:
                    or parse_cpu_list(rd("topology", "core_cpus_list"))
                    or [c])
             sib = tuple(s for s in sib if s in online) or (c,)
+            # Il modulo: le CPU che dividono la L2. Su un P-core e' il core
+            # (i due fratelli SMT); sugli E-core di Meteor Lake sono i 4 core
+            # del modulo, che dividono anche il dominio di frequenza.
+            l2 = tuple(s for s in parse_cpu_list(
+                rd("cache", "index2", "shared_cpu_list")) if s in online)
+            cluster = tuple(sorted(set(l2) | set(sib))) if c in l2 else sib
             if hybrid:
                 if c in core_set:
                     kind = "P"
@@ -368,7 +374,8 @@ class Topology:
                     kind = "?"
             else:
                 kind = "-"
-            cpus[c] = dict(core=sib, core_id=_int(rd("topology", "core_id"), c),
+            cpus[c] = dict(core=sib, cluster=cluster,
+                           core_id=_int(rd("topology", "core_id"), c),
                            pkg=_int(rd("topology", "physical_package_id"), 0),
                            kind=kind,
                            max_khz=_int(rd("cpufreq", "cpuinfo_max_freq")),
@@ -393,6 +400,14 @@ class Topology:
     def siblings(self, cpu):
         return [s for s in self.core(cpu) if s != cpu]
 
+    def cluster(self, cpu):
+        """Le CPU che dividono la L2 con `cpu` (lei compresa): il core
+        fisico su un P-core, il modulo di 4 su un E-core. Senza
+        l'informazione nel sysfs, il core."""
+        if cpu not in self.cpus:
+            return (cpu,)
+        return self.cpus[cpu].get("cluster") or self.core(cpu)
+
     def kind(self, cpu):
         return self.cpus.get(cpu, {}).get("kind", "?")
 
@@ -409,6 +424,9 @@ class Topology:
         sib = self.siblings(cpu)
         if sib:
             parts.append("fratello " + ",".join(str(s) for s in sib))
+        mod = [s for s in self.cluster(cpu) if s != cpu and s not in sib]
+        if mod:
+            parts.append("modulo L2 con " + format_cpu_list(mod))
         return f"cpu{cpu}" + (f" ({', '.join(parts)})" if parts else "")
 
     def summary(self):
@@ -551,9 +569,15 @@ def egress_cpus(egress):
 
 
 def idle_siblings(topo, used):
-    """I fratelli SMT dei thread usati: restano a riposo, fuori da tutto."""
+    """I fratelli SMT dei thread usati, e i compagni di modulo L2 sugli
+    E-core: restano a riposo, fuori da tutto.
+
+    Il modulo degli E-core (4 core, una L2 da 2 MB) divide anche la
+    frequenza: lasciati al sistema, i compagni del DUT ne prenderebbero il
+    tetto (--system-max-mhz) e il carico, e la L2 del DUT si dividerebbe
+    con il desktop. Su un P-core il modulo e' il core: niente cambia."""
     used = set(used)
-    return sorted({s for c in used for s in topo.core(c)} - used)
+    return sorted({s for c in used for s in topo.cluster(c)} - used)
 
 
 def housekeeping(topo, used):

@@ -1,0 +1,239 @@
+# Sorgente di "Test reale su dual boot - spiegazione.pdf".
+# Una sezione per slide: "== N | titolo". Righe: paragrafo; "- " elenco; "1. " elenco
+# numerato; ">> " riquadro grigio (esempio); "!! " riquadro giallo (cautela);
+# "ok " riquadro verde (verificato). **grassetto**, `codice`. Riga vuota = nuovo blocco.
+# Rigenera: python3 docs/slides_src/build.py test_reale
+
+== 1 | Copertina
+La presentazione racconta il test del datapath su traffico vero, sul portatile con Ubuntu installato direttamente (dual boot). Al centro c'è il **nodo**: il computer che riceve un pacchetto, esegue la rete neurale dentro il kernel (con XDP, cioè nel primo punto in cui Linux vede il pacchetto) e decide da quale porta farlo uscire.
+
+Le domande a cui risponde sono tre:
+1. Quanti pacchetti al secondo regge un nodo, con ciascuna delle versioni del programma, e su che tipo di core?
+1. Con quale traffico lo misuriamo? Il generatore è xdp_gen, che consegna i pacchetti come li consegnerebbe una scheda di rete vera.
+1. Che cosa succede quando il traffico cresce oltre quello che il nodo regge: dove si perdono i pacchetti? È la domanda centrale, e la risposta arriva nella parte 5.
+
+Tutte le cifre vengono dallo stesso portatile (Intel Core Ultra 7 155H), con le condizioni della macchina controllate e registrate a ogni misura, nella campagna del 6 ottobre 2026 (`results/campagna_2026-10-06/`).
+
+== 2 | La domanda
+Se si manda al nodo sempre più traffico, a un certo punto il nodo non ce la fa più. Davanti al nodo c'è una **coda** di 256 posti: i pacchetti che il nodo non ha ancora elaborato aspettano lì, in ordine di arrivo. Finché il nodo è più veloce del traffico la coda resta quasi vuota; quando è più lento la coda si riempie, e i pacchetti che arrivano a coda piena vengono **respinti**, cioè persi.
+
+La slide segue questa catena in quattro passi: il traffico cresce, la coda si riempie, il ritardo cresce (ogni pacchetto aspetta quelli davanti), e alla fine si perde. La domanda è **dove** si perde, perché il punto della perdita dice chi è il collo di bottiglia:
+- se si perde **prima** del programma (il pacchetto non è mai entrato), il programma è troppo lento per il traffico;
+- se si perde **dopo** (il programma lo ha elaborato e deciso di inoltrarlo, ma non arriva a destinazione), il problema è la trasmissione in uscita.
+
+>> **Esempio.** Il nodo riesce a elaborare 3,45 milioni di pacchetti al secondo e il generatore ne manda 5,6 milioni. Ogni secondo circa 2,2 milioni di pacchetti non trovano posto e vengono respinti. Se contiamo quanti pacchetti entrano nel programma (3,45 milioni) e quanti ne escono (sempre 3,45 milioni), vediamo che si perdono tutti prima: il collo di bottiglia è il programma.
+
+Per rispondere servono quindi due conteggi in più rispetto a quelli del generatore: i pacchetti che il programma riceve e quelli che rilancia. Come si ottengono è nelle slide 13 e 14.
+
+== 3 | Come è organizzata la presentazione
+È la mappa delle cinque parti. Ognuna risponde a una domanda, e le prime quattro servono a potersi fidare dei numeri della quinta.
+1. **Il banco** (slide 4–5): quali programmi si confrontano e come si misura il costo per pacchetto.
+1. **La macchina** (slide 6–8): perché il nodo ha bisogno di un core vero tutto suo, come la si prepara e quanto si ripetono le misure.
+1. **Il generatore** (slide 9): xdp_gen, che consegna pacchetti come una scheda di rete.
+1. **I risultati** (slide 10–12): quanti pacchetti al secondo regge ogni programma, su un core, su due, e su un core lento.
+1. **La domanda** (slide 13–19): dove si perde quando il traffico cresce e che cosa succede al ritardo.
+
+La risposta è anticipata nel riquadro in basso: si perde **prima** del programma, quindi il collo di bottiglia è il programma eBPF, non la trasmissione. E le misure si ripetono entro pochi punti.
+
+== 4 | I sei programmi
+Le quattro pipeline (P1, P1.5, P2, P3) calcolano la stessa rete neurale e prendono la stessa decisione sullo stesso pacchetto: lo verificano i test di correttezza. Cambia solo **quanto è scritto dentro il programma** quando lo si compila, e quanto invece il programma legge da tabelle (le mappe eBPF) mentre gira. Due programmi di riferimento completano il confronto.
+- **rxonly**: riceve il pacchetto, incrementa un contatore e lo butta. Non fa altro. Serve a sapere quanto costa la sola ricezione: nessun programma può essere più veloce, quindi è il "pavimento".
+- **baseline**: legge l'intestazione, abbassa il TTL e inoltra il pacchetto su una porta fissa, senza rete neurale. Fa tutto quello che fa una pipeline tranne l'inferenza: per questo **quanto una pipeline costa in più della baseline è il costo della rete neurale**.
+- **P1 statica**: pesi della rete e numero del nodo sono costanti nel codice. Il compilatore può semplificare molto (moltiplicazioni per costanti, rami eliminati), ma serve un binario per ogni nodo: quello compilato per il nodo 7 non va bene per il nodo 8.
+- **P1.5 hardcoded**: i pesi sono nel codice, il numero del nodo si legge da una tabella. Un binario per modello, valido per tutti i nodi che usano quel modello.
+- **P2 template**: anche la forma della rete (quanti ingressi, quanti neuroni per strato) si legge da tabella. Nel codice ci sono solo i soffitti, cioè i valori massimi ammessi, e i cicli girano fino a quelli. Un solo programma serve molti modelli.
+- **P3 modular**: anche il numero di strati si legge da tabella, e ogni strato è un programma a parte raggiunto con un salto (tail call). È la versione più generale.
+
+Regola generale: più informazioni si spostano dalla compilazione all'esecuzione, più il programma è riutilizzabile, e più lavoro fa per ogni pacchetto (letture da tabella, cicli più lunghi, salti). Le slide successive misurano proprio quanto costa questa generalità. I colori dei quadratini restano gli stessi in tutti i grafici.
+
+== 5 | Il banco di misura
+Tutto gira sullo stesso portatile, ma ogni pezzo ha il suo core fisico dedicato, così nessuno ruba tempo agli altri:
+- il **generatore** (CPU 10) crea i pacchetti: è xdp_gen, un thread solo;
+- la **coda** da 256 posti è quella del cavo virtuale (veth) che collega generatore e nodo;
+- il **nodo** (CPU 6) esegue la pipeline in XDP: è l'unica cosa che vogliamo misurare;
+- la **coda d'uscita** porta i pacchetti inoltrati verso il nodo successivo;
+- il **nodo successivo** (CPU 8) conta i pacchetti che arrivano e li butta.
+
+**Come si misura il costo.** Si manda più traffico di quanto il nodo possa elaborare. Così valgono le tre condizioni della slide: la coda è sempre piena, il core del nodo non resta mai senza lavoro, e il ritmo a cui elabora è la sua **capacità**. Il tempo speso per ogni pacchetto è allora 1 diviso la capacità.
+
+>> **Esempio.** In una finestra di 300 millisecondi il nodo elabora 1 035 000 pacchetti con P2. Sono 3,45 milioni al secondo, quindi spende 1 / 3 450 000 di secondo per pacchetto, cioè 290 ns.
+
+Perché mandare più traffico del necessario? Se il generatore mandasse meno pacchetti di quanti il nodo ne regge, il nodo starebbe fermo ogni tanto e misureremmo il ritmo del generatore, non quello del nodo. La misura avviene solo a regime: si scartano i primi istanti, si leggono i contatori a inizio e fine finestra, e si ripete più volte (giri) per vedere quanto varia.
+
+ok **Verificato.** Il banco misura anche quanto è occupato il core del nodo, nella stessa finestra in cui conta i pacchetti (il **tempo di CPU per pacchetto**), e con i contatori hardware del processore quante istruzioni e quanti cicli costa ogni pacchetto. Con xdp_gen il nodo lavora il 100% del tempo, 1 diviso la capacità coincide con il tempo di CPU, e i cicli contati coincidono con il tempo per la frequenza (per P3: 1 483 cicli contati, 425 ns × 3,5 GHz = 1 487).
+
+== 6 | Il vincolo: il nodo non può fermarsi
+Il grafico a sinistra mette a confronto i tempi in gioco. Quanto può stare fermo il nodo prima di perdere pacchetti? Dipende da quanto ci mette la coda a riempirsi. A 1,5 milioni di pacchetti al secondo ne arriva uno ogni 0,67 µs, quindi 256 posti si riempiono in 256 × 0,67 ≈ 170 µs. Qualunque pausa più lunga fa traboccare la coda. Un core che si risveglia dal sonno profondo ci mette 310 µs; un core di una macchina virtuale, che è un thread del sistema ospite, può essere fermato per millisecondi: entrambe le pause superano di molto il margine.
+
+>> **Esempio.** Il core del nodo si ferma per 2 millisecondi. In quel tempo arrivano 2 ms × 1,5 milioni/s = 3 000 pacchetti, ma la coda ne contiene 256: circa 2 750 vanno persi. E il programma non c'entra niente: poteva essere velocissimo.
+
+A destra, le due cose che succederebbero:
+- **se il core del nodo si ferma**: si perde a qualunque ritmo, anche bassissimo, e la perdita misura le assenze del core, non il programma;
+- **se generatore e nodo dividono il core**: non si perde niente, perché il core non si ferma mentre lavora per sé, ma il core fa il lavoro del generatore e del nodo insieme, e il limite diventa il generatore.
+
+La conclusione: per misurare il programma il nodo deve avere un core fisico suo, sveglio e senza interruzioni. Per questo il banco gira sul portatile vero e non in una macchina virtuale.
+
+== 7 | Ogni core ha un ruolo fisso
+Lo script `host_conditions.py` prepara la macchina prima di ogni misura e la rimette com'era alla fine (anche se la misura si interrompe):
+- **ogni ruolo ha un core fisico suo** (schema a sinistra): generatore sulla CPU 10, nodo sulla 6, nodo successivo sulla 8; le altre CPU al sistema. Il processore è ibrido: 6 P-core veloci, ciascuno con due thread gemelli (SMT), più 8 E-core e 2 LP E-core più lenti. Il gemello di ogni core usato resta a riposo (in tratteggio), perché due thread sullo stesso core fisico si dividono pipeline e cache e si rallentano a vicenda. Con due core sul nodo (slide 11) si aggiungono la CPU 8 al nodo, la 1 al generatore e le CPU 3 e 5 all'uscita. Con il nodo su un E-core (slide 12) restano a riposo anche gli altri tre E-core del suo modulo, che dividono con lui la cache L2 e la frequenza;
+- **frequenza fissa**: 3,5 GHz richiesti, e si verifica con i contatori del processore (APERF/MPERF) che sia davvero quella: 3 472–3 507 MHz misurati durante le misure. Senza frequenza fissa il turbo cambierebbe la velocità del core da un istante all'altro;
+- **niente sonno profondo**: gli stati di risparmio energetico profondi (C6, C10) sono spenti sui core del banco, perché un core che si addormenta ci mette fino a 310 µs a svegliarsi, più dei 170 µs che la coda concede (slide 6);
+- **tutto il resto altrove**: processi, thread del kernel, interruzioni e code di lavoro del sistema vengono spostati sulle CPU di sistema;
+- **un monitor sempre acceso**: ogni secondo registra temperatura, throttling termico e frequenza vera. Se una finestra di misura avviene in condizioni sbagliate non si scarta di nascosto: viene contata e segnalata nel file `env.csv` del run.
+
+Risultato: il core del nodo non dorme, non cambia velocità e nessuno lo interrompe. Si misura il programma, non la macchina.
+
+== 8 | Le misure si ripetono
+La tabella riporta il costo dello stesso nodo, in nanosecondi di CPU per pacchetto, in quattro misure diverse della stessa sessione: il confronto a 64 byte, la misura per classe (qui la classe 0) e due taglie di pacchetto, 512 e 1 514 byte. Le quattro colonne danno lo stesso costo entro il 2% per P1 e P1.5, entro pochi punti per P3; P2 varia un po' di più con la porta d'uscita (classe 0: 274 ns).
+
+>> **Esempio.** P1.5 costa 124, 124, 126 e 127 ns nelle quattro misure: uno scarto di 3 ns, il 2%. È abbastanza poco perché la differenza fra P1 e P1.5, 7 ns, si veda senza ambiguità.
+
+Gli altri numeri a destra:
+- **≤ 2%**: lo scarto del costo di P1 e P1.5 fra le quattro misure;
+- **0**: con un traffico più basso della capacità nessun pacchetto viene respinto, nemmeno con il solo contatore;
+- **≈ 0,1%**: lo stesso punto del test sul bit rate, nei 5 giri, varia in genere meno dello 0,1%, al massimo del 6% vicino al punto in cui la pipeline smette di reggere.
+
+Il messaggio della slide: con la macchina preparata, differenze piccole come P1 contro P1.5 o scartare contro inoltrare (circa 50 ns) si misurano.
+
+== 9 | Il generatore: xdp_gen
+xdp_gen (script `ipa/test/xdp_gen.py`) usa una funzione del kernel, BPF_PROG_TEST_RUN in modalità **live frames**: il kernel prepara dei pacchetti già nel formato che XDP si aspetta (un frame grezzo con 256 byte liberi davanti) e li spedisce davvero sul cavo virtuale. La slide segue i tre passi: xdp_gen crea il frame, il cavo lo passa così com'è, il nodo lo elabora. Niente skb e niente copia: il pacchetto arriva al nodo come arriverebbe da una scheda di rete vera con XDP nativo, e il nodo paga solo il proprio lavoro.
+
+I due riquadri in basso: un solo thread di xdp_gen offre **15–19 milioni** di pacchetti al secondo, più di quanto ogni pipeline regga su un core; e ogni misura è **una sola chiamata** al kernel. Ogni chiamata parte e finisce con una pausa del generatore di circa 12 ms: con più chiamate per finestra il generatore tacerebbe una parte del tempo, e il nodo svuoterebbe la coda e dormirebbe.
+
+Si usa così: **un thread per ogni coda del nodo**. La coda in cui un thread scrive dipende dalla CPU su cui gira (numero della CPU modulo numero di code), e con più thread nella stessa coda i thread si passano un lucchetto e le stesse righe di cache, e rallentano anche il nodo che la svuota.
+
+>> **Il ritmo.** Per il test al crescere del traffico (slide 15–19) serve un ritmo fissato. xdp_gen non ne ha uno suo: lo tiene il suo programma, che a ogni giro guarda l'orologio, scarta il pacchetto se non è ancora il momento e lo spedisce quando lo è. I pacchetti partono a distanza regolare, non a raffiche; nello stesso istante il programma ci scrive un timbro con l'ora di partenza, e il nodo successivo misura il ritardo. Il ritmo è esatto fino a circa 11 milioni di pacchetti al secondo.
+
+L'alternativa è pktgen, il generatore che sta dentro il kernel: crea i pacchetti in una skb con 64 byte liberi davanti, e siccome XDP ne vuole 256 il cavo virtuale **copia** ogni pacchetto prima di consegnarlo al nodo. La copia la pagherebbe il nodo, e su una scheda vera non c'è: per questo il banco usa xdp_gen.
+
+== 10 | Risultati con xdp_gen
+Per ogni programma la slide riporta quanti milioni di pacchetti al secondo regge (la barra), quanti nanosecondi spende per pacchetto (1 diviso la capacità) e quanto costa in più della baseline, cioè il costo della rete neurale. Un core del nodo, un thread di xdp_gen, uscita su un core suo, pacchetti da 64 byte, 3 giri. Il nodo lavora al 100%.
+
+>> **Esempio di calcolo.** P2 regge 3,45 milioni di pacchetti al secondo, quindi spende 1 / 3 450 000 s ≈ 290 ns per pacchetto. La baseline ne spende 66. La differenza, 290 − 66 = 224 ns, è il tempo che P2 dedica alla rete neurale: ricevere, leggere l'intestazione e inoltrare lo fanno tutte e due allo stesso modo.
+
+Le tre letture della slide:
+- **Il costo dipende da dove stanno i pesi e la forma.** Pesi scritti nel codice (P1, P1.5): la rete costa 50–60 ns. Forma letta da tabella (P2): circa 225 ns, perché i cicli girano fino ai soffitti e ogni peso è una lettura da mappa. Anche la profondità da tabella (P3): circa 360 ns, per i salti fra uno strato e l'altro.
+- **Sotto capacità, zero perdite**: finché il traffico resta sotto la capacità di una pipeline nessun pacchetto viene respinto (≤ 0,05%, curve della slide 15).
+- **P1 contro P1.5**: 8,56 contro 8,04 milioni al secondo, 117 contro 124 ns. Congelare il numero del nodo nel codice fa risparmiare circa 7 ns e 206 istruzioni per pacchetto: poco, ma misurabile.
+
+La baseline arriva al suo limite appena: il generatore ne offre 15,3 milioni al secondo e il nodo li elabora lavorando al 100%. rxonly invece non satura (il nodo riceve 19,5 milioni al secondo e lavora al 79%): il suo valore, circa 41 ns, è indicativo.
+
+ok **Scartare costa più che inoltrare**, circa 50 ns: nella misura per classe la classe DROP costa 166 ns su P1 contro 118–120, 467 su P3 contro 416–426. Quando il pacchetto viene scartato la sua memoria si libera sul core del nodo; quando viene inoltrato, su quello d'uscita. A 512 e 1 514 byte ogni pipeline costa come a 64 entro l'1%: il nodo tocca solo le intestazioni.
+
+== 11 | Con xdp_gen due core reggono il doppio
+La slide dà al nodo **due core** (CPU 6 e 8), ciascuno con la sua coda d'ingresso alimentata da un thread di xdp_gen. Le barre colorate sono i pacchetti al secondo elaborati con due core; le barre grigie sono il riferimento: **il doppio di quello che regge un core** nella slide 10 (per P2: 2 × 3,45 = 6,90 milioni al secondo).
+
+>> **Come si legge.** P2 con due core elabora 6,63 milioni al secondo, il riferimento è 6,90: il 96%. Le altre: baseline 29,11 contro 30,54 (95%), P1 17,46 contro 17,12 (102%), P1.5 16,19 contro 16,08 (101%), P3 4,60 contro 4,72 (98%).
+
+Il riquadro in basso a destra lo dice nell'unità del costo: il tempo di CPU per pacchetto di ogni core è 67, 114, 124, 301 e 434 ns, contro 66, 117, 124, 290 e 425 con un core solo. Il secondo core non rallenta il primo perché i contatori delle pipeline sono **per-core**: ogni core incrementa la sua copia, senza istruzioni atomiche, e chi legge somma. Al nodo successivo arrivano tutti i pacchetti elaborati.
+
+**Perché serve una coda d'uscita per ogni core.** Il redirect verso il cavo d'uscita sceglie la coda dal numero del core che inoltra (numero modulo numero di code). Con una coda sola i due core del nodo scriverebbero nello stesso anello, svuotato da un solo core del nodo successivo, con due danni insieme:
+1. **contesa**: lucchetto e righe di cache dell'anello passerebbero da un core all'altro a ogni pacchetto, e il costo lo pagherebbe il core del nodo nel redirect;
+1. **un solo core d'uscita non basta**: ricevere, contare e restituire la pagina costa al nodo successivo circa 70 ns a pacchetto, cioè un tetto di circa 14 milioni al secondo. Oltre, l'anello trabocca e il pacchetto si perde dopo il nodo.
+
+Per questo ogni core del nodo ha la sua coda d'uscita e il suo core d'uscita (CPU 3 e 5). Con i core 6 e 8 le code d'uscita sono tre: con due, 6 e 8 (entrambi pari) cadrebbero nella stessa coda.
+
+Conclusione: il costo per pacchetto resta quello misurato su un core, e un nodo con N code regge circa N volte la capacità di un core. Lo stesso su due E-core: 99–102% del doppio. Una scheda vera distribuisce i pacchetti su più code e più core (RSS), con un solo scrittore per coda per costruzione: la scheda stessa.
+
+== 12 | Il nodo su un core lento
+Il processore ha tre tipi di core. La slide sposta il nodo dal P-core (CPU 6) a un **E-core** (CPU 12), lasciando generatore e nodo successivo dove sono: cambia solo il core del nodo. L'E-core gira alla stessa frequenza, 3,5 GHz, quindi la differenza di capacità è tutta nei cicli che servono per ogni pacchetto. Le barre sono i milioni di pacchetti al secondo sull'E-core, poi i nanosecondi per pacchetto e il rapporto con il P-core.
+
+>> **Come si legge.** P3 sull'E-core regge 1,94 milioni al secondo contro 2,36 sul P-core: l'82%. La baseline 9,39 contro 15,27: solo il 61%.
+
+Perché il rapporto cambia da una pipeline all'altra? I contatori hardware del core del nodo dicono che **le istruzioni per pacchetto sono le stesse** sui due core (606 per la baseline, 6 573 per P3): il codice è identico. Cambia l'**IPC**, cioè quante istruzioni il core completa per ciclo:
+- la parte fissa del nodo (ricevere, inoltrare, restituire la pagina: tutto quello che fa la baseline) è lavoro del kernel con salti e accessi alla memoria, e l'E-core la esegue a IPC 1,7 invece di 2,7: costa il 60% in più;
+- l'aritmetica della rete neurale è una fila di moltiplicazioni senza bivi, e l'E-core la esegue quasi altrettanto bene (IPC 3,7 contro 4,4 per P3): l'inferenza di P3 sopra la baseline costa solo il 14% in più.
+
+Più la pipeline è pesante, quindi, più il rapporto si avvicina a 1. Il **LP E-core** (CPU 20), che sta fuori dalla cache L3 e arriva al massimo a 2,5 GHz, regge dal 36 al 47% del P-core sulle pipeline: paga anche la memoria, con 14–19 mancate di cache per pacchetto.
+
+!! **Il LP E-core e la baseline.** Sul LP E-core rxonly e baseline non saturano (il nodo lavora al 72% e al 93%): il generatore non riesce a offrire di più, e le loro cifre sono un limite inferiore.
+
+== 13 | Come si risponde alla domanda: due programmi in catena
+Per sapere dove si perdono i pacchetti servono tre contatori, messi in tre punti diversi del percorso:
+1. **inviati**: li conta xdp_gen;
+1. **ricevuti**: li conta un piccolo programma messo davanti alla pipeline, che fa solo `ing_count += 1` e poi passa il pacchetto alla pipeline;
+1. **inoltrati**: li conta il nodo successivo.
+
+Un'interfaccia può avere un solo programma XDP agganciato. Per averne due, il primo (il contatore) salta al secondo (la pipeline) con una **tail call**, lo stesso meccanismo che le pipeline usano già al loro interno (P3 lo usa fra uno strato e l'altro). Il salto non torna indietro: la pipeline prosegue come se fosse stata agganciata direttamente.
+
+Con i tre conteggi la perdita si divide in due parti:
+- **inviati − ricevuti** = persi prima del programma, cioè respinti dalla coda d'ingresso piena;
+- **ricevuti − inoltrati** = persi dopo il programma, oppure pacchetti che il modello ha deciso di scartare (si separano con i contatori della pipeline, slide 14).
+
+>> **Esempio.** In una finestra di misura: inviati 1 000 000, ricevuti 800 000, inoltrati 800 000. Allora 200 000 pacchetti si sono persi prima del programma (respinti dalla coda) e zero dopo.
+
+Il contatore costa pochissimo, e lo si misura invece di supporlo: il kernel tiene il tempo di ogni programma agganciato, e con e senza il contatore davanti la differenza va da −3 a +2 ns, dentro la variazione fra le ripetizioni. rxonly è il contatore da solo, senza pipeline dietro: dice quanto regge la sola ricezione allo stesso ritmo.
+
+== 14 | Come si leggono i tre conteggi
+Un programma XDP non ha una coda sua: elabora un pacchetto alla volta, dall'inizio alla fine, sul core che lo ha ricevuto. Se è lento, non accumula lavoro dentro di sé: si riempie la coda che sta davanti a lui. Per questo il punto in cui mancano i pacchetti dice chi è il collo di bottiglia. La slide distingue tre casi:
+- **inviati > ricevuti**: mancano pacchetti prima di XDP, la coda d'ingresso era piena. Il collo di bottiglia è il programma, oppure la sola ricezione: lo si capisce confrontando con rxonly (slide 18).
+- **ricevuti > inoltrati, e il programma aveva deciso di inoltrare**: il pacchetto è stato elaborato ma non è arrivato. Il collo di bottiglia è la trasmissione in uscita.
+- **ricevuti > inoltrati, e il programma aveva deciso di scartare** (o la classe non è usata): non è una perdita, è la rete neurale che ha scelto così.
+
+Le decisioni si leggono dai contatori che ogni pipeline tiene comunque: HIT (inoltrati secondo il modello), MISS (nessuna regola trovata) e DROP (scartati per decisione).
+
+>> **Esempio.** Ricevuti 100, inoltrati 90. Se il programma ha deciso "scarta" per 10 pacchetti, va tutto bene: zero perdite. Se invece aveva deciso "inoltra" per tutti e 100, 10 si sono persi in uscita.
+
+Tre conteggi più le decisioni del programma separano quindi tre casi che, guardando solo inviati e arrivati, sembrerebbero uguali.
+
+== 15 | Le curve: pacchetti inoltrati al crescere del traffico
+**Come si legge il grafico.** In orizzontale c'è il traffico inviato (in Gbit/s, con pacchetti da 64 byte), in verticale i pacchetti che il nodo riesce a inoltrare (milioni al secondo). La linea tratteggiata è "tutto quello che si invia": finché una curva sta sulla diagonale, il nodo inoltra tutto. Quando la curva diventa piatta, il nodo è arrivato alla sua capacità e il resto si perde.
+
+>> **Da Gbit/s a pacchetti.** Un pacchetto da 64 byte è 512 bit. Quindi 1 Gbit/s = 1 000 000 000 / 512 ≈ 1,95 milioni di pacchetti al secondo. P2 si ferma a 3,45 milioni di pacchetti al secondo, cioè 3,45 × 0,512 ≈ 1,77 Gbit/s.
+
+**Tutte e quattro le pipeline si fermano alla capacità trovata nel test di saturazione** (slide 10): P1 a 8,66 contro 8,56, P1.5 a 8,17 contro 8,04, P2 a 3,45 contro 3,45, P3 a 2,37 contro 2,36 milioni al secondo. Due test diversi, uno a traffico crescente e uno a traffico massimo, danno lo stesso numero entro il 2%: la capacità misurata è una proprietà del nodo e non del metodo. Al ginocchio il nodo lavora il 99,5–100% del tempo.
+
+!! **La baseline è un caso a parte.** Da 9 milioni al secondo perde circa l'1%, ma il nodo lavora solo il 60% del tempo: ha tempo libero, quindi non è il programma a non farcela. È il banco: quando i pacchetti vengono inoltrati, xdp_gen non riesce a mandarne più di circa 9 milioni al secondo (senza inoltro, con rxonly, arriva a 11,9). Per questo nella tabella la baseline ha l'asterisco: la sua capacità vera, 15,3 milioni al secondo, è quella della slide 10.
+
+**Le colonne della tabella.** Il traffico si prova a 16 valori, da 0,5 a 12 milioni di pacchetti al secondo. "Pulita fino a" è l'ultimo valore provato senza perdite, "perde da" il primo con perdite: la soglia vera sta fra i due. Esempio: P2 è pulita a 1,54 Gbit/s (3 milioni al secondo) e perde da 1,79 (3,5 milioni); la sua soglia vera è 1,77. "Inoltro max" è il massimo che la pipeline ha inoltrato.
+
+Ogni punto è la mediana di 5 giri: 16 valori × 5 giri × 6 programmi = 480 finestre di misura, con il nodo a 3,5 GHz.
+
+== 16 | Ricevuti e inoltrati coincidono
+Il grafico mostra una sola pipeline, P2, con tre curve: inviati (tratteggiata), ricevuti dal programma (linea scura) e inoltrati (arancione). Ricevuti e inoltrati sono una sopra l'altra per tutto il grafico: tutto quello che il programma riceve, lo rilancia.
+
+Si leggono tre fasi:
+1. **sotto il limite** le tre curve coincidono: tutto ciò che si invia viene ricevuto e inoltrato;
+1. **sopra il limite** sale solo la curva degli inviati; ricevuti e inoltrati si fermano insieme a 3,45 milioni al secondo;
+1. **ciò che manca non è mai entrato**: la distanza fra inviati e ricevuti è tutta perdita all'ingresso.
+
+>> **Esempio con i numeri veri.** Al traffico più alto si inviano 9,13 milioni di pacchetti al secondo. P2 ne riceve 3,42 e ne inoltra 3,42. I 5,7 milioni mancanti si sono persi tutti prima del programma, alla coda d'ingresso.
+
+La linea rossa verticale segna il punto da cui la coda è piena: a sinistra le tre curve coincidono, a destra sale solo quella degli inviati. Lo stesso vale per tutte le pipeline, non solo per P2.
+
+!! **Sullo "0,04%".** È rumore di misura, non una perdita vera. Il banco legge i contatori uno dopo l'altro, non tutti nello stesso istante, e in quel breve intervallo passano alcune centinaia di pacchetti: il valore è a volte negativo (una perdita vera non può esserlo) e in media è quasi zero. Più corretto dire: dopo il programma la perdita è zero, entro il rumore di misura. Fa eccezione la baseline sopra 8 milioni al secondo (0,1–0,2%), per la ragione della slide 15.
+
+== 17 | La perdita è tutta prima del programma
+Qui si guarda la percentuale di pacchetti persi prima del programma. Ogni curva resta a zero finché la pipeline regge, poi sale: più traffico si manda oltre la capacità, più grande è la parte che non entra. La curva sale tanto prima quanto più la pipeline è costosa.
+
+>> **Esempio di calcolo.** All'ultimo punto a P3 arrivano 9,51 milioni di pacchetti al secondo e ne inoltra 2,33. La parte persa è 1 − 2,33 / 9,51 ≈ 76%. P2: 1 − 3,41 / 9,13 ≈ 63%.
+
+Al traffico più alto: P3 76%, P2 63%, P1.5 9%, P1 7%, baseline 1,3% (il banco, slide 15), rxonly 0,1%. L'ordine è quello della capacità della slide 10. Si chiedono fino a 12 milioni al secondo, ma a coda piena ne partono 9,0–9,5: quando la coda respinge, ogni pacchetto respinto costa un po' anche al generatore, che rallenta.
+
+La linea rossa in basso è la perdita dopo il programma: resta a zero per tutte le pipeline e a ogni traffico (lo "0,04%" è rumore, vedi slide 16). Quindi il collo di bottiglia è il programma, non la trasmissione.
+
+== 18 | È il programma o la sola ricezione?
+La perdita all'ingresso potrebbe venire dalla sola ricezione, che gira sullo stesso core del programma. Lo si controlla con rxonly, il contatore da solo: **fino a 11 milioni di pacchetti al secondo rxonly non perde niente**; a 12 milioni perde lo 0,1%, dove comincia a cedere il generatore stesso. Il pavimento, cioè la parte di perdita che non dipende dalla pipeline, è praticamente zero.
+
+Ogni barra è quindi quasi tutta "in più": è perdita dovuta al lavoro del programma. 7% per P1, 9% per P1.5, 63% per P2, 76% per P3: cresce con il costo del programma. La baseline perde l'1%, ma con il nodo al 60%: non è il programma (slide 15). La colonna "dopo il programma" resta a zero per tutte le pipeline.
+
+>> **Perché il pavimento è zero.** Su un core, senza la copia, la sola ricezione regge circa 19 milioni di pacchetti al secondo (slide 10), più del traffico più alto di questa scala. Le pipeline cominciano a perdere molto prima (P3 già a 2,5 milioni al secondo, P2 a 3,5, P1.5 e P1 a 9): nella zona in cui le pipeline perdono, la ricezione da sola non è vicina al suo limite.
+
+== 19 | Il ritardo
+Il ritardo è il tempo dal momento in cui xdp_gen spedisce il pacchetto (lo scrive nel pacchetto stesso, come un timbro) a quando arriva al nodo successivo. Il grafico mostra la mediana, cioè il valore "tipico". I pallini pieni sono i punti senza perdita, quelli vuoti i punti in cui perde il programma.
+- Finché il nodo regge, il ritardo è di qualche decina di microsecondi, e non cresce con il traffico.
+- Quando comincia la perdita il ritardo salta di colpo: 34 µs per P1, 35 per P1.5, 84 per P2, 125 per P3. La coda è piena, e ogni pacchetto deve aspettare che passino i 255 davanti a lui.
+- Poi resta piatto: la coda non può diventare più lunga di 256 posti. Il traffico in più non aumenta l'attesa, viene semplicemente respinto.
+
+>> **Esempio di calcolo.** P2 elabora 3,45 milioni di pacchetti al secondo, cioè uno ogni 290 ns. Con la coda piena un pacchetto aspetta 256 × 290 ns ≈ 74 µs. La misura dà 84 µs: il resto (circa il 10%) è il viaggio fino al nodo successivo.
+
+La tabella a destra fa lo stesso conto per tutte: P1 30 previsti contro 34 misurati, P1.5 32 contro 35, P2 74 contro 84, P3 109 contro 125. Previsto e misurato sono vicini, quindi il salto del ritardo è proprio la coda piena. La baseline non riempie mai la coda (il nodo ha tempo libero, slide 15): per lei la riga è vuota.
+
+!! **Il ritardo a basso carico.** I 17–19 µs a sinistra contengono un'attesa dentro il generatore: xdp_gen spedisce a lotti di 256, e il nodo viene svegliato a fine lotto, quindi un pacchetto può aspettare fino a una dozzina di µs prima di essere visto. Con lotti più piccoli quell'attesa sparisce, ma il generatore regge ritmi più bassi. Il salto a coda piena non cambia.
+
+== 20 | In sintesi
+1. **Le misure si ripetono.** Quattro misure diverse dello stesso nodo danno lo stesso costo entro il 2%, e si vedono anche differenze piccole come P1 contro P1.5 (7 ns) o scartare contro inoltrare (50 ns).
+1. **Un generatore come una scheda vera.** xdp_gen consegna i pacchetti senza copia: P1–P3 costano 117, 124, 290 e 425 ns per pacchetto, la baseline 66, due core reggono il doppio di uno, e su un E-core il nodo regge dal 61 all'82% del P-core.
+1. **Si perde prima del programma.** Quando il traffico supera la capacità, la coda si riempie, il ritardo salta alla coda piena e i pacchetti vengono respinti all'ingresso; dopo il programma non se ne perde nessuno, e la sola ricezione non perde affatto. Il collo di bottiglia è il programma.
+
+!! **Cose da dire con cautela.** Slide 10: la baseline satura appena, rxonly no. Slide 12: sul LP E-core baseline e rxonly non saturano. Slide 15–19: la baseline perde da 9 milioni al secondo con il nodo al 60%: è un limite del banco, non del programma, e la sua capacità è quella della slide 10. Slide 16–18: "≤ 0,04%" è rumore di misura, meglio dire "zero". Slide 19: il ritardo a basso carico contiene l'attesa nel generatore. P3 varia di qualche punto fra una misura e l'altra (416–445 ns).

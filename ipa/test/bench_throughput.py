@@ -163,6 +163,7 @@ for _p in (SHARED_DIR, _TEST_DIR):
         sys.path.insert(0, _p)
 
 import host_conditions as HC  # noqa: E402
+import hw_counters as HW  # noqa: E402
 
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
@@ -2333,7 +2334,37 @@ def measure_point(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
         med["ns_cpu"] = ns_cpu(med, med["cpu_dut_pct"], plan)
         med["softnet_dropped"] = diag_data.get("softnet_dropped")
         med["_diag"] = diag_data
+    med.update(hw_columns(runs, plan))
     return med
+
+
+def hw_columns(runs, plan):
+    """Istruzioni, cicli e IPC per pacchetto (hw_counters.per_packet) di
+    ogni ripetizione, poi la mediana fra le ripetizioni, come il rate. Il
+    denominatore e' quello del tempo di CPU: i pacchetti che il nodo ha
+    elaborato (HIT + MISS + DROP; per rxonly i ricevuti). Vuoto senza
+    contatori."""
+    if not plan or not plan.dut:
+        return {}
+    per = []
+    for r in runs:
+        hw = r.get("_hw_win") or {}
+        if not hw:
+            continue
+        pkts = (r.get("hit", 0) + r.get("miss", 0) + r.get("drop", 0)
+                or r.get("rx", 0))
+        cols = HW.per_packet(hw, plan.dut, pkts, r.get("secs"),
+                             egress=HC.egress_cpus(plan.egress))
+        if cols:
+            per.append(cols)
+    if not per:
+        return {}
+    out = {}
+    for k in HW.COLUMNS:
+        vals = [c[k] for c in per if c.get(k) is not None]
+        if vals:
+            out[k] = round(statistics.median(vals), 3)
+    return out
 
 
 def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
@@ -2349,6 +2380,7 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
     storico -- aggiungi, configura, misura -- che serve ai chiamanti che non
     hanno un Generator."""
     cpu_win = {}
+    hw_win = {}
     if gen is not None and steady and gen.window_mode == "steady":
         # Finestra stazionaria: i contatori si leggono a differenza mentre
         # tutte le istanze trasmettono, quindi niente azzeramento, niente
@@ -2368,6 +2400,11 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
             for c, (busy, tot) in _read_proc_stat().items():
                 out[f"_cpub{c}"] = busy
                 out[f"_cput{c}"] = tot
+            # Istruzioni e cicli dei core del nodo e dell'uscita, nella
+            # stessa lettura: la loro differenza e' sulla stessa finestra dei
+            # pacchetti (hw_counters).
+            if HW_COUNTERS is not None:
+                out.update(HW_COUNTERS.read())
             return out
         run = gen.steady(frame, delay, probe)
         devs = gen.names
@@ -2379,6 +2416,7 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
             if k.startswith("_cput") and dt > 0:
                 c = int(k[5:])
                 cpu_win[c] = round(100.0 * d.get(f"_cpub{c}", 0) / dt, 1)
+        hw_win = {k: v for k, v in d.items() if k.startswith("_hw")}
     else:
         # PRIMA di azzerare: la coda della finestra precedente (warm-up o
         # ripetizione) deve essere atterrata, altrimenti i suoi pacchetti finiscono
@@ -2455,6 +2493,7 @@ def _measure_once(setup, rx_tab, fab, frame, delay, count, n_out, clone=0,
                 offered_real_pps=int(offered_tx / secs),
                 hit=hit, miss=miss, drop=drop, rx=rx,
                 _cpu_win=cpu_win,
+                _hw_win=hw_win,
                 rx_pps=int(rx / secs),
                 # Il rate a cui il PROGRAMMA ha preso la decisione. E' la
                 # capacita' del nodo anche quando l'uscita non tiene il passo:
@@ -3970,7 +4009,6 @@ DUT_QUEUES = None
 # una porta scrive nello stesso ptr_ring del peer, sotto lo stesso
 # producer_lock: su 2 core la baseline si fermava a 13,0 Mpps elaborati con
 # 18-26 offerti, rxonly_fwd (solo redirect) a ~15,7 contro i 38,3 di rxonly
-# (results/generator_contention/xdp_2core_2thread_uscita_separata/).
 #
 # None (--egress-queues auto, il default): il minimo numero di code per cui le
 # CPU del DUT cadono in code diverse -- veth_xdp_xmit sceglie la coda come
@@ -4019,7 +4057,7 @@ def _warn_shared_queues(plan):
 
     Il redirect nel veth sceglie la coda del nodo dalla CPU che trasmette
     (CPU modulo numero di code: e' cio' che le misure del 2026-09-30
-    mostrano, results/generator_contention/). Due scrittori sulla stessa coda
+    mostrano). Due scrittori sulla stessa coda
     la svuotano piu' lentamente: su un core, 1 -> 3 thread porta la baseline
     da 12,4 a 7,2 Mpps; su due core, 2 thread (uno per coda) contro 3 danno
     13,0 contro 7,6. Le pipeline leggere ne escono sottostimate fino al 70%,
@@ -5359,6 +5397,10 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                        cpu_dut_pct=_median_or_none(
                            [r.get("cpu_dut_pct") for r in pts]),
                        ns_cpu=_median_or_none([r.get("ns_cpu") for r in pts]))
+            for k in HW.COLUMNS:
+                v = _median_or_none([r.get(k) for r in pts])
+                if v is not None:
+                    row[k] = round(v, 3)
             summary.append(row)
             flag = f" {RED}+-{spread:.0f}%{NC}" if row["unreliable"] else ""
             print(f"  {m:10s} {frame:5d} {phase:11s} {len(pts):4d} "
@@ -5368,12 +5410,34 @@ def run_compare(methods, model_path, frames, offered_pps=None,
                   f"{row['loss_pct']:7.2f}% "
                   f"{_fmt_opt(row['cpu_dut_pct']):>6s} "
                   f"{_fmt_opt(row['ns_cpu']):>7s} {tag:>18s}{flag}")
+        _hw_table(summary)
         _compare_verdict(summary, offered_pps, threshold)
     return raw, summary
 
 
 def _fmt_opt(v):
     return "-" if v is None else f"{v:.1f}"
+
+
+def _hw_table(summary):
+    """Cicli, istruzioni e IPC per pacchetto, se i contatori c'erano."""
+    rows = [r for r in summary if r.get("ipc") is not None]
+    if not rows:
+        if HW_WHY:
+            note(f"niente istruzioni per ciclo: {HW_WHY}")
+        return
+    print(f"\n  {'pipeline':10s} {'frame':>5s} {'fase':11s} "
+          f"{'ns CPU':>7s} {'cicli/pk':>9s} {'istr/pk':>9s} {'IPC':>6s} "
+          f"{'LLC/pk':>7s} {'br-miss':>7s} {'GHz':>6s} {'usc cic':>8s}")
+    for r in rows:
+        def g(k, spec):
+            v = r.get(k)
+            return "-" if v is None else format(v, spec)
+        print(f"  {r['method']:10s} {r['frame']:5d} {r['phase']:11s} "
+              f"{_fmt_opt(r.get('ns_cpu')):>7s} {g('cycles_pkt', '9.0f')} "
+              f"{g('instr_pkt', '9.0f')} {g('ipc', '6.2f')} "
+              f"{g('llc_miss_pkt', '7.3f')} {g('br_miss_pkt', '7.3f')} "
+              f"{g('dut_ghz_busy', '6.2f')} {g('egress_cycles_pkt', '8.0f')}")
 
 
 def _median_or_none(vals):
@@ -6481,7 +6545,7 @@ def ns_cpu(r, dut_pct, plan):
     nodo resta fermo ~17% del tempo pur respingendo il 72% dei pacchetti (le
     raffiche riempiono la coda, le pause la lasciano vuota), e 1/elaborati
     attribuiva al pacchetto anche l'attesa: P2 339 ns contro 286 di CPU.
-    Misurato il 2026-09-30, results/generator_contention/. None senza
+    Misurato il 2026-09-30. None senza
     diagnostica."""
     pps = node_pps(r)
     if not dut_pct or not pps or not plan or not plan.dut:
@@ -6858,6 +6922,36 @@ def capture_env(a=None, plan=None, methods=(), frames=()):
 # Le righe di env.csv sulla macchina per il run in corso (una funzione senza
 # argomenti), o None. La fissa main(), come WINDOW_MODE.
 HOST_ENV = None
+# I contatori hardware dei core del nodo e dell'uscita (hw_counters), aperti
+# da conditioned() per il run in corso, o None; HW_WHY dice perche' mancano.
+HW_COUNTERS = None
+HW_WHY = None
+
+
+def open_hw_counters(plan, enabled=True):
+    """Apre i contatori sui core del nodo e dell'uscita. Restituisce le
+    righe di env.csv che li descrivono."""
+    global HW_COUNTERS, HW_WHY
+    HW_COUNTERS, HW_WHY = None, None
+    if not enabled:
+        HW_WHY = "spenti (--no-hw)"
+        return [("contatori_hw", HW_WHY)]
+    cpus = sorted(set(plan.dut) | set(HC.egress_cpus(plan.egress)))
+    hw = HW.HwCounters(cpus)
+    HW_COUNTERS = hw.open()
+    if HW_COUNTERS is None:
+        HW_WHY = hw.why
+        warn(f"istruzioni per ciclo non misurate: {HW_WHY}")
+        return [("contatori_hw", f"n/d ({HW_WHY})")]
+    info(f"contatori hardware: {HW_COUNTERS.describe()}")
+    return [("contatori_hw", HW_COUNTERS.describe())]
+
+
+def close_hw_counters():
+    global HW_COUNTERS
+    if HW_COUNTERS is not None:
+        HW_COUNTERS.close()
+    HW_COUNTERS = None
 
 
 def print_env(env):
@@ -6956,6 +7050,8 @@ def report_rows(rows, threshold=DEFAULT_LOSS_THRESHOLD):
             ns_cpu=peak.get("ns_cpu") if peak.get("ns_cpu") is not None else "",
             cpu_dut_pct=peak.get("cpu_dut_pct")
             if peak.get("cpu_dut_pct") is not None else "",
+            **{k: (peak.get(k) if peak.get(k) is not None else "")
+               for k in HW.COLUMNS},
             max_loss_pct=round(_loss_of(peak), 3),
             max_loss_med_pct=_num(peak, "loss_med", ""),
             max_offered_pps=int(_num(peak, "offered_real_pps",
@@ -7412,6 +7508,10 @@ def main():
                         "default: da lei viene il tempo di CPU per pacchetto.")
     o.add_argument("--no-diag", dest="diag", action="store_false",
                    help="spegne la diagnostica (niente tempo di CPU)")
+    o.add_argument("--no-hw", action="store_true",
+                   help="non aprire i contatori hardware (istruzioni, cicli, "
+                        "IPC per pacchetto sui core del nodo e dell'uscita, "
+                        "hw_counters.py)")
     o.add_argument("--out", default=None, help="dove scrivere i CSV")
     o.add_argument("--latency", action="store_true",
                    help="percorso storico: latenza arrivo->ripartenza con una "
@@ -7564,12 +7664,17 @@ def conditioned(a, plan, body, out_dir=None):
         if os.path.exists(log_path):
             os.remove(log_path)
         mon.start_log(log_path)
+    # Dopo le condizioni: con il watchdog NMI spento i contatori fissi sono
+    # liberi e nessun evento e' multiplexato.
+    hw_env = open_hw_counters(plan, enabled=not getattr(a, "no_hw", False))
     HOST_ENV = lambda: HC.env_pairs(
         plan, host=host, monitor=mon,
-        log_summary=HC.summarise_log(log_path) if log_path else None)
+        log_summary=HC.summarise_log(log_path) if log_path else None) \
+        + hw_env
     try:
         return body(mon)
     finally:
+        close_hw_counters()
         cols = mon.run_columns()
         mon.close()
         HOST_ENV = None

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-diag_verifier.py -- perche' P2 oltre due strati e P1 oltre ~300 pesi non
-caricano: le statistiche del verificatore, forma per forma.
+diag_verifier.py -- perche' la ReLU delle pipeline non ha salti: le
+statistiche del verificatore, forma per forma, con e senza.
 
 Il banco (bench_scaling, bench_depth_vs_width) registra solo l'esito: carica o
 RIFIUTATO. Qui ogni programma si carica con log_level = 4 (BPF_LOG_STATS), che
@@ -16,9 +16,8 @@ Quando `processed` cresce molto piu' delle istruzioni del programma, il
 verificatore percorre gli stessi blocchi su molti cammini e la potatura non li
 riunisce: e' un'esplosione di cammini, non un programma troppo lungo.
 
-La causa, misurata il 2026-09-28 su 6.8.0-142: la ReLU scritta
-`a > 0 ? a : 0` diventava un salto condizionale per neurone, e il verificatore
-li percorreva su entrambi i lati. P2 a 1 strato: 799 563 istruzioni percorse
+Su 6.8.0-142 la ReLU scritta `a > 0 ? a : 0` diventa un salto condizionale
+per neurone, e il verificatore li percorre su entrambi i lati. P2 a 1 strato: 799 563 istruzioni percorse
 (56x il programma), da 3 strati oltre il limite; P1 1x16: 1 000 001 (287x).
 Con la ReLU senza salto (ipa_relu: a & ~(a >> 63), dietro una barriera asm
 perche' clang non la rifaccia salto) P2 sta fra 120 000 e 137 000 da 1 a 6
@@ -27,7 +26,7 @@ strati e P1 tier B fra 5 700 e 12 000.
 Ogni forma si prova in due varianti:
 
   attuale  il sorgente del progetto, con ipa_relu
-  salto    la vecchia ReLU `a > 0 ? a : 0` rimessa al suo posto: riproduce
+  salto    la ReLU `a > 0 ? a : 0` rimessa al suo posto: riproduce
            il problema, cosi' il confronto resta ripetibile
 
 Uso (root):

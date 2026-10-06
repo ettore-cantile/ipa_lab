@@ -217,8 +217,7 @@ per thread: su un core baseline, P1 e rxonly non arrivano al loro limite.
 DUT, e con 256 un frame puo' aspettare nel generatore fino a ~12 us, che il
 ritardo a basso carico conta (16-19 us contro 4-6 con 32). Con 32 la cadenza
 regge solo fino a ~2,5 Mpps. Le colonne napi_* e gen_* sono la diagnostica
-che ha trovato la pausa di ogni chiamata test_run (results/diag_xdp/ contro
-results/diag_xdp_lunga/).
+che ha trovato la pausa di ogni chiamata test_run.
 """
 import argparse
 import contextlib
@@ -240,7 +239,7 @@ GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
 # La scala di default con xdp_gen, in Mpps: fino a dove la cadenza di un
-# thread e' esatta (~11-12 Mpps, results/xdp_cadenza_test/, docs/testing.md
+# thread e' esatta (~11-12 Mpps, docs/testing.md
 # §11.4).
 XDP_RATES_MPPS = (0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 
@@ -630,6 +629,20 @@ def napi_sched(pids):
     return out
 
 
+def hw_row(B, plan, run):
+    """Istruzioni, cicli e IPC per pacchetto della finestra
+    (hw_counters.per_packet). Denominatore: i pacchetti che il contatore
+    davanti alla pipeline ha visto, cioe' tutti quelli che il nodo ha
+    elaborato. Hanno senso dove il nodo e' saturo: sotto, i cicli contano
+    anche l'attesa in POLL fra un pacchetto e l'altro."""
+    import hw_counters as HW
+    d = run.dut or {}
+    pkts = d.get("rx_xdp") or 0
+    egress = getattr(plan, "egress", None)
+    return HW.per_packet(d, plan.dut, pkts, run.window,
+                         egress=B.HC.egress_cpus(egress))
+
+
 def diag_columns(d, secs, sent):
     """Le colonne diagnostiche di una finestra dalle differenze dei contatori
     di napi_sched e XdpGen.diag (assenti: colonne vuote)."""
@@ -741,7 +754,8 @@ MEDIAN_KEYS = (
     "e2e_latency_max_us", "e2e_latency_p50_raw_us", "e2e_samples",
     "e2e_spin_correction_us", "duration_s", "point_wall_s",
     "host_dut_mhz", "host_dut_busy_pct", "host_pkg_temp_c",
-    "napi_run_pct")
+    "napi_run_pct", "instr_pkt", "cycles_pkt", "ipc", "llc_miss_pkt",
+    "br_miss_pkt", "dut_ghz_busy", "egress_cycles_pkt", "egress_ipc")
 SPREAD_KEYS = ("sent_pps", "rx_pps", "forwarded_pps", "bitrate_sent_gbps",
                "e2e_latency_p50_us", "e2e_latency_p99_us")
 
@@ -1193,6 +1207,10 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                     ps = setup["pkt_stats"]
                     d.update(hit=B._read_u64(ps, 0), miss=B._read_u64(ps, 1),
                              drop=B._read_u64(ps, 2))
+                # istruzioni e cicli di nodo e uscita (hw_counters), nella
+                # stessa lettura
+                if B.HW_COUNTERS is not None:
+                    d.update(B.HW_COUNTERS.read())
                 return d
             return read
 
@@ -1368,6 +1386,7 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                 gen.n_inst, run.window, wall, run.tx,
                                 getattr(run, "errors", 0), run.dut, lat, mask,
                                 idle_ok=idle_ok[0], host=host)
+                            row.update(hw_row(B, plan, run))
                             raw.append(row)
                             if save:
                                 save(raw, over)

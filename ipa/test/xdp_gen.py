@@ -38,7 +38,7 @@ riempirebbe da sola la coda da 256 posti e farebbe perdere pacchetti sotto
 capacita'. Se il thread resta indietro (la chiamata successiva, uno
 scheduling) recupera al piu' CATCHUP frame di fila e poi riparte da adesso --
 pktgen invece trasmette di fila fino a rimettersi in orario, a qualunque
-distanza. Il primo run (2026-10-02, results/bitrate_xdp/) non recuperava
+distanza. Senza recupero (il primo run, 2026-10-02) non recuperava
 niente: a ogni fine lotto il thread resta fermo qualche us, e spediva l'80-87%
 del chiesto a rate basso, il 45-65% a rate alto. Il redirect accoda nel veth a gruppi (al piu' 16 frame,
 DEV_MAP_BULK_SIZE, o a fine lotto): a rate alto i frame arrivano a gruppetti
@@ -100,9 +100,8 @@ BATCH_SIZE = 256
 # parte e finisce con una pausa del thread di ~12 ms dentro il kernel
 # (preparazione e smontaggio: dispatcher XDP, page_pool). Con chiamate da
 # CALL_FRAMES frame ce n'erano 2-4 per finestra: il generatore taceva il ~13%
-# del tempo, il DUT svuotava la coda e dormiva (diagnostica in
-# results/diag_xdp/: thread NAPI all'87%, 2-3 sonni per finestra quante le
-# chiamate). Per questo il nodo risultava occupato all'~87% anche a coda
+# del tempo, il DUT svuotava la coda e dormiva (diagnostica: thread NAPI
+# all'87%, 2-3 sonni per finestra quante le chiamate). Per questo il nodo risultava occupato all'~87% anche a coda
 # piena, e la cadenza spediva l'~80% del chiesto. steady() fa quindi UNA
 # chiamata lunga e la interrompe con un segnale a fine finestra: test_run
 # controlla signal_pending e torna con EINTR. La pausa iniziale cade prima

@@ -75,6 +75,11 @@ def build_mtl(root):
         w(root, f"{d}/topology/physical_package_id", 0)
         if n < 20:
             w(root, f"{d}/cache/index3/shared_cpu_list", "0-19")
+        # L2: il core sui P-core, il modulo di 4 sugli E-core, la coppia sui
+        # LP E-core (come su questa macchina)
+        l2 = (sib.get(n, str(n)) if n < 12 else "12-15" if n < 16
+              else "16-19" if n < 20 else "20-21")
+        w(root, f"{d}/cache/index2/shared_cpu_list", l2)
         if n in (1, 2, 3, 4):
             mx, base = 4800000, 1400000
         elif n < 12:
@@ -341,6 +346,16 @@ def t_plan(root, flat, smt):
     check("--threads 6: esteso sugli E-core (mai sui LP E), e lo dice",
           r["gen"] == [8, 10, 1, 3, 12, 13]
           and any("lenti" in n for n in r["notes"]), str(r))
+    used = [12, 16, 10]
+    check("DUT e uscita su E-core: i compagni di modulo L2 a riposo, "
+          "fuori dal sistema",
+          HC.format_cpu_list(HC.idle_siblings(topo, used)) == "11,13-15,17-19"
+          and HC.format_cpu_list(HC.housekeeping(topo, used))
+          == "0-9,20-21"
+          and topo.label(12) == "cpu12 (E, modulo L2 con 13-15)",
+          f"{HC.idle_siblings(topo, used)} {topo.label(12)}")
+    check("su un P-core il modulo e' il core",
+          topo.cluster(6) == topo.core(6) == (6, 7))
     r = HC.plan_roles(topo, allow_cpu0=True)
     check("--allow-cpu0: il core 0/5 torna disponibile",
           0 in r["dut"] + r["gen"], str(r))

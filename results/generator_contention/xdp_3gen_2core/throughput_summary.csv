@@ -1,7 +1,0 @@
-method,frame,max_rx_pps,max_rx_mbps,max_loss_pct,max_loss_med_pct,max_offered_pps,rx_pkts,tx_pkts,lost_before,lost_after,respinti,respinti_pct,persi_dut,persi_in_coda,persi_dopo,loss_dut_pct,noloss_rx_pps,noloss_gen_bound,noloss_rx_mbps,noloss_loss_pct,zero_rx_pps,lat_p50_ns,lat_min_ns,lat_rx_pps,bottleneck,unreliable,rounds,ns_pkt,ns_pkt_vs_baseline
-baseline,64,5070504,2596.1,87.244,,38681367,1522224,11611471,9308202,758366,0,80.134,0,0,0,6.548,0,False,0,,0,,,5070504,pipeline-ingresso,False,3,197.2,
-p1_static,64,5494732,2813.3,86.503,,39242964,1649526,11780791,9730263,401002,0,82.586,0,0,0,3.404,0,False,0,,0,,,5494732,pipeline-ingresso,False,3,182.0,-15.2
-hardcoded,64,5312304,2719.9,86.564,,38873537,1594991,11671571,9698370,378210,0,83.046,0,0,0,3.24,0,False,0,,0,,,5312304,pipeline-ingresso,False,3,188.2,-9.0
-template,64,4434216,2270.32,89.95,,43127422,1331094,12946289,11615149,46,0,89.679,0,0,0,0.0,0,False,0,,0,,,4434216,pipeline-ingresso,False,3,225.5,28.3
-modular,64,3379598,1730.35,92.765,,46045895,1014514,13822411,12807858,39,0,92.66,0,0,0,0.0,0,False,0,,0,,,3379598,pipeline-ingresso,False,3,295.9,98.7
-rxonly,64,29004353,14850.23,35.217,,44150409,8707137,13255458,4662523,0,0,35.099,0,0,0,0.0,0,False,0,,0,,,29004353,pipeline-ingresso,False,3,34.5,-162.7

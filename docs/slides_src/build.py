@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-build.py -- rigenera "Test reale su dual boot - spiegazione.pdf".
+build.py -- rigenera i PDF "<presentazione> - spiegazione.pdf": ogni slide,
+una alla volta, con la sua spiegazione sotto.
 
 Le immagini delle slide vengono dal .pptx (LibreOffice -> PDF -> PNG), il testo
-da spiegazione.txt (formato descritto in testa al file). L'HTML si stampa in
-PDF con Chrome senza interfaccia, come il PDF originale.
+da spiegazione_<nome>.txt (formato descritto in testa al file). L'HTML si stampa
+in PDF con Chrome senza interfaccia.
 
-    python3 docs/slides_src/build.py
+    python3 docs/slides_src/build.py                 # tutte e due
+    python3 docs/slides_src/build.py inferenza       # solo una
 
 Serve: libreoffice (soffice), pdftoppm (poppler), google-chrome o chromium.
 $SOFFICE sostituisce il comando di LibreOffice.
@@ -23,9 +25,12 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DOCS = os.path.dirname(HERE)
-PPTX = os.path.join(DOCS, "Test reale su dual boot.pptx")
-OUT = os.path.join(DOCS, "Test reale su dual boot - spiegazione.pdf")
-TEXT = os.path.join(HERE, "spiegazione.txt")
+# nome -> (presentazione, titolo, glossario in più)
+DECKS = {
+    "inferenza": ("Inferenza di una rete neurale nel kernel Linux con eBPF XDP",
+                  "Inferenza di una rete neurale nel kernel Linux"),
+    "test_reale": ("Test reale su dual boot", "Il test reale su dual boot"),
+}
 
 GLOSSARY = [
     ("Nodo", "Il computer che riceve il pacchetto, esegue la rete neurale e lo inoltra. Nel banco è il core 6."),
@@ -33,7 +38,7 @@ GLOSSARY = [
     ("Pipeline", "Una delle versioni del programma che esegue la rete neurale (P1, P1.5, P2, P3)."),
     ("baseline / rxonly", "I due programmi di riferimento: la baseline inoltra senza rete neurale, rxonly riceve e basta."),
     ("Coda", "I 256 posti davanti al nodo dove i pacchetti aspettano. Se è piena, chi arriva è respinto."),
-    ("Coda d'uscita", "La coda del cavo virtuale verso il nodo successivo. Con più core sul nodo ce n'è una per core, svuotata da un core suo (slide 12)."),
+    ("Coda d'uscita", "La coda del cavo virtuale verso il nodo successivo. Con più core sul nodo ce n'è una per core, svuotata da un core suo."),
     ("Capacità", "Quanti pacchetti al secondo il nodo riesce a elaborare al massimo."),
     ("Collo di bottiglia", "Il pezzo più lento della catena: decide quanto traffico passa."),
     ("M/s", "Milioni di pacchetti al secondo."),
@@ -42,6 +47,10 @@ GLOSSARY = [
     ("Costo per pacchetto", "1 diviso la capacità. 2 milioni di pacchetti al secondo = 500 ns per pacchetto."),
     ("Tempo di CPU per pacchetto", "Quanto tempo il core del nodo lavora davvero per ogni pacchetto: occupazione del core × 1 diviso la capacità. Coincide con il costo per pacchetto quando il nodo lavora il 100% del tempo."),
     ("Scrittore", "Chi mette pacchetti in una coda. Con una scheda di rete vera è la scheda stessa: uno per coda."),
+    ("P-core, E-core, LP E-core", "I tre tipi di core del processore: veloci (Redwood Cove), efficienti (Crestmont, in moduli da quattro che dividono cache L2 e frequenza) e a basso consumo (fuori dalla cache L3, al massimo 2,5 GHz)."),
+    ("Istruzioni per pacchetto", "Quante istruzioni macchina il core del nodo esegue per ogni pacchetto, contate dal processore stesso (contatori hardware). Dipendono dal codice, non dal core."),
+    ("Ciclo, IPC", "Il ciclo è il battito dell'orologio del core (3,5 miliardi al secondo a 3,5 GHz). IPC = istruzioni eseguite per ciclo: dice quanto lavoro il core fa a ogni battito, e dipende dal core."),
+    ("BPF_PROG_TEST_RUN", "Una funzione del kernel che esegue il programma XDP su un pacchetto preparato, in un ciclo, senza traffico vero: misura il costo del solo programma."),
 ]
 
 CSS = """
@@ -122,15 +131,15 @@ def render_blocks(blocks):
     return "\n".join(out)
 
 
-def slide_images(tmp):
+def slide_images(tmp, pptx):
     soffice = os.environ.get("SOFFICE") or shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
         sys.exit("serve LibreOffice (soffice)")
     profile = "file://" + os.path.join(tmp, "lo_profile")
     subprocess.run([soffice, f"-env:UserInstallation={profile}", "--headless",
-                    "--convert-to", "pdf", "--outdir", tmp, PPTX],
+                    "--convert-to", "pdf", "--outdir", tmp, pptx],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    pdf = os.path.join(tmp, os.path.splitext(os.path.basename(PPTX))[0] + ".pdf")
+    pdf = os.path.join(tmp, os.path.splitext(os.path.basename(pptx))[0] + ".pdf")
     subprocess.run(["pdftoppm", "-png", "-scale-to-x", "1920", "-scale-to-y", "-1",
                     pdf, os.path.join(tmp, "s")], check=True)
     imgs = sorted(glob.glob(os.path.join(tmp, "s-*.png")),
@@ -138,15 +147,15 @@ def slide_images(tmp):
     return {i + 1: p for i, p in enumerate(imgs)}
 
 
-def main():
-    chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
-    if not chrome:
-        sys.exit("serve google-chrome o chromium")
-    slides = parse(TEXT)
+def build(name, chrome):
+    base, title = DECKS[name]
+    pptx = os.path.join(DOCS, base + ".pptx")
+    out = os.path.join(DOCS, base + " - spiegazione.pdf")
+    slides = parse(os.path.join(HERE, f"spiegazione_{name}.txt"))
     with tempfile.TemporaryDirectory() as tmp:
-        imgs = slide_images(tmp)
+        imgs = slide_images(tmp, pptx)
         parts = [f"<style>{CSS}</style>",
-                 "<h1>Il test reale su dual boot</h1>",
+                 f"<h1>{html.escape(title)}</h1>",
                  '<div class="sub">Le slide una alla volta, ognuna con la sua spiegazione</div>',
                  "<p>Ogni pagina ha l'immagine di una slide e sotto la spiegazione. I riquadri "
                  "grigi sono <b>esempi con i numeri</b>; i riquadri gialli segnalano i <b>punti "
@@ -165,12 +174,23 @@ def main():
         page = os.path.join(tmp, "spiegazione.html")
         with open(page, "w", encoding="utf-8") as f:
             f.write('<!doctype html><html lang="it"><head><meta charset="utf-8">'
-                    "<title>Il test reale su dual boot</title></head><body>"
+                    f"<title>{html.escape(title)}</title></head><body>"
                     + "\n".join(parts) + "</body></html>")
         subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
-                        f"--print-to-pdf={OUT}", "file://" + page],
+                        f"--print-to-pdf={out}", "file://" + page],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"scritto {OUT}")
+    print(f"scritto {out}")
+
+
+def main():
+    chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+    if not chrome:
+        sys.exit("serve google-chrome o chromium")
+    names = sys.argv[1:] or list(DECKS)
+    for n in names:
+        if n not in DECKS:
+            sys.exit(f"presentazione sconosciuta: {n} ({', '.join(DECKS)})")
+        build(n, chrome)
 
 
 if __name__ == "__main__":
