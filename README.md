@@ -1,426 +1,532 @@
-# IPA Lab — una rete neurale dentro il kernel Linux, con eBPF/XDP
+# IPA Lab — a neural network inside the Linux kernel, with eBPF/XDP
 
-Questo repository esegue una piccola rete neurale **dentro il kernel Linux**, nel
-primo punto in cui un pacchetto arriva (XDP), per decidere da quale porta farlo
-uscire. È l'implementazione di laboratorio degli **Intelligent PAckets (IPA)**:
-il pacchetto porta con sé quale modello usare, e ogni nodo esegue l'inferenza sul
-proprio stato locale, senza un piano di controllo che riconfiguri le rotte.
+This repository runs a small neural network **inside the Linux kernel**, at the
+first point a packet reaches (XDP), to decide which port the packet leaves
+from. It is the lab implementation of **Intelligent PAckets (IPA)**: the packet
+carries which model to use, and every node runs the inference on its own local
+state, with no control plane reconfiguring routes.
 
-La stessa rete è scritta in **quattro versioni**, da completamente compilata a
-completamente configurabile, e il repository misura quanto costa ogni scelta:
-per pacchetto, in istruzioni, su traffico vero, e su core di tipo diverso.
+The same network is written in **four versions**, from fully compiled to fully
+configurable, and the repository measures what each choice costs: per packet,
+in instructions, under real traffic, and on different kinds of CPU core.
 
-> Il lavoro estende il proof-of-concept di Polverini, Cianfrani e Listanti
-> (Sapienza Università di Roma / Università del Molise). Il codice della fase
-> preliminare è sul branch `ipa-poc-preliminar`.
-
----
-
-## Indice
-
-1. [I risultati in una tabella](#i-risultati-in-una-tabella)
-2. [Le quattro versioni](#le-quattro-versioni)
-3. [Com'è fatto il repository](#comè-fatto-il-repository)
-4. [Installazione](#installazione)
-5. [Primi passi: i test in dieci minuti](#primi-passi-i-test-in-dieci-minuti)
-6. [Misurare](#misurare)
-7. [Tutti i test](#tutti-i-test)
-8. [Usare una pipeline su un'interfaccia](#usare-una-pipeline-su-uninterfaccia)
-9. [Come funziona il datapath](#come-funziona-il-datapath)
-10. [Altri modelli, altre reti](#altri-modelli-altre-reti)
-11. [Documentazione](#documentazione)
-12. [Limiti](#limiti)
-13. [Riferimenti](#riferimenti)
+> This work extends the proof of concept by Polverini, Cianfrani and Listanti
+> (Sapienza University of Rome / University of Molise). The code of the
+> preliminary phase is on the `ipa-poc-preliminar` branch.
+>
+> The documents in `docs/` (test guide, claims, notebook, slides) are in
+> Italian; this README and the code comments are in English.
 
 ---
 
-## I risultati in una tabella
+## Contents
 
-Modello 65-4-4-7 (319 pesi), pacchetti da 64 byte, generatore `xdp_gen`, un core
-del nodo a 3,5 GHz. Campagna del 6 ottobre 2026, tutti i dati in
-[`results/campagna_2026-10-06/`](results/campagna_2026-10-06/) (sintesi in `sintesi.md`).
+1. [Results at a glance](#results-at-a-glance)
+2. [The four versions](#the-four-versions)
+3. [Repository layout](#repository-layout)
+4. [Installation](#installation)
+5. [First steps: the tests in ten minutes](#first-steps-the-tests-in-ten-minutes)
+6. [How the measurements work](#how-the-measurements-work)
+7. [Running measurements](#running-measurements)
+8. [All the tests](#all-the-tests)
+9. [Running a pipeline on an interface](#running-a-pipeline-on-an-interface)
+10. [How the datapath works](#how-the-datapath-works)
+11. [Other models, other networks](#other-models-other-networks)
+12. [Documentation](#documentation)
+13. [Limitations](#limitations)
+14. [References](#references)
 
-| | baseline | P1 statica | P1.5 | P2 | P3 |
+---
+
+## Results at a glance
+
+Model 65-4-4-7 (319 weights), 64-byte packets, `xdp_gen` traffic generator,
+one node core at 3.5 GHz. Campaign of 6 October 2026, all data in
+[`results/campagna_2026-10-06/`](results/campagna_2026-10-06/) (summary in
+`sintesi.md`).
+
+| | baseline | P1 static | P1.5 | P2 | P3 |
 |---|---:|---:|---:|---:|---:|
-| **milioni di pacchetti/s, P-core** | 15,27 | 8,56 | 8,04 | 3,45 | 2,36 |
-| ns di CPU per pacchetto | 66 | 117 | 124 | 290 | 425 |
-| costo della rete neurale (sopra la baseline) | — | +51 ns | +58 ns | +224 ns | +359 ns |
-| istruzioni eseguite per pacchetto | 606 | 1 220 | 1 426 | 4 556 | 6 573 |
-| istruzioni per ciclo (IPC), P-core | 2,7 | 3,0 | 3,3 | 4,5 | 4,4 |
-| **milioni di pacchetti/s, E-core** | 9,39 | 6,35 | 5,84 | 2,83 | 1,94 |
-| E-core rispetto al P-core | 0,61 | 0,74 | 0,73 | 0,82 | 0,82 |
-| programma da solo (`BPF_PROG_TEST_RUN`) | 14 ns | 46 ns | 52 ns | 194 ns | 318 ns |
+| **million packets/s, P-core** | 15.27 | 8.56 | 8.04 | 3.45 | 2.36 |
+| CPU ns per packet | 66 | 117 | 124 | 290 | 425 |
+| neural network cost (above the baseline) | — | +51 ns | +58 ns | +224 ns | +359 ns |
+| instructions executed per packet | 606 | 1 220 | 1 426 | 4 556 | 6 573 |
+| instructions per cycle (IPC), P-core | 2.7 | 3.0 | 3.3 | 4.5 | 4.4 |
+| **million packets/s, E-core** | 9.39 | 6.35 | 5.84 | 2.83 | 1.94 |
+| E-core relative to P-core | 0.61 | 0.74 | 0.73 | 0.82 | 0.82 |
+| program alone (`BPF_PROG_TEST_RUN`) | 14 ns | 46 ns | 52 ns | 194 ns | 318 ns |
 
-In quattro righe:
+In five lines:
 
-- **La configurabilità si paga per pacchetto**: circa 50–60 ns di rete con i pesi
-  compilati, 225–360 ns con i pesi letti da tabella.
-- **Il collo di bottiglia è il programma**: oltre la capacità i pacchetti si
-  perdono all'ingresso, mai dopo il programma; due core reggono il doppio.
-- **Su un core lento il codice è lo stesso, l'IPC no**: l'E-core esegue le stesse
-  istruzioni ma rallenta soprattutto la parte fissa del nodo, poco la rete neurale.
-- **Cambiare modello costa millisecondi a tutte le pipeline**: P1 si compila
-  fuori dal nodo e si carica in ~1 ms; P2 e P3 scrivono una tabella in ~10 ms.
+- **Configurability is paid per packet**: about 50–60 ns of neural network
+  with compiled-in weights, 225–360 ns with weights read from maps.
+- **The bottleneck is the program**: above capacity, packets are lost at the
+  program's input queue, never after it; two cores carry twice the traffic.
+- **On a slow core the code is the same, the IPC is not**: an E-core executes
+  the same instructions but mostly slows down the node's fixed work, much less
+  the neural network.
+- **The program alone predicts the shape, not the full cost**: under traffic
+  the inference alone costs 10–40 ns more (P1, P1.5) and 40–110 ns more (P2,
+  P3) than `BPF_PROG_TEST_RUN` reports, with the same trends on every axis
+  (campaign of 10 October, [`results/campagna_2026-10-10/`](results/campagna_2026-10-10/)).
+- **Changing the model costs milliseconds for every pipeline**: P1 is compiled
+  off the node and loaded in ~1 ms; P2 and P3 write a map in ~10 ms.
 
 ---
 
-## Le quattro versioni
+## The four versions
 
-Tutte calcolano la stessa rete intera (pesi a 8 bit) e prendono la stessa
-decisione sullo stesso pacchetto. Cambia che cosa è scritto nel programma quando
-lo si compila e che cosa il programma legge da tabelle (mappe eBPF) mentre gira.
+All four compute the same integer network (8-bit weights) and take the same
+decision on the same packet. What changes is what is written into the program
+at compile time and what the program reads from eBPF maps while it runs.
 
-| | **P1 statica** (`p1_static`) | **P1.5** (`hardcoded`) | **P2** (`template`) | **P3** (`modular`) |
+| | **P1 static** (`p1_static`) | **P1.5** (`hardcoded`) | **P2** (`template`) | **P3** (`modular`) |
 |---|---|---|---|---|
-| pesi | nel codice | nel codice | in tabella | in tabella |
-| identità del nodo | nel codice | in tabella | in tabella | in tabella |
-| forma della rete | nel codice | nel codice | in tabella, entro tetti compilati | in tabella |
-| numero di strati | nel codice | nel codice | nel codice | in tabella |
-| un binario per | nodo | modello | famiglia di architetture | tutto |
-| salti fra programmi per pacchetto | 1 | 1 | 1 | 1 + strati |
-| cambiare modello | ricompilare (fuori dal nodo) | ricompilare (fuori dal nodo) | scrivere una tabella | scrivere una tabella |
+| weights | in the code | in the code | in a map | in a map |
+| node identity | in the code | in a map | in a map | in a map |
+| network shape | in the code | in the code | in a map, within compiled ceilings | in a map |
+| number of layers | in the code | in the code | in the code | in a map |
+| one binary per | node | model | family of architectures | everything |
+| tail calls per packet | 1 | 1 | 1 | 1 + layers |
+| changing the model | recompile (off the node) | recompile (off the node) | write a map | write a map |
 
-P1 e P1.5 si distribuiscono come **oggetto precompilato (AOT)**: il C con i pesi
-dentro si compila con clang su una macchina qualunque, e il nodo carica il file
-pronto con un piccolo caricatore statico, senza compilatore. P2 e P3 si compilano
-una volta con BCC all'avvio del nodo e poi non si toccano più.
+P1 and P1.5 ship as a **precompiled (AOT) object**: the C source with the
+weights inside is compiled with clang on any machine, and the node loads the
+ready file with a small static loader, without a compiler. P2 and P3 are
+compiled once with BCC when the node starts and are never touched again.
 
-Due programmi di riferimento completano i confronti: **baseline** (legge
-l'intestazione, decrementa il TTL e inoltra, senza rete neurale) e **rxonly**
-(riceve e butta: il costo della sola ricezione).
+Two reference programs complete the comparisons: **baseline** (parses the
+header, decrements the TTL and forwards, without a neural network) and
+**rxonly** (receives and drops: the cost of reception alone).
 
 ---
 
-## Com'è fatto il repository
+## Repository layout
 
-Tre strati, e la dipendenza punta sempre verso l'alto: il motore non sa niente
-della rete su cui si misura.
+Three layers, and the dependency always points upwards: the engine knows
+nothing about the network it is measured on.
 
 ```
 ipa_lab/
-├── ipa/                          MOTORE: pipeline, inferenza, piano di controllo
-│   ├── execute_pipeline.py       punto d'ingresso: attacca una pipeline a un'interfaccia
-│   ├── ebpf_program.py           P1/P1.5: genera il C con i pesi come letterali
-│   ├── ebpf_template_arch.py     P2: sorgente eBPF e caricamento dei pesi in tabella
-│   ├── ebpf_modular.py           P3: sorgente eBPF, uno strato per programma
-│   ├── p1_aot.py                 P1 come oggetto precompilato (build + caricatore)
-│   ├── poc_aot/                  generatore del C (gen_full_c.py), loader_aot.c, Makefile
-│   ├── methods/                  ingresso per pipeline (usati da execute_pipeline)
-│   ├── class_semantics.py        classe → azione → porta logica, dichiarata dal modello
-│   ├── node_config.py            porta logica → interfaccia, ifindex e MAC (per nodo)
-│   ├── model_meta.py / .json     la scheda del modello: feature, scale, classi, rete
-│   ├── model_source.py           carica qualunque modello (checkpoint, sintetico, cartella)
-│   ├── pipeline_limits.py        quali forme regge ogni pipeline
-│   ├── link_state_monitor.py     stato reale dei collegamenti → mappa link_state
-│   ├── queue_state_monitor.py    occupazione delle code → mappa queue_state
-│   ├── common.py, stats_maps.py, pinned_maps.py   mappe, attach XDP, contatori per-CPU
-│   ├── FRR_model.py, extract_weights.py, label_mapping.py   lato addestramento: .pt → pesi
-│   ├── frr_germany50_5_model_4x2.pt, weights.json          il modello addestrato
-│   ├── synth/                    generatore di modelli sintetici (scenari generati: non in git)
-│   └── test/                     test, banchi di misura, script di campagna (sotto)
+├── ipa/                          ENGINE: pipelines, inference, control plane
+│   ├── execute_pipeline.py       entry point: attaches a pipeline to an interface
+│   ├── ebpf_program.py           P1/P1.5: generates C with the weights as literals
+│   ├── ebpf_template_arch.py     P2: eBPF source and loading of the weights into maps
+│   ├── ebpf_modular.py           P3: eBPF source, one program per layer
+│   ├── p1_aot.py                 P1 as a precompiled object (build + loader)
+│   ├── poc_aot/                  C generator (gen_full_c.py), loader_aot.c, Makefile
+│   ├── methods/                  per-pipeline entry points (used by execute_pipeline)
+│   ├── class_semantics.py        class → action → logical port, declared by the model
+│   ├── node_config.py            logical port → interface, ifindex and MAC (per node)
+│   ├── model_meta.py / .json     the model card: features, scale, classes, network
+│   ├── model_source.py           loads any model (checkpoint, synthetic, directory)
+│   ├── pipeline_limits.py        which shapes each pipeline can run
+│   ├── link_state_monitor.py     real link state → link_state map
+│   ├── queue_state_monitor.py    queue occupancy → queue_state map
+│   ├── common.py, stats_maps.py, pinned_maps.py   maps, XDP attach, per-CPU counters
+│   ├── FRR_model.py, extract_weights.py, label_mapping.py   training side: .pt → weights
+│   ├── frr_germany50_5_model_4x2.pt, weights.json          the trained model
+│   ├── synth/                    synthetic model generator (generated scenarios: not in git)
+│   └── test/                     tests, benches, campaign scripts (below)
 │
-├── topologies/                   SCENARI: una cartella per rete
-│   ├── germany50/                SNDlib Germany50 (la rete del modello addestrato)
-│   └── germany50_ttl16/, synth_*/   le reti dei modelli sintetici
+├── topologies/                   SCENARIOS: one directory per network
+│   ├── germany50/                SNDlib Germany50 (the network of the trained model)
+│   └── germany50_ttl16/, synth_*/   the networks of the synthetic models
 │
-├── results/                      MISURE: una cartella per campagna
-│   └── campagna_2026-10-06/      CSV, condizioni della macchina, sintesi.md
+├── results/                      MEASUREMENTS: one directory per campaign
+│   ├── campagna_2026-10-06/      full campaign: CSV, machine conditions, sintesi.md
+│   └── campagna_2026-10-10/      30 parametric models under traffic (incl. network size and
+│                                 input composition), with the inference alone (T2−T1)
 │
-└── docs/                         DOCUMENTI (in italiano)
-    ├── testing.md                la guida ai test, con tutti i risultati
-    ├── claims.md                 ogni affermazione, la sua prova e come rifarla
-    ├── september_notebook.tex/.pdf   il quaderno: come funziona e quanto costa
-    ├── *.pptx + "- spiegazione.pdf"  le presentazioni, e una spiegazione slide per slide
-    ├── slides_src/               build.py e i testi delle spiegazioni
-    └── figures/                  i grafici del quaderno
+└── docs/                         DOCUMENTS (in Italian)
+    ├── testing.md                the test guide, with every result
+    ├── claims.md                 every claim, its evidence and how to reproduce it
+    ├── september_notebook.tex/.pdf   the notebook: how it works and what it costs
+    ├── *.pptx + "- spiegazione.pdf"  the slides, and a slide-by-slide explanation
+    ├── slides_src/               build.py and the explanation texts
+    └── figures/                  the notebook's charts
 ```
 
-`ipa/test/` contiene tre famiglie di file:
+`ipa/test/` holds five families of files:
 
-| famiglia | file | a che cosa serve |
+| family | files | purpose |
 |---|---|---|
-| test senza root | `test_suite.py`, `test_class_semantics.py`, `test_synth.py`, `test_model_source.py`, `test_host_conditions.py`, `test_bitrate_math.py`, `test_steady_window.py`, `p1_c_eval.py` | aritmetica, semantica, modelli sintetici, logica dei banchi |
-| test nel kernel | `verify_prog_run.py`, `verify_multi_model.py`, `verify_per_model_semantics.py`, `verify_synth_kernel.py`, `test_fabric.py`, `test_host_kernel.py`, `diag_verifier.py` | i programmi veri caricati nel kernel, il fabric `veth`, la macchina |
-| banchi di misura | `bench_throughput.py`, `bench_bitrate.py`, `bench_scaling.py`, `bench_depth_vs_width.py`, `bench_tailcall_overhead.py` | capacità, curve al crescere del traffico, analisi parametrica |
-| infrastruttura | `host_conditions.py`, `hw_counters.py`, `xdp_gen.py`, `netns_fabric.py`, `pipeline_setup.py`, `model_under_test.py`, `traffic_models.py`, `campaign_report.py`, `plot_bitrate.py` | condizioni della macchina, contatori hardware, generatore, fabric, modelli |
-| campagne | `remeasure_campagna.sh`, `remeasure_all.sh` | rifanno ogni numero dei documenti |
+| tests without root | `test_suite.py`, `test_class_semantics.py`, `test_synth.py`, `test_model_source.py`, `test_host_conditions.py`, `test_bitrate_math.py`, `test_steady_window.py`, `p1_c_eval.py` | arithmetic, class semantics, synthetic models, bench logic |
+| kernel tests | `verify_prog_run.py`, `verify_multi_model.py`, `verify_per_model_semantics.py`, `verify_synth_kernel.py`, `test_fabric.py`, `test_host_kernel.py`, `diag_verifier.py` | the real programs loaded in the kernel, the `veth` fabric, the machine |
+| benches | `bench_throughput.py`, `bench_bitrate.py`, `bench_scaling.py`, `bench_depth_vs_width.py`, `bench_tailcall_overhead.py` | capacity, curves under growing traffic, parametric analysis |
+| infrastructure | `host_conditions.py`, `hw_counters.py`, `xdp_gen.py`, `netns_fabric.py`, `pipeline_setup.py`, `model_under_test.py`, `traffic_models.py`, `campaign_report.py`, `plot_bitrate.py` | machine conditions, hardware counters, generator, fabric, models |
+| campaigns | `remeasure_campagna.sh`, `remeasure_all.sh` | reproduce every number in the documents |
 
 ---
 
-## Installazione
+## Installation
 
-Serve **Linux su una macchina vera** (non una macchina virtuale: vedi
-[Limiti](#limiti)), con BCC. Su Ubuntu 24.04:
+You need **Linux on a physical machine** (not a virtual machine: see
+[Limitations](#limitations)), with BCC. On Ubuntu 24.04:
 
 ```bash
 sudo apt install bpfcc-tools python3-bpfcc linux-headers-$(uname -r) \
                  clang libbpf-dev libelf-dev zlib1g-dev libzstd-dev liblzma-dev \
                  python3-numpy python3-matplotlib python3-networkx
-# facoltativo: PyTorch, solo per i test sul checkpoint addestrato (estrazione dei pesi)
+# optional: PyTorch, only for the tests on the trained checkpoint (weight extraction)
 pip install --user --break-system-packages torch
 ```
 
-Niente da scaricare o compilare a parte: il motore compila i programmi eBPF da sé,
-contro gli header del kernel che gira. I documenti si rigenerano con
-`pdflatex` (quaderno) e con LibreOffice, `pdftoppm` e Chrome (spiegazioni delle
-slide; `pip install python-pptx` per modificare le presentazioni).
+Nothing else to download or build: the engine compiles the eBPF programs
+itself, against the headers of the running kernel. The documents are rebuilt
+with `pdflatex` (notebook) and with LibreOffice, `pdftoppm` and Chrome (slide
+explanations; `pip install python-pptx` to edit the slides).
 
 ---
 
-## Primi passi: i test in dieci minuti
+## First steps: the tests in ten minutes
 
-Tutti i comandi si lanciano dalla radice del repository.
+Run every command from the repository root.
 
-**1. Senza root** (un minuto): il C di P1 calcola il modello, la semantica delle
-classi regge, i modelli sintetici sono coerenti.
-
-```bash
-python3 ipa/test/test_synth.py               # 60 controlli, anche il C di P1 valutato dal testo
-python3 ipa/test/test_class_semantics.py     # 69 controlli
-python3 ipa/test/test_model_source.py        # 62 controlli: modelli, reti, compatibilità
-python3 ipa/test/test_suite.py               # estrazione dei pesi e quantizzazione (serve torch)
-```
-
-**2. La macchina** (niente root per il primo comando):
+**1. Without root** (one minute): the P1 C code computes the model, the class
+semantics hold, the synthetic models are consistent.
 
 ```bash
-python3 ipa/test/host_conditions.py --show   # tipi di core, piano dei ruoli, condizioni attuali
-sudo python3 ipa/test/test_host_kernel.py    # le condizioni si mettono, si misurano e si tolgono
+python3 ipa/test/test_synth.py               # 60 checks, including P1's C evaluated from its text
+python3 ipa/test/test_class_semantics.py     # 69 checks
+python3 ipa/test/test_model_source.py        # 62 checks: models, networks, compatibility
+python3 ipa/test/test_suite.py               # weight extraction and quantization (needs torch)
 ```
 
-**3. Il kernel** (qualche minuto):
+Without root, `test_suite.py` reports the kernel suite as `SKIP`.
+
+**2. The machine** (no root for the first command):
 
 ```bash
-sudo python3 ipa/test/test_suite.py --only kernel   # metriche e decisioni delle quattro pipeline
-sudo python3 ipa/test/test_fabric.py                # il pacchetto attraversa davvero un fabric veth
-sudo python3 ipa/test/verify_synth_kernel.py --all --n 300   # 8 modelli sintetici, 2 400 decisioni
+python3 ipa/test/host_conditions.py --show   # core types, role plan, current conditions
+sudo python3 ipa/test/test_host_kernel.py    # conditions are applied, measured and removed
 ```
 
-Se questi passano, il repository funziona su quella macchina.
+**3. The kernel** (a few minutes):
+
+```bash
+sudo python3 ipa/test/test_suite.py --only kernel   # metrics and decisions of the four pipelines
+sudo python3 ipa/test/test_fabric.py                # the packet really crosses a veth fabric
+sudo python3 ipa/test/verify_synth_kernel.py --all --n 300   # 8 synthetic models, 2 400 decisions
+```
+
+If these pass, the repository works on that machine.
 
 ---
 
-## Misurare
+## How the measurements work
 
-### Le condizioni della macchina
+### The bench
 
-Un portatile lasciato a sé stesso cambia frequenza, addormenta i core e mette i
-processi dove capita. `host_conditions.py` mette la macchina in condizioni note
-per la durata di un banco e le **ripristina** alla fine (anche dopo un errore o
-un Ctrl-C):
+One machine plays every role: the traffic generator, the node running the
+neural network, and the next node receiving the forwarded packets. They are
+connected by virtual cables (`veth`) with native XDP, so the node's program
+sees every packet at the first point in the kernel it reaches, as with a real
+network card. Each role has its own physical core: by default the node on
+CPU 6, the egress (next node) on CPU 8, the generator on CPU 10.
 
-- nodo, generatore e nodo successivo su **core fisici distinti**, un thread per
-  core; il gemello SMT di ognuno, e gli altri tre core del modulo di un E-core,
-  restano a riposo;
-- **frequenza fissa e misurata** (3,5 GHz di default, verificata con APERF/MPERF);
-- stati di sonno profondi spenti, desktop, IRQ e thread del kernel spostati sulle
-  altre CPU, un monitor di temperatura e throttling sempre acceso.
+### The traffic generator: `xdp_gen`
 
-I banchi di traffico la applicano da soli; per qualunque altro comando:
-`sudo python3 ipa/test/host_conditions.py --run -- <comando>`. Dopo un run ucciso:
-`sudo python3 ipa/test/host_conditions.py --restore`.
+`xdp_gen` hands the node **raw XDP frames**, in the same form a network card
+driver with native XDP produces: no `skb`, no copy. It uses
+`BPF_PROG_TEST_RUN` with live frames (kernel ≥ 5.18) and a pacing program, so
+it can either push as hard as possible or keep a fixed, evenly spaced rate.
+pktgen is available as an alternative (`--generator pktgen`), but it adds a
+per-packet copy on `veth` that a real card does not have.
 
-### Una campagna intera
+### Four ways of measuring
+
+Each answers a different question. All of them run with the machine in known
+conditions (below) and write those conditions next to the numbers.
+
+| method | command | what it measures | question |
+|---|---|---|---|
+| **full load** | `bench_throughput.py --mode compare` | the generator offers more than the node can process; the node core is busy 100% of the time. Capacity (packets/s), **CPU time per packet**, and hardware counters: instructions, cycles, IPC, cache misses | how much does a packet cost the node? |
+| **growing load** | `bench_bitrate.py` | 0.5 → 12 Mpps; packets sent, received by the program, forwarded; end-to-end latency | where are packets lost, and when does latency grow? |
+| **three clocks** | `bench_throughput.py --mode rates` | an instrumented build stamps the clock at program entry (T1), just before `bpf_redirect` (T2) and on arrival at the next node (T3). **T2−T1 is the program alone**, T3−T2 the transport. Minimum, mean, maximum and percentiles per window | how much of the cost is the inference, under real traffic? |
+| **program alone** | `test_suite.py --only kernel`, `bench_scaling.py` | `BPF_PROG_TEST_RUN`: the kernel runs the program on a prepared packet, thousands of times in a loop, without receiving or transmitting. Minimum of 7 trials | program size, map lookups, model install time, dense sweeps |
+
+Where the time goes (P-core, 3.5 GHz, model 65-4-4-7):
+
+- **receiving the frame**: ~41 ns (rxonly);
+- **parsing, TTL, redirect**: +25 ns; together the 66 ns of the baseline, the
+  node's fixed cost;
+- **the neural network**: what each pipeline adds above the baseline, ~50 ns
+  (P1) to ~360 ns (P3). Inside it, the arithmetic is cheap (~0.3 ns per
+  multiply-accumulate with compiled weights); the cost of configurability is
+  in **map lookups** (5 → 29 per packet) and **tail calls** (1 → 3);
+- **transport to the next node**: ~210 ns (redirect, `veth`, reception). It
+  adds to the packet's latency; the reception is paid by the egress core.
+
+The methods cross-check each other. On the checkpoint, the inference alone
+(ns above the baseline, P1 / P2 / P3) is 32 / 180 / 304 with
+`BPF_PROG_TEST_RUN`; under traffic the **minimum** of T2−T1 is 34 / 195 / 313
+(the packet that finds everything in cache) and the **mean** is 44 / 229 / 364,
+which matches the CPU time above the baseline at full load, 51 / 224 / 359.
+
+### Machine conditions
+
+A laptop left alone changes frequency, puts cores to sleep and schedules
+processes anywhere. `host_conditions.py` puts the machine in known conditions
+for the duration of a bench and **restores** them at the end (also after an
+error or Ctrl-C):
+
+- node, generator and next node on **distinct physical cores**, one thread per
+  core; the SMT sibling of each, and the other three cores of an E-core
+  module, stay idle;
+- **fixed and measured frequency** (3.5 GHz by default, checked with
+  APERF/MPERF);
+- deep idle states off; desktop, IRQs and kernel threads moved to the other
+  CPUs; a temperature and throttling monitor always on. A window with
+  throttling, battery power or a frequency more than 5% off is counted and
+  reported as *disturbed*, not discarded.
+
+The traffic benches apply it themselves; for any other command:
+`sudo python3 ipa/test/host_conditions.py --run -- <command>`. After a killed
+run: `sudo python3 ipa/test/host_conditions.py --restore`.
+
+---
+
+## Running measurements
+
+### A full campaign
 
 ```bash
-bash ipa/test/remeasure_campagna.sh                 # tutto, circa un'ora
-bash ipa/test/remeasure_campagna.sh pcore ecore     # solo alcune sezioni
-python3 ipa/test/campaign_report.py results/campagna_<data>   # le tabelle di sintesi
+bash ipa/test/remeasure_campagna.sh                 # everything, about 2 hours
+bash ipa/test/remeasure_campagna.sh pcore ecore     # only some sections
+python3 ipa/test/campaign_report.py results/campagna_<date> > sintesi.md   # summary tables
 ```
 
-| sezione | che cosa misura | durata |
+The script asks for `sudo` once and keeps it alive. Results go to
+`results/campagna_<date>/` (`CAMPAGNA=<dir>` to choose another directory):
+one CSV per measurement, the machine conditions (`env.csv`,
+`host_monitor.csv`), the logs in `log/`, and `sintesi.md`.
+
+| section | what it measures | time |
 |---|---|---:|
-| `pcore` | nodo su un P-core: capacità a 1 e 2 core, per classe, per taglia, tre marcature, curve del bit rate | ~12 min |
-| `ecore` | lo stesso nodo su un E-core (stessa frequenza) | ~7 min |
-| `lpe` | nodo su un LP E-core (2,5 GHz) | ~4 min |
-| `assi` | larghezza, profondità, pari pesi, sparsità sotto traffico, su P-core ed E-core | ~22 min |
-| `kernel` | tutto quello che non usa traffico vero (`remeasure_all.sh`) | ~15 min |
+| `pcore` | node on a P-core: capacity on 1 and 2 cores, per class, per frame size, three clocks, bit-rate curves | ~12 min |
+| `ecore` | the same node on an E-core (same frequency) | ~7 min |
+| `lpe` | node on an LP E-core (2.5 GHz) | ~4 min |
+| `assi` | under traffic, on P-core and E-core: the inference alone (T2−T1) of the checkpoint, then CPU time and T2−T1 for 30 synthetic models — width, depth, equal weights, sparsity, network size (nodes), dense and one-hot inputs | ~70 min |
+| `kernel` | everything that does not use real traffic (`remeasure_all.sh`) | ~15 min |
 
-Tutto finisce in `results/campagna_<data>/`: un CSV per misura, le condizioni
-della macchina (`env.csv`, `host_monitor.csv`), i log e `sintesi.md`.
-
-### Una misura sola
+Options of the `assi` section, as environment variables:
 
 ```bash
-# capacità a massima spinta: nodo sul P-core 6 (oppure --dut-cpus 12 per un E-core)
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
-    --gen-cpus 10 --dut-cpus 6 --egress-cpu 8 --out results/prova
-
-# il traffico che cresce: dove si perde, e il ritardo
-sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 \
-    --egress-cpu 8 --out results/prova_bitrate
-
-# il programma da solo, al variare della forma della rete
-sudo python3 ipa/test/host_conditions.py --run -- \
-    python3 ipa/test/bench_scaling.py --axis all --out results/prova_assi
+ASSI_CORES=P bash ipa/test/remeasure_campagna.sh assi             # P-core only (P, E, L)
+ASSI_SOLO="depth_1 width_6" bash ipa/test/remeasure_campagna.sh assi   # only these points
+ASSI_T2=0 bash ipa/test/remeasure_campagna.sh assi                # skip T2−T1
+ASSI_RATES=0.3,0.6 bash ipa/test/remeasure_campagna.sh assi       # rates for T2−T1, in Mpps
+ASSI_AXES="nodes iv_dense" bash ipa/test/remeasure_campagna.sh assi   # only these axes
 ```
 
-### Che cosa si legge
-
-- **Tempo di CPU per pacchetto** (`ns_cpu`): occupazione del core del nodo × 1 /
-  pacchetti elaborati, nella stessa finestra stazionaria da 300 ms.
-- **Istruzioni, cicli, IPC per pacchetto** (`instr_pkt`, `cycles_pkt`, `ipc`):
-  dai contatori hardware del core del nodo (`hw_counters.py`), nella stessa
-  lettura. Dicono *perché* un pacchetto costa quello che costa.
-- **Dove si perde**: inviati, ricevuti dal programma, inoltrati; se mancano prima
-  del programma il collo di bottiglia è il programma, se mancano dopo è la
-  trasmissione.
-
-Il generatore è **`xdp_gen`**: consegna al nodo frame XDP grezzi, come una scheda
-di rete con XDP nativo, senza la copia che pktgen impone. Un thread per coda del
-nodo: più scrittori nella stessa coda si intralciano.
-
----
-
-## Tutti i test
-
-| comando | root | che cosa verifica | esito atteso |
-|---|:---:|---|---|
-| `test_suite.py` | no | estrazione dei pesi, quantizzazione | PASS (serve torch) |
-| `test_class_semantics.py` | no | classe → azione su cinque schemi di classi | 69/69 |
-| `test_synth.py` | no | modelli sintetici; il C di P1 contro il riferimento | 60/60 |
-| `test_model_source.py` | no | modelli, reti, compatibilità, limiti delle pipeline | 62/62 |
-| `test_host_conditions.py` | no | ruoli, moduli E-core, applicazione e ripristino su un /sys finto | 95/95 |
-| `test_bitrate_math.py` | no | formule e attribuzione delle perdite | 100/100 |
-| `test_steady_window.py` | no | la finestra stazionaria, con un generatore simulato | 18 (uno sensibile ai tempi) |
-| `test_suite.py --only kernel` | sì | metriche, dispatch per TTL, TTL e checksum, reroute | PASS |
-| `verify_prog_run.py --method <p>` | sì | verificatore e decisioni di una pipeline | 9/9 |
-| `verify_multi_model.py` | sì | più modelli registrati insieme | PASS |
-| `verify_per_model_semantics.py` | sì | semantica diversa per modello in P2 e P3 | 53/53 |
-| `verify_synth_kernel.py --all` | sì | riferimento intero ed eBPF identici su 8 modelli | 8/8 |
-| `test_model_source.py --kernel` | sì | ogni rete × modello × pipeline | 110/110 |
-| `test_fabric.py` (`--method aot`, `--sweep`) | sì | consegna su veth, P1 come si distribuisce, cinque topologie | 29/29, 11/11, 34/34 |
-| `test_host_kernel.py --bench` | sì | le condizioni sul kernel vero | 25/25 |
-| `diag_verifier.py` | sì | statistiche del verificatore, ReLU con e senza salto | — |
-
-Il criterio di correttezza è lo stesso per tutte le pipeline: si eseguono i
-programmi veri nel kernel, si richiede un redirect (o uno scarto, se il modello lo
-decide) **e** l'incremento del contatore della classe giusta, confrontata con un
-riferimento Python intero indipendente che replica la stessa aritmetica.
-
----
-
-## Usare una pipeline su un'interfaccia
+### A single measurement
 
 ```bash
-# una rete di veth su cui attaccare (Ctrl-C la smonta)
+# capacity at full load: node on P-core 6 (or --dut-cpus 12 for an E-core)
+sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
+    --gen-cpus 10 --dut-cpus 6 --egress-cpu 8 --out results/try_compare
+
+# the inference alone under traffic (T1/T2/T3), for any model
+sudo python3 ipa/test/bench_throughput.py --mode rates --generator xdp --frames 64 \
+    --rounds 3 --gen-cpus 10 --dut-cpus 6 --rates 0.3,0.6 \
+    --model ipa/synth/traffic/depth_6 --out results/try_t2
+
+# growing traffic: where packets are lost, and the latency
+sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 --dut-cpus 6 \
+    --egress-cpu 8 --out results/try_bitrate
+
+# the program alone, varying the shape of the network
+sudo python3 ipa/test/host_conditions.py --run -- \
+    python3 ipa/test/bench_scaling.py --axis all --out results/try_axes
+```
+
+Every bench accepts `--model` (see [Other models](#other-models-other-networks))
+and `--help` lists the CPU, frequency and isolation options.
+
+### Reading the results
+
+- **CPU time per packet** (`ns_cpu`, `compare.csv`): node core occupancy ×
+  1 / packets processed, in the same 300 ms steady window.
+- **Instructions, cycles, IPC per packet** (`instr_pkt`, `cycles_pkt`, `ipc`):
+  from the node core's hardware counters (`hw_counters.py`), in the same
+  reading. They say *why* a packet costs what it costs.
+- **T2−T1** (`pipe_min_ns`, `pipe_avg_ns`, `rates_raw.csv`): the program alone
+  under traffic. Subtract the baseline's value to get the neural network. The
+  minimum is the best case (warm caches), the mean the typical cost; the
+  maximum tells whether a single long stall is skewing the mean.
+- **Where packets are lost**: sent, received by the program, forwarded. Packets
+  missing before the program mean the program is the bottleneck; missing after
+  it, the transmission.
+
+---
+
+## All the tests
+
+| command | root | what it checks | expected |
+|---|:---:|---|---|
+| `test_suite.py` | no | weight extraction, quantization | PASS (needs torch); kernel suite SKIP |
+| `test_class_semantics.py` | no | class → action on five class schemes | 69/69 |
+| `test_synth.py` | no | synthetic models; P1's C against the reference | 60/60 |
+| `test_model_source.py` | no | models, networks, compatibility, pipeline limits | 62/62 |
+| `test_host_conditions.py` | no | roles, E-core modules, apply and restore on a fake /sys | 95/95 |
+| `test_bitrate_math.py` | no | formulas and loss attribution | 100/100 |
+| `test_steady_window.py` | no | the steady window, with a simulated generator | 18 (one is timing-sensitive and may fail on a busy machine) |
+| `test_suite.py --only kernel` | yes | metrics, TTL dispatch, TTL and checksum, reroute | PASS |
+| `verify_prog_run.py --method <p>` | yes | verifier and decisions of one pipeline | 9/9 |
+| `verify_multi_model.py` | yes | several models registered together | PASS |
+| `verify_per_model_semantics.py` | yes | different semantics per model in P2 and P3 | 53/53 |
+| `verify_synth_kernel.py --all` | yes | integer reference and eBPF identical on 8 models | 8/8 |
+| `test_model_source.py --kernel` | yes | every network × model × pipeline | 110/110 |
+| `test_fabric.py` (`--method aot`, `--sweep`) | yes | delivery over veth, P1 as deployed, five topologies | 29/29, 11/11, 34/34 |
+| `test_host_kernel.py --bench` | yes | the machine conditions on the real kernel | 25/25 |
+| `diag_verifier.py` | yes | verifier statistics, ReLU with and without a branch | — |
+
+The correctness criterion is the same for every pipeline: the real programs run
+in the kernel, and a test requires a redirect (or a drop, if the model decides
+so) **and** the increment of the right class counter, compared with an
+independent integer Python reference that replicates the same arithmetic.
+
+---
+
+## Running a pipeline on an interface
+
+```bash
+# a veth network to attach to (Ctrl-C tears it down)
 sudo python3 ipa/test/netns_fabric.py --n-ports 5 --hold
 
-# una pipeline sull'interfaccia d'ingresso
+# a pipeline on the ingress interface
 sudo IPA_IFACE_PATTERN='ipa{i}' python3 ipa/execute_pipeline.py --method template --iface ipain
-sudo python3 ipa/execute_pipeline.py --method hardcoded --iface ipain   # P1: l'oggetto AOT
+sudo python3 ipa/execute_pipeline.py --method hardcoded --iface ipain   # P1: the AOT object
 ```
 
-`--method` è `hardcoded`, `template` o `modular`; il nodo stampa dal vivo HIT,
-MISS e DROP. Quale interfaccia realizza quale porta logica è un fatto del nodo:
-`IPA_PORT_MAP="0=ipa0,1=ipa1,4=enp0s3"` (esplicito) o `IPA_IFACE_PATTERN="ipa{i}"`
-(per nome). L'attacco è **native** di default, e la modalità davvero in uso si
-rilegge dal kernel: un attacco native che fallisce è un errore, non un ripiego
-silenzioso su generic. Per togliere un programma rimasto: `sudo ip link set dev
-ipain xdp off`.
+`--method` is `hardcoded`, `template` or `modular`; the node prints HIT, MISS
+and DROP live. Which interface implements which logical port is a property of
+the node: `IPA_PORT_MAP="0=ipa0,1=ipa1,4=enp0s3"` (explicit) or
+`IPA_IFACE_PATTERN="ipa{i}"` (by name). Attachment is **native** by default,
+and the mode actually in use is read back from the kernel: a native attach
+that fails is an error, not a silent fallback to generic. To remove a leftover
+program: `sudo ip link set dev ipain xdp off`.
 
 ---
 
-## Come funziona il datapath
+## How the datapath works
 
 ```
-Ethernet → IP → UDP:9999 → intestazione IPA (model_id)
+Ethernet → IP → UDP:9999 → IPA header (model_id)
    │
-   ├── vettore d'ingresso, costruito SUL NODO dal descrittore del modello:
-   │     link_state (stato dei collegamenti) · ingress_iface (porta d'ingresso)
-   │     ttl (normalizzato) · node (identità del nodo) · queue_occupancy
+   ├── input vector, built ON THE NODE from the model descriptor:
+   │     link_state · ingress_iface (ingress port)
+   │     ttl (normalized) · node (node identity) · queue_occupancy
    │
-   ├── rete neurale intera (pesi a 8 bit, ReLU senza salti), argmax
+   ├── integer neural network (8-bit weights, branch-free ReLU), argmax
    │
-   └── classe → azione (FORWARD su una porta logica / DROP / UNUSED)
-                → porta logica → interfaccia (mac_table) → bpf_redirect
+   └── class → action (FORWARD on a logical port / DROP / UNUSED)
+                → logical port → interface (mac_table) → bpf_redirect
 ```
 
-- **Il vettore d'ingresso non viaggia nel pacchetto**: lo costruisce il nodo dal
-  proprio stato. Le larghezze vengono dalla rete (`topology_config.json`), il tipo
-  e l'ordine delle feature dal modello (`model_meta.json`).
-- **La classe non è la porta**: che cosa significa ogni classe lo dichiara il
-  modello, quale interfaccia realizza ogni porta lo dichiara il nodo. In P2 e P3
-  la tabella classe → azione ha chiave `(model_id, classe)`: modelli con
-  significati diversi convivono nello stesso programma.
-- **Il TTL entra normalizzato**, come in addestramento (`ttl / 30`): la divisione
-  si applica al prodotto con il peso, per non perdere risoluzione. La scala è un
-  dato del modello.
-- **Il nodo si comporta da router**: decrementa il TTL dopo l'inferenza e
-  aggiorna il checksum; un pacchetto che scadrebbe passa allo stack (ICMP Time
-  Exceeded).
-- **La ReLU non ha salti** (`x & ~(x >> 63)` dietro una barriera per il
-  compilatore): con un salto per neurone il verificatore del kernel rifiuterebbe
-  P2 oltre due strati.
-- **L'intestazione IPA** (21 byte, porta UDP 9999) seleziona il modello con
-  `model_id`; i pesi sono caricati dal piano di controllo, non letti dal
-  pacchetto.
+- **The input vector does not travel in the packet**: the node builds it from
+  its own state. The widths come from the network (`topology_config.json`),
+  the type and order of the features from the model (`model_meta.json`).
+- **The class is not the port**: what each class means is declared by the
+  model, which interface implements each port is declared by the node. In P2
+  and P3 the class → action map is keyed by `(model_id, class)`: models with
+  different meanings coexist in the same program.
+- **The TTL enters normalized**, as in training (`ttl / 30`): the division is
+  applied to the product with the weight, so no resolution is lost. The scale
+  is a property of the model.
+- **The node behaves as a router**: it decrements the TTL after the inference
+  and updates the checksum; a packet that would expire goes to the stack (ICMP
+  Time Exceeded).
+- **The ReLU has no branch** (`x & ~(x >> 63)` behind a compiler barrier):
+  with one branch per neuron the kernel verifier would reject P2 beyond two
+  layers.
+- **The IPA header** (21 bytes, UDP port 9999) selects the model with
+  `model_id`; the weights are loaded by the control plane, not read from the
+  packet.
 
-Il modello depositato è addestrato su **Germany50** (SNDlib): 50 router più due
-host, quindi 52 nodi, e grado massimo 6 (Karlsruhe con il suo host). Da lì la
-forma: 6 + 6 + 1 + 52 = **65 ingressi**, 7 uscite. Questi numeri stanno in
-`topologies/germany50/topology_config.json` e nella scheda del modello, mai nel
-motore.
+The deposited model is trained on **Germany50** (SNDlib): 50 routers plus two
+hosts, so 52 nodes, and maximum degree 6 (Karlsruhe with its host). Hence the
+shape: 6 + 6 + 1 + 52 = **65 inputs**, 7 outputs. These numbers live in
+`topologies/germany50/topology_config.json` and in the model card, never in
+the engine.
 
 ---
 
-## Altri modelli, altre reti
+## Other models, other networks
 
-Ogni test e ogni banco accettano `--model` e `--topology`:
+Every test and every bench accepts `--model` and `--topology`, including the
+instrumented build of `--mode rates`:
 
 ```bash
-python3 ipa/test/traffic_models.py                    # i modelli degli assi, in ipa/synth/traffic/
+python3 ipa/test/traffic_models.py                    # the 30 axis models, in ipa/synth/traffic/
+python3 ipa/test/traffic_models.py --list nodes       # the directories of one axis
 sudo python3 ipa/test/test_suite.py --only kernel --model synth:deep
 sudo python3 ipa/test/test_fabric.py --model synth:small --topology synth_small
 sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
     --model ipa/synth/traffic/depth_3 --out results/depth_3
 ```
 
-`--model` accetta `checkpoint`, `synth:<preset>` (ipa_like, deep, sparse,
-ipa_ttl16, small, mixed, large, ones), una cartella o un altro `.pt`. Il modello
-deve stare sulla rete: ogni feature larga quanto la dimensione da cui dipende, la
-scala del TTL uguale al TTL iniziale. Altrimenti il test si ferma prima di
-compilare e dice perché; una pipeline che non regge la forma è "non applicabile",
-non un errore.
+The axis models for network size and input composition come with their own
+network: pass `--topology <dir>/topology_config.json` (the campaign does it
+for you; `traffic_models.py --topology <dir>` prints the file, or nothing for
+Germany50).
+
+`--model` accepts `checkpoint`, `synth:<preset>` (ipa_like, deep, sparse,
+ipa_ttl16, small, mixed, large, ones), a directory or another `.pt`. Without
+`--model` the configured checkpoint runs; `--model checkpoint` sends the same
+checkpoint through the generic path, which is how that path is checked against
+the default one. The model must fit the network: every feature as wide as the
+dimension it depends on, the TTL scale equal to the initial TTL. Otherwise the
+test stops before compiling and says why; a pipeline that cannot run the shape
+is reported as "not applicable", not as an error.
+
+Compiled shape ceilings (`ipa/pipeline_limits.py`): at most 128 inputs and 32
+outputs for every pipeline; P2 at most 8 neurons per hidden layer and 1 024
+weights; P3 at most 16 layers, 8 neurons per layer and 2 048 weights.
 
 ---
 
-## Documentazione
+## Documentation
 
-| documento | per chi |
+| document | for whom |
 |---|---|
-| [`docs/testing.md`](docs/testing.md) | la guida completa ai test e ai banchi, con tutte le cifre |
-| [`docs/claims.md`](docs/claims.md) | ogni affermazione della tesi: ipotesi, misura, numero, comando per rifarla |
-| [`docs/september_notebook.pdf`](docs/september_notebook.pdf) | il quaderno: come funziona e quanto costa, spiegato dall'inizio |
-| `docs/Inferenza … eBPF XDP.pptx` + `- spiegazione.pdf` | le slide dei risultati, e la loro spiegazione una alla volta |
-| `docs/Test reale su dual boot.pptx` + `- spiegazione.pdf` | il banco su traffico vero e la domanda sul bit rate |
+| [`docs/testing.md`](docs/testing.md) | the complete guide to the tests and benches, with every figure |
+| [`docs/claims.md`](docs/claims.md) | every claim of the thesis: hypothesis, measurement, number, command to reproduce it |
+| [`docs/september_notebook.pdf`](docs/september_notebook.pdf) | the notebook: how it works and what it costs, explained from scratch |
+| `docs/Inferenza … eBPF XDP.pptx` + `- spiegazione.pdf` | the results slides, and their explanation one by one, with a first page on how every measurement is taken |
 
-Per rigenerare: `pdflatex docs/september_notebook.tex` (da `docs/`), e
-`python3 docs/slides_src/build.py` per i PDF di spiegazione.
-
----
-
-## Limiti
-
-- **Tutto su una macchina.** Generatore, nodo e nodo successivo sono core dello
-  stesso processore collegati da `veth`: niente scheda di rete, niente DMA. Le
-  cifre assolute sono di questo percorso a 3,5 GHz; i confronti fra pipeline
-  reggono. Una macchina virtuale non va bene: un core virtuale può fermarsi per
-  millisecondi, più dei ~170 µs che la coda da 256 posti concede.
-- **Il modello non decide sulla destinazione**: le feature non contengono
-  l'indirizzo di destinazione. Il TTL limita i giri a vuoto, ma un instradamento
-  per destinazione richiede un modello addestrato con quella feature.
-- **I pesi non viaggiano nel pacchetto**: li carica il piano di controllo.
-- **Reti fino a ~115 nodi** in P2 e P3 (`MAX_N_IN` = 128); oltre si alza il tetto
-  e si rimisura.
-- **Isolamento a sistema acceso**, non dal boot (`isolcpus`, `nohz_full` non usati).
+To rebuild: `pdflatex september_notebook.tex` (from `docs/`), and
+`python3 docs/slides_src/build.py` for the explanation PDF (the text is in
+`docs/slides_src/spiegazione_inferenza.txt`).
 
 ---
 
-## Riferimenti
+## Limitations
+
+- **Everything on one machine.** Generator, node and next node are cores of
+  the same processor connected by `veth`: no network card, no DMA, no hardware
+  interrupts. Absolute figures belong to this path at 3.5 GHz; the comparisons
+  between pipelines hold. A virtual machine is not suitable: a virtual core can
+  stall for milliseconds, longer than the ~170 µs the 256-slot queue allows.
+- **The model does not decide on the destination**: the features do not
+  contain the destination address. The TTL bounds loops, but routing by
+  destination needs a model trained with that feature.
+- **Weights do not travel in the packet**: the control plane loads them.
+- **Networks up to ~115 nodes** in P2 and P3 (`MAX_N_IN` = 128); beyond that
+  the ceiling must be raised and the measurements repeated.
+- **Isolation at runtime**, not from boot (`isolcpus`, `nohz_full` not used).
+- **Instrumented build**: T1/T2/T3 add two clock reads per packet; subtracting
+  the baseline removes that cost, but the throughput of `--mode rates` is not a
+  capacity. A single load of a program can occasionally land in an unfavourable
+  code layout: an outlier point is re-measured before it is quoted.
+
+---
+
+## References
 
 - M. Polverini, A. Cianfrani, M. Listanti, *"Intelligent Packets: Embedding Machine
-  Learning Models into Network Packets"*, IEEE INFOCOM Workshops ICCN 2026 (sottomesso).
+  Learning Models into Network Packets"*, IEEE INFOCOM Workshops ICCN 2026 (submitted).
 - M. Polverini, *"IPA Prototype"*,
   [github.com/marcopolverini/ipa-prototype](https://github.com/marcopolverini/ipa-prototype), 2026.
 - S. Miano, F. Risso, *"Extended Berkeley Packet Filter"*, CNIT Technical Report 06 —

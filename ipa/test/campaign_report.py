@@ -12,6 +12,8 @@ Legge, se ci sono:
     pcore/per_class/per_class.csv  costo per classe
     pcore/frames/compare.csv       costo per taglia
     assi_<P|E>core/<asse>_<punto>/compare.csv
+    assi_<P|E>core/<asse>_<punto>/rates/rates_raw.csv   T2-T1 sugli assi
+    assi_<P|E>core/checkpoint/rates/rates_raw.csv       T2-T1 del checkpoint
 
 Niente root, niente BCC: si puo' rifare a mano su una campagna gia' raccolta.
 Una cella senza dato resta "-".
@@ -334,7 +336,25 @@ def sec_frames(base):
 
 AXIS_TITLE = {"width": "Larghezza: 65-v-v-7", "depth": "Profondita': 65-4×d-7",
               "isoparam": "A parita' di pesi (~592): da 1 a 5 strati",
-              "sparsity": "Sparsita': % di pesi a zero, 65-4-4-7"}
+              "sparsity": "Sparsita': % di pesi a zero, 65-4-4-7",
+              "nodes": "Nodi della rete: (13+n)-4-4-7",
+              "iv_dense": "Ingressi densi: n-8-8-7, ogni colonna moltiplicata",
+              "iv_onehot": "Ingressi one-hot: n-8-8-7, la larghezza in una one-hot"}
+AXES_ORDER = tuple(AXIS_TITLE)
+# Gli esperimenti della retta "costo per moltiplicazione" (slide del costo per
+# MAC): ingressi densi, ingressi one-hot, larghezza, profondita'.
+MAC_AXES = ("iv_dense", "iv_onehot", "width", "depth")
+TRAFFIC_MODELS = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "synth", "traffic")
+
+
+def point_of(sub, axis):
+    """Il punto di una cartella `<asse>_<punto>`, o None se non e' di
+    quell'asse (iv_dense_5 -> 5; depth_2 non e' di `depth_camp`)."""
+    if not sub.startswith(axis + "_"):
+        return None
+    rest = sub[len(axis) + 1:]
+    return int(rest) if rest.isdigit() else None
 
 
 def sec_axes(base):
@@ -348,13 +368,14 @@ def sec_axes(base):
           "Per ogni punto: ns di CPU per pacchetto, poi istruzioni per "
           "pacchetto e IPC. La baseline (senza inferenza) e' nella colonna "
           "di riferimento.", ""]
-    for axis in ("width", "depth", "isoparam", "sparsity"):
+    for axis in AXES_ORDER:
         for d in dirs:
             core = d.split("_", 1)[1]
             pts = []
             for sub in os.listdir(os.path.join(base, d)):
-                if sub.startswith(axis + "_"):
-                    pts.append((int(sub.split("_")[1]), sub))
+                p = point_of(sub, axis)
+                if p is not None:
+                    pts.append((p, sub))
             if not pts:
                 continue
             pts.sort()
@@ -376,6 +397,134 @@ def sec_axes(base):
                   "ns di CPU per pacchetto:", "", table(head, rows_ns), "",
                   "istruzioni per pacchetto / IPC:", "",
                   table(head, rows_hw), ""]
+            rows_t2 = [[str(p)] + axis_t2(os.path.join(base, d, sub, "rates"))
+                       for p, sub in pts]
+            if any(v != "-" for r in rows_t2 for v in r[1:]):
+                L += ["T2−T1, la sola pipeline (build strumentata), minimo / "
+                      "media in ns, mediana fra giri e rate:", "",
+                      table(head, rows_t2), ""]
+    return L
+
+
+def axis_t2(rates_dir):
+    """Per pipeline 'minimo / media' di T2−T1 da un rates_raw.csv degli assi:
+    mediana fra giri e rate (T2−T1 e' piatto sul rate)."""
+    rr = read_csv(os.path.join(rates_dir, "rates_raw.csv"))
+    out = []
+    for m in PIPES[1:]:
+        pts = [r for r in rr if r.get("method") == m]
+        mins = [num(r.get("pipe_min_ns")) for r in pts
+                if num(r.get("pipe_min_ns"))]
+        avgs = [num(r.get("pipe_avg_ns")) for r in pts
+                if num(r.get("pipe_avg_ns"))]
+        out.append(f"{fmt(statistics.median(mins))} / "
+                   f"{fmt(statistics.median(avgs) if avgs else None)}"
+                   if mins else "-")
+    return out
+
+
+def t2_net(rates_dir, stat="pipe_avg_ns"):
+    """{pipeline: ns di rete neurale} da un rates_raw.csv: T2-T1 (mediana fra
+    giri e rate) meno quello della baseline. Vuoto se manca."""
+    rr = read_csv(os.path.join(rates_dir, "rates_raw.csv"))
+    med = {}
+    for m in PIPES[1:]:
+        v = [num(r.get(stat)) for r in rr if r.get("method") == m
+             and num(r.get(stat))]
+        if v:
+            med[m] = statistics.median(v)
+    b = med.pop("baseline", None)
+    return {m: v - b for m, v in med.items()} if b is not None else {}
+
+
+def sec_checkpoint_t2(base):
+    rows = []
+    for d, label in (("assi_Pcore", "P-core"), ("assi_Ecore", "E-core"),
+                     ("assi_Lcore", "LP E-core")):
+        rd = os.path.join(base, d, "checkpoint", "rates")
+        lo, avg = t2_net(rd, "pipe_min_ns"), t2_net(rd, "pipe_avg_ns")
+        if avg:
+            rows.append([label] + [f"{fmt(lo.get(m))} / {fmt(avg.get(m))}"
+                                   for m in PIPES[2:]])
+    if not rows:
+        return []
+    return ["## La sola rete neurale del checkpoint (T2−T1, xdp_gen)", "",
+            "ns di rete neurale per pacchetto, minimo / media, baseline "
+            "sottratta (stessi rate degli assi):", "",
+            table(["core"] + [NAME[m] for m in PIPES[2:]], rows), ""]
+
+
+def executed_macs(model_dir):
+    """(MAC eseguite, MAC dalla forma) di un modello degli assi. Una one-hot
+    attiva una colonna sola: h1 addizioni, qualunque sia la sua larghezza
+    (bench_scaling.mac_count_eff); le colonne dense contano per intero."""
+    import json
+    with open(os.path.join(model_dir, "model.json")) as f:
+        mj = json.load(f)
+    hidden = [int(h) for h in mj["arch"]["hidden"]]
+    n_out = int(mj["arch"]["n_out"])
+    h1 = hidden[0] if hidden else n_out
+    first_eff = first_nom = 0
+    for f in mj["descriptor"]:
+        size = int(f["size"])
+        first_nom += size * h1
+        first_eff += h1 if f.get("kind") == "onehot" else size * h1
+    rest = hidden + [n_out]
+    tail = sum(rest[i - 1] * rest[i] for i in range(1, len(rest)))
+    return first_eff + tail, first_nom + tail
+
+
+def _fit(xs, ys):
+    """(pendenza, intercetta, r2) dei minimi quadrati, o None."""
+    n = len(xs)
+    if n < 3 or len(set(xs)) < 2:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    m = sxy / sxx
+    q = my - m * mx
+    ss_res = sum((y - (m * x + q)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    return m, q, (1 - ss_res / ss_tot) if ss_tot else 1.0
+
+
+def sec_mac_fit(base):
+    """La retta 'costo per MAC eseguita' rifatta sotto traffico: ns di rete
+    neurale (media T2-T1, baseline sottratta) contro MAC eseguite, sui
+    quattro esperimenti di MAC_AXES."""
+    L = []
+    for d, label in (("assi_Pcore", "P-core"), ("assi_Ecore", "E-core")):
+        root = os.path.join(base, d)
+        if not os.path.isdir(root):
+            continue
+        pts = {m: [] for m in PIPES[2:]}
+        for sub in sorted(os.listdir(root)):
+            if not any(point_of(sub, a) is not None for a in MAC_AXES):
+                continue
+            mdir = os.path.join(TRAFFIC_MODELS, sub)
+            net = t2_net(os.path.join(root, sub, "rates"))
+            if not net or not os.path.exists(os.path.join(mdir, "model.json")):
+                continue
+            eff, nom = executed_macs(mdir)
+            for m, v in net.items():
+                if m in pts:
+                    pts[m].append((eff, nom, v))
+        rows = []
+        for m, p in pts.items():
+            fe = _fit([x[0] for x in p], [x[2] for x in p])
+            fn = _fit([x[1] for x in p], [x[2] for x in p])
+            if fe:
+                rows.append([NAME[m], str(len(p)), f"{fe[0]:.2f}",
+                             f"{fe[2]:.2f}", f"{fn[2]:.2f}" if fn else "-"])
+        if rows:
+            L += [f"## Costo per MAC eseguita sotto traffico — nodo su {label}",
+                  "", "Media T2−T1 meno la baseline contro le MAC eseguite "
+                  "per pacchetto (una one-hot conta h1), su ingressi densi, "
+                  "ingressi one-hot, larghezza e profondita'. r² con le MAC "
+                  "contate dalla forma per confronto.", "",
+                  table(["pipeline", "punti", "ns per MAC", "r² (eseguite)",
+                         "r² (dalla forma)"], rows), ""]
     return L
 
 
@@ -408,6 +557,7 @@ def main(argv=None):
     base = argv[0]
     L = [f"# Campagna: {os.path.basename(os.path.abspath(base))}", ""]
     for part in (sec_capacity, sec_cores2, sec_bitrate, sec_rates,
+                 sec_checkpoint_t2, sec_mac_fit,
                  sec_per_class, sec_frames, sec_axes, sec_env):
         L += part(base)
     print("\n".join(L))

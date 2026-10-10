@@ -4,8 +4,9 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Office temp/lock files
+# Office temp/lock files (Word/PowerPoint ~$*, LibreOffice .~lock.*#)
 ~$*
+.~lock.*#
 *.tmp
 
 # Generated AOT artefacts: gen_full_c.py writes the C source and the header,

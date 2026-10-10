@@ -7,8 +7,10 @@ Le immagini delle slide vengono dal .pptx (LibreOffice -> PDF -> PNG), il testo
 da spiegazione_<nome>.txt (formato descritto in testa al file). L'HTML si stampa
 in PDF con Chrome senza interfaccia.
 
-    python3 docs/slides_src/build.py                 # tutte e due
+    python3 docs/slides_src/build.py                 # tutte
     python3 docs/slides_src/build.py inferenza       # solo una
+
+Una sezione "== 0 | titolo" e' una pagina introduttiva, senza immagine.
 
 Serve: libreoffice (soffice), pdftoppm (poppler), google-chrome o chromium.
 $SOFFICE sostituisce il comando di LibreOffice.
@@ -29,7 +31,6 @@ DOCS = os.path.dirname(HERE)
 DECKS = {
     "inferenza": ("Inferenza di una rete neurale nel kernel Linux con eBPF XDP",
                   "Inferenza di una rete neurale nel kernel Linux"),
-    "test_reale": ("Test reale su dual boot", "Il test reale su dual boot"),
 }
 
 GLOSSARY = [
@@ -51,6 +52,9 @@ GLOSSARY = [
     ("Istruzioni per pacchetto", "Quante istruzioni macchina il core del nodo esegue per ogni pacchetto, contate dal processore stesso (contatori hardware). Dipendono dal codice, non dal core."),
     ("Ciclo, IPC", "Il ciclo è il battito dell'orologio del core (3,5 miliardi al secondo a 3,5 GHz). IPC = istruzioni eseguite per ciclo: dice quanto lavoro il core fa a ogni battito, e dipende dal core."),
     ("BPF_PROG_TEST_RUN", "Una funzione del kernel che esegue il programma XDP su un pacchetto preparato, in un ciclo, senza traffico vero: misura il costo del solo programma."),
+    ("xdp_gen", "Il generatore di traffico del banco: manda al nodo pacchetti nella stessa forma in cui XDP li riceve da una scheda di rete."),
+    ("T1, T2, T3", "Tre letture dell'orologio in una versione strumentata del programma: all'ingresso (T1), prima di inoltrare (T2), all'arrivo al nodo successivo (T3). T2−T1 è il solo programma, T3−T2 il trasporto."),
+    ("Minimo e media", "Il minimo è il pacchetto più veloce di una finestra (tutto in cache); la media è il costo tipico di un pacchetto sotto traffico."),
 ]
 
 CSS = """
@@ -165,6 +169,10 @@ def build(name, chrome):
         parts += [f"<tr><td>{inline(a)}</td><td>{inline(b)}</td></tr>" for a, b in GLOSSARY]
         parts.append("</table>")
         for n, title, blocks in slides:
+            if n == 0:
+                parts.append(f'<div class="slide"><h2>{inline(title)}</h2>'
+                             + render_blocks(blocks) + "</div>")
+                continue
             img = imgs.get(n)
             data = base64.b64encode(open(img, "rb").read()).decode() if img else ""
             parts.append(f'<div class="slide"><div class="label">SLIDE {n}</div>'

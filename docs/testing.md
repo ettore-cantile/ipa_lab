@@ -13,7 +13,8 @@ repository. Il motore sta in `ipa/`; i dati della topologia su cui il checkpoint
 stato addestrato stanno in `topologies/germany50/`.
 
 **Le cifre di questo documento vengono dalla campagna del 2026-10-06**
-(`results/campagna_2026-10-06/`, sintesi in `sintesi.md`, log in `log/`), sulla macchina e
+(`results/campagna_2026-10-06/`, sintesi in `sintesi.md`, log in `log/`), salvo T2−T1 sugli
+assi (§10.8), dalla campagna del 2026-10-10 (`results/campagna_2026-10-10/`), sulla macchina e
 nelle condizioni descritte in §0, con due script: `ipa/test/remeasure_campagna.sh` (il
 traffico vero con `xdp_gen`, sui P-core, sugli E-core e sui LP E-core, e gli assi sotto
 traffico) e `ipa/test/remeasure_all.sh` (tutto quello che non usa traffico vero, che la
@@ -125,7 +126,7 @@ python3 ipa/test/test_host_conditions.py             # 95 controlli su un /sys f
 sudo python3 ipa/test/test_host_kernel.py            # sul kernel vero: applica, misura, ripristina
 sudo python3 ipa/test/test_host_kernel.py --bench    # + un giro corto di bench_bitrate
 
-bash ipa/test/remeasure_campagna.sh                 # tutto (~1 h): traffico su P/E/LP E-core, assi, kernel
+bash ipa/test/remeasure_campagna.sh                 # tutto (~1,5 h): traffico su P/E/LP E-core, assi (con T2−T1), kernel
 bash ipa/test/remeasure_campagna.sh pcore ecore lpe # solo il traffico a massima spinta e le curve
 bash ipa/test/remeasure_all.sh                      # solo BPF_PROG_TEST_RUN, fabric, modelli sintetici (~20 min)
 ```
@@ -1016,6 +1017,14 @@ Build **strumentata**: il dispatcher marca T1, il programma marca T2 subito prim
 resta in softirq sulla CPU del DUT (niente `--egress-cpu`). T3−T1 al rate più basso è la
 latenza minima arrivo → ripartenza.
 
+Vale per qualunque modello: con `--model` la build strumentata passa da `pipeline_setup`,
+lo stesso percorso di `--mode compare` (forma del modello, foglia di P2 per la sua
+profondità, strati di P3, ingressi che portano a un inoltro), con i timbri inseriti nei
+sorgenti. Senza `--model`, il checkpoint configurato. `rates_raw.csv` riporta per ciascuna
+delle tre misure minimo, media, massimo e i percentili (bordi dei bucket log2): il minimo è
+il caso migliore, la media il costo tipico con le mancate di cache, il massimo dice se una
+sola attesa lunga sta spostando la media.
+
 Minimi per finestra, mediana fra tre giri, da 0,5 a 3 Mpps (`pcore/rates/`, `ecore/rates/`):
 
 | | baseline | P1 | P1.5 | P2 | P3 |
@@ -1133,7 +1142,19 @@ sparsità (65-4-4-7 al 0 / 50 / 90 % di pesi a zero) sono cartelle di modello si
 stesso descrittore del checkpoint, che `bench_throughput --model <cartella>` misura con
 `xdp_gen`. Il seme è lo stesso per tutti i punti, salvo dove quel seme dà un modello che
 decide DROP in ogni stato dei link per il pacchetto del generatore (width_6, depth_4,
-isoparam_3: seme successivo). L'asse dei nodi resta a `BPF_PROG_TEST_RUN` (§9). ns di CPU
+isoparam_3: seme successivo). Per ogni punto la campagna misura anche T2−T1, la sola
+pipeline con la build strumentata (§10.6), a 0,3 e 0,6 Mpps (`<punto>/rates/`; `ASSI_RATES`,
+`ASSI_T2=0` per saltarla). Tre assi hanno una rete diversa per punto, scritta accanto al
+modello (`<cartella>/topology_config.json`, passata con `--topology`): **nodi** ((13+n)-4-4-7,
+n = 10, 25, 52, 75, 100: cambia solo la one-hot del nodo), **ingressi densi** (n-8-8-7,
+n = 5, 9, 13, 17: `link_state`(k) + `queue_occupancy`(k) + ttl, ogni colonna moltiplicata) e
+**ingressi one-hot** (n-8-8-7, n = 16, 32, 65: `node`(n−5) + ttl + `queue_occupancy`(4)).
+L'asse one-hot di §9 allarga `ingress_iface`; sul fabric una rete con più di 8 interfacce
+sfonda `IPA_MAX_IFACES`, quindi qui si allarga la one-hot del nodo, che nel datapath è la
+stessa aritmetica (h1 addizioni a ogni larghezza). Prima degli assi la campagna misura T2−T1
+del checkpoint agli stessi rate (`assi_<core>core/checkpoint/rates/`), e la sintesi rifà la
+retta del costo per MAC eseguita (§9) sulle medie T2−T1 di ingressi densi, one-hot, larghezza
+e profondità. ns di CPU
 per pacchetto (`assi_Pcore/`, `assi_Ecore/`), P-core / E-core:
 
 | profondità | 1 | 2 | 3 | 4 | 5 | 6 |
@@ -1173,10 +1194,132 @@ entrambi i tipi di core; P2 di 300–600 a strato, a passi irregolari perché sr
 ricompila; a pesi a zero le istruzioni di P1 scendono da 1 210 a 939 e quelle di P2 e P3 non
 cambiano. Sull'E-core ogni punto costa il 20–35% in più.
 
+**La sola rete neurale sotto traffico (T2−T1).** Per ogni punto la campagna misura anche
+T2−T1 con la build strumentata (§10.6), a 0,3 e 0,6 Mpps, tre giri: il minimo per finestra
+(il pacchetto che trova tutto in cache) e la media (il costo tipico), mediana fra giri e rate,
+meno la stessa misura della baseline. Accanto, il programma da solo (`BPF_PROG_TEST_RUN`,
+§9, minimo su 7 prove, meno la baseline). Campagna del 2026-10-10
+(`results/campagna_2026-10-10/assi_*/<punto>/rates/`), a batteria come gli assi di sopra.
+ns di rete neurale per pacchetto, P-core, da solo / minimo / media:
+
+| profondità | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| P1 | 19 / 26 / 40 | 27 / 34 / 46 | 32 / 36 / 55 | 36 / 42 / 56 | 42 / 45 / 62 | 47 / 48 / 59 |
+| P1.5 | 26 / 35 / 60 | 32 / 42 / 55 | 37 / 46 / 62 | 43 / 52 / 75 | 47 / 54 / 75 | 53 / 58 / 84 |
+| P2 | 157 / 180 / 214 | 179 / 196 / 252 | 206 / 227 / 264 | 227 / 238 / 267 | 256 / 272 / 324 | 286 / 292 / 356 |
+| P3 | 246 / 262 / 322 | 303 / 312 / 348 | 356 / 374 / 436 | 408 / 408 / 509 | 453 / 461 / 560 | 510 / 508 / 610 |
+
+Media T2−T1 sugli altri assi, P-core / E-core (da solo fra parentesi):
+
+| larghezza | 2 | 4 | 6 | 8 |
+|---|---:|---:|---:|---:|
+| P1 | 25 / 56 (12) | 40 / 52 (27) | 61 / 64 (38) | 79 / 100 (54) |
+| P1.5 | 46 / 54 (20) | 58 / 80 (32) | 80 / 92 (46) | 97 / 103 (61) |
+| P2 | 236 / 237 (164) | 233 / 270 (178) | 248 / 287 (189) | 275 / 318 (202) |
+| P3 | 363 / 409 (266) | 363 / 432 (300) | 394 / 474 (329) | 457 / 525 (372) |
+
+| pari pesi (strati) | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| P1 | 54 / 64 (42) | 72 / 68 (40) | 60 / 80 (43) | 76 / 92 (53) | 76 / 88 (54) |
+| P1.5 | 70 / 79 (48) | 79 / 94 (50) | 88 / 92 (49) | 86 / 104 (58) | 90 / 123 (57) |
+| P2 | 232 / 250 (161) | 234 / 308 (176) | 258 / 280 (193) | 336 / 342 (240) | 319 / 354 (254) |
+| P3 | 328 / 380 (270) | 390 / 443 (314) | 430 / 502 (344) | 539 / 630 (431) | 574 / 661 (476) |
+
+| pesi a zero | 0% | 50% | 90% |
+|---|---:|---:|---:|
+| P1 | 42 / 50 (26) | 34 / 38 (14) | 23 / 42 (5) |
+| P1.5 | 58 / 76 (31) | 48 / 50 (21) | 37 / 40 (11) |
+| P2 | 260 / 272 (174) | 274 / 254 (173) | 224 / 265 (174) |
+| P3 | 380 / 441 (293) | 387 / 426 (296) | 364 / 442 (296) |
+
+| profondità, E-core | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| P1 | 38 / 58 | 42 / 48 | 50 / 73 | 56 / 76 | 58 / 77 | 66 / 87 |
+| P1.5 | 55 / 68 | 58 / 79 | 61 / 78 | 68 / 91 | 72 / 92 | 79 / 99 |
+| P2 | 212 / 230 | 240 / 281 | 278 / 322 | 289 / 309 | 326 / 358 | 356 / 374 |
+| P3 | 340 / 368 | 404 / 433 | 478 / 514 | 542 / 573 | 625 / 656 | 688 / 718 |
+
+Sul P-core il **minimo** sotto traffico coincide con il programma da solo (P3 e P2
+entro 30 ns, P1 e P1.5 entro 12): la misura di §9 descrive il pacchetto che trova cache e
+predittori caldi. La **media** sta sopra di 10–40 ns per P1 e P1.5 e di 40–110 ns per P2 e
+P3, con gli stessi andamenti su ogni asse (P3 ~50 ns per strato, al 90% di zeri dimagriscono
+solo P1 e P1.5). Sull'E-core lo scarto è circa doppio (P3 110–210 ns, P2 75–130). Sul
+checkpoint la media di T2−T1 sopra la baseline (P1 44, P2 229, P3 364 ns,
+`results/prova_t2_ckpt/`) coincide con il tempo di CPU per pacchetto meno la baseline di
+§10.2 (51, 224, 359): due misure indipendenti dello stesso costo.
+
+**Un caricamento sfavorevole.** In un run P3 a 1 strato sull'E-core ha dato 502 ns di
+minimo, stabile su sei finestre, con le altre pipeline nella norma; un nuovo caricamento ha
+dato 368 ns, in linea con la curva. La disposizione del codice in memoria cambia a ogni
+caricamento e può spostare P3 di un terzo: un punto fuori curva si rifà
+(`ASSI_SOLO=<punto> ASSI_CORES=<core>`) prima di citarlo.
+
+**Nodi della rete e composizione dell'ingresso.** Stessa campagna (2026-10-10), una rete per
+punto. ns di rete neurale per pacchetto (tempo di CPU meno la baseline), P-core / E-core, e fra
+parentesi la media T2−T1 sul P-core:
+
+| nodi della rete | 10 | 25 | 52 | 75 | 100 |
+|---|---:|---:|---:|---:|---:|
+| P1 | 49 / 52 (42) | 52 / 51 (48) | 49 / 50 (45) | 48 / 48 (40) | 45 / 50 (35) |
+| P1.5 | 59 / 66 (58) | 57 / 62 (58) | 58 / 64 (46) | 55 / 64 (58) | 55 / 63 (52) |
+| P2 | 221 / 264 (242) | 237 / 252 (258) | 235 / 255 (228) | 230 / 251 (231) | 232 / 250 (254) |
+| P3 | 351 / 433 (394) | 351 / 427 (367) | 366 / 426 (382) | 364 / 431 (366) | 362 / 420 (362) |
+
+| ingressi densi (n_in) | 5 | 9 | 13 | 17 |
+|---|---:|---:|---:|---:|
+| P1 | 74 / 64 (82) | 67 / 66 (76) | 77 / 83 (99) | 86 / 92 (99) |
+| P1.5 | 73 / 63 (74) | 68 / 65 (84) | 76 / 86 (88) | 86 / 91 (109) |
+| P2 | 213 / 244 (214) | 232 / 261 (220) | 244 / 283 (244) | 253 / 296 (268) |
+| P3 | 416 / 451 (428) | 444 / 481 (450) | 475 / 514 (466) | 488 / 548 (492) |
+
+| ingressi one-hot (n_in) | 16 | 32 | 65 |
+|---|---:|---:|---:|
+| P1 | 77 / 65 (81) | 73 / 59 (77) | 70 / 56 (80) |
+| P1.5 | 77 / 76 (76) | 73 / 72 (80) | 73 / 76 (81) |
+| P2 | 194 / 239 (222) | 197 / 237 (204) | 207 / 233 (226) |
+| P3 | 410 / 476 (438) | 408 / 481 (464) | 402 / 477 (424) |
+
+La taglia della rete non costa niente a nessuna pipeline: da 10 a 100 nodi P1 45–52 ns, P2
+221–237, P3 351–366 sul P-core, con le stesse istruzioni eseguite (P3 6 573–6 577). Lo stesso per
+la one-hot dell'ingresso da 16 a 65 colonne. Gli ingressi densi invece costano: da 5 a 17 colonne
+P1 sale di 12 ns, P2 di 40, P3 di 72.
+
+**Il costo per MAC eseguita sotto traffico.** Tempo di CPU meno la baseline contro le MAC
+eseguite per pacchetto (una one-hot conta h1), su ingressi densi, ingressi one-hot e larghezza
+(11 punti per pipeline, P-core):
+
+| | P1 | P1.5 | P2 | P3 |
+|---|---:|---:|---:|---:|
+| ns per MAC eseguita | 0.22 | 0.18 | 0.11 | 0.69 |
+| r² (MAC eseguite) | 0.89 | 0.71 | 0.09 | 0.94 |
+| r² (MAC dalla forma) | 0.03 | 0.22 | 0.01 | 0.00 |
+
+Contate dalla forma le MAC non spiegano niente; contate eseguite spiegano P1, P1.5 e P3. P2 non
+sta su una retta sola: in ogni esperimento sale di ~0,2 ns per MAC, ma il costo di partenza
+cambia con la composizione dell'ingresso. La profondità è fuori dalla retta per costruzione:
+uno strato aggiunge 16 MAC e un salto fra programmi (P3 ~58 ns a strato). La sintesi calcola la
+stessa retta anche sulla media T2−T1 (`campaign_report.py`, sezione "Costo per MAC eseguita").
+
+**Il checkpoint, sola rete neurale** (`assi_<core>core/checkpoint/rates/`), T2−T1 minimo /
+media, baseline sottratta: P-core P1 36 / 38, P1.5 44 / 57, P2 198 / 262, P3 320 / 365;
+E-core 44 / 66, 56 / 78, 238 / 250, 401 / 439. La media di una finestra oscilla del ±15–20%
+fra le finestre, il minimo del ±3%: per gli andamenti si usa il tempo di CPU meno la baseline,
+che a nodo saturo ripete entro l'1–2%.
+
+**Un caricamento sfavorevole anche in produzione.** Sull'E-core P3 a 25 nodi un caricamento ha
+dato 699 ns di CPU, con le stesse istruzioni (6 576) e IPC 2,8 invece di 3,6, mentre T2−T1 e le
+altre pipeline erano nella norma; un nuovo caricamento (`ASSI_CORES=E ASSI_SOLO=nodes_25`) ha
+dato 533 ns, IPC 3,6, in linea con gli altri punti (531–538). La tabella riporta il secondo.
+Succede quindi anche alla build di produzione, non solo a quella strumentata: un punto fuori
+curva si rifà con un nuovo caricamento prima di citarlo.
+
 ```bash
 bash ipa/test/remeasure_campagna.sh ecore lpe    # capacità, due core, tre marcature, curve
 ASSI_CORES=P bash ipa/test/remeasure_campagna.sh assi
 ASSI_SOLO="width_6 depth_4" bash ipa/test/remeasure_campagna.sh assi     # solo alcuni punti
+ASSI_T2=0 bash ipa/test/remeasure_campagna.sh assi       # senza T2−T1 (solo capacità e ns di CPU)
+ASSI_AXES="nodes iv_dense iv_onehot" bash ipa/test/remeasure_campagna.sh assi   # solo alcuni assi
+python3 ipa/test/traffic_models.py --topology ipa/synth/traffic/nodes_10   # la rete di un modello
 python3 ipa/test/campaign_report.py results/campagna_2026-10-06 > sintesi.md
 sudo python3 ipa/test/hw_counters.py --cpu 6,12,20 --seconds 1    # i contatori, a mano
 sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --rounds 3 \
@@ -1411,8 +1554,7 @@ diversi dal checkpoint depositato. Senza `--model` usano il checkpoint.
   lo stampa (`large`: `00111000` → classe 4). Si misura sempre un inoltro.
 - **Saltati con un messaggio**: extract e quant (riguardano il `.pt` addestrato), le
   architetture alternative della suite (forme proprie), il deploy AOT di `test_fabric`
-  (si costruisce da un checkpoint), `--mode rates` e `--latency` (build strumentate, solo
-  col checkpoint).
+  (si costruisce da un checkpoint).
 
 ```bash
 sudo python3 ipa/test/test_model_source.py --kernel      # ogni scenario x modello x pipeline

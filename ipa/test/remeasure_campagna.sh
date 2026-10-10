@@ -4,7 +4,7 @@
 # versione attuale, con il traffico vero di xdp_gen, sui P-core, sugli E-core
 # e sui LP E-core, con istruzioni e cicli per pacchetto (hw_counters.py).
 #
-#   cd ~/Scrivania/ipa_lab && bash ipa/test/remeasure_campagna.sh            # tutto (~1 h)
+#   cd ~/Scrivania/ipa_lab && bash ipa/test/remeasure_campagna.sh            # tutto (~2 h)
 #   cd ~/Scrivania/ipa_lab && bash ipa/test/remeasure_campagna.sh pcore      # solo i P-core
 #   cd ~/Scrivania/ipa_lab && bash ipa/test/remeasure_campagna.sh ecore lpe  # piu' sezioni
 #
@@ -15,9 +15,12 @@
 #           2 core, tre marcature, curve (~7 min)
 #   lpe     nodo su un LP E-core (cpu20, fuori dalla L3, massimo 2,5 GHz):
 #           capacita' e curve (~4 min)
-#   assi    larghezza, profondita', pari pesi e sparsita' sotto traffico
-#           (traffic_models.py), sui core di $ASSI_CORES (default "P E";
-#           ~11 min per tipo di core)
+#   assi    sotto traffico (traffic_models.py), sui core di $ASSI_CORES
+#           (default "P E"): T2-T1 del checkpoint, poi per ogni punto di
+#           larghezza, profondita', pari pesi, sparsita', nodi della rete,
+#           ingressi densi e one-hot capacita' e ns di CPU e T2-T1 (la sola
+#           inferenza, build strumentata) a $ASSI_RATES Mpps. ASSI_T2=0 salta
+#           T2-T1, ASSI_AXES sceglie gli assi (~35 min per tipo di core)
 #   kernel  BPF_PROG_TEST_RUN: suite, semantica per modello, modelli
 #           sintetici, tail call, AOT, assi di bench_scaling (= remeasure_all.sh,
 #           ~15 min)
@@ -41,6 +44,11 @@ OUT="${CAMPAGNA:-$ROOT/results/campagna_$(date +%Y-%m-%d)}"
 LOG="${IPA_LOG_DIR:-$OUT/log}"
 ASSI_CORES="${ASSI_CORES:-P E}"
 # ASSI_SOLO="width_6 depth_4": solo questi punti degli assi
+# T2-T1 e' piatto sul rate: due rate sotto la capacita' del punto piu' lento
+# (P3 a 6 strati sull'E-core, con l'uscita sulla stessa CPU del nodo).
+ASSI_RATES="${ASSI_RATES:-0.3,0.6}"
+ASSI_T2="${ASSI_T2:-1}"
+ASSI_AXES="${ASSI_AXES:-width depth isoparam sparsity nodes iv_dense iv_onehot}"
 mkdir -p "$LOG" "$OUT"
 
 sudo -v || exit 1
@@ -86,11 +94,12 @@ bitrate1() {    # <tipo> <cartella> <rates> <giri>
 }
 
 # tre marcature: uscita sulla CPU del nodo (timbri in mappe per-CPU)
-rates1() {      # <tipo> <cartella>
-    local k=$1 dir=$2
+rates1() {      # <tipo> <cartella> [rates] [argomenti in piu']
+    local k=$1 dir=$2 rates=${3:-0.05,0.5,1,1.5,2,2.5,3}
+    shift; shift; [ $# -gt 0 ] && shift
     bench "${dir//\//_}" ipa/test/bench_throughput.py --mode rates --generator xdp \
         --frames 64 --rounds 3 --gen-cpus $GEN --dut-cpus "$(dut_of "$k")" \
-        --rates 0.05,0.5,1,1.5,2,2.5,3 --out "$OUT/$dir"
+        --rates "$rates" --out "$OUT/$dir" "$@"
 }
 
 sec_pcore() {
@@ -130,14 +139,28 @@ sec_assi() {
         echo "traffic_models.py fallito: vedi $LOG/traffic_models.log"; return; }
     for k in $ASSI_CORES; do
         echo "== assi sotto traffico, nodo su $k-core (cpu$(dut_of "$k"))"
-        for axis in width depth isoparam sparsity; do
+        # il riferimento: la sola inferenza del checkpoint, agli stessi rate
+        if [ "$ASSI_T2" = 1 ] && { [ -z "${ASSI_SOLO:-}" ] || \
+                [[ " $ASSI_SOLO " == *" checkpoint "* ]]; }; then
+            rates1 "$k" "assi_${k}core/checkpoint/rates" "$ASSI_RATES" \
+                --method "$PIPES"
+        fi
+        for axis in $ASSI_AXES; do
             for d in $(python3 ipa/test/traffic_models.py --list "$axis"); do
                 if [ -n "${ASSI_SOLO:-}" ] && \
                         ! [[ " $ASSI_SOLO " == *" $(basename "$d") "* ]]; then
                     continue
                 fi
+                # nodi e ingressi hanno una rete loro, accanto al modello
+                local topo=()
+                local t
+                t=$(python3 ipa/test/traffic_models.py --topology "$d")
+                [ -n "$t" ] && topo=(--topology "$t")
                 compare1 "$k" "assi_${k}core/$(basename "$d")" --model "$d" \
-                    --method "$PIPES"
+                    "${topo[@]}" --method "$PIPES"
+                [ "$ASSI_T2" = 1 ] && rates1 "$k" \
+                    "assi_${k}core/$(basename "$d")/rates" "$ASSI_RATES" \
+                    --model "$d" "${topo[@]}" --method "$PIPES"
             done
         done
     done

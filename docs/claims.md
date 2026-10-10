@@ -133,7 +133,7 @@ scheda lo dice.
 | **Variabili fisse** | Le pipeline, i costruttori comuni (`pipeline_setup.py`), il riferimento generico. |
 | **Metrica** | Classe e azione decise nel kernel contro il riferimento; pacchetto consegnato sulla porta attesa. |
 | **Compatibilità** | Ogni feature larga quanto la dimensione della rete da cui dipende, scala del TTL uguale al TTL iniziale; limiti compilati di P2/P3 da `pipeline_limits.py`. Un'incompatibilità ferma il test prima di compilare, con il motivo. |
-| **Risultato** | `test_model_source --kernel` **110/110** (scenario × modello × pipeline, 40 ingressi, model_id 0 e 190; `large` su P2/P3 non applicabile); suite kernel PASS su 9 modelli; i banchi di traffico misurano 18 modelli sintetici sugli assi (E8). Col checkpoint, `--model checkpoint` e nessun `--model` danno pesi, scala, semantica e riferimento identici (3 000/3 000), e sorgenti di P1 e della foglia di P2 identici byte per byte. |
+| **Risultato** | `test_model_source --kernel` **110/110** (scenario × modello × pipeline, 40 ingressi, model_id 0 e 190; `large` su P2/P3 non applicabile); suite kernel PASS su 9 modelli; i banchi di traffico misurano 18 modelli sintetici sugli assi (E8), anche con la build strumentata a tre marcature (E9). Col checkpoint, `--model checkpoint` e nessun `--model` danno pesi, scala, semantica e riferimento identici (3 000/3 000), e sorgenti di P1 e della foglia di P2 identici byte per byte. |
 | **Controllo negativo** | Un modello incompatibile (one-hot a 52 su 30 nodi, TTL 16 su una rete a 30, 9 interfacce oltre il tetto) è rifiutato con il motivo: `test_model_source`, 62/62. Un modello che per il pacchetto del generatore decide DROP in ogni stato dei link non viene misurato come inoltro: il banco salta la pipeline. |
 | **Limite dichiarato** | ⚠️ Le classi consegnate dal fabric sono quelle che il modello decide davvero: per `sparse` 2 su 7, per `ones` 1 su 3 (campionamento di 200 000 ingressi). `--mode rates` e `--latency` restano solo col checkpoint. |
 | **Come rigirarlo** | `sudo python3 ipa/test/test_model_source.py --kernel`; `test_suite.py --only kernel --model synth:deep`; `test_fabric.py --model synth:small` |
@@ -202,7 +202,7 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Ipotesi** | Una rete più grande costa di più per pacchetto. **Falsa per la one-hot.** |
 | **Variabile modificata** | Numero di nodi (10 → 100) e neuroni per hidden layer (2 → 8). |
 | **Metrica** | Latenza minima su 7 trial; sul traffico vero, tempo di CPU per pacchetto. |
-| **Risultato** | Nodi: P1 specializzata 39–42, P1.5 45–47, P2 188–192, P3 310–317 ns, **piatte**, mentre le istruzioni di P1.5 vanno da 731 a 1 673. Neuroni: P1 26 → 68, P1.5 34 → 75, P2 178 → 216, P3 280 → 386 ns, in salita su tutte; sul traffico vero P1 104 → 145, P3 391 → 496 ns di CPU (E8). |
+| **Risultato** | Nodi: P1 specializzata 39–42, P1.5 45–47, P2 188–192, P3 310–317 ns, **piatte**, mentre le istruzioni di P1.5 vanno da 731 a 1 673. Neuroni: P1 26 → 68, P1.5 34 → 75, P2 178 → 216, P3 280 → 386 ns, in salita su tutte; sul traffico vero P1 104 → 145, P3 391 → 496 ns di CPU (E8). Sul traffico vero anche i nodi: da 10 a 100 il costo della rete neurale resta piatto su tutte (E8). |
 | **Conclusione** | Una one-hot ha un solo uno, quindi il datapath legge una colonna di pesi qualunque sia la sua larghezza. Un layer denso più largo legge più pesi. **La rete può crescere quanto vuole, il modello no.** |
 | **Come rigirarlo** | `bench_scaling.py --axis nodes` e `--axis width` |
 
@@ -261,7 +261,7 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Ipotesi** | La latenza si predice dalle MAC contate sulla forma del modello (n_in × h1, …). |
 | **Variabile modificata** | Quattro assi: colonne dense (n_in 5 → 17), colonne one-hot (16 → 65), larghezza (4 → 32), profondità (1 → 4 strati). |
 | **Metrica** | Pendenza e r² della retta sui quattro assi insieme, con MAC nominali e con MAC eseguite. |
-| **Risultato** | Eseguite: **0,287 / 0,292 / 0,574 / 1,195 ns/MAC** (P1 statica, P1.5, P2, P3), r² **0,99 / 0,98 / 0,71 / 0,92**. Nominali: r² 0,63 / 0,69 / 0,24 / 0,10. |
+| **Risultato** | Eseguite: **0,287 / 0,292 / 0,574 / 1,195 ns/MAC** (P1 statica, P1.5, P2, P3), r² **0,99 / 0,98 / 0,71 / 0,92**. Nominali: r² 0,63 / 0,69 / 0,24 / 0,10. **Sotto traffico** (`xdp_gen`, tempo di CPU meno la baseline, ingressi densi, one-hot e larghezza, 11 punti per pipeline): **0,22 / 0,18 / — / 0,69 ns/MAC**, r² 0,89 / 0,71 / 0,09 / 0,94; dalla forma r² ≤ 0,22. P2 non sta su una retta sola: ~0,2 ns/MAC in ogni esperimento, con un costo di partenza che cambia con l'ingresso. La profondità resta fuori dalla retta (costo fisso per strato, D3). |
 | **Conclusione** | Con le MAC nominali il modello spiega poco; con quelle eseguite i quattro assi collassano sulla stessa retta. Una one-hot occupa `size` colonne ma ne attiva una. **P3 costa 4,2× P1 per MAC eseguita**: il prezzo della genericità espresso in una costante. |
 | **Controprova** | Sull'asse one-hot n_in ×4 e pesi ×2,4, latenza piatta su tutte (p1_static e P1.5 63–65, P2 168–170, P3 361–367 ns) mentre le istruzioni di P1 vanno da 1 099 a 1 587. |
 | **Limite dichiarato** | ⚠️ P2 ha r² più basso: un costo fisso alto rispetto alla pendenza, e il residuo più grande su `width_camp`, dove i neuroni oltre la larghezza del modello si calcolano comunque fino al soffitto. |
@@ -422,13 +422,26 @@ core fisici distinti, un thread di generatore per coda e una coda d'uscita per c
 | | |
 |---|---|
 | **Ipotesi** | Quello che larghezza, profondità, pari pesi e sparsità fanno sotto `BPF_PROG_TEST_RUN` (C2, C3, D2, D3) lo fanno anche sul traffico vero, più il costo fisso del nodo. |
-| **Variabile modificata** | Il modello: 18 cartelle sintetiche (`traffic_models.py`), stesso descrittore del checkpoint: 65-v-v-7 (v = 2…8), 65-4×d-7 (d = 1…6), le cinque forme a ~592 pesi, 65-4-4-7 al 0 / 50 / 90 % di zeri; il core del nodo (P o E). |
+| **Variabile modificata** | Il modello: 30 cartelle sintetiche (`traffic_models.py`): 65-v-v-7 (v = 2…8), 65-4×d-7 (d = 1…6), le cinque forme a ~592 pesi, 65-4-4-7 al 0 / 50 / 90 % di zeri, con il descrittore del checkpoint; e con una rete propria per punto (`topology_config.json` nella cartella) (13+n)-4-4-7 per n = 10…100 nodi, ingressi densi n-8-8-7 (n = 5…17) e one-hot n-8-8-7 (n = 16…65); il core del nodo (P o E). |
 | **Variabili fisse** | Il banco di E4, il seme dei pesi (tranne tre punti dove quel seme decide DROP per il pacchetto del generatore in ogni stato dei link: lì il seme successivo). |
 | **Metrica** | Tempo di CPU per pacchetto; istruzioni eseguite per pacchetto. |
-| **Risultato** | Baseline 64–67 ns (P-core) e 105–107 (E-core) in ogni punto. Profondità: P3 351 → 652 ns (~60 per strato), **+1 096 istruzioni eseguite per strato esatte** (5 488 → 10 952) su entrambi i core; P2 264 → 396; P1 113 → 132. Larghezza: P1 104 → 145, P3 391 → 496. Pari pesi: P2 +35%, P3 +60% da 1 a 5 strati, P1 125–135. Sparsità al 90%: P1 113 → 95, P1.5 120 → 106, P2 e P3 fermi (istruzioni di P1 1 210 → 939, di P2 e P3 invariate). E-core: ogni punto +20–35%. |
+| **Risultato** | Baseline 64–67 ns (P-core) e 105–107 (E-core) in ogni punto. Profondità: P3 351 → 652 ns (~60 per strato), **+1 096 istruzioni eseguite per strato esatte** (5 488 → 10 952) su entrambi i core; P2 264 → 396; P1 113 → 132. Larghezza: P1 104 → 145, P3 391 → 496. Pari pesi: P2 +35%, P3 +60% da 1 a 5 strati, P1 125–135. Sparsità al 90%: P1 113 → 95, P1.5 120 → 106, P2 e P3 fermi (istruzioni di P1 1 210 → 939, di P2 e P3 invariate). E-core: ogni punto +20–35%. Nodi (10 → 100, CPU meno baseline, P-core): piatti su tutte (P1 45–52, P2 221–237, P3 351–366 ns), istruzioni eseguite di P3 6 573–6 577. Ingressi one-hot 16 → 65: piatti; ingressi densi 5 → 17: P1 +12, P2 +40, P3 +72 ns. |
 | **Conclusione** | Le conclusioni del programma da solo reggono sul nodo vero; i contatori hardware mostrano che P3 esegue lo stesso lavoro per ogni strato. |
-| **Limite dichiarato** | ⚠️ Un giro di misure per punto (3 giri ciascuno), a batteria senza throttling (frequenza misurata 3,48–3,50 GHz). L'asse dei nodi non è misurato sotto traffico (servirebbe una rete diversa per punto). |
+| **Limite dichiarato** | ⚠️ Due campagne (6 e 10 ottobre, 3 giri per punto), entrambe a batteria senza throttling dei core (frequenza misurata 3,38–3,50 GHz); fra le due il tempo di CPU dei 180 punti × pipeline differisce dello 0,7% in mediana, al massimo del 6%. Un caricamento di P3 (E-core, 25 nodi) ha dato una volta 699 ns di CPU con IPC 2,8; un nuovo caricamento 533 ns, in linea: i punti fuori curva si rifanno. |
 | **Come rigirarlo** | `bash ipa/test/remeasure_campagna.sh assi` (`ASSI_CORES`, `ASSI_SOLO`) |
+
+### E9 — Sotto traffico la sola rete neurale costa quanto da sola, più la cache fredda ✅ ⚠️
+
+| | |
+|---|---|
+| **Ipotesi** | Il costo della rete neurale misurato con `BPF_PROG_TEST_RUN` (programma da solo, pacchetto sempre caldo) è quello che il nodo paga davvero sotto traffico. |
+| **Variabile modificata** | Il modo di misurare: T2−T1 della build strumentata (§10.6) sotto `xdp_gen` a 0,3 e 0,6 Mpps, contro il programma da solo; i 18 modelli degli assi di E8; il core del nodo (P o E). |
+| **Variabili fisse** | Il banco di E3, i modelli e i semi di E8; baseline sottratta in entrambe le misure. |
+| **Metrica** | ns di rete neurale per pacchetto: minimo per finestra e media, mediana fra 3 giri e 2 rate. |
+| **Risultato** | P-core: il **minimo** coincide con il programma da solo entro 30 ns per P2 e P3 ed entro 12 per P1 e P1.5 (profondità, P3: 246 → 510 da solo, 262 → 508 minimo). La **media** sta sopra di 10–40 ns per P1 e P1.5 e di 40–110 ns per P2 e P3 (P3 a 6 strati: 610 contro 510), con gli stessi andamenti su ogni asse. E-core: scarto circa doppio (P3 110–210, P2 75–130 ns). Sul checkpoint la media sopra la baseline (P1 44, P2 229, P3 364 ns) coincide con il tempo di CPU di E4 meno la baseline (51, 224, 359). |
+| **Conclusione** | Le conclusioni del programma da solo valgono per l'inferenza sul nodo vero. `BPF_PROG_TEST_RUN` misura il caso migliore; il costo tipico sotto traffico è la media di T2−T1, e coincide con il tempo di CPU sopra la baseline. |
+| **Limite dichiarato** | ⚠️ Una campagna (10 ottobre), a batteria. A 0,3–0,6 Mpps il core resta fermo fra un pacchetto e l'altro: la media descrive il nodo poco carico. La build strumentata legge l'orologio due volte in più; la sottrazione della baseline toglie quel costo. Un caricamento di P3 (1 strato, E-core) ha dato una volta 502 ns invece di 368, stabile su sei finestre: un punto fuori curva si rifà con un nuovo caricamento. |
+| **Come rigirarlo** | `bash ipa/test/remeasure_campagna.sh assi` (T2−T1 in `<punto>/rates/`; `ASSI_RATES`, `ASSI_T2=0`); un modello a mano: `bench_throughput.py --mode rates --generator xdp --rates 0.3,0.6 --model <cartella>` |
 
 ## G. La macchina
 
@@ -439,7 +452,7 @@ core fisici distinti, un thread di generatore per coda e una coda d'uscita per c
 | **Ipotesi** | La variabilità delle misure è della macchina (frequenza, idle, scheduling, temperatura), e si può togliere. |
 | **Variabile modificata** | Le condizioni: frequenza fissa e misurata, C-state profondi spenti, core fisici distinti (e moduli E-core interi), isolamento a runtime (`host_conditions.py`). |
 | **Metrica** | Dispersione fra trial e fra giri; eventi di throttling; frequenza reale del DUT. |
-| **Risultato** | `test_suite`: spread 0–7%. `bench_throughput`: P-core ripetuto in quattro misure diverse della stessa sessione (confronto, classe 0, 512 B, 1514 B) entro il 2% per baseline e P1.5. DUT a 3 472–3 507 MHz (E-core 3 472–3 493, LP E-core 2 498–2 501) in ogni misura; nessun evento di throttling nelle misure della campagna. |
+| **Risultato** | `test_suite`: spread 0–7%. `bench_throughput`: P-core ripetuto in quattro misure diverse della stessa sessione (confronto, classe 0, 512 B, 1514 B) entro il 2% per baseline e P1.5. Fra due sessioni a quattro giorni di distanza (assi sotto traffico, 6 e 10 ottobre, 180 punti × pipeline) il tempo di CPU differisce dello 0,7% in mediana, del 3% al 90° percentile, al massimo del 6%. DUT a 3 472–3 507 MHz (E-core 3 472–3 493, LP E-core 2 498–2 501) in ogni misura; nessun evento di throttling nelle misure della campagna. |
 | **Conclusione** | Le cifre sono ripetibili sulla stessa macchina alla stessa frequenza. |
 | **Come rigirarlo** | `sudo python3 ipa/test/test_host_kernel.py --bench` (25/25) |
 

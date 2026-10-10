@@ -4,14 +4,40 @@
 # "ok " riquadro verde (verificato). **grassetto**, `codice`. Riga vuota = nuovo blocco.
 # Rigenera: python3 docs/slides_src/build.py inferenza
 
+== 0 | Come si misura e da dove vengono i tempi
+**Il banco.** Un solo portatile fa tutto: il generatore di traffico, il nodo che esegue la rete neurale e il nodo successivo che riceve i pacchetti inoltrati. Sono collegati da cavi virtuali (`veth`) con XDP nativo: il programma del nodo vede ogni pacchetto nel primo punto del kernel in cui arriva, come su una scheda di rete vera. Ogni ruolo ha un core suo (nodo sulla CPU 6, uscita sulla 8, generatore sulla 10).
+
+**Le condizioni della macchina** (`host_conditions.py`). Lasciato a sé stesso, il portatile cambia frequenza fra 0,4 e 4,8 GHz, addormenta i core e mette processi qualunque sul core che misura. Prima di ogni misura il banco fissa la frequenza dei core del banco a 3,5 GHz, spegne gli stati di sonno profondi, sposta il resto del sistema su altri core e accende un monitor (frequenza misurata, temperatura, throttling, alimentazione). Tutto viene ripristinato a fine misura e scritto accanto ai numeri.
+
+**Il generatore** (`xdp_gen`). Produce pacchetti già nella forma in cui XDP li riceve da una scheda di rete (frame XDP grezzi): niente struttura `skb`, niente copie. Il nodo li vede come li vedrebbe da un driver vero. Può spingere al massimo o tenere un ritmo fissato, con i pacchetti distanziati in modo uniforme.
+
+**Quattro modi di misurare**, ognuno per una domanda diversa:
+1. **A massima spinta** (`bench_throughput --mode compare`): il generatore manda più pacchetti di quanti il nodo ne regga, la coda resta piena e il core del nodo lavora il 100% del tempo. Si misurano la **capacità** (pacchetti al secondo) e il **tempo di CPU per pacchetto**, più istruzioni, cicli e mancate di cache dai contatori del processore. Slide 3–8, 10, 12–15.
+1. **A traffico crescente** (`bench_bitrate`): da 0,5 a 12 milioni di pacchetti al secondo; si contano i pacchetti inviati, quelli ricevuti dal programma e quelli inoltrati, e la latenza da un capo all'altro. Dice **dove** si perde oltre la capacità. Slide 9.
+1. **Con tre orologi** (`bench_throughput --mode rates`): una versione del programma legge l'orologio all'ingresso (T1), subito prima di inoltrare (T2) e all'arrivo al nodo successivo (T3). **T2−T1 è il solo programma**, T3−T2 il trasporto. Il traffico sta sotto la capacità. Slide 11 e 16.
+1. **Il programma da solo** (`test_suite.py --only kernel`, `bench_scaling.py`, cioè `BPF_PROG_TEST_RUN`): il kernel esegue il programma su un pacchetto preparato, migliaia di volte di fila, senza ricevere né trasmettere. Minimo su 7 prove. Nelle slide serve solo per ciò che il traffico non misura: le istruzioni del programma caricato, le letture di tabella, i salti, i tempi di installazione di un modello (slide 17, 18, 20). E come confronto nella slide 16: tutti i tempi delle slide vengono dal traffico vero.
+
+**Da dove vengono i tempi** (P-core a 3,5 GHz, modello 65-4-4-7):
+- **ricevere il frame**: circa 41 ns (rxonly, il programma che riceve e butta);
+- **leggere l'intestazione, decrementare il TTL, inoltrare**: 25 ns in più. Con la ricezione fanno i 66 ns della baseline, il costo fisso del nodo;
+- **la rete neurale**: quello che ogni pipeline aggiunge sopra la baseline. Circa 50 ns per P1, 58 per P1.5, 224 per P2, 359 per P3;
+- **dentro la rete neurale**: l'aritmetica pesa poco (circa 0,3 ns per moltiplicazione con i pesi compilati); pesano le **letture di tabella** (da 5 a 29 per pacchetto) e i **salti fra programmi** (da 1 a 3), che sono il prezzo della configurabilità;
+- **il trasporto verso il nodo successivo**: circa 210 ns (redirect, cavo virtuale, ricezione). Pesa sulla latenza del pacchetto; nel tempo del nodo entra solo l'accodamento del redirect, la ricezione la paga il core d'uscita.
+
+>> **Tre misure della stessa rete neurale, sul checkpoint** (ns sopra la baseline, P1 / P2 / P3). Programma da solo: 32 / 180 / 304. Tre orologi sotto traffico, minimo: 34 / 195 / 313; media: 44 / 229 / 364. Tempo di CPU a massima spinta: 51 / 224 / 359. Il minimo sotto traffico ritrova il programma da solo; la media ritrova il tempo di CPU. Le differenze sono quello che il programma da solo non vede: cache e predittori non sempre caldi quando i pacchetti arrivano davvero.
+
+!! **I limiti del banco.** Il cavo virtuale non è una scheda di rete: non ci sono interruzioni hardware né trasferimenti dalla scheda alla memoria (DMA), e il generatore sta sulla stessa macchina. I costi del programma sono quelli veri; il costo di ricezione su una scheda vera può essere diverso. Le cifre assolute valgono a 3,5 GHz e vanno citate con il tipo di core.
+
 == 1 | Copertina
 La tesi esegue una piccola rete neurale **dentro il kernel Linux**, nel punto in cui il pacchetto è appena arrivato (XDP), per decidere da quale porta farlo uscire. La stessa rete è scritta in quattro modi diversi, da completamente compilata a completamente configurabile, e la domanda è quanto costa, per ogni pacchetto, ciascuna scelta.
 
 La presentazione ha due parti:
-1. **Il nodo sotto traffico vero** (slide 3–15): un generatore manda pacchetti veri al nodo e si misura quanti ne regge, quante istruzioni esegue per ognuno, e che cosa cambia se il nodo gira su un core veloce (P-core), efficiente (E-core) o a basso consumo (LP E-core). È la parte con le misure nuove.
-1. **Il programma da solo** (slide 16–22): lo stesso programma eseguito dal kernel su un pacchetto preparato, senza traffico, per vedere come il costo cresce con la forma della rete.
+1. **Il nodo sotto traffico vero** (slide 3–16): un generatore manda pacchetti veri al nodo e si misura quanti ne regge, quante istruzioni esegue per ognuno, e che cosa cambia se il nodo gira su un core veloce (P-core), efficiente (E-core) o a basso consumo (LP E-core). È la parte con le misure nuove.
+1. **La rete neurale sotto traffico** (slide 17–23): quanto costa la sola rete neurale al crescere della forma del modello e della rete, misurato sempre con xdp_gen sul nodo vero; più il costo di cambiare modello (slide 18), che è un tempo del piano di controllo.
 
-Tutte le cifre vengono dalla campagna del 6 ottobre 2026 sul portatile di laboratorio (Intel Core Ultra 7 155H, Ubuntu 24.04), con i core del banco a frequenza fissa: 3,5 GHz per P-core ed E-core, 2,5 GHz per il LP E-core.
+Le cifre vengono dalla campagna del 6 ottobre 2026 sul portatile di laboratorio (Intel Core Ultra 7 155H, Ubuntu 24.04), con i core del banco a frequenza fissa: 3,5 GHz per P-core ed E-core, 2,5 GHz per il LP E-core. Le slide 16 e 19–23 vengono dalla campagna del 10 ottobre, che ha rifatto anche gli assi delle slide 13–15 (gli stessi numeri entro l'1,5% in mediana) e ha aggiunto la taglia della rete e la composizione dell'ingresso.
+
+Prima delle slide, la pagina «Come si misura e da dove vengono i tempi» descrive il banco, i quattro modi di misurare e la scomposizione del costo di un pacchetto. Le spiegazioni delle slide la danno per letta.
 
 == 2 | Le quattro versioni
 Tutte e quattro calcolano **la stessa rete** (65 ingressi, due strati nascosti da 4 neuroni, 7 uscite, 319 pesi) e prendono **la stessa decisione** sullo stesso pacchetto: lo verificano i test di correttezza. Cambia solo che cosa è già scritto nel programma quando lo si compila (arancione) e che cosa invece il programma legge da tabelle mentre gira (verde).
@@ -118,7 +144,7 @@ Il trasporto è un costo comune: circa 210 ns sul P-core e 245 sull'E-core, ugua
 
 >> **Esempio.** P2 sul P-core: 216 ns di programma più 218 di trasporto. La somma, 442 ns a traffico bassissimo, è la latenza minima dall'arrivo del pacchetto alla sua ripartenza.
 
-!! **Una misura, non una capacità.** Questa versione legge l'orologio due volte in più per pacchetto, e l'uscita resta sullo stesso core del nodo: serve a capire dove va il tempo, non a misurare quanti pacchetti regge il nodo (quello lo fanno le slide 3 e 5).
+!! **Una misura, non una capacità.** Questa versione legge l'orologio due volte in più per pacchetto, e l'uscita resta sullo stesso core del nodo: serve a capire dove va il tempo, non a misurare quanti pacchetti regge il nodo (quello lo fanno le slide 3 e 5). Gli stessi orologi, sui modelli sintetici, danno la slide 16.
 
 == 12 | Il costo dipende dalla pipeline, e da niente altro
 Due controlli sul P-core:
@@ -130,13 +156,13 @@ Due controlli sul P-core:
 Basta quindi un numero per pipeline a descrivere il costo del nodo: non dipende dalla taglia del pacchetto né dalla porta d'uscita. Il traffico in bit al secondo che il nodo regge cresce con la taglia del pacchetto.
 
 == 13 | Gli stessi andamenti sul nodo vero
-Le analisi della seconda parte (slide 18–22) usano il programma da solo. Qui due di quelle analisi sono rifatte **sotto traffico vero**, con modelli sintetici che hanno lo stesso tipo di ingresso del modello reale, sul P-core.
+Qui due analisi parametriche sono fatte **sotto traffico vero**, con modelli sintetici che hanno lo stesso tipo di ingresso del modello reale, sul P-core. Le slide 19–23 le riprendono in ns di sola rete neurale.
 
 **A sinistra la profondità**: strati nascosti da 4 neuroni, da 1 a 6. P3 paga circa 60 ns per strato (351 → 652 ns), P2 circa 26 (264 → 396), P1 e P1.5 quasi niente.
 
 **A destra i pesi a zero**: lo stesso modello con lo 0, il 50 e il 90% dei pesi a zero. P1 e P1.5 accelerano (P1 113 → 95 ns, P1.5 120 → 106), perché il compilatore vede lo zero e cancella la moltiplicazione; P2 e P3 non cambiano, perché per loro uno zero letto da una tabella è un numero come un altro.
 
-Le conclusioni del programma da solo valgono sul nodo vero, con il costo fisso del nodo (circa 66 ns) in più. Sull'E-core le stesse curve stanno più in alto del 20–30%.
+Le curve sono quelle della rete neurale (slide 19–23) più il costo fisso del nodo (circa 66 ns). Sull'E-core le stesse curve stanno più in alto del 20–30%.
 
 == 14 | Ogni strato di P3 costa esattamente 1 096 istruzioni
 **A sinistra** le istruzioni eseguite per pacchetto, dai contatori hardware, al crescere della profondità. P3 sale di **esattamente 1 096 istruzioni a ogni strato** (5 488, 6 576, 7 663, 8 759, 9 856, 10 952), identiche su P-core ed E-core. P2 cresce a passi irregolari, perché per ogni profondità ricompila e srotola un programma diverso. P1 e P1.5 crescono poco.
@@ -156,17 +182,40 @@ Altre due analisi sotto traffico vero, sul P-core; il tratteggio è P3 sull'E-co
 
 Sull'E-core le curve hanno la stessa forma, più alte del 20–35%: la forma migliore non dipende dal core su cui girerà il nodo.
 
-== 16 | Il programma da solo: istruzioni e latenza
-Da qui in poi il programma è eseguito dal kernel (BPF_PROG_TEST_RUN) su un pacchetto preparato, migliaia di volte, senza traffico: è il costo del solo programma, senza ricevere né trasmettere. Si riporta il minimo su 7 prove, sul P-core a 3,5 GHz.
+== 16 | Sul nodo vero la rete neurale costa un po' di più
+Prima di passare alla sola rete neurale, un controllo su come la si misura. Qui la stessa domanda (quanto costa la sola rete neurale, al crescere della profondità) è rifatta **sotto traffico vero**, con i tre orologi della slide 11: T2−T1 meno la stessa misura della baseline, sui modelli sintetici con 4 neuroni per strato, nodo su un P-core, xdp_gen a 0,3 e 0,6 milioni di pacchetti al secondo.
 
-Il grafico dà la latenza: dalla baseline (14 ns, nessuna rete) a P1 (46), P1.5 (52), P2 (194), P3 (318). La tabella spiega da dove viene: le **letture di tabella** per pacchetto passano da 5 a 29, i **salti fra programmi** da 1 a 3.
+Ogni grafico ha tre curve:
+- **da solo** (grigio tratteggiato): il programma da solo, `BPF_PROG_TEST_RUN`, minimo su 7 prove;
+- **sotto traffico, minimo** (chiaro): il pacchetto più veloce di ogni finestra, cioè il caso migliore;
+- **sotto traffico, media** (scuro): il costo tipico di un pacchetto, mediana fra giri e rate.
 
->> **Esempio.** P2 ha 15 089 istruzioni e costa 194 ns; P3 ne ha 12 288 e costa 318 ns. Il programma più piccolo è il più lento: lo spiegano i 3 salti e le 29 letture di tabella di P3 contro 1 e 11 di P2.
+**A sinistra P3**: da solo 246 → 510 ns da 1 a 6 strati; sotto traffico il minimo coincide (262 → 508), la media sta 45–107 ns sopra (322 → 610). **A destra P2**: da solo 157 → 286, minimo 180 → 292, media 214 → 356. P1 e P1.5: la media sta 12–34 ns sopra il programma da solo.
 
-La configurabilità si paga nelle letture di tabella e nei salti, non nell'aritmetica. Rendere configurabile la forma (P2) costa circa 4 volte P1; anche la profondità (P3) circa 7 volte. Fra P1 e P1.5 quasi niente.
+>> **Perché la media sta sopra.** Il programma da solo gira in un ciclo stretto sullo stesso pacchetto: dati, istruzioni e predittori dei salti restano caldi. Sotto traffico fra un pacchetto e l'altro il core riceve, inoltra e serve il kernel, e una parte di quello stato si raffredda. Il minimo è il pacchetto che trova tutto caldo, e infatti coincide con il programma da solo.
 
-== 17 | Cambiare modello costa millisecondi a tutte le pipeline
-Il grafico (scala logaritmica) confronta quanto costa installare un modello nuovo su un nodo già in servizio:
+ok **Due metodi indipendenti concordano.** Sul checkpoint la media di T2−T1 (P2 229 ns, P3 364 sopra la baseline) coincide con il tempo di CPU per pacchetto a massima spinta meno la baseline (224 e 359, slide 3).
+
+Il programma da solo dà quindi la forma giusta delle curve ma sottostima il costo vero. Per questo le slide 17–23 usano il **tempo di CPU per pacchetto meno la baseline**, misurato a nodo saturo con la build di produzione (senza orologi): è il costo che il nodo paga davvero, tre giri concordano entro l'1–2%, e sul checkpoint coincide con la media di T2−T1. Sull'E-core il divario fra media e programma da solo è circa doppio: sulla profondità 120–210 ns per P3, 75–115 per P2. Le tabelle per tutti gli assi (larghezza, pari pesi, pesi a zero) e per l'E-core sono in `docs/testing.md` §10.8.
+
+!! **Un caricamento anomalo.** In una misura P3 a 1 strato sull'E-core ha dato 502 ns invece di 368, stabile su tutte le finestre; rifatta con un nuovo caricamento del programma è tornata regolare, mentre le altre pipeline erano rimaste identiche. Un singolo caricamento può quindi finire in una disposizione del codice sfavorevole: un punto fuori curva va rifatto prima di citarlo.
+
+== 17 | La configurabilità si paga per pacchetto
+Da qui in poi ogni tempo è il **tempo di CPU per pacchetto** del nodo saturo sotto xdp_gen, sul P-core a 3,5 GHz (slide 3). Il costo della sola rete neurale è quel tempo meno la baseline, il programma che riceve e inoltra senza rete neurale.
+
+Il grafico dà il tempo per pacchetto del modello 65-4-4-7: 66 ns la baseline, 117 P1, 124 P1.5, 290 P2, 425 P3. Sopra la baseline la rete neurale costa da **+51 ns (P1) a +359 ns (P3)**.
+
+La tabella spiega da dove viene, con tre proprietà del programma che non dipendono da come lo si misura:
+- **istruzioni** del programma caricato, contate dal kernel quando lo carica;
+- **letture di tabella** per pacchetto: da 5 (P1) a 29 (P3);
+- **salti fra programmi** per pacchetto: 1, e 3 per P3.
+
+>> **Esempio.** P2 ha 15 089 istruzioni e costa 224 ns di rete neurale; P3 ne ha 12 288 e costa 359 ns. Il programma più piccolo è il più lento: lo spiegano i 3 salti e le 29 letture di tabella di P3 contro 1 e 11 di P2.
+
+La configurabilità si paga nelle letture di tabella e nei salti, non nell'aritmetica. Sopra la baseline, rendere configurabile la forma (P2) costa circa 4 volte P1; anche la profondità (P3) circa 7 volte. Fra P1 e P1.5 quasi niente.
+
+== 18 | Cambiare modello costa millisecondi a tutte le pipeline
+Questi non sono tempi per pacchetto ma tempi del **piano di controllo**: quanto costa installare un modello nuovo su un nodo già in servizio. Si misurano fuori dal traffico, perché non dipendono da esso. Il grafico (scala logaritmica):
 - **P2: compilare il programma generico**, una volta sola all'avvio del nodo: circa 1,5 secondi;
 - **P1: generare e compilare** il programma con i pesi dentro, su una macchina qualunque, fuori dal nodo: circa 80 ms;
 - **P1: caricarlo sul nodo**: circa 1 ms;
@@ -174,51 +223,59 @@ Il grafico (scala logaritmica) confronta quanto costa installare un modello nuov
 
 >> **Perché P1 non ha bisogno di un compilatore sul nodo.** Il programma con i pesi si compila prima (AOT, ahead of time) e al nodo arriva un file già pronto, che un piccolo caricatore apre e attacca. Il nodo non ha né clang né le librerie di sviluppo.
 
-Il tempo per cambiare modello non è quindi un criterio di scelta: millisecondi per tutte. Si sceglie sul costo per pacchetto (circa 50 ns di rete con i pesi compilati, 225–360 con quelli da tabella) e su dove serve un compilatore: P1 ne vuole uno per ogni modello nuovo, su qualche macchina; P2 e P3 nessuno.
+Il tempo per cambiare modello non è quindi un criterio di scelta: millisecondi per tutte. Si sceglie sul costo per pacchetto (circa 50 ns di rete con i pesi compilati, 225–360 con quelli da tabella, slide 17) e su dove serve un compilatore: P1 ne vuole uno per ogni modello nuovo, su qualche macchina; P2 e P3 nessuno.
 
-== 18 | La rete può crescere quanto vuole. Il modello no.
-**A sinistra la taglia della rete**: da 10 a 100 nodi. L'identità del nodo è un ingresso con un solo 1 (one-hot) e attiva una sola colonna di pesi, qualunque sia la sua larghezza: nessuna pipeline rallenta. P1 statica conosce già il nodo quando viene compilata, le altre lo leggono da tabella.
+!! **Che cosa non dice.** Non dice che cosa succede ai pacchetti che passano **mentre** il modello cambia (perdite, pacchetti classificati con una tabella scritta a metà). È un test che il banco non fa ancora.
 
-**A destra la larghezza del modello**: da 2 a 8 neuroni per strato. Sale su tutte e quattro: P1 26 → 68 ns, P3 280 → 386 ns. Un neurone in più è lavoro vero a ogni pacchetto.
+== 19 | La rete può crescere quanto vuole. Il modello no.
+**A sinistra la taglia della rete**: da 10 a 100 nodi, ciascun punto con la sua rete e un modello sintetico (13+n)-4-4-7. L'identità del nodo è un ingresso con un solo 1 (one-hot) e attiva una sola colonna di pesi, qualunque sia la sua larghezza: nessuna pipeline rallenta (P1 45–52 ns, P3 351–366 ns). P1 statica conosce già il nodo quando viene compilata, le altre lo leggono da tabella.
 
->> **Esempio.** Una rete di 100 nodi costa a P3 317 ns, una di 10 nodi 310: la stessa cosa. Un modello con 8 neuroni per strato invece di 4 costa a P3 386 ns invece di 314.
+**A destra la larghezza del modello**: da 2 a 8 neuroni per strato. Sale su tutte e quattro: P1 37 → 76 ns, P3 334 → 430 ns. Un neurone in più è lavoro vero a ogni pacchetto.
+
+>> **Esempio.** Una rete di 100 nodi costa a P3 362 ns di rete neurale, una di 10 nodi 351: la stessa cosa. Un modello con 8 neuroni per strato invece di 4 costa a P3 430 ns invece di 370.
 
 Una rete più grande (più nodi) non rallenta nessuna pipeline: basta una riga in più in tabella. Un modello più largo rallenta tutte. Si può far crescere la rete; il modello va tenuto piccolo.
 
-== 19 | Uno strato in più: P2 lo paga in spazio, P3 in tempo
+!! **Un caricamento sfavorevole sull'E-core.** Sull'E-core P3 a 25 nodi un caricamento ha dato 699 ns di CPU, con le stesse istruzioni ma IPC 2,8 invece di 3,6; rifatto con un nuovo caricamento ha dato 533 ns, come gli altri punti. È lo stesso fenomeno della slide 16, e capita anche alla build di produzione: un punto fuori curva si rifà prima di citarlo.
+
+== 20 | Uno strato in più: P2 lo paga in spazio, P3 in tempo
 Quattro neuroni per strato, da 1 a 6 strati, tutto il resto fermo.
 
-**A sinistra la dimensione** (scala logaritmica): P2 ricompila e srotola per ogni profondità, e cresce da 14 604 a 18 937 istruzioni, circa 870 per strato. P3 non si muove: 12 288 istruzioni a ogni profondità, perché esegue sempre lo stesso strato generico.
+**A sinistra la dimensione** (scala logaritmica): le istruzioni del programma caricato. P2 ricompila e srotola per ogni profondità, e cresce da 14 604 a 18 937 istruzioni, circa 870 per strato. P3 non si muove: 12 288 istruzioni a ogni profondità, perché esegue sempre lo stesso strato generico.
 
-**A destra il tempo**: P3 paga 260 → 524 ns da 1 a 6 strati, circa 53 ns per strato, perché ogni strato è un salto fra programmi e un giro di letture di tabella (sotto traffico circa 60 ns, slide 14). P2 paga circa 26 ns per strato.
+**A destra il tempo** sotto traffico: P3 paga 292 → 580 ns di rete neurale da 1 a 6 strati, circa 58 ns per strato, perché ogni strato è un salto fra programmi e un giro di letture di tabella (le 1 096 istruzioni della slide 14). P2 paga circa 25 ns per strato, P1 e P1.5 circa 4.
 
 Un modello profondo si paga sempre: con P2 in un programma più grande da ricompilare, con P3 in tempo a ogni pacchetto. P3 è la più flessibile, ed è quella che la profondità rallenta di più.
 
-== 20 | «Meglio larga o profonda?» dipende da chi la esegue
+== 21 | «Meglio larga o profonda?» dipende da chi la esegue
 Cinque forme con circa 592 pesi: uno strato largo da 8 neuroni, oppure fino a cinque strati più stretti. Lo stesso numero di pesi, disposto in modo diverso.
 
-- **Generiche (P2, P3): la profondità si paga.** Da 1 a 5 strati P2 passa da 175 a 268 ns (+53%), P3 da 284 a 490 ns (+73%).
-- **Specializzate (P1, P1.5): quasi indifferenti.** 54–72 ns senza un andamento chiaro: il compilatore srotola tutto in una funzione sola, e la forma conta poco.
+- **Generiche (P2, P3): la profondità si paga.** Da 1 a 5 strati P2 passa da 216 a 304 ns (+41%), P3 da 321 a 537 ns (+67%).
+- **Specializzate (P1, P1.5): quasi indifferenti.** 59–85 ns: il compilatore srotola tutto in una funzione sola, e la forma conta poco.
 
->> **Esempio.** Lo stesso budget di 592 pesi in un solo strato costa a P3 284 ns, in cinque strati 490: la scelta della forma vale 200 ns per pacchetto con P3, una decina con P1.
+>> **Esempio.** Lo stesso budget di 592 pesi in un solo strato costa a P3 321 ns, in cinque strati 537: la scelta della forma vale più di 200 ns per pacchetto con P3, una decina con P1.
 
-Con le versioni specializzate la forma della rete si sceglie per l'accuratezza. Con le generiche, a parità di pesi, conviene una rete larga e poco profonda. Sotto traffico vero lo stesso (slide 15).
+Con le versioni specializzate la forma della rete si sceglie per l'accuratezza. Con le generiche, a parità di pesi, conviene una rete larga e poco profonda.
 
-== 21 | Il costo per moltiplicazione è una costante della pipeline
-Si può prevedere quanto costerà un modello prima di misurarlo? Il grafico mette in relazione la latenza con il numero di moltiplicazioni per pacchetto, su quattro esperimenti diversi (ingressi densi, ingressi one-hot, larghezza, profondità).
+== 22 | Il costo per MAC è una costante, tranne che per P2
+Si può prevedere quanto costerà un modello prima di misurarlo? Il grafico mette in relazione il costo della rete neurale con il numero di moltiplicazioni (MAC, moltiplicazione e somma) per pacchetto, su tre esperimenti diversi: **ingressi densi** (da 5 a 17 colonne, tutte moltiplicate), **ingressi one-hot** (da 16 a 65 colonne, la larghezza in una one-hot) e **larghezza** del modello.
 
-Il trucco è contare le moltiplicazioni **davvero eseguite**. Un ingresso one-hot occupa molte colonne nella matrice dei pesi ma ne attiva una sola: contato dalla forma del modello sembra costoso, nel programma no. Contando quelle eseguite, i quattro esperimenti cadono sulla stessa retta, una per pipeline (r² 0,92–0,99; P2 0,71).
+Il trucco è contare le moltiplicazioni **davvero eseguite**. Un ingresso one-hot occupa molte colonne nella matrice dei pesi ma ne attiva una sola: contato dalla forma del modello sembra costoso, nel programma no. Contando le MAC dalla forma la retta non spiega niente (r² al massimo 0,22); contando quelle eseguite i tre esperimenti cadono sulla stessa retta: r² 0,89 per P1, 0,71 per P1.5, 0,94 per P3.
 
->> **Esempio.** Contando le moltiplicazioni dalla forma, per P3 la retta spiega solo il 10% dei punti; contando quelle eseguite, il 92%.
+- **P1 e P1.5**: circa 0,2 ns per moltiplicazione (pesi nel codice).
+- **P3**: circa 0,7 ns, perché legge ogni peso da una tabella.
+- **P2 non sta su una retta sola** (r² 0,09). In ogni esperimento sale di circa 0,2 ns a moltiplicazione, ma parte da un costo diverso a seconda di com'è composto l'ingresso: la lettura delle feature pesa più delle moltiplicazioni.
 
-La pendenza è il costo di una moltiplicazione: circa 0,29 ns con i pesi compilati (P1, P1.5), 0,57 ns per P2, 1,20 ns per P3, che legge ogni peso da una tabella. Il costo di un modello si stima quindi come moltiplicazioni eseguite × costo per moltiplicazione, più il costo fisso della pipeline.
+>> **La profondità è fuori dalla retta** (triangoli vuoti): uno strato in più aggiunge poche moltiplicazioni (16 a 4 neuroni) ma un costo fisso, il salto fra programmi di P3 (circa 58 ns, slide 20). Non è aritmetica, e per questo non sta sulla retta.
 
-== 22 | Pesi a zero: solo le specializzate dimagriscono
-Lo stesso modello con una frazione crescente di pesi esattamente a zero, da 0 al 90%.
+Il costo di un modello si stima quindi come moltiplicazioni eseguite × costo per moltiplicazione, più il costo fisso della pipeline e, con P3, circa 58 ns per strato.
 
-- **P1 e P1.5** scendono: P1.5 passa da 1 045 a 337 istruzioni e da 45 a 25 ns. Il compilatore vede che il peso è zero e cancella la moltiplicazione.
-- **P2 e P3** non cambiano né in dimensione né in tempo: uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
+!! **Una differenza dal programma da solo.** L'asse one-hot di `bench_scaling` allarga la porta d'ingresso; sul fabric una rete con più di 8 interfacce non si può collegare, quindi qui si allarga la one-hot del nodo, che nel datapath è la stessa aritmetica.
 
->> **Sotto traffico vero lo stesso.** Al 90% di zeri P1.5 passa da 120 a 106 ns di CPU per pacchetto; P2 e P3 restano fermi (slide 13).
+== 23 | Pesi a zero: solo le specializzate dimagriscono
+Lo stesso modello 65-4-4-7 con lo 0, il 50 e il 90% dei pesi esattamente a zero.
+
+- **P1 e P1.5** scendono: P1 da 44 a 27 ns di rete neurale (−39%), P1.5 da 52 a 39 (−25%). Il programma di P1.5 passa da 1 045 a 337 istruzioni: il compilatore vede che il peso è zero e cancella la moltiplicazione.
+- **P2 e P3** non cambiano (entro il 5%): uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
 
 È l'unico esperimento in cui dimensione e tempo scendono insieme. Potare il modello (mettere pesi a zero) rende più veloci solo le versioni specializzate; con P2 e P3 la potatura non dà niente in velocità, e va giustificata solo dall'accuratezza.

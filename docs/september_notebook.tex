@@ -2613,6 +2613,45 @@ mentre le P1 restano fra 125 e 135~ns; con il 90\% dei pesi a zero P1 passa da
 113 a 95~ns e P1.5 da 120 a 106, mentre P2 e P3 non si muovono, con le stesse
 istruzioni. Sull'E-core ogni punto costa il 20--35\% in più.
 
+\paragraph{La sola rete neurale.} Il tempo di CPU contiene anche il costo fisso
+del nodo. Per isolare la rete neurale si usano le tre marcature della build
+strumentata: T2$-$T1, meno la stessa misura della baseline, con il traffico a
+0,3 e 0,6 milioni di pacchetti al secondo. Il \textbf{minimo} per finestra,
+cioè il pacchetto che trova tutto in cache, coincide con il programma da solo:
+P3 da 1 a 6 strati 262 $\rightarrow$ 508~ns contro 246 $\rightarrow$ 510. La
+\textbf{media}, il costo tipico, sta sopra di 10--40~ns per P1 e P1.5 e di
+40--110~ns per P2 e P3 (P3 a 6 strati 610~ns), con gli stessi andamenti su
+ogni asse; sull'E-core lo scarto è circa doppio. Sul modello depositato la
+media sopra la baseline (P1 44, P2 229, P3 364~ns) coincide con il tempo di CPU
+meno la baseline (51, 224, 359): due misure indipendenti dello stesso costo.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+\textbf{strati da 4 neuroni} & 1 & 2 & 3 & 4 & 5 & 6 \\
+\midrule
+P2, da solo      & 157 & 179 & 206 & 227 & 256 & 286 \\
+P2, media T2$-$T1 & 214 & 252 & 264 & 267 & 324 & 356 \\
+P3, da solo      & 246 & 303 & 356 & 408 & 453 & 510 \\
+P3, media T2$-$T1 & 322 & 348 & 436 & 509 & 560 & 610 \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize\color{soft} Nanosecondi di rete neurale per pacchetto (baseline
+sottratta), nodo su un P-core. Da solo: \texttt{BPF\_PROG\_TEST\_RUN}, minimo
+su 7 prove.}
+\end{center}
+
+\paragraph{La rete e l'ingresso.} Con una rete diversa per punto, da 10 a 100
+nodi, il costo della rete neurale (tempo di CPU meno la baseline) resta piatto
+su tutte le pipeline: P1 45--52~ns, P2 221--237, P3 351--366, con le stesse
+istruzioni eseguite. Lo stesso per una one-hot d'ingresso da 16 a 65 colonne;
+gli ingressi densi invece costano (da 5 a 17 colonne P3 sale di 72~ns). Contando
+le moltiplicazioni davvero eseguite, ingressi densi, one-hot e larghezza cadono
+su una retta: circa 0,2~ns per moltiplicazione con i pesi compilati e 0,7~ns
+per P3 ($r^2$ 0,71--0,94); P2 no, perché il suo costo di partenza cambia con
+la composizione dell'ingresso.
+
 \section{Che cosa questo numero non dice}
 
 I limiti del banco sono nella sezione \ref{sec:limiti}. Uno in più riguarda il
@@ -3025,9 +3064,6 @@ dell'ingresso su tutte, e su P1 più che altrove.
 \section{Che cosa non fa}
 
 \begin{itemize}
-  \item \textbf{Tre marcature e latenza minima} (\texttt{--mode rates},
-        \texttt{--latency}) girano solo col checkpoint: usano versioni del
-        programma con i timbri dentro, generate dal suo sorgente.
   \item \textbf{Nessun modello sintetico è addestrato}: servono a provare le
         pipeline su forme diverse, non a dire qualcosa sull'instradamento.
 \end{itemize}

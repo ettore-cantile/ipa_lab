@@ -854,25 +854,30 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
 # eBPF sources). TTL=1 is therefore a legitimate NON-forward, and including it
 # in a sweep that asserts 'the packet was redirected' would fail by design.
 # TTL=1 is covered separately by the dedicated expiry test.
+# A suite that could not run here (no root, no Linux, no BCC): truthy, so it
+# does not fail the run, but reported as SKIP and not as PASS.
+SKIPPED = "skip"
+
+
 def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=True, trials=7):
     print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
     if not sys.platform.startswith("linux"):
         info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
         info("Run on a Linux host: sudo python3 ipa/test/test_suite.py --only kernel")
-        return True
+        return SKIPPED
     if os.geteuid() != 0:
         # Checked up front: without root BCC reports a generic "Failed to
         # compile BPF module", which the per-pipeline permission check below
         # cannot tell apart from a real failure.
         info("kernel suite skipped: needs root (loads XDP programs).")
         info("Run: sudo python3 ipa/test/test_suite.py --only kernel")
-        return True
+        return SKIPPED
     try:
         import verify_prog_run as V
     except Exception as e:
         info(f"kernel suite skipped: BCC/verify_prog_run not importable ({e}).")
         info("Needs Linux + BCC + root: sudo python3 ipa/test/test_suite.py --only kernel")
-        return True
+        return SKIPPED
     mp = model_path or V.MODEL_PT
     mut = V._mut()
     if mut is not None:
@@ -1224,7 +1229,8 @@ def main():
     print(f"{YELLOW}{'#'*52}{NC}")
     print(f"{YELLOW}#  SUITE SUMMARY{NC}")
     for name, res in results.items():
-        tag = f"{GREEN}PASS{NC}" if res else f"{RED}FAIL{NC}"
+        tag = (f"{YELLOW}SKIP{NC}" if res == SKIPPED else
+               f"{GREEN}PASS{NC}" if res else f"{RED}FAIL{NC}")
         print(f"   {name:<10} : {tag}")
     print(f"{YELLOW}{'#'*52}{NC}")
     sys.exit(0 if all(results.values()) else 1)

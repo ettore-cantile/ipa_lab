@@ -145,6 +145,7 @@ domande diverse:
 Serve Linux, root, BCC e il modulo pktgen (`sudo modprobe pktgen`).
 """
 import io
+import contextlib
 import os
 import re
 import sys
@@ -2732,7 +2733,14 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
     else:
         from ebpf_modular import EBPF_MODULAR_FULL
         src = EBPF_MODULAR_FULL
+    return _stamp_bcc_source(src, method), weights, scale
 
+
+def _stamp_bcc_source(src, method):
+    """Il sorgente BCC di `method` con T1 all'ingresso, T2 al redirect e il
+    contatore d'uscita (T3) in coda. Non guarda il modello: vale per il
+    sorgente del checkpoint come per quello generato da pipeline_setup per un
+    modello qualunque."""
     anchor = f"int {LAT_ENTRY[method]}(struct xdp_md *ctx) {{"
     if src.count(anchor) != 1:
         raise RuntimeError(
@@ -2816,7 +2824,7 @@ def _instrumented_source(method, model_path, node=STATIC_NODE):
                 f"di essere dichiarata (offset {decl}). clang si fermerebbe "
                 f"con 'undeclared identifier'.")
 
-    return src + "\n" + LAT_COUNTER_SRC, weights, scale
+    return src + "\n" + LAT_COUNTER_SRC
 
 
 # --------------------------------------------------------------------------
@@ -2944,8 +2952,57 @@ def _load_instrumented_aot(method, model_path, fab, sem, node=STATIC_NODE):
     return setup, obj.progs["xdp_lat_count"]
 
 
+@contextlib.contextmanager
+def _latency_in_sources(method):
+    """Per la durata del blocco i sorgenti che pipeline_setup compila portano
+    T1, T2 e il contatore d'uscita: pipeline_setup._source per le pipeline
+    BCC, p1_aot.p1_source per l'oggetto AOT di P1/P1.5. Tutto il resto --
+    la forma del modello, la foglia di P2 per la sua profondita', i pesi di
+    P3 per i suoi strati, il cablaggio sul fabric, gli ingressi che portano
+    a un inoltro -- resta quello di build_pipeline. Lo stesso schema del
+    contatore d'ingresso di bench_bitrate (_counter_in_aot_object)."""
+    import p1_aot
+    import pipeline_setup as PS
+    orig_src, orig_p1 = PS._source, p1_aot.p1_source
+
+    def bcc_source(raw, instrument):
+        return _stamp_bcc_source(orig_src(raw, instrument), method)
+
+    def p1_source(*a, **k):
+        return _instrument_aot_latency(orig_p1(*a, **k))
+
+    PS._source, p1_aot.p1_source = bcc_source, p1_source
+    try:
+        yield
+    finally:
+        PS._source, p1_aot.p1_source = orig_src, orig_p1
+
+
+def _load_instrumented_model(method, model_path, fab, sem):
+    """La build strumentata del modello sotto test (--model): build_pipeline,
+    cioe' lo stesso percorso di --mode compare, con i timbri nei sorgenti."""
+    with _latency_in_sources(method):
+        setup = build_pipeline(method, model_path, fab, sem)
+    if method in ("hardcoded", "p1_static"):
+        lat_fn = setup["owner"].progs.get("xdp_lat_count")
+    else:
+        from bcc import BPF
+        lat_fn = setup["b"].load_func("xdp_lat_count", BPF.XDP)
+    if lat_fn is None:
+        raise RuntimeError(f"{method}: l'oggetto non contiene xdp_lat_count "
+                           f"-- il sorgente non e' passato dai timbri?")
+    return setup, lat_fn
+
+
 def _load_instrumented(method, model_path, fab, sem, node=STATIC_NODE):
-    """Compila tutto insieme, carica, e cabla la pipeline su questo fabric."""
+    """Compila tutto insieme, carica, e cabla la pipeline su questo fabric.
+
+    Con --model il modello sotto test, di qualunque forma, passa da
+    pipeline_setup (_load_instrumented_model). Senza, il checkpoint
+    configurato per la strada di sempre, qui sotto."""
+    import verify_prog_run as V
+    if V._mut() is not None:
+        return _load_instrumented_model(method, model_path, fab, sem)
     if method in ("hardcoded", "p1_static"):
         return _load_instrumented_aot(method, model_path, fab, sem, node)
     from bcc import BPF
@@ -5700,9 +5757,11 @@ DEFAULT_RATES_MPPS = (0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0)
 def _sane(st):
     """Le tre statistiche in forma stampabile, anche quando mancano."""
     if not st:
-        return dict(n=0, min=None, p50=None, p90=None, p99=None)
+        return dict(n=0, min=None, p50=None, p90=None, p99=None, avg=None,
+                    max=None)
     return dict(n=st["n"], min=st["lat_min_ns"], p50=st["lat_p50_ns"],
-                p90=st["lat_p90_ns"], p99=st["lat_p99_ns"])
+                p90=st["lat_p90_ns"], p99=st["lat_p99_ns"],
+                avg=st["lat_avg_ns"], max=st["lat_max_ns"])
 
 
 def _median(vals):
@@ -5921,6 +5980,11 @@ def run_rates(methods, model_path, frame=64, rates=None, rounds=DEFAULT_ROUNDS,
                         row[f"{nome}_p50_ns"] = v["p50"]
                         row[f"{nome}_p90_ns"] = v["p90"]
                         row[f"{nome}_p99_ns"] = v["p99"]
+                        # La media e' il costo tipico, mancate di cache
+                        # comprese; il massimo dice se una sola attesa
+                        # lunga (un'interruzione) la sta trascinando.
+                        row[f"{nome}_avg_ns"] = v["avg"]
+                        row[f"{nome}_max_ns"] = v["max"]
                         row[f"{nome}_n"] = v["n"]
                     raw.append(row)
 
@@ -7523,12 +7587,7 @@ def main():
     MUT.add_args(p)
     a = p.parse_args()
     HC.check_args(a)
-    mut = MUT.select(a.model, a.topology)
-    if mut is not None and (a.latency or a.mode == "rates"):
-        # Le due modalita' misurano con build STRUMENTATE (timbri nel
-        # programma), generate a parte dal sorgente del checkpoint.
-        sys.exit("--latency e --mode rates: per ora solo col checkpoint "
-                 "configurato (build strumentate); togli --model")
+    MUT.select(a.model, a.topology)
     a.egress_cpu = HC.parse_egress(a.egress_cpu)
     # --out e' rispetto alla cartella da cui si lancia: sotto, main() si
     # sposta in ipa/, e fino al 2026-09-27 `--out results/x` finiva in
