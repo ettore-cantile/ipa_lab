@@ -21,6 +21,7 @@ ipa/poc_aot/loader_aot
 # into temp dirs and never reads this tree. 42 files / 4.4 MB of pure output.
 ipa/synth/scenarios/
 ipa/synth/traffic/
+ipa/synth/population/
 
 # LaTeX build artefacts. The .tex is the source and the .pdf is tracked (it is
 # what gets read); everything pdflatex writes in between is regenerable by
@@ -38,3 +39,4 @@ results/**/*
 !results/**/
 !results/**/*.csv
 !results/**/sintesi.md
+!results/**/sintesi_popolazione.md

@@ -5149,10 +5149,17 @@ def run_compare(methods, model_path, frames, offered_pps=None,
               f"(nessuna misura in corso){NC}")
         print(f"{YELLOW}{'=' * 78}{NC}")
         loaded = {}
+        import prog_census as PC
         for m in methods:
             try:
+                before = PC.snapshot()
                 loaded[m] = build_pipeline(m, model_path, fab, sem)
-                info(f"{m}: caricata")
+                size = PC.loaded_since(before)
+                if size:
+                    PROG_SIZE[m] = size
+                info(f"{m}: caricata"
+                     + (f" ({size['n_progs']} programmi, {size['xlated']} "
+                        f"istruzioni)" if size else ""))
             except Exception as e:
                 warn(f"{m}: non caricata, la salto -- {type(e).__name__}: {e}")
         if not loaded:
@@ -5505,6 +5512,20 @@ def _median_or_none(vals):
 # I FAIL di _rxonly_verdict. Lista propria, non VERDICT: check_validity, che
 # gira dopo, svuota VERDICT per primo. main() li riaggiunge dopo di lui.
 RXONLY_FAILS = []
+
+# I programmi che run_compare ha caricato per ogni pipeline (prog_census):
+# {metodo: {n_progs, xlated, jited, names}}. E' la dimensione del programma
+# sullo stesso caricamento che poi va sotto traffico.
+PROG_SIZE = {}
+
+
+def _write_prog_size(out_dir):
+    if not PROG_SIZE:
+        return
+    _write_csv(os.path.join(out_dir, "prog_size.csv"),
+               [dict(method=m, n_progs=s["n_progs"], xlated_insns=s["xlated"],
+                     jited_bytes=s["jited"], programs=" ".join(s["names"]))
+                for m, s in PROG_SIZE.items()])
 
 
 def _read_any(table, key):
@@ -7918,6 +7939,7 @@ def _main_run(a, plan):
                 _write_csv(os.path.join(a.out, "compare.csv"), rows)
             if raw:
                 _write_csv(os.path.join(a.out, "compare_raw.csv"), raw)
+            _write_prog_size(a.out)
             write_env(a.out, env_finale())
             # Sulle righe di SINTESI, cioe' sulle mediane dei giri: costruirlo
             # sulle righe grezze farebbe vincere il giro piu' fortunato, che a
@@ -8010,6 +8032,7 @@ def _run_per_class(a, methods, model_path, frames, plan, env_finale):
         os.makedirs(a.out, exist_ok=True)
         _write_csv(os.path.join(a.out, "per_class.csv"), tutte_rows)
         _write_csv(os.path.join(a.out, "per_class_raw.csv"), tutti_raw)
+        _write_prog_size(a.out)
         write_env(a.out, env_finale())
         _give_back(a.out)
     _closing_note(plan)

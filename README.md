@@ -156,6 +156,7 @@ ipa_lab/
 | benches | `bench_throughput.py`, `bench_bitrate.py`, `bench_scaling.py`, `bench_depth_vs_width.py`, `bench_tailcall_overhead.py` | capacity, curves under growing traffic, parametric analysis |
 | infrastructure | `host_conditions.py`, `hw_counters.py`, `xdp_gen.py`, `netns_fabric.py`, `pipeline_setup.py`, `model_under_test.py`, `traffic_models.py`, `campaign_report.py`, `plot_bitrate.py` | machine conditions, hardware counters, generator, fabric, models |
 | campaigns | `remeasure_campagna.sh`, `remeasure_all.sh` | reproduce every number in the documents |
+| population | `model_population.py`, `remeasure_popolazione.sh`, `population_report.py`, `prog_census.py` | every test on a population of models, and the conclusions over it |
 
 ---
 
@@ -319,6 +320,48 @@ ASSI_T2=0 bash ipa/test/remeasure_campagna.sh assi                # skip T2−T1
 ASSI_RATES=0.3,0.6 bash ipa/test/remeasure_campagna.sh assi       # rates for T2−T1, in Mpps
 ASSI_AXES="nodes iv_dense" bash ipa/test/remeasure_campagna.sh assi   # only these axes
 ```
+
+### The population campaign: no privileged model
+
+`remeasure_campagna.sh` measures the node on the checkpoint, and its axes vary
+one parameter at a time around it. `remeasure_popolazione.sh` runs every one
+of those tests on a **population** of synthetic models instead, so that each
+conclusion is a range over many models, or a statement with the number of
+models it holds for:
+
+```bash
+bash ipa/test/remeasure_popolazione.sh                      # everything (base tier)
+POP_TIER=quick bash ipa/test/remeasure_popolazione.sh       # a short trial run
+bash ipa/test/remeasure_popolazione.sh genera pop sintesi   # only some sections
+python3 ipa/test/population_report.py results/popolazione_<date> > sintesi.md
+```
+
+The population comes from `model_population.py` (`--tier quick|base|full`:
+about 30, 91 or 140 models). It covers 7 input layouts (one-hot, dense,
+scalar and mixed features, from 5 to 117 inputs), depths 1–6, widths 2–8 and
+3–7 outputs. On top of that it has replicas with other seeds (how much the
+cost depends on the drawn weights), sparse models, and five shapes with the
+same number of weights spread over 1–5 layers. Models P2 cannot run stay in the population, and the manifest records why.
+The long tests (bit-rate curves, LP E-core, two cores, per class, mixed TTL,
+frame sizes) run on subsets that go from the lightest to the heaviest model.
+
+| section | what it measures |
+|---|---|
+| `genera` | the population and its manifest (`population.csv`) |
+| `corretto` | exact agreement integer reference / eBPF, every model and pipeline |
+| `rif` | rxonly and baseline, once per core type (they run no model) |
+| `pop` | every model on P-core and E-core: capacity, CPU time, instructions, cycles, loaded program size (`prog_size.csv`), T2−T1 at light load |
+| `lpe`, `carico`, `core2`, `classi`, `mix`, `taglie` | the subsets: LP E-core, growing traffic, two cores, one session per class, mixed TTLs, 64/512/1514 bytes |
+
+The base tier is expected to take about 5–6 hours, the quick tier about 1.5;
+both are estimates, not yet timed on the machine. The script resumes: a
+measurement whose CSV is already in `$CAMPAGNA` is skipped, so the same
+command (with the same `CAMPAGNA=<dir>`) continues an interrupted campaign or
+splits it over several sessions; `POP_RIFAI=1` measures everything again.
+`POP_CORES`, `POP_T2`,
+`POP_RATES`, `POP_SOLO` and `CARICO_ROUNDS` play the role of the `ASSI_*`
+variables. `population_report.py` also reads the `assi_*` directories of an
+October campaign as a first, narrower population.
 
 ### A single measurement
 
