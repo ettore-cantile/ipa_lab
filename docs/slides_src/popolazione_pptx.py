@@ -6,7 +6,10 @@ Linux con eBPF XDP.pptx" con le cifre di una campagna di popolazione.
 Si usa da popolazione.py (--pptx). Lo stile resta quello del file: di ogni
 grafico si sostituiscono i dati (chart.replace_data), di ogni casella il
 testo, copiando la formattazione del primo pezzo; "**...**" nel testo vuol
-dire grassetto. La slide 22 e' un'immagine e si ridisegna con matplotlib.
+dire grassetto. La slide della legge di costo e' un'immagine e si ridisegna
+con matplotlib. I testi sono scritti per chi non conosce il repository: niente
+nomi di script nelle slide, ogni termine detto in italiano semplice, e una
+slide in piu' («Come leggere i numeri», copiata dalla struttura della slide 2).
 
 La slide "Cambiare modello costa millisecondi" e la tabella della slide 17
 (letture di tabella, salti) vengono dalla sezione `solo` della campagna
@@ -33,7 +36,8 @@ DECK = os.path.join(DOCS, "Inferenza di una rete neurale nel kernel Linux "
 BASE = os.path.join(HERE, "inferenza_base.pptx")
 PIPES = POP.PIPES
 ALL = POP.ALL
-CATS = ["baseline", "P1 statica", "P1.5", "P2", "P3"]
+# "senza rete" = la baseline: il nodo che riceve e inoltra senza rete neurale
+CATS = ["senza rete", "P1 statica", "P1.5", "P2", "P3"]
 NAMES = ["P1 statica", "P1.5", "P2", "P3"]
 COLOR = {"p1_static": "#C8551E", "hardcoded": "#F09A3E",
          "template": "#2E9C8F", "modular": "#1F5F8B"}
@@ -177,6 +181,152 @@ def drop_slide(prs, index):
 
 
 # --------------------------------------------------------------------------
+# per chi non conosce il repo
+# --------------------------------------------------------------------------
+# L'etichetta in alto di ogni slide (indice nel deck di base): un percorso in
+# cinque parti, al posto delle etichette della storia del progetto.
+SEZIONI = {
+    2: "1 · IL NODO · QUANTO COSTA UN PACCHETTO",
+    3: "1 · IL NODO · LE ISTRUZIONI",
+    4: "2 · TRE TIPI DI CORE",
+    5: "2 · TRE TIPI DI CORE · ISTRUZIONI PER CICLO",
+    6: "2 · TRE TIPI DI CORE · DOVE L'E-CORE PERDE TEMPO",
+    7: "2 · TRE TIPI DI CORE · IL CORE A BASSO CONSUMO",
+    8: "3 · SOTTO CARICO · TRAFFICO CRESCENTE",
+    9: "3 · SOTTO CARICO · DUE CORE",
+    10: "3 · SOTTO CARICO · PROGRAMMA E TRASPORTO",
+    11: "3 · SOTTO CARICO · CHE COSA NON CONTA",
+    12: "4 · LA FORMA DEL MODELLO · IL NODO INTERO",
+    13: "4 · LA FORMA DEL MODELLO · LE ISTRUZIONI",
+    14: "4 · LA FORMA DEL MODELLO · LARGHEZZA E PARI PESI",
+    15: "4 · LA FORMA DEL MODELLO · DUE MODI DI MISURARE",
+    16: "5 · LA SOLA RETE NEURALE · IL PREZZO DELLA CONFIGURABILITÀ",
+    17: "5 · LA SOLA RETE NEURALE · CAMBIARE MODELLO",
+    18: "5 · LA SOLA RETE NEURALE · TAGLIA DELLA RETE E DEL MODELLO",
+    19: "5 · LA SOLA RETE NEURALE · PROFONDITÀ",
+    20: "5 · LA SOLA RETE NEURALE · A PARITÀ DI PESI",
+    21: "5 · LA SOLA RETE NEURALE · PREVEDERE IL COSTO",
+    22: "5 · LA SOLA RETE NEURALE · PESI A ZERO",
+}
+
+# I titoli degli assi del deck di base, detti senza gergo.
+VOCABOLARIO = {
+    "ns per pacchetto": "tempo per pacchetto (ns)",
+    "ns di CPU per pacchetto": "tempo per pacchetto (ns)",
+    "M pacchetti/s": "milioni di pacchetti al secondo",
+    "M pacchetti/s, P-core": "milioni di pacchetti/s, P-core",
+    "M pacchetti/s, E-core": "milioni di pacchetti/s, E-core",
+    "cicli per pacchetto": "cicli di clock per pacchetto",
+    "mancate dell'ultimo livello di cache per pacchetto":
+        "letture andate in memoria, per pacchetto",
+    "ns": "tempo (ns)",
+    "ns di rete neurale per pacchetto": "tempo della sola rete (ns)",
+    "istruzioni (scala logaritmica)": "istruzioni del programma (scala log.)",
+    "istruzioni per ciclo": "istruzioni per ciclo di clock",
+}
+
+
+def vocabolario_assi(prs):
+    for sl in prs.slides:
+        for sh in sl.shapes:
+            if not sh.has_chart:
+                continue
+            for ax in (sh.chart.category_axis, sh.chart.value_axis):
+                try:
+                    if not ax.has_title:
+                        continue
+                except Exception:
+                    continue
+                t = ax.axis_title.text_frame.text
+                if t in VOCABOLARIO:
+                    p = ax.axis_title.text_frame.paragraphs[0]
+                    p.runs[0].text = VOCABOLARIO[t]
+                    for rr in p.runs[1:]:
+                        rr.text = ""
+
+
+def clona_slide(prs, src, posizione):
+    """Una copia di `src` (solo forme senza relazioni: testo e tabelle) in
+    `posizione` (0 = prima)."""
+    new = prs.slides.add_slide(src.slide_layout)
+    for sh in list(new.shapes):
+        sh._element.getparent().remove(sh._element)
+    for sh in src.shapes:
+        new.shapes._spTree.insert_element_before(copy.deepcopy(sh._element),
+                                                 "p:extLst")
+    bg = src._element.cSld.bg
+    if bg is not None:
+        new._element.cSld.insert(0, copy.deepcopy(bg))
+    lst = prs.slides._sldIdLst
+    el = lst[-1]
+    lst.remove(el)
+    lst.insert(posizione, el)
+    return new
+
+
+def come_leggere(prs, src, f):
+    """La slide «Come leggere i numeri», con la struttura della slide 2:
+    la tabella delle versioni diventa una tabella a due colonne."""
+    from pptx.oxml.ns import qn
+    sl = clona_slide(prs, src, 2)
+    n = f["n_models"]
+    rg = f["ranges"]
+    set_text(sl, "TextBox 2", "COME LEGGERE I NUMERI")
+    set_text(sl, "TextBox 3", f"Ogni cifra vale per {n} modelli, non per uno")
+    set_text(sl, "TextBox 6",
+             f"Ogni misura è ripetuta su **{n} reti neurali diverse**: da "
+             f"{it(rg['n_in'][0])} a {it(rg['n_in'][1])} ingressi, da "
+             f"{it(rg['depth'][0])} a {it(rg['depth'][1])} strati, da "
+             f"{it(rg['width_max'][0])} a {it(rg['width_max'][1])} neuroni per "
+             f"strato. Una conclusione vale solo se regge su tutte.")
+    tab = shape(sl, "Table 7")
+    tbl = tab.table._tbl
+    W = sum(int(g.get("w")) for g in tbl.tblGrid.findall(qn("a:gridCol")))
+    for g in tbl.tblGrid.findall(qn("a:gridCol"))[2:]:
+        tbl.tblGrid.remove(g)
+    for tr in tbl.tr_lst:
+        for tc in tr.tc_lst[2:]:
+            tr.remove(tc)
+    cols = tbl.tblGrid.findall(qn("a:gridCol"))
+    cols[0].set("w", str(int(W * 0.30)))
+    cols[1].set("w", str(W - int(W * 0.30)))
+    righe = [["Si legge", "Vuol dire"],
+             ["52 [19–155] ns", "la mediana dei modelli e, fra parentesi, il "
+                                "più leggero e il più pesante"],
+             ["85/85", "vale su 85 modelli su 85"],
+             ["4,3 volte", "un rapporto calcolato modello per modello, poi la "
+                           "mediana"],
+             ["senza rete", "il nodo che riceve e inoltra senza rete neurale: "
+                            "il costo fisso"]]
+    set_table(sl, "Table 7", righe)
+    t = tab.table
+    for i in range(1, len(righe)):
+        for j in range(2):
+            c = t.cell(i, j)
+            c.fill.solid()
+            c.fill.fore_color.rgb = RGBColor.from_string(
+                "FFFFFF" if i % 2 else "F4F6F9")
+            for p in c.text_frame.paragraphs:
+                for rr in p.runs:
+                    rr.font.color.rgb = RGBColor.from_string("222B36")
+                    rr.font.bold = (j == 0)
+    set_text(sl, "TextBox 8",
+             "Il **nodo** è il computer che riceve il pacchetto, esegue la "
+             "rete neurale per scegliere da quale porta farlo uscire, e lo "
+             "inoltra. Il processore ha tre tipi di core: **P-core** veloci, "
+             "**E-core** efficienti, **LP E-core** a basso consumo. Un "
+             "nanosecondo (ns) è un miliardesimo di secondo.")
+    set_text(sl, "TextBox 10",
+             "Il **costo** di un pacchetto è il tempo di processore che "
+             "serve per elaborarlo; 1 diviso quel tempo è la **capacità**, "
+             "quanti pacchetti al secondo il nodo regge.")
+    set_text(sl, "TextBox 5",
+             "Campagna dell'11–12 ottobre 2026, portatile di laboratorio "
+             "(Intel Core Ultra 7 155H), core a frequenza fissa")
+    return sl
+
+
+# --------------------------------------------------------------------------
 # le cifre che servono solo alle slide
 # --------------------------------------------------------------------------
 def groups(pop, ids, group, stat):
@@ -251,8 +401,8 @@ def law_figure(pop, facts, path):
             ys.append(y - law["c"] * POP.num(pop.m(i, "n_layers")))
         ax.scatter(xs, ys, s=16, marker=marker[m], color=COLOR[m],
                    alpha=0.75, linewidths=0.6, edgecolors="white",
-                   label=f"{name[m]}: {it(law['b'], 2)} ns/MAC, "
-                         f"r² {it(law['r2'], 2)}", zorder=3)
+                   label=f"{name[m]}: {it(law['b'], 2)} ns per "
+                         f"moltiplicazione", zorder=3)
         ax.plot([0, xmax * 1.03], [law["a"], law["a"] + law["b"] * xmax * 1.03],
                 color=COLOR[m], linewidth=2, zorder=2)
         # P1 e P1.5 finiscono quasi nello stesso punto: etichette scostate
@@ -262,9 +412,10 @@ def law_figure(pop, facts, path):
                     color=ink, fontsize=8, va="center")
     ax.set_xlim(0, xmax * 1.16)
     ax.set_ylim(bottom=0)
-    ax.set_xlabel("moltiplicazioni (MAC) eseguite per pacchetto", color=ink2,
+    ax.set_xlabel("moltiplicazioni eseguite per pacchetto", color=ink2,
                   fontsize=8)
-    ax.set_ylabel("ns di rete neurale − c × strati", color=ink2, fontsize=8)
+    ax.set_ylabel("ns di rete neurale, tolta la parte per strato", color=ink2,
+                  fontsize=8)
     ax.grid(True, color=grid, linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
@@ -306,61 +457,58 @@ def build(pop, f, out=DECK):
 
     # 1 -- copertina
     set_text(S[0], "TextBox 4",
-             f"Quattro versioni della stessa rete neurale, misurate sul "
-             f"traffico vero su {n} modelli diversi: quanto costa un "
-             f"pacchetto, quante istruzioni esegue, e che cosa cambia da un "
-             f"P-core a un E-core.")
+             f"Quattro modi di scrivere la stessa rete neurale dentro il "
+             f"kernel Linux, misurati con traffico vero su {n} reti diverse: "
+             f"quanto costa ogni pacchetto, perché, e che cosa cambia su un "
+             f"core più lento.")
 
     # 2 -- le quattro versioni
     set_text(S[1], "TextBox 6",
-             f"Tutte e quattro calcolano lo stesso modello e prendono la stessa "
-             f"decisione: verificato su {n} modelli ({n85} per P2, che ha un "
-             f"tetto sui pesi). Cambia solo **quanto sanno già** quando "
-             f"vengono compilate.")
+             f"Tutte e quattro prendono la stessa decisione su ogni pacchetto "
+             f"(verificato su {n} modelli). Cambia solo **quanto sanno già** "
+             f"quando vengono compilate.")
     set_text(S[1], "TextBox 8",
-             "* Solo P1 statica può congelare anche **quali interfacce il "
-             "nodo ha davvero**: le colonne dei collegamenti che non esistono non "
-             "vengono generate (se un link è su o giù resta letto a runtime). "
-             "Serve il nodo congelato, perché le porte dipendono da quale nodo "
-             "si è. Le misure di queste slide usano tutte le porte.")
+             "* Solo P1 statica può togliere dal programma anche i "
+             "**collegamenti che il suo nodo non ha**, perché conosce già il "
+             "nodo su cui girerà. Le misure di queste slide non lo fanno: "
+             "tutte le versioni vedono tutte le porte.")
 
     # 3 -- quanto costa un pacchetto
     rx, bl = ref["rxonly_P"]["ns"], ref["baseline_P"]["ns"]
     nnP = [None] + [nn["P"][m]["med"] for m in PIPES]
     set_chart(S[2], "Chart 6",
-              ["solo ricezione", "baseline"] + NAMES,
-              [("ricevere il frame", [rx] * 6),
-               ("parse, TTL, redirect, accodamento", [0] + [bl - rx] * 5),
+              ["solo ricezione", "senza rete"] + NAMES,
+              [("ricevere il pacchetto", [rx] * 6),
+               ("leggere l'intestazione e inoltrare", [0] + [bl - rx] * 5),
                ("rete neurale", [0, 0] + nnP[1:])])
     set_text(S[2], "TextBox 10", f"{it(ns['P']['baseline']['med'])} ns")
     set_text(S[2], "TextBox 11",
-             f"{it(mpps['P']['baseline']['med'], 1)} M pacchetti/s, "
-             f"{n} modelli")
+             f"{it(mpps['P']['baseline']['med'], 1)} milioni di pacchetti/s")
     lo = min(ns["P"]["p1_static"]["min"], ns["P"]["hardcoded"]["min"])
     hi = max(ns["P"]["p1_static"]["max"], ns["P"]["hardcoded"]["max"])
     set_text(S[2], "TextBox 15", f"{it(lo)}–{it(hi)} ns")
     set_text(S[2], "TextBox 16",
-             f"{span(mpps['P']['p1_static'], 1)} M pacchetti/s")
+             f"{span(mpps['P']['p1_static'], 1)} milioni di pacchetti/s")
     set_text(S[2], "TextBox 20", f"{span(ns['P']['template'])} ns")
     set_text(S[2], "TextBox 21",
-             f"{span(mpps['P']['template'], 1)} M pacchetti/s")
+             f"{span(mpps['P']['template'], 1)} milioni di pacchetti/s")
     set_text(S[2], "TextBox 25", f"{span(ns['P']['modular'])} ns")
     set_text(S[2], "TextBox 26",
-             f"{span(mpps['P']['modular'], 1)} M pacchetti/s")
+             f"{span(mpps['P']['modular'], 1)} milioni di pacchetti/s")
     set_text(S[2], "TextBox 5",
-             f"64 byte, P-core a 3,5 GHz  ·  barre: mediana su {n} modelli "
-             f"(P2: {n85})  ·  schede: dal modello più leggero al più "
-             f"pesante")
+             f"Nodo su un core veloce (P-core) a 3,5 GHz, pacchetti da 64 "
+             f"byte  ·  barre: mediana dei {n} modelli  ·  schede: dal "
+             f"modello più leggero al più pesante")
     set_text(S[2], "TextBox 30",
-             f"Ricevere e inoltrare costano **~{it(bl)} ns**, con qualunque "
-             f"modello. La rete neurale aggiunge **{span(p1(nn['P']))} ns** "
-             f"con i pesi compilati (mediana {md(p1(nn['P']))}), "
-             f"**{span(nn['P']['template'])} ns** se la forma è letta da "
-             f"tabella (P2), **{span(nn['P']['modular'])} ns** se anche la "
-             f"profondità (P3): un core regge da **"
-             f"{it(mpps['P']['p1_static']['max'], 1)}** a **"
-             f"{it(mpps['P']['modular']['min'], 1)} milioni** di pacchetti al "
-             f"secondo, secondo modello e pipeline.")
+             f"Ricevere e inoltrare un pacchetto costa **~{it(bl)} ns**, con "
+             f"qualunque modello. La rete neurale aggiunge "
+             f"**{span(p1(nn['P']))} ns** con i pesi scritti nel programma "
+             f"(P1), **{span(nn['P']['template'])} ns** se la forma si legge "
+             f"da tabella (P2), **{span(nn['P']['modular'])} ns** se anche il "
+             f"numero di strati (P3). Un core regge da "
+             f"{it(mpps['P']['p1_static']['max'], 1)} a "
+             f"{it(mpps['P']['modular']['min'], 1)} milioni di pacchetti al "
+             f"secondo.")
 
     # 4 -- caricate contro eseguite
     ld = f["loaded"]
@@ -379,17 +527,15 @@ def build(pop, f, out=DECK):
     iep = max(abs(f["instr_E_P"][m]["max"] - 1) for m in ALL) * 100
     ilp = max(abs(f["lpe"]["instr_L_P"][m]["max"] - 1) for m in PIPES) * 100
     set_text(S[3], "TextBox 8",
-             f"**Caricate contro eseguite** (mediane). P2 carica più "
-             f"istruzioni di P3 ma ne esegue meno: su {b2[0]} modelli su "
-             f"{b2[1]}.")
+             f"**Caricate contro eseguite.** P2 è il più grande ma esegue "
+             f"meno istruzioni di P3 ({b2[0]} modelli su {b2[1]}).")
     set_text(S[3], "TextBox 9",
-             f"**Stesse istruzioni su ogni core.** Entro lo "
-             f"{it(iep, 1)} % fra P-core ed E-core su {n} modelli, entro lo "
-             f"{it(ilp, 1)} % sul LP E-core ({f['lpe']['n']} modelli).")
+             f"**Stesse istruzioni su ogni core:** al più {it(iep, 1)} % di "
+             f"differenza ({it(ilp, 1)} % sul LP E-core).")
     set_text(S[3], "TextBox 5",
-             "Caricate: contate dal kernel al caricamento  ·  eseguite: "
-             "contatori hardware, per pacchetto, nodo saturo  ·  a destra i "
-             f"{f['lpe']['n']} modelli misurati sui tre core")
+             "Caricate: la dimensione del programma, contata dal kernel  ·  "
+             "eseguite: contate dal processore per ogni pacchetto  ·  a "
+             f"destra i {f['lpe']['n']} modelli misurati su tutti e tre i core")
 
     # 5 -- P, E, LP
     lpe = f["lpe"]
@@ -408,32 +554,26 @@ def build(pop, f, out=DECK):
              f"Su un E-core il nodo regge dal {pct(lo)} al {pct(hi)} % del "
              f"P-core")
     set_text(S[4], "TextBox 8",
-             f"**Milioni di pacchetti al secondo.** Capacità E/P su {n} "
-             f"modelli: baseline {span(ce['baseline'], 2)}, P3 "
-             f"{span(ce['modular'], 2)}.")
+             f"**Milioni di pacchetti al secondo.** Rispetto al P-core, "
+             f"l'E-core regge {span(ce['baseline'], 2)} volte senza rete e "
+             f"{span(ce['modular'], 2)} volte con P3.")
     cyc = f["cycles_E_P"]
     nnc = f["nn_cycles_E_P"]
     set_text(S[4], "TextBox 9",
-             f"**ns di CPU per pacchetto.** Sull'E-core la baseline costa il "
-             f"{pct(cyc['baseline']['med'] - 1)} % in più, la sola rete "
-             f"neurale di P3 il {pct(nnc['modular']['med'] - 1)} % "
-             f"(mediane).")
+             f"**Tempo per pacchetto.** Sull'E-core il lavoro fisso del nodo "
+             f"costa il {pct(cyc['baseline']['med'] - 1)} % in più, la rete "
+             f"neurale di P3 solo il {pct(nnc['modular']['med'] - 1)} %.")
     cl = lpe["cap_L_P"]
     set_text(S[4], "TextBox 13",
-             f"A parità di frequenza l'E-core è più lento soprattutto nel "
-             f"**lavoro di rete del kernel**: più la pipeline è pesante, meno "
-             f"pesa la differenza (capacità E/P {md(ce['baseline'], 2)} per la "
-             f"baseline, {md(ce['p1_static'], 2)} per P1, "
-             f"{md(ce['template'], 2)}–{md(ce['modular'], 2)} per P2 e P3). "
-             f"Il LP E-core (fuori dalla L3, 2,5 GHz) regge dal "
-             f"{pct(min(cl[m]['min'] for m in PIPES))} al "
-             f"{pct(max(cl[m]['max'] for m in PIPES))} % del P-core sulle "
-             f"pipeline.")
+             f"A parità di frequenza l'E-core rallenta soprattutto il **lavoro "
+             f"fisso del nodo** (ricevere e inoltrare): più la rete pesa sul "
+             f"totale, meno conta il core. Il core a basso consumo (LP E-core, "
+             f"2,5 GHz) regge dal {pct(min(cl[m]['min'] for m in PIPES))} al "
+             f"{pct(max(cl[m]['max'] for m in PIPES))} % del P-core.")
     set_text(S[4], "TextBox 5",
-             "P-core e E-core a 3,5 GHz, LP E-core a 2,5 GHz; generatore e "
-             "uscita su P-core  ·  grafici: mediana dei "
-             f"{lpe['n']} modelli del sottoinsieme LP, dal più leggero al più "
-             "pesante")
+             "Core veloce (P-core) ed efficiente (E-core) a 3,5 GHz, a basso "
+             "consumo (LP E-core) a 2,5 GHz  ·  grafici: mediana dei "
+             f"{lpe['n']} modelli misurati su tutti e tre i core")
 
     # 6 -- IPC
     set_chart(S[5], "Chart 6", CATS,
@@ -450,24 +590,22 @@ def build(pop, f, out=DECK):
     ipc = f["ipc"]
     llc = lpe["llc"]["L"]
     set_text(S[5], "TextBox 11",
-             f"Le istruzioni per pacchetto sono le stesse su ogni core: il "
-             f"codice non cambia. Cambia l'IPC: {md(ipc['P']['baseline'], 1)} "
-             f"→ {md(ipc['E']['baseline'], 1)} per la baseline (lavoro di "
-             f"rete, salti, memoria), {md(ipc['P']['modular'], 1)} → "
-             f"{md(ipc['E']['modular'], 1)} per P3 (aritmetica lineare). Il "
-             f"LP E-core ha {it(min(llc[m]['med'] for m in ALL))}–"
-             f"{it(max(llc[m]['med'] for m in ALL))} mancate di cache per "
-             f"pacchetto.")
+             f"Il codice è lo stesso su ogni core; cambia quante istruzioni il "
+             f"core esegue a ogni ciclo di clock (IPC): "
+             f"{md(ipc['P']['baseline'], 1)} → {md(ipc['E']['baseline'], 1)} "
+             f"senza rete, dove il kernel salta e aspetta la memoria; "
+             f"{md(ipc['P']['modular'], 1)} → {md(ipc['E']['modular'], 1)} "
+             f"con P3, una fila di moltiplicazioni.")
     set_text(S[5], "TextBox 5",
-             "Contatori hardware sul core del nodo, nodo saturo  ·  mediane: "
-             f"tabella su {n} modelli, grafico sui {lpe['n']} misurati sui "
+             "Contatori del processore sul core del nodo  ·  tabella: mediane "
+             f"su {n} modelli  ·  grafico: i {lpe['n']} modelli misurati sui "
              "tre core")
 
     # 7 -- dove l'E-core perde tempo
     fixP, fixE = f["cycles"]["P"]["baseline"]["med"], \
         f["cycles"]["E"]["baseline"]["med"]
     cats7, fixed, net = [], [], []
-    for m, nm in zip(ALL, ["baseline", "P1", "P1.5", "P2", "P3"]):
+    for m, nm in zip(ALL, ["senza rete", "P1", "P1.5", "P2", "P3"]):
         for k, fx in (("P", fixP), ("E", fixE)):
             cats7.append(f"{nm} · {k}")
             fixed.append(fx)
@@ -493,15 +631,14 @@ def build(pop, f, out=DECK):
                  f"{it(f['nn_cycles']['E'][m]['med'])} cicli "
                  f"({span(nnc[m], 2)}×)")
     set_text(S[6], "TextBox 30",
-             f"Ricevere, inoltrare e restituire la pagina è lavoro del kernel "
-             f"con salti e memoria: l'E-core lo esegue a IPC "
-             f"{md(ipc['E']['baseline'], 1)} invece di "
-             f"{md(ipc['P']['baseline'], 1)}, su ogni modello. L'aritmetica "
-             f"della rete è una fila di moltiplicazioni, e l'E-core la esegue "
-             f"quasi altrettanto bene.")
+             f"Ricevere, inoltrare e liberare la memoria è lavoro del kernel, "
+             f"pieno di salti e attese: l'E-core ne esegue "
+             f"{md(ipc['E']['baseline'], 1)} istruzioni per ciclo invece di "
+             f"{md(ipc['P']['baseline'], 1)}. La rete è una fila di "
+             f"moltiplicazioni, che l'E-core esegue quasi come il P-core.")
     set_text(S[6], "TextBox 5",
-             "Cicli per pacchetto dai contatori hardware, 3,5 GHz  ·  parte "
-             "fissa = baseline, rete = pipeline meno baseline  ·  mediane su "
+             "Cicli di clock per pacchetto, contati dal processore  ·  parte "
+             "fissa = il nodo senza rete, rete = il resto  ·  mediane su "
              f"{n} modelli")
 
     # 8 -- LP E-core
@@ -515,31 +652,29 @@ def build(pop, f, out=DECK):
                               ("L", "LP E-core"))])
     lc = lpe["cycles"]
     set_text(S[7], "TextBox 8",
-             f"**Mancate di cache.** Zero sul P-core e sull'E-core; "
-             f"{it(min(llc[m]['med'] for m in ALL))}–"
-             f"{it(max(llc[m]['med'] for m in ALL))} per pacchetto sul LP "
-             f"E-core, fuori dalla L3.")
+             f"**Letture andate in memoria** (il dato non è in cache): zero "
+             f"su P-core ed E-core, {it(min(llc[m]['med'] for m in ALL))}–"
+             f"{it(max(llc[m]['med'] for m in ALL))} per pacchetto sul "
+             f"LP E-core.")
     set_text(S[7], "TextBox 9",
-             f"**Cicli per pacchetto** (mediane). P3: "
-             f"{it(lc['P']['modular']['med'])} → "
-             f"{it(lc['E']['modular']['med'])} → "
-             f"{it(lc['L']['modular']['med'])}; in tempo "
-             f"{it(lpe['ns']['P']['modular']['med'])} → "
-             f"{it(lpe['ns']['E']['modular']['med'])} → "
+             f"**Cicli per pacchetto.** Per P3: "
+             f"{it(lc['P']['modular']['med'])} sul P-core, "
+             f"{it(lc['E']['modular']['med'])} sull'E-core, "
+             f"{it(lc['L']['modular']['med'])} sul LP E-core; in tempo "
+             f"{it(lpe['ns']['P']['modular']['med'])}, "
+             f"{it(lpe['ns']['E']['modular']['med'])} e "
              f"{it(lpe['ns']['L']['modular']['med'])} ns.")
     lipc = lpe["ipc"]["L"]
     set_text(S[7], "TextBox 13",
-             f"Il LP E-core sta su un'altra parte del chip: i pacchetti scritti "
-             f"dal generatore gli arrivano dalla memoria. Fra memoria, IPC più "
-             f"basso ({it(min(lipc[m]['med'] for m in ALL), 1)}–"
-             f"{it(max(lipc[m]['med'] for m in ALL), 1)}) e 2,5 GHz regge dal "
+             f"Il LP E-core sta in un'altra parte del chip, fuori dalla cache "
+             f"che gli altri core condividono: i pacchetti gli arrivano dalla "
+             f"memoria. Fra attese, un core più semplice e 2,5 GHz regge dal "
              f"{pct(min(cl[m]['min'] for m in PIPES))} al "
-             f"{pct(max(cl[m]['max'] for m in PIPES))} % del P-core sulle "
-             f"pipeline.")
+             f"{pct(max(cl[m]['max'] for m in PIPES))} % del P-core.")
     set_text(S[7], "TextBox 5",
-             "Contatori hardware del core del nodo, per pacchetto, nodo saturo"
-             f"  ·  LP E-core a 2,5 GHz, fuori dalla L3  ·  mediane dei "
-             f"{lpe['n']} modelli misurati sui tre core")
+             "Contatori del processore, per pacchetto, a nodo pieno  ·  "
+             f"LP E-core a 2,5 GHz  ·  mediane dei {lpe['n']} modelli misurati "
+             "sui tre core")
 
     # 9 -- traffico crescente, curve normalizzate alla capacita'
     ld9 = f["load"]
@@ -547,28 +682,27 @@ def build(pop, f, out=DECK):
     for chart, k in (("Chart 6", "P"), ("Chart 7", "E")):
         set_chart(S[8], chart, cats9,
                   [(nm, ld9["curves"][k][m]) for nm, m in zip(NAMES, PIPES)])
-        axis_title(S[8], chart, cat="traffico chiesto / capacità",
-                   val="inoltrati / capacità")
+        axis_title(S[8], chart, cat="traffico offerto ÷ capacità",
+                   val="inoltrati ÷ capacità")
     kc = ld9["knee_over_cap"]
     n_curves = kc["P"]["n"] // 4
     set_text(S[8], "TextBox 8",
-             f"**P-core.** Fino alla capacità passa tutto, poi la curva è "
-             f"piatta: massimo {r(kc['P'], 2)} della capacità, "
-             f"{kc['P']['n']} curve.")
+             f"**P-core.** Fino alla capacità passa tutto, poi la curva resta "
+             f"piatta: il massimo inoltrato è {md(kc['P'], 2)} volte la "
+             f"capacità misurata a parte.")
     set_text(S[8], "TextBox 9",
-             f"**E-core.** Stesso andamento: {r(kc['E'], 2)}, "
-             f"{kc['E']['n']} curve. Divise per la capacità, le curve di "
-             f"modelli diversi si sovrappongono.")
+             f"**E-core.** Stesso andamento ({md(kc['E'], 2)}). Divise per la "
+             f"capacità del loro modello, le curve di modelli diversi "
+             f"coincidono.")
     set_text(S[8], "TextBox 13",
-             "I pacchetti si perdono **all'ingresso**, non dopo il programma: "
-             "il collo di bottiglia è il programma eBPF, su ogni tipo di core. "
-             "Fa eccezione P1 sui modelli più leggeri: oltre i 9 milioni di "
-             "pacchetti al secondo comincia a perdere anche l'uscita.")
+             "Oltre la capacità i pacchetti si perdono **in coda, prima del "
+             "programma**: il collo di bottiglia è il programma, su ogni tipo "
+             "di core. Fa eccezione P1 sui modelli più leggeri: sopra i 9 "
+             "milioni di pacchetti al secondo perde anche l'uscita.")
     set_text(S[8], "TextBox 5",
-             f"bench_bitrate, xdp_gen, 3 giri per punto, 64 byte, "
-             f"{n_curves} modelli dal più leggero al più pesante  ·  asse x e "
-             f"asse y divisi per la capacità del modello  ·  mediana delle "
-             f"curve")
+             f"Traffico crescente da 0,5 a 12 milioni di pacchetti al "
+             f"secondo, {n_curves} modelli dal più leggero al più pesante  ·  "
+             f"entrambi gli assi divisi per la capacità del modello")
 
     # 10 -- due core
     tw = f["two"]
@@ -577,52 +711,53 @@ def build(pop, f, out=DECK):
                   [("1 core", [tw[k]["one"][m] for m in ALL]),
                    ("2 core", [tw[k]["two"][m] for m in ALL])])
     set_text(S[9], "TextBox 8",
-             f"**P-core.** {r(tw['P']['pct_all'])} % del doppio su "
-             f"{tw['P']['pct_all']['n']} coppie modello-pipeline.")
+             f"**P-core.** Con due core il nodo regge il "
+             f"{md(tw['P']['pct_all'])} % del doppio (fra il "
+             f"{span(tw['P']['pct_all'])} %).")
     set_text(S[9], "TextBox 9",
-             f"**E-core.** {r(tw['E']['pct_all'])} % del doppio, con un "
-             f"E-core per modulo: i due moduli non si disturbano.")
+             f"**E-core.** Il {md(tw['E']['pct_all'])} % del doppio, con i due "
+             f"core in gruppi diversi del chip.")
     set_text(S[9], "TextBox 5",
-             "Un thread di xdp_gen, una coda e un core d'uscita per core del "
-             "nodo  ·  P: CPU 6 e 8  ·  E: CPU 12 e 16  ·  mediane di "
-             f"{tw['P']['n']} modelli")
+             "Una coda, un generatore e un core d'uscita per ogni core del "
+             f"nodo  ·  mediane di {tw['P']['n']} modelli dal più leggero al "
+             "più pesante")
 
     # 11 -- tre orologi
     ck = f["clocks"]
     cats11, progv, xpv = [], [], []
-    for m, nm in zip(ALL, ["baseline", "P1", "P1.5", "P2", "P3"]):
+    for m, nm in zip(ALL, ["senza rete", "P1", "P1.5", "P2", "P3"]):
         for k in ("P", "E"):
             cats11.append(f"{nm} · {k}")
             progv.append(ck["prog"][(k, m)]["med"])
             xpv.append(ck["xport"][(k, m)]["med"])
     set_chart(S[10], "Chart 6", cats11,
-              [("il programma (T2−T1)", progv),
-               ("il trasporto (T3−T2)", xpv)])
+              [("il programma", progv),
+               ("il trasporto", xpv)])
     pP = ck["prog"]
     set_text(S[10], "TextBox 10",
-             f"Da {md(pP[('P', 'baseline')])} ns (baseline) a "
-             f"{md(pP[('P', 'modular')])} ns (P3) sul P-core, mediane; P3 va "
-             f"da {span(pP[('P', 'modular')])} ns secondo il modello.")
+             f"Da {md(pP[('P', 'baseline')])} ns senza rete a "
+             f"{md(pP[('P', 'modular')])} ns con P3 (mediane, P-core). Per "
+             f"P3 da {span(pP[('P', 'modular')])} ns secondo il modello.")
     xp = [ck["xport"][("P", m)] for m in ALL]
     xe = [ck["xport"][("E", m)] for m in ALL]
     set_text(S[10], "TextBox 14",
-             f"Redirect, veth e ricezione: "
+             f"Consegnare il pacchetto al nodo successivo: "
              f"{it(min(s['min'] for s in xp))}–{it(max(s['max'] for s in xp))} "
              f"ns sul P-core, {it(min(s['min'] for s in xe))}–"
-             f"{it(max(s['max'] for s in xe))} sull'E-core, su ogni modello e "
-             f"pipeline.")
+             f"{it(max(s['max'] for s in xe))} sull'E-core, con ogni modello e "
+             f"versione.")
     lat = lambda k, m: (pP[(k, m)]["med"] + ck["xport"][(k, m)]["med"])  # noqa
     set_text(S[10], "TextBox 18",
-             f"Il trasporto è un costo comune che non dipende né dalla "
-             f"pipeline né dal modello; il programma pesa di più sull'E-core "
-             f"quanto più è lungo. La latenza minima arrivo → ripartenza va "
-             f"da {it(lat('P', 'baseline'))} a {it(lat('P', 'modular'))} ns "
-             f"sul P-core, da {it(lat('E', 'baseline'))} a "
-             f"{it(lat('E', 'modular'))} sull'E-core (mediane).")
+             f"Il trasporto è un costo comune, che non dipende né dalla "
+             f"versione né dal modello. Dall'arrivo del pacchetto alla sua "
+             f"ripartenza servono almeno {it(lat('P', 'baseline'))}–"
+             f"{it(lat('P', 'modular'))} ns sul P-core e "
+             f"{it(lat('E', 'baseline'))}–{it(lat('E', 'modular'))} "
+             f"sull'E-core (dal nodo senza rete a P3).")
     set_text(S[10], "TextBox 5",
-             "T1 all'ingresso del programma, T2 prima di bpf_redirect, T3 "
-             "all'arrivo dall'altra parte  ·  minimi, a 0,25 e 0,5 Mpps  ·  "
-             f"barre: mediana su {n} modelli")
+             "Tre orologi letti dal programma: all'ingresso, prima di "
+             "inoltrare, all'arrivo al nodo successivo  ·  minimi, a traffico "
+             f"leggero  ·  barre: mediana dei {n} modelli")
 
     # 12 -- taglia e classi
     fr = f["frames"]
@@ -635,23 +770,23 @@ def build(pop, f, out=DECK):
                ("scarta", [cs["drop"].get(m) for m in ALL])],
               colors={0: "#6C819C", 1: "#C0443C"})
     set_text(S[11], "TextBox 8",
-             f"**Taglia del pacchetto: nessun effetto** "
-             f"({r(fr['var'], 1)} % fra 64 e 1 514 byte, "
-             f"{fr['var']['n']} coppie). Il nodo legge solo l'intestazione.")
+             f"**Taglia del pacchetto: nessun effetto** ({md(fr['var'], 1)} % "
+             f"fra 64 e 1 514 byte, in mediana). Il nodo legge solo "
+             f"l'intestazione.")
     set_text(S[11], "TextBox 9",
-             f"**Porta d'uscita: nessun effetto** ({r(cs['spread'])} % fra "
-             f"le classi che inoltrano). Scartare costa {r(cs['extra'])} ns "
-             f"in più.")
+             f"**Porta d'uscita: nessun effetto.** Scartare il pacchetto costa "
+             f"~{md(cs['extra'])} ns in più: la sua memoria si libera sul core "
+             f"del nodo.")
     mx = f["mix"]["rel"]
     set_text(S[11], "TextBox 13",
-             f"Basta un numero per pipeline e modello a descrivere il costo "
-             f"del nodo: non dipende da taglia del pacchetto, porta d'uscita "
-             f"o TTL (TTL diversi a ogni pacchetto: {r(mx)} %); solo la "
-             f"decisione di scartare costa ~{md(cs['extra'])} ns in più.")
+             f"Basta un numero per versione e modello a descrivere il costo "
+             f"del nodo: non contano la taglia del pacchetto, la porta "
+             f"d'uscita né il TTL. Solo la decisione di scartare costa "
+             f"~{md(cs['extra'])} ns in più, per come è fatto il banco.")
     set_text(S[11], "TextBox 5",
-             "Una sessione per classe decisa, verificata su ogni pipeline  ·  "
-             f"P-core a 3,5 GHz  ·  mediane: {fr['n']} modelli per le taglie, "
-             f"{cs['n']} per le classi, dal più leggero al più pesante")
+             "Una prova per ogni decisione che il modello sa prendere  ·  "
+             f"P-core a 3,5 GHz  ·  mediane di {fr['n']} modelli (taglie) e "
+             f"{cs['n']} (decisioni)")
 
     # 13 -- profondita' e pesi a zero, tempo del nodo
     dv, dg = groups(pop, base_ids, "depth",
@@ -661,28 +796,27 @@ def build(pop, f, out=DECK):
     tw13 = sparse_twin(pop)
     set_chart(S[12], "Chart 7", ["0 %", "50 %", "90 %"],
               [(nm, tw13[m]) for nm, m in zip(NAMES, PIPES)])
-    axis_title(S[12], "Chart 7", val="tempo del nodo / modello denso")
-    set_text(S[12], "TextBox 3", "Profondità e pesi a zero, sul nodo vero")
+    axis_title(S[12], "Chart 7", val="tempo ÷ stesso modello senza zeri")
+    set_text(S[12], "TextBox 3",
+             "Profondità e pesi a zero, sul nodo vero")
     set_text(S[12], "TextBox 8",
-             f"**Profondità** (mediane per numero di strati, "
-             f"{len(base_ids)} modelli). Per strato in più, a MAC ferme: P3 "
-             f"~{it(L[('P', 'ns', 'modular')]['c'])} ns, P2 "
-             f"~{it(L[('P', 'ns', 'template')]['c'])}, P1 e P1.5 "
-             f"~{it(L[('P', 'ns', 'p1_static')]['c'])}.")
+             f"**Profondità.** Ogni strato nascosto in più costa "
+             f"~{it(L[('P', 'ns', 'modular')]['c'])} ns a P3, "
+             f"~{it(L[('P', 'ns', 'template')]['c'])} a P2, quasi niente a P1 "
+             f"e P1.5.")
     set_text(S[12], "TextBox 9",
-             f"**Pesi a zero** (tempo del nodo diviso quello del modello "
-             f"denso con la stessa forma). Al 90 % P1 "
-             f"{it(tw13['p1_static'][2], 2)}×, P1.5 "
-             f"{it(tw13['hardcoded'][2], 2)}×; P2 e P3 ferme.")
+             f"**Pesi a zero.** Al 90 % di zeri il nodo con P1 scende a "
+             f"{it(tw13['p1_static'][2], 2)} e con P1.5 a "
+             f"{it(tw13['hardcoded'][2], 2)} volte il tempo dello stesso "
+             f"modello senza zeri; P2 e P3 non cambiano.")
     set_text(S[12], "TextBox 13",
-             f"Sul nodo vero, su tutta la popolazione: la profondità costa "
-             f"soprattutto a P3 e P2, i pesi a zero aiutano solo P1 e P1.5. "
-             f"Il costo fisso del nodo (~{it(bl)} ns) resta lo stesso con "
-             f"qualunque modello.")
+             f"Su tutta la popolazione la profondità costa soprattutto a P3 e "
+             f"P2, i pesi a zero aiutano solo P1 e P1.5. Il lavoro fisso del "
+             f"nodo (~{it(bl)} ns) è lo stesso con qualunque modello.")
     set_text(S[12], "TextBox 5",
-             "Tempo di CPU per pacchetto, xdp_gen, P-core  ·  profondità: "
-             f"famiglia base ({len(base_ids)} modelli)  ·  pesi a zero: 4 "
-             "forme contro il gemello denso")
+             "Tempo per pacchetto, P-core  ·  profondità: mediane dei "
+             f"{len(base_ids)} modelli del disegno principale  ·  pesi a zero: "
+             "4 forme, contro lo stesso modello senza zeri")
 
     # 14 -- istruzioni per strato
     dvi, dgi = groups(pop, base_ids, "depth",
@@ -699,23 +833,23 @@ def build(pop, f, out=DECK):
     set_text(S[13], "TextBox 3",
              f"Ogni strato di P3 costa ~{it(round(li['c'], -1))} istruzioni")
     set_text(S[13], "TextBox 8",
-             f"**Istruzioni.** Legge su {li['n']} modelli: P3 "
-             f"+{it(li['c'])} per strato (r² {it(li['r2'], 2)}), identiche su "
-             f"P-core ed E-core; P2 +{it(L[('P', 'instr', 'template')]['c'])}"
-             f" per strato.")
+             f"**Istruzioni eseguite.** Ogni strato in più ne aggiunge "
+             f"{it(li['c'])} a P3 e {it(L[('P', 'instr', 'template')]['c'])} "
+             f"a P2, uguali su P-core ed E-core.")
     set_text(S[13], "TextBox 9",
-             f"**Tempo.** P3 ~{it(L[('P', 'ns', 'modular')]['c'])} ns per "
-             f"strato sul P-core, ~{it(L[('E', 'ns', 'modular')]['c'])} "
-             f"sull'E-core (legge). Tratteggio = E-core.")
+             f"**Tempo.** Ogni strato costa a P3 "
+             f"~{it(L[('P', 'ns', 'modular')]['c'])} ns sul P-core e "
+             f"~{it(L[('E', 'ns', 'modular')]['c'])} sull'E-core (tratteggio): "
+             f"stesse istruzioni, eseguite più lentamente.")
     set_text(S[13], "TextBox 13",
-             "In P3 ogni strato è un salto più le letture che ricostruiscono "
-             "il contesto: lo stesso conto di istruzioni a ogni strato, su "
-             "ogni modello. La profondità si paga a ogni pacchetto, e "
-             "sull'E-core un po' di più.")
+             "P3 esegue uno strato alla volta: a ogni strato salta a un altro "
+             "programma e rilegge dalle tabelle dove si trova. È sempre lo "
+             "stesso lavoro, per questo ogni strato costa uguale, su ogni "
+             "modello.")
     set_text(S[13], "TextBox 5",
-             f"Mediane per numero di strati sui {len(base_ids)} modelli della "
-             "famiglia base  ·  leggi su tutti i modelli densi  ·  contatori "
-             "hardware del core del nodo, per pacchetto")
+             f"Mediane per numero di strati sui {len(base_ids)} modelli del "
+             f"disegno principale  ·  costo per strato stimato su "
+             f"{li['n']} modelli senza zeri  ·  contatori del processore")
 
     # 15 -- larghezza e pari pesi, tempo del nodo
     wv, wg = groups(pop, base_ids, "width_max",
@@ -734,25 +868,25 @@ def build(pop, f, out=DECK):
               + [("P3 · E-core", [iso["E"]["modular"].get(int(d),
                                   iso["E"]["modular"].get(d)) for d in dd])])
     set_text(S[14], "TextBox 8",
-             f"**Larghezza.** Da 2 a 8 neuroni sale su tutte: P1 "
-             f"{it(wg['p1_static'][0])} → {it(wg['p1_static'][-1])}, P3 "
-             f"{it(wg['modular'][0])} → {it(wg['modular'][-1])} ns (mediane).")
+             f"**Larghezza.** Da 2 a 8 neuroni per strato il tempo sale su "
+             f"tutte: P1 da {it(wg['p1_static'][0])} a "
+             f"{it(wg['p1_static'][-1])} ns, P3 da {it(wg['modular'][0])} a "
+             f"{it(wg['modular'][-1])} ns.")
     rise = f["isoparam"]["rise"]
     set_text(S[14], "TextBox 9",
-             f"**A pari pesi.** Da 1 a 5 strati P2 "
-             f"+{md(rise['template'])} %, P3 +{md(rise['modular'])} %; le P1 "
-             f"+{md(rise['hardcoded'])}–{md(rise['p1_static'])} %.")
+             f"**A pari pesi.** Gli stessi ~592 pesi su 5 strati invece di 1: "
+             f"P2 +{md(rise['template'])} %, P3 +{md(rise['modular'])} %, "
+             f"P1 e P1.5 solo +{md(rise['hardcoded'])}–"
+             f"{md(rise['p1_static'])} %.")
     eratio = [wgE["modular"][j] / wg["modular"][j] for j in range(len(wv))]
     set_text(S[14], "TextBox 13",
-             f"Le stesse scelte valgono sul nodo vero, con il costo fisso del "
-             f"nodo in più. Sull'E-core P3 sta più in alto del "
-             f"{pct(min(eratio) - 1)}–{pct(max(eratio) - 1)} %, con la stessa "
-             f"forma: la forma migliore non cambia con il core.")
+             f"Sull'E-core P3 ha la stessa forma, più in alto del "
+             f"{pct(min(eratio) - 1)}–{pct(max(eratio) - 1)} %: la forma "
+             f"migliore del modello non dipende dal core su cui girerà.")
     set_text(S[14], "TextBox 5",
-             "Tempo di CPU per pacchetto, nodo su P-core  ·  tratteggio: P3 "
-             f"sull'E-core  ·  larghezza: famiglia base ({len(base_ids)} "
-             f"modelli); pari pesi: famiglia imbuto ({f['isoparam']['n']} "
-             "modelli, 2 composizioni)")
+             "Tempo per pacchetto, P-core; tratteggio: P3 sull'E-core  ·  "
+             f"larghezza: {len(base_ids)} modelli del disegno principale  ·  "
+             f"pari pesi: {f['isoparam']['n']} modelli")
 
     # 16 -- traffico leggero contro nodo saturo
     lt = f["depth_light"]
@@ -763,36 +897,33 @@ def build(pop, f, out=DECK):
                      lambda i, m: pop.c.nn_t2("P", i, m, 1))
     for chart, m in (("Chart 6", "modular"), ("Chart 7", "template")):
         set_chart(S[15], chart, [str(v) for v in dv],
-                  [("nodo saturo (tempo di CPU)", dnn[m]),
-                   ("traffico leggero, minimo", dmin[m]),
-                   ("traffico leggero, media", davg[m])])
+                  [("nodo pieno", dnn[m]),
+                   ("poco traffico, il pacchetto più veloce", dmin[m]),
+                   ("poco traffico, media", davg[m])])
         axis_title(S[15], chart, cat="strati nascosti")
     li_ = ck["light"]
     mav = ck["minavg"]
     set_text(S[15], "TextBox 3",
-             "Leggero o saturo, la rete di P2 e P3 costa uguale")
+             "Poco traffico o nodo pieno: la rete di P2 e P3 costa uguale")
     set_text(S[15], "TextBox 8",
-             f"**P3.** Media a traffico leggero / nodo saturo "
-             f"{r(li_[('P', 'modular')], 2)} su {li_[('P', 'modular')]['n']} "
-             f"modelli; il minimo sta al {pct(mav[('P', 'modular')]['med'])} "
-             f"% della media.")
+             f"**P3.** Con poco traffico la rete costa "
+             f"{md(li_[('P', 'modular')], 2)} volte quanto a nodo pieno; il "
+             f"pacchetto più veloce il {pct(1 - mav[('P', 'modular')]['med'])} "
+             f"% meno della media.")
     set_text(S[15], "TextBox 9",
-             f"**P2.** {r(li_[('P', 'template')], 2)}. P1 e P1.5 no: "
-             f"{md(li_[('P', 'p1_static')], 2)} e "
-             f"{md(li_[('P', 'hardcoded')], 2)} (mediane), con una rete da "
-             f"poche decine di ns.")
+             f"**P2:** {md(li_[('P', 'template')], 2)} volte. Per P1 e P1.5 no "
+             f"({md(li_[('P', 'p1_static')], 2)} e "
+             f"{md(li_[('P', 'hardcoded')], 2)}): la loro rete costa poche "
+             f"decine di ns, e le due misure non la distinguono bene.")
     set_text(S[15], "TextBox 13",
-             f"Tempo di CPU a nodo saturo e T2−T1 a traffico leggero danno "
-             f"lo stesso costo della rete per P2 e P3, su ogni modello. Il "
-             f"pacchetto più veloce costa "
-             f"~{pct(1 - mav[('P', 'modular')]['med'])} % meno della media: "
-             f"cache e predittori non sempre caldi.")
+             "Due modi indipendenti di misurare la rete, a nodo pieno e con "
+             "poco traffico, danno lo stesso costo per P2 e P3 su ogni "
+             "modello. Il pacchetto più veloce è quello che trova la cache "
+             "già pronta.")
     set_text(S[15], "TextBox 5",
-             "T2−T1 (build strumentata), xdp_gen a 0,25 e 0,5 Mpps, baseline "
-             "sottratta  ·  mediane per strati, famiglia base "
-             f"({len(base_ids)} modelli)  ·  P-core")
-    set_text(S[15], "TextBox 2",
-             "GLI ASSI SOTTO TRAFFICO · LA SOLA RETE NEURALE · P-CORE")
+             "Tempo letto dal programma stesso, con 0,25 e 0,5 milioni di "
+             "pacchetti al secondo, meno il nodo senza rete  ·  mediane per "
+             f"strati, {len(base_ids)} modelli  ·  P-core")
 
     # 17 -- la configurabilita' si paga per pacchetto
     set_chart(S[16], "Chart 6", CATS,
@@ -807,24 +938,24 @@ def build(pop, f, out=DECK):
                    or m != "modular"
                    else f"{it(so['lookups'][m]['min'])}–"
                         f"{it(so['lookups'][m]['max'])}"),
-                  ("1/strato" if m == "modular"
+                  (span(so["n_tail"][m]) if m == "modular"
                    else it(so["n_tail"][m]["med"]))]
                  for nm, m in zip(NAMES, PIPES)])
     set_text(S[16], "TextBox 3",
-             f"La configurabilità si paga per pacchetto: "
-             f"+{md(p1(nn['P']))} → +{md(nn['P']['modular'])} ns")
+             f"La configurabilità si paga per pacchetto: da "
+             f"+{md(p1(nn['P']))} a +{md(nn['P']['modular'])} ns")
     set_text(S[16], "TextBox 11",
-             f"La configurabilità si paga nelle **letture di tabella** "
-             f"({md(so['lookups']['p1_static'])} → "
-             f"{md(so['lookups']['modular'])} per pacchetto) e nei **salti** "
-             f"(P3: uno per strato), non nell'aritmetica. Sopra la baseline, "
-             f"rendere "
-             f"configurabile la forma (P2) costa **{r(f['p2_over_p1'], 1)}×** "
-             f"P1; anche la profondità (P3) **{r(f['p3_over_p1'], 1)}×**. Fra "
-             f"P1 e P1.5: {r(f['p15_over_p1'], 1)}×.")
+             f"Il prezzo della configurabilità sta nelle **letture di "
+             f"tabella** (da {md(so['lookups']['p1_static'])} a "
+             f"{md(so['lookups']['modular'])} per pacchetto) e nei **salti "
+             f"fra programmi** (P3 ne fa uno per strato), non nelle "
+             f"moltiplicazioni. In mediana P2 costa "
+             f"**{md(f['p2_over_p1'], 1)} volte** P1, P3 "
+             f"**{md(f['p3_over_p1'], 1)} volte**; P1.5 quasi come P1.")
     set_text(S[16], "TextBox 5",
-             f"Mediane su {n} modelli (P2: {n85})  ·  tempo di CPU, xdp_gen, "
-             "P-core  ·  letture e salti per pacchetto: build strumentata")
+             f"Mediane su {n} modelli (P2: {n85})  ·  tempo per pacchetto, "
+             "P-core  ·  letture e salti contati da una versione del "
+             "programma che li conta")
 
     # 19 -- la rete puo' crescere (diventa la 18)
     nd = f["nodes"]
@@ -832,7 +963,7 @@ def build(pop, f, out=DECK):
               [(nm, [nd["residual"][m].get(x, nd["residual"][m].get(str(x)))
                      for x in nd["sizes"]]) for nm, m in zip(NAMES, PIPES)])
     axis_title(S[18], "Chart 6", cat="nodi della rete",
-               val="ns: misurato − legge")
+               val="scarto dalla legge (ns)")
     va = shape(S[18], "Chart 6").chart.value_axis
     va.minimum_scale, va.maximum_scale = -40, 40
     from pptx.enum.chart import XL_TICK_LABEL_POSITION
@@ -843,19 +974,19 @@ def build(pop, f, out=DECK):
               [(nm, wnn[m]) for nm, m in zip(NAMES, PIPES)])
     slope = nd["ns_per_node"]
     set_text(S[18], "TextBox 8",
-             f"**Nodi della rete** ({nd['n']} modelli, reti da "
-             f"{nd['sizes'][0]} a {nd['sizes'][-1]} nodi). Lo scarto dalla "
-             f"legge non cresce: al più "
-             f"{it(max(abs(v) for v in slope.values()), 2)} ns per nodo.")
+             f"**Nodi della rete.** Reti da {nd['sizes'][0]} a "
+             f"{nd['sizes'][-1]} nodi ({nd['n']} modelli): il costo resta "
+             f"quello previsto dalla legge, al più "
+             f"{it(max(abs(v) for v in slope.values()), 2)} ns per nodo in "
+             f"più.")
     set_text(S[18], "TextBox 9",
-             f"**Larghezza del modello.** Da 2 a 8 neuroni sale su tutte e "
-             f"quattro: P1 {it(wnn['p1_static'][0])} → "
-             f"{it(wnn['p1_static'][-1])} ns, P3 {it(wnn['modular'][0])} → "
-             f"{it(wnn['modular'][-1])} ns (mediane).")
+             f"**Larghezza del modello.** Da 2 a 8 neuroni sale su tutte: P1 "
+             f"da {it(wnn['p1_static'][0])} a {it(wnn['p1_static'][-1])} ns, "
+             f"P3 da {it(wnn['modular'][0])} a {it(wnn['modular'][-1])} ns.")
     set_text(S[18], "TextBox 5",
-             "Tempo di CPU meno la baseline, xdp_gen, P-core  ·  a sinistra: "
-             "misurato meno la legge, mediana per taglia della rete  ·  a "
-             "destra: famiglia base")
+             "Tempo della sola rete, P-core  ·  a sinistra: costo misurato "
+             "meno quello previsto dalla legge, per taglia della rete  ·  a "
+             f"destra: {len(base_ids)} modelli del disegno principale")
 
     # 20 -- profondita' (diventa la 19)
     _, dsz = groups(pop, base_ids, "depth",
@@ -866,26 +997,24 @@ def build(pop, f, out=DECK):
               [(nm, dnn[m]) for nm, m in zip(NAMES, PIPES)])
     sz = L
     set_text(S[19], "TextBox 8",
-             f"**Dimensione.** P2 ricompila e srotola: "
-             f"+{it(sz[('size', 'template')]['c'])} istruzioni per strato "
-             f"(r² {it(sz[('size', 'template')]['r2'], 2)}). P3 non si muove: "
-             f"{it(ld['modular']['med'])} su ogni modello.")
+             f"**Dimensione.** P2 si ricompila per ogni profondità: "
+             f"~{it(round(sz[('size', 'template')]['c'], -1))} istruzioni in "
+             f"più per strato. P3 resta di {it(ld['modular']['med'])} "
+             f"istruzioni con ogni modello.")
     set_text(S[19], "TextBox 9",
-             f"**Tempo.** P3 paga ~{it(L[('P', 'ns', 'modular')]['c'])} ns "
-             f"per strato, P2 ~{it(L[('P', 'ns', 'template')]['c'])}, P1 e "
-             f"P1.5 ~{it(L[('P', 'ns', 'p1_static')]['c'])} (legge, a MAC "
-             f"ferme).")
+             f"**Tempo.** Ogni strato costa a P3 "
+             f"~{it(L[('P', 'ns', 'modular')]['c'])} ns, a P2 "
+             f"~{it(L[('P', 'ns', 'template')]['c'])}, a P1 e P1.5 "
+             f"~{it(L[('P', 'ns', 'p1_static')]['c'])}.")
     set_text(S[19], "TextBox 13",
-             f"Un modello profondo si paga sempre: con P2 in un programma più "
-             f"grande da ricompilare (~{it(round(sz[('size', 'template')]['c'], -1))}"
-             f" istruzioni per strato), con P3 in "
-             f"~{it(L[('P', 'ns', 'modular')]['c'])} ns per pacchetto a ogni "
-             f"strato. P3 è la più flessibile, ed è quella che la profondità "
-             f"rallenta di più.")
+             f"Un modello profondo si paga sempre: P2 con un programma più "
+             f"grande da compilare, P3 con ~{it(L[('P', 'ns', 'modular')]['c'])}"
+             f" ns in più a ogni pacchetto per ogni strato. P3 è la versione "
+             f"più flessibile, ed è quella che la profondità rallenta di più.")
     set_text(S[19], "TextBox 5",
-             f"Mediane per numero di strati, famiglia base ({len(base_ids)} "
-             "modelli)  ·  dimensione: istruzioni del programma caricato  ·  "
-             "tempo: CPU meno baseline, xdp_gen, P-core a 3,5 GHz")
+             f"Mediane per numero di strati, {len(base_ids)} modelli del "
+             "disegno principale  ·  dimensione: istruzioni del programma "
+             "caricato  ·  tempo: sola rete, P-core")
 
     # 21 -- a pari pesi (diventa la 20)
     isn = f["isoparam"]["nn"]["P"]
@@ -894,24 +1023,25 @@ def build(pop, f, out=DECK):
                for nm, m in zip(NAMES, PIPES)])
     slp = f["isoparam"]["slope"]
     set_text(S[20], "TextBox 10",
-             f"Da 1 a 5 strati, a pesi fermi: P2 +{r(rise['template'])} %, "
-             f"P3 +{r(rise['modular'])} %; ~{md(slp['modular'])} ns per "
-             f"strato per P3.")
+             f"Gli stessi ~592 pesi su 5 strati invece di 1: P2 costa il "
+             f"{md(rise['template'])} % in più, P3 il {md(rise['modular'])} % "
+             f"(~{md(slp['modular'])} ns per strato).")
     p1v = [v for m in ("p1_static", "hardcoded") for v in isn[m].values()]
     set_text(S[20], "TextBox 14",
-             f"**{it(min(p1v))}–{it(max(p1v))} ns** (mediane): srotolano "
-             f"tutto in una funzione sola, e la forma conta poco "
+             f"**{it(min(p1v))}–{it(max(p1v))} ns**: P1 e P1.5 scrivono la rete "
+             f"per esteso in una funzione sola, e la forma conta poco "
              f"(~{md(slp['p1_static'])} ns per strato).")
     set_text(S[20], "TextBox 18",
-             f"Con le versioni specializzate la forma della rete si sceglie "
-             f"per l'accuratezza. Con le generiche, a parità di pesi, conviene "
-             f"una rete larga e poco profonda: da 1 a 5 strati il costo sale "
-             f"del {md(rise['template'])} % (P2) e del "
-             f"{md(rise['modular'])} % (P3).")
+             f"Con le versioni che hanno i pesi nel programma la forma della "
+             f"rete si sceglie per l'accuratezza. Con quelle che li leggono da "
+             f"tabella, a parità di pesi conviene una rete larga e poco "
+             f"profonda: da 1 a 5 strati il costo sale del "
+             f"{md(rise['template'])} % (P2) e del {md(rise['modular'])} % "
+             f"(P3).")
     set_text(S[20], "TextBox 5",
-             "Cinque forme con circa 592 pesi, da 1 a 5 strati, 2 "
-             f"composizioni dell'ingresso ({f['isoparam']['n']} modelli)  ·  "
-             "mediane  ·  CPU meno baseline, P-core")
+             "Cinque forme con circa 592 pesi, da 1 a 5 strati, su 2 tipi di "
+             f"ingresso ({f['isoparam']['n']} modelli)  ·  mediane  ·  sola "
+             "rete, P-core")
 
     # 22 -- la legge (diventa la 21)
     import tempfile
@@ -925,37 +1055,33 @@ def build(pop, f, out=DECK):
     # dove va il tempo: quota mediana di ogni termine della legge
     sh21 = f["law_shares"]
     set_table(S[21], [sh.name for sh in S[21].shapes if sh.has_table][0],
-              [["Versione", "fisso · MAC · strati"]]
+              [["Versione", "fisso · moltipl. · strati"]]
               + [[nm, " · ".join(f"{pct(x['med'])} %" for x in sh21[m])]
                  for nm, m in zip(NAMES, PIPES)])
     errs = [L[("P", "ns", m)]["err50"] for m in PIPES]
     r2s = [L[("P", "ns", m)]["r2"] for m in PIPES]
     r2sh = [L[("P", "ns", m)]["r2_shape"] for m in PIPES]
     set_text(S[21], "TextBox 3",
-             "Il costo di un modello si prevede: a + b × MAC + c × strati")
+             "Il costo di un modello si può prevedere prima di misurarlo")
     struct = [1 - sh21[m][1]["med"] for m in ("template", "modular")]
     set_text(S[21], "TextBox 8",
-             f"**Dove va il tempo** (quota mediana di ogni termine). P1 e "
-             f"P1.5: circa metà nelle moltiplicazioni. P2 e P3: "
-             f"{pct(min(struct)) if pct(min(struct)) == pct(max(struct)) else pct(min(struct)) + '–' + pct(max(struct))}"
-             f" % nella parte fissa e "
-             f"negli strati, cioè tail call e letture di tabella. La legge "
-             f"regge su tutte (r² {it(min(r2s), 2)}–{it(max(r2s), 2)}, "
-             f"errore {it(min(errs))}–{it(max(errs))} % su modelli non "
-             f"visti).")
+             f"**Dove va il tempo.** Con P1 e P1.5 circa metà è "
+             f"moltiplicazioni. Con P2 e P3 circa l'"
+             f"{pct(min(struct))} % è struttura: il lavoro fisso e quello per "
+             f"strato, cioè salti fra programmi e letture di tabella. Su "
+             f"modelli mai visti la legge sbaglia del {it(min(errs))}–"
+             f"{it(max(errs))} %.")
     lp1, lp3 = L[("P", "ns", "p1_static")], L[("P", "ns", "modular")]
     set_text(S[21], "TextBox 12",
-             f"Il costo di un modello si **stima prima di misurarlo**: "
-             f"~{it(lp1['a'])} ns + **{it(lp1['b'], 2)} ns** per MAC con i "
-             f"pesi compilati (P1), ~{it(lp3['a'])} ns + "
-             f"**{it(lp3['b'], 2)} ns** per MAC + ~{it(lp3['c'])} ns per "
-             f"strato con P3. Per P2 e P3 pesa la **struttura** (tail call, "
-             f"letture di tabella), non l'aritmetica.")
+             f"**Costo della rete ≈ fisso + moltiplicazioni × costo di una + "
+             f"strati × costo di uno.** P1: ~{it(lp1['a'])} ns + "
+             f"{it(lp1['b'], 2)} ns per moltiplicazione. P3: ~{it(lp3['a'])} "
+             f"ns + {it(lp3['b'], 2)} ns per moltiplicazione + "
+             f"~{it(lp3['c'])} ns per strato.")
     set_text(S[21], "TextBox 5",
-             f"Legge su {lp1['n']} modelli densi (P2: "
-             f"{L[('P', 'ns', 'template')]['n']}), errore su modelli lasciati "
-             "fuori  ·  grafico: misurato meno c × strati  ·  tabella: "
-             "quote mediane dei tre termini  ·  P-core")
+             f"Stimata su {lp1['n']} modelli senza pesi a zero, errore su "
+             "modelli lasciati fuori  ·  grafico: costo meno la parte per "
+             "strato  ·  tabella: quanto pesa ogni parte")
 
     # 23 -- pesi a zero (diventa la 22)
     sp = f["sparsity"]["ratio"]          # {pipeline: {0.0|0.5|0.9: summ}}
@@ -963,29 +1089,29 @@ def build(pop, f, out=DECK):
                   for k in (0.0, 0.5, 0.9)] for m in PIPES}
     set_chart(S[22], "Chart 6", ["0 %", "50 %", "90 %"],
               [(nm, vals23[m]) for nm, m in zip(NAMES, PIPES)])
-    axis_title(S[22], "Chart 6", val="misurato / previsto dalla legge densa")
+    axis_title(S[22], "Chart 6", val="misurato ÷ previsto senza zeri")
     szr = f["sparsity"]["size"]
     set_text(S[22], "TextBox 10",
-             f"Al 90 % di zeri il programma scende a "
-             f"{span(szr['hardcoded@0.9'], 2)}× quello del modello denso, e "
-             f"il costo della rete a {r(sp['hardcoded'][0.9], 2)}× del "
-             f"previsto. Il compilatore vede lo zero e cancella la "
-             f"moltiplicazione.")
+             f"Al 90 % di zeri il programma scende a circa un terzo "
+             f"({span(szr['hardcoded@0.9'], 2)} volte) e la rete costa "
+             f"{md(sp['hardcoded'][0.9], 2)} volte quanto previsto per lo "
+             f"stesso modello senza zeri: il compilatore toglie le "
+             f"moltiplicazioni per zero.")
     set_text(S[22], "TextBox 14",
-             f"Dimensione identica al modello denso, costo "
-             f"{r(sp['template'][0.9], 2)}× (P2) e "
-             f"{r(sp['modular'][0.9], 2)}× (P3) del previsto: zero, letto da "
-             f"una tabella, è un numero come un altro.")
+             f"Programma identico e costo come previsto "
+             f"({md(sp['template'][0.9], 2)} volte per P2, "
+             f"{md(sp['modular'][0.9], 2)} per P3): uno zero letto da una "
+             f"tabella è un numero come un altro.")
     set_text(S[22], "TextBox 18",
-             f"Potare il modello (pesi a zero) rende più veloci **solo le "
-             f"versioni specializzate**: al 90 % di zeri P1 costa "
-             f"**{md(sp['p1_static'][0.9], 2)}×** e P1.5 "
-             f"**{md(sp['hardcoded'][0.9], 2)}×** del modello denso "
-             f"previsto. Con P2 e P3 non dà niente.")
+             f"Mettere pesi a zero rende più veloci **solo le versioni con i "
+             f"pesi nel programma**: al 90 % di zeri P1 costa "
+             f"**{md(sp['p1_static'][0.9], 2)}** e P1.5 "
+             f"**{md(sp['hardcoded'][0.9], 2)}** volte il previsto. Con P2 e "
+             f"P3 non dà niente.")
     set_text(S[22], "TextBox 5",
-             "4 forme al 50 e al 90 % di pesi a zero, ciascuna contro la legge "
-             "stimata sui modelli densi  ·  tempo di CPU meno la baseline, "
-             "xdp_gen, nodo saturo, P-core a 3,5 GHz")
+             "4 forme con il 50 e il 90 % di pesi a zero, confrontate con la "
+             "legge stimata sui modelli senza zeri  ·  sola rete, P-core a "
+             "3,5 GHz")
 
     # 18 -- cambiare modello (bench_solo.py: il nodo, e clang fuori dal nodo)
     S18 = S[17]
@@ -1008,31 +1134,52 @@ def build(pop, f, out=DECK):
     va18.tick_labels.number_format_is_linked = False
     shape(S18, "Chart 6").chart.plots[0].has_data_labels = False
     set_text(S18, "TextBox 10",
-             f"Il nodo carica un file pronto: {span(up['p1_static'], 1)} ms "
-             f"(mediana {md(up['p1_static'], 1)}). Generarlo e compilarlo con "
-             f"clang, fuori dal nodo, costa {span(cp['p1_static'])} ms "
-             f"secondo il modello (mediana {md(cp['p1_static'])}).")
+             f"Il nodo carica un programma già compilato in "
+             f"{span(up['p1_static'], 1)} ms. Compilarlo per un modello "
+             f"nuovo, su un'altra macchina, costa {span(cp['p1_static'])} ms.")
     lo_t = min(up["template"]["min"], up["modular"]["min"])
     hi_t = max(up["template"]["max"], up["modular"]["max"])
     set_text(S18, "TextBox 14",
              f"Un modello nuovo si installa scrivendo le sue tabelle: "
-             f"{it(lo_t, 2)}–{it(hi_t, 2)} ms, nessun compilatore. Il "
-             f"programma generico si compila una volta sola all'avvio (P2 "
-             f"{it(bm['template']['min'] / 1000, 1)}–"
-             f"{it(bm['template']['max'] / 1000, 1)} s, P3 "
-             f"{it(bm['modular']['med'] / 1000, 1)} s).")
+             f"{it(lo_t, 2)}–{it(hi_t, 2)} ms, nessun compilatore sul nodo. "
+             f"Il programma generico si compila una volta sola, "
+             f"all'accensione ({it(min(bm['template']['min'], bm['modular']['min']) / 1000, 1)}–"
+             f"{it(max(bm['template']['max'], bm['modular']['max']) / 1000, 1)} s).")
     set_text(S18, "TextBox 18",
-             f"Il tempo per cambiare modello non è un criterio di scelta: "
-             f"sul nodo meno di {it(math.ceil(max(up[m]['max'] for m in PIPES)))}"
-             f" ms per tutte, su ogni modello. Si sceglie sul costo per "
-             f"pacchetto ({span(p1(nn['P']))} ns di rete con i pesi compilati, "
-             f"{it(nn['P']['template']['min'])}–"
-             f"{it(nn['P']['modular']['max'])} con quelli da tabella) e su "
-             f"dove serve un compilatore.")
+             f"Cambiare modello non è un criterio di scelta: sul nodo costa "
+             f"meno di {it(math.ceil(max(up[m]['max'] for m in PIPES)))} ms a "
+             f"tutte. Si sceglie sul costo per pacchetto e su dove serve un "
+             f"compilatore: P1 ne vuole uno per ogni modello nuovo, P2 e P3 "
+             f"no.")
     set_text(S18, "TextBox 5",
-             "Tempo per installare un modello nuovo su un nodo già in servizio "
-             f"(scala logaritmica)  ·  mediane su {so['n']} modelli, "
-             "bench_solo.py  ·  clang senza cache, fuori dal nodo")
+             "Tempo per installare un modello nuovo su un nodo già in "
+             f"servizio, scala logaritmica  ·  mediane su {so['n']} modelli  ·  "
+             "compilazione da zero, fuori dal nodo")
+
+    # per chi non conosce il repo: le etichette del percorso, i due «QUINDI»
+    # che venivano dal deck di base, i titoli degli assi, e la slide che
+    # spiega come leggere le cifre
+    for k, lab in SEZIONI.items():
+        set_text(S[k], "TextBox 2", lab)
+    set_text(S[3], "TextBox 13",
+             "La dimensione dice quanto è **grande** il programma, non quanto "
+             "**lavora**: conta quante istruzioni il processore esegue davvero "
+             "per ogni pacchetto. E sono le stesse su ogni tipo di core: "
+             "cambia solo quante ne esegue a ogni ciclo di clock.")
+    set_text(S[9], "TextBox 13",
+             "Ogni core ha i suoi contatori e la sua coda d'uscita: il secondo "
+             "core non rallenta il primo. Una scheda di rete che divide i "
+             "pacchetti su **N code** regge circa **N volte** la capacità di "
+             "un core.")
+    set_text(S18, "TextBox 9", "P1: si compila prima, fuori dal nodo")
+    set_text(S[2], "TextBox 9", "senza rete")
+    set_text(S[11], "TextBox 3",
+             "Il costo dipende solo da versione e modello")
+    set_text(S[17], "TextBox 3",
+             "Cambiare modello costa millisecondi a tutte le versioni")
+    set_text(S[22], "TextBox 3", "Pesi a zero: accelerano solo P1 e P1.5")
+    vocabolario_assi(prs)
+    come_leggere(prs, S[1], f)
 
     # i numeri in fondo
     for k, sl in enumerate(prs.slides, 1):

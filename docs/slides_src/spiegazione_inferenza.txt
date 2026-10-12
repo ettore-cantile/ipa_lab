@@ -4,311 +4,318 @@
 # "ok " riquadro verde (verificato). **grassetto**, `codice`. Riga vuota = nuovo blocco.
 # Rigenera: python3 docs/slides_src/build.py inferenza
 # Le cifre vengono da results/popolazione_2026-10 (python3 docs/slides_src/popolazione.py).
+# Scritto per chi non conosce il repository: ogni termine si spiega la prima volta.
 
 == 0 | Come si misura e da dove vengono i tempi
-**Il banco.** Un solo portatile fa tutto: il generatore di traffico, il nodo che esegue la rete neurale e il nodo successivo che riceve i pacchetti inoltrati. Sono collegati da cavi virtuali (`veth`) con XDP nativo: il programma del nodo vede ogni pacchetto nel primo punto del kernel in cui arriva, come su una scheda di rete vera. Ogni ruolo ha un core suo (nodo sulla CPU 6, uscita sulla 8, generatore sulla 10).
+**Che cosa fa il nodo.** In una rete di calcolatori ogni nodo riceve pacchetti e deve decidere da quale porta farli ripartire. Qui la decisione la prende una piccola **rete neurale** che gira **dentro il kernel Linux**, nel primo punto in cui il pacchetto arriva (XDP, una funzione del kernel che lascia eseguire un programma su ogni pacchetto appena ricevuto). Il programma legge alcune informazioni (lo stato dei collegamenti, la porta d'ingresso, il TTL, cioè quanti salti di rete restano al pacchetto), le dà alla rete neurale, e inoltra il pacchetto sulla porta che la rete sceglie, oppure lo scarta.
 
-**Le condizioni della macchina** (`host_conditions.py`). Lasciato a sé stesso, il portatile cambia frequenza fra 0,4 e 4,8 GHz, addormenta i core e mette processi qualunque sul core che misura. Prima di ogni misura il banco fissa la frequenza dei core del banco a 3,5 GHz, spegne gli stati di sonno profondi, sposta il resto del sistema su altri core e accende un monitor (frequenza misurata, temperatura, throttling, alimentazione). Tutto viene ripristinato a fine misura e scritto accanto ai numeri. Una misura in cui la macchina esce dalle condizioni dichiarate è marcata e non entra nelle conclusioni.
+**Il banco.** Un solo portatile fa tutto: il generatore di traffico, il nodo che esegue la rete neurale e il nodo successivo che riceve i pacchetti inoltrati. Sono collegati da cavi virtuali; il programma del nodo vede ogni pacchetto come lo vedrebbe da una scheda di rete vera. Ogni ruolo ha un core del processore tutto suo.
 
-**Il generatore** (`xdp_gen`). Produce pacchetti già nella forma in cui XDP li riceve da una scheda di rete (frame XDP grezzi): niente struttura `skb`, niente copie. Il nodo li vede come li vedrebbe da un driver vero. Può spingere al massimo o tenere un ritmo fissato, con i pacchetti distanziati in modo uniforme.
+**Le condizioni della macchina.** Lasciato a sé stesso, il portatile cambia velocità di continuo, addormenta i core e mette altri programmi sul core che sta misurando. Prima di ogni misura il banco fissa la frequenza dei core a 3,5 GHz, impedisce che si addormentino, sposta il resto del sistema su altri core e sorveglia la macchina (frequenza, temperatura, rallentamenti per calore, alimentazione). Una misura in cui la macchina esce da queste condizioni viene marcata e non entra nelle conclusioni.
 
-**La popolazione di modelli** (`model_population.py`). Ogni misura gira su **91 modelli sintetici**, non su un modello solo. Coprono 7 composizioni dell'ingresso (solo colonne dense, solo one-hot, miste; da 5 a 117 ingressi), da 1 a 6 strati nascosti, da 2 a 8 neuroni per strato, da 3 a 7 uscite, da 21 a 1 349 pesi. Sono divisi in quattro famiglie:
-- **base** (53): le combinazioni di composizione, profondità e larghezza;
-- **replica** (20): sei forme con semi diversi, per vedere quanto il costo dipende dai pesi estratti;
-- **sparsità** (8): quattro forme con il 50 e il 90 % dei pesi a zero;
-- **imbuto** (10): cinque forme con lo stesso numero di pesi (~592) distribuito su 1–5 strati, su due composizioni.
-I test più lunghi (traffico crescente, LP E-core, due core, classi, TTL misti, taglie) girano su sottoinsiemi di 6–14 modelli, scelti dal più leggero al più pesante.
+**I tre tipi di core.** Il processore (Intel Core Ultra 7 155H) ha core **veloci** (P-core), core **efficienti** (E-core) e due core **a basso consumo** (LP E-core), che stanno in un'altra parte del chip. Dove non è detto altro, il nodo gira su un P-core.
 
-**Come si leggono le cifre.** Nessuna cifra delle slide è di un modello solo. Ogni numero è una **mediana sulla popolazione**, un intervallo **[minimo–massimo]** dal modello più leggero al più pesante, il numero di modelli su cui un'affermazione regge («85 modelli su 85»), oppure una **legge** stimata su tutti i modelli: costo = a + b × moltiplicazioni eseguite + c × strati.
+**La popolazione di modelli.** Ogni misura è ripetuta su **91 reti neurali diverse**, generate apposta. Hanno da 5 a 117 ingressi, da 1 a 6 strati nascosti, da 2 a 8 neuroni per strato, da 3 a 7 uscite, da 21 a 1 349 pesi. Sono di quattro tipi:
+- il **disegno principale** (53 modelli): le combinazioni di tipo d'ingresso, numero di strati e larghezza;
+- le **repliche** (20): sei forme ripetute con pesi estratti a caso in modo diverso, per vedere quanto contano i valori dei pesi;
+- i **modelli con pesi a zero** (8): quattro forme con il 50 e il 90 % dei pesi uguali a zero;
+- le **forme a pari pesi** (10): circa 592 pesi distribuiti su 1, 2, 3, 4 o 5 strati.
+Le prove più lunghe (traffico crescente, core a basso consumo, due core, decisioni diverse, pacchetti di taglie diverse) usano 6–14 modelli, scelti dal più leggero al più pesante.
 
 **Cinque modi di misurare**, ognuno per una domanda diversa:
-1. **A massima spinta** (`bench_throughput --mode compare`): il generatore manda più pacchetti di quanti il nodo ne regga, la coda resta piena e il core del nodo lavora il 100% del tempo. Si misurano la **capacità** (pacchetti al secondo) e il **tempo di CPU per pacchetto**, più istruzioni, cicli e mancate di cache dai contatori del processore. Slide 3–8, 10, 12–15, 17, 19–23.
-1. **A traffico crescente** (`bench_bitrate`): da 0,5 a 12 milioni di pacchetti al secondo; si contano i pacchetti inviati, quelli ricevuti dal programma e quelli inoltrati. Dice **dove** si perde oltre la capacità. Slide 9.
-1. **Con tre orologi** (`bench_throughput --mode rates`): una versione del programma legge l'orologio all'ingresso (T1), subito prima di inoltrare (T2) e all'arrivo al nodo successivo (T3). **T2−T1 è il solo programma**, T3−T2 il trasporto. Il traffico sta sotto la capacità (0,25 e 0,5 milioni di pacchetti al secondo). Slide 11 e 16.
-1. **Il programma caricato** (`prog_census`): il kernel dice quanti programmi e quante istruzioni ha caricato ogni pipeline. È una proprietà del programma, non una misura di tempo. Slide 4, 17, 20, 23.
-1. **Il programma da solo** (`bench_solo`, cioè `BPF_PROG_TEST_RUN`): il kernel esegue il programma su un pacchetto preparato, con gli stessi ingressi del traffico, senza ricevere né trasmettere. Serve per ciò che il traffico non misura: le letture di tabella e i salti fra programmi per pacchetto (con una build che li conta), e il tempo per installare un modello. Slide 17 e 18.
+1. **A nodo pieno.** Il generatore manda più pacchetti di quanti il nodo ne regga: il core del nodo lavora il 100 % del tempo. Si misura la **capacità** (quanti pacchetti al secondo il nodo elabora) e il **tempo per pacchetto**, che è 1 diviso la capacità. In più, il processore stesso conta istruzioni, cicli di clock e letture andate in memoria.
+1. **A traffico crescente.** Il traffico sale da 0,5 a 12 milioni di pacchetti al secondo; si contano i pacchetti inviati, quelli che il programma riceve e quelli inoltrati. Dice dove si perdono i pacchetti oltre la capacità (slide 10).
+1. **Con tre orologi.** Una versione del programma legge l'orologio all'ingresso, subito prima di inoltrare, e all'arrivo al nodo successivo: separa il tempo del programma da quello del trasporto, con poco traffico (slide 12 e 17).
+1. **Il programma caricato.** Il kernel dice quanto è grande ogni programma, in istruzioni (slide 5, 18, 21, 24).
+1. **Il programma da solo.** Il kernel esegue il programma su un pacchetto preparato, senza traffico. Serve a contare quante volte il programma legge una tabella e quante volte salta da un programma all'altro, e a misurare quanto costa installare un modello nuovo (slide 18 e 19).
 
-**Da dove vengono i tempi** (P-core a 3,5 GHz):
-- **ricevere il frame**: circa 40 ns (rxonly, il programma che riceve e butta);
-- **leggere l'intestazione, decrementare il TTL, inoltrare**: circa 27 ns in più. Con la ricezione fanno i ~67 ns della baseline, il costo fisso del nodo, uguale con qualunque modello (64–69 ns sui 91);
-- **la rete neurale**: quello che ogni pipeline aggiunge sopra la baseline. Mediane: 52 ns per P1, 59 per P1.5, 225 per P2, 420 per P3; dal modello più leggero al più pesante 19–155 ns per P1, 129–446 per P2, 240–852 per P3;
-- **dentro la rete neurale**: il costo segue una legge. Circa 0,26 ns per moltiplicazione con i pesi compilati (P1, P1.5), 0,42 per P2, 0,77 per P3, che legge ogni peso da una tabella; P3 paga in più circa 46 ns per ogni strato, P2 circa 20. Pesano le **letture di tabella** (in mediana 5 per pacchetto con P1, 12 con P2, 35 con P3, fino a 54 sui modelli più profondi) e i **salti fra programmi** (uno per P1, P1.5 e P2; per P3 uno per strato): sono il prezzo della configurabilità;
-- **il trasporto verso il nodo successivo**: 187–221 ns (redirect, cavo virtuale, ricezione), uguale per tutte le pipeline e tutti i modelli. Pesa sulla latenza del pacchetto; nel tempo del nodo entra solo l'accodamento del redirect, la ricezione la paga il core d'uscita.
+**Da dove vengono i tempi** (P-core a 3,5 GHz, mediane sui 91 modelli):
+- **ricevere il pacchetto**: circa 40 ns (un nanosecondo, ns, è un miliardesimo di secondo);
+- **leggere l'intestazione e inoltrare**: circa 27 ns in più. Insieme fanno i ~67 ns del **nodo senza rete** (in inglese *baseline*): il costo fisso, uguale con qualunque modello;
+- **la rete neurale**: quello che ogni versione aggiunge al nodo senza rete. 52 ns per P1, 59 per P1.5, 225 per P2, 420 per P3; dal modello più leggero al più pesante da 19 a 852 ns;
+- **il trasporto** verso il nodo successivo: circa 200 ns, uguale per tutte le versioni e tutti i modelli.
 
->> **Esempio: due misure della stessa rete.** Per P3 la mediana di T2−T1 a traffico leggero, meno la baseline, sta a 1,02 [0,94–1,11] volte il tempo di CPU a nodo saturo meno la baseline, sui 91 modelli; per P2 a 1,03 [0,94–1,09]. Due metodi indipendenti danno lo stesso costo della rete su ogni modello.
+!! **I limiti del banco.** Il cavo virtuale non è una scheda di rete, e il generatore sta sulla stessa macchina: il costo del programma è quello vero, quello di ricezione su una scheda vera può essere diverso. Le cifre assolute valgono a 3,5 GHz. I modelli sono generati: coprono forme e tipi d'ingresso diversi, non dicono niente sull'accuratezza di un modello addestrato.
 
-!! **I limiti del banco.** Il cavo virtuale non è una scheda di rete: non ci sono interruzioni hardware né trasferimenti dalla scheda alla memoria (DMA), e il generatore sta sulla stessa macchina. I costi del programma sono quelli veri; il costo di ricezione su una scheda vera può essere diverso. Le cifre assolute valgono a 3,5 GHz e vanno citate con il tipo di core. I modelli sono sintetici: coprono forme e composizioni, non l'accuratezza di un modello addestrato.
+ok **Quanto è pulito il dato.** Su 526 misure 2 sono fuori dalle conclusioni, perché la macchina era disturbata. Su questo portatile un breve rallentamento del processore arriva circa una volta al minuto: le curve a traffico crescente, che durano quasi tre minuti, sono tenute senza i pochi istanti colpiti (17 su 1 920).
 
-ok **Quanto è pulito il dato.** Su 435 misure una sola è fuori dalle conclusioni (macchina disturbata). Le curve a traffico crescente durano ~160 s e su questo portatile un evento di throttling di pacchetto arriva circa una volta al minuto: 8 curve sono tenute senza le finestre colpite (17 su 1 920), purché ogni punto conservi almeno 2 giri puliti su 3.
+**Per chi vuole rifare le misure.** Tutto lo fa `ipa/test/remeasure_popolazione.sh` (circa 4 ore e mezza); le conclusioni le calcola `ipa/test/population_report.py`, e queste slide le rigenera `docs/slides_src/popolazione.py`. I banchi sono `bench_throughput.py` (nodo pieno, tre orologi), `bench_bitrate.py` (traffico crescente), `bench_solo.py` (programma da solo), il generatore è `xdp_gen.py`, le condizioni della macchina `host_conditions.py`. La guida completa è `docs/testing.md`, §13.
 
 == 1 | Copertina
-La tesi esegue una piccola rete neurale **dentro il kernel Linux**, nel punto in cui il pacchetto è appena arrivato (XDP), per decidere da quale porta farlo uscire. La stessa rete è scritta in quattro modi diversi, da completamente compilata a completamente configurabile, e la domanda è quanto costa, per ogni pacchetto, ciascuna scelta.
+La tesi esegue una piccola rete neurale **dentro il kernel Linux**, nel punto in cui il pacchetto è appena arrivato, per decidere da quale porta farlo uscire. La stessa rete è scritta in quattro modi, da completamente fissata nel programma a completamente configurabile, e la domanda è: quanto costa, per ogni pacchetto, ciascuna scelta? E perché?
 
-La risposta non deve dipendere da un modello particolare. Per questo ogni misura gira su una popolazione di **91 modelli**, diversi per composizione dell'ingresso, profondità, larghezza, uscite, pesi e pesi a zero, e ogni conclusione è un intervallo o una legge su tutti.
+La risposta non deve dipendere da un modello particolare. Per questo ogni misura è ripetuta su **91 reti neurali diverse**, e ogni conclusione è un intervallo o una legge che vale su tutte.
 
-La presentazione ha due parti:
-1. **Il nodo sotto traffico vero** (slide 3–16): un generatore manda pacchetti veri al nodo e si misura quanti ne regge, quante istruzioni esegue per ognuno, e che cosa cambia se il nodo gira su un core veloce (P-core), efficiente (E-core) o a basso consumo (LP E-core).
-1. **La rete neurale sotto traffico** (slide 17–23): quanto costa la sola rete neurale al crescere della forma del modello e della rete, e la legge che permette di stimarlo prima di misurarlo; più il costo di cambiare modello (slide 18), che è un tempo del piano di controllo.
+La presentazione segue cinque passi:
+1. **Il nodo** (slide 4–5): quanto costa un pacchetto e quanto lavora il processore per elaborarlo.
+1. **Tre tipi di core** (slide 6–9): che cosa cambia se il nodo gira su un core efficiente o a basso consumo.
+1. **Sotto carico** (slide 10–13): che cosa succede quando il traffico supera la capacità, con due core, e che cosa non influisce sul costo.
+1. **La forma del modello** (slide 14–17): quanto pesano strati, neuroni e pesi a zero sul nodo intero.
+1. **La sola rete neurale** (slide 18–24): il prezzo della configurabilità, il cambio di modello, e una legge che prevede il costo di un modello prima di misurarlo.
 
-Le cifre vengono dalla campagna dell'11–12 ottobre 2026 sul portatile di laboratorio (Intel Core Ultra 7 155H, Ubuntu 24.04), con i core del banco a frequenza fissa: 3,5 GHz per P-core ed E-core, 2,5 GHz per il LP E-core.
+Le cifre vengono dalla campagna dell'11–12 ottobre 2026 sul portatile di laboratorio. Prima delle slide, la pagina «Come si misura e da dove vengono i tempi» descrive il banco, i modelli e i modi di misurare; le spiegazioni la danno per letta.
 
-Prima delle slide, la pagina «Come si misura e da dove vengono i tempi» descrive il banco, la popolazione, i modi di misurare e la scomposizione del costo di un pacchetto. Le spiegazioni delle slide la danno per letta.
+== 2 | Stessa rete, quattro modi di scriverla
+Tutte e quattro le versioni calcolano **la stessa rete neurale** e prendono **la stessa decisione** su ogni pacchetto. Lo verifica, su ogni modello, un confronto esatto con un calcolo di riferimento fatto fuori dal kernel: 200 pacchetti per modello, nessuna differenza. P2 accetta al più 1 024 pesi, quindi per P2 i modelli sono 85 invece di 91.
 
-== 2 | Le quattro versioni
-Tutte e quattro calcolano **lo stesso modello** e prendono **la stessa decisione** sullo stesso pacchetto. Lo verifica, su ogni modello della popolazione, il confronto esatto fra il riferimento intero e il programma eBPF (`BPF_PROG_TEST_RUN`, 200 ingressi per modello): P1 e P3 coincidono su 91 modelli su 91, P2 su 85 su 85. Gli altri 6 modelli superano il tetto sui pesi di P2, che le altre pipeline non hanno.
+Le versioni differiscono in **che cosa è già scritto nel programma quando lo si compila** (arancione nella tabella) e **che cosa il programma legge da tabelle mentre gira** (verde). Una tabella, qui, è una zona di memoria del kernel che il programma consulta e che si può riscrivere senza ricompilare il programma.
+- **P1 statica**: i pesi e l'identità del nodo sono scritti nel programma. Serve un programma diverso per ogni nodo.
+- **P1.5**: i pesi sono nel programma, il nodo si legge da tabella. Un programma per ogni modello.
+- **P2**: anche la forma della rete (quanti ingressi, quanti neuroni) si legge da tabella; nel programma ci sono solo i valori massimi ammessi. Un programma per molti modelli.
+- **P3**: anche il numero di strati si legge da tabella, e ogni strato è un programma a parte, raggiunto con un salto. Un programma per tutto.
 
-Cambia solo che cosa è già scritto nel programma quando lo si compila (arancione) e che cosa invece il programma legge da tabelle mentre gira (verde).
-- **P1 statica**: pesi e identità del nodo scritti nel programma. Un binario per ogni nodo.
-- **P1.5 hardcoded**: pesi nel programma, nodo letto da tabella. Un binario per modello.
-- **P2 template**: anche la forma della rete si legge da tabella; nel programma ci sono solo i valori massimi ammessi. Un programma per molti modelli.
-- **P3 modular**: anche il numero di strati si legge da tabella, e ogni strato è un programma a parte raggiunto con un salto. Un programma per tutto.
+La regola che le slide successive misurano: più informazioni si spostano dalla compilazione all'esecuzione, più il programma diventa riutilizzabile, e più cresce il costo per pacchetto. I colori restano gli stessi in tutti i grafici: P1 rosso, P1.5 arancione, P2 verde, P3 blu.
 
-La regola che le slide successive misurano: più informazioni si spostano dalla compilazione all'esecuzione, più il programma diventa riutilizzabile, e più cresce il costo per pacchetto. I colori delle pipeline (P1 rosso, P1.5 arancione, P2 verde, P3 blu) restano gli stessi in tutti i grafici.
+== 3 | Ogni cifra vale per 91 modelli, non per uno
+Questa slide spiega come leggere i numeri del resto della presentazione.
 
-== 3 | Quanto costa un pacchetto al nodo
-**Come si misura.** Un generatore (xdp_gen) manda al nodo più pacchetti di quanti ne possa elaborare. La coda davanti al nodo resta sempre piena, il core del nodo lavora il 100% del tempo, e il ritmo a cui elabora è la sua capacità. Il costo per pacchetto è 1 diviso la capacità, ed è anche il tempo di CPU per pacchetto.
+- **«52 [19–155] ns»**: 52 è la **mediana** sui modelli (metà dei modelli costa meno, metà di più); fra parentesi quadre il valore del modello più leggero e quello del più pesante.
+- **«85/85»**: un'affermazione vale su 85 modelli su 85. Se un modello la smentisse, il conteggio lo direbbe.
+- **«4,3 volte»**: un rapporto calcolato **modello per modello** (per esempio il costo di P2 diviso quello di P1 sullo stesso modello), poi riassunto con la mediana.
+- **«senza rete»**: il nodo che riceve e inoltra il pacchetto senza eseguire nessuna rete neurale. È il costo fisso che ogni versione paga; il costo della **rete neurale** è quello che ogni versione aggiunge sopra.
 
-Le barre scompongono il costo in tre pezzi, con la mediana sui 91 modelli:
-- **ricevere il frame** (grigio chiaro): quanto costa rxonly, il programma che riceve e butta, circa 40 ns;
-- **parse, TTL, redirect, accodamento**: quello che la baseline fa in più, circa 27 ns;
-- **rete neurale** (arancione): quello che ogni pipeline aggiunge sopra la baseline.
+Due grandezze tornano ovunque. Il **costo** di un pacchetto è il tempo di processore che serve per elaborarlo, in nanosecondi. La **capacità** è quanti pacchetti al secondo il nodo regge: 1 diviso il costo. Un nodo che spende 250 ns per pacchetto ne regge 4 milioni al secondo.
 
-Le schede a destra danno l'intervallo dal modello più leggero al più pesante: il tempo per pacchetto e la capacità.
+== 4 | Quanto costa un pacchetto al nodo
+**Come si misura.** Il generatore manda al nodo più pacchetti di quanti ne possa elaborare. La coda davanti al nodo resta sempre piena, il core lavora il 100 % del tempo, e il ritmo a cui elabora è la sua capacità.
 
->> **Esempio di calcolo.** La mediana di P2 regge 3,4 milioni di pacchetti al secondo: spende 1 / 3 400 000 s ≈ 291 ns per pacchetto. La baseline ne spende 67. La differenza, ~225 ns, è il tempo che P2 dedica alla rete neurale.
+Le barre scompongono il costo di un pacchetto in tre pezzi (mediane sui 91 modelli):
+- **ricevere il pacchetto** (grigio chiaro), circa 40 ns: lo misura un programma che riceve e basta;
+- **leggere l'intestazione e inoltrare** (grigio scuro), circa 27 ns: quello che il nodo senza rete fa in più;
+- **rete neurale** (arancione): quello che ogni versione aggiunge.
 
-La rete neurale costa 19–155 ns con i pesi scritti nel programma (P1; mediana 52), 129–446 ns con la forma letta da tabella (P2; mediana 225), 240–852 ns con anche la profondità (P3; mediana 420). Un core regge da 11,7 a 1,1 milioni di pacchetti al secondo, secondo modello e pipeline. L'ordine P1 ≤ P2 ≤ P3 regge su 85 modelli su 85.
+Le schede a destra danno, per ogni versione, il costo e la capacità dal modello più leggero al più pesante.
 
-== 4 | Le istruzioni: caricate contro eseguite
-**Grafico a sinistra.** Due modi di contare le istruzioni, in mediana sulla popolazione:
-- **caricate** (grigio): quante istruzioni ha il programma, contate dal kernel quando lo carica. È la dimensione del programma;
-- **eseguite** (blu): quante istruzioni il core del nodo esegue davvero per ogni pacchetto, contate dal processore stesso con i contatori hardware durante la misura sotto traffico. Comprendono anche il lavoro del kernel attorno al programma (ricevere, inoltrare).
+>> **Esempio di calcolo.** P2, nella mediana dei modelli, regge 3,4 milioni di pacchetti al secondo: spende 1 / 3 400 000 di secondo, circa 291 ns, per pacchetto. Il nodo senza rete ne spende 67. La differenza, circa 225 ns, è il tempo della rete neurale.
 
-Le due misure dicono cose diverse. P2 è il programma più grande (14 604–18 937 istruzioni, mediana 16 813) ma ne esegue meno di P3 (mediana 4 578 contro 7 575): srotola cicli fino ai valori massimi, ma molti rami non vengono percorsi. P3 è più piccolo (12 288, uguale per ogni modello) ma ne esegue di più: rientra in sé stesso una volta per strato. Succede su **85 modelli su 85**. **La dimensione non predice il lavoro** fra pipeline diverse; dentro una pipeline ordina bene i modelli per P1 (correlazione di rango 0,98), meno per P2 (0,77).
+La rete neurale costa da 19 a 155 ns se i pesi sono scritti nel programma (P1), da 129 a 446 se la forma si legge da tabella (P2), da 240 a 852 se anche il numero di strati (P3). Un core regge da 11,7 a 1,1 milioni di pacchetti al secondo. L'ordine P1 ≤ P2 ≤ P3 vale su 85 modelli su 85.
 
-**Grafico a destra.** Le istruzioni eseguite per pacchetto sul P-core, sull'E-core e sul LP E-core, sui 14 modelli misurati su tutti e tre: le barre coincidono. Sui 91 modelli P-core ed E-core differiscono al più dello 0,3 %, il LP E-core dello 0,7 % sulle pipeline. Il codice è lo stesso; è la base per la slide 6: se i core vanno a velocità diverse, non è perché eseguono istruzioni diverse.
+== 5 | Quanto è grande il programma non dice quanto lavora
+**Grafico a sinistra.** Due modi di contare le istruzioni:
+- **caricate** (grigio): quante istruzioni ha il programma. È la sua dimensione, contata dal kernel quando lo carica;
+- **eseguite** (blu): quante istruzioni il processore esegue davvero per ogni pacchetto, contate dal processore stesso. Comprendono anche il lavoro del kernel per ricevere e inoltrare.
 
-== 5 | Il nuovo assetto: P-core, E-core, LP E-core
-Il processore del portatile ha tre tipi di core: sei **P-core** veloci, otto **E-core** efficienti (in due moduli da quattro che dividono cache e frequenza) e due **LP E-core** a basso consumo, su un'altra parte del chip. La domanda: che cosa succede se il nodo gira su un core lento?
+Le due misure dicono cose diverse. **P2 è il programma più grande** (circa 16 800 istruzioni) **ma ne esegue meno di P3** (circa 4 600 contro 7 600 per pacchetto), su 85 modelli su 85. P2 contiene il codice per tutte le forme ammesse, ma per ogni pacchetto ne percorre solo una parte; P3 è più piccolo (12 288 istruzioni, sempre uguale) ma ripete il suo codice una volta per strato.
 
-**Il disegno della misura**: cambia solo il core del nodo. Il generatore e il nodo successivo restano su P-core, così il generatore satura sempre il nodo. L'E-core gira alla stessa frequenza del P-core, 3,5 GHz, quindi la differenza dipende solo da come il core esegue il codice. Il LP E-core gira al suo massimo, 2,5 GHz. Gli altri tre core del modulo dell'E-core restano a riposo.
+**Grafico a destra.** Le istruzioni eseguite per pacchetto sui tre tipi di core: le barre coincidono. Il codice è lo stesso, quindi lo è anche il lavoro: fra un core e l'altro la differenza è al più dello 0,7 %. Se i core vanno a velocità diverse (slide 6), non è perché eseguono istruzioni diverse.
 
-**A sinistra** i milioni di pacchetti al secondo, **a destra** i nanosecondi per pacchetto: mediane dei 14 modelli misurati su tutti e tre i core, dal più leggero al più pesante.
+== 6 | Su un E-core il nodo regge dal 61 al 91 % del P-core
+Il processore ha tre tipi di core: sei **P-core** veloci, otto **E-core** efficienti (a gruppi di quattro che condividono una cache) e due **LP E-core** a basso consumo, in un'altra parte del chip. La domanda: che cosa succede se il nodo gira su un core più lento?
 
-Sui 91 modelli l'E-core regge, rispetto al P-core, 0,63 [0,61–0,66] per la baseline, 0,77 [0,70–0,91] per P1, 0,82 [0,77–0,87] per P2 e 0,83 [0,72–0,89] per P3. Il LP E-core regge dal 32 al 53 % del P-core sulle pipeline.
+**Il disegno della misura.** Cambia solo il core del nodo; generatore e nodo successivo restano su P-core. P-core ed E-core girano alla stessa frequenza, 3,5 GHz, quindi la differenza dipende solo da come il core esegue il codice. Il LP E-core gira al suo massimo, 2,5 GHz.
 
->> **Esempio.** P3, mediana dei 14 modelli: 2,2 milioni al secondo sul P-core, 1,8 sull'E-core, 1,0 sul LP E-core. In tempo: 462, 562 e 976 ns per pacchetto.
+**A sinistra** la capacità, **a destra** il tempo per pacchetto, nella mediana dei 14 modelli misurati su tutti e tre i core.
 
-== 6 | Stesse istruzioni, meno istruzioni per ciclo
-Se le istruzioni per pacchetto sono le stesse (slide 4), la differenza fra i core sta nei **cicli**: quanti battiti d'orologio servono per eseguirle. Il rapporto fra istruzioni e cicli è l'**IPC**, istruzioni per ciclo.
+Sull'E-core il nodo regge circa il 63 % del P-core senza rete, e fino a circa l'83 % con P2 e P3. Più la versione è pesante, meno pesa il tipo di core: la slide 8 spiega perché. Il LP E-core regge dal 32 al 53 % del P-core.
 
-Il grafico mostra l'IPC sui tre core (mediane dei 14 modelli misurati sui tre); la tabella istruzioni e cicli per pacchetto su P-core ed E-core (mediane dei 91).
+>> **Esempio.** P3, mediana dei 14 modelli: 2,2 milioni di pacchetti al secondo sul P-core, 1,8 sull'E-core, 1,0 sul LP E-core. In tempo: 462, 562 e 976 ns per pacchetto.
 
->> **Esempio.** La mediana di P3 esegue 7 575 istruzioni per pacchetto. Il P-core ci mette 1 697 cicli (IPC 4,4), l'E-core 2 021 (IPC 3,7). A 3,5 GHz sono circa 485 e 577 ns: lo stesso ordine dei tempi di CPU misurati, quindi i due metodi di misura concordano.
+== 7 | Stesse istruzioni, meno istruzioni per ciclo
+Se le istruzioni per pacchetto sono le stesse su ogni core (slide 5), la differenza sta nei **cicli di clock**: quanti battiti dell'orologio del core servono per eseguirle. Il rapporto fra istruzioni e cicli si chiama **IPC**, istruzioni per ciclo: più è alto, più lavoro il core fa a ogni battito.
+
+Il grafico mostra l'IPC sui tre core; la tabella istruzioni e cicli per pacchetto su P-core ed E-core.
+
+>> **Esempio.** P3 esegue circa 7 600 istruzioni per pacchetto. Il P-core ci mette circa 1 700 cicli (IPC 4,4), l'E-core circa 2 000 (IPC 3,7). A 3,5 GHz (3,5 miliardi di cicli al secondo) sono circa 485 e 577 ns: gli stessi tempi misurati con il primo metodo.
 
 Due cose si leggono nel grafico:
-- l'IPC cresce con la pipeline: la baseline (lavoro del kernel, salti, accessi alla memoria) sta a 2,6 sul P-core, P2 e P3 (aritmetica in fila, senza bivi) a 4,4–4,5;
-- il distacco fra i core è più grande dove l'IPC è basso: 2,6 → 1,7 per la baseline, 4,4 → 3,7 per P3. Modello per modello, l'IPC dell'E-core sta a 0,65 [0,63–0,68] di quello del P-core per la baseline e a 0,84 [0,70–0,89] per P3.
+- l'IPC cresce con la versione: senza rete sta a 2,6 sul P-core, perché il lavoro del kernel è pieno di salti e di attese della memoria; P2 e P3 arrivano a 4,4–4,5, perché la rete neurale è una lunga fila di moltiplicazioni indipendenti, che il core esegue molte per volta;
+- il distacco fra i core è più grande dove l'IPC è basso: 2,6 → 1,7 senza rete, 4,4 → 3,7 con P3.
 
-Il LP E-core ha l'IPC più basso di tutti (1,0–3,0) perché, oltre al core più semplice, aspetta la memoria (slide 8).
+Il LP E-core ha l'IPC più basso (da 1,0 a 3,0) perché, oltre a essere più semplice, aspetta spesso la memoria (slide 9).
 
-== 7 | Dove l'E-core perde tempo
-Le barre dividono i cicli per pacchetto in due parti, sul P-core (P) e sull'E-core (E), in mediana sui 91 modelli:
-- **parte fissa del nodo** (grigio): i cicli della baseline, cioè ricevere, leggere l'intestazione, inoltrare, restituire la memoria del pacchetto;
-- **rete neurale** (arancione): i cicli che la pipeline aggiunge sopra la baseline.
+== 8 | L'E-core rallenta il nodo, non la rete neurale
+Le barre dividono i cicli per pacchetto in due parti, sul P-core (P) e sull'E-core (E):
+- **parte fissa del nodo** (grigio): i cicli del nodo senza rete, cioè ricevere, leggere l'intestazione, inoltrare e liberare la memoria del pacchetto;
+- **rete neurale** (arancione): i cicli che ogni versione aggiunge.
 
-Il risultato è netto. La parte fissa passa da 231 a 360 cicli: +56 %, fra il 50 e il 61 % su ogni modello. La rete neurale cambia poco: modello per modello, i suoi cicli sull'E-core stanno a 0,94 [0,55–1,17] volte quelli del P-core per P1, 1,10 [1,02–1,18] per P2, 1,13 [1,05–1,40] per P3.
+Il risultato è netto. La parte fissa passa da 231 a 360 cicli, il 56 % in più, su ogni modello. La rete neurale cambia poco: per P2 e P3 il 10–13 % in più, per P1 circa lo stesso.
 
 >> **Perché.** La parte fissa è codice del kernel con molti salti e accessi alla memoria, dove un core più semplice si ferma spesso ad aspettare. La rete neurale è una fila di moltiplicazioni e somme indipendenti, che anche l'E-core esegue molte per volta.
 
-È questa la ragione per cui il rapporto di capacità della slide 5 sale con il peso della pipeline: più una pipeline passa tempo nella rete neurale, meno conta che il core sia un E-core. Le misure sono in cicli, quindi non dipendono dalla frequenza.
+È per questo che nella slide 6 il rapporto fra i core migliora con le versioni più pesanti: più tempo il nodo passa nella rete neurale, meno conta che il core sia un E-core.
 
-!! **P1 sotto l'1.** Per P1 la rete costa poche decine di cicli sopra una baseline di 231–360: la differenza fra due numeri grandi è rumorosa, e il rapporto E/P va da 0,55 a 1,17. Vale come «circa uguale», non come «l'E-core è più veloce».
+!! **P1, −6 %.** Per P1 la rete costa poche decine di cicli sopra una parte fissa di 231–360: la differenza fra due numeri grandi è incerta. Va letta come «circa uguale», non come «l'E-core è più veloce».
 
-== 8 | Il LP E-core paga anche la memoria
-**A sinistra** le mancate dell'ultimo livello di cache per pacchetto: quante volte il core cerca un dato nella cache più grande e non lo trova, e deve andare in memoria. Sul P-core e sull'E-core sono zero: i pacchetti che il generatore scrive restano nella cache L3, condivisa da P-core ed E-core. Il LP E-core sta fuori dalla L3: ne ha 14–19 per pacchetto (mediane dei 14 modelli), e ogni volta aspetta la memoria.
+== 9 | Il LP E-core paga anche la memoria
+**A sinistra** le **letture andate in memoria** per pacchetto: quante volte il core cerca un dato nella sua cache (una piccola memoria veloce vicino al core) e non lo trova, e deve andarlo a prendere nella memoria principale, molto più lenta. Su P-core ed E-core sono zero: i pacchetti che il generatore scrive restano nella cache che questi core condividono. Il LP E-core sta fuori da quella cache: ha 14–19 letture in memoria per pacchetto, e ogni volta aspetta.
 
-**A destra** i cicli per pacchetto sui tre core. Per P3: 1 614 sul P-core, 1 945 sull'E-core, 2 435 sul LP E-core. In tempo pesa anche la frequenza più bassa del LP E-core (2,5 GHz): 462, 562 e 976 ns.
+**A destra** i cicli per pacchetto sui tre core. Per P3: circa 1 600 sul P-core, 1 900 sull'E-core, 2 400 sul LP E-core. In tempo conta anche la frequenza più bassa del LP E-core: 462, 562 e 976 ns.
 
->> **Esempio.** La baseline sul LP E-core spende 640 cicli per pacchetto contro 233 sul P-core: quasi tre volte tanto, per lo stesso codice. La differenza è quasi tutta attesa della memoria.
+>> **Esempio.** Il nodo senza rete sul LP E-core spende 640 cicli per pacchetto, contro 233 sul P-core: quasi tre volte tanto, per lo stesso codice. La differenza è quasi tutta attesa della memoria.
 
-Il LP E-core regge dal 32 al 53 % del P-core sulle pipeline: dal 35 % per P1 al 48 % per P3, in mediana. È il caso estremo: un core pensato per tenere acceso il sistema consumando poco, non per elaborare pacchetti.
+Il LP E-core regge dal 32 al 53 % del P-core. È il caso estremo: un core pensato per tenere acceso il sistema consumando poco, non per elaborare pacchetti.
 
-== 9 | Oltre la capacità si perde all'ingresso del programma
-Qui il traffico **cresce** gradualmente, da 0,5 a 12 milioni di pacchetti al secondo, e si contano i pacchetti inoltrati. A sinistra il nodo su un P-core, a destra su un E-core, sei modelli dal più leggero al più pesante.
+== 10 | Oltre la capacità si perde all'ingresso del programma
+Qui il traffico **cresce** a poco a poco, da 0,5 a 12 milioni di pacchetti al secondo, e si contano i pacchetti inoltrati. A sinistra il nodo su un P-core, a destra su un E-core; sei modelli, dal più leggero al più pesante.
 
-Modelli diversi hanno capacità diverse. Per metterli sullo stesso grafico, ogni curva è divisa per la capacità del suo modello: sull'asse x il traffico chiesto diviso la capacità, sull'asse y gli inoltrati divisi la capacità. Le linee sono la mediana delle curve. Così 1 vuol dire «la capacità di quel modello», qualunque sia.
+Modelli diversi hanno capacità diverse. Per metterli sullo stesso grafico, entrambi gli assi sono divisi per la capacità di ogni modello: sull'asse orizzontale il traffico offerto, sull'asse verticale i pacchetti inoltrati. Così «1» vuol dire «la capacità di quel modello», qualunque sia.
 
-Ogni curva sale lungo la diagonale (tutto ciò che arriva viene inoltrato) finché il traffico resta sotto la capacità, poi diventa piatta: il nodo non può inoltrare di più, e il resto viene respinto dalla coda d'ingresso piena. Il massimo inoltrato sta a 0,98 [0,88–1,03] della capacità misurata a massima spinta sul P-core e a 0,99 [0,94–1,03] sull'E-core, su 24 curve per core.
+Ogni curva sale in diagonale (tutto ciò che arriva viene inoltrato) finché il traffico resta sotto la capacità, poi diventa piatta: il nodo non può inoltrare di più, e il resto viene respinto dalla coda d'ingresso piena. Il massimo inoltrato coincide con la capacità misurata a nodo pieno: 0,98 volte sul P-core, 0,99 sull'E-core.
 
->> **Dove si perde.** Il banco conta i pacchetti in tre punti: inviati, ricevuti dal programma, inoltrati. Della perdita, la parte persa **prima** del programma, alla coda, è 1,000 in mediana: il programma rilancia tutto ciò che riceve. Il collo di bottiglia è il programma eBPF, non la trasmissione, su ogni tipo di core.
+>> **Dove si perde.** Il banco conta i pacchetti in tre punti: inviati, ricevuti dal programma, inoltrati. Quasi tutti i pacchetti persi si perdono **prima** del programma, nella coda: il programma inoltra tutto ciò che riceve. Il collo di bottiglia è il programma, non la trasmissione, su ogni tipo di core.
 
-!! **L'eccezione.** P1 sui modelli più leggeri regge oltre 9 milioni di pacchetti al secondo. Lì comincia a perdere anche l'uscita: la quota persa alla coda scende fino a 0,69, e il massimo inoltrato a 0,88 della capacità. È il limite del cavo virtuale e del core d'uscita, non della rete neurale.
+!! **L'eccezione.** P1 sui modelli più leggeri regge più di 9 milioni di pacchetti al secondo, e lì comincia a perdere anche all'uscita: è il limite del cavo virtuale e del core d'uscita, non della rete neurale.
 
-== 10 | Due core reggono il doppio
-Il nodo riceve **due core**, ciascuno con la sua coda d'ingresso alimentata da un thread del generatore, la sua coda d'uscita e il suo core d'uscita. A sinistra due P-core, a destra due E-core (uno per modulo). Le barre chiare sono un core, quelle scure due: mediane degli 8 modelli del sottoinsieme, dal più leggero al più pesante.
+== 11 | Due core reggono il doppio, sul P-core e sull'E-core
+Qui il nodo usa **due core**, ciascuno con la sua coda d'ingresso, il suo generatore, la sua coda d'uscita e il suo core d'uscita. A sinistra due P-core, a destra due E-core (in due gruppi diversi del chip). Barre chiare: un core; barre scure: due. Mediane di 8 modelli dal più leggero al più pesante.
 
->> **Come si legge.** P2 con un P-core regge 3,6 milioni al secondo in mediana, con due 7,1: il doppio. Sull'E-core 2,9 e 5,8.
+>> **Come si legge.** P2 con un P-core regge 3,6 milioni di pacchetti al secondo, con due 7,1: il doppio. Sull'E-core 2,9 e 5,8.
 
-Due core reggono il 99 [94–103] % del doppio di un core sul P-core e il 99 [98–101] % sull'E-core, su 40 coppie modello-pipeline per core. Il secondo core non rallenta il primo perché non condividono niente di scritto a ogni pacchetto: i contatori delle pipeline sono per-core, e ogni core ha la sua coda d'uscita.
+Due core reggono il 99 % del doppio di un core, sia sul P-core sia sull'E-core, con ogni modello. Il secondo core non rallenta il primo perché non scrivono mai negli stessi dati: ogni core ha i suoi contatori e la sua coda d'uscita.
 
-Conseguenza pratica: una scheda di rete vera distribuisce i pacchetti su più code e più core (RSS). Un nodo con N code regge circa N volte la capacità misurata su un core, con qualunque modello.
+Conseguenza pratica: una scheda di rete vera divide i pacchetti su più code, ognuna servita da un core. Un nodo con N code regge circa N volte la capacità di un core.
 
-== 11 | Tre orologi: il programma e il trasporto
-Con una versione del programma che legge l'orologio in tre punti si separa il tempo del programma da quello del trasporto:
-- **T1** all'ingresso del programma, **T2** subito prima di inoltrare: T2−T1 è il programma (arancione);
-- **T3** all'arrivo al nodo successivo: T3−T2 è il trasporto, cioè redirect, cavo virtuale e ricezione (grigio).
+== 12 | Il programma e il trasporto, su un P-core e su un E-core
+Una versione del programma legge l'orologio in tre punti: all'ingresso del programma, subito prima di inoltrare, e all'arrivo al nodo successivo. Così si separano due tempi:
+- **il programma** (arancione): dall'ingresso a prima di inoltrare;
+- **il trasporto** (grigio): dall'inoltro all'arrivo al nodo successivo, cioè passaggio sul cavo virtuale e ricezione.
 
-Le barre mostrano i minimi di ogni pezzo, in mediana sui 91 modelli, per ogni pipeline sul P-core (P) e sull'E-core (E).
+Le barre mostrano il tempo minimo di ciascun pezzo, nella mediana dei 91 modelli, sul P-core (P) e sull'E-core (E).
 
-Il trasporto è un costo comune: 187–221 ns sul P-core e 226–274 sull'E-core su ogni modello e pipeline; fra la pipeline più cara e la meno cara dello stesso modello differisce del 4 [1–17] %. Il programma va da 27 ns (baseline) a 391 ns (P3) sul P-core in mediana, e per P3 da 237 a 797 ns secondo il modello; sull'E-core costa di più, tanto di più quanto più è lungo (P3: 498 ns in mediana).
+Il trasporto è un costo comune: 187–221 ns sul P-core e 226–274 sull'E-core, con ogni modello e ogni versione. Il programma va da 27 ns senza rete a 391 ns con P3 (mediane sul P-core), e per P3 da 237 a 797 ns secondo il modello; sull'E-core costa di più, tanto di più quanto più è lungo.
 
->> **Esempio.** La mediana di P2 sul P-core: 229 ns di programma più 204 di trasporto. La somma, ~430 ns, è la latenza minima dall'arrivo del pacchetto alla sua ripartenza.
+>> **Esempio.** P2 sul P-core: 229 ns di programma più 204 di trasporto. La somma, circa 430 ns, è il tempo minimo fra l'arrivo del pacchetto e il suo arrivo al nodo successivo.
 
-!! **Il minimo, non la media.** Qui l'uscita gira sullo stesso core del nodo, quindi la media di T3−T2 contiene anche l'attesa in coda e cresce col traffico (da ~550 ns a 0,25 milioni di pacchetti al secondo a ~1 200 a 0,5). Il minimo è il trasporto senza attesa. Questa versione legge l'orologio due volte in più per pacchetto: serve a capire dove va il tempo, non a misurare quanti pacchetti regge il nodo (quello lo fanno le slide 3 e 5).
+!! **Il minimo, non la media.** In questa misura il nodo successivo gira sullo stesso core del nodo, quindi il tempo medio di trasporto contiene anche l'attesa in coda, e cresce col traffico. Il minimo è il trasporto senza attesa. Leggere l'orologio costa un poco: questa versione serve a capire dove va il tempo, non a misurare la capacità (che danno le slide 4 e 6).
 
-== 12 | Il costo dipende dalla pipeline, e da niente altro
-Tre controlli sul P-core, ciascuno su un sottoinsieme dal modello più leggero al più pesante:
-- **a sinistra** la taglia del pacchetto (6 modelli): a 64, 512 e 1 514 byte ogni pipeline costa uguale, con una differenza di 1,2 [0,3–3,1] % fra la taglia più cara e la meno cara. Il nodo legge solo l'intestazione, come farebbe su una scheda di rete vera;
-- **a destra** la classe decisa (8 modelli): stato dei collegamenti e TTL sono scelti apposta perché la rete decida ciascuna delle classi che il modello sa raggiungere. Le classi che inoltrano (su porte diverse) costano uguale, 0 [0–9] % fra la più cara e la meno cara; la classe che **scarta** (rosso) costa 51 [17–63] ns in più;
-- nel riquadro, i **TTL diversi a ogni pacchetto** (12 modelli): il modello decide classi diverse pacchetto per pacchetto, e il tempo del nodo cambia di 0 [−6–4] % rispetto al pacchetto fisso.
+== 13 | Il costo dipende solo da versione e modello
+Tre controlli sul P-core, ciascuno su modelli dal più leggero al più pesante:
+- **a sinistra la taglia del pacchetto** (6 modelli): a 64, 512 e 1 514 byte ogni versione costa uguale, con l'1,2 % di differenza in mediana. Il nodo legge solo l'intestazione del pacchetto, come farebbe su una scheda di rete vera;
+- **a destra la decisione presa** (8 modelli): lo stato dei collegamenti e il TTL sono scelti apposta perché la rete decida ciascuna delle uscite che il modello sa raggiungere. Inoltrare su una porta o su un'altra costa uguale; **scartare** il pacchetto (rosso) costa circa 51 ns in più;
+- nel riquadro, **pacchetti tutti diversi** (12 modelli): un TTL diverso a ogni pacchetto fa prendere al modello decisioni diverse pacchetto per pacchetto, e il costo non cambia.
 
->> **Perché scartare costa di più.** Quando il pacchetto viene inoltrato, la sua memoria si libera sul core d'uscita; quando viene scartato, si libera sul core del nodo, che quindi lavora di più. È un effetto del banco, non della rete neurale.
+>> **Perché scartare costa di più.** Quando il pacchetto è inoltrato, la sua memoria la libera il core d'uscita; quando è scartato, la libera il core del nodo, che quindi lavora di più. È un effetto del banco, non della rete neurale.
 
-Basta quindi un numero per pipeline e modello a descrivere il costo del nodo: non dipende dalla taglia del pacchetto né dalla porta d'uscita. Il traffico in bit al secondo che il nodo regge cresce con la taglia del pacchetto.
+Basta quindi un numero per versione e modello a descrivere il costo del nodo.
 
-== 13 | Profondità e pesi a zero, sul nodo vero
-Qui il tempo è quello del **nodo intero** (rete neurale più costo fisso), sul P-core.
+== 14 | Profondità e pesi a zero, sul nodo vero
+Qui il tempo è quello del **nodo intero** (rete neurale più parte fissa), sul P-core.
 
-**A sinistra la profondità**: la mediana del tempo per pacchetto per numero di strati nascosti, sui 53 modelli della famiglia base (che hanno 1, 2, 3, 4 o 6 strati). Ogni punto mescola composizioni e larghezze diverse; la legge separa l'effetto dello strato: a moltiplicazioni ferme, uno strato in più costa circa 46 ns a P3, 20 a P2, 1 a P1 e P1.5.
+**A sinistra la profondità**: il tempo per pacchetto per numero di strati nascosti, nella mediana dei 53 modelli del disegno principale (che hanno 1, 2, 3, 4 o 6 strati). Ogni punto mescola modelli con ingressi e larghezze diverse; la legge della slide 23 separa l'effetto dello strato: uno strato in più costa circa 46 ns a P3, 20 a P2, quasi niente a P1 e P1.5.
 
-**A destra i pesi a zero**: per le quattro forme con il 50 e il 90 % dei pesi a zero, il tempo del nodo diviso quello del modello denso con la stessa forma e composizione. P1 e P1.5 accelerano (al 90 %: 0,77× e 0,83×), perché il compilatore vede lo zero e cancella la moltiplicazione; P2 e P3 non cambiano, perché per loro uno zero letto da una tabella è un numero come un altro.
+**A destra i pesi a zero**: quattro forme con il 50 e il 90 % di pesi uguali a zero, confrontate con lo stesso modello senza zeri. P1 e P1.5 accelerano (al 90 % di zeri il nodo costa 0,77 e 0,83 volte), perché il compilatore vede lo zero e toglie la moltiplicazione. P2 e P3 non cambiano: per loro uno zero letto da una tabella è un numero come un altro.
 
-Le curve sono quelle della rete neurale (slide 19–23) più il costo fisso del nodo, ~67 ns con qualunque modello.
+La parte fissa del nodo, circa 67 ns, è la stessa con qualunque modello.
 
-== 14 | Ogni strato di P3 costa ~900 istruzioni
-**A sinistra** le istruzioni eseguite per pacchetto, dai contatori hardware, in mediana per numero di strati (famiglia base). La legge stimata su tutti gli 83 modelli densi dà a P3 **+901 istruzioni per ogni strato** (r² 0,99), identiche su P-core ed E-core; a P2 +370; P1 e P1.5 non pagano lo strato (le loro istruzioni seguono le moltiplicazioni, non gli strati).
+== 15 | Ogni strato di P3 costa ~900 istruzioni
+**A sinistra** le istruzioni eseguite per pacchetto, contate dal processore, per numero di strati. Stimato su tutti gli 83 modelli senza pesi a zero, ogni strato in più aggiunge **circa 900 istruzioni a P3**, uguali su P-core ed E-core, e circa 370 a P2. P1 e P1.5 non pagano lo strato in sé: le loro istruzioni crescono con le moltiplicazioni.
 
->> **Che cosa sono le ~900 istruzioni.** P3 esegue uno strato per volta: alla fine di ogni strato salta di nuovo al programma generico dello strato, che deve rileggere da tabelle dove si trova, che forma ha lo strato e dove sono i suoi pesi. Il conto è lo stesso su ogni modello, ed è per questo che il costo per strato è una costante della legge.
+>> **Che cosa sono le ~900 istruzioni.** P3 esegue uno strato alla volta. Alla fine di ogni strato salta di nuovo al programma generico dello strato, che deve rileggere dalle tabelle dove si trova, che forma ha lo strato e dove stanno i suoi pesi. È sempre lo stesso lavoro, per questo ogni strato costa uguale, su ogni modello.
 
-**A destra** il tempo per pacchetto di P3 e P2, sul P-core (linea continua) e sull'E-core (tratteggio), in mediana per numero di strati. Per la legge P3 paga circa 46 ns per strato sul P-core e 62 sull'E-core: stesse istruzioni, eseguite a un IPC più basso.
+**A destra** il tempo per pacchetto di P3 e P2 sul P-core (linea continua) e sull'E-core (tratteggio). Ogni strato costa a P3 circa 46 ns sul P-core e 62 sull'E-core: le stesse istruzioni, eseguite più lentamente.
 
-== 15 | Larghezza e profondità sul nodo vero
-Altre due analisi sotto traffico vero, sul P-core, nel tempo del nodo intero; il tratteggio è P3 sull'E-core.
+== 16 | Larghezza e profondità sul nodo vero
+Altre due analisi sul nodo intero, sul P-core; il tratteggio è P3 sull'E-core.
 
-**A sinistra la larghezza**: mediana per numero di neuroni per strato (2, 4, 8) sulla famiglia base. Sale su tutte le pipeline: P1 103 → 158 ns, P3 457 → 605. Un neurone in più è lavoro vero a ogni pacchetto.
+**A sinistra la larghezza**: quanti neuroni per strato (2, 4 o 8), nella mediana dei modelli del disegno principale. Il tempo sale su tutte le versioni: P1 da 103 a 158 ns, P3 da 457 a 605. Un neurone in più è lavoro vero a ogni pacchetto.
 
-**A destra a pari pesi**: la famiglia imbuto, cinque forme con circa 592 pesi, da uno strato largo a cinque stretti, su due composizioni dell'ingresso. Passando da 1 a 5 strati la sola rete sale del 48 [44–53] % per P2 e del 63 [55–70] % per P3; P1 e P1.5 del 14–17 %.
+**A destra a pari pesi**: le dieci forme con circa 592 pesi, distribuiti su 1, 2, 3, 4 o 5 strati. Passando da 1 a 5 strati la rete costa il 48 % in più con P2 e il 63 % in più con P3; P1 e P1.5 solo il 14–17 %.
 
->> **Che cosa vuol dire per chi progetta il modello.** Con le pipeline specializzate (P1, P1.5) la forma della rete si sceglie solo per l'accuratezza. Con quelle generiche (P2, P3), a parità di pesi, conviene una rete larga e poco profonda.
+>> **Che cosa vuol dire per chi progetta il modello.** Con P1 e P1.5 la forma della rete si sceglie solo per l'accuratezza. Con P2 e P3, a parità di pesi, conviene una rete larga e poco profonda.
 
-Sull'E-core P3 ha la stessa forma, più in alto del 16–21 %: la forma migliore non dipende dal core su cui girerà il nodo.
+Sull'E-core P3 ha la stessa forma, più in alto del 16–21 %: la forma migliore del modello non dipende dal core su cui girerà.
 
-== 16 | Leggero o saturo, la rete di P2 e P3 costa uguale
+== 17 | Poco traffico o nodo pieno: la rete di P2 e P3 costa uguale
 Prima di passare alla sola rete neurale, un controllo su come la si misura. Il costo della rete si può ricavare in due modi indipendenti:
-- **a nodo saturo**: il tempo di CPU per pacchetto meno quello della baseline (slide 3);
-- **a traffico leggero**: con i tre orologi della slide 11, T2−T1 meno la stessa misura della baseline, con xdp_gen a 0,25 e 0,5 milioni di pacchetti al secondo.
+- **a nodo pieno**: il tempo per pacchetto meno quello del nodo senza rete (slide 4);
+- **con poco traffico**: con i tre orologi della slide 12, il tempo del programma meno lo stesso tempo del nodo senza rete.
 
-Ogni grafico ha tre curve, mediane per numero di strati sulla famiglia base: **nodo saturo** (grigio tratteggiato), **traffico leggero, minimo** (chiaro: il pacchetto più veloce di ogni finestra, il caso migliore) e **traffico leggero, media** (scuro: il costo tipico di un pacchetto). **A sinistra P3**, **a destra P2**.
+Ogni grafico ha tre curve, mediane per numero di strati: **nodo pieno** (grigio tratteggiato), **poco traffico, il pacchetto più veloce** (chiaro) e **poco traffico, media** (scuro). **A sinistra P3, a destra P2.**
 
-Per P3 la media a traffico leggero sta a 1,02 [0,94–1,11] volte il costo a nodo saturo, sui 91 modelli; per P2 a 1,03 [0,94–1,09]. Le due misure danno lo stesso costo, su ogni modello. Il minimo sta all'86–87 % della media.
+Per P3 la media con poco traffico vale 1,02 volte il costo a nodo pieno, per P2 1,03: **le due misure danno lo stesso costo**, su ogni modello. Il pacchetto più veloce costa circa il 14 % meno della media.
 
->> **Perché il minimo sta sotto.** Fra un pacchetto e l'altro il core riceve, inoltra e serve il kernel, e una parte dello stato (dati, istruzioni, predittori dei salti) si raffredda. Il minimo è il pacchetto che trova tutto caldo; la media è il costo tipico, e coincide con quello misurato a nodo saturo.
+>> **Perché il pacchetto più veloce costa meno.** Fra un pacchetto e l'altro il core riceve, inoltra e serve il kernel, e una parte di ciò che il programma aveva in cache viene sostituita. Il pacchetto più veloce è quello che trova tutto già pronto; la media è il costo tipico, e coincide con quello misurato a nodo pieno.
 
-!! **P1 e P1.5 no.** Per loro il rapporto vale 0,77 [0,48–1,02] e 0,83 [0,50–1,02] sul P-core, e sull'E-core sale sopra 1 (mediana 1,27 e 1,22). La loro rete costa poche decine di ns sopra una baseline di ~67: la differenza fra due misure grandi è rumorosa. Il loro costo della rete va citato con il metodo che lo ha misurato.
+!! **P1 e P1.5 no.** Per loro le due misure non coincidono (0,77 e 0,83 volte). La loro rete costa poche decine di ns sopra un nodo senza rete di circa 67: una differenza piccola fra due misure grandi, che i due metodi stimano con errori diversi. Per P1 e P1.5 il riferimento è il tempo a nodo pieno.
 
-!! **E il programma da solo?** `bench_solo` lo misura a chiamate singole, con il pacchetto del traffico: ogni esecuzione è una chiamata al kernel, che raffredda cache e predittori come fa il traffico. Così misurata, la rete da sola costa quanto sotto traffico o poco di più (nodo saturo / da solo: 0,94 [0,77–1,10] per P2, 0,91 [0,84–0,97] per P3). Il programma in un ciclo caldo, senza nulla in mezzo, la popolazione non lo misura.
+Da qui in poi ogni tempo è il **tempo a nodo pieno meno il nodo senza rete**: il costo che il nodo paga davvero per la rete neurale.
 
-Per questo le slide 17–23 usano il **tempo di CPU per pacchetto meno la baseline**, misurato a nodo saturo con la build di produzione (senza orologi): è il costo che il nodo paga davvero.
+== 18 | La configurabilità si paga per pacchetto: da +52 a +420 ns
+Il grafico dà il tempo per pacchetto in mediana sui 91 modelli: 67 ns senza rete, 119 con P1, 126 con P1.5, 291 con P2, 486 con P3. La sola rete neurale costa quindi da **+52 ns (P1) a +420 ns (P3)**.
 
-== 17 | La configurabilità si paga per pacchetto
-Da qui in poi ogni tempo è il **tempo di CPU per pacchetto** del nodo saturo sotto xdp_gen, sul P-core a 3,5 GHz (slide 3). Il costo della sola rete neurale è quel tempo meno la baseline, il programma che riceve e inoltra senza rete neurale.
+La tabella spiega da dove viene la differenza, con tre proprietà del programma (mediane):
+- **istruzioni**: la dimensione del programma;
+- **letture di tabella** per pacchetto: quante volte il programma consulta una tabella. 5 per P1, 6 per P1.5, 12 per P2, e per P3 da 23 a 54 secondo il modello, circa 6 in più per ogni strato. Le conta una versione del programma che incrementa un contatore a ogni lettura;
+- **salti fra programmi** per pacchetto: P1, P1.5 e P2 sono un programma solo, raggiunto con un salto; P3 salta una volta per ogni strato (da 2 a 7 salti), su 89 modelli su 89.
 
-Il grafico dà il tempo per pacchetto in mediana sui 91 modelli: 67 ns la baseline, 119 P1, 126 P1.5, 291 P2, 486 P3. Sopra la baseline la rete neurale costa da **+52 ns (P1) a +420 ns (P3)** in mediana.
+>> **Esempio.** P2 ha circa 16 800 istruzioni, P3 12 288: P3 è più piccolo, eppure costa quasi il doppio. Lo spiegano i salti (uno per strato) e le letture di tabella (35 contro 12 per pacchetto).
 
-La tabella dà tre proprietà del programma, in mediana sulla popolazione:
-- **istruzioni**: quelle dei programmi della pipeline, contate dal kernel quando li carica;
-- **letture di tabella** per pacchetto: 5 per P1, 6 per P1.5, 12 per P2, e per P3 da 23 a 54 secondo il modello, circa 6 in più a ogni strato. Le conta una build che incrementa un contatore a ogni lettura, sul pacchetto e con gli ingressi del traffico;
-- **salti fra programmi** per pacchetto: uno per P1, P1.5 e P2; per P3 uno per strato, su 89 modelli su 89.
+**Il prezzo della configurabilità sta nelle letture di tabella e nei salti, non nelle moltiplicazioni.** Modello per modello, P2 costa 4,3 volte P1 e P3 7,8 volte, in mediana; P1.5 quasi come P1. I rapporti più alti vengono dai modelli più piccoli, dove P1 costa poche decine di ns.
 
->> **Esempio.** P2 carica 16 813 istruzioni (mediana) ed esegue 3 972 istruzioni di rete per pacchetto; P3 ne carica 12 288 e ne esegue 6 969. Il programma più piccolo è il più lento: rientra nello strato generico a ogni strato (un salto), e ogni volta rilegge da tabella dove si trova (in mediana 35 letture per pacchetto contro 12).
+== 19 | Cambiare modello costa millisecondi a tutte le versioni
+Questi non sono tempi per pacchetto, ma il tempo per **installare un modello nuovo** su un nodo già in servizio. Il grafico (scala logaritmica: ogni tacca vale dieci volte la precedente) dà le mediane:
+- **P2 e P3: compilare il programma generico**, una volta sola all'accensione del nodo: 1,2–1,7 secondi;
+- **P1: generare e compilare** il programma con i pesi dentro, su una macchina qualunque fuori dal nodo: 34–114 millisecondi secondo il modello;
+- **P1: caricarlo sul nodo**: 0,3–1,5 ms. Il kernel controlla che il programma sia sicuro e lo traduce in codice macchina;
+- **P2 e P3: scrivere le tabelle** con i pesi del modello nuovo: 0,24–0,51 ms.
 
-La configurabilità si paga nelle letture di tabella e nei salti, non nell'aritmetica. Modello per modello, sopra la baseline rendere configurabile la forma (P2) costa 4,3 [2,7–12,8] volte P1; anche la profondità (P3) 7,8 [4,9–24,6] volte; P3 costa 1,9 [1,4–2,3] volte P2. Fra P1 e P1.5 quasi niente: 1,1 [0,9–1,7] volte. I rapporti più alti sono quelli dei modelli più piccoli, dove P1 costa poche decine di ns.
+>> **Perché P1 non ha bisogno di un compilatore sul nodo.** Il programma con i pesi si compila prima, su un'altra macchina (*ahead of time*), e al nodo arriva un file già pronto, che un piccolo caricatore attacca. Sul nodo non serve né il compilatore né il suo ambiente.
 
-== 18 | Cambiare modello costa millisecondi a tutte le pipeline
-Questi non sono tempi per pacchetto ma tempi del **piano di controllo**: quanto costa installare un modello nuovo su un nodo già in servizio. Si misurano fuori dal traffico (`bench_solo`), su ogni modello della popolazione. Il grafico (scala logaritmica) dà le mediane:
-- **P2: compilare il programma generico**, una volta sola all'avvio del nodo: 1,5–1,7 s (P3: 1,2 s);
-- **P1: generare e compilare** il programma con i pesi dentro, su una macchina qualunque, fuori dal nodo: 34–114 ms secondo il modello (mediana 49). Il C si genera in meno di un millisecondo; il resto è clang, e cresce con la taglia del modello;
-- **P1: caricarlo sul nodo** (verifier e JIT): 0,3–1,5 ms (mediana 0,6);
-- **P2 / P3: scrivere le tabelle** con i pesi del modello nuovo: 0,24–0,51 ms.
+Cambiare modello non è quindi un criterio di scelta: sul nodo costa meno di 6 ms a tutte le versioni. Si sceglie sul costo per pacchetto (slide 18) e su dove serve un compilatore: P1 ne vuole uno per ogni modello nuovo, su qualche macchina; P2 e P3 nessuno.
 
->> **Perché P1 non ha bisogno di un compilatore sul nodo.** Il programma con i pesi si compila prima (AOT, ahead of time) e al nodo arriva un file già pronto, che un piccolo caricatore apre e attacca. Il nodo non ha né clang né le librerie di sviluppo.
+!! **Che cosa non dice.** Scrivere le tabelle è misurato su un nodo che le ha già aperte. E non dice che cosa succede ai pacchetti che passano **mentre** il modello cambia: è una prova che il banco non fa ancora.
 
-Il tempo per cambiare modello non è quindi un criterio di scelta: sul nodo meno di 6 ms per tutte, su ogni modello. Si sceglie sul costo per pacchetto (slide 17) e su dove serve un compilatore: P1 ne vuole uno per ogni modello nuovo, su qualche macchina; P2 e P3 nessuno.
+== 20 | La rete può crescere quanto vuole. Il modello no.
+**A sinistra la taglia della rete.** Fra gli ingressi di 56 modelli c'è l'identità del nodo, codificata con una colonna per ogni nodo della rete (10, 24, 52 o 100 nodi), di cui una sola vale 1. Il grafico dà, per ogni taglia, lo **scarto dalla legge**: il costo misurato meno quello previsto dalla legge della slide 23, che non tiene conto dei nodi. Se la taglia della rete costasse qualcosa, lo scarto crescerebbe con i nodi. Non cresce: oscilla di qualche ns attorno a zero, al più 0,03 ns per nodo in più.
 
-!! **Che cosa non dice.** Scrivere le tabelle è misurato su un nodo che le ha già aperte: è il tempo delle scritture, non quello di un processo che parte da zero. E non dice che cosa succede ai pacchetti che passano **mentre** il modello cambia (perdite, pacchetti classificati con una tabella scritta a metà): è un test che il banco non fa ancora.
+Il motivo: delle colonne dell'identità del nodo una sola vale 1, e il programma legge solo i pesi di quella colonna, qualunque sia il numero di nodi.
 
-== 19 | La rete può crescere quanto vuole. Il modello no.
-**A sinistra la taglia della rete.** Nella popolazione 56 modelli hanno fra gli ingressi l'identità del nodo, una one-hot con una colonna per ogni nodo della rete: 10, 24, 52 o 100 nodi. Il grafico dà, per ogni taglia, la mediana dello **scarto dalla legge**: il costo misurato meno quello previsto dalle moltiplicazioni eseguite e dagli strati (slide 22). Se la taglia della rete costasse qualcosa, lo scarto crescerebbe con i nodi. Non cresce: sta entro ±13 ns a ogni taglia, e la pendenza è al più 0,03 ns per nodo su tutte e quattro le pipeline.
+**A destra la larghezza del modello**: più neuroni per strato. Il costo sale su tutte e quattro le versioni: P1 da 37 a 90 ns, P3 da 389 a 537 ns. Un neurone in più è lavoro vero a ogni pacchetto.
 
-Il motivo: l'identità del nodo attiva una sola colonna di pesi, qualunque sia la larghezza della one-hot. P1 statica la conosce già quando viene compilata, le altre la leggono da tabella; nessuna moltiplica le colonne spente.
+Una rete più grande non rallenta nessuna versione: basta una riga in più in tabella. Un modello più largo rallenta tutte. Si può far crescere la rete; il modello va tenuto piccolo.
 
-**A destra la larghezza del modello**: mediana per neuroni per strato sulla famiglia base. Sale su tutte e quattro: P1 37 → 90 ns, P3 389 → 537 ns di rete neurale. Un neurone in più è lavoro vero a ogni pacchetto.
+== 21 | Uno strato in più: P2 lo paga in spazio, P3 in tempo
+Mediane per numero di strati nascosti, sui modelli del disegno principale.
 
-Una rete più grande (più nodi) non rallenta nessuna pipeline: basta una riga in più in tabella. Un modello più largo rallenta tutte. Si può far crescere la rete; il modello va tenuto piccolo.
+**A sinistra la dimensione** del programma (scala logaritmica). P2 si ricompila per ogni profondità e scrive per esteso il codice di ogni strato: circa 890 istruzioni in più per strato. P3 non si muove: 12 288 istruzioni con ogni modello, perché esegue sempre lo stesso strato generico.
 
-== 20 | Uno strato in più: P2 lo paga in spazio, P3 in tempo
-Mediane per numero di strati nascosti sulla famiglia base, e leggi su tutti i modelli densi.
+**A destra il tempo** della sola rete. Ogni strato costa a P3 circa 46 ns, perché è un salto fra programmi e un giro di letture di tabella (le ~900 istruzioni della slide 15); a P2 circa 20 ns; a P1 e P1.5 quasi niente.
 
-**A sinistra la dimensione** (scala logaritmica): le istruzioni del programma caricato. P2 ricompila e srotola per ogni profondità: la legge gli dà +887 istruzioni per strato (r² 0,96), da 14 604 a 18 937. P3 non si muove: 12 288 istruzioni su ogni modello, perché esegue sempre lo stesso strato generico. P1 e P1.5 crescono con le moltiplicazioni, non con gli strati.
+Un modello profondo si paga sempre: con P2 in un programma più grande da compilare, con P3 in tempo a ogni pacchetto. P3 è la versione più flessibile, ed è quella che la profondità rallenta di più.
 
-**A destra il tempo** sotto traffico: a moltiplicazioni ferme P3 paga circa 46 ns per strato, perché ogni strato è un salto fra programmi e un giro di letture di tabella (le ~900 istruzioni della slide 14). P2 paga circa 20 ns per strato, P1 e P1.5 circa 1.
+== 22 | «Meglio larga o profonda?» dipende da chi la esegue
+Le dieci forme a pari pesi: circa 592 pesi in un solo strato largo, oppure distribuiti su fino a cinque strati più stretti, su due tipi d'ingresso. Lo stesso numero di pesi, disposto in modo diverso. Il grafico dà la mediana dei due tipi d'ingresso.
 
-Un modello profondo si paga sempre: con P2 in un programma più grande da ricompilare, con P3 in tempo a ogni pacchetto. P3 è la più flessibile, ed è quella che la profondità rallenta di più.
+- **P2 e P3: la profondità si paga.** Da 1 a 5 strati P2 costa il 48 % in più, P3 il 63 % (circa 58 ns per strato).
+- **P1 e P1.5: quasi indifferenti.** 69–92 ns di rete, circa 4 ns per strato: il compilatore scrive tutta la rete per esteso in una funzione sola, e la forma conta poco.
 
-== 21 | «Meglio larga o profonda?» dipende da chi la esegue
-La famiglia imbuto: cinque forme con circa 592 pesi, uno strato largo da 8 neuroni oppure fino a cinque strati più stretti, su due composizioni dell'ingresso (10 modelli). Lo stesso numero di pesi, disposto in modo diverso. Il grafico dà la mediana delle due composizioni.
+>> **Esempio.** Lo stesso budget di circa 592 pesi costa a P3 357 ns in un solo strato e 577 in cinque: la scelta della forma vale più di 200 ns per pacchetto con P3, una decina con P1.
 
-- **Generiche (P2, P3): la profondità si paga.** Da 1 a 5 strati P2 sale del 48 [44–53] %, P3 del 63 [55–70] %; per P3 sono circa 58 ns per strato.
-- **Specializzate (P1, P1.5): quasi indifferenti.** 69–92 ns di rete in mediana, circa 4 ns per strato: il compilatore srotola tutto in una funzione sola, e la forma conta poco.
+Qui uno strato costa a P3 58 ns invece dei 46 della legge: a pesi fermi, passare da uno strato largo a più strati stretti cambia anche il numero di moltiplicazioni, che la legge conta a parte.
 
->> **Esempio.** Lo stesso budget di ~592 pesi in un solo strato costa a P3 357 ns di rete (mediana), in cinque strati 577: la scelta della forma vale più di 200 ns per pacchetto con P3, una decina con P1.
+Con P1 e P1.5 la forma della rete si sceglie per l'accuratezza. Con P2 e P3, a parità di pesi, conviene una rete larga e poco profonda.
 
-Qui lo strato costa a P3 58 ns invece dei 46 della legge: a pesi fermi, togliere neuroni da uno strato largo per farne strati stretti cambia anche le moltiplicazioni eseguite, e la legge le conta a parte.
+== 23 | Il costo di un modello si può prevedere prima di misurarlo
+Si può sapere quanto costerà un modello prima di misurarlo? Su tutti gli 83 modelli senza pesi a zero, il costo della rete segue una legge semplice:
 
-Con le versioni specializzate la forma della rete si sceglie per l'accuratezza. Con le generiche, a parità di pesi, conviene una rete larga e poco profonda.
+**costo della rete ≈ parte fissa + moltiplicazioni × costo di una + strati × costo di uno**
 
-== 22 | Il costo di un modello si prevede
-Si può prevedere quanto costerà un modello prima di misurarlo? La legge stimata sugli 83 modelli densi (77 per P2) è
+Sul P-core:
+- **P1**: 22 ns + 0,26 ns per moltiplicazione + 1 ns per strato;
+- **P1.5**: 29 ns + 0,26 ns per moltiplicazione + 1 ns per strato;
+- **P2**: 103 ns + 0,42 ns per moltiplicazione + 20 ns per strato;
+- **P3**: 154 ns + 0,77 ns per moltiplicazione + 46 ns per strato.
 
-**costo della rete = a + b × moltiplicazioni eseguite + c × strati**
+Il trucco è contare le moltiplicazioni **davvero eseguite**. Un ingresso codificato con molte colonne di cui una sola vale 1 (come l'identità del nodo) occupa molte colonne di pesi, ma il programma ne legge una sola: contato dalla forma del modello sembra costoso, nel programma no.
 
-con questi coefficienti sul P-core:
-- **P1**: 22 ns + 0,26 ns per moltiplicazione + 1 ns per strato (r² 0,98);
-- **P1.5**: 29 ns + 0,26 ns + 1 ns (r² 0,95);
-- **P2**: 103 ns + 0,42 ns + 20 ns (r² 0,93);
-- **P3**: 154 ns + 0,77 ns + 46 ns (r² 0,99).
+Il grafico mostra ogni modello: sull'asse orizzontale le moltiplicazioni eseguite, su quello verticale il costo della rete tolta la parte per strato. I punti cadono sulle rette.
 
-Il trucco è contare le moltiplicazioni **davvero eseguite**. Un ingresso one-hot occupa molte colonne nella matrice dei pesi ma ne attiva una sola: contato dalla forma del modello sembra costoso, nel programma no. Contando le moltiplicazioni dalla forma la legge spiega meno (r² 0,58–0,79); contando quelle eseguite spiega il costo di tutte e quattro le pipeline.
+ok **Su modelli che non ha mai visto.** La legge si stima lasciando fuori un modello alla volta e prevedendo quello: sbaglia in mediana del 3 % per P3, del 6 % per P1 e P2, del 9 % per P1.5. Il costo di un modello nuovo si stima quindi prima di misurarlo, con qualche punto percentuale di errore. (Per chi conosce la statistica: r² fra 0,93 e 0,99; contando le moltiplicazioni dalla forma del modello scende a 0,58–0,79.)
 
-Il grafico mostra ogni modello denso: sull'asse x le moltiplicazioni eseguite, sull'asse y il costo della rete meno c × strati, cioè la parte che la legge attribuisce alle moltiplicazioni. I punti cadono sulle rette.
+**Dove va il tempo.** La tabella dà, per ogni versione, quanto pesa in mediana ciascuna parte della legge (parte fissa · moltiplicazioni · strati):
+- **P1**: 40 · 50 · 8 %; **P1.5**: 48 · 46 · 5 %. Con i pesi nel programma circa metà del tempo sono moltiplicazioni;
+- **P2**: 47 · 18 · 31 %; **P3**: 37 · 18 · 39 %. Con i pesi in tabella circa l'82 % del tempo è **struttura**: la parte fissa (il primo programma, la lettura della descrizione del modello, la preparazione degli ingressi da tabella) e la parte per strato (il salto allo strato generico e la rilettura del suo contesto).
 
-**Dove va il tempo.** La tabella dà, per ogni pipeline, la quota mediana di ciascun termine sul costo previsto dei modelli densi (fisso · moltiplicazioni · strati):
-- **P1**: 40 · 50 · 8 %; **P1.5**: 48 · 46 · 5 %. Con i pesi nel codice circa metà del tempo è aritmetica;
-- **P2**: 47 · 18 · 31 %; **P3**: 37 · 18 · 39 %. Con i pesi in tabella circa l'82 % del tempo è **struttura**: il termine fisso (dispatcher, lettura del descrittore del modello, costruzione degli ingressi da tabella) e quello per strato (la tail call allo strato generico e la rilettura del suo contesto, le ~900 istruzioni della slide 14). Le moltiplicazioni arrivano al 44–46 % solo sui modelli più grandi.
+Anche il costo per moltiplicazione contiene le tabelle: P3 paga 0,77 ns per moltiplicazione contro 0,26 di P1 perché legge ogni peso da una tabella, mentre in P1 il peso è un numero scritto nel programma.
 
-Anche il termine per moltiplicazione contiene le tabelle: P3 paga 0,77 ns per MAC contro 0,26 di P1 perché legge ogni peso dalla memoria di una mappa, in un ciclo non srotolato, mentre in P1 il peso è una costante nel codice. La legge resta lineare proprio perché ogni tail call e ogni lettura di tabella costa quasi sempre lo stesso, e il loro numero dipende solo dalla forma.
+!! **Nessun passaggio fuori dal kernel.** Le tabelle si leggono dentro il kernel, senza mai uscire verso i programmi normali: questi le scrivono solo quando si installa un modello. Quanto dei 46 ns per strato di P3 sia il salto e quanto le letture di tabella, la campagna non lo separa.
 
-!! **Nessun passaggio in user space.** Le mappe si leggono dentro il kernel (`bpf_map_lookup_elem`; per le mappe array il verifier sostituisce di solito la chiamata con un calcolo di indirizzo). Lo user space scrive le mappe solo quando si installa un modello, mai mentre passano i pacchetti. Le due cose si contano: su ogni modello P3 fa 35 [23–54] letture di tabella per pacchetto, circa 6 in più per strato, e un salto per strato su 89 modelli su 89. Quanto dei 46 ns per strato sia il salto e quanto le letture, invece, la campagna non lo separa.
+Anche i valori dei pesi contano poco: sei forme ripetute con pesi estratti in modo diverso danno un costo che varia al più del 5–6 % (2 % per P3).
 
-ok **Su modelli che non ha visto.** La legge si stima lasciando fuori un modello alla volta e prevedendo quello: l'errore mediano è del 3 % per P3, del 6 % per P1 e P2, del 9 % per P1.5. Il costo di un modello nuovo si stima quindi prima di misurarlo, con qualche punto percentuale di errore.
+== 24 | Pesi a zero: accelerano solo P1 e P1.5
+Le quattro forme con il 50 e il 90 % di pesi esattamente uguali a zero. Il grafico dà il costo misurato della rete diviso quello che la legge della slide 23 prevede per lo stesso modello senza zeri: 1 vuol dire «come previsto», sotto 1 «più veloce».
 
-Anche i pesi estratti contano poco: sei forme ripetute con quattro semi diversi (uno con pesi a distribuzione normale) danno un costo che varia al più del 5–6 % per P1, P1.5 e P2, del 2 % per P3.
+- **P1 e P1.5 accelerano**: al 90 % di zeri P1 costa 0,44 volte il previsto e P1.5 0,62. Il programma di P1.5 scende a circa un terzo delle istruzioni: il compilatore vede che un peso è zero e toglie la moltiplicazione.
+- **P2 e P3 non cambiano** (1,02 e 1,01 volte il previsto), con un programma identico a quello senza zeri. Uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
 
-== 23 | Pesi a zero: solo le specializzate dimagriscono
-Le quattro forme della famiglia sparsità, ciascuna con il 50 e il 90 % dei pesi esattamente a zero. Il grafico dà, per ogni livello, il costo misurato della rete diviso quello che la legge della slide 22, stimata sui modelli densi, prevede per la stessa forma.
-
-- **P1 e P1.5** scendono sotto la legge: al 90 % di zeri P1 costa 0,44 [0,31–0,63] volte il previsto, P1.5 0,62 [0,27–0,83]. Il programma di P1.5 scende a 0,34–0,35 volte quello del modello denso con la stessa forma (al 50 %: 0,78): il compilatore vede che il peso è zero e cancella la moltiplicazione.
-- **P2 e P3** stanno sulla legge: 1,02 [0,91–1,14] e 1,01 [0,91–1,03] al 90 %, con un programma identico a quello del modello denso. Uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
-
-È l'unico esperimento in cui dimensione e tempo scendono insieme. Potare il modello (mettere pesi a zero) rende più veloci solo le versioni specializzate; con P2 e P3 la potatura non dà niente in velocità, e va giustificata solo dall'accuratezza.
+È l'unico caso in cui dimensione del programma e tempo scendono insieme. Mettere pesi a zero (potare il modello) rende più veloci solo le versioni con i pesi nel programma; con P2 e P3 non dà niente in velocità, e va scelto solo per l'accuratezza.
