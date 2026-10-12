@@ -1,0 +1,6 @@
+method,n_progs,xlated_insns,jited_bytes,programs
+baseline,1,135,625,xdp_baseline:135
+p1_static,2,263,1268,xdp_model:234 xdp_dispatch:29
+hardcoded,2,287,1393,xdp_model:258 xdp_dispatch:29
+template,2,16945,76374,ipa_switch_temp:41 arch_generic_2l:16904
+modular,3,12288,57501,modular_dispatc:137 layer_first:10475 layer_hidden:1676

@@ -31,6 +31,9 @@
 #   classi    il sottoinsieme "classi": una sessione per classe decisa (P)
 #   mix       il sottoinsieme "mix": TTL diversi pacchetto per pacchetto (P)
 #   taglie    il sottoinsieme "taglie": 64 / 512 / 1514 byte (P)
+#   solo      OGNI modello, il programma da solo (BPF_PROG_TEST_RUN) sul
+#             P-core: latenza, tempo per installare un modello, letture di
+#             tabella e salti per pacchetto (bench_solo.py)
 #   sintesi   population_report.py, anche da sola
 #
 # Il disegno dei core e' quello di remeasure_campagna.sh: cambia solo il core
@@ -44,7 +47,10 @@
 # Ripresa: una misura il cui CSV c'e' gia' in $CAMPAGNA si salta, quindi la
 # campagna si puo' interrompere e rilanciare con lo stesso comando (e la
 # stessa CAMPAGNA), o spezzare su piu' sessioni. Un banco fallito non scrive
-# il CSV e al rilancio si rifa'. POP_RIFAI=1 rimisura tutto comunque. Se la
+# il CSV e al rilancio si rifa'; uno bocciato dal controllo di validita' il
+# CSV lo scrive, ma al rilancio si rifa' lo stesso. POP_RIFAI_DISTURBATE=1
+# rifa' anche le misure con run_disturbed in env.csv (le stesse che
+# population_report.py lascia fuori). POP_RIFAI=1 rimisura tutto. Se la
 # popolazione cambia (altro POP_TIER, altro disegno) la ripresa si rifiuta:
 # gli id dei modelli indicherebbero modelli diversi da quelli misurati.
 set -u
@@ -63,6 +69,8 @@ POP_SOLO="${POP_SOLO:-}"
 # giri delle curve al crescere del rate (5 nella campagna di ottobre)
 CARICO_ROUNDS="${CARICO_ROUNDS:-3}"
 POP_RIFAI="${POP_RIFAI:-0}"
+# 1: rifai le misure che la macchina ha disturbato (run_disturbed in env.csv)
+POP_RIFAI_DISTURBATE="${POP_RIFAI_DISTURBATE:-0}"
 mkdir -p "$LOG" "$OUT"
 
 PY=python3
@@ -87,9 +95,30 @@ bench() {
         "$([ "$hw" != 0 ] && echo '  [niente contatori hardware]')"
 }
 
+# La misura c'e' ma non vale: bocciata dal controllo di validita' del banco
+# (sempre), o disturbata (con POP_RIFAI_DISTURBATE=1). Per le disturbate
+# decide population_report.py, che le elenca in $OUT/escluse.csv: una curva
+# al crescere del rate con poche finestre colpite la tiene senza quelle, e
+# rifarla non servirebbe. Senza escluse.csv (nessuna sintesi ancora) vale
+# run_disturbed in env.csv.
+da_rifare() {   # <cartella relativa a $OUT>
+    grep -q "RUN BOCCIATO" "$OUT/$1/throughput_report.md" 2>/dev/null && return 0
+    [ "$POP_RIFAI_DISTURBATE" = 1 ] || return 1
+    if [ -f "$OUT/escluse.csv" ]; then
+        grep -q "^$1," "$OUT/escluse.csv" && return 0
+    else
+        grep -q "^run_disturbed,True" "$OUT/$1/env.csv" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
 # La misura c'e' gia'? (ripresa). <cartella relativa a $OUT> <file>
 fatto() {
     [ "$POP_RIFAI" = 1 ] && return 1
+    if [ -s "$OUT/$1/$2" ] && da_rifare "$1"; then
+        printf '%-34s da rifare\n' "${1//\//_}"
+        return 1
+    fi
     if [ -s "$OUT/$1/$2" ]; then
         printf '%-34s gia misurato, saltato\n' "${1//\//_}"
         return 0
@@ -275,6 +304,32 @@ sec_taglie() {
     done
 }
 
+sec_solo() {
+    echo "== il programma da solo, P-core (cpu$(dut_of P)), ogni modello"
+    local d id
+    for d in $(models); do
+        id=$(id_of "$d")
+        # generare e compilare P1, senza kernel e senza root: la cache di
+        # clang propria, perche' /tmp/ipa_aot_cache la creano i banchi sudo
+        fatto "compila/$id" compila.csv || \
+            IPA_AOT_CACHE="$OUT/.aot_cache" $PY ipa/test/bench_solo.py \
+                --compila --model "$d" --topology "$d" \
+                --out "$OUT/compila/$id" > "$LOG/compila_$id.log" 2>&1 || \
+            echo "compila_$id fallito: vedi il log"
+        fatto "solo/$id" solo.csv && continue
+        local t0=$SECONDS
+        sudo $PY ipa/test/host_conditions.py --run --cpu "$(dut_of P)" \
+            --env "$OUT/solo/$id" -- \
+            $PY ipa/test/bench_solo.py --model "$d" --topology "$d" \
+            --out "$OUT/solo/$id" > "$LOG/solo_$id.log" 2>&1
+        local rc=$?
+        printf '%-34s rc=%-3s %5ss%s\n' "solo_$id" "$rc" "$((SECONDS - t0))" \
+            "$(grep -q '^run_disturbed,True' "$OUT/solo/$id/env.csv" 2>/dev/null \
+               && echo '  [macchina disturbata: vedi il log]')"
+    done
+    rm -rf "$OUT/.aot_cache"
+}
+
 sec_sintesi() {
     [ -f "$OUT/population.csv" ] || $PY $POPGEN --manifest "$OUT/population.csv"
     $PY ipa/test/population_report.py "$OUT" > "$OUT/sintesi.md" 2> "$LOG/sintesi.log" \
@@ -282,7 +337,7 @@ sec_sintesi() {
         || echo "sintesi fallita: vedi $LOG/sintesi.log"
 }
 
-ALL="genera corretto rif pop lpe carico core2 classi mix taglie"
+ALL="genera corretto rif pop lpe carico core2 classi mix taglie solo"
 SECTIONS="${*:-$ALL}"
 [ "$SECTIONS" = tutto ] && SECTIONS=$ALL
 echo "campagna in $OUT, log in $LOG, popolazione $POP_TIER"
@@ -308,7 +363,7 @@ if [ $needs_hw = 1 ]; then
 fi
 for s in $SECTIONS; do
     case $s in
-        genera|corretto|rif|pop|lpe|carico|core2|classi|mix|taglie|sintesi) "sec_$s" ;;
+        genera|corretto|rif|pop|lpe|carico|core2|classi|mix|taglie|solo|sintesi) "sec_$s" ;;
         *) echo "sezione sconosciuta: $s ($ALL sintesi)"; exit 2 ;;
     esac
 done

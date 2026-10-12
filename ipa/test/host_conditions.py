@@ -2055,6 +2055,19 @@ def _run_command(a, cmd):
             warn("il comando NON ha girato nelle condizioni dichiarate "
                  "(throttling, powerclamp, batteria o frequenza fuori "
                  "target): vedi le righe sopra")
+        if a.env:
+            # Le stesse colonne, in un env.csv accanto ai risultati del
+            # comando: run_disturbed e' cio' che population_report.py
+            # guarda per lasciare fuori una misura.
+            os.makedirs(a.env, exist_ok=True)
+            with open(os.path.join(a.env, "env.csv"), "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["campo", "valore"])
+                w.writerow(["comando", " ".join(cmd)])
+                w.writerow(["cpu_dut", dut])
+                for k, v in cols.items():
+                    w.writerow([("run_" + k[5:]) if k.startswith("host_")
+                                else k, v])
     return rc
 
 
@@ -2077,6 +2090,9 @@ def main(argv=None):
                    help="con --run: la CPU del comando (default: il DUT del "
                         "piano automatico)")
     p.add_argument("--allow-cpu0", action="store_true")
+    p.add_argument("--env", default=None, metavar="DIR",
+                   help="con --run: scrive in DIR/env.csv che cosa ha fatto "
+                        "la macchina durante il comando (run_disturbed, ...)")
     p.add_argument("--log", default=None, help=argparse.SUPPRESS)
     p.add_argument("--watch", default="", help=argparse.SUPPRESS)
     p.add_argument("--period", type=float, default=1.0,

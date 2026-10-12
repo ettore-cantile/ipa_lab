@@ -55,6 +55,10 @@ GLOSSARY = [
     ("xdp_gen", "Il generatore di traffico del banco: manda al nodo pacchetti nella stessa forma in cui XDP li riceve da una scheda di rete."),
     ("T1, T2, T3", "Tre letture dell'orologio in una versione strumentata del programma: all'ingresso (T1), prima di inoltrare (T2), all'arrivo al nodo successivo (T3). T2−T1 è il solo programma, T3−T2 il trasporto."),
     ("Minimo e media", "Il minimo è il pacchetto più veloce di una finestra (tutto in cache); la media è il costo tipico di un pacchetto sotto traffico."),
+    ("Popolazione", "I 91 modelli sintetici su cui gira ogni misura: diversi per composizione dell'ingresso, profondità, larghezza, uscite, pesi e pesi a zero. Nessuna cifra è di un modello solo."),
+    ("Mediana [min–max]", "La mediana sulla popolazione e, fra parentesi, il valore più basso e il più alto: dal modello più leggero al più pesante."),
+    ("MAC", "Moltiplicazione e somma (multiply-accumulate): l'operazione base di uno strato. Le MAC eseguite contano una feature one-hot come una colonna sola."),
+    ("Legge di costo", "costo della rete = a + b × MAC eseguite + c × strati, stimata con i minimi quadrati su tutti i modelli densi. L'errore si misura su modelli lasciati fuori dalla stima."),
 ]
 
 CSS = """

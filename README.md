@@ -352,12 +352,20 @@ frame sizes) run on subsets that go from the lightest to the heaviest model.
 | `rif` | rxonly and baseline, once per core type (they run no model) |
 | `pop` | every model on P-core and E-core: capacity, CPU time, instructions, cycles, loaded program size (`prog_size.csv`), T2−T1 at light load |
 | `lpe`, `carico`, `core2`, `classi`, `mix`, `taglie` | the subsets: LP E-core, growing traffic, two cores, one session per class, mixed TTLs, 64/512/1514 bytes |
+| `solo` | every model, the program alone (`bench_solo.py`, `BPF_PROG_TEST_RUN` on the traffic packet): map lookups and tail calls per packet, time to install a model; and, without root, generating and compiling P1 |
 
-The base tier is expected to take about 5–6 hours, the quick tier about 1.5;
-both are estimates, not yet timed on the machine. The script resumes: a
+The base tier takes about 4 hours on the lab machine (3 h 54 min, measured, plus about 30 min for `solo`);
+the quick tier is estimated at about 1.5. The script resumes: a
 measurement whose CSV is already in `$CAMPAGNA` is skipped, so the same
 command (with the same `CAMPAGNA=<dir>`) continues an interrupted campaign or
 splits it over several sessions; `POP_RIFAI=1` measures everything again.
+A measurement the bench's validity check rejected is redone on every resume.
+`population_report.py` leaves rejected and disturbed measurements
+(`run_disturbed` in `env.csv`) out of every range and law, and lists them in
+`escluse.csv`; a bit-rate curve keeps its clean windows if every point still
+has two clean rounds out of three (on the lab machine a package-throttle
+event lands about once a minute, so a 160 s curve almost always catches one).
+`POP_RIFAI_DISTURBATE=1` redoes exactly what `escluse.csv` lists.
 `POP_CORES`, `POP_T2`,
 `POP_RATES`, `POP_SOLO` and `CARICO_ROUNDS` play the role of the `ASSI_*`
 variables. `population_report.py` also reads the `assi_*` directories of an

@@ -1,0 +1,3 @@
+method,generate_ms,compile_ms,source_bytes
+p1_static,0.168,63.314,14605
+hardcoded,0.178,63.576,14605

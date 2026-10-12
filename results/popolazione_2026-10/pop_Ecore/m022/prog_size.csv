@@ -1,0 +1,5 @@
+method,n_progs,xlated_insns,jited_bytes,programs
+baseline,1,135,625,xdp_baseline:135
+p1_static,2,2242,8971,xdp_model:2213 xdp_dispatch:29
+hardcoded,2,4313,21183,xdp_model:4284 xdp_dispatch:29
+modular,3,12288,57501,modular_dispatc:137 layer_first:10475 layer_hidden:1676

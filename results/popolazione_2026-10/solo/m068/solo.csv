@@ -1,0 +1,6 @@
+method,esito,lat_ns,lat_min,lat_max,retval,fwd_pct,build_ms,update_ms,lookups,n_tail,insns,jited,detail
+baseline,OK,38.0,31,428,4,100.0,712.323,0.0,3.0,0,135,625,
+p1_static,OK,113.0,104,1788,4,100.0,4.004,0.912,4.0,1,1382,5405,
+hardcoded,OK,129.0,116,1889,4,100.0,3.526,2.309,5.0,1,3464,16390,
+template,N/A,,,,,,,,,,,,1109 pesi oltre MAX_WEIGHT_ENTRIES=1024
+modular,OK,707.0,654,5633,4,100.0,1200.599,0.483,42.0,5,12288,57501,

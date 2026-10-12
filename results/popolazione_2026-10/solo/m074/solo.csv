@@ -1,0 +1,6 @@
+method,esito,lat_ns,lat_min,lat_max,retval,fwd_pct,build_ms,update_ms,lookups,n_tail,insns,jited,detail
+baseline,OK,40.0,31,83,4,100.0,712.054,0.0,3.0,0,135,625,
+p1_static,OK,55.0,47,443,4,100.0,3.494,0.35,5.0,1,239,1193,
+hardcoded,OK,62.0,56,3242,4,100.0,1.322,0.432,6.0,1,392,1963,
+template,OK,269.0,241,3937,4,100.0,1504.321,0.258,11.0,1,15089,68307,
+modular,OK,435.0,392,5267,4,100.0,1228.345,0.288,29.0,3,12288,57501,

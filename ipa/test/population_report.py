@@ -50,6 +50,10 @@ import campaign_report as CR  # noqa: E402
 PIPES = ("p1_static", "hardcoded", "template", "modular")
 NAME = CR.NAME
 CORE_LABEL = {"P": "P-core", "E": "E-core", "L": "LP E-core"}
+# blocco minimo del ciclo caldo di bench_solo per usarne la misura
+HOT_MIN_K = 10
+# giri puliti che ogni punto di una curva disturbata deve conservare (su 3)
+MIN_CLEAN_ROUNDS = 2
 read_csv, num, fmt, table = CR.read_csv, CR.num, CR.fmt, CR.table
 
 
@@ -166,12 +170,37 @@ def count(pred_list):
 # --------------------------------------------------------------------------
 # lettura
 # --------------------------------------------------------------------------
+def unusable(d):
+    """Perche' la misura nella cartella `d` non entra nelle conclusioni, o
+    None. Due motivi, scritti dal banco stesso: il controllo di validita' di
+    bench_throughput l'ha bocciata (throughput_report.md), o la macchina non e'
+    rimasta nelle condizioni dichiarate (run_disturbed in env.csv: throttling,
+    powerclamp, batteria, frequenza del nodo fuori target)."""
+    try:
+        with open(os.path.join(d, "throughput_report.md"),
+                  encoding="utf-8") as f:
+            if "RUN BOCCIATO" in f.read():
+                return "bocciata"
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(d, "env.csv"), encoding="utf-8") as f:
+            if any(ln.strip() == "run_disturbed,True" for ln in f):
+                return "disturbata"
+    except OSError:
+        pass
+    return None
+
+
 class Campaign:
     """Tutto cio' che il report usa, indicizzato per modello."""
 
     def __init__(self, base):
         self.base = base
         self.legacy = False
+        self.seen = set()          # cartelle di misura lette
+        self.excluded = {}         # cartella relativa -> motivo
+        self.salvaged = {}         # curva -> (finestre tolte, finestre)
         self.models = {}           # id -> riga del manifesto
         self.core_dir = {}         # "P"/"E" -> cartella della popolazione
         man = os.path.join(base, "population.csv")
@@ -187,24 +216,78 @@ class Campaign:
         self.sat = {}              # (core, id) -> {metodo: riga saturazione}
         self.size = {}             # id -> {metodo: istruzioni caricate}
         self.t2 = {}               # (core, id) -> {metodo: (min, media)}
+        self.xport = {}            # (core, id) -> {metodo: T3-T2 medio}
         for k, d in self.core_dir.items():
             for mid in self.models:
                 sub = os.path.join(d, self.models[mid].get("_sub", mid))
-                s = CR.saturation(read_csv(os.path.join(sub, "compare.csv")))
+                s = CR.saturation(self.read(sub, "compare.csv"))
                 if s:
                     self.sat[(k, mid)] = s
+                # la dimensione caricata non dipende da come e' andata la
+                # macchina: si tiene anche da un run disturbato
                 ps = read_csv(os.path.join(sub, "prog_size.csv"))
                 if ps and mid not in self.size:
                     self.size[mid] = {r["method"]: num(r["xlated_insns"])
                                       for r in ps}
-                t = self._t2(os.path.join(sub, "rates"))
+                t, x = self._t2(os.path.join(sub, "rates"))
                 if t:
                     self.t2[(k, mid)] = t
+                if x:
+                    self.xport[(k, mid)] = x
         lpe = os.path.join(base, "lpe")
         for mid in self.models:
-            s = CR.saturation(read_csv(os.path.join(lpe, mid, "compare.csv")))
+            s = CR.saturation(self.read(os.path.join(lpe, mid), "compare.csv"))
             if s:
                 self.sat[("L", mid)] = s
+
+    def read(self, d, name):
+        """Il CSV `name` della misura in `d`, o [] se la misura non entra
+        nelle conclusioni (unusable): resta contata in self.excluded."""
+        if not os.path.exists(os.path.join(d, name)):
+            return []
+        rel = os.path.relpath(d, self.base)
+        self.seen.add(rel)
+        why = unusable(d)
+        if why:
+            self.excluded[rel] = why
+            return []
+        return read_csv(os.path.join(d, name))
+
+    def read_bitrate(self, d):
+        """Le righe di sintesi di una curva al crescere del rate. Una curva
+        dura ~160 s e un evento della macchina (throttling di pacchetto, ~1
+        ogni 60-80 s su questo portatile) ne tocca una finestra di un giro,
+        non la curva: da un run disturbato la sintesi si ricalcola dalle sole
+        finestre pulite di bitrate_raw.csv, con la stessa summarise del
+        banco. La curva resta se ogni punto conserva almeno
+        MIN_CLEAN_ROUNDS giri; altrimenti e' fuori come le altre."""
+        if not os.path.exists(os.path.join(d, "bitrate.csv")):
+            return []
+        rel = os.path.relpath(d, self.base)
+        self.seen.add(rel)
+        why = unusable(d)
+        if why is None:
+            return read_csv(os.path.join(d, "bitrate.csv"))
+        raw_path = os.path.join(d, "bitrate_raw.csv")
+        if why == "disturbata" and os.path.exists(raw_path):
+            import bench_bitrate as BB
+            import plot_bitrate as PB
+            raw = PB.read_summary(raw_path)
+            clean = [r for r in raw if str(r.get("host_disturbed")) != "True"]
+            pts = {}
+            for r in raw:
+                pts.setdefault((r["method"], r["frame"],
+                                r["rate_requested_pps"]), 0)
+            for r in clean:
+                pts[(r["method"], r["frame"], r["rate_requested_pps"])] += 1
+            if pts and min(pts.values()) >= MIN_CLEAN_ROUNDS:
+                self.salvaged[rel] = (len(raw) - len(clean), len(raw))
+                # come le righe lette da bitrate.csv: i booleani in testo
+                return [{k: str(v) if isinstance(v, bool) else v
+                         for k, v in s.items()}
+                        for s in BB.summarise(clean)]
+        self.excluded[rel] = why
+        return []
 
     def _legacy(self):
         """Gli assi di una campagna di ottobre come popolazione."""
@@ -250,8 +333,8 @@ class Campaign:
             self.models[s] = r
 
     def _t2(self, rates_dir):
-        rr = read_csv(os.path.join(rates_dir, "rates_raw.csv"))
-        out = {}
+        rr = self.read(rates_dir, "rates_raw.csv")
+        out, xport = {}, {}
         for m in ("baseline",) + PIPES:
             pts = [r for r in rr if r.get("method") == m]
             mins = [num(r.get("pipe_min_ns")) for r in pts
@@ -260,7 +343,20 @@ class Campaign:
                     if num(r.get("pipe_avg_ns"))]
             if mins and avgs:
                 out[m] = (st.median(mins), st.median(avgs))
-        return out
+            # T3-T2: il minimo e' il trasporto senza attesa; la media
+            # contiene anche la coda (l'uscita gira sul core del nodo) e
+            # cresce col rate, quindi si tiene rate per rate
+            xmin = [num(r.get("xport_min_ns")) for r in pts
+                    if num(r.get("xport_min_ns"))]
+            if xmin:
+                avg = {}
+                for r in pts:
+                    v, q = num(r.get("xport_avg_ns")), num(r.get("rate_req_pps"))
+                    if v and q:
+                        avg.setdefault(q, []).append(v)
+                xport[m] = (st.median(xmin),
+                            {q: st.median(v) for q, v in avg.items()})
+        return out, xport
 
     # -- grandezze per modello ---------------------------------------------
     def val(self, core, mid, method, key):
@@ -401,8 +497,8 @@ def sec_correct(c):
 def sec_reference(c):
     rows = []
     for k in ("P", "E", "L"):
-        s = CR.saturation(read_csv(os.path.join(c.base, f"rif_{k}core",
-                                                "compare.csv")))
+        s = CR.saturation(c.read(os.path.join(c.base, f"rif_{k}core"),
+                                  "compare.csv"))
         for m in ("rxonly", "baseline"):
             if m in s:
                 r = s[m]
@@ -682,12 +778,38 @@ def sec_law(c):
                   table(["pipeline", "variabili", "n", "a (ns)",
                          "b (ns/MAC)", "c (ns/strato)", "r²", "errore 50°",
                          "errore 90°"], rows), ""]
-        rows, _ = _fit_rows(c, k, "instr", families=fam)
+        rows, ilaws = _fit_rows(c, k, "instr", families=fam)
         if rows and k == "P":
             L += ["**istruzioni per pacchetto, P-core** (stessa forma: "
                   "b in istruzioni per MAC, c per strato)", "",
                   table(["pipeline", "variabili", "n", "a", "b", "c", "r²",
                          "errore 50°", "errore 90°"], rows), ""]
+            parts = [f"{NAME[m]} {d[lab][0][2]:.0f} (r² {d[lab][1]:.2f})"
+                     for m, d in ilaws.items()
+                     for lab in ("MAC eseguite + strati",) if lab in d]
+            if parts:
+                claim("istruzioni eseguite per strato in piu' (legge, "
+                      "P-core)", ", ".join(parts))
+    if c.size:
+        def loaded(k, i, m, key):
+            return c.size.get(i, {}).get(m)
+        rows, slaws = _fit_rows(c, None, None, stat=loaded, families=fam)
+        if rows:
+            L += ["**istruzioni caricate** (dimensione dei programmi, stessa "
+                  "forma: b per MAC, c per strato)", "",
+                  table(["pipeline", "variabili", "n", "a", "b", "c", "r²",
+                         "errore 50°", "errore 90°"], rows), ""]
+        parts = []
+        for m in PIPES:
+            v = [c.size[i][m] for i in c.models if c.size.get(i, {}).get(m)]
+            d = slaws.get(m, {}).get("MAC eseguite + strati")
+            if v and min(v) == max(v):
+                parts.append(f"{NAME[m]} sempre {v[0]:.0f}")
+            elif d:
+                parts.append(f"{NAME[m]} {d[0][2]:+.0f} (r² {d[1]:.2f})")
+        if parts:
+            claim("istruzioni caricate per strato in piu' (legge)",
+                  ", ".join(parts))
     if c.t2:
         def t2s(k, i, m, key):
             return c.nn_t2(k, i, m)
@@ -866,12 +988,61 @@ def sec_light(c):
          "predittori caldi rispetto a quello tipico.", "",
          table(["core", "pipeline", "n", "media leggero / saturo",
                 "minimo / media"], rows), ""]
-    v = [c.nn_t2("P", i, m) / c.nn("P", i, m) for i in c.models for m in PIPES
-         if c.nn_t2("P", i, m) is not None and c.nn("P", i, m)]
-    if v:
-        claim("costo a traffico leggero / costo a nodo saturo (P-core)",
-              spread(v, ".2f"))
-    return L
+    # Per pipeline, mai mescolate: P2 e P3 stanno attorno a 1, P1 e P1.5 no
+    # (sotto il P-core, sopra sull'E-core), e una sola cifra le nasconderebbe.
+    for k in c.core_dir:
+        parts = []
+        for m in PIPES:
+            v = [c.nn_t2(k, i, m) / c.nn(k, i, m) for i in c.models
+                 if c.nn_t2(k, i, m) is not None and c.nn(k, i, m)]
+            if v:
+                parts.append(f"{NAME[m]} {spread(v, '.2f')}")
+        if parts:
+            claim(f"costo a traffico leggero / costo a nodo saturo "
+                  f"({CORE_LABEL[k]})", ", ".join(parts))
+    return L + sec_transport(c)
+
+
+def sec_transport(c):
+    """T3-T2: redirect, cavo virtuale e ricezione al nodo successivo, dalla
+    stessa misura a tre orologi. Il minimo e' il trasporto senza attesa; la
+    media aggiunge la coda, perche' in questa misura l'uscita gira sul core
+    del nodo, e cresce col rate. Che non dipenda dalla pipeline lo si
+    verifica su ogni modello: differenza fra la piu' cara e la meno cara."""
+    rows, mins, gap = [], {}, []
+    for k in c.core_dir:
+        for m in ("baseline",) + PIPES:
+            xs = [c.xport[(k, i)][m] for i in c.models
+                  if m in c.xport.get((k, i), {})]
+            if not xs:
+                continue
+            mins.setdefault(k, []).extend(x[0] for x in xs)
+            rates = sorted({q for x in xs for q in x[1]})
+            avg = ", ".join(
+                f"{q / 1e6:g} Mpps {spread([x[1][q] for x in xs if q in x[1]])}"
+                for q in rates)
+            rows.append([CORE_LABEL[k], NAME[m], str(len(xs)),
+                         spread([x[0] for x in xs]), avg])
+        for i in c.models:
+            x = [c.xport.get((k, i), {}).get(m) for m in PIPES]
+            x = [v[0] for v in x if v]
+            if len(x) >= 2:
+                gap.append((max(x) / min(x) - 1) * 100)
+    if not rows:
+        return []
+    claim("il trasporto (T3−T2 minimo, senza attesa) e' un costo comune, ns",
+          ", ".join(f"{CORE_LABEL[k]} {spread(v)}" for k, v in mins.items()))
+    if gap:
+        claim("il trasporto non dipende dalla pipeline",
+              f"differenza fra la piu' cara e la meno cara {spread(gap)}% "
+              f"su {len(gap)} modelli-core")
+    return ["## Il trasporto verso il nodo successivo", "",
+            "T3−T2 (redirect, cavo virtuale, ricezione) dalla misura a tre "
+            "orologi, ns. Il minimo e' il trasporto senza attesa. La media "
+            "contiene anche la coda: qui l'uscita gira sul core del nodo, e "
+            "la media cresce col rate.", "",
+            table(["core", "programma", "n", "minimo", "media per rate"],
+                  rows), ""]
 
 
 def sec_load_curves(c):
@@ -881,7 +1052,7 @@ def sec_load_curves(c):
         if not os.path.isdir(root):
             continue
         for mid in sorted(os.listdir(root)):
-            br = read_csv(os.path.join(root, mid, "bitrate.csv"))
+            br = c.read_bitrate(os.path.join(root, mid))
             if not br:
                 continue
             for m in PIPES:
@@ -892,8 +1063,13 @@ def sec_load_curves(c):
                 if cap:
                     agree.append(mx / cap)
                 pts = [r for r in br if r.get("method") == m]
-                lost = [num(r.get("loss_before_xdp")) or 0 for r in pts]
-                inpipe = [num(r.get("loss_in_pipeline")) or 0 for r in pts]
+                # due contatori letti in istanti diversi: una differenza
+                # appena negativa e' zero, non una perdita negativa (dava
+                # quote sopra 1)
+                lost = [max(0, num(r.get("loss_before_xdp")) or 0)
+                        for r in pts]
+                inpipe = [max(0, num(r.get("loss_in_pipeline")) or 0)
+                          for r in pts]
                 tot = sum(lost) + sum(inpipe)
                 if tot > 0:
                     ingress.append(sum(lost) / tot)
@@ -924,8 +1100,7 @@ def sec_two_cores(c):
         if not os.path.isdir(root):
             continue
         for mid in sorted(os.listdir(root)):
-            two = CR.saturation(read_csv(os.path.join(root, mid,
-                                                      "compare.csv")))
+            two = CR.saturation(c.read(os.path.join(root, mid), "compare.csv"))
             for m in ("baseline",) + PIPES:
                 one = c.val(k, mid, m, "mpps")
                 if m in two and one:
@@ -948,7 +1123,7 @@ def sec_classes(c):
         return []
     rows, fwd_spread, drop_extra = [], [], []
     for mid in sorted(os.listdir(root)):
-        pc = [r for r in read_csv(os.path.join(root, mid, "per_class.csv"))
+        pc = [r for r in c.read(os.path.join(root, mid), "per_class.csv")
               if r.get("phase") == "saturazione"]
         for m in PIPES:
             fw = [num(r["ns_cpu"]) for r in pc if r["method"] == m
@@ -987,7 +1162,7 @@ def sec_mix(c):
         return []
     rows, rel = [], []
     for mid in sorted(os.listdir(root)):
-        s = CR.saturation(read_csv(os.path.join(root, mid, "compare.csv")))
+        s = CR.saturation(c.read(os.path.join(root, mid), "compare.csv"))
         for m in PIPES:
             fixed = c.val("P", mid, m, "ns")
             if m in s and fixed:
@@ -1013,7 +1188,7 @@ def sec_frames(c):
         return []
     var = []
     for mid in sorted(os.listdir(root)):
-        rows = [r for r in read_csv(os.path.join(root, mid, "compare.csv"))
+        rows = [r for r in c.read(os.path.join(root, mid), "compare.csv")
                 if r.get("phase") == "saturazione"]
         for m in ("baseline",) + PIPES:
             v = [num(r["ns_cpu"]) for r in rows if r["method"] == m
@@ -1028,6 +1203,201 @@ def sec_frames(c):
     return ["## Taglia del pacchetto", "",
             f"Differenza fra la taglia piu' cara e la meno cara, per modello "
             f"e pipeline: {spread(var, '.1f')}% su {len(var)} coppie.", ""]
+
+
+def sec_solo(c):
+    """Il programma da solo (bench_solo.py, BPF_PROG_TEST_RUN), su ogni
+    modello: la sua latenza contro il traffico, il tempo per installare un
+    modello, le letture di tabella e i salti per pacchetto."""
+    root = os.path.join(c.base, "solo")
+    if not os.path.isdir(root):
+        return []
+    # Una misura vale solo se il programma ha preso la strada del traffico:
+    # inoltrato in (quasi) ogni esecuzione. Un solo.csv senza fwd_pct viene
+    # da bench_solo con il pacchetto di bench_scaling (TTL 255), dove un
+    # modello su quattro scartava: non si usa.
+    solo, off = {}, []
+    for mid in c.models:
+        rows = c.read(os.path.join(root, mid), "solo.csv")
+        d = {}
+        for r in rows:
+            if r.get("esito") != "OK":
+                continue
+            if (num(r.get("fwd_pct")) or 0) < 99:
+                off.append(f"{mid}/{r['method']}")
+                continue
+            d[r["method"]] = r
+        if d:
+            solo[mid] = d
+
+    def v(mid, m, key):
+        return num(solo.get(mid, {}).get(m, {}).get(key))
+
+    def nn(mid, m, key="lat_ns"):
+        """La sola rete da sola: la pipeline meno la baseline dello stesso
+        modello. Con key="lat_hot" il ciclo caldo, solo dove il blocco
+        e' lungo almeno HOT_MIN_K esecuzioni per entrambe."""
+        if key == "lat_hot" and any((v(mid, x, "hot_k") or 0) < HOT_MIN_K
+                                    for x in (m, "baseline")):
+            return None
+        a, b = v(mid, m, key), v(mid, "baseline", key)
+        return a - b if a is not None and b is not None else None
+
+    # generare il C di P1 e compilarlo (bench_solo.py --compila, senza
+    # kernel): un modello nuovo per P1 costa questo, fuori dal nodo
+    comp = {}
+    for mid in c.models:
+        for r in read_csv(os.path.join(c.base, "compila", mid,
+                                       "compila.csv")):
+            g, k = num(r.get("generate_ms")), num(r.get("compile_ms"))
+            if g is not None and k is not None:
+                comp.setdefault(r["method"], []).append(g + k)
+    rows, upd, lk, light, sat, hot_sat, hot_light = [], [], [], {}, {}, \
+        {}, {}
+    for m in ("baseline",) + PIPES:
+        lat = [v(i, m, "lat_ns") for i in solo]
+        net = [nn(i, m) for i in solo] if m != "baseline" else []
+        bld = [v(i, m, "build_ms") for i in solo]
+        up = [v(i, m, "update_ms") for i in solo]
+        look = [v(i, m, "lookups") for i in solo]
+        tail = [v(i, m, "n_tail") for i in solo]
+        hot = [nn(i, m, "lat_hot") for i in solo] if m != "baseline" \
+            else [v(i, m, "lat_hot") for i in solo]
+        rows.append([NAME.get(m, m), str(len([x for x in lat if x])),
+                     spread(lat), spread(net), spread(hot),
+                     spread(bld, ".1f"), spread(comp.get(m, []), ".0f"),
+                     spread(up, ".1f"), spread(look, ".1f"),
+                     spread(tail)])
+        if m == "baseline":
+            continue
+        # sotto traffico (media T2-T1 a traffico leggero, minimo, e tempo
+        # di CPU a nodo saturo, tutti meno la baseline) / da solo
+        light[m] = [c.nn_t2("P", i, m) / nn(i, m) for i in solo
+                    if nn(i, m) and c.nn_t2("P", i, m) is not None]
+        sat[m] = [c.nn("P", i, m) / nn(i, m) for i in solo
+                  if nn(i, m) and c.nn("P", i, m) is not None]
+        hot_sat[m] = [c.nn("P", i, m) / nn(i, m, "lat_hot") for i in solo
+                      if nn(i, m, "lat_hot")
+                      and c.nn("P", i, m) is not None]
+        hot_light[m] = [c.nn_t2("P", i, m, 0) / nn(i, m, "lat_hot")
+                        for i in solo if nn(i, m, "lat_hot")
+                        and c.nn_t2("P", i, m, 0) is not None]
+        upd.append((m, up))
+        lk.append((m, look))
+    if off:
+        claim("programma da solo fuori dalla strada del traffico (non "
+              "inoltrato)", f"{len(off)} misure modello-pipeline")
+    L = ["## Il programma da solo", "",
+         "bench_solo.py su ogni modello, P-core: latenza da solo "
+         "(BPF_PROG_TEST_RUN, minimo su 7 misure), e la sola rete (meno la "
+         "baseline dello stesso modello); build = caricare la pipeline da "
+         "zero; installare = un modello nuovo su un nodo in servizio (P1: "
+         "caricare l'oggetto compilato; P2, P3: scrivere le tabelle); "
+         "letture di tabella e salti per pacchetto. Pacchetto e ingressi "
+         "sono quelli del traffico (TTL 32, stato dei link che inoltra); "
+         "una misura che non ha inoltrato resta fuori"
+         + (f" ({len(off)}: {', '.join(off[:12])}"
+            + (" ..." if len(off) > 12 else "") + ")" if off else "")
+         + ".", "",
+         table(["pipeline", "n", "chiamata singola ns", "rete ns",
+                "rete, ciclo caldo ns", "build ms", "generare e compilare "
+                "P1 ms", "installare ms", "letture", "salti"], rows), "",
+         f"Ciclo caldo: blocchi di esecuzioni di fila finche' il TTL che "
+         f"scende non cambia la classe decisa; si usa solo dove il blocco e' "
+         f"lungo almeno {HOT_MIN_K} esecuzioni.", ""]
+    rows2 = []
+    for m in PIPES:
+        if light.get(m) or sat.get(m):
+            rows2.append([NAME[m], spread(hot_sat.get(m, []), ".2f"),
+                          spread(hot_light.get(m, []), ".2f"),
+                          spread(sat.get(m, []), ".2f"),
+                          spread(light.get(m, []), ".2f")])
+    if rows2:
+        L += ["La sola rete sotto traffico divisa per la sola rete da sola, "
+              "modello per modello:", "",
+              table(["pipeline", "nodo saturo / ciclo caldo",
+                     "traffico leggero, minimo / ciclo caldo",
+                     "nodo saturo / chiamata singola",
+                     "traffico leggero, media / chiamata singola"], rows2), ""]
+        if any(hot_sat.values()):
+            claim("la rete a nodo saturo / la rete da sola in un ciclo caldo "
+                  "(P-core)",
+                  ", ".join(f"{NAME[m]} {spread(hot_sat[m], '.2f')}"
+                            for m in PIPES if hot_sat.get(m)))
+            claim("il pacchetto piu' veloce sotto traffico / il ciclo caldo",
+                  ", ".join(f"{NAME[m]} {spread(hot_light[m], '.2f')}"
+                            for m in PIPES if hot_light.get(m)))
+        else:
+            # misure di bench_solo senza ciclo caldo: il confronto e' con la
+            # chiamata singola, che non e' il programma in cache
+            claim("la rete a nodo saturo / la rete da sola a chiamate "
+                  "singole (P-core)",
+                  ", ".join(f"{NAME[m]} {spread(sat[m], '.2f')}"
+                            for m in PIPES if sat.get(m)))
+    if comp:
+        claim("generare e compilare P1 per un modello nuovo (fuori dal "
+              "nodo), ms", ", ".join(f"{NAME[m]} {spread(v_, '.0f')}"
+                                    for m, v_ in comp.items()))
+    claim("installare un modello su un nodo in servizio, ms",
+          ", ".join(f"{NAME[m]} {spread(u, '.1f')}" for m, u in upd if
+                    any(x is not None for x in u)))
+    claim("letture di tabella per pacchetto",
+          ", ".join(f"{NAME[m]} {spread(x, '.0f')}" for m, x in lk if
+                    any(y is not None for y in x)))
+    # P3: letture e salti contro gli strati
+    pts = [(num(c.models[i]["n_layers"]), v(i, "modular", "lookups"),
+            v(i, "modular", "n_tail")) for i in solo]
+    pts = [p for p in pts if p[1] is not None]
+    if len(pts) > 3:
+        f = CR._fit([p[0] for p in pts], [p[1] for p in pts])
+        same = sum(1 for p in pts if p[2] == p[0])
+        claim("P3: letture di tabella e salti crescono con gli strati",
+              f"+{f[0]:.1f} letture per strato; salti = strati su "
+              f"{same}/{len(pts)} modelli")
+    return L
+
+
+def sec_excluded(c):
+    """Le misure lasciate fuori da ogni cifra, e perche'. Dopo tutte le altre
+    sezioni: i sottoinsiemi si leggono sezione per sezione. L'elenco va anche
+    in escluse.csv accanto ai risultati: POP_RIFAI_DISTURBATE=1
+    remeasure_popolazione.sh rifa' esattamente quelle."""
+    if not c.seen:
+        return []
+    try:
+        with open(os.path.join(c.base, "escluse.csv"), "w", newline="",
+                  encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["cartella", "motivo"])
+            w.writerows(sorted(c.excluded.items()))
+    except OSError:
+        pass
+    claim("misure fuori dalle conclusioni (disturbate o bocciate)",
+          f"{len(c.excluded)}/{len(c.seen)}")
+    if c.salvaged:
+        out = sum(a for a, _ in c.salvaged.values())
+        tot = sum(b for _, b in c.salvaged.values())
+        claim("curve disturbate tenute senza le finestre colpite",
+              f"{len(c.salvaged)} curve, {out}/{tot} finestre tolte")
+    if not c.excluded and not c.salvaged:
+        return []
+    by = {}
+    for rel, why in sorted(c.excluded.items()):
+        by.setdefault(why, []).append(rel)
+    L = ["## Misure fuori dalle conclusioni", "",
+         "Non entrano in nessun intervallo ne' in nessuna legge. disturbata = "
+         "la macchina non e' rimasta nelle condizioni dichiarate (run_disturbed "
+         "in env.csv); bocciata = il controllo di validita' del banco l'ha "
+         "respinta (throughput_report.md). Si rifanno con POP_RIFAI_DISTURBATE=1 "
+         "remeasure_popolazione.sh.", ""]
+    for why, rels in by.items():
+        L += [f"**{why}** ({len(rels)}): " + ", ".join(rels), ""]
+    if c.salvaged:
+        L += [f"**curve tenute senza le finestre disturbate** (ogni punto con "
+              f"almeno {MIN_CLEAN_ROUNDS} giri puliti): "
+              + ", ".join(f"{rel} ({a}/{b})"
+                          for rel, (a, b) in sorted(c.salvaged.items())), ""]
+    return L
 
 
 def sec_sums():
@@ -1067,6 +1437,8 @@ def main(argv=None):
     body += sec_classes(c)
     body += sec_mix(c)
     body += sec_frames(c)
+    body += sec_solo(c)
+    body += sec_excluded(c)
     title = os.path.basename(os.path.normpath(argv[0]))
     try:
         sys.stdout.reconfigure(encoding="utf-8")

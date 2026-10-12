@@ -12,7 +12,12 @@ Tutti gli script di test vivono sotto `ipa/test/`; i comandi si eseguono dalla r
 repository. Il motore sta in `ipa/`; i dati della topologia su cui il checkpoint depositato è
 stato addestrato stanno in `topologies/germany50/`.
 
-**Le cifre di questo documento vengono dalla campagna del 2026-10-06**
+**Le cifre di riferimento della tesi sono quelle della campagna di popolazione**
+(§13, `results/popolazione_2026-10/`, registro in `docs/claims.md`): ogni banco su 91
+modelli, ogni cifra un intervallo o una legge. Le sezioni 0–12 descrivono i banchi uno
+per uno, con gli esempi del modello depositato 65-4-4-7.
+
+**Le cifre delle sezioni 0–12 vengono dalla campagna del 2026-10-06**
 (`results/campagna_2026-10-06/`, sintesi in `sintesi.md`, log in `log/`), salvo T2−T1 sugli
 assi (§10.8), dalla campagna del 2026-10-10 (`results/campagna_2026-10-10/`), sulla macchina e
 nelle condizioni descritte in §0, con due script: `ipa/test/remeasure_campagna.sh` (il
@@ -1243,10 +1248,12 @@ Sul P-core il **minimo** sotto traffico coincide con il programma da solo (P3 e 
 entro 30 ns, P1 e P1.5 entro 12): la misura di §9 descrive il pacchetto che trova cache e
 predittori caldi. La **media** sta sopra di 10–40 ns per P1 e P1.5 e di 40–110 ns per P2 e
 P3, con gli stessi andamenti su ogni asse (P3 ~50 ns per strato, al 90% di zeri dimagriscono
-solo P1 e P1.5). Sull'E-core lo scarto è circa doppio (P3 110–210 ns, P2 75–130). Sul
-checkpoint la media di T2−T1 sopra la baseline (P1 44, P2 229, P3 364 ns,
-`results/prova_t2_ckpt/`) coincide con il tempo di CPU per pacchetto meno la baseline di
-§10.2 (51, 224, 359): due misure indipendenti dello stesso costo.
+solo P1 e P1.5). Sull'E-core lo scarto è circa doppio (P3 110–210 ns, P2 75–130). Sui 91
+modelli della popolazione (`results/popolazione_2026-10/`, sezione `pop`) la media di
+T2−T1 sopra la baseline sta a 1,03 [0,94–1,09] volte il tempo di CPU per pacchetto meno
+la baseline per P2 e a 1,02 [0,94–1,11] per P3: due misure indipendenti dello stesso
+costo. Per P1 e P1.5 no (0,77 [0,48–1,02] e 0,83 [0,50–1,02]): la loro rete costa poche
+decine di ns, e la differenza fra due misure grandi è rumorosa.
 
 **Un caricamento sfavorevole.** In un run P3 a 1 strato sull'E-core ha dato 502 ns di
 minimo, stabile su sei finestre, con le altre pipeline nella norma; un nuovo caricamento ha
@@ -1606,6 +1613,83 @@ ipa_like, ipa_ttl16 e sparse hanno la stessa forma e lo stesso costo, entro 10 n
 **valori** dei pesi (sparse, stessa forma, 31 ns contro 46). Uno strato in più costa circa
 +29 ns a P2 e +57 ns a P3; ingressi più piccoli abbassano P2 e P3 di 40–100 ns. Sotto
 traffico vero gli stessi andamenti sono negli assi di §10.8.
+
+## 13. La campagna di popolazione (`remeasure_popolazione.sh`)
+
+Ogni banco delle sezioni precedenti gira qui su **91 modelli sintetici** invece che su
+uno. Le conclusioni le tira `population_report.py`: intervalli sulla popolazione
+(mediana [minimo–massimo]), leggi stimate su tutti i modelli con l'errore su modelli
+lasciati fuori, e per ogni affermazione su quanti modelli regge.
+
+```bash
+bash ipa/test/remeasure_popolazione.sh                       # tutto, ~4 h 30
+CAMPAGNA=results/prova_pop POP_SOLO="m000 m037" \
+    bash ipa/test/remeasure_popolazione.sh                   # prova breve
+bash ipa/test/remeasure_popolazione.sh pop solo              # alcune sezioni
+python3 ipa/test/population_report.py results/popolazione_2026-10 > sintesi.md
+```
+
+### 13.1 La popolazione (`model_population.py`)
+
+Tier `base`: 91 modelli in quattro famiglie. **base** (53): 7 composizioni dell'ingresso
+(solo dense, solo one-hot, miste; 5–117 ingressi) × profondità 1, 2, 3, 4, 6 × larghezza
+2, 4, 8, metà delle combinazioni, 3–7 uscite. **replica** (20): sei forme con tre semi in
+più (uno a pesi normali). **sparsità** (8): quattro forme al 50 e al 90 % di pesi a zero.
+**imbuto** (10): cinque forme a ~592 pesi su 1–5 strati, due composizioni. Seme fisso
+(rigenerata è identica byte per byte); un seme si scarta se il modello non inoltra il
+pacchetto del generatore in nessuno stato dei link, o non raggiunge almeno due classi.
+I modelli che P2 non sa eseguire (6, oltre 1 024 pesi) restano, e il manifesto
+(`population.csv`) dice perché. I test lunghi girano su sottoinsiemi dal più leggero al
+più pesante (6–14 modelli).
+
+### 13.2 Le sezioni
+
+| sezione | banco | che cosa misura |
+|---|---|---|
+| `corretto` | `verify_synth_kernel.py` | riferimento intero contro eBPF, 200 ingressi, ogni modello e pipeline |
+| `rif` | `bench_throughput.py` | rxonly e baseline senza modello, una volta per tipo di core |
+| `pop` | `bench_throughput.py` | ogni modello su P-core ed E-core: capacità, tempo di CPU, contatori hardware, programmi caricati; T2−T1 e T3−T2 a 0,25 e 0,5 Mpps |
+| `lpe`, `carico`, `core2` | `bench_throughput.py`, `bench_bitrate.py` | LP E-core, traffico crescente, due core |
+| `classi`, `mix`, `taglie` | `bench_throughput.py` | una sessione per classe, TTL misti, 64/512/1 514 B |
+| `solo` | `bench_solo.py` | programma da solo, letture di tabella e salti per pacchetto, installare un modello; `--compila` (senza root) generare e compilare P1 |
+
+### 13.3 Il programma da solo (`bench_solo.py`)
+
+Carica il modello con `pipeline_setup.build`, lo stesso costruttore dei banchi sotto
+traffico, e lo esegue con `BPF_PROG_TEST_RUN` sul **pacchetto e con gli ingressi del
+traffico**: TTL 32, il nodo e la porta del fabric, lo stato dei link che fa inoltrare il
+modello (`bench_throughput._forwarding_inputs`). Con il TTL 255 di `bench_scaling` un
+modello su quattro della popolazione decide di scartare, e il programma da solo
+misurerebbe la strada dello scarto. Il kernel non ripristina il pacchetto fra una
+ripetizione e l'altra e il datapath decrementa il TTL: quindi ogni esecuzione è una
+chiamata con `repeat=1` (mediana di 1 000, minimo su 7 prove), e `fwd_pct` registra la
+quota di esecuzioni inoltrate; il report usa solo le misure al 99 % o più. Le letture di
+tabella si contano con la build strumentata (`lookup_ctr`), sullo stesso pacchetto.
+Installare un modello: per P1 caricare l'oggetto compilato (`t_redirect_s` del loader),
+per P2 e P3 scrivere le tabelle di un `model_id` nuovo (`register_model_id`). `--compila`
+genera il C di P1 e lo compila con clang senza cache: non serve root, ma serve una cache
+scrivibile (`IPA_AOT_CACHE`), perché `/tmp/ipa_aot_cache` la creano i banchi lanciati
+con sudo.
+
+### 13.4 Ripresa ed esclusioni
+
+Una misura il cui CSV c'è già si salta; una bocciata dal controllo di validità del banco
+(«RUN BOCCIATO» in `throughput_report.md`) si rifà a ogni ripresa. `population_report.py`
+lascia fuori da ogni cifra le misure disturbate (`run_disturbed` in `env.csv`: throttling,
+powerclamp, batteria, frequenza fuori target) e le bocciate, e le elenca in
+`escluse.csv`; `POP_RIFAI_DISTURBATE=1` rifà esattamente quelle. Su questo portatile un
+evento di throttling di pacchetto arriva circa una volta al minuto anche con
+l'alimentatore: una curva a traffico crescente (~160 s) lo prende quasi sempre, quindi il
+report la ricalcola dalle sole finestre pulite (`bitrate_raw.csv`, la `summarise` del
+banco) se ogni punto conserva almeno 2 giri su 3. `host_conditions.py --run --env DIR`
+scrive le stesse colonne per un comando qualunque (lo usa la sezione `solo`).
+
+### 13.5 Risultati
+
+In `results/popolazione_2026-10/sintesi.md`, schede in `docs/claims.md`; slide e
+spiegazione si rigenerano con `python3 docs/slides_src/popolazione.py
+results/popolazione_2026-10 --pptx` e `python3 docs/slides_src/build.py inferenza`. Durata:
+3 h 54 min per le sezioni di traffico, ~30 min per `solo`.
 
 ## Note e limiti
 

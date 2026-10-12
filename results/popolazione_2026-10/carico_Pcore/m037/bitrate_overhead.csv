@@ -1,0 +1,6 @@
+method,reps,prog_chain_ns,prog_direct_ns,prog_overhead_ns,prog_spread_chain_ns,prog_spread_direct_ns,cost_chain_ns,cost_direct_ns,cost_overhead_ns,cost_spread_chain_ns,cost_spread_direct_ns
+baseline,5,23.69,22.03,1.66,0.27,0.14,109.11,107.74,1.37,6.46,2.54
+p1_static,5,170.05,173.17,-3.12,8.16,12.3,223.06,225.28,-2.22,14.12,21.09
+hardcoded,5,173.97,175.4,-1.43,13.62,10.84,229.62,232.35,-2.73,20.86,19.65
+template,5,453.45,444.48,8.97,15.72,11.78,515.11,504.17,10.94,27.65,10.52
+modular,5,870.77,857.99,12.78,10.62,8.19,933.61,921.61,12.0,13.74,8.01
