@@ -1080,8 +1080,8 @@ def sec_load_curves(c):
         return []
     if agree:
         claim("il massimo inoltrato al crescere del rate coincide con la "
-              "capacita' a massima spinta", f"rapporto {spread(agree, '.2f')}"
-              f" su {len(agree)} curve")
+              "capacita' a massima spinta (entro il rumore fra sessioni)",
+              f"rapporto {spread(agree, '.2f')} su {len(agree)} curve")
     if ingress:
         claim("oltre la capacita' si perde prima del programma, alla coda",
               f"quota persa prima di XDP {spread(ingress, '.3f')}")
@@ -1110,8 +1110,10 @@ def sec_two_cores(c):
                                  f"{CR.node_mpps(two[m]):.2f}", f"{s:.0f}"])
     if not rows:
         return []
-    claim("due core reggono il doppio di uno", f"{spread(scal)}% del doppio "
-          f"su {len(scal)} coppie")
+    # un core e due core vengono da sessioni diverse: un valore sopra 100
+    # e' rumore di misura (sec_noise), non un guadagno
+    claim("due core reggono il doppio di uno (entro il rumore fra sessioni)",
+          f"{spread(scal)}% del doppio su {len(scal)} coppie")
     return ["## Due core del nodo", "",
             table(["core", "modello", "pipeline", "1 core", "2 core",
                    "% del doppio"], rows), ""]
@@ -1357,6 +1359,76 @@ def sec_solo(c):
     return L
 
 
+def noise(c):
+    """Quanto varia la stessa misura: dentro una misura (i giri), fra sessioni
+    con lo stesso programma (il nodo senza rete, in ogni sessione `pop`), e
+    fra sessioni con lo stesso modello e la stessa versione (le taglie a 64
+    byte contro `pop`). In % del valore; liste, per spread() e quant()."""
+    within, base, same = [], {}, []
+    for k, d in c.core_dir.items():
+        for i in c.models:
+            rows = c.read(os.path.join(d, i), "compare_raw.csv")
+            by = {}
+            for r in rows:
+                v = num(r.get("ns_cpu"))
+                if r.get("phase") == "saturazione" and v:
+                    by.setdefault(r["method"], []).append(v)
+            for v in by.values():
+                if len(v) >= 2:
+                    within.append((max(v) - min(v)) / st.median(v) * 100)
+        v = [c.val(k, i, "baseline", "ns") for i in c.models
+             if c.val(k, i, "baseline", "ns")]
+        if v:
+            m = st.median(v)
+            base[k] = [abs(x / m - 1) * 100 for x in v]
+    root = os.path.join(c.base, "taglie")
+    if os.path.isdir(root):
+        for i in sorted(os.listdir(root)):
+            for r in c.read(os.path.join(root, i), "compare.csv"):
+                if r.get("phase") != "saturazione" or r.get("frame") != "64":
+                    continue
+                a, b = num(r.get("ns_cpu")), c.val("P", i, r["method"], "ns")
+                if a and b:
+                    same.append(abs(a / b - 1) * 100)
+    return dict(within=within, base=base, same=same)
+
+
+def sec_noise(c):
+    """Il rumore di misura: la soglia sotto cui una differenza non e' una
+    differenza. Due misure di sessioni diverse (un core contro due, il
+    massimo di una curva contro la capacita') possono dare un rapporto
+    sopra 1 anche dove fisicamente non puo' esserlo."""
+    n = noise(c)
+    if not (n["within"] or n["same"]):
+        return []
+    L = ["## Quanto varia la stessa misura", "",
+         "Variazione in % del valore: mediana, 90° percentile, massimo. Una "
+         "differenza dentro la variazione fra sessioni non e' una differenza; "
+         "un rapporto fra due misure di sessioni diverse puo' superare 1 per "
+         "questo solo motivo.", ""]
+    rows = []
+    if n["within"]:
+        rows.append(["i giri di una misura ((max − min) / mediana)",
+                     str(len(n["within"])), fmt(quant(n["within"], .5), ".1f"),
+                     fmt(quant(n["within"], .9), ".1f"),
+                     fmt(max(n["within"]), ".1f")])
+    for k, v in n["base"].items():
+        rows.append([f"il nodo senza rete in sessioni diverse, {CORE_LABEL[k]}",
+                     str(len(v)), fmt(quant(v, .5), ".1f"),
+                     fmt(quant(v, .9), ".1f"), fmt(max(v), ".1f")])
+    if n["same"]:
+        rows.append(["stesso modello e versione, due sessioni",
+                     str(len(n["same"])), fmt(quant(n["same"], .5), ".1f"),
+                     fmt(quant(n["same"], .9), ".1f"),
+                     fmt(max(n["same"]), ".1f")])
+        claim("la stessa misura rifatta in un'altra sessione cambia di",
+              f"{quant(n['same'], .5):.1f} % in mediana, "
+              f"{quant(n['same'], .9):.1f} % al 90° percentile, "
+              f"{max(n['same']):.1f} % al massimo ({len(n['same'])} coppie)")
+    L += [table(["che cosa", "n", "mediana %", "90° %", "max %"], rows), ""]
+    return L
+
+
 def sec_excluded(c):
     """Le misure lasciate fuori da ogni cifra, e perche'. Dopo tutte le altre
     sezioni: i sottoinsiemi si leggono sezione per sezione. L'elenco va anche
@@ -1438,6 +1510,7 @@ def main(argv=None):
     body += sec_mix(c)
     body += sec_frames(c)
     body += sec_solo(c)
+    body += sec_noise(c)
     body += sec_excluded(c)
     title = os.path.basename(os.path.normpath(argv[0]))
     try:

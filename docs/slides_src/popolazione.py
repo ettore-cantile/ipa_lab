@@ -589,6 +589,15 @@ class Pop:
                 stat=lambda k, i, m, w=which: self.c.nn_t2(k, i, m, w))
         f["depth_light"] = light
         f["law_shares"] = self.law_shares(laws)
+        # il rumore di misura (population_report.noise): la stessa misura
+        # rifatta in un'altra sessione; sotto questa soglia una differenza
+        # non e' una differenza
+        nz = PR.noise(self.c)
+        f["noise"] = dict(
+            same_med=PR.quant(nz["same"], .5), same_p90=PR.quant(nz["same"], .9),
+            same_max=max(nz["same"]) if nz["same"] else None,
+            within_med=PR.quant(nz["within"], .5),
+            base_P_max=max(nz["base"].get("P", [0])))
         f["solo"] = self.solo()
         f["nodes"] = self.nodes(laws)
         f["sparsity"] = self.sparsity(laws)

@@ -40,9 +40,9 @@ Ogni riga e' un'affermazione e la sua prova sulla popolazione: su quanti modelli
 | costo a traffico leggero / costo a nodo saturo (E-core) | P1 1.26 [0.34–2.73], P1.5 1.22 [0.30–2.52], P2 1.08 [0.93–1.35], P3 1.07 [0.82–1.13] |
 | il trasporto (T3−T2 minimo, senza attesa) e' un costo comune, ns | P-core 199 [187–221], E-core 240 [226–274] |
 | il trasporto non dipende dalla pipeline | differenza fra la piu' cara e la meno cara 4 [1–17]% su 182 modelli-core |
-| il massimo inoltrato al crescere del rate coincide con la capacita' a massima spinta | rapporto 0.99 [0.88–1.03] su 48 curve |
+| il massimo inoltrato al crescere del rate coincide con la capacita' a massima spinta (entro il rumore fra sessioni) | rapporto 0.99 [0.88–1.03] su 48 curve |
 | oltre la capacita' si perde prima del programma, alla coda | quota persa prima di XDP 1.000 [0.689–1.000] |
-| due core reggono il doppio di uno | 99 [94–103]% del doppio su 80 coppie |
+| due core reggono il doppio di uno (entro il rumore fra sessioni) | 99 [94–103]% del doppio su 80 coppie |
 | le classi che inoltrano costano uguale | differenza fra la piu' cara e la meno cara 0 [0–9]% |
 | scartare costa in piu' (effetto del banco: la memoria del pacchetto si libera sul nodo) | 51 [17–63] ns |
 | TTL diversi pacchetto per pacchetto contro pacchetto fisso | 0 [-6–4]% sul tempo del nodo |
@@ -52,6 +52,7 @@ Ogni riga e' un'affermazione e la sua prova sulla popolazione: su quanti modelli
 | installare un modello su un nodo in servizio, ms | P1 0.6 [0.3–1.5], P1.5 0.9 [0.3–5.6], P2 0.3 [0.2–0.4], P3 0.3 [0.2–0.5] |
 | letture di tabella per pacchetto | P1 5 [4–5], P1.5 6 [5–6], P2 12 [11–12], P3 35 [23–54] |
 | P3: letture di tabella e salti crescono con gli strati | +6.0 letture per strato; salti = strati su 89/89 modelli |
+| la stessa misura rifatta in un'altra sessione cambia di | 1.8 % in mediana, 5.0 % al 90° percentile, 7.0 % al massimo (30 coppie) |
 | misure fuori dalle conclusioni (disturbate o bocciate) | 2/526 |
 | curve disturbate tenute senza le finestre colpite | 8 curve, 17/1920 finestre tolte |
 
@@ -661,6 +662,17 @@ La sola rete sotto traffico divisa per la sola rete da sola, modello per modello
 | P1.5 | - | - | 1.23 [1.02–3.19] | 1.04 [0.85–2.14] |
 | P2 | - | - | 0.94 [0.77–1.10] | 0.97 [0.79–1.07] |
 | P3 | - | - | 0.91 [0.84–0.97] | 0.92 [0.86–1.00] |
+
+## Quanto varia la stessa misura
+
+Variazione in % del valore: mediana, 90° percentile, massimo. Una differenza dentro la variazione fra sessioni non e' una differenza; un rapporto fra due misure di sessioni diverse puo' superare 1 per questo solo motivo.
+
+| che cosa | n | mediana % | 90° % | max % |
+|---|---:|---:|---:|---:|
+| i giri di una misura ((max − min) / mediana) | 898 | 1.3 | 3.3 | 7.8 |
+| il nodo senza rete in sessioni diverse, P-core | 91 | 1.1 | 2.1 | 3.5 |
+| il nodo senza rete in sessioni diverse, E-core | 91 | 0.4 | 1.0 | 1.7 |
+| stesso modello e versione, due sessioni | 30 | 1.8 | 5.0 | 7.0 |
 
 ## Misure fuori dalle conclusioni
 

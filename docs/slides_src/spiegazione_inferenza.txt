@@ -39,6 +39,8 @@ Le prove più lunghe (traffico crescente, core a basso consumo, due core, decisi
 
 ok **Quanto è pulito il dato.** Su 526 misure 2 sono fuori dalle conclusioni, perché la macchina era disturbata. Su questo portatile un breve rallentamento del processore arriva circa una volta al minuto: le curve a traffico crescente, che durano quasi tre minuti, sono tenute senza i pochi istanti colpiti (17 su 1 920).
 
+**Il rumore di misura.** La stessa misura, rifatta in un'altra sessione, non dà esattamente lo stesso numero. Lo si vede in tre modi: i 3 giri di una stessa misura si discostano dell'1,3 % in mediana; il nodo senza rete, misurato in 91 sessioni diverse, varia di ±1 % in mediana e al più del 3,5 %; lo stesso modello con la stessa versione, misurato in due sessioni diverse, cambia dell'1,8 % in mediana e fino al **5 %** (90° percentile). Quindi due misure di sessioni diverse che differiscono meno del 5 % sono **uguali, entro il rumore**: la differenza non vuol dire niente.
+
 **Per chi vuole rifare le misure.** Tutto lo fa `ipa/test/remeasure_popolazione.sh` (circa 4 ore e mezza); le conclusioni le calcola `ipa/test/population_report.py`, e queste slide le rigenera `docs/slides_src/popolazione.py`. I banchi sono `bench_throughput.py` (nodo pieno, tre orologi), `bench_bitrate.py` (traffico crescente), `bench_solo.py` (programma da solo), il generatore è `xdp_gen.py`, le condizioni della macchina `host_conditions.py`. La guida completa è `docs/testing.md`, §13.
 
 == 1 | Copertina
@@ -69,10 +71,15 @@ La regola che le slide successive misurano: più informazioni si spostano dalla 
 == 3 | Ogni cifra vale per 91 modelli, non per uno
 Questa slide spiega come leggere i numeri del resto della presentazione.
 
-- **«52 [19–155] ns»**: 52 è la **mediana** sui modelli (metà dei modelli costa meno, metà di più); fra parentesi quadre il valore del modello più leggero e quello del più pesante.
+Nessuna cifra delle slide è di un modello solo. Ogni numero è di uno di questi tipi, e il testo dice sempre quale:
+- **«52 ns, in mediana»**: la **mediana** sui modelli. Metà dei modelli costa meno, metà di più. È il valore tipico.
+- **«fra i modelli da 19 a 155 ns»**: il valore del modello più leggero e quello del più pesante. Non è un errore di misura: sono reti diverse, che costano davvero cose diverse.
+- **«da 27 ns senza rete a 391 ns con P3»**: mediane di versioni diverse, messe in fila. Quando un intervallo va da una versione all'altra, il testo nomina le versioni.
+- **«secondo la legge»**: un coefficiente della legge di costo (slide 23), stimato su tutti i modelli insieme.
 - **«85/85»**: un'affermazione vale su 85 modelli su 85. Se un modello la smentisse, il conteggio lo direbbe.
-- **«4,3 volte»**: un rapporto calcolato **modello per modello** (per esempio il costo di P2 diviso quello di P1 sullo stesso modello), poi riassunto con la mediana.
-- **«senza rete»**: il nodo che riceve e inoltra il pacchetto senza eseguire nessuna rete neurale. È il costo fisso che ogni versione paga; il costo della **rete neurale** è quello che ogni versione aggiunge sopra.
+- **«rumore ±5 %»**: quanto cambia la stessa misura rifatta in un'altra sessione (pagina iniziale). Una differenza più piccola non è una differenza; e un rapporto fra due misure di sessioni diverse può uscire poco sopra 100 % anche dove fisicamente non può (slide 11).
+
+Un rapporto come **«4,3 volte»** si calcola modello per modello (per esempio il costo di P2 diviso quello di P1 sullo stesso modello), poi si riassume con la mediana. **«Senza rete»** è il nodo che riceve e inoltra il pacchetto senza eseguire nessuna rete neurale: il costo fisso che ogni versione paga.
 
 Due grandezze tornano ovunque. Il **costo** di un pacchetto è il tempo di processore che serve per elaborarlo, in nanosecondi. La **capacità** è quanti pacchetti al secondo il nodo regge: 1 diviso il costo. Un nodo che spende 250 ns per pacchetto ne regge 4 milioni al secondo.
 
@@ -88,7 +95,7 @@ Le schede a destra danno, per ogni versione, il costo e la capacità dal modello
 
 >> **Esempio di calcolo.** P2, nella mediana dei modelli, regge 3,4 milioni di pacchetti al secondo: spende 1 / 3 400 000 di secondo, circa 291 ns, per pacchetto. Il nodo senza rete ne spende 67. La differenza, circa 225 ns, è il tempo della rete neurale.
 
-La rete neurale costa da 19 a 155 ns se i pesi sono scritti nel programma (P1), da 129 a 446 se la forma si legge da tabella (P2), da 240 a 852 se anche il numero di strati (P3). Un core regge da 11,7 a 1,1 milioni di pacchetti al secondo. L'ordine P1 ≤ P2 ≤ P3 vale su 85 modelli su 85.
+Fra il modello più leggero e il più pesante, la rete neurale costa da 19 a 155 ns se i pesi sono scritti nel programma (P1), da 129 a 446 se la forma si legge da tabella (P2), da 240 a 852 se anche il numero di strati (P3). Un core regge da 11,7 a 1,1 milioni di pacchetti al secondo. L'ordine P1 ≤ P2 ≤ P3 vale su 85 modelli su 85.
 
 == 5 | Quanto è grande il programma non dice quanto lavora
 **Grafico a sinistra.** Due modi di contare le istruzioni:
@@ -106,7 +113,7 @@ Il processore ha tre tipi di core: sei **P-core** veloci, otto **E-core** effici
 
 **A sinistra** la capacità, **a destra** il tempo per pacchetto, nella mediana dei 14 modelli misurati su tutti e tre i core.
 
-Sull'E-core il nodo regge circa il 63 % del P-core senza rete, e fino a circa l'83 % con P2 e P3. Più la versione è pesante, meno pesa il tipo di core: la slide 8 spiega perché. Il LP E-core regge dal 32 al 53 % del P-core.
+In mediana, sull'E-core il nodo regge il 63 % del P-core senza rete e l'82–83 % con P2 e P3; fra i modelli si va dal 61 al 91 %. Più la versione è pesante, meno pesa il tipo di core: la slide 8 spiega perché. Il LP E-core regge dal 32 al 53 % del P-core.
 
 >> **Esempio.** P3, mediana dei 14 modelli: 2,2 milioni di pacchetti al secondo sul P-core, 1,8 sull'E-core, 1,0 sul LP E-core. In tempo: 462, 562 e 976 ns per pacchetto.
 
@@ -128,13 +135,13 @@ Le barre dividono i cicli per pacchetto in due parti, sul P-core (P) e sull'E-co
 - **parte fissa del nodo** (grigio): i cicli del nodo senza rete, cioè ricevere, leggere l'intestazione, inoltrare e liberare la memoria del pacchetto;
 - **rete neurale** (arancione): i cicli che ogni versione aggiunge.
 
-Il risultato è netto. La parte fissa passa da 231 a 360 cicli, il 56 % in più, su ogni modello. La rete neurale cambia poco: per P2 e P3 il 10–13 % in più, per P1 circa lo stesso.
+Il risultato è netto. La parte fissa passa da 231 a 360 cicli in mediana, il 56 % in più; fra i modelli da +50 a +60 %, quindi su ogni modello. La rete neurale cambia poco: in mediana +10 % per P2 e +13 % per P3. Nelle schede la cifra grande è la mediana, la riga sotto l'intervallo fra i modelli.
 
 >> **Perché.** La parte fissa è codice del kernel con molti salti e accessi alla memoria, dove un core più semplice si ferma spesso ad aspettare. La rete neurale è una fila di moltiplicazioni e somme indipendenti, che anche l'E-core esegue molte per volta.
 
 È per questo che nella slide 6 il rapporto fra i core migliora con le versioni più pesanti: più tempo il nodo passa nella rete neurale, meno conta che il core sia un E-core.
 
-!! **P1, −6 %.** Per P1 la rete costa poche decine di cicli sopra una parte fissa di 231–360: la differenza fra due numeri grandi è incerta. Va letta come «circa uguale», non come «l'E-core è più veloce».
+!! **P1, «≈ uguale».** Per P1 la rete costa poche decine di cicli sopra una parte fissa di 231–360: è la piccola differenza fra due numeri grandi, e fra i modelli va da −45 a +17 %. Il segno non è affidabile: la scheda dice «≈ uguale», non «l'E-core è più veloce».
 
 == 9 | Il LP E-core paga anche la memoria
 **A sinistra** le **letture andate in memoria** per pacchetto: quante volte il core cerca un dato nella sua cache (una piccola memoria veloce vicino al core) e non lo trova, e deve andarlo a prendere nella memoria principale, molto più lenta. Su P-core ed E-core sono zero: i pacchetti che il generatore scrive restano nella cache che questi core condividono. Il LP E-core sta fuori da quella cache: ha 14–19 letture in memoria per pacchetto, e ogni volta aspetta.
@@ -150,7 +157,7 @@ Qui il traffico **cresce** a poco a poco, da 0,5 a 12 milioni di pacchetti al se
 
 Modelli diversi hanno capacità diverse. Per metterli sullo stesso grafico, entrambi gli assi sono divisi per la capacità di ogni modello: sull'asse orizzontale il traffico offerto, sull'asse verticale i pacchetti inoltrati. Così «1» vuol dire «la capacità di quel modello», qualunque sia.
 
-Ogni curva sale in diagonale (tutto ciò che arriva viene inoltrato) finché il traffico resta sotto la capacità, poi diventa piatta: il nodo non può inoltrare di più, e il resto viene respinto dalla coda d'ingresso piena. Il massimo inoltrato coincide con la capacità misurata a nodo pieno: 0,98 volte sul P-core, 0,99 sull'E-core.
+Ogni curva sale in diagonale (tutto ciò che arriva viene inoltrato) finché il traffico resta sotto la capacità, poi diventa piatta: il nodo non può inoltrare di più, e il resto viene respinto dalla coda d'ingresso piena. Il massimo inoltrato coincide con la capacità misurata a nodo pieno: 0,98 volte sul P-core e 0,99 sull'E-core, in mediana. Qualche curva arriva poco sopra 1 (fino a 1,03): le due grandezze vengono da sessioni diverse, ed è rumore di misura, non un nodo che inoltra più della sua capacità.
 
 >> **Dove si perde.** Il banco conta i pacchetti in tre punti: inviati, ricevuti dal programma, inoltrati. Quasi tutti i pacchetti persi si perdono **prima** del programma, nella coda: il programma inoltra tutto ciò che riceve. Il collo di bottiglia è il programma, non la trasmissione, su ogni tipo di core.
 
@@ -161,7 +168,11 @@ Qui il nodo usa **due core**, ciascuno con la sua coda d'ingresso, il suo genera
 
 >> **Come si legge.** P2 con un P-core regge 3,6 milioni di pacchetti al secondo, con due 7,1: il doppio. Sull'E-core 2,9 e 5,8.
 
-Due core reggono il 99 % del doppio di un core, sia sul P-core sia sull'E-core, con ogni modello. Il secondo core non rallenta il primo perché non scrivono mai negli stessi dati: ogni core ha i suoi contatori e la sua coda d'uscita.
+In mediana due core reggono il 99 % del doppio di un core, sia sul P-core sia sull'E-core. Fra modelli e versioni il rapporto va dal 94 al 103 % sul P-core e dal 98 al 101 % sull'E-core.
+
+!! **Perché il 103 %.** Due core non possono reggere più del doppio di uno. Ma «un core» e «due core» sono due misure fatte in sessioni diverse, ciascuna con il suo rumore (fino al 5 %): il loro rapporto oscilla di qualche punto attorno al valore vero, sopra e sotto. Il 94–103 % dice quindi una cosa sola: **il doppio, entro il rumore**.
+
+Il secondo core non rallenta il primo perché non scrivono mai negli stessi dati: ogni core ha i suoi contatori e la sua coda d'uscita.
 
 Conseguenza pratica: una scheda di rete vera divide i pacchetti su più code, ognuna servita da un core. Un nodo con N code regge circa N volte la capacità di un core.
 
@@ -172,7 +183,7 @@ Una versione del programma legge l'orologio in tre punti: all'ingresso del progr
 
 Le barre mostrano il tempo minimo di ciascun pezzo, nella mediana dei 91 modelli, sul P-core (P) e sull'E-core (E).
 
-Il trasporto è un costo comune: 187–221 ns sul P-core e 226–274 sull'E-core, con ogni modello e ogni versione. Il programma va da 27 ns senza rete a 391 ns con P3 (mediane sul P-core), e per P3 da 237 a 797 ns secondo il modello; sull'E-core costa di più, tanto di più quanto più è lungo.
+Il trasporto è un costo comune: fra tutti i modelli e le versioni sta fra 187 e 221 ns sul P-core e fra 226 e 274 sull'E-core. Il programma, in mediana sul P-core, va da 27 ns senza rete a 391 ns con P3; fra i modelli, P3 va da 237 a 797 ns. Sull'E-core costa di più, tanto di più quanto più è lungo.
 
 >> **Esempio.** P2 sul P-core: 229 ns di programma più 204 di trasporto. La somma, circa 430 ns, è il tempo minimo fra l'arrivo del pacchetto e il suo arrivo al nodo successivo.
 
@@ -180,8 +191,8 @@ Il trasporto è un costo comune: 187–221 ns sul P-core e 226–274 sull'E-core
 
 == 13 | Il costo dipende solo da versione e modello
 Tre controlli sul P-core, ciascuno su modelli dal più leggero al più pesante:
-- **a sinistra la taglia del pacchetto** (6 modelli): a 64, 512 e 1 514 byte ogni versione costa uguale, con l'1,2 % di differenza in mediana. Il nodo legge solo l'intestazione del pacchetto, come farebbe su una scheda di rete vera;
-- **a destra la decisione presa** (8 modelli): lo stato dei collegamenti e il TTL sono scelti apposta perché la rete decida ciascuna delle uscite che il modello sa raggiungere. Inoltrare su una porta o su un'altra costa uguale; **scartare** il pacchetto (rosso) costa circa 51 ns in più;
+- **a sinistra la taglia del pacchetto** (6 modelli): a 64, 512 e 1 514 byte ogni versione costa uguale: l'1,2 % di differenza in mediana, meno del rumore. Il nodo legge solo l'intestazione del pacchetto, come farebbe su una scheda di rete vera;
+- **a destra la decisione presa** (8 modelli): lo stato dei collegamenti e il TTL sono scelti apposta perché la rete decida ciascuna delle uscite che il modello sa raggiungere. inoltrare su una porta o su un'altra costa uguale, entro il rumore; **scartare** il pacchetto (rosso) costa circa 51 ns in più, in mediana;
 - nel riquadro, **pacchetti tutti diversi** (12 modelli): un TTL diverso a ogni pacchetto fa prendere al modello decisioni diverse pacchetto per pacchetto, e il costo non cambia.
 
 >> **Perché scartare costa di più.** Quando il pacchetto è inoltrato, la sua memoria la libera il core d'uscita; quando è scartato, la libera il core del nodo, che quindi lavora di più. È un effetto del banco, non della rete neurale.
@@ -222,7 +233,7 @@ Prima di passare alla sola rete neurale, un controllo su come la si misura. Il c
 
 Ogni grafico ha tre curve, mediane per numero di strati: **nodo pieno** (grigio tratteggiato), **poco traffico, il pacchetto più veloce** (chiaro) e **poco traffico, media** (scuro). **A sinistra P3, a destra P2.**
 
-Per P3 la media con poco traffico vale 1,02 volte il costo a nodo pieno, per P2 1,03: **le due misure danno lo stesso costo**, su ogni modello. Il pacchetto più veloce costa circa il 14 % meno della media.
+In mediana, per P3 la media con poco traffico vale 1,02 volte il costo a nodo pieno, per P2 1,03: **le due misure danno lo stesso costo**, entro il rumore. Il pacchetto più veloce costa circa il 14 % meno della media.
 
 >> **Perché il pacchetto più veloce costa meno.** Fra un pacchetto e l'altro il core riceve, inoltra e serve il kernel, e una parte di ciò che il programma aveva in cache viene sostituita. Il pacchetto più veloce è quello che trova tutto già pronto; la media è il costo tipico, e coincide con quello misurato a nodo pieno.
 
@@ -316,6 +327,6 @@ Anche i valori dei pesi contano poco: sei forme ripetute con pesi estratti in mo
 Le quattro forme con il 50 e il 90 % di pesi esattamente uguali a zero. Il grafico dà il costo misurato della rete diviso quello che la legge della slide 23 prevede per lo stesso modello senza zeri: 1 vuol dire «come previsto», sotto 1 «più veloce».
 
 - **P1 e P1.5 accelerano**: al 90 % di zeri P1 costa 0,44 volte il previsto e P1.5 0,62. Il programma di P1.5 scende a circa un terzo delle istruzioni: il compilatore vede che un peso è zero e toglie la moltiplicazione.
-- **P2 e P3 non cambiano** (1,02 e 1,01 volte il previsto), con un programma identico a quello senza zeri. Uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
+- **P2 e P3 non cambiano**: 1,02 e 1,01 volte il previsto in mediana, cioè come previsto entro il rumore, con un programma identico a quello senza zeri. Uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
 
 È l'unico caso in cui dimensione del programma e tempo scendono insieme. Mettere pesi a zero (potare il modello) rende più veloci solo le versioni con i pesi nel programma; con P2 e P3 non dà niente in velocità, e va scelto solo per l'accuratezza.
