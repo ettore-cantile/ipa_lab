@@ -198,11 +198,21 @@ def _build_p3(model, instrument=False):
 # --------------------------------------------------------------------------
 # after the build
 # --------------------------------------------------------------------------
-def register_model_id(setup, model_id, model=None):
+def register_model_id(setup, model_id, model=None, offset=0):
     """Make the model answer to `model_id` as well (pktgen writes 190).
-    Same weights, same descriptor, same semantics as model_id 0."""
+    Same weights, same descriptor, same semantics as model_id 0, unless
+    `model` is given. `offset` is where its weights go in the pipeline's
+    weight block (P2 weight_offset, P3 base_offset).
+
+    This WRITES IN PLACE: on a model_id that packets are already using it is
+    not atomic (weights, shapes and descriptor change one table at a time).
+    To change the model of a node in service use install_model / retire_model
+    (make-before-break)."""
     model = model or setup["model"]
     b, pl = setup["b"], setup["pipeline"]
+    if pl in (2, 3):
+        setup.setdefault("regions", {})[model_id] = (offset,
+                                                     len(model.weights))
     if pl == 0:
         return
     if pl == 1:
@@ -213,6 +223,7 @@ def register_model_id(setup, model_id, model=None):
             from ebpf_template_arch import load_arch_weights
             h = model.hidden
             load_arch_weights(b, model.weights, model_id=model_id,
+                              weight_offset=offset,
                               scale=model.scale, n_h1=h[0],
                               n_h2=h[1] if len(h) > 1 else h[0],
                               features=model.features, n_in=model.n_in,
@@ -220,12 +231,88 @@ def register_model_id(setup, model_id, model=None):
         else:
             from ebpf_modular import load_modular_weights
             load_modular_weights(b, model.weights, model_id=model_id,
+                                 base_offset=offset,
                                  scale=model.scale,
                                  layer_dims=model.layer_dims,
                                  features=model.features,
                                  semantics=model.semantics)
     except ValueError as e:
         raise NotApplicable(f"P{pl}: {e}")
+
+
+# --------------------------------------------------------------------------
+# changing the model of a node in service (make-before-break)
+# --------------------------------------------------------------------------
+def weight_capacity(setup):
+    """Size of the weight block every model of P2 / P3 shares."""
+    if setup["pipeline"] == 2:
+        from ebpf_template_arch import MAX_WEIGHT_ENTRIES
+        return MAX_WEIGHT_ENTRIES
+    from ebpf_modular import MAX_LAYER_WEIGHT_ENTRIES
+    return MAX_LAYER_WEIGHT_ENTRIES
+
+
+def install_model(setup, model, model_id):
+    """Step 1 of a model change, for P2 and P3: install `model` under a NEW
+    `model_id`, in a free part of the weight block, while the old model keeps
+    serving its own id. Everything the datapath reads for the new id is
+    written first and its registry entry last (the commit), so no packet
+    ever sees a mixture: a packet carries one model_id, and an id is never
+    rewritten while in use. Step 2 is the senders' switch to the new id,
+    step 3 retire_model on the old one. Returns the weight offset used.
+
+    Refuses a model_id that is already registered (that would be an in-place
+    rewrite, not atomic) and a model that does not fit beside the ones
+    installed: then the change needs an interruption, and the caller must
+    know."""
+    pl = setup["pipeline"]
+    if pl not in (2, 3):
+        raise NotApplicable(
+            "P1 e P1.5 cambiano modello sostituendo il programma intero: "
+            "il kernel lo fa in un colpo solo, non serve install_model")
+    if pl == 2 and len(model.hidden) != len(setup["model"].hidden):
+        # P2's leaf is compiled for one depth: a model of another depth needs
+        # another program, so it is not a table write
+        raise NotApplicable(
+            f"P2 è compilata per {len(setup['model'].hidden)} strati, il "
+            f"modello nuovo ne ha {len(model.hidden)}: serve un altro "
+            f"programma, non solo le tabelle")
+    regions = setup.setdefault("regions", {})
+    if model_id in regions:
+        raise ValueError(f"model_id {model_id} è già registrato: riscriverlo "
+                         f"mentre i pacchetti lo usano non è atomico; usa un "
+                         f"id nuovo e poi retire_model sul vecchio")
+    n = len(model.weights)
+    cap = weight_capacity(setup)
+    used = sorted(regions.values())
+    offset, ok = 0, False
+    for o, k in used + [(cap, 0)]:
+        if o - offset >= n:
+            ok = True
+            break
+        offset = max(offset, o + k)
+    if not ok:
+        raise NotApplicable(
+            f"il modello nuovo ({n} pesi) non sta accanto a quelli installati "
+            f"(blocco da {cap}): il cambio richiede un'interruzione")
+    register_model_id(setup, model_id, model, offset=offset)
+    return offset
+
+
+def retire_model(setup, model_id):
+    """Step 3: remove `model_id` once the senders have switched away from it.
+    One delete from the registry (a hash map, so atomic): packets still
+    carrying it are no longer processed (XDP_PASS, to the stack), never
+    computed with half a model. Its weight region becomes free."""
+    pl = setup["pipeline"]
+    name = {2: "arch_registry", 3: "layer_registry"}.get(pl)
+    if name is None:
+        raise NotApplicable("retire_model vale per P2 e P3")
+    try:
+        del setup["b"][name][ct.c_uint8(model_id)]
+    except KeyError:
+        pass
+    setup.get("regions", {}).pop(model_id, None)
 
 
 def set_node(setup, node_index):

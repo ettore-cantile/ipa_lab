@@ -1,0 +1,44 @@
+
+== template: A = pop_m000 (17-2-3, 45 pesi, scala 25, 1 strati nascosti, ingressi [link_state 3, ingress_iface 3, ttl 1 /30, node 10], DROP = classe 2),
+   B = pop_m001 (17-8-7, 207 pesi, scala 25, 1 strati nascosti, ingressi [link_state 3, ingress_iface 3, ttl 1 /30, node 10], DROP = classe 6); classe di A 1, di B 0 per lo stesso pacchetto
+[Pipeline2] arch_weights fd=15 block=1024 bytes
+[Pipeline2] arch_weights[0] verify: OK
+[Pipeline2] model_desc[0] = n_feat=4 n_in=17 feats=[(1, 3, 0, 1), (2, 3, 3, 1), (3, 1, 6, 30), (4, 10, 7, 1)]
+[class_action] class_action_t2[model_id=0, bank=0]: n_out=3 drop_class=2 ports=[0, 1]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: DROP
+[Pipeline2] arch_registry[0] = arch_id=0 woff=0 scale=25 shape=17-2-2-3 weights=45
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+  al posto              175101 pacchetti, 11025 cambi: classi {0: 82468, 1: 92633}; misti 0 (classe estranea 0, non elaborati 0); id appena ritirato 0
+[Pipeline2] arch_weights fd=30 block=1024 bytes
+[Pipeline2] arch_weights[0] verify: OK
+[Pipeline2] model_desc[0] = n_feat=4 n_in=17 feats=[(1, 3, 0, 1), (2, 3, 3, 1), (3, 1, 6, 30), (4, 10, 7, 1)]
+[class_action] class_action_t2[model_id=0, bank=0]: n_out=3 drop_class=2 ports=[0, 1]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: DROP
+[Pipeline2] arch_registry[0] = arch_id=0 woff=0 scale=25 shape=17-2-2-3 weights=45
+[Pipeline2] NOTE: arch_progs wiring is caller's responsibility (setup_template already does: b['arch_progs'][0]=leaf_fn.fd)
+  make-before-break     569829 pacchetti,  3311 cambi: classi {0: 285865, 1: 283964}; misti 0 (classe estranea 0, non elaborati 0); id appena ritirato 0
+  registrare lo stesso modello in un processo nuovo: 1a 0.62 ms, 2a 0.19 ms, 3a 0.17 ms
+
+== modular: A = pop_m000 (17-2-3, 45 pesi, scala 25, 1 strati nascosti, ingressi [link_state 3, ingress_iface 3, ttl 1 /30, node 10], DROP = classe 2),
+   B = pop_m001 (17-8-7, 207 pesi, scala 25, 1 strati nascosti, ingressi [link_state 3, ingress_iface 3, ttl 1 /30, node 10], DROP = classe 6); classe di A 1, di B 0 per lo stesso pacchetto
+[Pipeline3] model_desc[0] = n_feat=4 n_in=17 feats=[(1, 3, 0, 1), (2, 3, 3, 1), (3, 1, 6, 30), (4, 10, 7, 1)]
+[class_action] class_action_t3[model_id=0, bank=0]: n_out=3 drop_class=2 ports=[0, 1]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: DROP
+[Pipeline3] model_id=0 registered: scale=25, shape=17-2-3, n_layers=2, base_offset=0, total_weights=45
+  al posto              183148 pacchetti, 10156 cambi: classi {0: 95347, 1: 87741}; misti 60 (classe estranea 0, non elaborati 60); id appena ritirato 0
+[Pipeline3] model_desc[0] = n_feat=4 n_in=17 feats=[(1, 3, 0, 1), (2, 3, 3, 1), (3, 1, 6, 30), (4, 10, 7, 1)]
+[class_action] class_action_t3[model_id=0, bank=0]: n_out=3 drop_class=2 ports=[0, 1]
+[class_action]   class 0: FORWARD -> logical_port 0
+[class_action]   class 1: FORWARD -> logical_port 1
+[class_action]   class 2: DROP
+[Pipeline3] model_id=0 registered: scale=25, shape=17-2-3, n_layers=2, base_offset=0, total_weights=45
+  make-before-break     549402 pacchetti,  3147 cambi: classi {0: 273893, 1: 275509}; misti 0 (classe estranea 0, non elaborati 0); id appena ritirato 0
+  registrare lo stesso modello in un processo nuovo: 1a 1.11 ms, 2a 0.20 ms, 3a 0.19 ms
+
+make-before-break: nessun pacchetto misto
