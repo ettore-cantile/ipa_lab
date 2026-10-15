@@ -942,7 +942,9 @@ def sec_shape(c):
     if not any(groups.values()):
         return []
     L = ["## Larga o profonda, a parita' di pesi", "",
-         "Cinque forme con ~592 pesi, da 1 a 5 strati: ns di rete neurale "
+         "Cinque forme per composizione, a pari pesi dentro ognuna (~600 "
+         "con ipa65, ~210-270 con dense17; a 4-5 strati le MAC eseguite "
+         "crescono del 16-43 %), da 1 a 5 strati: ns di rete neurale "
          "con 1 strato → con 5, e la pendenza per strato (minimi quadrati), "
          "P-core.", ""]
     rows, slopes = [], {m: [] for m in PIPES}

@@ -448,10 +448,27 @@ class Pop:
                 if d.get(1) and d.get(5):
                     v.append((d[5] / d[1] - 1) * 100)
             rise[m] = summ(v)
+        # "a pari pesi" solo in parte: i pesi sono pari dentro un ingresso
+        # (non fra i due), e a 4-5 strati le MAC eseguite crescono. Le cifre
+        # per dirlo nelle didascalie.
+        lays = sorted({self.m(i, "layout") for i in ids})
+        wts = {lay: [int(num(self.m(i, "weights"))) for i in ids
+                     if self.m(i, "layout") == lay] for lay in lays}
+        mac_rise = []
+        for lay in lays:
+            mac = {int(num(self.m(i, "depth"))): num(self.m(i, "mac_exec"))
+                   for i in ids if self.m(i, "layout") == lay}
+            mac_rise += [mac[d] / mac[1] - 1 for d in mac if d >= 4]
         return dict(nn=res, slope={m: summ(v) for m, v in slopes.items()},
                     rise=rise, n=len(ids),
                     total={k: self.by_group(k, "ns", "depth", ids, nn=False)
-                           for k in ("P", "E")})
+                           for k in ("P", "E")},
+                    instr=self.by_group("P", "instr", "depth", ids, nn=False),
+                    size=self.by_group(
+                        "P", None, "depth", ids, nn=False,
+                        stat=lambda k, i, m: self.c.size.get(i, {}).get(m)),
+                    weights={lay: (min(w), max(w)) for lay, w in wts.items()},
+                    mac_rise=(min(mac_rise), max(mac_rise)))
 
     def replicas(self):
         groups = {}
@@ -570,8 +587,6 @@ class Pop:
         f["laws"] = laws
         f["depth"] = {k: self.by_group(k, "ns", "depth", dense)
                       for k in ("P", "E")}
-        f["depth_total"] = {k: self.by_group(k, "ns", "depth", dense, nn=False)
-                            for k in ("P", "E")}
         f["depth_instr"] = self.by_group("P", "instr", "depth", dense,
                                          nn=False)
         f["depth_size"] = self.by_group(

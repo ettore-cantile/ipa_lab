@@ -325,9 +325,10 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 |---|---|
 | **Ipotesi** | La conclusione di D1 vale anche fuori da P1. **Parzialmente falsa.** |
 | **Variabile modificata** | Come lo stesso budget è disposto: 1–5 hidden layer (famiglia imbuto). |
-| **Variabili fisse** | **I parametri: ~592** (591–604), su due composizioni dell'ingresso (10 modelli). |
+| **Variabili fisse** | **I parametri, dentro ogni composizione dell'ingresso**: 589–604 con `ipa65`, 207–268 con `dense17` (10 modelli). Non le MAC eseguite: uguali entro il 3 % da 1 a 3 strati, **+16–43 % a 4 e 5 strati** (strati intermedi da 5 e 4 neuroni invece di 3). |
 | **Risultato** | Sola rete, da 1 a 5 strati: **P2 +48 [44–53] %**, **P3 +63 [55–70] %**, circa 27 e 58 ns per strato; P1 +17 %, P1.5 +14 %, circa 4 ns per strato (69–92 ns). Istruzioni caricate: P2 +887 per strato (legge), P3 **12 288 su ogni modello**. |
 | **Conclusione** | Le due P1 crescono poco; P2 paga lo strato in codice, P3 un salto per strato a codice identico. Con le pipeline generiche, a parità di pesi, conviene una rete larga e poco profonda. |
+| **Limite dichiarato** | ⚠️ Da 1 a 5 strati l'aumento comprende le MAC in più di 4 e 5 strati. Da 1 a 3 strati, a pesi e MAC fermi: P3 **+26 %**, P2 **+19 %**, P1 e P1.5 +3–6 %; per strato 46 / 20 / 1–2 ns, come la legge (C8). |
 | **Come rigirarlo** | `bash ipa/test/remeasure_popolazione.sh pop` (famiglia `imbuto`) |
 
 ### D3 — Perché la profondità costa, quando costa ✅
