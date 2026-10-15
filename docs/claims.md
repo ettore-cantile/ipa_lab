@@ -172,9 +172,10 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Metrica** | Installare un modello nuovo su un nodo in servizio (P1: caricare l'oggetto compilato, verifier e JIT; P2/P3: scrivere le tabelle); generare e compilare P1 (clang senza cache, fuori dal nodo); compilare il programma generico (P2/P3, una volta all'avvio). |
 | **Risultato** | Installare: P1 **0,6 [0,3–1,5] ms**, P1.5 0,9 [0,3–5,6], P2 **0,3 [0,2–0,4]**, P3 **0,3 [0,2–0,5] ms**. Generare e compilare P1: **49 [34–114] ms** (P1.5 61 [34–181]); il C si genera in meno di 1 ms, il resto è clang e cresce con il modello. Compilare il programma generico: P2 1,6 [1,5–1,7] s, P3 1,2 s. |
 | **Conclusione** | Sul nodo cambiare modello costa al più 6 ms a tutte, su ogni modello. Il costo di P1 è della **compilazione**, fuori dal nodo: P1 richiede un compilatore per ogni modello nuovo, P2 e P3 no. |
-| **Nota metodologica** | Scrivere le tabelle è misurato su un nodo che le ha già aperte: è il tempo delle scritture, non di un processo che parte da zero. |
-| **Limite dichiarato** | Che cosa succede ai pacchetti che passano **mentre** il modello cambia non è misurato (sezione F). |
-| **Come rigirarlo** | `bash ipa/test/remeasure_popolazione.sh solo` (`bench_solo.py`, e `bench_solo.py --compila` senza root) |
+| **Nota metodologica** | Registrare lo stesso modello tre volte in un processo nuovo: la prima 0,62 ms (P2) e 1,11 ms (P3), le successive ~0,2 ms; la prima paga il piano di controllo che si prepara. I 10–12 ms di `bench_scaling` comprendono ~9 ms di lettura dai file del modello del significato delle classi, fatta dentro il tempo misurato. |
+| **Mentre il modello cambia** | Riscrivere le tabelle allo stesso `model_id` non è atomico: in P3, con 10 156 cambi mentre un altro core esegue il programma, 60 pacchetti su 183 148 hanno trovato tabelle che non stavano insieme e non sono stati elaborati. Con **make-before-break** (`install_model` sotto un id nuovo con il registro scritto per ultimo, poi i mittenti passano al nuovo id, poi `retire_model`): **0 pacchetti misti** in P2 e P3, su 1 119 231 pacchetti e 6 458 cambi (`verify_model_swap.py`). |
+| **Limite dichiarato** | ⚠️ Make-before-break richiede che il modello nuovo stia accanto al vecchio nel blocco dei pesi: 63 modelli su 91 in P2, 85 su 91 in P3; gli altri richiedono un'interruzione. In P2 il modello nuovo deve avere la profondità del programma compilato. |
+| **Come rigirarlo** | `bash ipa/test/remeasure_popolazione.sh solo` (`bench_solo.py`, e `bench_solo.py --compila` senza root); `sudo python3 ipa/test/verify_model_swap.py` |
 
 ### B3 — L'AOT toglie il compilatore dal nodo senza costo per pacchetto ✅ 🔹
 
@@ -497,8 +498,8 @@ Dichiarato per non far sembrare coperto ciò che non lo è.
   macchina e una NIC con XDP nativo.
 - **Il programma da solo in un ciclo caldo, sulla popolazione** (E9): misurato solo a
   chiamate singole.
-- **Che cosa succede ai pacchetti mentre il modello cambia** (B2): il tempo di
-  installazione è misurato, le perdite o le decisioni con una tabella scritta a metà no.
+- **Un cambio di modello senza interruzione per i modelli più grandi** (B2): con
+  make-before-break il modello nuovo deve stare accanto al vecchio nel blocco dei pesi.
 - **Quanto del costo per strato di P3 sia il salto e quanto le letture** (C10): si contano
   entrambi, ma non si separano nel tempo.
 - **La capacità di rxonly**: con uno scrittore per coda il generatore non la satura sul

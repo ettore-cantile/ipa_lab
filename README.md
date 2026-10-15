@@ -70,7 +70,10 @@ In five lines:
   P3) than `BPF_PROG_TEST_RUN` reports, with the same trends on every axis
   (campaign of 10 October, [`results/campagna_2026-10-10/`](results/campagna_2026-10-10/)).
 - **Changing the model costs milliseconds for every pipeline**: P1 is compiled
-  off the node and loaded in ~1 ms; P2 and P3 write a map in ~10 ms.
+  off the node and loaded in ~1 ms; P2 and P3 write their tables in 0.2–1 ms.
+  A model is changed make-before-break (`install_model` under a new id, the
+  senders switch, `retire_model`): no packet ever sees half a model
+  (`verify_model_swap.py`).
 
 ---
 

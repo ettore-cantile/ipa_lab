@@ -1374,7 +1374,10 @@ profondità senza ricompilare, P2 deve ricompilare il programma.
 Con P1 costruita come oggetto precompilato, installare un modello nuovo su un
 nodo già in servizio costa \textbf{0,4--2,2 millisecondi} in P1 --- il nodo apre
 e carica un file pronto --- e \textbf{10--12 millisecondi} in P2 e P3, che
-scrivono in una tabella (pesi e semantica delle classi).
+scrivono in una tabella (pesi e semantica delle classi). Di questi, circa 9~ms
+sono la lettura dai file del modello del significato delle classi, che questo
+banco fa dentro il tempo misurato: le scritture nel kernel costano 0,2--1~ms
+(capitolo~\ref{ch:cambio}).
 
 Contando anche il lavoro di P1 fuori dal nodo --- generare il C, compilarlo con
 clang --- si sta fra 57 e 121~ms. P2 e P3 compilano con BCC una volta sola,
@@ -3552,9 +3555,6 @@ Taglia del pacchetto, porta, TTL non contano & 1,2\,\%, 0\,\%, 0\,\% in mediana 
   \item \textbf{Le letture di tabella e i salti si contano, ma non si separano nel
         tempo}: quanto dei circa 46~ns per strato di P3 sia il salto e quanto le
         letture, la campagna non lo dice.
-  \item \textbf{Il cambio di modello è misurato sul nodo, non durante il traffico}:
-        che cosa succede ai pacchetti che passano mentre le tabelle cambiano resta
-        da provare.
   \item \textbf{Il banco resta un portatile con cavi virtuali}: nessuna scheda di
         rete, generatore sulla stessa macchina. I costi del programma sono quelli
         veri; quello di ricezione su una scheda vera può essere diverso.
@@ -3572,6 +3572,195 @@ CAMPAGNA=results/popolazione_2026-10 POP_RIFAI_DISTURBATE=1 bash ipa/test/remeas
 # la sintesi, le slide e la figura di questo capitolo
 python3 ipa/test/population_report.py results/popolazione_2026-10 > sintesi.md
 python3 docs/slides_src/popolazione.py results/popolazione_2026-10 --pptx
+\end{lstlisting}
+
+% ==================================================================
+\chapter{Cambiare modello senza fermare i pacchetti}
+\label{ch:cambio}
+% ==================================================================
+
+\section{La domanda}
+
+Un nodo in servizio riceve un modello nuovo. Quanto costa installarlo lo dice la
+sezione~\ref{sec:pop-solo}. Qui la domanda è un'altra: \textbf{che cosa vedono i
+pacchetti che arrivano mentre il modello cambia?} Per P1 e P1.5 la risposta è
+semplice: il modello sta dentro il programma, e cambiarlo vuol dire sostituire il
+programma intero, cosa che il kernel fa in un colpo solo. Per P2 e P3 il modello
+sta in più tabelle, e la risposta dipende da come le si scrive.
+
+\section{Le tabelle di un modello}
+
+In P2 e P3 un modello è fatto di cinque cose, scritte dal piano di controllo:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{9.6cm}@{}}
+\toprule
+\textbf{Tabella} & \textbf{che cosa contiene} \\
+\midrule
+pesi & un solo blocco condiviso da tutti i modelli, ciascuno nella sua zona
+       (1\,024 posti in P2, 2\,048 in P3) \\
+forme & in P3, una riga per strato: neuroni d'ingresso, d'uscita, dove stanno i pesi \\
+descrizione degli ingressi & quali feature, di che larghezza, in che ordine \\
+semantica delle classi & che cosa vuol dire ogni classe; due banchi per modello \\
+registro & ``questo \texttt{model\_id} esiste'', con la sua forma e il banco in uso \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Il pacchetto porta nell'intestazione il \texttt{model\_id}; il programma cerca
+quell'id nel registro e da lì legge tutto il resto. In P3 ogni programma della
+catena (il dispatcher, il primo strato, gli strati successivi) rilegge il registro.
+
+\section{Il problema}
+
+Cambiare il modello A con il modello B voleva dire riscrivere le tabelle di A con
+i dati di B, \textbf{allo stesso \texttt{model\_id}}, una tabella alla volta: i
+pesi, poi le forme, poi la semantica, poi il registro, e infine la descrizione
+degli ingressi. Solo la semantica era protetta: si scrive nel banco libero, e la
+scrittura del registro scambia i banchi in un colpo solo. Tutto il resto cambiava
+sotto i piedi dei pacchetti.
+
+\begin{prima}[Un esempio]
+A ha 17 ingressi, 2 neuroni e 3 classi; B ha gli stessi ingressi, 8 neuroni e 7
+classi. Un pacchetto che arriva quando i pesi sono già di B ma la forma dice ancora
+``2 neuroni'' legge i pesi di B con la disposizione di A, e calcola un numero che
+non è né A né B. In P3 può anche cominciare la catena con il registro di A e
+finirla con quello di B. Se i dati che trova non stanno insieme, il programma
+rinuncia e passa il pacchetto al kernel senza decidere; se stanno insieme per
+caso, decide con un modello che non esiste, e nessun controllo se ne accorge.
+\end{prima}
+
+C'era anche un errore d'ordine: la descrizione degli ingressi veniva scritta
+\emph{dopo} il registro, quindi anche un modello installato sotto un id nuovo era
+visibile per un istante con la descrizione vecchia, o vuota.
+
+\section{La soluzione}
+
+Nessuna riga del programma eBPF cambia: cambia il modo in cui il piano di
+controllo scrive le tabelle (\texttt{ipa/test/pipeline\_setup.py},
+\texttt{ipa/ebpf\_template\_arch.py}, \texttt{ipa/ebpf\_modular.py}).
+
+\begin{enumerate}
+  \item \textbf{Il registro per ultimo.} In P2 e in P3 la descrizione degli
+        ingressi si scrive prima del registro. Il registro diventa davvero
+        l'ultima scrittura: finché non c'è, il modello non esiste; quando c'è,
+        tutto il resto è già al suo posto.
+  \item \textbf{Mai riscrivere un modello in uso} (\emph{make-before-break}):
+        \begin{itemize}
+          \item \texttt{install\_model} mette B sotto un \texttt{model\_id}
+                nuovo, in una zona libera del blocco dei pesi. A continua a
+                servire il suo id; nessun pacchetto usa ancora B;
+          \item i mittenti passano al nuovo id. Ogni pacchetto porta il suo
+                \texttt{model\_id}, quindi usa tutto A o tutto B;
+          \item \texttt{retire\_model} cancella l'id di A dal registro, una
+                tabella hash: la cancellazione è una sola operazione, atomica.
+                Un pacchetto che porta ancora l'id ritirato non viene elaborato
+                (passa al kernel), mai calcolato con mezzo modello.
+        \end{itemize}
+\end{enumerate}
+
+Scrivere B nel blocco dei pesi riscrive l'intero blocco, quindi anche la zona di
+A: ma con gli stessi byte, e chi legge A in quell'istante legge sempre A.
+
+\begin{lezione}
+Un \texttt{model\_id} non cambia mai contenuto mentre i pacchetti lo usano: si
+installa il nuovo accanto al vecchio, si sposta il traffico, si toglie il vecchio.
+Ogni pacchetto vede un modello intero.
+\end{lezione}
+
+\textbf{I limiti.} A e B devono stare insieme nel blocco dei pesi: in P2 (1\,024
+posti) il modello nuovo può avere circa metà del blocco, ed è il caso di 63
+modelli della popolazione su 91; in P3 (2\,048 posti) di 85 su 91. Per i modelli
+più grandi \texttt{install\_model} si rifiuta, e il cambio richiede una breve
+interruzione. In P2 il modello nuovo deve avere anche la stessa profondità del
+programma compilato: una profondità diversa richiede un altro programma, non solo
+le tabelle.
+
+\section{La prova}
+
+\texttt{ipa/test/verify\_model\_swap.py} cambia modello migliaia di volte mentre il
+programma lavora senza sosta. Un thread, su un core, esegue il programma un
+pacchetto alla volta (\texttt{BPF\_PROG\_TEST\_RUN}, con gli ingressi del
+traffico); un altro, su un altro core, cambia il modello per 3 secondi. I modelli
+sono due della popolazione con gli stessi ingressi e larghezze diverse: per lo
+stesso pacchetto A decide la classe 1, B la classe 0. Alla fine si contano i
+pacchetti decisi con un'altra classe, o non elaborati mentre il loro id era
+registrato: sono quelli che hanno visto un modello misto.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+& \textbf{modo} & \textbf{cambi} & \textbf{pacchetti} & \textbf{pacchetti misti} \\
+\midrule
+P2 & riscrittura allo stesso id & 11\,025 & 175\,101 & 0 \\
+P2 & make-before-break & 3\,311 & 569\,829 & \textbf{0} \\
+\addlinespace
+P3 & riscrittura allo stesso id & 10\,156 & 183\,148 & \textbf{60} (non elaborati) \\
+P3 & make-before-break & 3\,147 & 549\,402 & \textbf{0} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{In P3 la riscrittura allo stesso id ha prodotto 60 pacchetti non
+        elaborati}: arrivati a metà riscrittura, hanno trovato tabelle che non
+        stavano insieme, e il programma li ha passati al kernel senza decidere.
+        Su un nodo vero non avrebbero seguito la decisione della rete. È lo
+        0,03\,\% dei pacchetti, con un cambio ogni 0,3~ms: su un nodo vero i cambi
+        sono rari, ma il rischio c'è a ogni cambio. E 60 è un minimo, perché la
+        prova girava già con l'ordine corretto delle scritture.
+  \item \textbf{In P2 la riscrittura allo stesso id non ha mostrato pacchetti
+        misti}, ma questo non la rende sicura: la finestra fra i pesi e il
+        registro esiste, ed è solo più stretta; e un modello misto può dare per
+        caso la classe giusta.
+  \item \textbf{Con make-before-break zero pacchetti misti in P2 e in P3}, su più
+        di un milione di pacchetti e 6\,458 cambi in tutto. Nessun pacchetto ha
+        trovato nemmeno un id appena ritirato: i mittenti passano al nuovo id
+        prima che il vecchio sparisca.
+\end{itemize}
+
+I test del kernel che registrano i modelli passano con l'ordine nuovo delle
+scritture: \texttt{test\_model\_source --kernel} 110/110,
+\texttt{verify\_per\_model\_semantics} 53/53.
+
+\section{Quanto costa installare un modello}
+
+Registrare lo stesso modello tre volte di fila, in un processo nuovo, sullo stesso
+programma: la prima costa 0,62~ms in P2 e 1,11~ms in P3, la seconda e la terza
+circa 0,2~ms. La prima paga il piano di controllo che si prepara (gli oggetti
+delle tabelle, i moduli Python); la scrittura nel kernel è la stessa.
+
+\begin{prima}[I 10--12 ms]
+Il banco degli assi (\texttt{bench\_scaling}) misura 10--12~ms per installare un
+modello in P2 e P3. Quel banco chiama la registrazione senza passarle il
+significato delle classi, e la funzione lo ricava leggendo i file del modello
+dentro il tempo misurato: 9,3~ms la prima volta, 0,1~ms le successive. Le
+scritture nel kernel costano 0,2--1~ms; i 10--12~ms sono quasi tutti lettura di
+file.
+\end{prima}
+
+\section{Che cosa non dice}
+
+\begin{itemize}
+  \item \textbf{Il traffico della prova è il programma eseguito dal kernel su un
+        altro core}, non pacchetti veri sul cavo virtuale: è la stessa
+        concorrenza fra chi legge le tabelle e chi le scrive, senza la rete
+        attorno.
+  \item \textbf{P1 e P1.5 non sono nella prova}: cambiano modello sostituendo il
+        programma intero, e il kernel garantisce che un pacchetto ne esegua uno
+        o l'altro.
+  \item \textbf{I modelli che non stanno due volte nel blocco dei pesi} (28 su 91
+        per P2, 6 su 91 per P3) richiedono ancora un'interruzione.
+\end{itemize}
+
+\section{Come rifarla}
+
+\begin{lstlisting}
+sudo python3 ipa/test/verify_model_swap.py --out results/popolazione_2026-10/cambio_modello
+sudo python3 ipa/test/test_model_source.py --kernel
+sudo python3 ipa/test/verify_per_model_semantics.py
 \end{lstlisting}
 
 % ==================================================================
@@ -3604,7 +3793,7 @@ $T_2-T_1$ sul percorso vero (minimo) & 26 ns & 60 ns & 69 ns & 216 ns & 331 ns \
 istruzioni del programma caricato & 135 & 606 & 1\,019 & 15\,089 & 12\,288 \\
 \addlinespace
 \multicolumn{6}{@{}l}{\emph{Cambiare modello su un nodo in servizio}} \\
-caricare sul nodo & --- & \multicolumn{2}{c}{0,4--2,2 ms (AOT)} & \multicolumn{2}{c}{10--12 ms} \\
+caricare sul nodo & --- & \multicolumn{2}{c}{0,4--2,2 ms (AOT)} & \multicolumn{2}{c}{0,2--1 ms (10--12 con la lettura dei file)} \\
 anche generare e compilare & --- & \multicolumn{2}{c}{57--121 ms} & \multicolumn{2}{c}{non serve} \\
 serve un compilatore sul nodo? & --- & \multicolumn{2}{c}{no (compilato prima)} & \multicolumn{2}{c}{no} \\
 \bottomrule

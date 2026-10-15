@@ -346,7 +346,7 @@ Installare un modello nuovo su un nodo in servizio (`update_ms` di `bench_scalin
 | pipeline | sul nodo | una volta, fuori dal nodo o all'avvio |
 |---|---|---|
 | P1, P1.5 | carica l'oggetto AOT già compilato: **0,4–2,2 ms** (sul modello standard `open` 0,08 + verifica e JIT 0,97 ms) | clang, **57–121 ms**, sulla macchina di build |
-| P2 | scrive in mappa pesi, descrittore e semantica: **10–12 ms** | BCC compila il programma generico: ~1,5 s |
+| P2 | scrive in mappa pesi, descrittore e semantica: **10–12 ms**, di cui ~9 ms per leggere dai file del modello il significato delle classi (le scritture: 0,2–1 ms, §13.6) | BCC compila il programma generico: ~1,5 s |
 | P3 | come P2: **10–11 ms** | ~1,2 s |
 
 Nessun compilatore sul nodo per nessuna pipeline. La differenza che resta è qualitativa: P1
@@ -673,7 +673,8 @@ costa ~1 ms per entrambe.
 
 `update_ms` (installare un modello nuovo su un nodo in servizio): P1 e P1.5 **0,4–2,2 ms**
 (caricamento dell'oggetto AOT), P2 e P3 **10–12 ms** (scritture in mappa, compresa la
-semantica). `build_ms` (una volta): P1 57–121 ms di clang sulla macchina di build, P2
+semantica, più ~9 ms per leggere dai file del modello il significato delle classi:
+le scritture da sole costano 0,2–1 ms, §13.6). `build_ms` (una volta): P1 57–121 ms di clang sulla macchina di build, P2
 ~1,5 s e P3 ~1,2 s di BCC all'avvio del nodo. Nessun divario di ordini di grandezza fra le
 pipeline: resta la differenza qualitativa, P1 richiede un compilatore (fuori dal nodo) per
 ogni modello nuovo (§5).
@@ -1684,7 +1685,27 @@ report la ricalcola dalle sole finestre pulite (`bitrate_raw.csv`, la `summarise
 banco) se ogni punto conserva almeno 2 giri su 3. `host_conditions.py --run --env DIR`
 scrive le stesse colonne per un comando qualunque (lo usa la sezione `solo`).
 
-### 13.5 Risultati
+### 13.5 Cambiare modello senza fermare i pacchetti (`verify_model_swap.py`)
+
+Riscrivere le tabelle di un modello allo stesso `model_id` mentre i pacchetti lo usano non è
+atomico: pesi, forme e descrizione cambiano una tabella alla volta. Il cambio si fa
+**make-before-break**: `pipeline_setup.install_model` mette il modello nuovo sotto un id
+nuovo, in una zona libera del blocco dei pesi, con il registro scritto per ultimo; i
+mittenti passano al nuovo id; `retire_model` cancella il vecchio (una cancellazione da
+tabella hash). La prova esegue il programma di continuo su un core e cambia modello su un
+altro per 3 s: con la riscrittura allo stesso id P3 ha 60 pacchetti non elaborati su
+183 148 (10 156 cambi), P2 nessuno su 175 101; con make-before-break 0 pacchetti misti su
+1 119 231 (6 458 cambi). Il modello nuovo deve stare accanto al vecchio (63 modelli su 91 in
+P2, 85 su 91 in P3) e, in P2, avere la profondità del programma compilato.
+
+### 13.6 Quanto costa installare un modello
+
+Lo stesso modello registrato tre volte in un processo nuovo: la prima 0,62 ms (P2) e
+1,11 ms (P3), le successive ~0,2 ms. I 10–12 ms di `bench_scaling` (§5, §9) comprendono
+~9 ms per ricavare dai file del modello il significato delle classi, che quel banco fa
+dentro il tempo misurato.
+
+### 13.7 Risultati
 
 In `results/popolazione_2026-10/sintesi.md`, schede in `docs/claims.md`; slide e
 spiegazione si rigenerano con `python3 docs/slides_src/popolazione.py
