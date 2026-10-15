@@ -1184,9 +1184,21 @@ def load_modular_weights(
         shapes_table[LayerShapeKey(model_id=model_id, layer_idx=layer_idx)] = \
             LayerShapeEntry(n_in=n_in, n_out=n_out, weight_offset=woff)
 
+    # The first-hop feature descriptor BEFORE the commit (default 65-feature
+    # layout unless a custom one is passed) so layer_first builds its IV
+    # generically. n_in must equal the first layer's n_in. It used to be
+    # written after the layer_registry update, leaving a window in which a
+    # packet found the new registry entry with the old, or an empty,
+    # descriptor.
+    if features is None:
+        from model_meta import derive_shape, DEFAULT_META, load_topology_config
+        features = derive_shape(dict(DEFAULT_META),
+                                topology_config=load_topology_config())["features"]
+    load_model_desc(bpf_obj, features, n_in=layer_dims[0][0], model_id=model_id)
+
     # Semantics into this model's INACTIVE bank; the layer_registry write below
-    # (still the last one) commits n_layers and sem_bank together. Other
-    # model_ids' rows are never written.
+    # is the last one, the commit: it makes this model_id visible, with
+    # n_layers and sem_bank together. Other model_ids' rows are never written.
     from ebpf_template_arch import load_class_action
     bank = load_class_action(bpf_obj, "class_action_t3", "layer_registry",
                              model_id, semantics)
@@ -1204,15 +1216,6 @@ def load_modular_weights(
           f"shape={shape_str}, n_layers={n_layers}, "
           f"base_offset={base_offset}, total_weights={total_weights}")
 
-    # Seed the first-hop feature descriptor (default 65-feature layout unless a
-    # custom one is passed) so layer_first builds its IV generically. Folded in
-    # here so every existing caller (methods + test harnesses) registers
-    # model_desc without a separate call. n_in must equal the first layer's n_in.
-    if features is None:
-        from model_meta import derive_shape, DEFAULT_META, load_topology_config
-        features = derive_shape(dict(DEFAULT_META),
-                                topology_config=load_topology_config())["features"]
-    load_model_desc(bpf_obj, features, n_in=layer_dims[0][0], model_id=model_id)
     return total_weights
 
 

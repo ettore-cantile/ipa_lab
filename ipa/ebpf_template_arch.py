@@ -1405,6 +1405,14 @@ def load_arch_weights(bpf_obj, weights_int8: list,
                     ("n_h2",           c_uint8),
                     ("sem_bank",       c_uint8)]
 
+    # The per-model feature descriptor BEFORE the registry: the registry
+    # update below is the commit, the one write that makes this model_id
+    # visible to packets, so everything the datapath reads for it must already
+    # be in place. (It used to be written after the commit, which left a
+    # window in which a packet could find the new registry entry with the old,
+    # or an empty, descriptor.)
+    load_model_desc(bpf_obj, features, n_in, model_id=model_id)
+
     # This model's semantics go into its INACTIVE bank first; the registry
     # update below is the commit: it installs n_out and flips sem_bank in one
     # BPF_MAP_UPDATE_ELEM. No other model_id's rows are touched.
@@ -1419,11 +1427,6 @@ def load_arch_weights(bpf_obj, weights_int8: list,
           f"shape={n_in}-{n_h1}-{n_h2}-{semantics.n_out} weights={n_weights}")
     print("[Pipeline2] NOTE: arch_progs wiring is caller's responsibility "
           "(setup_template already does: b['arch_progs'][0]=leaf_fn.fd)")
-
-    # Seed the per-model feature descriptor so the leaf builds its IV
-    # generically. Folded in here so every existing caller (methods + test
-    # harnesses) registers model_desc without a separate call.
-    load_model_desc(bpf_obj, features, n_in, model_id=model_id)
 
 
 # Max features per descriptor -- must match MAX_FEAT in the eBPF source.
