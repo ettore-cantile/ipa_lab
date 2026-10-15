@@ -212,7 +212,7 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Metrica** | Tempo di CPU meno la baseline; lo scarto dalla legge di costo (C8) al variare dei nodi. |
 | **Risultato** | Nodi, su 56 modelli con l'identità del nodo in ingresso: lo scarto dalla legge non cresce con i nodi, **al più 0,03 ns per nodo** su tutte e quattro le pipeline. Neuroni (famiglia base, mediane): P1 37 → 90, P3 389 → 537 ns da 2 a 8 neuroni; nella legge è il termine per MAC. |
 | **Conclusione** | Una one-hot ha un solo uno, quindi il datapath legge una colonna di pesi qualunque sia la sua larghezza; un layer più largo legge più pesi. **La rete può crescere quanto vuole, il modello no.** |
-| **Come rigirarlo** | `bash ipa/test/remeasure_popolazione.sh pop`; `python3 docs/slides_src/popolazione.py results/popolazione_2026-10` (chiave `nodes`) |
+| **Come rigirarlo** | `bash ipa/test/remeasure_popolazione.sh pop`; `python3 ipa/test/popolazione.py results/popolazione_2026-10` (chiave `nodes`) |
 
 ### C3 — In P1 il conteggio istruzioni e il tempo dipendono dai valori dei pesi ✅
 
@@ -295,7 +295,7 @@ nodo da mappa) c'è una P1 pienamente specializzata (pesi **e** nodo compilati).
 | **Risultato** | Quote mediane fisso · MAC · strati: **P1 40 · 50 · 8 %**, P1.5 48 · 46 · 5 %, **P2 47 · 18 · 31 %**, **P3 37 · 18 · 39 %**. P3 fa 35 [23–54] letture di tabella per pacchetto, circa 6 in più per strato, e un salto per strato su 89/89 modelli. |
 | **Conclusione** | Con i pesi nel codice circa metà del tempo è aritmetica; con i pesi in tabella circa l'82 % è struttura: il termine fisso (dispatcher, descrittore, ingressi da tabella) e quello per strato (salto allo strato generico e rilettura del contesto). Anche il termine per MAC contiene le tabelle: P3 legge ogni peso da una mappa. Nessun pezzo passa dallo user space: le mappe si leggono nel kernel. |
 | **Limite dichiarato** | ⚠️ Quanto dei 46 ns per strato di P3 sia il salto e quanto le letture non è separato. |
-| **Come rigirarlo** | `python3 docs/slides_src/popolazione.py results/popolazione_2026-10` (chiave `law_shares`); `bench_solo.py` per letture e salti |
+| **Come rigirarlo** | `python3 ipa/test/popolazione.py results/popolazione_2026-10` (chiave `law_shares`); `bench_solo.py` per letture e salti |
 
 ---
 

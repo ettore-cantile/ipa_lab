@@ -14,7 +14,7 @@ in instructions, under real traffic, and on different kinds of CPU core.
 > (Sapienza University of Rome / University of Molise). The code of the
 > preliminary phase is on the `ipa-poc-preliminar` branch.
 >
-> The documents in `docs/` (test guide, claims, notebook, slides) are in
+> The documents in `docs/` (test guide, claims, notebook) are in
 > Italian; this README and the code comments are in English.
 
 ---
@@ -145,8 +145,6 @@ ipa_lab/
     ├── testing.md                the test guide, with every result
     ├── claims.md                 every claim, its evidence and how to reproduce it
     ├── september_notebook.tex/.pdf   the notebook: how it works and what it costs
-    ├── *.pptx + "- spiegazione.pdf"  the slides, and a slide-by-slide explanation
-    ├── slides_src/               build.py and the explanation texts
     └── figures/                  the notebook's charts
 ```
 
@@ -159,7 +157,7 @@ ipa_lab/
 | benches | `bench_throughput.py`, `bench_bitrate.py`, `bench_scaling.py`, `bench_depth_vs_width.py`, `bench_tailcall_overhead.py` | capacity, curves under growing traffic, parametric analysis |
 | infrastructure | `host_conditions.py`, `hw_counters.py`, `xdp_gen.py`, `netns_fabric.py`, `pipeline_setup.py`, `model_under_test.py`, `traffic_models.py`, `campaign_report.py`, `plot_bitrate.py` | machine conditions, hardware counters, generator, fabric, models |
 | campaigns | `remeasure_campagna.sh`, `remeasure_all.sh` | reproduce every number in the documents |
-| population | `model_population.py`, `remeasure_popolazione.sh`, `population_report.py`, `prog_census.py` | every test on a population of models, and the conclusions over it |
+| population | `model_population.py`, `remeasure_popolazione.sh`, `population_report.py`, `popolazione.py`, `prog_census.py` | every test on a population of models, and the conclusions over it |
 
 ---
 
@@ -178,8 +176,7 @@ pip install --user --break-system-packages torch
 
 Nothing else to download or build: the engine compiles the eBPF programs
 itself, against the headers of the running kernel. The documents are rebuilt
-with `pdflatex` (notebook) and with LibreOffice, `pdftoppm` and Chrome (slide
-explanations; `pip install python-pptx` to edit the slides).
+with `pdflatex` (notebook).
 
 ---
 
@@ -548,11 +545,9 @@ weights; P3 at most 16 layers, 8 neurons per layer and 2 048 weights.
 | [`docs/testing.md`](docs/testing.md) | the complete guide to the tests and benches, with every figure |
 | [`docs/claims.md`](docs/claims.md) | every claim of the thesis: hypothesis, measurement, number, command to reproduce it |
 | [`docs/september_notebook.pdf`](docs/september_notebook.pdf) | the notebook: how it works and what it costs, explained from scratch |
-| `docs/Inferenza … eBPF XDP.pptx` + `- spiegazione.pdf` | the results slides, and their explanation one by one, with a first page on how every measurement is taken |
 
-To rebuild: `pdflatex september_notebook.tex` (from `docs/`), and
-`python3 docs/slides_src/build.py` for the explanation PDF (the text is in
-`docs/slides_src/spiegazione_inferenza.txt`).
+To rebuild: `pdflatex september_notebook.tex` (from `docs/`); the cost-law
+chart is redrawn with `python3 ipa/test/popolazione.py results/popolazione_<date> --figura`.
 
 ---
 

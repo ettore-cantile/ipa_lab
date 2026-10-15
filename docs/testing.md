@@ -1749,9 +1749,9 @@ non usa per la stima, sbaglia il tempo sul P-core del 5 % (P2, P3), 6 % (P1) e 1
 
 ### 13.8 Risultati
 
-In `results/popolazione_2026-10/sintesi.md`, schede in `docs/claims.md`; slide e
-spiegazione si rigenerano con `python3 docs/slides_src/popolazione.py
-results/popolazione_2026-10 --pptx` e `python3 docs/slides_src/build.py inferenza`. Durata:
+In `results/popolazione_2026-10/sintesi.md`, schede in `docs/claims.md`; le cifre
+riassuntive si ricalcolano con `python3 ipa/test/popolazione.py results/popolazione_2026-10`
+(con `--figura` ridisegna `docs/figures/popolazione_legge.pdf`). Durata:
 3 h 54 min per le sezioni di traffico, ~30 min per `solo`.
 
 ## Note e limiti

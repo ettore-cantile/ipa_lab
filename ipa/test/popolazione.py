@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-popolazione.py -- le cifre delle slide "Inferenza di una rete neurale nel
-kernel Linux con eBPF XDP", calcolate su una campagna di popolazione.
+popolazione.py -- le cifre riassuntive di una campagna di popolazione.
 
-    python3 docs/slides_src/popolazione.py results/popolazione_2026-10           # cifre
-    python3 docs/slides_src/popolazione.py results/popolazione_2026-10 --pptx    # e slide
+    python3 ipa/test/popolazione.py results/popolazione_2026-10            # cifre
+    python3 ipa/test/popolazione.py results/popolazione_2026-10 --figura   # e figura
 
 Nessuna cifra e' di un modello solo: ogni numero e' una mediana, un
 intervallo [minimo–massimo] o una legge stimata sulla popolazione, letta con
 population_report.Campaign (stesse esclusioni: misure disturbate o bocciate
-fuori). Senza --pptx stampa le cifre in JSON, che servono anche a scrivere
-spiegazione_inferenza.txt e il capitolo del september_notebook. Con --pptx
-riscrive i grafici, le schede e i testi del .pptx (lo stile resta quello del
-file: si sostituiscono i dati, non i grafici).
+fuori). Stampa le cifre in JSON; sono quelle citate in docs/claims.md e nel
+capitolo del september_notebook. Con --figura ridisegna invece la figura
+della legge di costo del notebook (docs/figures/popolazione_legge.pdf).
 """
 import json
 import math
@@ -24,6 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "ipa", "test"))
 sys.path.insert(0, os.path.join(ROOT, "ipa"))
+FIGURE = os.path.join(ROOT, "docs", "figures", "popolazione_legge.pdf")
 
 import population_report as PR  # noqa: E402
 import campaign_report as CR  # noqa: E402
@@ -754,6 +753,75 @@ class Pop:
 
 
 # --------------------------------------------------------------------------
+# figura della legge di costo (docs/figures/popolazione_legge.pdf)
+# --------------------------------------------------------------------------
+COLOR = {"p1_static": "#C8551E", "hardcoded": "#F09A3E",
+         "template": "#2E9C8F", "modular": "#1F5F8B"}
+
+
+def it(x, d=0):
+    """1234.5 -> '1 234,5' (spazio per le migliaia, virgola decimale)."""
+    s = f"{x:,.{d}f}"
+    return s.replace(",", " ").replace(".", ",")
+
+
+def law_figure(pop, facts, path):
+    """Costo della rete meno c x strati contro le MAC eseguite, un punto per
+    modello denso: la parte che la legge attribuisce alle MAC, che deve
+    stare su una retta di pendenza b."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    ink, ink2, grid = "#222B36", "#5B6676", "#E3E7EC"
+    marker = {"p1_static": "o", "hardcoded": "s", "template": "D",
+              "modular": "^"}
+    name = {"p1_static": "P1 statica", "hardcoded": "P1.5", "template": "P2",
+            "modular": "P3"}
+    fig, ax = plt.subplots(figsize=(6.4, 4.0), dpi=200)
+    ax.set_facecolor("white")
+    ids = pop.ids_of(DENSE)
+    xmax = max(num(pop.m(i, "mac_exec")) for i in ids)
+    for m in PIPES:
+        law = facts["laws"][("P", "ns", m)]
+        xs, ys = [], []
+        for i in ids:
+            y = pop.nn("P", i, m)
+            if y is None:
+                continue
+            xs.append(num(pop.m(i, "mac_exec")))
+            ys.append(y - law["c"] * num(pop.m(i, "n_layers")))
+        ax.scatter(xs, ys, s=16, marker=marker[m], color=COLOR[m],
+                   alpha=0.75, linewidths=0.6, edgecolors="white",
+                   label=f"{name[m]}: {it(law['b'], 2)} ns per "
+                         f"moltiplicazione", zorder=3)
+        ax.plot([0, xmax * 1.03], [law["a"], law["a"] + law["b"] * xmax * 1.03],
+                color=COLOR[m], linewidth=2, zorder=2)
+        # P1 e P1.5 finiscono quasi nello stesso punto: etichette scostate
+        dy = {"hardcoded": 9, "p1_static": -9}.get(m, 0)
+        ax.annotate(name[m], (xmax * 1.035,
+                              law["a"] + law["b"] * xmax * 1.03 + dy),
+                    color=ink, fontsize=8, va="center")
+    ax.set_xlim(0, xmax * 1.16)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("moltiplicazioni eseguite per pacchetto", color=ink2,
+                  fontsize=8)
+    ax.set_ylabel("ns di rete neurale, tolta la parte per strato", color=ink2,
+                  fontsize=8)
+    ax.grid(True, color=grid, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(grid)
+    ax.tick_params(colors=ink2, labelsize=7)
+    ax.legend(fontsize=8, frameon=False, loc="upper left",
+              labelcolor=ink, markerscale=1.4)
+    fig.tight_layout()
+    fig.savefig(path, facecolor="white")
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
 # JSON: le chiavi tuple diventano stringhe
 # --------------------------------------------------------------------------
 def _jsonable(o):
@@ -772,9 +840,8 @@ def main(argv):
         sys.exit(__doc__.split("\n\n")[1])
     pop = Pop(argv[0])
     facts = pop.facts()
-    if "--pptx" in argv:
-        import popolazione_pptx as PX
-        PX.build(pop, facts)
+    if "--figura" in argv:
+        law_figure(pop, facts, FIGURE)
     else:
         print(json.dumps(_jsonable(facts), indent=1, ensure_ascii=False))
 

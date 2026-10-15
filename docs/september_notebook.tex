@@ -3673,9 +3673,9 @@ CAMPAGNA=results/prova_pop POP_SOLO="m000 m037" bash ipa/test/remeasure_popolazi
 CAMPAGNA=results/popolazione_2026-10 POP_T2=0 bash ipa/test/remeasure_popolazione.sh genera corretto pop solo
 # rifare solo cio' che il report ha lasciato fuori
 CAMPAGNA=results/popolazione_2026-10 POP_RIFAI_DISTURBATE=1 bash ipa/test/remeasure_popolazione.sh
-# la sintesi, le slide e la figura di questo capitolo
+# la sintesi e la figura di questo capitolo
 python3 ipa/test/population_report.py results/popolazione_2026-10 > sintesi.md
-python3 docs/slides_src/popolazione.py results/popolazione_2026-10 --pptx
+python3 ipa/test/popolazione.py results/popolazione_2026-10 --figura
 \end{lstlisting}
 
 % ==================================================================
