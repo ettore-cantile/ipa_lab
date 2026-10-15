@@ -361,7 +361,7 @@ core fisici distinti, un thread di generatore per coda e una coda d'uscita per c
 | **Ipotesi** | Le perdite su un banco `veth` possono essere della pipeline, del trasporto o della ricezione; vanno separate. |
 | **Variabile modificata** | Il carico offerto (16 punti da 0,5 a 12 Mpps, 3 giri); il modello (6, dal più leggero al più pesante); il tipo di core (P, E). |
 | **Metrica** | Massimo inoltrato contro la capacità a massima spinta dello stesso modello; quota della perdita avvenuta prima di XDP. |
-| **Risultato** | Il massimo inoltrato sta a **0,98 [0,88–1,03]** della capacità sul P-core e **0,99 [0,94–1,03]** sull'E-core, 24 curve per core. Della perdita oltre la capacità, la quota persa **prima di XDP** è 1,000 in mediana. Divise per la capacità del loro modello, le curve si sovrappongono. |
+| **Risultato** | Il massimo inoltrato sta a **0,98 [0,88–1,03]** della capacità sul P-core e **0,99 [0,94–1,03]** sull'E-core, 24 curve per core (i valori sopra 1 sono rumore fra sessioni, G1). Della perdita oltre la capacità, la quota persa **prima di XDP** è 1,000 in mediana. Divise per la capacità del loro modello, le curve si sovrappongono. |
 | **Conclusione** | Il collo di bottiglia è il programma eBPF, all'ingresso, su ogni tipo di core. Un nodo sotto la sua capacità consegna tutto. |
 | **Limite dichiarato** | ⚠️ P1 sui modelli più leggeri regge oltre 9 Mpps, e lì comincia a perdere anche l'uscita: la quota persa all'ingresso scende fino a 0,69, il massimo inoltrato fino a 0,88 della capacità. È il limite del cavo virtuale e del core d'uscita. |
 | **Come rigirarlo** | `bash ipa/test/remeasure_popolazione.sh carico` |
@@ -419,7 +419,7 @@ core fisici distinti, un thread di generatore per coda e una coda d'uscita per c
 | **Ipotesi** | Con i contatori per-CPU i core del nodo non si contendono niente di scritto a ogni pacchetto, quindi due code su due core danno circa il doppio. |
 | **Variabile modificata** | Il numero di core e di code del DUT (1 o 2); il tipo di core (P o E); il modello (8, dal più leggero al più pesante). |
 | **Metrica** | Pacchetti elaborati al secondo a saturazione, 3 giri. |
-| **Risultato** | Un thread `xdp_gen` per coda, una coda e un core d'uscita per core. Due P-core: **99 [94–103] %** del doppio, due E-core (uno per modulo) **99 [98–101] %**, su 40 coppie modello-pipeline per core. |
+| **Risultato** | Un thread `xdp_gen` per coda, una coda e un core d'uscita per core. Due P-core: **99 [94–103] %** del doppio, due E-core (uno per modulo) **99 [98–101] %**, su 40 coppie modello-pipeline per core. Un core e due core sono misure di sessioni diverse, ciascuna con il rumore di G1 (fino al 5 %): i valori sopra 100 % sono quel rumore, non un guadagno. |
 | **Conclusione** | Il costo misurato su un core è quello da moltiplicare per il numero di code di una scheda con RSS, con qualunque modello. |
 | **Limite dichiarato** | ⚠️ Solo 1 e 2 core: oltre, questa macchina non ha P-core liberi per generatore, DUT e uscita insieme. Il secondo core d'uscita del P-core (cpu5) va indicato a mano. |
 | **Come rigirarlo** | `bash ipa/test/remeasure_popolazione.sh core2` |
@@ -470,7 +470,7 @@ core fisici distinti, un thread di generatore per coda e una coda d'uscita per c
 | **Ipotesi** | La variabilità delle misure è della macchina (frequenza, idle, scheduling, temperatura), e si può togliere. |
 | **Variabile modificata** | Le condizioni: frequenza fissa e misurata, C-state profondi spenti, core fisici distinti (e moduli E-core interi), isolamento a runtime (`host_conditions.py`). |
 | **Metrica** | Dispersione fra giri e fra semi; eventi di throttling; misure rifatte. |
-| **Risultato** | Sei forme con quattro semi: coefficiente di variazione del costo della rete ≤ 5–6 % (P3 ≤ 2 %). Le 74 misure rifatte dopo un evento di throttling di pacchetto hanno la stessa distribuzione delle altre. Su questo portatile un evento di throttling di pacchetto arriva circa una volta al minuto, con l'alimentatore e a 57–72 °C: una misura che lo contiene è marcata e lasciata fuori, una curva lunga tiene le sole finestre pulite. Alla fine 2 misure su 526 sono fuori. 🔹 `test_suite`: spread 0–7 %. |
+| **Risultato** | La stessa misura (stesso modello e versione) rifatta in un'altra sessione cambia dell'1,8 % in mediana, del **5 % al 90° percentile**, del 7 % al massimo (30 coppie); i 3 giri di una misura dell'1,3 % in mediana; il nodo senza rete in 91 sessioni del ±1 % (al più 3,5 %). Una differenza sotto il 5 % fra misure di sessioni diverse non è una differenza. Sei forme con quattro semi: coefficiente di variazione del costo della rete ≤ 5–6 % (P3 ≤ 2 %). Le 74 misure rifatte dopo un evento di throttling di pacchetto hanno la stessa distribuzione delle altre. Su questo portatile un evento di throttling di pacchetto arriva circa una volta al minuto, con l'alimentatore e a 57–72 °C: una misura che lo contiene è marcata e lasciata fuori, una curva lunga tiene le sole finestre pulite. Alla fine 2 misure su 526 sono fuori. 🔹 `test_suite`: spread 0–7 %. |
 | **Conclusione** | Le cifre sono ripetibili sulla stessa macchina alla stessa frequenza, e una misura disturbata non entra nelle conclusioni. |
 | **Come rigirarlo** | `sudo python3 ipa/test/test_host_kernel.py --bench` (25/25); `POP_RIFAI_DISTURBATE=1 bash ipa/test/remeasure_popolazione.sh` |
 
