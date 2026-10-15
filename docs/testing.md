@@ -1632,11 +1632,13 @@ python3 ipa/test/population_report.py results/popolazione_2026-10 > sintesi.md
 
 ### 13.1 La popolazione (`model_population.py`)
 
-Tier `base`: 91 modelli in quattro famiglie. **base** (53): 7 composizioni dell'ingresso
+Tier `base`: 109 modelli in cinque famiglie. **base** (53): 7 composizioni dell'ingresso
 (solo dense, solo one-hot, miste; 5–117 ingressi) × profondità 1, 2, 3, 4, 6 × larghezza
 2, 4, 8, metà delle combinazioni, 3–7 uscite. **replica** (20): sei forme con tre semi in
 più (uno a pesi normali). **sparsità** (8): quattro forme al 50 e al 90 % di pesi a zero.
-**imbuto** (10): cinque forme a ~592 pesi su 1–5 strati, due composizioni. Seme fisso
+**imbuto** (10): cinque forme a ~592 pesi su 1–5 strati, due composizioni. **strati**
+(18): 1–6 strati nascosti a moltiplicazioni eseguite costanti (102–113) su tre composizioni
+(dense17, mixed33, ipa65), in fondo al manifesto (id m091–m108). Seme fisso
 (rigenerata è identica byte per byte); un seme si scarta se il modello non inoltra il
 pacchetto del generatore in nessuno stato dei link, o non raggiunge almeno due classi.
 I modelli che P2 non sa eseguire (6, oltre 1 024 pesi) restano, e il manifesto
@@ -1682,8 +1684,15 @@ powerclamp, batteria, frequenza fuori target) e le bocciate, e le elenca in
 evento di throttling di pacchetto arriva circa una volta al minuto anche con
 l'alimentatore: una curva a traffico crescente (~160 s) lo prende quasi sempre, quindi il
 report la ricalcola dalle sole finestre pulite (`bitrate_raw.csv`, la `summarise` del
-banco) se ogni punto conserva almeno 2 giri su 3. `host_conditions.py --run --env DIR`
-scrive le stesse colonne per un comando qualunque (lo usa la sezione `solo`).
+banco) se ogni punto conserva almeno 2 giri su 3. Lo stesso vale per una misura a massima
+spinta (`compare_raw.csv`, ~30 s) disturbata solo da throttling: si tolgono i giri la cui
+finestra cade entro 1 s da un evento registrato in `host_monitor.csv` (che campiona al
+secondo), e le mediane si rifanno come le fa il banco se ogni pipeline conserva almeno 2
+giri. Powerclamp, batteria o frequenza fuori target lasciano la misura fuori. `host_conditions.py --run --env DIR`
+scrive le stesse colonne per un comando qualunque (lo usa la sezione `solo`). Una
+popolazione che aggiunge modelli in fondo al manifesto (una famiglia nuova) si accetta
+nella stessa campagna: le righe dei modelli già misurati restano identiche, il manifesto
+in `$CAMPAGNA` si aggiorna e le sezioni misurano solo i nuovi.
 
 ### 13.5 Cambiare modello senza fermare i pacchetti (`verify_model_swap.py`)
 
@@ -1705,7 +1714,40 @@ Lo stesso modello registrato tre volte in un processo nuovo: la prima 0,62 ms (P
 ~9 ms per ricavare dai file del modello il significato delle classi, che quel banco fa
 dentro il tempo misurato.
 
-### 13.7 Risultati
+### 13.7 Il costo di uno strato a moltiplicazioni ferme (famiglia `strati`)
+
+Istruzioni eseguite per pacchetto, misure grezze (identiche su P-core ed E-core), da 1 a 6
+strati nascosti con le stesse moltiplicazioni: P3 sale in media di **~900 per strato**
+(790–910 secondo la composizione), P2 di ~370 (270–450), P1 e P1.5 restano piatte. I gradini dentro una
+composizione vanno da +270 a +1 350 istruzioni: il costo di uno strato dipende dalla sua
+forma, come scrive il codice.
+
+- **P3** (`EBPF_LAYER_HIDDEN`): ogni strato è un programma raggiunto con un tail call, che
+  rilegge `scratch_meta`, `layer_registry`, `layer_shapes`, i pesi e le attivazioni. I cicli
+  sono srotolati a `MLH_MAX_H` = 8 (il verificatore vuole un numero di giri costante): ogni
+  neurone d'uscita esegue 8 controlli `i >= n_in`, i neuroni oltre `n_out` girano a vuoto.
+- **P2** (`build_arch_leaf`): gli strati sono blocchi in fila nello stesso programma, senza
+  salti né riletture. I cicli interni non hanno il controllo: ogni neurone fa sempre 8
+  moltiplicazioni, per zero oltre la larghezza vera.
+- In entrambe il primo strato è srotolato alla misura massima: il suo costo dipende dalla
+  composizione dell'ingresso, non dalle moltiplicazioni eseguite.
+
+Legge con questi termini (costo fisso per composizione + per strato + per neurone e per
+moltiplicazione degli strati dopo il primo), stimata su tutti i modelli densi (101, P2 95),
+errore su un modello lasciato fuori:
+
+| istruzioni per | P3 | P2 |
+|---|---|---|
+| strato | 687 | 39 |
+| neurone dopo il primo strato | 44 | 122 |
+| moltiplicazione dopo il primo strato | 14 | ~0 |
+| errore mediano fuori stima | **0,1 %** | 1,0 % |
+
+La legge `a + b·MAC + c·strati` di C8 resta quella delle slide: il suo termine per strato è
+la media di questo costo sui modelli della popolazione. Sui 18 modelli della famiglia, che
+non usa per la stima, sbaglia il tempo sul P-core del 5 % (P2, P3), 6 % (P1) e 13 % (P1.5).
+
+### 13.8 Risultati
 
 In `results/popolazione_2026-10/sintesi.md`, schede in `docs/claims.md`; slide e
 spiegazione si rigenerano con `python3 docs/slides_src/popolazione.py

@@ -178,16 +178,23 @@ sec_genera() {
 
 # Il manifesto in $OUT e' quello dei modelli gia' misurati: se la popolazione
 # generata adesso e' un'altra, la ripresa mescolerebbe modelli diversi sotto
-# gli stessi id.
+# gli stessi id. Una popolazione che AGGIUNGE modelli in fondo (una famiglia
+# nuova) va bene: i modelli gia' misurati restano gli stessi, righe identiche
+# all'inizio del manifesto, e le sezioni misurano solo i nuovi.
 stessa_popolazione() {
     local cur=ipa/synth/population/population.csv
     [ -f "$OUT/population.csv" ] || return 0
     [ "$POP_RIFAI" = 1 ] && return 0
-    if ! cmp -s "$cur" "$OUT/population.csv"; then
+    if ! head -n "$(wc -l < "$OUT/population.csv")" "$cur" \
+            | cmp -s - "$OUT/population.csv"; then
         echo "la popolazione generata ($cur) non e' quella gia' misurata in"
         echo "$OUT/population.csv: altra CAMPAGNA, lo stesso POP_TIER, o"
         echo "POP_RIFAI=1 per rimisurare tutto"
         exit 1
+    fi
+    if ! cmp -s "$cur" "$OUT/population.csv"; then
+        echo "  popolazione estesa: $(( $(wc -l < "$cur") - $(wc -l < "$OUT/population.csv") )) modelli nuovi, si misurano solo quelli"
+        cp "$cur" "$OUT/population.csv"
     fi
 }
 

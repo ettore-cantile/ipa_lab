@@ -1,6 +1,6 @@
-method,esito,lat_ns,lat_min,lat_max,retval,fwd_pct,build_ms,update_ms,lookups,n_tail,insns,jited,detail
-baseline,OK,40.0,32,71,4,100.0,724.889,0.0,3.0,0,135,625,
-p1_static,OK,54.0,48,347,4,100.0,3.607,0.541,5.0,1,429,1887,
-hardcoded,OK,56.0,48,1792,4,100.0,1.345,0.528,5.0,1,429,1887,
-template,OK,237.0,214,1809,4,100.0,1462.262,0.285,12.0,1,14604,66403,
-modular,OK,405.0,360,3950,4,100.0,1227.06,0.318,24.0,2,12288,57501,
+method,esito,lat_ns,lat_min,lat_max,lat_hot,hot_k,retval,fwd_pct,build_ms,update_ms,lookups,n_tail,insns,jited,detail
+baseline,OK,37.0,29,480,17,31,4,100.0,697.133,0.0,3.0,0,135,625,
+p1_static,OK,54.0,46,350,34,31,4,100.0,52.639,0.571,5.0,1,429,1887,
+hardcoded,OK,53.0,45,1991,33,31,4,100.0,1.664,0.558,5.0,1,429,1887,
+template,OK,249.0,231,1596,194,31,4,100.0,1444.164,0.304,12.0,1,14604,66403,
+modular,OK,408.0,378,1802,323,31,4,100.0,1197.428,0.293,24.0,2,12288,57501,

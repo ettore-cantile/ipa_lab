@@ -6,16 +6,16 @@ Ogni riga e' un'affermazione e la sua prova sulla popolazione: su quanti modelli
 
 | affermazione | sulla popolazione |
 |---|---:|
-| P2 ha un tetto sui pesi che le altre pipeline non hanno | 6/91 modelli fuori da P2 |
-| P1 decide esattamente come il riferimento intero | 91/91 modelli |
-| P2 decide esattamente come il riferimento intero | 85/85 modelli |
-| P3 decide esattamente come il riferimento intero | 91/91 modelli |
-| rete neurale P1, ns per pacchetto (P-core) | 52 [19–155] |
-| rete neurale P1.5, ns per pacchetto (P-core) | 59 [19–156] |
-| rete neurale P2, ns per pacchetto (P-core) | 225 [129–446] |
-| rete neurale P3, ns per pacchetto (P-core) | 420 [240–852] |
-| P1 ≤ P2 ≤ P3 nel costo della rete neurale (P-core) | 85/85 |
-| P2 costa P1 per | 4.3 [2.7–12.8] |
+| P2 ha un tetto sui pesi che le altre pipeline non hanno | 6/109 modelli fuori da P2 |
+| P1 decide esattamente come il riferimento intero | 109/109 modelli |
+| P2 decide esattamente come il riferimento intero | 103/103 modelli |
+| P3 decide esattamente come il riferimento intero | 109/109 modelli |
+| rete neurale P1, ns per pacchetto (P-core) | 53 [19–155] |
+| rete neurale P1.5, ns per pacchetto (P-core) | 58 [19–156] |
+| rete neurale P2, ns per pacchetto (P-core) | 226 [129–446] |
+| rete neurale P3, ns per pacchetto (P-core) | 421 [240–852] |
+| P1 ≤ P2 ≤ P3 nel costo della rete neurale (P-core) | 103/103 |
+| P2 costa P1 per | 4.4 [2.7–12.8] |
 | P3 costa P1 per | 7.8 [4.9–24.6] |
 | P3 costa P2 per | 1.9 [1.4–2.3] |
 | istruzioni eseguite per strato in piu' (legge, P-core) | P1 -6 (r² 0.97), P1.5 -4 (r² 0.91), P2 370 (r² 0.94), P3 901 (r² 0.99) |
@@ -25,13 +25,13 @@ Ogni riga e' un'affermazione e la sua prova sulla popolazione: su quanti modelli
 | legge di P2 (P-core) | 103 ns + 0.42 ns/MAC + 20 ns/strato; r² 0.93, errore mediano 6% su modelli non visti (n=77) |
 | legge di P3 (P-core) | 154 ns + 0.77 ns/MAC + 46 ns/strato; r² 0.99, errore mediano 3% su modelli non visti (n=83) |
 | contare le MAC eseguite spiega il costo meglio della forma | 4/4 pipeline |
-| la dimensione di P1 predice il suo lavoro (ρ di rango) | 0.98 su 91 modelli |
-| la dimensione di P1.5 predice il suo lavoro (ρ di rango) | 0.90 su 91 modelli |
-| la dimensione di P2 predice il suo lavoro (ρ di rango) | 0.77 su 85 modelli |
-| P2 e' il programma piu' grande ma P3 esegue di piu' | 85/85 |
-| stesse istruzioni per pacchetto su P-core ed E-core | differenza massima 0.3% su 449 coppie modello-pipeline |
+| la dimensione di P1 predice il suo lavoro (ρ di rango) | 0.98 su 109 modelli |
+| la dimensione di P1.5 predice il suo lavoro (ρ di rango) | 0.90 su 109 modelli |
+| la dimensione di P2 predice il suo lavoro (ρ di rango) | 0.79 su 103 modelli |
+| P2 e' il programma piu' grande ma P3 esegue di piu' | 103/103 |
+| stesse istruzioni per pacchetto su P-core ed E-core | differenza massima 0.3% su 534 coppie modello-pipeline |
 | stesse istruzioni anche sul LP E-core | differenza massima 0.7% su 56 coppie |
-| l'E-core perde soprattutto nella parte fissa del nodo | cicli fissi E/P 1.56 [1.50–1.60]; ρ(quota rete, capacita' E/P) = 0.76 |
+| l'E-core perde soprattutto nella parte fissa del nodo | cicli fissi E/P 1.56 [1.50–1.61]; ρ(quota rete, capacita' E/P) = 0.76 |
 | capacita' del LP E-core rispetto al P-core | 0.43 [0.32–0.53] |
 | a parita' di forma, i pesi cambiano il costo di | P1 ≤5%, P1.5 ≤6%, P2 ≤5%, P3 ≤2% |
 | con ≥50% di pesi a zero, misurato / previsto dalla legge densa | P1 0.53 [0.31–0.85], P1.5 0.71 [0.27–0.99], P2 1.03 [0.91–1.14], P3 1.00 [0.91–1.03] |
@@ -47,18 +47,19 @@ Ogni riga e' un'affermazione e la sua prova sulla popolazione: su quanti modelli
 | scartare costa in piu' (effetto del banco: la memoria del pacchetto si libera sul nodo) | 51 [17–63] ns |
 | TTL diversi pacchetto per pacchetto contro pacchetto fisso | 0 [-6–4]% sul tempo del nodo |
 | la taglia del pacchetto non cambia il costo | differenza fra 64 e 1514 byte 1.2 [0.3–3.1]% (30 coppie) |
-| la rete a nodo saturo / la rete da sola a chiamate singole (P-core) | P1 1.37 [0.95–3.55], P1.5 1.23 [1.02–3.19], P2 0.94 [0.77–1.10], P3 0.91 [0.84–0.97] |
-| generare e compilare P1 per un modello nuovo (fuori dal nodo), ms | P1 49 [34–114], P1.5 61 [34–181] |
+| la rete a nodo saturo / la rete da sola in un ciclo caldo (P-core) | P1 1.33 [1.10–1.65], P1.5 1.28 [1.07–1.77], P2 1.08 [1.00–1.12], P3 1.11 [1.07–1.16] |
+| il pacchetto piu' veloce sotto traffico / il ciclo caldo | P1 0.99 [0.95–1.03], P1.5 1.04 [0.92–1.16], P2 0.95 [0.95–0.95], P3 0.97 [0.96–0.98] |
+| generare e compilare P1 per un modello nuovo (fuori dal nodo), ms | P1 50 [34–114], P1.5 61 [34–181] |
 | installare un modello su un nodo in servizio, ms | P1 0.6 [0.3–1.5], P1.5 0.9 [0.3–5.6], P2 0.3 [0.2–0.4], P3 0.3 [0.2–0.5] |
-| letture di tabella per pacchetto | P1 5 [4–5], P1.5 6 [5–6], P2 12 [11–12], P3 35 [23–54] |
-| P3: letture di tabella e salti crescono con gli strati | +6.0 letture per strato; salti = strati su 89/89 modelli |
+| letture di tabella per pacchetto | P1 5 [4–5], P1.5 6 [5–6], P2 12 [11–12], P3 36 [23–54] |
+| P3: letture di tabella e salti crescono con gli strati | +6.0 letture per strato; salti = strati su 108/108 modelli |
 | la stessa misura rifatta in un'altra sessione cambia di | 1.8 % in mediana, 5.0 % al 90° percentile, 7.0 % al massimo (30 coppie) |
-| misure fuori dalle conclusioni (disturbate o bocciate) | 2/526 |
-| curve disturbate tenute senza le finestre colpite | 8 curve, 17/1920 finestre tolte |
+| misure fuori dalle conclusioni (disturbate o bocciate) | 2/580 |
+| misure disturbate tenute senza i giri colpiti | 12 misure, 26/1980 giri o finestre tolti |
 
 ## La popolazione
 
-Per famiglia: base 53, replica 20, sparsita 8, imbuto 10.
+Per famiglia: base 53, replica 20, sparsita 8, imbuto 10, strati 18.
 
 | grandezza | intervallo |
 |---|---:|
@@ -77,15 +78,17 @@ Modelli per composizione dell'ingresso e profondita':
 
 | composizione | 1 strati | 2 strati | 3 strati | 4 strati | 5 strati | 6 strati |
 |---|---:|---:|---:|---:|---:|---:|
-| dense17 | 3 | 4 | 3 | 2 | 1 | 5 |
+| dense17 | 4 | 5 | 4 | 3 | 2 | 6 |
 | dense5 | 5 | 2 | 1 | 2 | 0 | 1 |
 | ipa117 | 4 | 1 | 2 | 1 | 0 | 2 |
 | ipa17 | 2 | 4 | 2 | 1 | 0 | 2 |
-| ipa65 | 2 | 8 | 2 | 3 | 1 | 1 |
-| mixed33 | 2 | 1 | 6 | 3 | 0 | 2 |
+| ipa65 | 3 | 9 | 3 | 4 | 2 | 2 |
+| mixed33 | 3 | 2 | 7 | 4 | 1 | 3 |
 | onehot105 | 1 | 2 | 1 | 5 | 0 | 1 |
 
-P2 non sa eseguire 6 modelli su 91 (MAX_WEIGHT_ENTRIES): m019, m022, m043, m067, m068, m069. Le altre pipeline li eseguono tutti.
+P2 non sa eseguire 6 modelli su 109 (MAX_WEIGHT_ENTRIES): m019, m022, m043, m067, m068, m069. Le altre pipeline li eseguono tutti.
+
+Modelli senza misura a massima spinta (vedi i log): E-core: 1 (m108).
 
 ## Correttezza su ogni modello
 
@@ -93,9 +96,9 @@ Riferimento intero contro eBPF (verify_synth_kernel, BPF_PROG_TEST_RUN, 200 ingr
 
 | pipeline | OK | NO | non applicabile | errore | quali |
 |---|---:|---:|---:|---:|---:|
-| P1 | 91 | 0 | 0 | 0 | - |
-| P2 | 85 | 0 | 6 | 0 | - |
-| P3 | 91 | 0 | 0 | 0 | - |
+| P1 | 109 | 0 | 0 | 0 | - |
+| P2 | 103 | 0 | 6 | 0 | - |
+| P3 | 109 | 0 | 0 | 0 | - |
 
 ## Il nodo senza rete neurale
 
@@ -118,39 +121,39 @@ ns per pacchetto della sola rete neurale: tempo di CPU a nodo saturo meno la bas
 
 | pipeline | n | min | 10° | mediana | 90° | max |
 |---|---:|---:|---:|---:|---:|---:|
-| P1 | 91 | 19 | 27 | 52 | 105 | 155 |
-| P1.5 | 91 | 19 | 36 | 59 | 107 | 156 |
-| P2 | 85 | 129 | 159 | 225 | 315 | 446 |
-| P3 | 91 | 240 | 299 | 420 | 608 | 852 |
+| P1 | 109 | 19 | 28 | 53 | 103 | 155 |
+| P1.5 | 109 | 19 | 37 | 58 | 107 | 156 |
+| P2 | 103 | 129 | 166 | 226 | 310 | 446 |
+| P3 | 109 | 240 | 307 | 421 | 607 | 852 |
 
 Capacita' del nodo, milioni di pacchetti al secondo per core (P-core):
 
 | pipeline | n | min | 10° | mediana | 90° | max |
 |---|---:|---:|---:|---:|---:|---:|
-| baseline | 91 | 14.48 | 14.74 | 15.01 | 15.19 | 15.27 |
-| P1 | 91 | 4.52 | 5.84 | 8.44 | 10.63 | 11.72 |
-| P1.5 | 91 | 4.50 | 5.76 | 7.97 | 9.78 | 11.64 |
-| P2 | 85 | 1.95 | 2.62 | 3.44 | 4.44 | 5.11 |
-| P3 | 91 | 1.09 | 1.49 | 2.06 | 2.74 | 3.26 |
+| baseline | 109 | 14.48 | 14.76 | 15.04 | 15.23 | 15.38 |
+| P1 | 109 | 4.52 | 5.86 | 8.44 | 10.54 | 11.72 |
+| P1.5 | 109 | 4.50 | 5.78 | 8.04 | 9.70 | 11.64 |
+| P2 | 103 | 1.95 | 2.65 | 3.43 | 4.31 | 5.11 |
+| P3 | 109 | 1.09 | 1.49 | 2.05 | 2.68 | 3.26 |
 
 **E-core**
 
 | pipeline | n | min | 10° | mediana | 90° | max |
 |---|---:|---:|---:|---:|---:|---:|
-| P1 | 91 | 13 | 20 | 49 | 95 | 150 |
-| P1.5 | 91 | 14 | 25 | 61 | 105 | 156 |
-| P2 | 85 | 134 | 171 | 246 | 351 | 493 |
-| P3 | 91 | 276 | 338 | 480 | 715 | 968 |
+| P1 | 108 | 13 | 22 | 50 | 90 | 150 |
+| P1.5 | 108 | 14 | 31 | 61 | 100 | 156 |
+| P2 | 102 | 134 | 186 | 248 | 342 | 493 |
+| P3 | 108 | 276 | 343 | 481 | 701 | 968 |
 
 Capacita' del nodo, milioni di pacchetti al secondo per core (E-core):
 
 | pipeline | n | min | 10° | mediana | 90° | max |
 |---|---:|---:|---:|---:|---:|---:|
-| baseline | 91 | 9.25 | 9.33 | 9.41 | 9.47 | 9.54 |
-| P1 | 91 | 3.92 | 4.98 | 6.42 | 7.91 | 8.34 |
-| P1.5 | 91 | 3.81 | 4.74 | 6.00 | 7.61 | 8.33 |
-| P2 | 85 | 1.67 | 2.19 | 2.83 | 3.60 | 4.16 |
-| P3 | 91 | 0.93 | 1.22 | 1.71 | 2.25 | 2.61 |
+| baseline | 108 | 9.25 | 9.33 | 9.40 | 9.47 | 9.54 |
+| P1 | 108 | 3.92 | 5.08 | 6.38 | 7.75 | 8.34 |
+| P1.5 | 108 | 3.81 | 4.84 | 5.99 | 7.31 | 8.33 |
+| P2 | 102 | 1.67 | 2.23 | 2.82 | 3.42 | 4.16 |
+| P3 | 108 | 0.93 | 1.24 | 1.70 | 2.23 | 2.61 |
 
 ## L'ordine fra le pipeline regge su ogni modello?
 
@@ -158,25 +161,25 @@ Capacita' del nodo, milioni di pacchetti al secondo per core (E-core):
 
 | confronto | rapporto | la prima costa di piu' |
 |---|---:|---:|
-| P1.5 / P1 | 1.12 [0.93–1.68] | 77/91 |
-| P2 / P1 | 4.32 [2.67–12.75] | 85/85 |
-| P3 / P1 | 7.77 [4.86–24.65] | 91/91 |
-| P3 / P2 | 1.87 [1.36–2.30] | 85/85 |
-| P2 / P1.5 | 3.90 [2.37–9.60] | 85/85 |
+| P1.5 / P1 | 1.11 [0.93–1.68] | 89/109 |
+| P2 / P1 | 4.36 [2.67–12.75] | 103/103 |
+| P3 / P1 | 7.82 [4.86–24.65] | 109/109 |
+| P3 / P2 | 1.88 [1.36–2.30] | 103/103 |
+| P2 / P1.5 | 3.91 [2.37–9.60] | 103/103 |
 
-P1 ≤ P2 ≤ P3 su 85/85 modelli.
+P1 ≤ P2 ≤ P3 su 103/103 modelli.
 
 **E-core** — rapporto fra i costi della rete neurale, mediana [min–max] sui modelli, e su quanti la prima costa piu' della seconda:
 
 | confronto | rapporto | la prima costa di piu' |
 |---|---:|---:|
-| P1.5 / P1 | 1.18 [0.95–1.85] | 75/91 |
-| P2 / P1 | 5.09 [3.17–20.35] | 85/85 |
-| P3 / P1 | 9.34 [5.93–39.60] | 91/91 |
-| P3 / P2 | 1.91 [1.47–2.51] | 85/85 |
-| P2 / P1.5 | 4.15 [2.61–19.01] | 85/85 |
+| P1.5 / P1 | 1.21 [0.95–1.85] | 89/108 |
+| P2 / P1 | 5.03 [3.17–20.35] | 102/102 |
+| P3 / P1 | 9.36 [5.85–39.60] | 108/108 |
+| P3 / P2 | 1.93 [1.47–2.51] | 102/102 |
+| P2 / P1.5 | 4.12 [2.61–19.01] | 102/102 |
 
-P1 ≤ P2 ≤ P3 su 85/85 modelli.
+P1 ≤ P2 ≤ P3 su 102/102 modelli.
 
 ## Istruzioni caricate contro eseguite
 
@@ -184,12 +187,12 @@ Caricate = istruzioni dei programmi della pipeline, contate dal kernel al carica
 
 | pipeline | n | caricate | eseguite (rete) | ρ |
 |---|---:|---:|---:|---:|
-| P1 | 91 | 624 [239–2315] | 556 [157–2250] | 0.98 |
-| P1.5 | 91 | 961 [282–4313] | 740 [168–2447] | 0.90 |
-| P2 | 85 | 16813 [14604–18937] | 3972 [2038–7910] | 0.77 |
-| P3 | 91 | 12288 [12288–12288] | 6969 [3851–15456] | - |
+| P1 | 109 | 650 [239–2315] | 562 [157–2250] | 0.98 |
+| P1.5 | 109 | 961 [282–4313] | 743 [168–2447] | 0.90 |
+| P2 | 103 | 16813 [14604–18937] | 3972 [2038–7910] | 0.79 |
+| P3 | 109 | 12288 [12288–12288] | 7014 [3851–15456] | - |
 
-P2 piu' grande di P3: 85/85; P3 esegue piu' di P2: 85/85; tutte e due insieme (la dimensione ordina al contrario del lavoro): 85/85.
+P2 piu' grande di P3: 103/103; P3 esegue piu' di P2: 103/103; tutte e due insieme (la dimensione ordina al contrario del lavoro): 103/103.
 
 ## Le istruzioni per pacchetto non dipendono dal core
 
@@ -197,11 +200,11 @@ P2 piu' grande di P3: 85/85; P3 esegue piu' di P2: 85/85; tutte e due insieme (l
 
 | pipeline | n | mediana % | massimo % |
 |---|---:|---:|---:|
-| baseline | 91 | 0.20 | 0.30 |
-| P1 | 91 | 0.15 | 0.30 |
-| P1.5 | 91 | 0.17 | 0.29 |
-| P2 | 85 | 0.01 | 0.09 |
-| P3 | 91 | 0.01 | 0.08 |
+| baseline | 108 | 0.20 | 0.30 |
+| P1 | 108 | 0.15 | 0.30 |
+| P1.5 | 108 | 0.17 | 0.29 |
+| P2 | 102 | 0.01 | 0.09 |
+| P3 | 108 | 0.01 | 0.08 |
 
 LP E-core contro P-core: massimo 0.7% su 56 coppie.
 
@@ -211,22 +214,22 @@ Capacita' e IPC dell'E-core in rapporto al P-core (stessa frequenza, 3,5 GHz), m
 
 | pipeline | n | capacita' E/P | IPC E/P |
 |---|---:|---:|---:|
-| baseline | 91 | 0.63 [0.61–0.66] | 0.65 [0.63–0.68] |
-| P1 | 91 | 0.77 [0.70–0.91] | 0.79 [0.71–0.94] |
-| P1.5 | 91 | 0.76 [0.68–0.88] | 0.78 [0.70–0.91] |
-| P2 | 85 | 0.82 [0.77–0.87] | 0.84 [0.78–0.89] |
-| P3 | 91 | 0.83 [0.72–0.89] | 0.84 [0.70–0.89] |
+| baseline | 108 | 0.63 [0.61–0.66] | 0.65 [0.63–0.68] |
+| P1 | 108 | 0.76 [0.69–0.91] | 0.78 [0.70–0.94] |
+| P1.5 | 108 | 0.75 [0.68–0.88] | 0.77 [0.70–0.91] |
+| P2 | 102 | 0.82 [0.77–0.87] | 0.84 [0.78–0.89] |
+| P3 | 108 | 0.83 [0.72–0.89] | 0.84 [0.70–0.89] |
 
-Cicli per pacchetto E/P: parte fissa del nodo (baseline) 1.56 [1.50–1.60]; rete neurale:
+Cicli per pacchetto E/P: parte fissa del nodo (baseline) 1.56 [1.50–1.61]; rete neurale:
 
 | pipeline | n | cicli della rete E/P |
 |---|---:|---:|
-| P1 | 91 | 0.94 [0.55–1.17] |
-| P1.5 | 91 | 0.99 [0.59–1.34] |
-| P2 | 85 | 1.10 [1.02–1.18] |
-| P3 | 91 | 1.13 [1.05–1.40] |
+| P1 | 108 | 0.95 [0.55–1.20] |
+| P1.5 | 108 | 1.01 [0.59–1.34] |
+| P2 | 102 | 1.09 [1.02–1.18] |
+| P3 | 108 | 1.13 [1.05–1.40] |
 
-Piu' la rete neurale pesa sul pacchetto, meno conta il core: ρ di rango fra la quota di cicli della rete (P-core) e la capacita' E/P = 0.76 su 358 coppie modello-pipeline.
+Piu' la rete neurale pesa sul pacchetto, meno conta il core: ρ di rango fra la quota di cicli della rete (P-core) e la capacita' E/P = 0.76 su 426 coppie modello-pipeline.
 
 LP E-core (2,5 GHz), 14 modelli dal piu' leggero al piu' pesante:
 
@@ -357,7 +360,7 @@ ns di rete neurale misurati e, fra parentesi, il rapporto con la legge stimata s
 
 ## Larga o profonda, a parita' di pesi
 
-Cinque forme con ~592 pesi, da 1 a 5 strati: ns di rete neurale con 1 strato → con 5, e la pendenza per strato (minimi quadrati), P-core.
+Cinque forme per composizione, a pari pesi dentro ognuna (~600 con ipa65, ~210-270 con dense17; a 4-5 strati le MAC eseguite crescono del 16-43 %), da 1 a 5 strati: ns di rete neurale con 1 strato → con 5, e la pendenza per strato (minimi quadrati), P-core.
 
 | composizione | pipeline | 1 → 5 strati | variazione | ns per strato |
 |---|---:|---:|---:|---:|
@@ -646,11 +649,11 @@ bench_solo.py su ogni modello, P-core: latenza da solo (BPF_PROG_TEST_RUN, minim
 
 | pipeline | n | chiamata singola ns | rete ns | rete, ciclo caldo ns | build ms | generare e compilare P1 ms | installare ms | letture | salti |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 89 | 38 [35–40] | - | - | 712.4 [707.0–724.7] | - | 0.0 [0.0–0.0] | 3.0 [3.0–3.0] | 0 [0–0] |
-| P1 | 89 | 77 [44–177] | 40 [6–140] | - | 3.8 [3.3–26.9] | 49 [34–114] | 0.6 [0.3–1.5] | 5.0 [4.0–5.0] | 1 [1–1] |
-| P1.5 | 89 | 88 [46–185] | 50 [7–148] | - | 1.8 [1.1–6.9] | 61 [34–181] | 0.9 [0.3–5.6] | 6.0 [5.0–6.0] | 1 [1–1] |
-| P2 | 83 | 275 [157–598] | 237 [118–562] | - | 1571.8 [1456.6–1749.6] | - | 0.3 [0.2–0.4] | 12.0 [11.0–12.0] | 1 [1–1] |
-| P3 | 89 | 504 [300–999] | 466 [262–963] | - | 1219.3 [1200.5–1234.1] | - | 0.3 [0.2–0.5] | 35.0 [23.0–54.0] | 4 [2–7] |
+| baseline | 108 | 38 [35–41] | - | 17 [16–17] | 711.7 [693.2–724.7] | - | 0.0 [0.0–0.0] | 3.0 [3.0–3.0] | 0 [0–0] |
+| P1 | 108 | 80 [44–177] | 41 [6–140] | 42 [17–49] | 3.7 [3.3–58.0] | 50 [34–114] | 0.6 [0.3–1.5] | 5.0 [4.0–5.0] | 1 [1–1] |
+| P1.5 | 108 | 88 [46–185] | 50 [7–148] | 48 [16–59] | 1.8 [1.1–6.9] | 61 [34–181] | 0.9 [0.3–5.6] | 6.0 [5.0–6.0] | 1 [1–1] |
+| P2 | 102 | 276 [157–598] | 238 [118–562] | 214 [161–280] | 1571.4 [1438.2–1749.6] | - | 0.3 [0.2–0.4] | 12.0 [11.0–12.0] | 1 [1–1] |
+| P3 | 108 | 504 [300–999] | 465 [262–963] | 381 [276–539] | 1217.5 [1188.8–1234.1] | - | 0.3 [0.2–0.5] | 35.5 [23.0–54.0] | 4 [2–7] |
 
 Ciclo caldo: blocchi di esecuzioni di fila finche' il TTL che scende non cambia la classe decisa; si usa solo dove il blocco e' lungo almeno 10 esecuzioni.
 
@@ -658,10 +661,10 @@ La sola rete sotto traffico divisa per la sola rete da sola, modello per modello
 
 | pipeline | nodo saturo / ciclo caldo | traffico leggero, minimo / ciclo caldo | nodo saturo / chiamata singola | traffico leggero, media / chiamata singola |
 |---|---:|---:|---:|---:|
-| P1 | - | - | 1.37 [0.95–3.55] | 1.06 [0.78–2.50] |
-| P1.5 | - | - | 1.23 [1.02–3.19] | 1.04 [0.85–2.14] |
-| P2 | - | - | 0.94 [0.77–1.10] | 0.97 [0.79–1.07] |
-| P3 | - | - | 0.91 [0.84–0.97] | 0.92 [0.86–1.00] |
+| P1 | 1.33 [1.10–1.65] | 0.99 [0.95–1.03] | 1.33 [0.95–3.55] | 1.06 [0.78–2.50] |
+| P1.5 | 1.28 [1.07–1.77] | 1.04 [0.92–1.16] | 1.23 [1.02–3.19] | 1.04 [0.85–2.14] |
+| P2 | 1.08 [1.00–1.12] | 0.95 [0.95–0.95] | 0.94 [0.77–1.10] | 0.97 [0.79–1.07] |
+| P3 | 1.11 [1.07–1.16] | 0.97 [0.96–0.98] | 0.91 [0.84–0.97] | 0.92 [0.86–1.00] |
 
 ## Quanto varia la stessa misura
 
@@ -669,16 +672,16 @@ Variazione in % del valore: mediana, 90° percentile, massimo. Una differenza de
 
 | che cosa | n | mediana % | 90° % | max % |
 |---|---:|---:|---:|---:|
-| i giri di una misura ((max − min) / mediana) | 898 | 1.3 | 3.3 | 7.8 |
-| il nodo senza rete in sessioni diverse, P-core | 91 | 1.1 | 2.1 | 3.5 |
-| il nodo senza rete in sessioni diverse, E-core | 91 | 0.4 | 1.0 | 1.7 |
+| i giri di una misura ((max − min) / mediana) | 1073 | 1.3 | 3.2 | 7.8 |
+| il nodo senza rete in sessioni diverse, P-core | 109 | 1.1 | 2.4 | 5.0 |
+| il nodo senza rete in sessioni diverse, E-core | 108 | 0.4 | 1.0 | 1.6 |
 | stesso modello e versione, due sessioni | 30 | 1.8 | 5.0 | 7.0 |
 
 ## Misure fuori dalle conclusioni
 
 Non entrano in nessun intervallo ne' in nessuna legge. disturbata = la macchina non e' rimasta nelle condizioni dichiarate (run_disturbed in env.csv); bocciata = il controllo di validita' del banco l'ha respinta (throughput_report.md). Si rifanno con POP_RIFAI_DISTURBATE=1 remeasure_popolazione.sh.
 
-**disturbata** (2): solo/m026, solo/m030
+**disturbata** (2): pop_Ecore/m108, solo/m093
 
-**curve tenute senza le finestre disturbate** (ogni punto con almeno 2 giri puliti): carico_Ecore/m013 (7/240), carico_Ecore/m031 (3/240), carico_Ecore/m037 (1/240), carico_Ecore/m042 (3/240), carico_Pcore/m000 (1/240), carico_Pcore/m031 (1/240), carico_Pcore/m037 (0/240), carico_Pcore/m042 (1/240)
+**misure tenute senza i giri disturbati** (curve: ogni punto, massima spinta: ogni pipeline, con almeno 2 giri puliti; massima spinta solo se il disturbo e' throttling, tolti i giri entro 1 s da un evento): carico_Ecore/m013 (7/240), carico_Ecore/m031 (3/240), carico_Ecore/m037 (1/240), carico_Ecore/m042 (3/240), carico_Pcore/m000 (1/240), carico_Pcore/m031 (1/240), carico_Pcore/m037 (0/240), carico_Pcore/m042 (1/240), pop_Ecore/m098 (3/15), pop_Pcore/m101 (3/15), pop_Pcore/m103 (3/15), pop_Pcore/m107 (0/15)
 

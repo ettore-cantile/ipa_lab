@@ -36,6 +36,7 @@ import csv
 import json
 import math
 import os
+import re
 import statistics as st
 import sys
 
@@ -192,6 +193,90 @@ def unusable(d):
     return None
 
 
+# Un giro di bench_throughput --mode compare: la finestra di misura
+# (`secs`) finisce DRAIN_S prima di t_wall. host_monitor.csv registra la
+# macchina una volta al secondo, con l'ora al secondo intero: un evento cade
+# fra due righe, e l'ora della prima riga e' nota a meno di un secondo.
+# Margine attorno a ogni evento, per parte.
+COMPARE_DRAIN_S = 0.05
+EVENT_MARGIN_S = 1.0
+
+
+def _throttle_events(d, day):
+    """Gli intervalli [inizio, fine] (secondi epoch) in cui il registro della
+    macchina ha visto un throttling, o None se il disturbo non e' solo
+    throttling (powerclamp, raffreddamento passivo, batteria, frequenza del
+    nodo fuori target: lo dice env.csv, e allora il run resta fuori)."""
+    import datetime as dt
+    env = {}
+    for r in csv.reader(open(os.path.join(d, "env.csv"), encoding="utf-8")):
+        if len(r) >= 2:
+            env[r[0]] = r[1]
+    if num(env.get("run_powerclamp")) or num(env.get("run_smi")):
+        return None
+    m = re.search(r"(\d+)-\1 MHz", env.get("frequenza_banco", ""))
+    mhz = num(env.get("run_dut_mhz"))
+    if not m or not mhz or abs(mhz - int(m.group(1))) > 0.05 * int(m.group(1)):
+        return None
+    log = read_csv(os.path.join(d, "host_monitor.csv"))
+    if len(log) < 2:
+        return None
+    if any(r.get("alimentazione_rete") not in ("1", "True", "") or
+           num(r.get("powerclamp")) or num(r.get("raffreddamento_cpu"))
+           for r in log):
+        return None
+    h, mi, se = (int(x) for x in log[0]["tempo"].split(":"))
+    t0 = dt.datetime.combine(day, dt.time(h, mi, se)).timestamp() \
+        - num(log[0]["t_s"])
+    out = []
+    for a, b in zip(log, log[1:]):
+        if any((num(b.get(k)) or 0) > (num(a.get(k)) or 0)
+               for k in ("throttle_core", "throttle_pacchetto")):
+            out.append((t0 + num(a["t_s"]) - EVENT_MARGIN_S,
+                        t0 + num(b["t_s"]) + 1.0 + EVENT_MARGIN_S))
+    return out
+
+
+def salvage_compare(d):
+    """(righe di compare.csv ricalcolate dai soli giri puliti di
+    compare_raw.csv, quei giri, (giri tolti, giri)): un run dura ~30 s, un
+    evento di throttling (~1 al minuto su questo portatile) ne tocca uno o
+    due giri, non il run. Ogni (pipeline, taglia, fase) deve conservare
+    almeno MIN_CLEAN_ROUNDS giri; le mediane sono quelle del banco
+    (run_compare), sugli stessi campi. None se non si puo'."""
+    import datetime as dt
+    raw = read_csv(os.path.join(d, "compare_raw.csv"))
+    rows = read_csv(os.path.join(d, "compare.csv"))
+    if not raw or not rows or not raw[0].get("t_wall"):
+        return None
+    day = dt.date.fromtimestamp(num(raw[0]["t_wall"]))
+    ev = _throttle_events(d, day)
+    if not ev:
+        return None
+
+    def hit(r):
+        end = num(r["t_wall"]) - COMPARE_DRAIN_S
+        start = end - num(r.get("secs"))
+        return any(start <= b and end >= a for a, b in ev)
+    clean = [r for r in raw if not hit(r)]
+    key = lambda r: (r["method"], r["frame"], r.get("phase"))  # noqa: E731
+    out = []
+    for row in rows:
+        pts = [r for r in clean if key(r) == key(row)]
+        if len(pts) < MIN_CLEAN_ROUNDS:
+            return None
+        new = dict(row, rounds=str(len(pts)))
+        for k in row:
+            if k in ("method", "frame", "phase", "rounds") or k not in pts[0]:
+                continue
+            vals = [num(r[k]) for r in pts if num(r.get(k)) is not None]
+            if vals and num(row[k]) is not None:
+                new[k] = str(max(vals) if k == "loss_worst"
+                             else st.median(vals))
+        out.append(new)
+    return out, clean, (len(raw) - len(clean), len(raw))
+
+
 class Campaign:
     """Tutto cio' che il report usa, indicizzato per modello."""
 
@@ -200,7 +285,7 @@ class Campaign:
         self.legacy = False
         self.seen = set()          # cartelle di misura lette
         self.excluded = {}         # cartella relativa -> motivo
-        self.salvaged = {}         # curva -> (finestre tolte, finestre)
+        self.salvaged = {}         # misura -> (giri/finestre tolti, totale)
         self.models = {}           # id -> riga del manifesto
         self.core_dir = {}         # "P"/"E" -> cartella della popolazione
         man = os.path.join(base, "population.csv")
@@ -242,12 +327,19 @@ class Campaign:
 
     def read(self, d, name):
         """Il CSV `name` della misura in `d`, o [] se la misura non entra
-        nelle conclusioni (unusable): resta contata in self.excluded."""
+        nelle conclusioni (unusable): resta contata in self.excluded. Una
+        misura a massima spinta disturbata SOLO da throttling si ricalcola
+        dai giri che l'evento non ha toccato (salvage_compare)."""
         if not os.path.exists(os.path.join(d, name)):
             return []
         rel = os.path.relpath(d, self.base)
         self.seen.add(rel)
         why = unusable(d)
+        if why == "disturbata" and name in ("compare.csv", "compare_raw.csv"):
+            got = salvage_compare(d)
+            if got:
+                rows, clean, self.salvaged[rel] = got
+                return rows if name == "compare.csv" else clean
         if why:
             self.excluded[rel] = why
             return []
@@ -1451,8 +1543,8 @@ def sec_excluded(c):
     if c.salvaged:
         out = sum(a for a, _ in c.salvaged.values())
         tot = sum(b for _, b in c.salvaged.values())
-        claim("curve disturbate tenute senza le finestre colpite",
-              f"{len(c.salvaged)} curve, {out}/{tot} finestre tolte")
+        claim("misure disturbate tenute senza i giri colpiti",
+              f"{len(c.salvaged)} misure, {out}/{tot} giri o finestre tolti")
     if not c.excluded and not c.salvaged:
         return []
     by = {}
@@ -1467,8 +1559,10 @@ def sec_excluded(c):
     for why, rels in by.items():
         L += [f"**{why}** ({len(rels)}): " + ", ".join(rels), ""]
     if c.salvaged:
-        L += [f"**curve tenute senza le finestre disturbate** (ogni punto con "
-              f"almeno {MIN_CLEAN_ROUNDS} giri puliti): "
+        L += [f"**misure tenute senza i giri disturbati** (curve: ogni punto, "
+              f"massima spinta: ogni pipeline, con almeno {MIN_CLEAN_ROUNDS} "
+              f"giri puliti; massima spinta solo se il disturbo e' throttling, "
+              f"tolti i giri entro {EVENT_MARGIN_S:g} s da un evento): "
               + ", ".join(f"{rel} ({a}/{b})"
                           for rel, (a, b) in sorted(c.salvaged.items())), ""]
     return L

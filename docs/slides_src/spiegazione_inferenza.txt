@@ -141,15 +141,17 @@ Il LP E-core ha l'IPC più basso (da 1,0 a 3,0) perché, oltre a essere più sem
 Il LP E-core regge dal 32 al 53 % del P-core. È il caso estremo: un core pensato per tenere acceso il sistema consumando poco, non per elaborare pacchetti.
 
 == 9 | Oltre la capacità si perde all'ingresso del programma
-Qui il traffico **cresce** a poco a poco, da 0,5 a 12 milioni di pacchetti al secondo, e si contano i pacchetti inoltrati. A sinistra il nodo su un P-core, a destra su un E-core; sei modelli, dal più leggero al più pesante.
+Qui il traffico **cresce** a poco a poco, da 0,5 a 12 milioni di pacchetti al secondo, e si contano i pacchetti inoltrati, sul P-core. I tre grafici sono tre modelli scelti fra i sei provati sotto carico: il più leggero (17-2-3: 1 strato nascosto, 18 moltiplicazioni), quello di mezzo (105-2-2-2-2-7: 4 strati nascosti, 38 moltiplicazioni) e il più pesante (17-8-8-8-8-8-8-3: 6 strati nascosti, il massimo della popolazione, 480 moltiplicazioni). Tutti e tre girano su tutte le versioni, P2 compresa: P2 esclude solo i 6 modelli con più di 1 024 pesi, che non entrano nella sua tabella. In ogni grafico una linea per versione.
 
-Modelli diversi hanno capacità diverse. Per metterli sullo stesso grafico, entrambi gli assi sono divisi per la capacità di ogni modello: sull'asse orizzontale il traffico offerto, sull'asse verticale i pacchetti inoltrati. Così «1» vuol dire «la capacità di quel modello», qualunque sia.
+**Gli assi.** In orizzontale i pacchetti offerti al nodo, in verticale quelli che il nodo inoltra, entrambi in milioni al secondo. La diagonale tratteggiata è «tutto inoltrato»: un punto sulla diagonale vuol dire che non si è perso niente.
 
-Ogni curva sale in diagonale (tutto ciò che arriva viene inoltrato) finché il traffico resta sotto la capacità, poi diventa piatta: il nodo non può inoltrare di più, e il resto viene respinto dalla coda d'ingresso piena. Il massimo inoltrato coincide con la capacità misurata a nodo pieno: 0,98 volte sul P-core, 0,99 sull'E-core.
+Ogni linea segue la diagonale finché il traffico resta sotto la capacità della versione, poi diventa piatta: il nodo non può inoltrare di più, e il resto viene respinto dalla coda d'ingresso piena. Il punto in cui si piega è la capacità: sul modello leggero circa 9 milioni di pacchetti al secondo per P1 e P1.5, 4,5 per P2, 3 per P3; sul modello pesante 4,5 per P1 e P1.5, 2 per P2, 1 per P3. Più il modello è pesante, più le linee si piegano in basso; l'ordine fra le versioni resta lo stesso.
+
+Su tutti e sei i modelli, e su entrambi i tipi di core, il massimo inoltrato coincide con la capacità misurata a nodo pieno: 0,98 volte sul P-core, 0,99 sull'E-core. Oltre la capacità non si guadagna niente: si perde.
 
 >> **Dove si perde.** Il banco conta i pacchetti in tre punti: inviati, ricevuti dal programma, inoltrati. Quasi tutti i pacchetti persi si perdono **prima** del programma, nella coda: il programma inoltra tutto ciò che riceve. Il collo di bottiglia è il programma, non la trasmissione, su ogni tipo di core.
 
-!! **L'eccezione.** P1 sui modelli più leggeri regge più di 9 milioni di pacchetti al secondo, e lì comincia a perdere anche all'uscita: è il limite del cavo virtuale e del core d'uscita, non della rete neurale.
+!! **L'eccezione.** P1 sui modelli più leggeri regge più di 9 milioni di pacchetti al secondo, e lì comincia a perdere anche all'uscita (la linea di P1 nel primo grafico oscilla fra 9 e 9,3): è il limite del cavo virtuale e del core d'uscita, non della rete neurale.
 
 == 10 | Due core reggono il doppio, sul P-core e sull'E-core
 Qui il nodo usa **due core**, ciascuno con la sua coda d'ingresso, il suo generatore, la sua coda d'uscita e il suo core d'uscita. A sinistra due P-core, a destra due E-core (in due gruppi diversi del chip). Barre chiare: un core; barre scure: due. Mediane di 8 modelli dal più leggero al più pesante.
@@ -171,15 +173,25 @@ Tre controlli sul P-core, ciascuno su modelli dal più leggero al più pesante:
 Basta quindi un numero per versione e modello a descrivere il costo del nodo.
 
 == 12 | Ogni strato di P3 costa ~900 istruzioni
-I grafici usano le **forme a pari pesi**: per ognuno dei due tipi d'ingresso, cinque reti con gli stessi pesi distribuiti su 1, 2, 3, 4 o 5 strati nascosti (589–604 pesi con l'ingresso da 65 valori, 207–268 con quello da 17). Ogni punto è la mediana dei due ingressi. Lo stesso gruppo di forme torna nella slide 17.
+Per misurare il costo di uno strato bisogna cambiare il numero di strati **senza** cambiare le moltiplicazioni. Per questo i grafici usano 18 modelli costruiti apposta: per tre tipi d'ingresso (17, 33 e 65 valori), una rete con 1, 2, 3, 4, 5 e 6 strati nascosti, sempre con 102–113 moltiplicazioni per pacchetto. Ogni punto è la mediana dei tre ingressi. Sono misure grezze: nessuna correzione, nessuna legge in mezzo.
 
-!! **A pari pesi, non sempre a pari moltiplicazioni.** Da 1 a 3 strati anche le moltiplicazioni eseguite restano uguali, entro il 3 %. A 4 e 5 strati crescono del 16–43 %, perché gli strati intermedi sono più larghi (5 e 4 neuroni invece di 3): per questo tutte le curve, anche quelle di P1, fanno un gradino a 4 strati. Il costo di uno strato a moltiplicazioni ferme lo dà la legge della slide 18; da 1 a 3 strati la misura diretta coincide con la legge.
+>> **Esempio.** Con l'ingresso da 17 valori: 17-5-5 (1 strato nascosto) fa 110 moltiplicazioni, 17-3-3-3-3-3-3-5 (6 strati) ne fa 111. Stesso lavoro aritmetico, sei volte gli strati.
 
-**A sinistra** le istruzioni eseguite per pacchetto, contate dal processore. Da 1 a 3 strati P3 passa da circa 6 400 a 8 000 (circa 790 per strato), P2 da 4 200 a 5 000; P1 e P1.5 restano a circa 1 500. Stimato su tutti gli 83 modelli senza pesi a zero, a parità di moltiplicazioni, ogni strato in più aggiunge **circa 900 istruzioni a P3** e circa 370 a P2, uguali su P-core ed E-core. P1 e P1.5 non pagano lo strato in sé: le loro istruzioni crescono solo con le moltiplicazioni.
+**A sinistra** le istruzioni eseguite per pacchetto, contate dal processore (P-core ed E-core danno le stesse). P3 sale da circa 5 700 a 10 000, **in media circa 900 istruzioni per strato** (fra 790 e 910 secondo l'ingresso); P2 circa 370 per strato (fra 270 e 450); P1 e P1.5 restano piatte, perché il loro programma è scritto per quel modello e uno strato in più è solo qualche moltiplicazione in più. La legge della slide 18, stimata su altri 83 modelli, dà 901 per strato a P3 e 370 a P2: gli stessi valori.
 
->> **Che cosa sono le ~900 istruzioni.** P3 esegue uno strato alla volta. Alla fine di ogni strato salta di nuovo al programma generico dello strato, che deve rileggere dalle tabelle dove si trova, che forma ha lo strato e dove stanno i suoi pesi. È sempre lo stesso lavoro, per questo ogni strato costa uguale, su ogni modello.
+**I gradini però non sono tutti uguali**: con lo stesso ingresso vanno da circa +270 a +1 350 istruzioni. Il motivo è nel codice di P3.
 
-**A destra** il tempo per pacchetto del nodo intero, per P3 e P2, sul P-core (linea continua) e sull'E-core (tratteggio). Da 1 a 3 strati P3 sale di circa 46 ns per strato sul P-core, come stima la legge, e di circa 58 sull'E-core (la legge: 62): le stesse istruzioni, eseguite più lentamente.
+- Ogni strato è un **programma a sé**: si salta al programma successivo (tail call), si rileggono dalle tabelle il modello, la forma dello strato e dove stanno i pesi. Questo costa circa **690 istruzioni a ogni strato**, qualunque forma abbia.
+- Il programma vale per qualunque modello, quindi i suoi cicli hanno un numero di giri fisso, il massimo che P3 accetta: 8. Ogni neurone dello strato **controlla sempre 8 ingressi**, anche se lo strato prima ne ha 3. Costa circa **44 istruzioni per neurone**, più circa 14 per ogni moltiplicazione vera.
+- Il primo strato è diverso: è srotolato alla misura massima, e il suo costo dipende quasi solo dal tipo d'ingresso.
+
+>> **Un gradino piccolo.** Con l'ingresso da 65 valori, da 6-4-4 (3 strati) a 8-2-2-2 (4 strati) P3 sale solo di 267 istruzioni: c'è uno strato in più (+690), ma dopo il primo strato ci sono 24 moltiplicazioni in meno (−336) e 2 neuroni in meno (−88), e il primo strato passa da 6 a 8 neuroni (+26). Totale previsto +292.
+
+Questa legge, scritta seguendo il codice, prevede le istruzioni di P3 con lo 0,1 % di errore su modelli lasciati fuori dalla stima. Vale anche per P2, con pesi diversi: P2 non salta fra programmi (gli strati sono in fila nello stesso programma), quindi lo strato in sé costa solo ~40 istruzioni; ma ogni neurone fa sempre 8 moltiplicazioni piene, anche per zero, e costa ~120 istruzioni. Per P2 lo "strato" è quasi tutto neuroni.
+
+**A destra** il tempo della sola rete, per P3 e P2, sul P-core (linea continua) e sull'E-core (tratteggio). P3 sale di circa 51 ns per strato sul P-core e 61 sull'E-core: le stesse istruzioni, eseguite più lentamente.
+
+!! **I ~900 sono una media.** Il costo vero di uno strato è ~690 istruzioni più il lavoro dei suoi neuroni. Con gli strati di questi modelli (2–8 neuroni) la media viene circa 900, ma uno strato molto stretto costa meno e uno largo di più.
 
 == 13 | Poco traffico o nodo pieno: la rete di P2 e P3 costa uguale
 Prima di passare alla sola rete neurale, un controllo su come la si misura. Il costo della rete si può ricavare in due modi indipendenti:
@@ -260,11 +272,11 @@ Il trucco è contare le moltiplicazioni **davvero eseguite**. Un ingresso codifi
 
 Il grafico mostra ogni modello: sull'asse orizzontale le moltiplicazioni eseguite, su quello verticale il costo della rete tolta la parte per strato. I punti cadono sulle rette.
 
-ok **Su modelli che non ha mai visto.** La legge si stima lasciando fuori un modello alla volta e prevedendo quello: sbaglia in mediana del 3 % per P3, del 6 % per P1 e P2, del 9 % per P1.5. Il costo di un modello nuovo si stima quindi prima di misurarlo, con qualche punto percentuale di errore. (Per chi conosce la statistica: r² fra 0,93 e 0,99; contando le moltiplicazioni dalla forma del modello scende a 0,58–0,79.)
+ok **Su modelli che non ha mai visto.** La legge si stima lasciando fuori un modello alla volta e prevedendo quello: sbaglia in mediana del 3 % per P3, del 6 % per P1 e P2, del 9 % per P1.5. Sui 18 modelli della slide 12, costruiti dopo e mai usati per stimarla, sbaglia del 5 % per P2 e P3, del 6 % per P1 e del 13 % per P1.5. Il costo di un modello nuovo si stima quindi prima di misurarlo, con qualche punto percentuale di errore (di più per P1.5). (Per chi conosce la statistica: r² fra 0,93 e 0,99; contando le moltiplicazioni dalla forma del modello scende a 0,58–0,79.)
 
 **Dove va il tempo.** La tabella dà, per ogni versione, quanto pesa in mediana ciascuna parte della legge (parte fissa · moltiplicazioni · strati):
 - **P1**: 40 · 50 · 8 %; **P1.5**: 48 · 46 · 5 %. Con i pesi nel programma circa metà del tempo sono moltiplicazioni;
-- **P2**: 47 · 18 · 31 %; **P3**: 37 · 18 · 39 %. Con i pesi in tabella circa l'82 % del tempo è **struttura**: la parte fissa (il primo programma, la lettura della descrizione del modello, la preparazione degli ingressi da tabella) e la parte per strato (il salto allo strato generico e la rilettura del suo contesto).
+- **P2**: 47 · 18 · 31 %; **P3**: 37 · 18 · 39 %. Con i pesi in tabella circa l'82 % del tempo è **struttura**: la parte fissa (il primo programma, la lettura della descrizione del modello, la preparazione degli ingressi da tabella) e la parte per strato. In P3 questa è il salto allo strato generico, la rilettura del suo contesto e i cicli fissati a 8 ingressi per neurone; in P2, che non salta fra strati, è quasi tutta nei neuroni, ognuno dei quali fa sempre 8 moltiplicazioni (slide 12).
 
 Anche il costo per moltiplicazione contiene le tabelle: P3 paga 0,77 ns per moltiplicazione contro 0,26 di P1 perché legge ogni peso da una tabella, mentre in P1 il peso è un numero scritto nel programma.
 
@@ -273,9 +285,13 @@ Anche il costo per moltiplicazione contiene le tabelle: P3 paga 0,77 ns per molt
 Anche i valori dei pesi contano poco: sei forme ripetute con pesi estratti in modo diverso danno un costo che varia al più del 5–6 % (2 % per P3).
 
 == 19 | Pesi a zero: accelerano solo P1 e P1.5
-Le quattro forme con il 50 e il 90 % di pesi esattamente uguali a zero. Il grafico dà il costo misurato della rete diviso quello che la legge della slide 18 prevede per lo stesso modello senza zeri: 1 vuol dire «come previsto», sotto 1 «più veloce».
+Quattro forme di rete, ciascuna con il 50 e il 90 % di pesi esattamente uguali a zero. Una linea per versione.
 
-- **P1 e P1.5 accelerano**: al 90 % di zeri P1 costa 0,44 volte il previsto e P1.5 0,62. Il programma di P1.5 scende a circa un terzo delle istruzioni: il compilatore vede che un peso è zero e toglie la moltiplicazione.
-- **P2 e P3 non cambiano** (1,02 e 1,01 volte il previsto), con un programma identico a quello senza zeri. Uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
+**Asse orizzontale:** la quota dei pesi della rete uguali a zero. A 0 % ci sono gli 83 modelli senza zeri, a 50 e 90 % le quattro forme; ogni punto è una mediana.
+
+**Asse verticale:** il tempo della sola rete con gli zeri, diviso il tempo dello stesso modello senza zeri. Il tempo «senza zeri» è quello che la legge della slide 18 prevede per la stessa forma, con le stesse moltiplicazioni. La linea tratteggiata a 1 vuol dire «come lo stesso modello senza zeri»; sotto la linea la rete è più veloce: 0,5 vuol dire metà tempo. A 0 % tutte le linee stanno a 1, perché lì la legge prevede bene i modelli senza zeri.
+
+- **P1 e P1.5 accelerano**: al 90 % di zeri P1 costa 0,44 volte il previsto e P1.5 0,62; il programma scende a 0,40 e 0,34 volte la dimensione del gemello senza zeri. Il compilatore vede che un peso è zero e toglie la moltiplicazione.
+- **P2 e P3 non cambiano**: le loro linee restano sulla linea tratteggiata (1,02 e 1,01 volte il previsto), con un programma identico a quello senza zeri. Uno zero letto da una tabella è un numero come un altro, e la moltiplicazione si fa comunque.
 
 È l'unico caso in cui dimensione del programma e tempo scendono insieme. Mettere pesi a zero (potare il modello) rende più veloci solo le versioni con i pesi nel programma; con P2 e P3 non dà niente in velocità, e va scelto solo per l'accuratezza.

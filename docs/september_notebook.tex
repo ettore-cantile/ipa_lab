@@ -3122,8 +3122,11 @@ replica  & 20 & 6 forme, 3 semi in più ciascuna (uno con pesi a distribuzione
 sparsità & 8  & 4 forme con il 50 e il 90\,\% dei pesi esattamente a zero \\
 imbuto   & 10 & 5 forme con circa 592 pesi distribuiti su 1--5 strati, su 2
                 composizioni \\
+strati   & 18 & 1--6 strati nascosti con 102--113 MAC eseguite, su 3
+                composizioni: il costo di uno strato a moltiplicazioni ferme
+                (sezione~\ref{sec:pop-strato}) \\
 \midrule
-totale   & 91 & 5--117 ingressi, 1--6 strati, 2--8 neuroni per strato,
+totale   & 109 & 5--117 ingressi, 1--6 strati, 2--8 neuroni per strato,
                 21--1\,349 pesi, 16--480 MAC eseguite \\
 \bottomrule
 \end{tabular}
@@ -3136,9 +3139,11 @@ feature dense (stato dei link, occupazione delle code, TTL) e le one-hot
 \texttt{ipa17}, \texttt{ipa65}, \texttt{ipa117} e \texttt{mixed33} miste, con
 reti da 10, 24, 52 e 100 nodi.
 
-Sei modelli superano il tetto sui pesi di P2 (\texttt{MAX\_WEIGHT\_ENTRIES}): restano
-nella popolazione, e per P2 le cifre sono su 85 modelli. Le altre pipeline li
-eseguono tutti.
+La famiglia \emph{strati} sta in fondo al manifesto (\texttt{m091}--\texttt{m108})
+e ha una sezione sua; le cifre delle altre sezioni sono sui primi 91 modelli.
+Sei di questi superano il tetto sui pesi di P2 (\texttt{MAX\_WEIGHT\_ENTRIES}):
+restano nella popolazione, e per P2 le cifre sono su 85 modelli. Le altre
+pipeline li eseguono tutti.
 
 I test lunghi girano su sottoinsiemi scelti dal modello più leggero al più
 pesante: 6 modelli per le curve a traffico crescente e per le taglie del
@@ -3182,15 +3187,18 @@ o che il controllo di validità del banco ha bocciato; le elenca in
 \begin{prima}[Il throttling del portatile]
 Con l'alimentatore collegato e a 57--72~°C, su questo portatile un evento di
 throttling di pacchetto arriva circa una volta al minuto, comunque si usi la
-macchina: lo decide il firmware. Una misura corta (25--70~s) lo prende di rado,
-e si rifà. Una curva a traffico crescente dura circa 160~s e lo prende quasi
-sempre: rifarla non converge. Per le curve il report tiene allora le finestre
-pulite, purché ogni punto ne conservi almeno 2 su 3, e ricalcola la curva con
-la stessa funzione del banco.
+macchina: lo decide il firmware. Una misura a massima spinta dura circa 30~s,
+una curva a traffico crescente circa 160~s: rifarle finché non lo prendono non
+converge. Un evento però tocca uno o due giri, non la misura. Il report toglie
+allora i soli giri la cui finestra cade entro 1~s da un evento (il registro
+della macchina campiona al secondo) e rifà le mediane con la stessa funzione
+del banco, purché ogni pipeline, o ogni punto della curva, conservi almeno 2
+giri su 3. Se il disturbo non è solo throttling (powerclamp, batteria,
+frequenza fuori target) la misura resta fuori.
 \end{prima}
 
-Alla fine: \textbf{una sola misura fuori su 435}, e 8 curve tenute senza le
-finestre colpite (17 finestre su 1\,920).
+Alla fine: \textbf{2 misure fuori su 580}, e 12 tenute senza i giri colpiti
+(26 giri o finestre su 1\,980).
 
 \section{Correttezza}
 
@@ -3396,7 +3404,8 @@ in tabella (P2, P3) circa l'82\,\% è \textbf{struttura}: il termine fisso
 tabella) e quello per strato (la tail call allo strato generico e la rilettura
 del suo contesto). La legge è lineare proprio per questo: ogni tail call e ogni
 lettura di tabella costa quasi sempre lo stesso, e quante ce ne sono dipende
-solo dalla forma del modello.
+solo dalla forma del modello. Il termine per strato è una media: che cosa ci sta
+dentro, strato per strato, lo dice la sezione~\ref{sec:pop-strato}.
 \end{lezione}
 
 Anche il termine per moltiplicazione contiene le tabelle: P3 paga 0,77~ns per MAC
@@ -3411,8 +3420,7 @@ pacchetto, circa 6 in più per strato, e un salto per strato. Quanto dei 46~ns p
 strato sia il salto e quanto le letture, la campagna non lo separa.
 
 La stessa forma spiega le istruzioni: P3 esegue \textbf{901 istruzioni in più per
-ogni strato} ($r^2$ 0,99), identiche su P-core ed E-core, P2 370. È il salto allo
-strato generico e la rilettura del suo contesto da tabella. Le istruzioni
+ogni strato} ($r^2$ 0,99), identiche su P-core ed E-core, P2 370 (sezione~\ref{sec:pop-strato}). Le istruzioni
 caricate: P2 ne aggiunge 887 per strato ($r^2$ 0,96), perché ricompila e srotola
 per ogni profondità; P3 ne ha 12\,288 con ogni modello.
 
@@ -3444,6 +3452,100 @@ per ogni profondità; P3 ne ha 12\,288 con ogni modello.
         rete varia al più del 5--6\,\% per P1, P1.5 e P2 e del 2\,\% per P3
         (coefficiente di variazione fra i semi).
 \end{itemize}
+
+\section{Il costo di uno strato, a moltiplicazioni ferme}
+\label{sec:pop-strato}
+
+La legge separa strati e moltiplicazioni con una regressione, su modelli in cui
+le due cose crescono insieme. Per misurare uno strato direttamente serve
+cambiare il numero di strati \emph{senza} cambiare le moltiplicazioni: è la
+famiglia \emph{strati}. Per tre composizioni dell'ingresso (\texttt{dense17},
+\texttt{mixed33}, \texttt{ipa65}) una rete con 1, 2, 3, 4, 5 e 6 strati
+nascosti, sempre con 102--113 MAC eseguite, e con le forme che P2 sa eseguire
+(dal terzo strato in poi larghi come il secondo, al più 8 neuroni). Per esempio
+\texttt{17-5-5} (1 strato, 110 MAC) e \texttt{17-3-3-3-3-3-3-5} (6 strati, 111
+MAC).
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+\textbf{P3, istruzioni per pacchetto} & \textbf{1} & \textbf{2} & \textbf{3} & \textbf{4} & \textbf{5} & \textbf{6} & \textbf{per strato} \\
+\midrule
+\texttt{dense17} & 6\,375 & 7\,057 & 7\,888 & 9\,087 & 9\,971 & 10\,933 & 912 \\
+\texttt{mixed33} & 5\,718 & 6\,536 & 7\,696 & 8\,713 & 9\,252 & 9\,644  & 785 \\
+\texttt{ipa65}   & 5\,479 & 6\,342 & 7\,517 & 7\,784 & 8\,616 & 9\,962  & 897 \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize\color{soft} Istruzioni eseguite per pacchetto, misure grezze
+(identiche su P-core ed E-core). Per strato: (6 strati $-$ 1 strato) / 5.}
+\end{center}
+
+In media P3 sale di circa 900 istruzioni per strato e P2 di circa 370 (270--450
+secondo la composizione): gli stessi valori della legge, stimata su altri
+modelli. P1 e P1.5 restano piatte, fra 1\,150 e 1\,400. Ma i gradini non sono
+uguali: dentro la stessa composizione vanno da +270 a +1\,350 istruzioni. Il
+costo di uno strato dipende dalla sua forma, e il codice dice come.
+
+\begin{itemize}
+  \item \textbf{P3.} Ogni strato nascosto è un programma
+        (\texttt{EBPF\_LAYER\_HIDDEN}) raggiunto con un tail call: rilegge
+        \texttt{scratch\_meta}, \texttt{layer\_registry} e
+        \texttt{layer\_shapes} (due tabelle hash), poi i pesi e le attivazioni.
+        La forma la scopre a ogni pacchetto, quindi i cicli non possono avere
+        la sua larghezza: sono srotolati a \texttt{MLH\_MAX\_H}~=~8, perché il
+        verifier vuole un numero di giri costante. Ogni neurone d'uscita
+        esegue 8 controlli \texttt{i >= n\_in}, e i neuroni oltre
+        \texttt{n\_out} girano a vuoto.
+  \item \textbf{P2.} La profondità è fissata alla compilazione
+        (\texttt{build\_arch\_leaf}): gli strati sono blocchi in fila nello
+        stesso programma, senza salti né riletture. La larghezza no: i cicli
+        sono srotolati a 8 e quello interno non ha il controllo, quindi ogni
+        neurone fa sempre 8 moltiplicazioni, per zero oltre la larghezza vera.
+  \item In entrambe il \textbf{primo strato} è srotolato alla misura massima: il
+        suo costo dipende dalla composizione dell'ingresso, non dalle MAC
+        eseguite.
+\end{itemize}
+
+Scritta con questi termini, la legge delle istruzioni ha un costo fisso per
+composizione, uno per strato, e uno per neurone e per moltiplicazione degli
+strati dopo il primo. Stimata su tutti i modelli densi, vecchi e nuovi (101; 95
+per P2):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{istruzioni per} & \textbf{P3} & \textbf{P2} \\
+\midrule
+strato                                & 687 & 39 \\
+neurone dopo il primo strato          & 44  & 122 \\
+moltiplicazione dopo il primo strato  & 14  & $\sim$0 \\
+\midrule
+errore su un modello lasciato fuori   & 0,1\,\% & 1,0\,\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lezione}
+In P3 uno strato costa circa \textbf{690 istruzioni fisse} (salto, letture di
+tabella, cicli a vuoto) \textbf{più circa 44 per ogni suo neurone}: i 901 della
+legge sono la media sulle forme della popolazione. In P2 lo strato in sé costa
+poco, perché non salta: paga i neuroni, ognuno con 8 moltiplicazioni piene. È il
+prezzo della genericità sulla larghezza: un programma che vale per ogni modello
+fino a 8 neuroni lavora sempre come se lo strato prima fosse largo 8.
+\end{lezione}
+
+Un gradino piccolo, con \texttt{ipa65}: da \texttt{6-4-4} a \texttt{8-2-2-2} P3
+sale di 267 istruzioni. Lo strato in più vale +687, ma dopo il primo strato ci
+sono 24 moltiplicazioni in meno ($-$336) e 2 neuroni in meno ($-$88), e il primo
+strato passa da 6 a 8 neuroni (+26): +292 previsti.
+
+La legge in tre termini ($a + b \cdot$ MAC $+ c \cdot$ strati) resta quella che
+si usa per stimare il tempo, perché basta la forma del modello. Sui 18 modelli
+di questa famiglia, che non usa per la stima, sbaglia il tempo sul P-core del
+5\,\% per P2 e P3, del 6\,\% per P1 e del 13\,\% per P1.5: un poco più del
+3--9\,\% stimato lasciando fuori un modello alla volta.
 
 \section{Il programma da solo, e il cambio di modello}
 \label{sec:pop-solo}
@@ -3567,6 +3669,8 @@ cd ~/Scrivania/ipa_lab
 CAMPAGNA=results/popolazione_2026-10 bash ipa/test/remeasure_popolazione.sh
 # prova breve, due modelli in tutte le sezioni
 CAMPAGNA=results/prova_pop POP_SOLO="m000 m037" bash ipa/test/remeasure_popolazione.sh
+# una famiglia aggiunta in fondo (strati): si misurano solo i modelli nuovi
+CAMPAGNA=results/popolazione_2026-10 POP_T2=0 bash ipa/test/remeasure_popolazione.sh genera corretto pop solo
 # rifare solo cio' che il report ha lasciato fuori
 CAMPAGNA=results/popolazione_2026-10 POP_RIFAI_DISTURBATE=1 bash ipa/test/remeasure_popolazione.sh
 # la sintesi, le slide e la figura di questo capitolo

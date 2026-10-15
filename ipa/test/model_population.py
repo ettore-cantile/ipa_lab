@@ -17,7 +17,7 @@ numero di modelli su cui reggono.
 
 Il disegno
 ----------
-Quattro famiglie, tutte nella cartella ipa/synth/population/:
+Cinque famiglie, tutte nella cartella ipa/synth/population/:
 
   base      il fattoriale: 7 composizioni dell'ingresso x 15 architetture
             (profondita' 1, 2, 3, 4, 6 x larghezza 2, 4, 8). Con --tier base
@@ -34,6 +34,10 @@ Quattro famiglie, tutte nella cartella ipa/synth/population/:
   sparsita  4 configurazioni con il 50 e il 90% dei pesi a zero.
   imbuto    le cinque forme a ~592 pesi (da 1 a 5 strati) su due composizioni
             diverse: larga contro profonda a parita' di pesi.
+  strati    da 1 a 6 strati nascosti a moltiplicazioni eseguite costanti
+            (~108, entro il 6 %) su tre composizioni: il costo di uno strato
+            si legge dalle misure grezze, senza togliere con la legge la
+            parte delle moltiplicazioni.
 
 Le composizioni dell'ingresso coprono i tipi di feature che il datapath sa
 leggere (binari, scalari, one-hot, vettori di coda), in proporzioni diverse:
@@ -171,6 +175,20 @@ ISOPARAM_DIMS = {1: (8,), 2: (8, 4), 3: (8, 3, 3), 4: (7, 5, 5, 5),
                  5: (7, 4, 4, 4, 4)}
 ISOPARAM_LAYOUTS = ("ipa65", "dense17")
 
+# Da 1 a 6 strati nascosti a moltiplicazioni eseguite costanti: per ogni
+# composizione le forme (P2: gli strati dopo il secondo uguali, h1 <= 8) piu'
+# vicine a STRATI_MAC, cercate su n_out fisso. Scarto massimo 6 MAC (5,6 %).
+STRATI_MAC = 108
+STRATI_DIMS = {
+    # composizione: (n_out, forme da 1 a 6 strati)             MAC eseguite
+    "dense17": (5, [(5,), (5, 2), (5, 2, 2), (4, 3, 3, 3),     # 110 105 109 113
+                    (3, 3, 3, 3, 3), (3, 3, 3, 3, 3, 3)]),     # 102 111
+    "mixed33": (5, [(7,), (7, 3), (5, 4, 4), (4, 4, 4, 4),     # 105 106 106 108
+                    (5, 3, 3, 3, 3), (7, 2, 2, 2, 2, 2)]),     # 107 110
+    "ipa65": (4, [(8,), (8, 3), (6, 4, 4), (8, 2, 2, 2),       # 104 108 110 104
+                  (8, 2, 2, 2, 2), (5, 3, 3, 3, 3, 3)]),       # 108 108
+}
+
 # (composizione, profondita', larghezza): dal leggero al pesante, ogni
 # composizione al piu' una volta.
 REPLICA_CONFIGS = [("dense5", 1, 2), ("ipa17", 2, 4), ("mixed33", 3, 4),
@@ -258,6 +276,10 @@ def design(tier="base"):
         for lay in ISOPARAM_LAYOUTS:
             for k, dims in ISOPARAM_DIMS.items():
                 add("imbuto", lay, dims, 7)
+        # in fondo: gli id dei modelli gia' misurati non cambiano
+        for lay, (n_out, forms) in STRATI_DIMS.items():
+            for dims in forms:
+                add("strati", lay, dims, n_out)
     return out
 
 
@@ -532,7 +554,7 @@ def main(argv=None):
                     help="con --list: solo i modelli di un sottoinsieme")
     ap.add_argument("--family", default=None,
                     help="con --list: solo una famiglia (base, replica, "
-                         "sparsita, imbuto)")
+                         "sparsita, imbuto, strati)")
     ap.add_argument("--manifest", metavar="CSV", default=None,
                     help="copia il manifesto qui (accanto ai risultati)")
     a = ap.parse_args(argv)

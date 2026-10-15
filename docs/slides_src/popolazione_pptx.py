@@ -147,6 +147,21 @@ def set_chart(slide, name, cats, series, colors=None):
         se.format.line.color.rgb = rgb
 
 
+def span_gaps(slide, name):
+    """Una linea con un valore mancante prosegue invece di interrompersi."""
+    from pptx.oxml.ns import qn
+    cs = shape(slide, name).chart._chartSpace.chart
+    el = cs.find(qn("c:dispBlanksAs"))
+    if el is None:
+        el = cs.makeelement(qn("c:dispBlanksAs"), {})
+        anchor = cs.find(qn("c:plotVisOnly"))
+        if anchor is not None:
+            anchor.addnext(el)
+        else:
+            cs.find(qn("c:plotArea")).addnext(el)
+    el.set("val", "span")
+
+
 def axis_title(slide, name, cat=None, val=None):
     ch = shape(slide, name).chart
     for ax, txt in ((ch.category_axis, cat), (ch.value_axis, val)):
@@ -411,6 +426,124 @@ def law_figure(pop, facts, path):
     fig.tight_layout()
     fig.savefig(path, facecolor="white")
     plt.close(fig)
+
+
+def _plt():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+INK, INK2, GRID = "#222B36", "#5B6676", "#E3E7EC"
+SHORT = {"p1_static": "P1 statica", "hardcoded": "P1.5", "template": "P2",
+         "modular": "P3"}
+
+
+def _style(ax):
+    ax.set_facecolor("white")
+    ax.grid(True, color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(GRID)
+    ax.tick_params(colors=INK2, labelsize=8)
+
+
+def load_figure(examples, path):
+    """Slide 9: inoltrati contro offerti, P-core, per un modello leggero,
+    uno di mezzo e uno pesante; una linea per pipeline."""
+    plt = _plt()
+    fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.55), dpi=200,
+                             sharey=True)
+    xmax = max(x for e in examples for v in e["pts"].values() for x, _ in v)
+    titles = ("Modello leggero", "Modello medio", "Modello pesante")
+    for ax, e, title in zip(axes, examples, titles):
+        _style(ax)
+        ax.plot([0, xmax], [0, xmax], color="#9AA3AE", linewidth=1,
+                linestyle="--", zorder=1)
+        for m in PIPES:
+            xs, ys = zip(*e["pts"][m])
+            ax.plot(xs, ys, color=COLOR[m], linewidth=2, marker="o",
+                    markersize=3, label=SHORT[m], zorder=3)
+        ax.set_xlim(0, xmax)
+        ax.set_ylim(0, 11.5)
+        ax.set_title(f"{title}\n{e['shape']}  ·  {e['layers']} "
+                     f"{'strato nascosto' if e['layers'] == 1 else 'strati nascosti'}  ·  "
+                     f"{it(e['mac'])} moltiplicazioni", color=INK,
+                     fontsize=9, loc="left")
+        ax.set_xlabel("pacchetti offerti (milioni al secondo)", color=INK2,
+                      fontsize=8.5)
+    axes[0].set_ylabel("pacchetti inoltrati\n(milioni al secondo)",
+                       color=INK2, fontsize=8.5)
+    axes[0].annotate("tutto inoltrato", (8.3, 8.3), rotation=33,
+                     color="#7B8592", fontsize=7.5, ha="center",
+                     va="bottom")
+    axes[0].legend(fontsize=8, frameon=False, loc="upper left",
+                   labelcolor=INK, ncol=2)
+    fig.tight_layout(w_pad=1.5)
+    fig.savefig(path, facecolor="white")
+    plt.close(fig)
+
+
+def sparsity_figure(sp, path):
+    """Slide 19: tempo della rete misurato diviso quello previsto per lo
+    stesso modello senza zeri, contro la frazione di pesi a zero; una linea
+    per pipeline (mediane delle forme)."""
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(7.4, 4.3), dpi=200)
+    _style(ax)
+    zs = (0.0, 0.5, 0.9)
+    ax.axhline(1, color=INK, linewidth=1, linestyle="--", zorder=2)
+    ax.text(25, 1.045, "come lo stesso modello senza zeri", color=INK,
+            fontsize=8, ha="center", va="bottom")
+    ends = []
+    for m in PIPES:
+        ys = [sp[m][z]["med"] if sp[m].get(z) else None for z in zs]
+        ax.plot([z * 100 for z in zs], ys, color=COLOR[m], linewidth=2.4,
+                marker="o", markersize=6, zorder=3)
+        ends.append([ys[-1], m])
+    # etichette a destra, scostate se troppo vicine
+    ends.sort()
+    last = -1
+    for e in ends:
+        last = max(e[0], last + 0.07)
+        e.append(last)
+    for y, m, yl in ends:
+        ax.annotate(f"{SHORT[m]}  {it(y, 2)}", (90, y), (92.5, yl),
+                    color=COLOR[m], fontsize=9, va="center",
+                    fontweight="bold")
+    ax.set_xticks([z * 100 for z in zs],
+                  ["0 %\n(nessuno zero)", "50 %", "90 %"])
+    ax.set_xlim(-3, 112)
+    ax.set_ylim(0, 1.25)
+    ax.set_xlabel("quota dei pesi della rete uguali a zero", color=INK2,
+                  fontsize=9)
+    ax.set_ylabel("tempo della rete con gli zeri\n÷ tempo dello stesso "
+                  "modello senza zeri", color=INK2, fontsize=9)
+    ax.text(-2, 0.05, "sotto la linea: più veloce", color=INK2, fontsize=8,
+            ha="left", va="bottom", style="italic")
+    fig.tight_layout()
+    fig.savefig(path, facecolor="white")
+    plt.close(fig)
+
+
+def replace_pictures(slide, names, png):
+    """Una figura al posto di piu' forme: occupa il rettangolo che le
+    contiene tutte."""
+    olds = [shape(slide, n) for n in names]
+    left, top = min(o.left for o in olds), min(o.top for o in olds)
+    right = max(o.left + o.width for o in olds)
+    bottom = max(o.top + o.height for o in olds)
+    for o in olds:
+        o._element.getparent().remove(o._element)
+    w, h = right - left, bottom - top
+    pic = slide.shapes.add_picture(png, left, top, width=w)
+    if pic.height > h:
+        scale = h / pic.height
+        pic.height = h
+        pic.width = int(w * scale)
 
 
 def replace_picture(slide, name, png):
@@ -720,24 +853,24 @@ def build(pop, f, out=DECK):
              f"LP E-core a 2,5 GHz  ·  mediane dei {lpe['n']} modelli misurati "
              "sui tre core")
 
-    # 9 -- traffico crescente, curve normalizzate alla capacita'
-    ld9 = f["load"]
-    cats9 = [f"{it(g, 2)}×" for g in ld9["grid"]]
-    for chart, k in (("Chart 6", "P"), ("Chart 7", "E")):
-        set_chart(S[8], chart, cats9,
-                  [(nm, ld9["curves"][k][m]) for nm, m in zip(NAMES, PIPES)])
-        axis_title(S[8], chart, cat="traffico offerto ÷ capacità",
-                   val="inoltrati ÷ capacità")
+    # 9 -- traffico crescente: tre modelli (leggero, medio, pesante per
+    # costo di P3) della prova di carico, P-core, una linea per pipeline
+    ld9, ex9 = f["load"], f["load_examples"]
     kc = ld9["knee_over_cap"]
-    n_curves = kc["P"]["n"] // 4
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        png = os.path.join(tmp, "carico.png")
+        load_figure(ex9, png)
+        replace_pictures(S[8], ("Chart 6", "Chart 7"), png)
     set_text(S[8], "TextBox 8",
-             f"**P-core.** Fino alla capacità passa tutto, poi la curva resta "
-             f"piatta: il massimo inoltrato è {md(kc['P'], 2)} volte la "
-             f"capacità misurata a parte.")
+             f"**Come leggerlo.** Finché il programma ce la fa la linea segue "
+             f"la diagonale: passa tutto. Poi diventa piatta alla capacità "
+             f"della versione: più il modello è pesante, più in basso.")
     set_text(S[8], "TextBox 9",
-             f"**E-core.** Stesso andamento ({md(kc['E'], 2)}). Divise per la "
-             f"capacità del loro modello, le curve di modelli diversi "
-             f"coincidono.")
+             f"**Su tutti i modelli provati.** Il massimo inoltrato è "
+             f"{md(kc['P'], 2)} volte la capacità misurata a parte sul "
+             f"P-core, {md(kc['E'], 2)} sull'E-core: sopra non si guadagna "
+             f"niente, si perde.")
     set_text(S[8], "TextBox 13",
              "Oltre la capacità i pacchetti si perdono **in coda, prima del "
              "programma**: il collo di bottiglia è il programma, su ogni tipo "
@@ -745,8 +878,9 @@ def build(pop, f, out=DECK):
              "milioni di pacchetti al secondo perde anche l'uscita.")
     set_text(S[8], "TextBox 5",
              f"Traffico crescente da 0,5 a 12 milioni di pacchetti al "
-             f"secondo, {n_curves} modelli dal più leggero al più pesante  ·  "
-             f"entrambi gli assi divisi per la capacità del modello")
+             f"secondo, P-core a 3,5 GHz  ·  i tre modelli: il più leggero, "
+             f"quello di mezzo e il più pesante dei {kc['P']['n'] // 4} "
+             f"provati sotto carico")
 
     # 10 -- due core
     tw = f["two"]
@@ -816,36 +950,52 @@ def build(pop, f, out=DECK):
     iso_nota = (f"a 4–5 strati +{pct(iso['mac_rise'][0])}–"
                 f"{pct(iso['mac_rise'][1])} % di moltiplicazioni")
 
-    # 14 -- istruzioni per strato
+    # 14 -- istruzioni per strato: la famiglia "strati", da 1 a 6 strati
+    # nascosti a moltiplicazioni costanti, misure grezze (mediana dei tre
+    # ingressi). Il fisso per strato e il costo per neurone vengono dalla
+    # legge con le forme degli strati (Pop.strati).
+    sf = f["strati"]
+    dd = [str(d) for d in sf["depths"]]
+    sf_s = lambda g, m: [g[m].get(int(d)) for d in dd]  # noqa: E731
     set_chart(S[13], "Chart 6", dd,
-              [(nm, iso_s(iso["instr"], m)) for nm, m in zip(NAMES, PIPES)])
+              [(nm, sf_s(sf["instr"], m)) for nm, m in zip(NAMES, PIPES)])
     set_chart(S[13], "Chart 7", dd,
-              [("P3 · P-core", iso_s(iso["total"]["P"], "modular")),
-               ("P3 · E-core", iso_s(iso["total"]["E"], "modular")),
-               ("P2 · P-core", iso_s(iso["total"]["P"], "template")),
-               ("P2 · E-core", iso_s(iso["total"]["E"], "template"))])
+              [("P3 · P-core", sf_s(sf["ns"]["P"], "modular")),
+               ("P3 · E-core", sf_s(sf["ns"]["E"], "modular")),
+               ("P2 · P-core", sf_s(sf["ns"]["P"], "template")),
+               ("P2 · E-core", sf_s(sf["ns"]["E"], "template"))])
+    for chart in ("Chart 6", "Chart 7"):
+        span_gaps(S[13], chart)
+    axis_title(S[13], "Chart 6", cat="strati nascosti",
+               val="istruzioni per pacchetto")
+    axis_title(S[13], "Chart 7", cat="strati nascosti",
+               val="ns di rete per pacchetto")
     li = L[("P", "instr", "modular")]
+    c3, c2 = sf["code"]["modular"], sf["code"]["template"]
     set_text(S[13], "TextBox 3",
              f"Ogni strato di P3 costa ~{it(round(li['c'], -1))} istruzioni")
     set_text(S[13], "TextBox 8",
-             f"**Istruzioni eseguite.** A parità di moltiplicazioni ogni strato "
-             f"in più ne aggiunge {it(li['c'])} a P3 e "
-             f"{it(L[('P', 'instr', 'template')]['c'])} a P2, uguali su P-core "
-             f"ed E-core.")
+             f"**Istruzioni, a moltiplicazioni ferme.** Ogni strato in più ne "
+             f"aggiunge in media {it(round(sf['step']['modular']['med'], -1))} "
+             f"a P3 e {it(round(sf['step']['template']['med'], -1))} a P2, "
+             f"uguali su P-core ed E-core. P1 e P1.5 restano piatte.")
     set_text(S[13], "TextBox 9",
              f"**Tempo.** Ogni strato costa a P3 "
-             f"~{it(L[('P', 'ns', 'modular')]['c'])} ns sul P-core e "
-             f"~{it(L[('E', 'ns', 'modular')]['c'])} sull'E-core (tratteggio): "
-             f"stesse istruzioni, eseguite più lentamente.")
+             f"~{it(sf['step_ns']['P']['modular']['med'])} ns sul P-core e "
+             f"~{it(sf['step_ns']['E']['modular']['med'])} sull'E-core "
+             f"(tratteggio): stesse istruzioni, eseguite più lentamente.")
     set_text(S[13], "TextBox 13",
-             "P3 esegue uno strato alla volta: a ogni strato salta a un altro "
-             "programma e rilegge dalle tabelle dove si trova. È sempre lo "
-             "stesso lavoro, per questo ogni strato costa uguale, su ogni "
-             "modello.")
+             f"In P3 ogni strato è un programma a sé: "
+             f"~{it(round(c3['per_layer'], -1))} istruzioni fisse (salto, "
+             f"letture di tabella, cicli a vuoto) più "
+             f"~{it(round(c3['per_neuron']))} per ogni suo neurone, che "
+             f"controlla sempre 8 ingressi. Per questo i gradini non sono "
+             f"tutti uguali.")
     set_text(S[13], "TextBox 5",
-             f"Grafici: {iso['n']} modelli a pari pesi, mediane ({iso_nota})"
-             f"  ·  testo: costo per strato a parità di moltiplicazioni, "
-             f"{li['n']} modelli")
+             f"{sf['n']} modelli, {it(sf['mac'][0])}–{it(sf['mac'][1])} "
+             f"moltiplicazioni, {len(sf['layouts'])} ingressi: mediane, "
+             f"misure senza correzioni  ·  fisso e per neurone: legge sulla "
+             f"forma del codice, {c3['n']} modelli")
 
     # 15 -- larghezza e pari pesi, tempo del nodo: tolta, ripeteva la
     # larghezza della slide della taglia e la profondita' delle slide 13 e
@@ -999,6 +1149,10 @@ def build(pop, f, out=DECK):
               + [[nm, " · ".join(f"{pct(x['med'])} %" for x in sh21[m])]
                  for nm, m in zip(NAMES, PIPES)])
     errs = [L[("P", "ns", m)]["err50"] for m in PIPES]
+    # la stessa legge sui modelli della famiglia "strati", che non ha visto
+    nuovi = ([f["strati"]["law_err"][("P", m)]["med"] for m in PIPES
+              if f["strati"]["law_err"].get(("P", m))]
+             if f.get("strati") else [])
     r2s = [L[("P", "ns", m)]["r2"] for m in PIPES]
     r2sh = [L[("P", "ns", m)]["r2_shape"] for m in PIPES]
     set_text(S[21], "TextBox 3",
@@ -1008,7 +1162,7 @@ def build(pop, f, out=DECK):
              f"**Dove va il tempo.** Con P1 e P1.5 circa metà è "
              f"moltiplicazioni. Con P2 e P3 circa l'"
              f"{pct(min(struct))} % è struttura: il lavoro fisso e quello per "
-             f"strato, cioè salti fra programmi e letture di tabella. Su "
+             f"strato: salti, letture di tabella, cicli fissati a 8. Su "
              f"modelli mai visti la legge sbaglia del {it(min(errs))}–"
              f"{it(max(errs))} %.")
     lp1, lp3 = L[("P", "ns", "p1_static")], L[("P", "ns", "modular")]
@@ -1020,17 +1174,19 @@ def build(pop, f, out=DECK):
              f"~{it(lp3['c'])} ns per strato.")
     set_text(S[21], "TextBox 5",
              f"Stimata su {lp1['n']} modelli senza pesi a zero, errore su "
-             "modelli lasciati fuori  ·  grafico: costo meno la parte per "
-             "strato  ·  tabella: quanto pesa ogni parte")
+             "modelli lasciati fuori"
+             + (f" (sui {f['strati']['n']} modelli aggiunti dopo: "
+                f"{it(min(nuovi))}–{it(max(nuovi))} %)" if nuovi else "")
+             + "  ·  grafico: costo meno la parte per strato  ·  tabella: "
+             "quanto pesa ogni parte")
 
     # 23 -- pesi a zero (diventa la 22)
     sp = f["sparsity"]["ratio"]          # {pipeline: {0.0|0.5|0.9: summ}}
-    vals23 = {m: [sp[m][k]["med"] if sp[m].get(k) else None
-                  for k in (0.0, 0.5, 0.9)] for m in PIPES}
-    set_chart(S[22], "Chart 6", ["0 %", "50 %", "90 %"],
-              [(nm, vals23[m]) for nm, m in zip(NAMES, PIPES)])
-    axis_title(S[22], "Chart 6", val="misurato ÷ previsto senza zeri")
     szr = f["sparsity"]["size"]
+    with tempfile.TemporaryDirectory() as tmp:
+        png = os.path.join(tmp, "zeri.png")
+        sparsity_figure(sp, png)
+        replace_pictures(S[22], ("Chart 6",), png)
     set_text(S[22], "TextBox 10",
              f"Al 90 % di zeri il programma scende a circa un terzo "
              f"({span(szr['hardcoded@0.9'], 2)} volte) e la rete costa "
@@ -1049,9 +1205,11 @@ def build(pop, f, out=DECK):
              f"**{md(sp['hardcoded'][0.9], 2)}** volte il previsto. Con P2 e "
              f"P3 non dà niente.")
     set_text(S[22], "TextBox 5",
-             "4 forme con il 50 e il 90 % di pesi a zero, confrontate con la "
-             "legge stimata sui modelli senza zeri  ·  sola rete, P-core a "
-             "3,5 GHz")
+             f"Sola rete, P-core a 3,5 GHz  ·  0 %: mediana dei "
+             f"{sp['p1_static'][0.0]['n']} modelli senza zeri; 50 e 90 %: "
+             f"mediana di {sp['p1_static'][0.9]['n']} forme  ·  "
+             f"«senza zeri» = tempo previsto dalla legge per la stessa "
+             f"forma")
 
     # 18 -- cambiare modello (bench_solo.py: il nodo, e clang fuori dal nodo)
     S18 = S[17]

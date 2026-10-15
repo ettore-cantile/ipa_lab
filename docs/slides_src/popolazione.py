@@ -184,6 +184,31 @@ class Pop:
         return dict(grid=list(grid), curves=curves,
                     knee_over_cap={k: summ(v) for k, v in knees.items()})
 
+    def load_examples(self, k="P"):
+        """Tre modelli della prova di carico -- il piu' leggero, quello di
+        mezzo e il piu' pesante per costo di P3 -- con le curve misurate
+        (offerti, inoltrati in milioni di pacchetti/s) e la capacita' misurata
+        a parte, per pipeline."""
+        root = os.path.join(self.base, f"carico_{k}core")
+        mids = [i for i in sorted(os.listdir(root))
+                if self.nn(k, i, "modular") is not None]
+        mids.sort(key=lambda i: self.nn(k, i, "modular"))
+        out = []
+        for mid in (mids[0], mids[(len(mids) - 1) // 2], mids[-1]):
+            br = self.c.read_bitrate(os.path.join(root, mid))
+            pts, caps = {}, {}
+            for m in PIPES:
+                pts[m] = sorted((num(r["rate_requested_pps"]) / 1e6,
+                                 (num(r.get("forwarded_pps")) or 0) / 1e6)
+                                for r in br if r.get("method") == m)
+                caps[m] = self.val(k, mid, m, "mpps")
+            out.append(dict(id=mid, shape=self.m(mid, "shape"),
+                            layers=int(num(self.m(mid, "depth"))),
+                            mac=num(self.m(mid, "mac_exec")),
+                            p3_ns=self.nn(k, mid, "modular"),
+                            pts=pts, caps=caps))
+        return out
+
     # -- due core ------------------------------------------------------------
     def two_cores(self):
         out = {}
@@ -310,6 +335,96 @@ class Pop:
                     g.setdefault(int(num(self.m(i, group))), []).append(v)
             out[m] = {x: med(v) for x, v in sorted(g.items())}
         return out
+
+    def strati(self, laws):
+        """Slide 12: la famiglia "strati" (model_population.py), da 1 a 6
+        strati nascosti a moltiplicazioni costanti su tre ingressi. Misure
+        grezze, nessuna correzione: mediana dei tre ingressi per profondita'.
+        Le istruzioni per pacchetto non dipendono dal core (P ed E danno le
+        stesse): dove la misura sul P-core e' esclusa si prende l'E-core.
+        Poi il costo di uno strato secondo la forma del codice (fisso per
+        strato, per neurone degli strati dopo il primo) e l'errore della legge
+        su questi modelli, che la legge non ha visto."""
+        ids = self.ids_of(("strati",))
+        if not ids:
+            return None
+        depths = sorted({int(num(self.m(i, "depth"))) for i in ids})
+        lays = sorted({self.m(i, "layout") for i in ids})
+
+        def instr(i, m):
+            return self.val("P", i, m, "instr") or self.val("E", i, m, "instr")
+
+        def table(get):
+            out = {}
+            for m in PIPES:
+                g = {}
+                for i in ids:
+                    v = get(i, m)
+                    if v is not None:
+                        g.setdefault(int(num(self.m(i, "depth"))), []).append(v)
+                out[m] = {d: med(v) for d, v in sorted(g.items())}
+            return out
+
+        def step(get, m):
+            """Salita media per strato, ingresso per ingresso: (6 - 1) / 5."""
+            st_ = []
+            for lay in lays:
+                byd = {int(num(self.m(i, "depth"))): get(i, m) for i in ids
+                       if self.m(i, "layout") == lay}
+                lo, hi = byd.get(depths[0]), byd.get(depths[-1])
+                if lo and hi:
+                    st_.append((hi - lo) / (depths[-1] - depths[0]))
+            return summ(st_)
+        ins = table(instr)
+        ns = {k: table(lambda i, m, k=k: self.nn(k, i, m)) for k in ("P", "E")}
+        steps = {m: step(instr, m) for m in PIPES}
+        steps_ns = {k: {m: step(lambda i, m_, k=k: self.nn(k, i, m_), m)
+                        for m in ("template", "modular")} for k in ("P", "E")}
+        macs = [num(self.m(i, "mac_exec")) for i in ids]
+        # il costo di uno strato come lo scrive il codice: un termine fisso
+        # per strato e uno per neurone degli strati dopo il primo (i cicli
+        # sono srotolati a 8 ingressi per neurone), con il costo del primo
+        # strato a parte per ogni ingresso. Stimato su tutti i modelli densi,
+        # vecchi e nuovi; errore su un modello lasciato fuori.
+        import numpy as np
+        fit_ids = self.ids_of(DENSE + ("strati",))
+
+        def shape_terms(i):
+            hid = [int(x) for x in self.m(i, "hidden").split("-")]
+            n_out = int(num(self.m(i, "n_out")))
+            later = list(zip(hid, hid[1:] + [n_out]))
+            mac = num(self.m(i, "mac_exec"))
+            mac_later = sum(a * b for a, b in later)
+            return [mac - mac_later, mac_later, len(hid) + 1, hid[0],
+                    sum(b for _, b in later)]
+        all_lays = sorted({self.m(i, "layout") for i in fit_ids})
+        code = {}
+        for m in ("template", "modular"):
+            rows = [(i, instr(i, m)) for i in fit_ids]
+            rows = [(i, v) for i, v in rows if v]
+            X = np.array([[1.0] + [1.0 if self.m(i, "layout") == l_ else 0.0
+                                   for l_ in all_lays[1:]] + shape_terms(i)
+                          for i, _ in rows])
+            y = np.array([v for _, v in rows])
+            beta = np.linalg.lstsq(X, y, rcond=None)[0]
+            errs = []
+            for k in range(len(y)):
+                keep = np.arange(len(y)) != k
+                b = np.linalg.lstsq(X[keep], y[keep], rcond=None)[0]
+                errs.append(abs(X[k] @ b - y[k]) / y[k] * 100)
+            code[m] = dict(per_layer=beta[-3], per_neuron=beta[-1],
+                           per_mac_later=beta[-4], n=len(y),
+                           err50=med(errs))
+        law_err = {}
+        for k in ("P", "E"):
+            for m in PIPES:
+                law = laws.get((k, "ns", m))
+                e = [abs(self.predict(law, i) / self.nn(k, i, m) - 1) * 100
+                     for i in ids if law and self.nn(k, i, m)]
+                law_err[(k, m)] = summ(e)
+        return dict(ids=ids, n=len(ids), depths=depths, layouts=lays,
+                    instr=ins, ns=ns, step=steps, step_ns=steps_ns,
+                    mac=(min(macs), max(macs)), code=code, law_err=law_err)
 
     def laws(self):
         """Le leggi di population_report: a + b*MAC eseguite + c*strati."""
@@ -540,7 +655,7 @@ class Pop:
         f = dict(
             n_models=len(self.ids),
             families={fam: len(self.ids_of((fam,)))
-                      for fam in ("base", "replica", "sparsita", "imbuto")},
+                      for fam in ("base", "replica", "sparsita", "imbuto", "strati")},
             ranges={k: rng([num(self.m(i, k)) for i in self.ids])
                     for k in ("n_in", "depth", "width_max", "n_out",
                               "weights", "mac_exec")},
@@ -617,6 +732,8 @@ class Pop:
         f["nodes"] = self.nodes(laws)
         f["sparsity"] = self.sparsity(laws)
         f["isoparam"] = self.isoparam()
+        f["strati"] = self.strati(laws)
+        f["load_examples"] = self.load_examples()
         f["replicas"] = self.replicas()
         order = []
         for i in self.ids:
