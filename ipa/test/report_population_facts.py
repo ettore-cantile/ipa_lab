@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""
-popolazione.py -- le cifre riassuntive di una campagna di popolazione.
+"""report_population_facts.py -- the summary figures of a population campaign.
 
-    python3 ipa/test/popolazione.py results/popolazione_2026-10            # cifre
-    python3 ipa/test/popolazione.py results/popolazione_2026-10 --figura   # e figura
+    python3 ipa/test/report_population_facts.py results/popolazione_2026-10            # figures, JSON
+    python3 ipa/test/report_population_facts.py results/popolazione_2026-10 --figura   # the cost-law chart
 
-Nessuna cifra e' di un modello solo: ogni numero e' una mediana, un
-intervallo [minimo–massimo] o una legge stimata sulla popolazione, letta con
-population_report.Campaign (stesse esclusioni: misure disturbate o bocciate
-fuori). Stampa le cifre in JSON; sono quelle citate in docs/claims.md e nel
-capitolo del september_notebook. Con --figura ridisegna invece la figura
-della legge di costo del notebook (docs/figures/popolazione_legge.pdf).
+Medians, ranges and laws over the population (same exclusions as
+report_population.py); --figura redraws docs/figures/popolazione_legge.pdf.
 """
 import json
 import math
@@ -24,22 +19,20 @@ sys.path.insert(0, os.path.join(ROOT, "ipa", "test"))
 sys.path.insert(0, os.path.join(ROOT, "ipa"))
 FIGURE = os.path.join(ROOT, "docs", "figures", "popolazione_legge.pdf")
 
-import population_report as PR  # noqa: E402
-import campaign_report as CR  # noqa: E402
+import report_population as PR  # noqa: E402
+import table_helpers as CR  # noqa: E402
 
-PIPES = PR.PIPES                       # p1_static, hardcoded, template, modular
+PIPES = PR.PIPES
 ALL = ("baseline",) + PIPES
-LAB = {"rxonly": "solo ricezione", "baseline": "baseline",
-       "p1_static": "P1 statica", "hardcoded": "P1.5", "template": "P2",
+LAB = {"rxonly": "receive only", "baseline": "baseline",
+       "p1_static": "P1 static", "hardcoded": "P1.5", "template": "P2",
        "modular": "P3"}
 SHORT = {"baseline": "baseline", "p1_static": "P1", "hardcoded": "P1.5",
          "template": "P2", "modular": "P3"}
-DENSE = ("base", "replica", "imbuto")  # le famiglie della legge di costo
+DENSE = ("base", "replica", "imbuto")
 
 
-# --------------------------------------------------------------------------
-# statistica
-# --------------------------------------------------------------------------
+# --- statistics ---
 def clean(xs):
     return [x for x in xs if x is not None and not (isinstance(x, float)
                                                     and math.isnan(x))]
@@ -56,7 +49,7 @@ def rng(xs):
 
 
 def summ(xs):
-    """{'n', 'med', 'min', 'max'} di una lista."""
+    """{'n', 'med', 'min', 'max'} of a list."""
     xs = clean(xs)
     if not xs:
         return None
@@ -67,14 +60,12 @@ def num(v):
     return PR.num(v)
 
 
-# --------------------------------------------------------------------------
-# le cifre
-# --------------------------------------------------------------------------
+# --- the figures ---
 class Pop:
     def __init__(self, base):
         self.c = PR.Campaign(base)
         if not self.c.models:
-            sys.exit(f"{base}: nessuna popolazione")
+            sys.exit(f"{base}: no population")
         self.base = base
         self.ids = sorted(self.c.models)
 
@@ -97,7 +88,6 @@ class Pop:
     def nn(self, k, i, m, key="ns"):
         return self.c.nn(k, i, m, key)
 
-    # -- tetti senza modello ----------------------------------------------
     def reference(self):
         out = {}
         for k in ("P", "E", "L"):
@@ -113,7 +103,6 @@ class Pop:
                         busy=num(r.get("dut_busy_pct")))
         return out
 
-    # -- per pipeline, per core, su tutta la popolazione --------------------
     def per_pipe(self, k, key, ids=None, nn=False):
         ids = ids or self.ids
         f = self.nn if nn else self.val
@@ -121,7 +110,7 @@ class Pop:
                 if not (nn and m == "baseline")}
 
     def ratio(self, k1, k0, key, ids=None, nn=False):
-        """k1/k0 modello per modello (stesso modello, due core)."""
+        """k1/k0 model by model (same model, two cores)."""
         ids = ids or self.ids
         f = self.nn if nn else self.val
         out = {}
@@ -137,7 +126,7 @@ class Pop:
         return out
 
     def pipe_ratio(self, k, a, b, key="ns"):
-        """pipeline a / pipeline b sulla rete neurale, modello per modello."""
+        """pipeline a / pipeline b on the neural network, model by model."""
         v = []
         for i in self.ids:
             x, y = self.nn(k, i, a, key), self.nn(k, i, b, key)
@@ -145,11 +134,8 @@ class Pop:
                 v.append(x / y)
         return summ(v)
 
-    # -- curve al crescere del rate, normalizzate alla capacita' -----------
     def load_curves(self, grid=(0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)):
-        """Per core e pipeline: mediana sui modelli di inoltrati/capacita' a
-        offerto/capacita' = grid (interpolazione lineare sulla curva di ogni
-        modello). Cosi' le curve di modelli diversi si sovrappongono."""
+        """Per core and pipeline."""
         out, knees = {}, {}
         for k in ("P", "E"):
             root = os.path.join(self.base, f"carico_{k}core")
@@ -184,10 +170,10 @@ class Pop:
                     knee_over_cap={k: summ(v) for k, v in knees.items()})
 
     def load_examples(self, k="P"):
-        """Tre modelli della prova di carico -- il piu' leggero, quello di
-        mezzo e il piu' pesante per costo di P3 -- con le curve misurate
-        (offerti, inoltrati in milioni di pacchetti/s) e la capacita' misurata
-        a parte, per pipeline."""
+        """Three models of the load test -- the lightest, the middle one and
+        the heaviest by P3 cost -- with the measured curves (offered,
+        forwarded, in million packets/s) and the capacity measured
+        separately, per pipeline."""
         root = os.path.join(self.base, f"carico_{k}core")
         mids = [i for i in sorted(os.listdir(root))
                 if self.nn(k, i, "modular") is not None]
@@ -208,7 +194,6 @@ class Pop:
                             pts=pts, caps=caps))
         return out
 
-    # -- due core ------------------------------------------------------------
     def two_cores(self):
         out = {}
         for k in ("P", "E"):
@@ -233,11 +218,8 @@ class Pop:
                           n=len(os.listdir(root)))
         return out
 
-    # -- tre orologi ---------------------------------------------------------
     def clocks(self):
-        """T2-T1 (programma intero, baseline compresa) e T3-T2 minimi:
-        mediana sui modelli. E il rapporto traffico leggero / nodo saturo
-        della sola rete."""
+        """Minimum T2-T1 (whole program, baseline included) and T3-T2."""
         prog, xport, light, minavg = {}, {}, {}, {}
         for k in ("P", "E"):
             for m in ALL:
@@ -259,7 +241,6 @@ class Pop:
                 minavg[(k, m)] = summ(w)
         return dict(prog=prog, xport=xport, light=light, minavg=minavg)
 
-    # -- taglie, classi, TTL misti ------------------------------------------
     def frames(self):
         root = os.path.join(self.base, "taglie")
         by, var = {}, []
@@ -321,9 +302,8 @@ class Pop:
                     rel.append((num(s[m].get("ns_cpu")) / fixed - 1) * 100)
         return dict(rel=summ(rel), n=len(os.listdir(root)))
 
-    # -- la forma: profondita', larghezza, pari pesi, sparsita' -------------
     def by_group(self, k, key, group, ids, nn=True, stat=None):
-        """{pipeline: {valore del gruppo: mediana}} sui modelli `ids`."""
+        """{pipeline: {group value: median}} over the models `ids`."""
         out = {}
         for m in (PIPES if nn else ALL):
             g = {}
@@ -336,14 +316,13 @@ class Pop:
         return out
 
     def strati(self, laws):
-        """Slide 12: la famiglia "strati" (model_population.py), da 1 a 6
-        strati nascosti a moltiplicazioni costanti su tre ingressi. Misure
-        grezze, nessuna correzione: mediana dei tre ingressi per profondita'.
-        Le istruzioni per pacchetto non dipendono dal core (P ed E danno le
-        stesse): dove la misura sul P-core e' esclusa si prende l'E-core.
-        Poi il costo di uno strato secondo la forma del codice (fisso per
-        strato, per neurone degli strati dopo il primo) e l'errore della legge
-        su questi modelli, che la legge non ha visto."""
+        """The "strati" family (model_population.py): 1 to 6 hidden layers at
+        constant multiplications on three input layouts. Raw measurements,
+        median of the three layouts per depth (instructions per packet do not
+        depend on the core: where the P-core measurement is excluded the
+        E-core one is used). Then the cost of a layer following the code
+        (fixed per layer, per neuron of the layers after the first) and the
+        error of the law on these models, which the law has not seen."""
         ids = self.ids_of(("strati",))
         if not ids:
             return None
@@ -365,7 +344,7 @@ class Pop:
             return out
 
         def step(get, m):
-            """Salita media per strato, ingresso per ingresso: (6 - 1) / 5."""
+            """Mean rise per layer, layout by layout."""
             st_ = []
             for lay in lays:
                 byd = {int(num(self.m(i, "depth"))): get(i, m) for i in ids
@@ -380,11 +359,6 @@ class Pop:
         steps_ns = {k: {m: step(lambda i, m_, k=k: self.nn(k, i, m_), m)
                         for m in ("template", "modular")} for k in ("P", "E")}
         macs = [num(self.m(i, "mac_exec")) for i in ids]
-        # il costo di uno strato come lo scrive il codice: un termine fisso
-        # per strato e uno per neurone degli strati dopo il primo (i cicli
-        # sono srotolati a 8 ingressi per neurone), con il costo del primo
-        # strato a parte per ogni ingresso. Stimato su tutti i modelli densi,
-        # vecchi e nuovi; errore su un modello lasciato fuori.
         import numpy as np
         fit_ids = self.ids_of(DENSE + ("strati",))
 
@@ -426,16 +400,16 @@ class Pop:
                     mac=(min(macs), max(macs)), code=code, law_err=law_err)
 
     def laws(self):
-        """Le leggi di population_report: a + b*MAC eseguite + c*strati."""
+        """The laws of report_population."""
         out = {}
         for k in ("P", "E"):
             for key in ("ns", "instr"):
                 _, laws = PR._fit_rows(self.c, k, key, families=DENSE)
                 for m, d in laws.items():
-                    lab = "MAC eseguite + strati"
+                    lab = "executed MACs + layers"
                     if lab in d:
                         beta, r2, e50, n = d[lab]
-                        shape = d.get("MAC dalla forma + strati")
+                        shape = d.get("shape MACs + layers")
                         out[(k, key, m)] = dict(
                             a=beta[0], b=beta[1], c=beta[2], r2=r2, err50=e50,
                             n=n, r2_shape=shape[1] if shape else None)
@@ -445,16 +419,14 @@ class Pop:
         _, laws = PR._fit_rows(self.c, None, None, stat=loaded,
                                families=DENSE)
         for m, d in laws.items():
-            beta, r2, e50, n = d["MAC eseguite + strati"]
+            beta, r2, e50, n = d["executed MACs + layers"]
             out[("size", m)] = dict(a=beta[0], b=beta[1], c=beta[2], r2=r2,
                                     n=n)
         return out
 
     def law_shares(self, laws):
-        """Quanto pesa ogni termine della legge sul costo previsto, modello
-        per modello (modelli densi, P-core): {pipeline: (fisso, MAC, strati)}
-        come summ() di frazioni. Dice dove va il tempo: nell'aritmetica (b)
-        o nella struttura, cioe' tail call e letture di tabella (a, c)."""
+        """How much each term of the law weighs on the predicted cost, model
+        by model (dense models, P-core)."""
         out = {}
         for m in PIPES:
             law = laws.get(("P", "ns", m))
@@ -478,9 +450,9 @@ class Pop:
                 + law["c"] * num(self.m(i, "n_layers")))
 
     def nodes(self, laws):
-        """Slide 19: costo misurato meno la legge, per numero di nodi della
-        rete (one-hot dell'identita' del nodo). Solo le composizioni che
-        hanno la feature del nodo. E la pendenza in ns per nodo."""
+        """Measured cost minus the law, per number of network nodes (node
+        identity one-hot), only for the layouts that have the node feature;
+        and the slope in ns per node."""
         import model_population as MP
         n_nodes = {}
         for lay, (fs, topo) in MP.LAYOUTS.items():
@@ -509,8 +481,8 @@ class Pop:
                     ns_per_node=slope, n=len(ids))
 
     def sparsity(self, laws):
-        """Slide 23: misurato / previsto dalla legge densa, per frazione di
-        pesi a zero; e la dimensione caricata contro il gemello denso."""
+        """Measured / predicted by the dense law, per fraction of zero
+        weights; and the loaded size against the dense twin."""
         out, size = {}, {}
         for m in PIPES:
             law = laws.get(("P", "ns", m))
@@ -524,8 +496,6 @@ class Pop:
                     continue
                 g.setdefault(sp, []).append(y / self.predict(law, i))
             out[m] = {x: summ(v) for x, v in sorted(g.items())}
-        # dimensione: modello sparso contro il modello denso con la stessa
-        # forma e composizione (famiglia base o replica)
         for i in self.ids_of(("sparsita",)):
             twin = [j for j in self.ids_of(("base", "replica"))
                     if self.m(j, "shape") == self.m(i, "shape")
@@ -562,9 +532,6 @@ class Pop:
                 if d.get(1) and d.get(5):
                     v.append((d[5] / d[1] - 1) * 100)
             rise[m] = summ(v)
-        # "a pari pesi" solo in parte: i pesi sono pari dentro un ingresso
-        # (non fra i due), e a 4-5 strati le MAC eseguite crescono. Le cifre
-        # per dirlo nelle didascalie.
         lays = sorted({self.m(i, "layout") for i in ids})
         wts = {lay: [int(num(self.m(i, "weights"))) for i in ids
                      if self.m(i, "layout") == lay] for lay in lays}
@@ -600,12 +567,9 @@ class Pop:
             out[m] = summ(v)
         return dict(spread=out, groups=len(groups))
 
-    # -- il programma da solo, il cambio di modello (bench_solo.py) ----------
     def solo(self):
-        """Letture di tabella, salti, tempi per installare un modello e per
-        compilare, su ogni modello; e la sola rete a nodo saturo divisa per
-        quella da sola a chiamate singole. Solo le misure che hanno inoltrato
-        (la strada del traffico), come in population_report."""
+        """Table lookups, tail calls, times to install a model and to
+        compile, on every model."""
         rows, comp = {}, {}
         for i in self.ids:
             d = os.path.join(self.base, "solo", i)
@@ -647,7 +611,6 @@ class Pop:
         out["n"] = len(rows)
         return out
 
-    # -- tutto ---------------------------------------------------------------
     def facts(self):
         laws = self.laws()
         dense = self.ids_of(DENSE)
@@ -710,7 +673,6 @@ class Pop:
                       for k in ("P", "E")}
         f["width_total"] = {k: self.by_group(k, "ns", "width_max", dense,
                                              nn=False) for k in ("P", "E")}
-        # la sola rete a traffico leggero, minimo e media di T2-T1
         light = {}
         for which, lab in ((0, "min"), (1, "avg")):
             light[lab] = self.by_group(
@@ -718,9 +680,6 @@ class Pop:
                 stat=lambda k, i, m, w=which: self.c.nn_t2(k, i, m, w))
         f["depth_light"] = light
         f["law_shares"] = self.law_shares(laws)
-        # il rumore di misura (population_report.noise): la stessa misura
-        # rifatta in un'altra sessione; sotto questa soglia una differenza
-        # non e' una differenza
         nz = PR.noise(self.c)
         f["noise"] = dict(
             same_med=PR.quant(nz["same"], .5), same_p90=PR.quant(nz["same"], .9),
@@ -752,30 +711,27 @@ class Pop:
         return f
 
 
-# --------------------------------------------------------------------------
-# figura della legge di costo (docs/figures/popolazione_legge.pdf)
-# --------------------------------------------------------------------------
+# --- cost-law figure (docs/figures/popolazione_legge.pdf) ---
 COLOR = {"p1_static": "#C8551E", "hardcoded": "#F09A3E",
          "template": "#2E9C8F", "modular": "#1F5F8B"}
 
 
 def it(x, d=0):
-    """1234.5 -> '1 234,5' (spazio per le migliaia, virgola decimale)."""
+    """1234.5 -> '1 234,5' (space for thousands, decimal comma)."""
     s = f"{x:,.{d}f}"
     return s.replace(",", " ").replace(".", ",")
 
 
 def law_figure(pop, facts, path):
-    """Costo della rete meno c x strati contro le MAC eseguite, un punto per
-    modello denso: la parte che la legge attribuisce alle MAC, che deve
-    stare su una retta di pendenza b."""
+    """Network cost minus c x layers against executed MACs, one point per
+    dense model."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     ink, ink2, grid = "#222B36", "#5B6676", "#E3E7EC"
     marker = {"p1_static": "o", "hardcoded": "s", "template": "D",
               "modular": "^"}
-    name = {"p1_static": "P1 statica", "hardcoded": "P1.5", "template": "P2",
+    name = {"p1_static": "P1 static", "hardcoded": "P1.5", "template": "P2",
             "modular": "P3"}
     fig, ax = plt.subplots(figsize=(6.4, 4.0), dpi=200)
     ax.set_facecolor("white")
@@ -793,19 +749,18 @@ def law_figure(pop, facts, path):
         ax.scatter(xs, ys, s=16, marker=marker[m], color=COLOR[m],
                    alpha=0.75, linewidths=0.6, edgecolors="white",
                    label=f"{name[m]}: {it(law['b'], 2)} ns per "
-                         f"moltiplicazione", zorder=3)
+                         f"multiplication", zorder=3)
         ax.plot([0, xmax * 1.03], [law["a"], law["a"] + law["b"] * xmax * 1.03],
                 color=COLOR[m], linewidth=2, zorder=2)
-        # P1 e P1.5 finiscono quasi nello stesso punto: etichette scostate
         dy = {"hardcoded": 9, "p1_static": -9}.get(m, 0)
         ax.annotate(name[m], (xmax * 1.035,
                               law["a"] + law["b"] * xmax * 1.03 + dy),
                     color=ink, fontsize=8, va="center")
     ax.set_xlim(0, xmax * 1.16)
     ax.set_ylim(bottom=0)
-    ax.set_xlabel("moltiplicazioni eseguite per pacchetto", color=ink2,
+    ax.set_xlabel("multiplications executed per packet", color=ink2,
                   fontsize=8)
-    ax.set_ylabel("ns di rete neurale, tolta la parte per strato", color=ink2,
+    ax.set_ylabel("ns of neural network, minus the per-layer part", color=ink2,
                   fontsize=8)
     ax.grid(True, color=grid, linewidth=0.8)
     ax.set_axisbelow(True)
@@ -821,9 +776,7 @@ def law_figure(pop, facts, path):
     plt.close(fig)
 
 
-# --------------------------------------------------------------------------
-# JSON: le chiavi tuple diventano stringhe
-# --------------------------------------------------------------------------
+# --- JSON: tuple keys become strings ---
 def _jsonable(o):
     if isinstance(o, dict):
         return {("|".join(map(str, k)) if isinstance(k, tuple) else str(k)):

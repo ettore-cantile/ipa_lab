@@ -1,13 +1,7 @@
-"""bench_throughput's steady window, checked without a kernel.
+"""test_capacity_window.py -- the measurement window of bench_capacity, checked
+with a simulated generator. No root.
 
-A fake pktgen reproduces the kernel's timing -- T_RUN picked up within HZ/10,
-a fixed 125 ms sleep, completion polled every 100 ms -- and the fake DUT
-counters follow it. Checks that Generator.steady reads the true rate, that the
-legacy count window (divided by the block on `pgctrl start`) does not, that a
-window with a stopped or never-started instance is discarded with `stop`
-written, and that _measure_once counts rejects as loss on the steady path.
-
-    python3 ipa/test/test_steady_window.py
+    python3 ipa/test/test_capacity_window.py
 """
 import io
 import os
@@ -19,7 +13,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
-import bench_throughput as B  # noqa: E402
+import bench_capacity as B  # noqa: E402
 
 RESULTS = []
 
@@ -33,14 +27,14 @@ class FakePG:
     def __init__(self, names, max_rate, rej, pickup_max=0.1, seed=1,
                  die_after=None, never_start=()):
         self.names = list(names)
-        self.max_rate = max_rate            # attempts/s per instance at delay 0
-        self.rej = rej                      # fraction rejected by veth_xmit
+        self.max_rate = max_rate
+        self.rej = rej
         self.pickup_max = pickup_max
         self.rng = random.Random(seed)
         self.params = {n: dict(count=0, delay=0) for n in names}
         self.t_start, self.t_end = {}, {}
         self.stop_flag = False
-        self.die_after = die_after          # instance stops by itself after s
+        self.die_after = die_after
         self.never_start = set(never_start)
         self.lock = threading.Lock()
 
@@ -123,8 +117,6 @@ _real_open = open
 
 
 def fake_open(path, *a, **k):
-    # Solo i file di pktgen sono simulati; il resto (/proc/stat, letto dalla
-    # finestra stazionaria per l'occupazione dei core) e' quello vero.
     if "/proc/net/pktgen" not in str(path):
         return _real_open(path, *a, **k)
     if "kpktgend_" in path:
@@ -162,8 +154,7 @@ def make_gen(mode):
     return B.Generator(["veth0"], Plan(), window_mode=mode, window_s=0.3)
 
 
-# ---- 1. steady window measures the true rate
-print("1. finestra stazionaria, 2 istanze, 1.25 M tentativi/s ciascuna, 20% respinti")
+print("1. steady window, 2 instances, 1.25 M attempts/s each, 20% rejected")
 FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.2)
 g = make_gen("steady")
 lag = 100
@@ -180,68 +171,63 @@ r = g.steady(64, 0, probe)
 el = time.monotonic() - t0
 true_acc = 2 * 1.25e6 * 0.8
 rate = r.tx / r.secs
-check("TX/s = rate vero entro 2%", abs(rate - true_acc) / true_acc < 0.02,
-      f"{rate:.0f} contro {true_acc:.0f}")
-check("respinti = 20% dell'offerto entro 1 punto",
+check("TX/s = true rate within 2%", abs(rate - true_acc) / true_acc < 0.02,
+      f"{rate:.0f} against {true_acc:.0f}")
+check("rejected = 20% of offered within 1 point",
       abs(r.errors / (r.tx + r.errors) - 0.2) < 0.01,
       f"{100 * r.errors / (r.tx + r.errors):.2f}%")
-check("RX delta = TX delta entro la coda in volo",
+check("RX delta = TX delta within the in-flight queue",
       abs(r.dut["rx"] - r.tx) <= 2 * lag + 2, f"rx {r.dut['rx']} tx {r.tx}")
-check("durata >= finestra chiesta, entro 50 ms", 0.3 - 0.005 <= r.secs < 0.35,
-      f"{r.secs:.4f}s, lettura {r.read_ms} ms")
-check("stop scritto una volta", len(STOPS) == 1, f"{len(STOPS)}")
-check("skew e mismatch nulli", r.skew_pct == 0.0 and r.rate_mismatch_pct < 1.0,
+check("duration >= requested window, within 50 ms", 0.3 - 0.005 <= r.secs < 0.35,
+      f"{r.secs:.4f}s, read {r.read_ms} ms")
+check("stop written once", len(STOPS) == 1, f"{len(STOPS)}")
+check("zero skew and mismatch", r.skew_pct == 0.0 and r.rate_mismatch_pct < 1.0,
       f"skew {r.skew_pct} mismatch {r.rate_mismatch_pct}")
-print(f"     (costo della finestra: {el:.2f}s, sfasamento di partenza {r.start_offset_ms} ms)")
+print(f"     (window cost: {el:.2f}s, start offset {r.start_offset_ms} ms)")
 
-# ---- 2. legacy count window on the same fake: the known bias
-print("2. controllo: percorso storico (count fisso, diviso il blocco su start)")
+print("2. check: legacy path (fixed count, divided by the block on start)")
 FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.2)
 g = make_gen("count")
 cnt = g.window_count(3_000_000)
 lr = g.run(64, cnt, 0)
 old_rate = lr.tx_pps_aggregate
-check("il percorso storico SOTTOSTIMA (>10%): e' il difetto che la finestra "
-      "stazionaria toglie", (true_acc - old_rate) / true_acc > 0.10,
-      f"{old_rate} contro {true_acc:.0f} ({100 * (old_rate - true_acc) / true_acc:+.1f}%), "
-      f"blocco {lr.window:.3f}s")
+check("the legacy path UNDERESTIMATES (>10%): the defect the steady "
+      "window removes", (true_acc - old_rate) / true_acc > 0.10,
+      f"{old_rate} against {true_acc:.0f} ({100 * (old_rate - true_acc) / true_acc:+.1f}%), "
+      f"block {lr.window:.3f}s")
 
-# ---- 3. negative control: instance dies mid-window -> discarded
-print("3. controllo negativo: un'istanza si ferma prima della seconda lettura")
+print("3. negative check: one instance stops before the second read")
 FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.2, die_after=0.2)
 g = make_gen("steady")
 n_stop = len(STOPS)
 try:
     g.steady(64, 0, probe)
-    check("finestra scartata", False, "nessuna eccezione")
+    check("window discarded", False, "no exception")
 except B.PktgenEmptyRun as e:
-    check("finestra scartata", True, str(e)[:70])
-check("stop scritto anche sul percorso d'errore", len(STOPS) == n_stop + 1)
+    check("window discarded", True, str(e)[:70])
+check("stop written on the error path too", len(STOPS) == n_stop + 1)
 
-# ---- 4. negative control: an instance never starts -> timeout, stop, join
-print("4. controllo negativo: un'istanza non parte mai")
+print("4. negative check: one instance never starts")
 FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.2, never_start=("veth0@1",))
 g = make_gen("steady")
 n_stop = len(STOPS)
 before = threading.active_count()
 try:
     g.steady(64, 0, probe)
-    check("timeout di partenza", False, "nessuna eccezione")
+    check("start timeout", False, "no exception")
 except B.PktgenEmptyRun as e:
-    check("timeout di partenza", True, str(e)[:70])
-check("stop scritto e thread di start chiuso",
+    check("start timeout", True, str(e)[:70])
+check("stop written and start thread closed",
       len(STOPS) == n_stop + 1 and threading.active_count() == before)
 
-# ---- 5. paced rate: delay honoured, count safety is not the limit
-print("5. rate cadenzato: 0.5 Mpps chiesti su 2 istanze, 0% respinti")
+print("5. paced rate: 0.5 Mpps requested on 2 instances, 0% rejected")
 FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.0)
 g = make_gen("steady")
 r = g.steady(64, g.delay_for(500_000), probe)
 rate = r.tx / r.secs
-check("TX/s = 0.5 M entro 2%", abs(rate - 5e5) / 5e5 < 0.02, f"{rate:.0f}")
+check("TX/s = 0.5 M within 2%", abs(rate - 5e5) / 5e5 < 0.02, f"{rate:.0f}")
 
-# ---- 6. _measure_once on the steady path: loss split from the deltas
-print("6. _measure_once a finestra stazionaria: respinti dentro la perdita")
+print("6. _measure_once with the steady window: rejects counted as loss")
 FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.2)
 g = make_gen("steady")
 
@@ -276,15 +262,14 @@ class RxTab:
 
 setup = {"pkt_stats": PktStats(), "cls_stats": {}}
 row = B._measure_once(setup, RxTab(), None, 64, 0, 450000, 7, gen=g)
-check("window_mode steady nella riga", row["window_mode"] == "steady")
+check("window_mode steady in the row", row["window_mode"] == "steady")
 check("respinti_pct ~ 20%", abs(row["respinti_pct"] - 20.0) < 1.0, f"{row['respinti_pct']}")
-check("loss_pct (totale) ~ 20%", abs(row["loss_pct"] - 20.0) < 1.0, f"{row['loss_pct']}")
-check("loss_dut_pct ~ 0 (entro la coda in volo)", row["loss_dut_pct"] < 0.1, f"{row['loss_dut_pct']}")
-check("rx_pps = capacita' vera entro 2%",
+check("loss_pct (total) ~ 20%", abs(row["loss_pct"] - 20.0) < 1.0, f"{row['loss_pct']}")
+check("loss_dut_pct ~ 0 (within the in-flight queue)", row["loss_dut_pct"] < 0.1, f"{row['loss_dut_pct']}")
+check("rx_pps = true capacity within 2%",
       abs(row["rx_pps"] - true_acc) / true_acc < 0.02, f"{row['rx_pps']}")
 
-# ---- 7. a process stall in the middle of a reading must not date it wrong
-print("7. sospensione di 150 ms dentro la seconda lettura: la lettura si rifa'")
+print("7. 150 ms suspension inside the second read: the read is redone")
 FAKE = FakePG(["veth0@0", "veth0@1"], 1.25e6, 0.2)
 g = make_gen("steady")
 calls = {"n": 0}
@@ -292,16 +277,16 @@ calls = {"n": 0}
 
 def stalling_probe():
     calls["n"] += 1
-    if calls["n"] == 2:            # the first reading of the SECOND snapshot
+    if calls["n"] == 2:
         time.sleep(0.15)
     return probe()
 
 
 r = g.steady(64, 0, stalling_probe)
 rate = r.tx / r.secs
-check("TX/s = rate vero entro 2% nonostante la sospensione",
+check("TX/s = true rate within 2% despite the suspension",
       abs(rate - true_acc) / true_acc < 0.02,
-      f"{rate:.0f}, letture {calls['n']}")
+      f"{rate:.0f}, reads {calls['n']}")
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} passed")
 sys.exit(0 if all(RESULTS) else 1)

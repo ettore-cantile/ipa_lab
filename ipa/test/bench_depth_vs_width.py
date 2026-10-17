@@ -1,54 +1,8 @@
 #!/usr/bin/env python3
-"""
-bench_depth_vs_width.py -- Pipeline 1 (hardcoded) trade-off sweep: at a
-roughly fixed neuron/weight budget, is it cheaper (ns/pkt, xlated insns) to
-go WIDE (one or two big hidden layers) or DEEP (many small hidden layers)?
+"""bench_depth_vs_width.py -- Pipeline 1: with the same number of weights, is a
+wide or a deep network cheaper? (BPF_PROG_TEST_RUN, program size). Needs root.
 
-Reuses the same measurement path as verify_prog_run.py / test_suite.py
---only kernel: builds and loads the P1 AOT object (p1_aot.load_p1)
-for each (hidden_dims) shape and times the dispatcher with
-BPF_PROG_TEST_RUN. Random int8 weights -- this measures SHAPE cost only,
-not inference correctness (that is already covered by test_suite).
-
-Swept across SEVERAL feature descriptors (not just the historical default),
-because the width-vs-depth verdict depends on the descriptor's feature mix:
-onehot features (ingress_iface, node) generate a switch-case whose cost is
-proportional to (that feature's size * n_h1), paid only by the FIRST hidden
-layer. A conclusion drawn from one descriptor is not safe to generalize --
-see FEATURE_SETS for the 0/1/2-onehot, small/big-onehot variants tested.
-
-Stack-overflow safety: whether a given (descriptor, hidden_dims) shape
-overflows the 512-byte eBPF per-function stack is NOT reliably predictable
-from a simple formula -- two independent attempts at one (see git history)
-were each contradicted by clang/BCC's actual -O2 stack-slot coalescing,
-which seems to depend on total code size/layer count in ways not worth
-reverse-engineering. And BCC's LLVM backend reports a real overflow via a
-process-fatal abort (not a Python exception), so a bad guess crashes the
-whole sweep. The robust fix used here: each (descriptor, shape) pair is
-benchmarked in its OWN subprocess (this same script re-invoked with
---_worker); a subprocess crash only marks that one cell CRASHED and the
-sweep continues. first_layer_stack_estimate() is kept as an informational
-column only, not a gate.
-
-Timing is reported as the MIN of 15 independent trials (p50/p90/max printed
-alongside for context, since the literature emphasizes tail latency, not
-just a central tendency) -- a single repeat=N sample turned out to swing up
-to 20x on some shapes with no correlation to instruction count (pure
-one-sided system noise: scheduler preemption, an unrelated process on the
-same host, CPU frequency scaling -- it can only slow a trial down, never
-speed it up), so min is the statistic that estimates the interference-free
-cost, the same reasoning tools like hyperfine / Google Benchmark use.
-
-`retval` (1=XDP_DROP or 2=XDP_PASS) is benign noise, not a defect: this
-bench never populates mac_table, so a forward-class argmax always misses
-(XDP_PASS) and only the random weights landing on the drop class gives
-XDP_DROP -- the map lookup cost is the same either way, so it does not bias
-the timing.
-
-Run on Linux with bcc installed:
     sudo python3 ipa/test/bench_depth_vs_width.py
-    sudo python3 ipa/test/bench_depth_vs_width.py --repeat 5000
-    sudo python3 ipa/test/bench_depth_vs_width.py --descriptor no_onehot
 """
 import os
 import sys
@@ -65,68 +19,26 @@ for p in (SHARED_DIR, _TEST_DIR):
 
 import model_meta as mm
 
-# ---------------------------------------------------------------------------
-# Feature descriptors to sweep. Isolates onehot COUNT (0 / 1 / 2) and onehot
-# SIZE (ingress_iface=6 vs node=52, the topology's 'largest' onehot) as
-# separate variables, instead of only ever testing the historical 4-feature
-# default (which happens to carry the most expensive onehot: 'node', size 52).
-# All variants keep n_out=7 so tier weight-budgets stay comparable.
-# ---------------------------------------------------------------------------
+# --- Feature descriptors to sweep. Isolates onehot COUNT (0 / 1 / 2) and onehot ---
 FEATURE_SETS = {
-    "default":      ["link_state", "ingress_iface", "ttl", "node"],   # 2 onehot (6 + 52)
-    "no_onehot":    ["link_state", "ttl", "queue_occupancy"],         # 0 onehot
-    "small_onehot": ["link_state", "ttl", "ingress_iface"],           # 1 onehot, size 6
-    "big_onehot":   ["link_state", "ttl", "node"],                    # 1 onehot, size 52
+    "default":      ["link_state", "ingress_iface", "ttl", "node"],
+    "no_onehot":    ["link_state", "ttl", "queue_occupancy"],
+    "small_onehot": ["link_state", "ttl", "ingress_iface"],
+    "big_onehot":   ["link_state", "ttl", "node"],
 }
 
-# (tier, label, hidden_dims) -- SAME architecture grid tested against every
-# descriptor above, so descriptor is the only thing that varies per sweep.
-# (tier label, target weights) x (label, depth). The WIDTH is not written here:
-# it is solved per descriptor so that the tier's weight budget is actually hit.
-#
-# It used to be a fixed list of shapes -- 1x16, 4x11, 8x9 and so on -- shared by
-# every descriptor. That silently broke the thing the whole bench exists to hold
-# constant. The shapes are fixed but `n_in` is not: with 65 inputs the first
-# layer dominates the budget and extra layers barely move it, while with 11
-# inputs they dominate. Measured spreads inside one tier were 10% for the
-# 65-input descriptor and **160%** for the 11-input one -- meaning the "deep"
-# variant there had 2.6x the parameters of the "wide" one, and was slower partly
-# because it was simply a bigger model.
-#
-# Worse, the badly-matched descriptors were precisely the two WITHOUT a large
-# one-hot, i.e. the two that exist to show the conclusion is not an artefact of
-# the one-hot features. The control was the part that did not work.
-#
-# Solving the width per descriptor fixes it at the source. The achieved spread
-# is still printed per tier, because a budget that is held by construction
-# should also be shown to have been held.
 TIERS = [
     ("A (~300 w)", 300),
     ("B (~1200 w)", 1200),
     ("C (~4700 w)", 4700),
 ]
 
-# (label, number of hidden layers). Depth 2 is the project's own shape, kept as
-# a reference point; 1 is "wide", 4 and 8 are "deep".
 DEPTHS = [("wide  ", 1), ("base  ", 2), ("deep 4", 4), ("deep 8", 8)]
-
-# Widths are searched in this range. The upper bound is generous on purpose:
-# tier C is expected to overflow the 512-byte eBPF stack, and that refusal is a
-# result of the bench, not something to design around.
-# 512, not 128: with only 11 inputs a SINGLE layer needs a width in the
-# hundreds to reach the 4 700-weight tier, and a cap of 128 left that cell 63%
-# short of the budget -- reintroducing, in tier C, exactly the mismatch this
-# rewrite removes elsewhere. Those cells overflow the eBPF stack anyway, but a
-# budget that cannot be hit should fail as a stack overflow, not quietly as an
-# unmatched comparison.
 WIDTH_SEARCH = range(2, 513)
 
 
 def solve_width(n_in, n_out, depth, target):
-    """The uniform hidden width whose weight count lands closest to `target`.
-
-    Returns (dims, n_weights). Ties go to the narrower shape, which keeps the
-    comparison conservative: it never inflates the deep variant."""
+    """The uniform hidden width whose weight count lands closest to `target`."""
     best = None
     for h in WIDTH_SEARCH:
         dims = (h,) * depth
@@ -148,16 +60,6 @@ def shapes_for(shape):
     return out
 
 
-
-# The scenario's own topology, plus the one dimension it does not declare.
-#
-# `no_onehot` uses queue_occupancy, and a descriptor cannot resolve a dimension
-# the topology does not state -- so leaving this to the scenario killed three of
-# the four descriptors with
-#   ScenarioError: feature 'queue_occupancy' needs topology dimension 'n_queues'
-# after the first one had already run, which reads like a bench problem and is
-# really a missing declaration here. 4 is under the compiled ceilings
-# (IPA_MAX_QUEUES is 8 in Pipeline 2 and in Pipeline 3).
 BENCH_TOPOLOGY = {"n_interfaces": 6, "n_nodes": 52, "n_queues": 4}
 
 
@@ -173,15 +75,7 @@ def weight_count(n_in, dims, n_out):
 
 
 def first_layer_stack_estimate(shape, n_h1):
-    """INFORMATIONAL ONLY (not a safety gate, see module docstring): estimated
-    live-stack bytes for just the FIRST hidden layer's `long long` locals --
-    ebpf_program._gen_feature_onehot_{iface,node} each declare their OWN
-    n_h1-sized temp array in addition to the h1_j output array, and
-    _gen_feature_dense_vector declares one `long long` per feature value.
-    Deeper layers (_gen_dense_layer) add their own n_cur-sized array each,
-    not counted here -- empirically, whether those get stack-coalesced by
-    -O2 is NOT reliably predictable, which is why this is a diagnostic
-    number only, never used to decide whether to attempt a shape."""
+    """INFORMATIONAL ONLY (not a safety gate, see module docstring)."""
     n_onehot = sum(1 for f in shape["features"]
                    if mm.FEATURE_CATALOG[f["type"]]["kind"] == "onehot")
     n_dense_vals = sum(f["size"] for f in shape["features"]
@@ -190,11 +84,9 @@ def first_layer_stack_estimate(shape, n_h1):
 
 
 def _bench_one(descriptor_name, dims, repeat):
-    """Runs in the WORKER subprocess. Prints exactly one JSON line to stdout
-    (the parent's only contract) and exits 0/1. Any BCC/clang diagnostics go
-    to stderr and are ignored by the parent unless this process crashes."""
+    """Runs in the WORKER subprocess."""
     import p1_aot
-    from verify_prog_run import prog_test_run, prog_insn_count, build_frame_sparse
+    from check_pipelines import prog_test_run, prog_insn_count, build_frame_sparse
 
     shape = build_shape(descriptor_name)
     n_in, n_out = shape["n_in"], shape["n_out"]
@@ -206,7 +98,6 @@ def _bench_one(descriptor_name, dims, repeat):
     weights = [rng.randint(-100, 100) for _ in range(nw)]
     scale = 128
 
-    # The AOT object, as P1 is deployed (p1_aot).
     setup = p1_aot.load_p1([(0, weights, scale)], features=shape["features"],
                            n_out=n_out, hidden_dims=dims)
     model_fn, disp_fn = setup["fn"], setup["disp"]
@@ -215,28 +106,8 @@ def _bench_one(descriptor_name, dims, repeat):
     xlated_model, _ = prog_insn_count(model_fn.fd)
 
     frame = build_frame_sparse(model_id=0, ttl=42, scale=scale, n_in=n_in, n_out=n_out)
-    # dur_ns from BPF_PROG_TEST_RUN is already the per-repetition average
-    # (kernel divides internally) -- test_suite.py uses it the same way, do
-    # NOT divide by repeat again here.
-    #
-    # A SINGLE repeat=N measurement is not enough: transient system noise
-    # (scheduler preemption, interrupts, an unrelated cgroup on the same
-    # host, CPU frequency scaling) can dominate one sample -- an earlier run
-    # of this sweep showed swings up to 20x (e.g. 44 to 998 ns) with no
-    # correlation to instruction count. This noise is ONE-SIDED: it can only
-    # slow a trial down (an interrupt landing mid-loop), never speed one up
-    # below the true cost. That makes MIN the right statistic (the same
-    # reasoning tools like hyperfine / Google Benchmark use), not median or
-    # mean -- across TRIALS independent repeat=`repeat` measurements, the
-    # smallest is the closest approximation to the interference-free cost.
-    # TRIALS=15 (not 7): the literature on evaluating this kind of datapath
-    # (see docs/testing.md sec. 7-8 sources) stresses TAIL latency, not just
-    # a central tendency -- p90/p99 need enough samples to mean something,
-    # and a min-of-7 already looked reasonable but gave no sense of the
-    # right tail shape (which matters if this were ever load-bearing for a
-    # real SLA-style claim, not just a relative width-vs-depth comparison).
     TRIALS = 15
-    prog_test_run(disp_fn.fd, frame, repeat=repeat)   # warm-up (JIT icache)
+    prog_test_run(disp_fn.fd, frame, repeat=repeat)
     samples = []
     for _ in range(TRIALS):
         retval, ns = prog_test_run(disp_fn.fd, frame, repeat=repeat)
@@ -258,8 +129,7 @@ def _bench_one(descriptor_name, dims, repeat):
 def bench_shape_isolated(descriptor_name, label, dims, repeat):
     """Runs _bench_one for (descriptor_name, dims) in a fresh subprocess so a
     fatal LLVM stack-overflow abort (uncatchable in-process) only kills that
-    subprocess. Returns a result dict; on crash, {"ok": False, "detail":...}
-    still carries nw/stack_est (computed here, cheaply, without compiling)."""
+    subprocess."""
     shape = build_shape(descriptor_name)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
@@ -341,7 +211,7 @@ def main():
     ap.add_argument("--descriptor", choices=list(FEATURE_SETS) + ["all"], default="all",
                     help="Which feature descriptor(s) to sweep (default: all)")
     ap.add_argument("--_worker", nargs=3, default=None,
-                    help=argparse.SUPPRESS)  # internal: descriptor, "d1,d2,...", repeat
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args._worker:

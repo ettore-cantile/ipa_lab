@@ -1,40 +1,21 @@
-"""
-prog_census.py -- quanti programmi BPF, e quanto grandi, ha caricato un passo.
-
-    before = snapshot()
-    setup = build_pipeline(...)
-    size = loaded_since(before)    # {"n_progs", "xlated", "jited", "names"}
-
-Perche' cosi' e non dai descrittori delle pipeline: ogni pipeline carica i
-suoi programmi in un modo diverso (BCC, oggetto AOT con libbpf, una catena di
-programmi per P3, il dispatcher piu' il programma del modello per P1.5), e
-bench_scaling._totals li elenca a mano pipeline per pipeline. Qui si chiede al
-kernel quali programmi esistono prima e dopo (BPF_PROG_GET_NEXT_ID): i nuovi
-sono quelli del passo, qualunque sia la strada con cui sono stati caricati, e
-la somma delle loro istruzioni e' la "dimensione caricata" del confronto fra
-istruzioni caricate ed eseguite, misurata sullo stesso caricamento che poi va
-sotto traffico.
-
-Mai fatale: senza permessi o su un kernel che rifiuta una chiamata si
-restituisce None, e il banco va avanti senza la colonna.
+"""prog_census.py -- how many BPF programs, and how large, a step has loaded
+(the kernel's program list before and after).
 """
 import ctypes as ct
 import os
 
-_NR_BPF = 321                      # x86_64
+_NR_BPF = 321
 _BPF_PROG_GET_NEXT_ID = 11
 _BPF_PROG_GET_FD_BY_ID = 13
 _BPF_OBJ_GET_INFO_BY_FD = 15
 
 try:
     _libc = ct.CDLL(None, use_errno=True)
-except OSError:                    # pragma: no cover (non Linux)
+except OSError:  # pragma: no cover (non Linux)
     _libc = None
 
 
 class _AttrId(ct.Structure):
-    # BPF_PROG_GET_NEXT_ID usa (start_id, next_id); BPF_PROG_GET_FD_BY_ID
-    # (prog_id, next_id, open_flags). Stesso layout.
     _fields_ = [("id", ct.c_uint32), ("next_id", ct.c_uint32),
                 ("open_flags", ct.c_uint32)]
 
@@ -49,14 +30,13 @@ def _bpf(cmd, attr):
 
 
 def snapshot():
-    """Gli id dei programmi caricati ora, o None se non si possono leggere."""
+    """The ids of the programs loaded now, or None if they cannot be read."""
     if _libc is None:
         return None
     ids, cur = set(), 0
     while True:
         a = _AttrId(id=cur)
         if _bpf(_BPF_PROG_GET_NEXT_ID, a) != 0:
-            # ENOENT = fine della lista; altro = niente permessi
             return ids if ct.get_errno() == 2 else None
         cur = a.next_id
         ids.add(cur)
@@ -82,9 +62,7 @@ def _info(prog_id):
 
 
 def loaded_since(before):
-    """I programmi comparsi dopo `before` (uno snapshot()): quanti, la somma
-    delle istruzioni tradotte (xlated, quelle che il verificatore ha
-    accettato) e dei byte JIT, e i nomi. None se il censimento non si fa."""
+    """The programs that appeared after `before` (a snapshot())."""
     if before is None:
         return None
     after = snapshot()

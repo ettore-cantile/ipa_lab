@@ -8,10 +8,10 @@
 // ARCHITECTURE: a dispatcher (xdp_dispatch) that parses and bpf_tail_calls into the model
 // (xdp_model), which RE-parses (the double parse) and infers. We populate the
 // model_progs PROG_ARRAY, seed the descriptor's feature maps + mac_table, and BPF_PROG_TEST_RUN the
-// DISPATCHER, so this measures the identical per-packet work test_suite
+// DISPATCHER, so this measures the identical per-packet work test_weights_and_metrics
 // --kernel measures (dispatcher + tail call + double parse + full path). The
 // reported instruction count is the SUM of both programs' xlated length, to
-// match test_suite (ipa_switch_hardcoded + model_0).
+// match test_weights_and_metrics (ipa_switch_hardcoded + model_0).
 //
 // Build: cc -O2 loader_aot.c -o loader_aot -lbpf
 // Run  : sudo ./loader_aot <literal.o> [--node-id N]   (bench: TEST_RUN)
@@ -36,9 +36,6 @@
 //   python  -> "DETACH", or EOF on stdin (the control plane died), or a
 //              SIGINT/SIGTERM -> the loader detaches, unpins and exits
 //
-// Until 2026-09-23 the deploy seeded mac_table here with ifindex 1 and zero
-// MACs for every logical port, and nothing ever replaced it: every FORWARD
-// decision was bpf_redirect()ed to ifindex 1, which is `lo` in every netns.
 // The program is attached only AFTER the control plane has written the maps,
 // so no packet ever sees them empty.
 
@@ -59,58 +56,38 @@
 
 struct fwd_action { __u32 ifindex; __u8 src_mac[6]; __u8 dst_mac[6]; } __attribute__((packed));
 
-/* The interface being attached to, or -1 in bench mode. seed_maps() needs it
- * to fill ingress_port, and it is parsed before seed_maps() runs. */
 static int g_attach_ifindex = -1;
 
-/* This node's index in the node one-hot, or -1 for "unknown".
- *
- * An AOT object is built on a build machine, so it cannot carry this: it is
- * supplied at load time by --node-id or $IPA_NODE_ID, exactly as the Python
- * control plane resolves it. Left unset, the node one-hot stays empty, which
- * is honest -- the alternative, defaulting to 0, would make every
- * unconfigured node claim to be node 0. That was the previous behaviour, via
- * ipa->model_id, and it is what this replaces. */
 static int g_node_id = -1;
 
-/* ifindex del kernel -> slot del one-hot ingress_iface, cosi' come lo ha
- * risolto il control plane (common.ingress_port_slots): logical_port -> nome
- * dell'interfaccia via NodeConfig, nome -> ifindex via if_nametoindex, e lo
- * slot e' il RANGO della porta fra quelle che il modello puo' scegliere.
- *
- * Passato invece che dedotto qui perche' il .o e' costruito su una macchina di
- * build che non sa quali ifindex il nodo assegnera', e perche' la convenzione
- * deve avere UNA definizione sola: e' la stessa funzione Python che riempie
- * ingress_port_t2 e ingress_port_t3 per le altre due pipeline. */
 #define MAX_INGRESS_ENTRIES 64
 static __u32 g_ingress_ifx[MAX_INGRESS_ENTRIES];
 static __u32 g_ingress_slot[MAX_INGRESS_ENTRIES];
 static int   g_n_ingress = 0;
 
-/* "207=1,209=2,..." -- ritorna 0, oppure -1 con un messaggio. */
 static int parse_ingress_ports(const char *spec) {
     const char *p = spec;
     while (*p) {
         char *end;
         long ifx = strtol(p, &end, 10);
         if (end == p || *end != '=') {
-            fprintf(stderr, "--ingress-port: attese coppie IFINDEX=SLOT "
-                            "separate da virgola, trovato \"%s\"\n", p);
+            fprintf(stderr, "--ingress-port: expected comma-separated IFINDEX=SLOT "
+                            "pairs, found \"%s\"\n", p);
             return -1;
         }
         p = end + 1;
         long slot = strtol(p, &end, 10);
         if (end == p) {
-            fprintf(stderr, "--ingress-port: manca lo slot dopo ifindex %ld\n", ifx);
+            fprintf(stderr, "--ingress-port: slot missing after ifindex %ld\n", ifx);
             return -1;
         }
         if (ifx <= 0 || slot < 1 || slot > 0xffff) {
-            fprintf(stderr, "--ingress-port: %ld=%ld fuori intervallo "
+            fprintf(stderr, "--ingress-port: %ld=%ld out of range "
                             "(ifindex > 0, slot in [1, 65535])\n", ifx, slot);
             return -1;
         }
         if (g_n_ingress >= MAX_INGRESS_ENTRIES) {
-            fprintf(stderr, "--ingress-port: piu' di %d voci\n", MAX_INGRESS_ENTRIES);
+            fprintf(stderr, "--ingress-port: more than %d entries\n", MAX_INGRESS_ENTRIES);
             return -1;
         }
         g_ingress_ifx[g_n_ingress]  = (__u32)ifx;
@@ -119,26 +96,18 @@ static int parse_ingress_ports(const char *spec) {
         p = end;
         if (*p == ',') p++;
         else if (*p) {
-            fprintf(stderr, "--ingress-port: carattere inatteso \"%s\"\n", p);
+            fprintf(stderr, "--ingress-port: unexpected character \"%s\"\n", p);
             return -1;
         }
     }
     return 0;
 }
 
-/* Set by SIGINT/SIGTERM so the live-attach deploy mode can detach cleanly. */
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
-/* bpffs directory the deploy pins the object's maps into (--pin-dir). */
 static const char *g_pin_dir = NULL;
 
-/* One line from stdin, read with read(2) rather than stdio: the control plane
- * talks to this process over a pipe, and a stdio buffer could hold the very
- * line this loop waits for. Returns its length, or -1 on EOF, on an error, or
- * on a stop signal -- all three mean "the control plane is gone, stand down".
- * The signal handler is installed WITHOUT SA_RESTART, so a Ctrl-C interrupts
- * the read instead of leaving it blocked. */
 static int read_line(char *buf, int cap) {
     int n = 0;
     for (;;) {
@@ -156,11 +125,6 @@ static int read_line(char *buf, int cap) {
     return n;
 }
 
-/* Remove what a previous run left pinned under `dir`: a crash or a kill -9
- * skips the unpin at the end of the deploy, and bpf_object__pin_maps() refuses
- * to pin over an existing file. Only the names THIS object would pin are
- * touched. libbpf turns '.' into '_' in pin paths (bpffs forbids periods), so
- * the same is done here; the directory itself is refused if it has one. */
 static void unlink_stale_pins(struct bpf_object *obj, const char *dir) {
     struct bpf_map *m;
     bpf_object__for_each_map(m, obj) {
@@ -182,9 +146,6 @@ static void unlink_stale_pins(struct bpf_object *obj, const char *dir) {
     }
 }
 
-/* Pin (or unpin) every program at <dir>/<program name>, next to the maps: a
- * caller outside this process -- the Python benches -- gets their fds with
- * BPF_OBJ_GET, exactly as it gets the maps'. */
 static int pin_programs(struct bpf_object *obj, const char *dir, int unpin) {
     struct bpf_program *pr;
     bpf_object__for_each_program(pr, obj) {
@@ -210,7 +171,6 @@ static double now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-// Ethernet/IPv4/UDP/IPA frame (63 bytes), model_id=0 to match test_suite.
 static int build_frame(unsigned char *buf) {
     memset(buf, 0, 128);
     unsigned char *p = buf;
@@ -232,8 +192,6 @@ static long prog_insns(int fd) {
 }
 
 // Seed a dense_vector_map feature map ({u32 v[N]} at key 0) if it exists in the
-// loaded object. Size is taken from the map's value_size, so it adapts to any
-// topology; absent maps (descriptor doesn't use that feature) are skipped.
 static void seed_vec_map(struct bpf_object *obj, const char *name, __u32 fill) {
     struct bpf_map *m = bpf_object__find_map_by_name(obj, name);
     if (!m) return;                                  // not used by this descriptor
@@ -246,21 +204,12 @@ static void seed_vec_map(struct bpf_object *obj, const char *name, __u32 fill) {
     bpf_map_update_elem(bpf_map__fd(m), &z, buf, BPF_ANY);
 }
 
-// Descriptor-driven seeding: dense-feature maps are seeded only when present,
-// and mac_table is seeded for the LOGICAL PORTS the generated switch can
-// select -- AOT_LOGICAL_PORTS in nn_aot_meta.h, emitted by gen_full_c.py from
-// the same ClassSemantics object the datapath switch is generated from.
 //
-// It used to seed classes 0..n_out-2, with n_out taken from cls_stats' size:
-// "the last class is DROP" and "class k is a forwarding class" re-derived here,
-// in a third language. For the checked-in model both are wrong -- DROP is
-// class 5 and class 6 is untrained -- so the loop installed a next-hop for the
-// DROP class, and it keyed mac_table by class where the datapath keys it by
 // logical port.
 static int seed_maps(struct bpf_object *obj) {
     struct bpf_map *mt = bpf_object__find_map_by_name(obj, "mac_table");
     if (!mt) { fprintf(stderr, "missing mac_table\n"); return -1; }
-    seed_vec_map(obj, "link_state",  1);    // all-up baseline (matches test_suite ref)
+    seed_vec_map(obj, "link_state",  1);    // all-up baseline (matches test_weights_and_metrics ref)
     seed_vec_map(obj, "queue_state", 1);    // nonzero occupancy baseline
     const __u32 ports[AOT_N_PORTS] = AOT_LOGICAL_PORTS;
     int mtfd = bpf_map__fd(mt);
@@ -272,24 +221,6 @@ static int seed_maps(struct bpf_object *obj) {
     fprintf(stderr, "seeded mac_table for %d logical port(s) of %d class(es)\n",
             AOT_N_PORTS, AOT_N_OUT);
 
-    /* Kernel ingress ifindex -> LOGICAL PORT. The program no longer carries a
-     * compiled-in [2, 3, ...] table: an AOT object is built on a build machine,
-     * possibly long before the node it runs on exists, so it cannot know what
-     * ifindexes that node will hand out. Without an entry here the
-     * ingress_iface one-hot stays empty and a trained feature contributes
-     * nothing -- silently, which is how it went unnoticed for so long.
-     *
-     * La tabella arriva da --ingress-port, risolta dal control plane. Prima
-     * veniva inventata qui: una sola voce, l'interfaccia di attach, slot 1
-     * fisso, con un commento che diceva "logical port 1 unless the deployment
-     * says otherwise" -- ma non c'era modo per il deployment di dire
-     * altrimenti. Su un nodo con piu' di una porta quello e' un mapping
-     * sbagliato che non rompe niente: fa contribuire la colonna di pesi di
-     * un'altra porta. Adesso senza --ingress-port non si indovina.
-     *
-     * In bench mode non c'e' interfaccia, quindi non si semina nulla e la
-     * feature resta vuota -- che e' anche quello che viene detto al
-     * riferimento, cosi' le due parti confrontano la stessa cosa. */
     struct bpf_map *ip_map = bpf_object__find_map_by_name(obj, "ingress_port");
     if (ip_map && g_n_ingress > 0) {
         int done = 0;
@@ -317,10 +248,6 @@ static int seed_maps(struct bpf_object *obj) {
                         "the ingress_iface one-hot contributes nothing\n");
     }
 
-    /* This node's own index. Bounded to a byte because the generated program
-     * bounds it too -- the verifier needs that range to reason about the
-     * switch cheaply, so an index it cannot represent is refused here rather
-     * than truncated into a different node. */
     struct bpf_map *nid_map = bpf_object__find_map_by_name(obj, "node_id");
     if (nid_map) {
         int nid = g_node_id;
@@ -351,16 +278,9 @@ static int seed_maps(struct bpf_object *obj) {
 
 int main(int argc, char **argv) {
     // Args: <literal.o> [--attach <ifindex>]
-    //   no --attach  -> bench mode  (BPF_PROG_TEST_RUN, deploy-cost + perf)
-    //   --attach N   -> deploy mode (attach xdp_dispatch to ifindex N, stay
     //                   resident until Ctrl-C, then detach).
     const char *lit = "nn_aot_arch.o";
-    // XDP attach mode. This used to be a bare 0, which means "kernel decides"
-    // -- and the kernel decides by trying native and SILENTLY falling back to
     // generic. A deploy that lands on the generic path (inside
-    // netif_receive_skb, after the sk_buff is allocated) is not the path being
-    // measured, and nothing in the output said so. Native is the default now,
-    // the mode actually in effect is read back from the kernel, and a failed
     // native attach is an error rather than a quiet downgrade.
     __u32 xdp_flags = XDP_FLAGS_DRV_MODE;
     const char *mode_name = "native";
@@ -393,8 +313,6 @@ int main(int argc, char **argv) {
     double t2 = now_ms();
 
     // wire the tail-calls, as the P2/P3 control planes do
-    // b["model_progs"][id] = model_fn.fd: `xdp_model` -> model_progs[0], and
-    // `xdp_model_<id>` -> model_progs[<id>] when the object carries several
     // models (gen_full_c._emit_arch(models=...)).
     struct bpf_program *disp = bpf_object__find_program_by_name(obj, "xdp_dispatch");
     struct bpf_map *progs = bpf_object__find_map_by_name(obj, "model_progs");
@@ -425,8 +343,6 @@ int main(int argc, char **argv) {
     if (!n_models) { fprintf(stderr, "no xdp_model / xdp_model_<id> program\n"); goto err; }
 
     // --- PINNED modes. LIVE DEPLOY (--attach): pin, hand the maps to the
-    // control plane, attach only when it says so, stay resident. PIN-ONLY (no
-    // --attach): pin maps and programs for an outside caller to drive, stay
     // resident until told to go. See the protocol at the top.
     // Requires libbpf >= 0.7 for bpf_xdp_attach/detach. ---
     if (g_attach_ifindex >= 0 || g_pin_dir) {
@@ -473,8 +389,6 @@ int main(int argc, char **argv) {
         printf("READY %s\n", g_pin_dir);
         fflush(stdout);
         if (g_attach_ifindex < 0) {
-            /* PIN-ONLY. The caller drives the pinned programs and maps; this
-             * process stays so the pins have an owner and vanish with it. */
             while (!g_stop) {
                 if (read_line(line, sizeof(line)) < 0 || !strcmp(line, "DETACH"))
                     break;
@@ -499,9 +413,6 @@ int main(int argc, char **argv) {
                         "explicitly: --xdp-mode generic\n");
             goto unpin;
         }
-        /* Trust the kernel, not the flags we passed: with --xdp-mode auto the
-         * kernel chooses, and every number from this run describes whichever
-         * path it actually chose. */
         {
             LIBBPF_OPTS(bpf_xdp_query_opts, q);
             const char *actual = "unknown";
@@ -525,8 +436,6 @@ int main(int argc, char **argv) {
         printf("[deploy] open+load (verify+JIT): %.3f ms\n", t2 - t0);
         printf("[deploy] xdp_dispatch attached to ifindex %d, maps pinned under "
                "%s. Ctrl-C to detach.\n", g_attach_ifindex, g_pin_dir);
-        /* Flush now: when stdout is a pipe rather than a TTY, C stdio is
-         * fully buffered, and the control plane is waiting for ATTACHED. */
         fflush(stdout);
         while (!g_stop) {
             if (read_line(line, sizeof(line)) < 0 || !strcmp(line, "DETACH"))
@@ -549,19 +458,10 @@ unpin:
     if (seed_maps(obj)) goto err;
 
     long insn_disp = prog_insns(disp_fd), insn_model = prog_insns(model_fd);
-    long insn_total = insn_disp + insn_model;   // matches test_suite (disp + model)
+    long insn_total = insn_disp + insn_model;   // matches test_weights_and_metrics (disp + model)
 
-    // run the DISPATCHER (parse -> tail call -> model re-parse -> infer -> action)
     //
-    // In chunks, each on a FRESH frame. BPF_PROG_TEST_RUN copies data_in once
-    // and re-runs the program on that same buffer `repeat` times; the program
-    // decrements the TTL. This used to be ONE call with repeat=1e6 on a TTL-64
-    // frame: after ~60 runs every run took the TTL-expired short-circuit (or,
-    // without a node id, the DROP class the drifting TTL fell into), and that
-    // is what the reported ns/pkt measured -- not the forwarding path. Same
     // scheme as
-    // verify_prog_run.prog_test_run_bench: 200 runs per chunk on a TTL-255
-    // frame (the TTL never reaches the expiry path within a chunk), minimum of
     // the per-chunk averages.
     enum { BENCH_CHUNK = 200, BENCH_CHUNKS = 25 };
     unsigned char in[128], out[256];
@@ -581,7 +481,7 @@ unpin:
 
     printf("================================================================\n");
     printf(" AOT-literal deploy bench (Pipeline 1, ARCH-FAITHFUL)\n");
-    printf(" dispatcher + tail-call + double-parse, as test_suite --only kernel\n");
+    printf(" dispatcher + tail-call + double-parse, as test_weights_and_metrics --only kernel\n");
     printf("================================================================\n\n");
     printf("[deploy] runtime cost of loading a prebuilt literal .o (NO clang):\n");
     printf("   open_file           : %8.3f ms\n", t1 - t0);
@@ -594,7 +494,7 @@ unpin:
     printf("   xlated insns        : %8ld   (dispatch %ld + model %ld)\n", insn_total, insn_disp, insn_model);
     printf("   latency             : %8.1f ns/pkt\n", ns);
     printf("   throughput          : %8.2f Mpps\n", mpps);
-    printf("\n   Same topology and methodology as test_suite --only kernel, so the\n");
+    printf("\n   Same topology and methodology as test_weights_and_metrics --only kernel, so the\n");
     printf("   numbers compare directly. Run it under host_conditions.py for\n");
     printf("   figures that repeat (fixed frequency, isolated core).\n");
 

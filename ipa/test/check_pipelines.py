@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""
-verify_prog_run.py  --  BPF_PROG_TEST_RUN verifier for the 3 IPA pipelines.
+"""check_pipelines.py -- every pipeline under BPF_PROG_TEST_RUN: it loads, passes
+the verifier and decides like an independent integer reference. Also the
+shared setup code the other tests import. Needs root.
 
-Lives in ipa/test/; the pipeline modules it imports (ebpf_program,
-ebpf_template_arch, ebpf_modular, extract_weights) live one level up in
-ipa/, so SHARED_DIR is added to sys.path below.
+    sudo python3 ipa/test/check_pipelines.py --method hardcoded
 """
 
 import os
@@ -43,33 +42,13 @@ class _BpfAttrTest(ct.Structure):
         ("batch_size",    ct.c_uint32),
     ]
 
-class _XdpMd(ct.Structure):
-    """struct xdp_md — kept for reference; NOT passed as ctx_in (see below)."""
-    _fields_ = [
-        ("data",            ct.c_uint32),
-        ("data_end",        ct.c_uint32),
-        ("data_meta",       ct.c_uint32),
-        ("ingress_ifindex", ct.c_uint32),
-        ("rx_queue_index",  ct.c_uint32),
-        ("egress_ifindex",  ct.c_uint32),
-    ]
 
-# TEST_RUN_DEFAULT_INGRESS_IFINDEX: empirically observed value of
-# ctx->ingress_ifindex under BPF_PROG_TEST_RUN when no ctx_in is supplied
-# (this kernel's dummy test device). A prior attempt to force it to 0 via a
-# zeroed xdp_md ctx_in caused every packet to be dropped before inference
-# (100% XDP_PASS on all 3 pipelines) -- the exact data/data_end/data_meta
-# semantics BPF_PROG_TEST_RUN expects for ctx_in are kernel-version-specific
-# and were not verified against this kernel. Simpler and verified-safe:
-# don't fight the default, just match it on the Python reference side.
 TEST_RUN_DEFAULT_INGRESS_IFINDEX = 1
 
 def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1, ingress_ifindex: int = None):
-    """Run an XDP program on `frame` via BPF_PROG_TEST_RUN (no ctx_in --
-    ctx_in field semantics for xdp_md are not reliably portable across
-    kernels, see TEST_RUN_DEFAULT_INGRESS_IFINDEX). `ingress_ifindex` is
-    accepted for API compatibility but unused; the kernel's default test
-    device ifindex is used (see TEST_RUN_DEFAULT_INGRESS_IFINDEX)."""
+    """Run an XDP program on `frame` via BPF_PROG_TEST_RUN (no ctx_in -- ctx_in
+    field semantics for xdp_md are not reliably portable across kernels, see
+    TEST_RUN_DEFAULT_INGRESS_IFINDEX)."""
     out = (ct.c_uint8 * 2048)()
     buf = ct.create_string_buffer(frame, len(frame))
     a = _BpfAttrTest(
@@ -87,43 +66,16 @@ def prog_test_run(prog_fd: int, frame: bytes, repeat: int = 1, ingress_ifindex: 
     return a.retval, a.duration
 
 
-# Max BPF_PROG_TEST_RUN repetitions per syscall when the program MUTATES the
-# packet. The kernel copies data_in into a page once and then re-runs the
-# program on THAT page `repeat` times, never restoring it in between. The
-# datapath decrements the TTL, so one large `repeat` walks the TTL down to 1
-# after a couple of hundred runs and every run after that measures the
-# TTL-expired short-circuit instead of the inference path. Chunking with a fresh
-# frame keeps every measured run on the real path. 200 < 255-1, so a frame built
-# with BENCH_TTL survives a whole chunk.
 TEST_RUN_MAX_CHUNK = 200
 BENCH_TTL          = 255
 
 
-# Chunks per measurement. The point of a large `repeat` is to amortise the
-# syscall cost over many in-kernel runs; 200 runs already does that, and the
-# reported figure is the MINIMUM per-run average across chunks, which stops
-# improving long before 250 chunks. Capping here keeps the suite fast: without
-# it a repeat=50000 request became 250 syscalls per trial (1750 per pipeline,
-# 7000 for the suite) for no gain in the statistic actually reported.
 TEST_RUN_MAX_CHUNKS = 25
 
 
 def prog_test_run_bench(prog_fd: int, make_frame, total_repeat: int,
                         max_chunks: int = TEST_RUN_MAX_CHUNKS):
-    """Time a packet-mutating program in TTL-safe chunks.
-
-    `make_frame` is called once per chunk to get a pristine frame -- required
-    because the kernel never restores the packet buffer between repetitions and
-    the datapath decrements the TTL (see TEST_RUN_MAX_CHUNK).
-
-    The kernel reports the AVERAGE ns/run for each chunk; the minimum across
-    chunks is returned, the same one-sided-noise reasoning the suite uses for
-    its min-of-N trials. `total_repeat` is a target: it is capped at
-    max_chunks * TEST_RUN_MAX_CHUNK runs, because the minimum-of-averages does
-    not keep improving past that and the extra syscalls are pure wall time.
-
-    Returns (retval_of_last_chunk, min_ns_per_run).
-    """
+    """Time a packet-mutating program in TTL-safe chunks."""
     chunks = max(1, min(max_chunks,
                         (max(1, total_repeat) + TEST_RUN_MAX_CHUNK - 1)
                         // TEST_RUN_MAX_CHUNK))
@@ -138,13 +90,7 @@ def prog_test_run_bench(prog_fd: int, make_frame, total_repeat: int,
 
 
 def prog_test_run_data(prog_fd: int, frame: bytes):
-    """Like prog_test_run(), but also returns the packet the program produced.
-
-    BPF_PROG_TEST_RUN writes the (possibly modified) packet back into data_out,
-    which is how the TTL decrement and the recomputed IP checksum can be checked
-    for real instead of being taken on trust. Separate from prog_test_run() so
-    the latency path keeps its exact shape.
-    """
+    """Like prog_test_run(), but also returns the packet the program produced."""
     out = (ct.c_uint8 * 2048)()
     buf = ct.create_string_buffer(frame, len(frame))
     a = _BpfAttrTest(
@@ -163,8 +109,7 @@ def prog_test_run_data(prog_fd: int, frame: bytes):
 
 
 def ip_checksum_ok(hdr: bytes) -> bool:
-    """True if the 20-byte IPv4 header checksums correctly. A valid header sums
-    (in one's complement, 16-bit words, checksum field included) to 0xFFFF."""
+    """True if the 20-byte IPv4 header checksums correctly."""
     if len(hdr) < 20:
         return False
     total = 0
@@ -256,22 +201,16 @@ def _nr_cpus() -> int:
         return max(1, os.cpu_count() or 1)
 
 _NR_CPUS = _nr_cpus()
-_PercpuLeaf = ct.c_longlong * _NR_CPUS
 
-def _percpu_arr(val: int) -> "_PercpuLeaf":
-    return _PercpuLeaf(*([int(val)] * _NR_CPUS))
 
 def _mut():
-    """The model under test (--model / $IPA_MODEL), or None: then every
-    function below runs the configured checkpoint exactly as before."""
+    """The model under test (--model / $IPA_MODEL), or None."""
     import model_under_test as MUT
     return MUT.active()
 
 
 def _setup_mut(pipeline, model_id, m):
-    """setup_* for the model under test: the shared builders, the model also
-    answering to `model_id`, every link up -- what the setups below do for
-    the checkpoint."""
+    """setup_* for the model under test."""
     import pipeline_setup as PS
     setup = PS.build(pipeline, m)
     if model_id != 0:
@@ -294,14 +233,7 @@ def load_weights(model_path=MODEL_PT):
 
 def _ip_csum(hdr20: bytes) -> int:
     """Standard IPv4 header checksum over a 20-byte header whose checksum field
-    is zero.
-
-    The synthetic frames used to ship with checksum 0 -- an invalid header. That
-    was harmless while the datapath never touched the IP header, but the TTL
-    decrement now updates the checksum INCREMENTALLY, and an incremental update
-    only preserves correctness if the input was already correct. So the frames
-    have to carry a real checksum, or the output checksum is unverifiable.
-    """
+    is zero."""
     total = 0
     for i in range(0, 20, 2):
         total += (hdr20[i] << 8) | hdr20[i + 1]
@@ -315,18 +247,11 @@ def build_frame(model_id: int, ttl: int, scale: int) -> bytes:
     ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, ttl, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     ip  = ip[:10] + struct.pack('!H', _ip_csum(ip)) + ip[12:]
     udp = struct.pack('!HHHH', 12345, 9999, 28, 0)
-    # exactly 20 format letters (3 B + 1 H + 16 B) = 21 bytes, matching
-    # sizeof(struct ipa_hdr) in the eBPF C source.
     ipa = struct.pack('!BBBHBBBBBBBBBBBBBBBB', model_id, 0, 0, scale, 65, 7, 2, 4, 3, 0, 65, 0, 0, 0, 0, 0, 0, 1, 0, 7)
     return eth + ip + udp + ipa
 
 def _trunc_div(a: int, b: int) -> int:
-    """Integer division truncating toward ZERO, like C.
-
-    Python's // floors, so -7 // 30 == -1 while C gives 0. The eBPF datapath
-    divides the scaled feature terms with C semantics, and this reference has to
-    agree bit for bit or the equivalence test fails on negative weights.
-    """
+    """Integer division truncating toward ZERO, like C."""
     if b == 1:
         return a
     q = abs(a) // abs(b)
@@ -334,9 +259,7 @@ def _trunc_div(a: int, b: int) -> int:
 
 
 def _feature_scales(features) -> list:
-    """Per-COLUMN divisor for a resolved descriptor: each feature's training
-    scale repeated over the columns it occupies. See model_meta.feature_scale
-    and DEFAULT_TTL_SCALE."""
+    """Per-COLUMN divisor for a resolved descriptor."""
     import model_meta as _mm
     out = []
     for f in features:
@@ -346,18 +269,7 @@ def _feature_scales(features) -> list:
 
 def ref_infer(weights, scale: int, ttl: int, model_id: int, ingress_port: int = 0,
               link_state=None, node_index=None):
-    """Integer reference for the checked-in 65-4-4-7 model.
-
-    `link_state` is the egress up/down vector as seeded into the map. It
-    defaults to all-up, which is the baseline every TEST_RUN check uses. It is
-    a parameter because TTL alone does not move this model's argmax: sweeping
-    ttl 2..8 returns the same class every time, so a test that varies only TTL
-    exercises exactly one output class however many times it runs. link_state
-    is the feature that actually changes the decision.
-
-    With a model under test the generic reference answers (it equals this one
-    on the checkpoint, logit for logit); h1/h2 are then empty.
-    """
+    """Integer reference for the checked-in 65-4-4-7 model."""
     m = _mut()
     if m is not None:
         import pipeline_setup as PS
@@ -375,56 +287,32 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ingress_port: int = 
     off_out_w = off_fc2_b + N_H2
     off_out_b = off_out_w + N_H2 * N_OUT
     x = [0] * N_IN
-    # link_state features [0..5]: all up unless the caller says otherwise.
-    # Must match whatever was written into the link_state map, or the reference
-    # and the datapath are answering different questions.
     ls = [1] * 6 if link_state is None else list(link_state)[:6]
     for i in range(6):
         x[i] = int(ls[i]) if i < len(ls) else 0
     x[12] = ttl
-    # The LOGICAL PORT (1-based), not a kernel ifindex: the datapath resolves
-    # ctx->ingress_ifindex through the `ingress_port` map before it reaches the
-    # feature. Passing a raw ifindex here would set a bit the datapath does not.
     if 1 <= ingress_port <= 6:
         x[5 + ingress_port] = 1
-    # The NODE's own index, not the packet's model_id. They used to be the same
-    # thing here because the datapath derived the one-hot from model_id; now it
-    # reads the node_id map, and a run that installs no entry sets no bit.
     _node = node_index
     if _node is not None and 0 <= _node <= 51:
         x[13 + _node] = 1
-    # Per-column divisors: only the ttl column (12) is scaled, by the
-    # checkpoint's initial_ttl. See model_meta.DEFAULT_TTL_SCALE.
     import model_meta as _mm
     col_scale = [1] * N_IN
     col_scale[12] = _mm.feature_scale("ttl")
 
     h1 = []
     for j in range(N_H1):
-        # Bias scaled into the accumulator's units. The weights are stored as
-        # round(w_float * scale), so after L layers of products the accumulator
-        # carries scale**L while a bias stored the same way carries scale**1.
-        # Multiplying by scale**(layer index) puts the two in the same scale;
-        # without it the datapath disagrees with the trained model on 28% of
-        # decisions (measured: float/int8 argmax agreement 72% -> 96%).
-        acc = s8(weights[off_fc1_b + j])            # layer 0: scale**0 == 1
+        acc = s8(weights[off_fc1_b + j])
         for i in range(N_IN):
             acc += _trunc_div(x[i] * s8(weights[j * N_IN + i]), col_scale[i])
         h1.append(max(0, acc))
     h2 = []
     for j in range(N_H2):
-        acc = s8(weights[off_fc2_b + j]) * scale        # layer 1: scale**1
+        acc = s8(weights[off_fc2_b + j]) * scale
         for i in range(N_H1):
             acc += h1[i] * s8(weights[off_fc2_w + j * N_H1 + i])
         h2.append(max(0, acc))
-    # No numeric sentinel: the logits are unbounded int64-scale accumulations, so
-    # any finite starting value can be above ALL of them and pin best_cls to 0.
     best_val, best_cls = None, 0
-    # Output layer: scale**2, matching bias_mul_3 in the eBPF sources. This
-    # read s8(weights[off_out_b + k]) alone -- scale**0 -- while layer 0 used
-    # scale**0 correctly and layer 1 used scale**1. Only the last layer was
-    # missed, and only sparse link_state inputs are sensitive enough to it to
-    # show the difference.
     out_bias_mul = scale * scale
     for k in range(N_OUT):
         acc = s8(weights[off_out_b + k]) * out_bias_mul
@@ -436,11 +324,7 @@ def ref_infer(weights, scale: int, ttl: int, model_id: int, ingress_port: int = 
 
 
 def build_frame_sparse(model_id: int, ttl: int, scale: int, n_in: int, n_out: int) -> bytes:
-    """Frame for a heterogeneous sparse model: same skeleton as build_frame()
-    but the IPA header carries the descriptor's real input_size/output_size.
-    No payload -- the sparse route builds the IV locally (TTL from this frame's
-    IP header, dense_vector features from BPF maps seeded by the caller, node
-    one-hot from model_id, ingress_iface from ctx->ingress_ifindex)."""
+    """Frame for a heterogeneous sparse model."""
     eth = b'\x00'*6 + b'\x00'*6 + struct.pack('!H', 0x0800)
     ip  = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 48, 0, 0, ttl, 17, 0, b'\x0a\x00\x00\x01', b'\x0a\x00\x00\x02')
     ip  = ip[:10] + struct.pack('!H', _ip_csum(ip)) + ip[12:]
@@ -453,23 +337,7 @@ def build_frame_sparse(model_id: int, ttl: int, scale: int, n_in: int, n_out: in
 def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
                      map_values, ingress_port=0, scale: int = 1,
                      node_index=None):
-    """Python reference for the heterogeneous sparse route: builds the input
-    vector feature by feature from the descriptor (mirroring the per-kind C
-    generators in ebpf_program.py), then runs the MLP + argmax. Returns
-    (best_cls, best_val). What best_cls MEANS is not this function's business:
-    ask the ClassSemantics. It deliberately does not say "n_out-1 means DROP"
-    any more -- that sentence was the only documentation of a convention the
-    trained model does not follow.
-
-    map_values: {map_name: [values]} the caller seeded into the dense_vector
-    maps (link_state, queue_state).
-
-    ingress_port: the LOGICAL PORT the packet arrived on, 1-based, 0 for none.
-    This used to be a raw ctx->ingress_ifindex plus an `ifindex_table` to
-    translate it, mirroring a table the generator compiled in. The datapath
-    now resolves the kernel ifindex through the `ingress_port` map before the
-    feature is built, so the reference is handed the resolved value -- which is
-    also the only value that means anything without knowing the node."""
+    """Python reference for the heterogeneous sparse route."""
     import model_meta as mm
     def s8(v):
         return ct.c_int8(int(v) & 0xFF).value
@@ -480,9 +348,9 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
     for f in features:
         t, size = f["type"], f["size"]
         kind = mm.FEATURE_CATALOG[t]["kind"]
-        if kind == "scalar":                       # ttl
+        if kind == "scalar":
             x[o] = ttl & 0xff
-        elif kind == "dense_vector_map":           # link_state / queue_occupancy
+        elif kind == "dense_vector_map":
             vals = map_values.get(mm.FEATURE_CATALOG[t]["map"], [0] * size)
             for i in range(size):
                 x[o + i] = vals[i]
@@ -496,10 +364,6 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
                 x[o + _n] = 1
         o += size
 
-    # Generic per-layer reference: layer_sizes = [n_in, h1, ..., hk, n_out].
-    # Same weight layout ebpf_program.generate_ebpf_hardcoded now emits (n_prev*n_cur
-    # weights then n_cur biases, layer by layer) -- reduces to the historical
-    # 2-hidden-layer math when hidden_dims == (n_h1, n_h2).
     layer_sizes = [n_in] + [int(d) for d in hidden_dims] + [n_out]
     off = 0
     acts = x
@@ -509,17 +373,8 @@ def ref_infer_sparse(weights, features, hidden_dims, n_out, ttl, model_id,
         off = b_off + n_cur
         is_out = (li == len(layer_sizes) - 1)
         nxt = []
-        # Only the FIRST layer consumes raw features, so only it applies the
-        # per-feature scales; later layers consume activations, which are
-        # already in the model's own units.
         scales = _feature_scales(features) if li == 1 else [1] * n_prev
         for j in range(n_cur):
-        # Bias scaled into the accumulator's units. The weights are stored as
-        # round(w_float * scale), so after L layers of products the accumulator
-        # carries scale**L while a bias stored the same way carries scale**1.
-        # Multiplying by scale**(layer index) puts the two in the same scale;
-        # without it the datapath disagrees with the trained model on 28% of
-        # decisions (measured: float/int8 argmax agreement 72% -> 96%).
             acc = s8(weights[b_off + j]) * (scale ** (li - 1))
             for i in range(n_prev):
                 acc += _trunc_div(acts[i] * s8(weights[w_off + j * n_prev + i]),
@@ -540,21 +395,7 @@ class _FwdAction(ct.Structure):
 
 def _install_mac_table(b, name, ifindex=2, semantics=None, ports=None):
     """Pre-install the logical-port -> action map the datapath reads after
-    argmax. The NN picks a class, the class semantics say which LOGICAL PORT
-    that class forwards on, and this dictionary resolves that port to
-    {ifindex, MACs}.
-
-    The signature used to be `n_classes=6`, filling keys 0..5 and defaulting to
-    "the historical egress count". That baked in three things at once: that the
-    map is keyed by class, that class k is a forwarding class for every k below
-    the count, and that the count is n_out-1. For the checked-in model all
-    three are wrong (DROP is class 5, class 6 is untrained), so the table both
-    installed a next-hop for the DROP class and left the real port space only
-    accidentally correct.
-
-    Pass `semantics` and the declared logical ports are used. `ports` overrides
-    with an explicit list, for tests that want a deliberately partial table.
-    """
+    argmax."""
     if ports is None:
         if semantics is None:
             semantics = _default_semantics_for(b, name)
@@ -570,11 +411,7 @@ def _install_mac_table(b, name, ifindex=2, semantics=None, ports=None):
 
 
 def _default_semantics_for(b, name):
-    """Semantics for a setup that did not pass any: descriptor, then reference.
-
-    Routed through the one shared resolver so the verifier cannot disagree with
-    the datapath about what class 5 means.
-    """
+    """Semantics for a setup that did not pass any."""
     m = _mut()
     if m is not None:
         return m.semantics
@@ -589,42 +426,11 @@ def _default_semantics_for(b, name):
             os.path.join(SHARED_DIR, "weights.json")))["n_out"]
     return mm.descriptor_semantics_or_reference(n_out, f"verify:{name}")
 
-def _prime_scratch_p3(b, h2: list, scale: int, model_id: int, layer_idx: int, ingress_ifindex: int = 0, ttl: int = 0):
-    """Seed scratch_acts/scratch_meta so that calling layer_hidden directly
-    (bypassing dispatcher + earlier hops) exercises just the model's LAST
-    layer: layer_idx must be n_layers-1 so layer_hidden's own
-    (layer_idx+1==n_layers) check resolves to argmax+forward. The weight
-    offset for that layer comes from layer_shapes[{model_id, layer_idx}]
-    (already populated by load_modular_weights), not from scratch_meta --
-    unlike the old fixed 3-block design there is no w_off_out slot anymore."""
-    # scratch_acts is now ONE struct-valued per-CPU entry (struct act_vec) holding
-    # the whole activation vector, not one entry per slot -- see ebpf_modular.py.
-    # Seed key 0 with the activations placed in the struct's v[] array.
-    acts_tbl = b["scratch_acts"]
-    leaf = acts_tbl.Leaf()
-    for cpu in range(len(leaf)):
-        for i, v in enumerate(h2[:4]):
-            leaf[cpu].v[i] = int(v)
-    acts_tbl[ct.c_int(0)] = leaf
-    # Slot 3 is META_NODE_CTX: (node_index << 16) | ingress_port. 0x100 in
-    # the upper half is "unknown node", which sets no bit -- matching a
-    # reference called with node_index=None.
-    meta = {0: model_id, 1: scale, 2: layer_idx,
-            3: (0x100 << 16) | (ingress_ifindex & 0xffff), 4: ttl}
-    for slot, val in meta.items():
-        b["scratch_meta"][ct.c_int(slot)] = _percpu_arr(val)
-
 
 def _seed_link_state(b, val: int = 1):
-    """Seed the link_state map [0..5] with `val` (1=up) if the program has it.
-    All three pipelines read these 6 slots as the model's first input features
-    (egress up/down). Verify runs the 'all links up' baseline, so it must match
-    ref_infer's x[0..5]=1."""
+    """Seed the link_state map [0..5] with `val` (1=up) if the program has it."""
     try:
         from common import write_vector_map
-        # Width from the scenario, not a literal 6: write_vector_map pads
-        # and truncates to the map, but a short list left the high slots at
-        # whatever the previous test wrote.
         import model_meta as _mm
         _n = int(_mm.load_topology_config()["n_interfaces"])
         write_vector_map(b, "link_state", [int(val)] * _n)
@@ -674,23 +480,8 @@ BPF_ARRAY(mac_table, struct fwd_action, 8);
 BPF_PERCPU_ARRAY(pkt_stats, __u64, 3);
 BPF_PERCPU_ARRAY(cls_stats, __u64, 7);
 
-/* CTR_INC(): real per-packet map-lookup counter, active only when
- * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
- * see common.py instrument_map_lookups()). No-op otherwise, so the baseline
- * program whose instructions and latency are measured is byte-identical to
- * what it was before this block existed.
- *
- * Added so the baseline gets a MEASURED lookup count like the three pipelines.
- * count_lookups() had no 'baseline' branch, so the design-space table printed
- * n/a for it -- and the figure that had been reported for the baseline was 0,
- * which is wrong: the hit path below does three lookups (mac_table, pkt_stats,
- * cls_stats). The baseline is the reference floor the other pipelines are
- * compared against, so its floor of map lookups has to be measured, not
- * assumed to be zero. */
 #ifdef IPA_COUNT_LOOKUPS
 BPF_PERCPU_ARRAY(lookup_ctr, __u64, 1);
-/* BCC's rewriter refuses table.lookup() calls that appear textually inside a
- * macro expansion -- must be a real function, not a #define body. */
 static inline __attribute__((always_inline)) void ctr_inc(void) {
     int _lci = 0;
     __u64 *_lcv = lookup_ctr.lookup(&_lci);
@@ -701,15 +492,6 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 #define CTR_INC() do {} while (0)
 #endif
 
-/* EMPTY/BASELINE pipeline: the SAME packet parse as the hardcoded dispatcher
- * (eth/ip/udp/ipa, bounds-checked) + the SAME action (mac_table -> MAC rewrite
- * -> bpf_redirect), but NO dispatch tail-call and NO neural-net inference. It
- * redirects a FIXED class 0 (no argmax). Measured with the identical
- * BPF_PROG_TEST_RUN harness as the real pipelines, so it is the reference floor:
- * hardcoded_latency - baseline_latency isolates the cost of the extra work
- * hardcoded does (tail-call + double parse + the MLP). If hardcoded ~ baseline,
- * the XDP+parse+redirect FRAMEWORK floor dominates and the int8 65-4-4-7 net is
- * nearly free -- which is why the hardcoded --kernel throughput looks so high. */
 int xdp_baseline(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -727,10 +509,6 @@ int xdp_baseline(struct xdp_md *ctx) {
     __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
     struct fwd_action *action = mac_table.lookup(&cls);
     if (action && action->ifindex != 0) {
-        /* The baseline is the reference floor the pipelines are compared
-         * against, so it must do the SAME framework work they do -- TTL
-         * decrement included. Leaving it out would push the cost of the TTL
-         * update into the "cost of the neural network" subtraction. */
         if (ip->ttl <= 1) {
             int ti = 1; __u64 *tv = pkt_stats.lookup(&ti);
             if (tv) *tv += 1;
@@ -753,11 +531,7 @@ int xdp_baseline(struct xdp_md *ctx) {
 
 
 def setup_baseline(model_id: int, model_path: str):
-    """Empty/baseline pipeline: XDP parse + redirect, NO neural-net inference,
-    NO tail-call. Same BPF_PROG_TEST_RUN harness as the real pipelines, so it is
-    the reference FLOOR for the throughput/latency comparison -- it answers "how
-    much of the hardcoded number is just the XDP+parse+redirect framework vs the
-    actual inference". Returns the same dict shape as the other setups."""
+    """Empty/baseline pipeline."""
     m = _mut()
     if m is not None:
         return _setup_mut("baseline", model_id, m)
@@ -819,13 +593,6 @@ BPF_PERCPU_ARRAY(pkt_stats, __u64, 3);
 BPF_PERCPU_ARRAY(cls_stats, __u64, 7);
 BPF_PROG_ARRAY(tail_progs, 2);
 
-/* SAME parse + SAME action as xdp_baseline (EBPF_BASELINE), but the action is
- * reached via ONE bpf_tail_call hop instead of inline. Comparing this
- * program's latency against xdp_baseline's isolates PURE tail-call overhead
- * (one PROG_ARRAY jump), with the parse and the redirect logic held
- * identical -- neither MLP cost nor a second packet parse is in this delta,
- * unlike hardcoded_latency - baseline_latency which bundles tail-call +
- * double-parse + MLP together. */
 int xdp_baseline_dispatch(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
@@ -852,20 +619,12 @@ int xdp_baseline_action(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
-    /* Re-parse the IP header: this leaf is reached through a tail call, so it
-     * does not inherit the dispatcher's pointers. Needed only for the TTL
-     * decrement -- the packet was already validated upstream, but the verifier
-     * requires the bounds check again regardless. */
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
 
     __u32 cls = 0;   /* fixed egress class -- no inference, no argmax */
     struct fwd_action *action = mac_table.lookup(&cls);
     if (action && action->ifindex != 0) {
-        /* The baseline is the reference floor the pipelines are compared
-         * against, so it must do the SAME framework work they do -- TTL
-         * decrement included. Leaving it out would push the cost of the TTL
-         * update into the "cost of the neural network" subtraction. */
         if (ip->ttl <= 1) {
             int ti = 1; __u64 *tv = pkt_stats.lookup(&ti);
             if (tv) *tv += 1;
@@ -889,9 +648,7 @@ int xdp_baseline_action(struct xdp_md *ctx) {
 
 def setup_baseline_tailcall(model_id: int, model_path: str):
     """Same floor as setup_baseline(), but the redirect action is reached via
-    ONE bpf_tail_call hop (see EBPF_BASELINE_TAILCALL docstring). Comparing
-    against setup_baseline() isolates pure tail-call overhead, decoupled from
-    any MLP cost or second packet parse."""
+    ONE bpf_tail_call hop (see EBPF_BASELINE_TAILCALL docstring)."""
     weights, scale = load_weights(model_path)
     b = BPF(text=EBPF_BASELINE_TAILCALL)
     fn_disp   = b.load_func("xdp_baseline_dispatch", BPF.XDP)
@@ -910,21 +667,9 @@ def setup_baseline_tailcall(model_id: int, model_path: str):
 
 
 def setup_hardcoded(model_id: int, model_path: str):
-    """
-    Pipeline 1 (P1.5: weights compiled in, node read from the node_id map),
+    """Pipeline 1 (P1.5: weights compiled in, node read from the node_id map),
     as it is DEPLOYED: the AOT object built by gen_full_c and loaded by
-    loader_aot, driven through bpffs (p1_aot.load_p1).
-
-    This compiled ebpf_program's BCC source until 2026-09-23 -- a different
-    generator, in a different dialect, that never reaches a node. The two were
-    measured side by side (claims.md B3) and then the tests moved to the object
-    that actually runs. The dictionary is the same as before.
-
-    Model update on the node = loading the prebuilt object:
-      - t_redirect_s : open + load (verifier + JIT) by loader_aot
-      - t_compile_s  : clang, offline (0 when the object was already cached)
-      - t_insert_s   : 0 (no runtime weight insertion in P1)
-    """
+    loader_aot, driven through bpffs (p1_aot.load_p1)."""
     m = _mut()
     if m is not None:
         return _setup_mut("hardcoded", model_id, m)
@@ -932,30 +677,16 @@ def setup_hardcoded(model_id: int, model_path: str):
     weights, scale = load_weights(model_path)
     setup = p1_aot.load_p1([(model_id, weights, scale)])
     setup.update(weights=weights, scale=scale)
-    # link_state[0..5] = 1 (all egress links up) -- input feature, not a weight.
     _seed_link_state(setup["b"], 1)
     _install_mac_table(setup["b"], "mac_table")
     return setup
 
 
-# The node P1 is specialised to. 7 is what the fabric has always claimed
-# (pipeline_setup.node_index_for keeps it when the model's node one-hot is
-# large enough); bench_scaling and bench_throughput use the same one.
 STATIC_NODE = 7
 
 
 def setup_p1_static(model_id: int, model_path: str, node: int = STATIC_NODE):
-    """
-    Pipeline 1 specialised (P1): setup_hardcoded with the node index frozen
-    into the source as well as the weights -- one binary per NODE. The
-    n_nodes-case switch on the node one-hot disappears, and the node_id map
-    read with it: n_h1 constants that clang folds into the accumulator (see
-    _gen_feature_onehot_node in ebpf_program.py; `bench_scaling.py --verify`
-    proves it decides like P1.5).
-
-    The setup carries "static_node": the reference must set that node's bit,
-    whereas the other pipelines, with no node_id entry installed, set none.
-    """
+    """Pipeline 1 specialised (P1)."""
     m = _mut()
     if m is not None:
         import pipeline_setup as PS
@@ -964,7 +695,6 @@ def setup_p1_static(model_id: int, model_path: str, node: int = STATIC_NODE):
             PS.register_model_id(setup, model_id)
         PS.seed_inputs(setup)
         return setup
-    # The AOT object, as P1 is deployed (p1_aot), with the node frozen.
     import p1_aot
     weights, scale = load_weights(model_path)
     setup = p1_aot.load_p1([(model_id, weights, scale)], static_node=node)
@@ -985,7 +715,7 @@ def setup_template(model_id: int, model_path: str):
     disp_fn = b.load_func("ipa_switch_template", BPF.XDP)
     leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
     b["arch_progs"][ct.c_int(0)] = ct.c_int(leaf_fn.fd)
-    load_arch_weights(b, weights, model_id=model_id, scale=scale)  # default n_h1=n_h2=4 matches weights.json
+    load_arch_weights(b, weights, model_id=model_id, scale=scale)
     _seed_link_state(b, 1)
     _install_mac_table(b, "mac_table_t2")
     return {
@@ -1008,10 +738,8 @@ def setup_modular(model_id: int, model_path: str):
     disp_fn   = b.load_func("modular_dispatcher", BPF.XDP)
     fn_first  = b.load_func("layer_first",  BPF.XDP)
     fn_hidden = b.load_func("layer_hidden", BPF.XDP)
-    # slot 0 = layer_first (always hop 0), slots 1..15 = layer_hidden
-    # (always a later hop) -- see ebpf_modular.py module docstring for why.
     b["layer_chain"][ct.c_int(0)] = ct.c_int(fn_first.fd)
-    for i in range(1, 16):  # LAYER_CHAIN_SIZE
+    for i in range(1, 16):
         b["layer_chain"][ct.c_int(i)] = ct.c_int(fn_hidden.fd)
     layer_dims = [(65, 4), (4, 4), (4, 7)]
     n_layers = len(layer_dims)
@@ -1020,18 +748,12 @@ def setup_modular(model_id: int, model_path: str):
     _install_mac_table(b, "mac_table_t3")
     print(f"[P3 setup] nr_cpus={_NR_CPUS}  PERCPU ctypes Array enabled")
     return {
-        # "fn" is the direct BPF_PROG_TEST_RUN target used by run() below to
-        # exercise the model's LAST layer in isolation (see _prime_scratch_p3):
-        # for a 3-layer model that's always layer_hidden (layer_idx>=1).
         "b": b, "fn": fn_hidden, "disp": disp_fn,
         "weights": weights, "scale": scale,
         "cls_stats": b["cls_stats_t3"],
         "pkt_stats": b["pkt_stats_t3"],
         "pipeline": 3,
         "last_layer_idx": n_layers - 1,
-        # n_tail = actual runtime tail-call hops for this model (dispatcher ->
-        # layer_first -> layer_hidden x (n_layers-1)): NOT len(progs)-1 --
-        # there are only 2 distinct layer programs regardless of depth.
         "n_tail": n_layers,
         "progs": {
             "modular_dispatcher": disp_fn.fd,
@@ -1042,28 +764,20 @@ def setup_modular(model_id: int, model_path: str):
 
 
 def setup_sparse_hetero(model_id: int, model_dir: str):
-    """
-    Load a heterogeneous sparse model (explicit per-model feature descriptor,
-    see model_meta.py) from a fixture directory. Seeds every dense_vector map
-    the descriptor uses (link_state and/or queue_state) with KNOWN
-    deterministic values and returns them under "map_values" so
-    ref_infer_sparse can rebuild the same input vector on the Python side.
-    """
+    """Load a heterogeneous sparse model (explicit per-model feature
+    descriptor, see model_meta.py) from a fixture directory."""
     from ebpf_program import load_and_generate
     import model_meta as mm
 
-    model_path = os.path.join(model_dir, "model.pt")  # need not exist
+    model_path = os.path.join(model_dir, "model.pt")
     meta = mm.load_model_meta(model_path)
     if meta.get("scenario", "sparse") != "sparse" or not meta.get("features"):
         raise ValueError(f"{model_dir}/model_meta.json is not a sparse model with a 'features' descriptor")
     shape = mm.derive_shape(meta)
 
     import p1_aot
-    # Weights and scale as the deploy resolves them; the program is the AOT
-    # object (p1_aot), not load_and_generate's BCC source.
     _, weights, scale = load_and_generate(model_path, model_id=model_id, meta=meta)
     n_out = shape["n_out"]
-    # One semantics object for the generated switch AND the seeded port space.
     semantics = mm.descriptor_semantics_or_reference(n_out, "verify:sparse")
     setup = p1_aot.load_p1([(model_id, weights, scale)],
                            features=shape["features"], n_out=n_out,
@@ -1072,8 +786,6 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
     b = setup["b"]
     _install_mac_table(b, "mac_table", semantics=semantics)
 
-    # Seed each dense_vector map with known values (deterministic, arbitrary).
-    # Each map holds all its slots in one struct-valued entry (single lookup).
     from common import write_vector_map
     map_values = {}
     for feat_type, map_name in mm.feature_maps(shape["features"]).items():
@@ -1088,22 +800,15 @@ def setup_sparse_hetero(model_id: int, model_dir: str):
 
 
 def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, repeat: int = None) -> float:
-    """
-    Real per-packet map-lookup count for `method`, measured via a dedicated
+    """Real per-packet map-lookup count for `method`, measured via a dedicated
     instrumented build (every `.lookup()` call wrapped with CTR_INC(), see
-    common.py instrument_map_lookups()). This compiles a SEPARATE BPF object
-    from the one used for latency/instruction measurement -- the counting
-    overhead never contaminates the hardware-measured performance numbers,
-    only this metric. Runs `repeat` packets through the dispatcher (the real
-    per-packet path, tail calls included) and returns lookup_ctr[0]/repeat.
-
-    """
+    common.py instrument_map_lookups())."""
     from common import instrument_map_lookups, count_instrumented_sites
 
     def _report(raw_src):
-        """Print where the instrumentation weight lands, per eBPF function, so a
-        'program too large' rejection of the measurement build is diagnosable
-        from the log instead of being a bare failure."""
+        """Print where the instrumentation weight lands, per eBPF function, so
+        a 'program too large' rejection of the measurement build is
+        diagnosable from the log instead of being a bare failure."""
         sites = count_instrumented_sites(raw_src)
         total = sum(sites.values())
         detail = "  ".join(f"{k}={v}" for k, v in sorted(sites.items()))
@@ -1128,17 +833,12 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
                                    build_frame(model_id, ttl, scale), repeat)
 
     if method == "baseline":
-        # The reference floor: same parse + same mac_table action as the real
-        # pipelines, no inference. Its lookups are the framework cost every
-        # pipeline pays, so subtracting it isolates the model's own lookups.
         src = "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(EBPF_BASELINE)
         _report(EBPF_BASELINE)
         b = BPF(text=src)
         disp_fn = b.load_func("xdp_baseline", BPF.XDP)
         _install_mac_table(b, "mac_table")
     elif method in ("p1_static", "hardcoded"):
-        # The AOT object with every bpf_map_lookup_elem counted
-        # (p1_aot.instrument_lookups, the libbpf twin of the BCC rewrite).
         import p1_aot
         setup = p1_aot.load_p1(
             [(model_id, weights, scale)], instrument=True,
@@ -1184,34 +884,21 @@ def count_lookups(method: str, model_id: int, model_path: str, ttl: int = None, 
 
 
 def _lookups_per_packet(method, b, disp_fn, frame, repeat):
-    """Run `repeat` packets through the instrumented build, return the
-    lookups per packet."""
-    # lookup_ctr is a BPF_PERCPU_ARRAY (no atomic on the hot path -- the same
-    # per-CPU counter pattern the design-space analysis recommends for
-    # pkt_stats/cls_stats). Zero every CPU's copy, then sum them back.
+    """Run `repeat` packets through the instrumented build, return the lookups
+    per packet."""
     ctr = b["lookup_ctr"]
     if method in ("p1_static", "hardcoded"):
-        # AOT build: a plain ARRAY with an atomic add (see p1_aot).
         ctr[ct.c_int(0)] = ct.c_ulonglong(0)
         prog_test_run(disp_fn.fd, frame, repeat=repeat)
         return int.from_bytes(ctr[ct.c_int(0)], "little") / float(repeat)
-    ctr[ct.c_int(0)] = ctr.Leaf()          # zeroed per-CPU array
+    ctr[ct.c_int(0)] = ctr.Leaf()
     prog_test_run(disp_fn.fd, frame, repeat=repeat)
     total = sum(int(v) for v in ctr[ct.c_int(0)])
     return total / float(repeat)
 
 
 def _count_lookups_defaults(ttl, repeat):
-    """TTL and repetition count for a lookup measurement.
-
-    Both default to values that keep every run on the FORWARDING path. The old
-    defaults (ttl=5, repeat=2000) were written when the datapath did not modify
-    the packet. Now it decrements the TTL and BPF_PROG_TEST_RUN never restores
-    the buffer between repetitions, so the TTL hit 1 after four runs and the
-    remaining 1996 took the expiry short-circuit -- which does one lookup fewer
-    (no cls_stats on a non-forward). The reported figure was therefore the
-    EXPIRY path's lookup count, off by one on every pipeline.
-    """
+    """TTL and repetition count for a lookup measurement."""
     return (BENCH_TTL if ttl is None else ttl,
             TEST_RUN_MAX_CHUNK if repeat is None else repeat)
 
@@ -1234,7 +921,7 @@ XDP_REDIRECT_PASS = frozenset({0, 4})
 
 def _fired_cls_p1(setup) -> int:
     """After a single-packet run of Pipeline 1, return the egress class that
-    fired: 0..5 = redirect on that class, 6 = DROP, -1 = nothing."""
+    fired."""
     cs = setup["cls_stats"]
     for c in range(6):
         if _read_u64(cs, c) > 0:
@@ -1244,46 +931,20 @@ def _fired_cls_p1(setup) -> int:
     return -1
 
 
-# TTL sweeps start at 2, not 1: a forwarding hop now decrements the TTL and
-# refuses to forward a packet whose TTL would reach 0 (see ipa_ttl_dec in the
-# eBPF sources). TTL=1 is therefore a legitimate NON-forward, and including it
-# in a sweep that asserts 'the packet was redirected' would fail by design.
-# TTL=1 is covered separately by the dedicated expiry test.
 def verify_ttl_handling(method: str, model_id: int, model_path: str):
-    """Prove the forwarding hop behaves like a router with respect to the TTL.
-
-    Two properties, both checked against the packet the program actually
-    produced (BPF_PROG_TEST_RUN writes it back to data_out), not against the
-    source code:
-
-      forwarded  -- a packet with a healthy TTL is redirected AND comes out
-                    with TTL decremented by exactly 1 AND with a valid IP
-                    header checksum. Without the incremental checksum fix the
-                    TTL would change and the checksum would not, producing a
-                    packet every downstream router silently discards -- a
-                    failure that is invisible in a return-code-only test.
-      expired    -- a packet with TTL=1 is NOT forwarded. A hop must not emit a
-                    packet with TTL 0; before this existed the datapath never
-                    wrote the TTL at all, so a redirected packet looped forever.
-
-    Returns (n_pass, n_fail, details).
-    """
+    """Prove the forwarding hop behaves like a router with respect to the TTL."""
     setup_fn = {"p1_static": setup_p1_static,
                 "hardcoded": setup_hardcoded,
                 "template":  setup_template,
                 "modular":   setup_modular}[method]
     setup = setup_fn(model_id, model_path)
-    b, disp = setup["b"], setup["disp"]          # noqa: F841 (b keeps maps alive)
+    b, disp = setup["b"], setup["disp"]  # noqa: F841 (b keeps maps alive)
     scale = setup["scale"]
     ps = setup["pkt_stats"]
-    node = setup.get("static_node")              # only P1 has one frozen in
+    node = setup.get("static_node")
 
     npass, nfail, details = 0, 0, []
 
-    # --- forwarded: TTL t must come out as TTL t-1 with a valid checksum ---
-    # t = 5 for the checkpoint, whose decision there is FORWARD. Another model
-    # may DROP at 5; the property is about forwarding, so the first TTL whose
-    # reference decision is FORWARD is used (none: nothing to check).
     t_fwd = 5
     m = _mut()
     if m is not None:
@@ -1293,13 +954,13 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
                           None, scale, t, model_id,
                           node_index=node)[0]) == "FORWARD"), None)
         if t_fwd is None:
-            details.append(f"{method}: nessun TTL porta a una classe FORWARD "
-                           f"con tutti i link su: inoltro non verificabile")
+            details.append(f"{method}: no TTL leads to a FORWARD class "
+                           f"with every link up: forwarding not verifiable")
     _reset_stats(setup)
     frame = build_frame(model_id, t_fwd or 5, scale)
     retval, _, out = prog_test_run_data(disp.fd, frame)
     if len(out) >= 34:
-        ttl_out = out[14 + 8]                    # eth(14) + offset of TTL in IP hdr
+        ttl_out = out[14 + 8]
         csum_ok = ip_checksum_ok(out[14:34])
     else:
         ttl_out, csum_ok = None, False
@@ -1312,9 +973,8 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
     else:
         nfail += 1
         details.append(f"{method}: TTL {t_fwd} -> retval={retval} out_ttl={ttl_out} "
-                       f"csum_ok={csum_ok} (atteso retval in (0,4), ttl {t_fwd - 1}, csum OK)")
+                       f"csum_ok={csum_ok} (expected retval in (0,4), ttl {t_fwd - 1}, csum OK)")
 
-    # --- expired: TTL 1 must NOT be forwarded ---
     _reset_stats(setup)
     frame = build_frame(model_id, 1, scale)
     retval, _, out = prog_test_run_data(disp.fd, frame)
@@ -1325,18 +985,13 @@ def verify_ttl_handling(method: str, model_id: int, model_path: str):
     else:
         nfail += 1
         details.append(f"{method}: TTL 1 -> retval={retval} hits={hits} "
-                       f"(atteso NON inoltrato)")
+                       f"(expected NOT forwarded)")
 
     return npass, nfail, details
 
 
 def probe_link_down(model_path, model_id: int = 0, ttl_min: int = 2, ttl_max: int = 6):
-    """Prove that link_state is a live routing input: for each TTL and each
-    egress k, run Pipeline 1 with all links up, then with link k down
-    (link_state[k]=0), and record the cases where the argmax egress class
-    changes. Returns (changes, tested) where changes is a list of
-    (ttl, k, cls_up, cls_down). A non-empty result means a link failure
-    actually reroutes the packet."""
+    """Prove that link_state is a live routing input."""
     setup = setup_hardcoded(model_id, model_path)
     b, fn, scale = setup["b"], setup["fn"], setup["scale"]
     changes, tested = [], 0
@@ -1347,9 +1002,6 @@ def probe_link_down(model_path, model_id: int = 0, ttl_min: int = 2, ttl_max: in
         prog_test_run(fn.fd, frame, repeat=1)
         cls_up = _fired_cls_p1(setup)
         from common import set_vector_slot
-        # Was `range(6)`: the Germany50 interface count, so on any other
-        # scenario the probe flipped the wrong slots and silently reported
-        # "0 link-down cases changed the egress".
         import model_meta as _mm
         _n_if = int(_mm.load_topology_config()["n_interfaces"])
         for k in range(_n_if):
@@ -1375,9 +1027,6 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     setup_fn = {"p1_static": setup_p1_static, "hardcoded": setup_hardcoded,
                 "template": setup_template, "modular": setup_modular}[method]
     setup = setup_fn(model_id, model_path)
-    # b and fn are not referenced again but must stay in scope: they own the
-    # BCC object and the loaded program: letting them be garbage-collected
-    # closes the map/program fds the TEST_RUN calls below still use.
     b, fn, disp = setup["b"], setup["fn"], setup["disp"]  # noqa: F841
     weights = setup["weights"]
     scale = setup["scale"]
@@ -1385,7 +1034,6 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     cs = setup.get("cls_stats")
     pipeline = setup["pipeline"]
 
-    # Model-update timing for Method 1
     if pipeline == 1:
         t_redir = setup.get("t_redirect_s", 0.0)
         t_ins   = setup.get("t_insert_s", 0.0)
@@ -1400,23 +1048,8 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
     print("      dispatcher -> ... -> action) -- no leaf-priming shortcut.")
     print("      argmax -> mac_table[class] -> bpf_redirect.")
     print("      PASS = retval in {0,4} (redirect) AND cls_stats[ref_cls] > 0.")
-    # Reference ingress port. This used to read
-    #     ref_ifindex = 0 if pipeline == 1 else 1
-    # because the three pipelines disagreed: P1 translated the kernel ifindex
-    # through a compile-time table that did not map the sandbox's value, while
-    # P2/P3 used the raw ifindex directly and did. That asymmetry is gone --
-    # all three now resolve the kernel ifindex through the `ingress_port` map,
-    # and this runner installs no entry in it, so no logical port resolves and
-    # the ingress_iface one-hot is empty for every pipeline. The reference has
-    # to say the same, or the two disagree about a feature neither is using.
     ref_ingress_port = 0
 
-    # Reference NODE index. All three pipelines take it from the `node_id`
-    # map now -- P3 included, by packing it alongside the ingress port in one
-    # scratch_meta slot rather than paying a second map lookup. This runner
-    # installs no entry, so no node resolves and no bit is set, the same for
-    # every pipeline -- except P1 specialised, whose node is frozen into the
-    # object and whose bit is therefore always set.
     ref_node_index = setup.get("static_node")
 
     passed = failed = 0
@@ -1426,16 +1059,8 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
                                              node_index=ref_node_index)
         frame = build_frame(model_id, ttl, scale)
         _reset_stats(setup)
-        # repeat=1: the program mutates the packet (TTL decrement) and
-        # BPF_PROG_TEST_RUN does not restore the buffer between repetitions, so
-        # re-running would walk the TTL down and end up testing the expiry path
-        # instead of the decision under test. One run is all a class check needs;
-        # latency for the tables is measured by prog_test_run_bench().
         retval, dur_ns = prog_test_run(disp.fd, frame, repeat=1, ingress_ifindex=0)
         cls_count = _read_u64(cs, ref_cls) if cs is not None else 0
-        # The checkpoint's reference class over this TTL range is a FORWARD
-        # one, so a redirect is what it must do. Another model may decide
-        # DROP or UNUSED: then the program must drop, or pass, instead.
         expect = XDP_REDIRECT_PASS
         m = _mut()
         if m is not None:
@@ -1462,13 +1087,7 @@ def run(method: str, model_id: int, model_path: str, ttl_min: int, ttl_max: int,
 
 
 def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int, repeat: int) -> int:
-    """
-    Heterogeneous-sparse counterpart to run(): a model with an explicit
-    per-model feature descriptor (different feature TYPES, not just sizes --
-    the target scenario). The IV is built locally from the seeded
-    dense_vector maps + the packet TTL + node one-hot; ref_infer_sparse
-    rebuilds the same IV and we sweep TTL to exercise the scalar feature.
-    """
+    """Heterogeneous-sparse counterpart to run()."""
     print("=" * 70)
     print(f" IPA/eBPF BPF_PROG_TEST_RUN  --  method=sparse-hetero  model_id={model_id}  dir={model_dir}")
     print("=" * 70)
@@ -1481,20 +1100,12 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
     ps, cs = setup["pkt_stats"], setup["cls_stats"]
     map_values = setup["map_values"]
 
-    # ifindex table the generator used by default (only relevant if the
-    # descriptor has an ingress_iface feature); TEST_RUN default ingress
-    # ifindex is 1, which this table does not map -> no iface contribution.
     iface_size = next((f["size"] for f in features if f["type"] == "ingress_iface"), 0)
 
     feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in features)
     print(f"[setup] scale={scale}  weights={len(weights)}  n_in={n_in}  n_out={n_out}")
     print(f"      features: {feats_str}")
     print(f"      seeded maps: {map_values}")
-    # PASS/FAIL comes from the DECLARED action of the reference class. The old
-    # rule was `ref_cls < n_out - 1 -> expect redirect, else expect DROP`, so a
-    # model whose DROP class is not the last one was scored against the wrong
-    # expectation on every single TTL -- and an UNUSED class had no expectation
-    # at all.
     semantics = setup["semantics"]
     for _l in semantics.summary().splitlines():
         print(f"      {_l}")
@@ -1505,18 +1116,9 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
     for ttl in range(ttl_min, ttl_max + 1):
         ref_cls, ref_val = ref_infer_sparse(
             weights, features, hidden_dims, n_out, ttl, model_id,
-            # This runner installs no ingress_port entry, so the datapath
-            # resolves no logical port and the ingress_iface one-hot stays
-            # empty. The reference has to agree, or the two disagree about a
-            # feature neither of them is exercising.
             map_values, ingress_port=0, scale=scale)
         frame = build_frame_sparse(model_id, ttl, scale, n_in, n_out)
         _reset_stats(setup, n_classes=n_out)
-        # repeat=1: the program mutates the packet (TTL decrement) and
-        # BPF_PROG_TEST_RUN does not restore the buffer between repetitions, so
-        # re-running would walk the TTL down and end up testing the expiry path
-        # instead of the decision under test. One run is all a class check needs;
-        # latency for the tables is measured by prog_test_run_bench().
         retval, dur_ns = prog_test_run(disp.fd, frame, repeat=1)
         action = semantics.action_of(ref_cls)
         if action == "FORWARD":
@@ -1529,10 +1131,6 @@ def run_sparse_hetero(model_dir: str, model_id: int, ttl_min: int, ttl_max: int,
             ok = (retval == 1) and (cls_count > 0)
             detail = f"DROP retval={retval} pkt_stats[DROP]={cls_count}"
         else:
-            # UNUSED: countable, never forwarded, never dropped. The generated
-            # epilogue returns XDP_PASS and bumps cls_stats, so that a class the
-            # model was never trained to emit is visible instead of silently
-            # taking the DROP path.
             cls_count = _read_u64(cs, ref_cls)
             ok = (retval == 2) and (cls_count > 0)
             detail = (f"UNUSED retval={retval} (expect XDP_PASS=2) "
@@ -1556,13 +1154,13 @@ def main():
                    default="hardcoded")
     p.add_argument("--model-id", type=int, default=0)
     p.add_argument("--model", default=None,
-                   help="modello (vedi model_under_test.py); senza: il "
-                        "checkpoint configurato")
+                   help="model (see model_under_test.py); without it: the "
+                        "configured checkpoint")
     p.add_argument("--topology", default=None,
-                   help="scenario in topologies/ (senza: quello compatibile)")
+                   help="scenario in topologies/ (without it: the compatible one)")
     p.add_argument("--model-dir", default=os.path.join(SHARED_DIR, "test", "fixtures", "sparse_hetero_11"),
                    help="sparse-hetero: directory with model_meta.json (+ weights.json)")
-    p.add_argument("--ttl-min", type=int, default=2)   # 1 = expired, never forwarded
+    p.add_argument("--ttl-min", type=int, default=2)
     p.add_argument("--ttl-max", type=int, default=10)
     p.add_argument("--repeat", type=int, default=1000, help="BPF_PROG_TEST_RUN repeat count for latency measurement")
     args = p.parse_args()

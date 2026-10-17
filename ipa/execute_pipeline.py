@@ -1,31 +1,10 @@
 #!/usr/bin/env python3
-"""
-execute_pipeline.py  —  Design-space pipeline launcher
-=======================================================
-Single entry point for all three design-space pipelines:
-
-  --method hardcoded   Pipeline 1: Hardcoded model
-                       (weights as C literals, unrolled inference,
-                        1 tail call, 0 weight map lookups)
-
-  --method template    Pipeline 2: Pre-built architectural template
-                       (weights in BPF_ARRAY, 1 tail call,
-                        model update = bpf_map_update_elem)
-
-  --method modular     Pipeline 3: Modular neural pipeline
-                       (BPF_PERCPU_ARRAY scratch, N tail calls,
-                        maximum runtime flexibility)
+"""execute_pipeline.py -- attach one pipeline to an interface and run it.
 
 Usage:
     sudo python3 ipa/execute_pipeline.py --method hardcoded [--iface eth0] [--model-id 0]
     sudo python3 ipa/execute_pipeline.py --method template  [--iface eth0] [--model-id 0]
     sudo python3 ipa/execute_pipeline.py --method modular   [--iface eth0] [--model-id 0]
-
-Notes:
-    - Requires root (XDP attach).
-    - The .pt model is resolved by model_meta.default_checkpoint()
-      ($IPA_CHECKPOINT, then model_meta.json's `checkpoint` key)
-    - extract_weights.py requires torch; it is skipped if weights.json exists.
 """
 
 import argparse
@@ -39,10 +18,6 @@ if SHARED_DIR not in sys.path:
 
 
 def main():
-    # chdir into ipa/ so the pipeline modules resolve their relative data
-    # paths (weights.json, the .pt checkpoint) the way they expect. Done here
-    # rather than at module level: importing this module should not silently
-    # change the caller's working directory.
     os.chdir(SHARED_DIR)
 
     parser = argparse.ArgumentParser(
@@ -55,7 +30,7 @@ Pipeline trade-off summary:
   modular   : lower performance   | maximum flexibility | PERCPU_ARRAY + N tail calls
 
 For the full metric comparison across pipelines:
-  sudo python3 ipa/test/test_suite.py --only kernel
+  sudo python3 ipa/test/test_weights_and_metrics.py --only kernel
         """
     )
     parser.add_argument(
@@ -108,12 +83,7 @@ For the full metric comparison across pipelines:
     from model_meta import default_checkpoint
     model_path = args.model or default_checkpoint()
 
-    # ------------------------------------------------------------------
-    # Step 1: extract weights (produces weights.json + weights_float.json)
-    # Skip if both files already exist — extract_weights.py requires torch
-    # which may not be installed on a minimal node.  The pre-built JSON
-    # files checked into the repo are sufficient for all three pipelines.
-    # ------------------------------------------------------------------
+    # --- Step 1: extract weights (produces weights.json + weights_float.json) ---
     weights_path = os.path.join(SHARED_DIR, "weights.json")
     float_path   = os.path.join(SHARED_DIR, "weights_float.json")
 
@@ -143,9 +113,7 @@ For the full metric comparison across pipelines:
 
     print("[pipeline] weights.json OK")
 
-    # ------------------------------------------------------------------
-    # Step 2: launch the chosen pipeline
-    # ------------------------------------------------------------------
+    # --- Step 2: launch the chosen pipeline ---
     print()
     print("=" * 60)
     pnum = {'hardcoded': '1', 'template': '2', 'modular': '3'}[args.method]
@@ -153,22 +121,13 @@ For the full metric comparison across pipelines:
     print("=" * 60)
 
     if args.method == "hardcoded":
-        # Pipeline 1 — weights hardcoded as C literals, unrolled inference.
         if args.verify_only:
-            # Verifier smoke test on the object the node actually loads: the
-            # AOT bench mode generates the .o, loads it through the verifier
-            # and JIT, and BPF_PROG_TEST_RUNs it once -- no attach.
             sys.argv = ["method4_hardcoded_aot.py", "--model", model_path]
             runpy.run_path(
                 os.path.join(SHARED_DIR, "methods", "method4_hardcoded_aot.py"),
                 run_name="__main__"
             )
         else:
-            # AOT-literal deploy: the prebuilt .o attached live, no clang or
-            # libbpf-dev needed on this node (see method4_hardcoded_aot.py and
-            # poc_aot/loader_aot.c, statically linked against libbpf). The
-            # model path is the already-resolved absolute one: this process
-            # has os.chdir'd into SHARED_DIR.
             sys.argv = ["method4_hardcoded_aot.py", "--iface", args.iface,
                         "--xdp-mode", args.xdp_mode or "native",
                         "--model", model_path]
@@ -178,13 +137,11 @@ For the full metric comparison across pipelines:
             )
 
     elif args.method == "template":
-        # Pipeline 2 — architectural template, weights in BPF_ARRAY
         from methods.method5_template import run
         run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids,
             xdp_mode=args.xdp_mode)
 
     else:
-        # Pipeline 3 — modular layers, scratch map, N tail calls
         from methods.method6_modular import run
         run(model_id=args.model_id, iface=args.iface, model_ids=args.model_ids,
             xdp_mode=args.xdp_mode)

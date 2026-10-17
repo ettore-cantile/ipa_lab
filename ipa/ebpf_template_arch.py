@@ -1,91 +1,12 @@
-"""
-ebpf_template_arch.py  —  Pipeline 2: Pre-built Architectural Template.
+"""ebpf_template_arch.py -- Pipeline 2 (P2): one program per architecture family.
 
-Design space position:
-  - One eBPF program for the whole "2 hidden-layer MLP" architecture family
-  - Any model with that topology (any hidden widths up to the compiled
-    ceiling) reuses the same program -- no recompilation per model
-  - Weights are stored in BPF_ARRAY maps, loaded at runtime by the CP
-  - One tail call: dispatcher -> arch_progs[arch_id] -> arch_generic_2layer
-
-Architecture family supported here: fc1 -> ReLU -> fc2 -> ReLU -> out,
-input/output sizes fixed by the IPA packet format, hidden widths dynamic:
-  fc1  : n_in inputs -> n_h1 hidden         (n_h1 <= T2_MAX_H1)
-  fc2  : n_h1 hidden       -> n_h2 hidden   (n_h2 <= T2_MAX_H2)
-  out  : n_h2 hidden       -> n_out outputs   (n_out <= MAX_N_OUT)
-n_in comes from the feature descriptor, not from this file; n_out is NOT
-(6 link_state + 6 iface one-hot + 1 ttl + 52 node one-hot = 65 in;
-6 egress classes + drop = 7 out) -- they are protocol constants, not model
-hyperparameters, so they stay compile-time. n_h1/n_h2 are read at runtime
-from arch_registry, up to the compiled ceilings T2_MAX_H1/T2_MAX_H2 (see
-arch_weight_count() below for how the flat weight layout depends on them).
-A model whose hidden widths exceed the ceiling is rejected at load time by
-load_arch_weights() with a clear error, not silently truncated.
-
-Control-plane split of responsibilities
-  load_arch_weights() populates:
-    - arch_weights    (int8 values via raw bpf(2) syscall)
-    - arch_registry   (arch_id, weight_offset, scale_factor, n_out, n_h1,
-                       n_h2, sem_bank)
-    - class_action_t2 (this model's class -> action rows)
-  The CALLER must separately wire the tail-call array BEFORE or AFTER:
-    leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
-    b["arch_progs"][ct.c_int(arch_id)] = ct.c_int(leaf_fn.fd)
-  This is done in verify_prog_run.py setup_template() already.
-  load_arch_weights does NOT touch arch_progs -- BCC does not expose
-  loaded XDP programs via bpf_obj[name] (only maps), so the fd must be
-  obtained from the .load_func() return value in the caller.
-
-Action (mac_table):
-  The NN decides the egress class (argmax). The program then does a single
-  lookup class_action_t2[(model_id, sem_bank, class)] -> {action, logical
-  port} -- per-model semantics, same one lookup as the old class-only key --
-  then
-  mac_table_t2[port] -> {ifindex, src_mac, dst_mac}, rewrites the L2
-  header and bpf_redirect()s. mac_table is just the physical next-hop
-  dictionary -- no routing decision, no output validation. cls 6 = DROP.
-  (Earlier design keyed a fwd_table by the raw argmax value and validated it
-  per-TTL via valid_keys; that was over-engineered for a routing action and
-  has been removed.)
-
-Implementation notes:
-  - Inference uses a sparse dot-product over the one-hot feature vector via
-    index arithmetic into the weight block, avoiding a large on-stack
-    activation array.
-  - arch_weights is ONE struct-valued entry holding the whole weight block, so
-    the datapath pays a SINGLE bpf_map_lookup_elem for all the weights instead
-    of one helper call per weight byte (~139 of P2's former 147 lookups per
-    packet). Same "N lookups -> 1" transformation as the dense feature vectors.
-  - the ingress one-hot is indexed by LOGICAL PORT, resolved from
-    ctx->ingress_ifindex through the `ingress_port` map. An ifindex with no
-    entry yields 0, i.e. "not one of this node's ports", and contributes
-    nothing -- which is also what happens under BPF_PROG_TEST_RUN, where no
-    entry is installed. All three pipelines resolve it the same way: the
-    earlier asymmetry, where P1 used a compiled-in table and P2/P3 used the raw
-    ifindex and so selected DIFFERENT columns for the same packet, is gone.
-  - The weight block is written through the raw bpf(2) syscall (libbcc does not
-    export a stable bpf_update_elem); the real map value size is detected via
-    BPF_OBJ_GET_INFO_BY_FD before writing.
+The program is compiled once per depth; hidden widths (up to T2_MAX_H1 and
+T2_MAX_H2) and weights are read from maps, so changing the model is a map write.
 """
 
 import ctypes as ct
 import os
 
-# Protocol-fixed constants: input/output size are dictated by the IPA
-# feature encoding (65 in) and the number of egress classes + drop (7 out),
-# not by the model. Hidden widths are the actual per-model hyperparameters.
-# The reference model's widths, RESOLVED FROM THE DESCRIPTOR, not written here.
-#
-# These were `T2_N_IN = 65` and `T2_N_OUT = 7`, described as "fixed by the IPA
-# header/feature encoding". 65 is not a protocol constant: it is
-# 6 link_state + 6 ingress_iface + 1 ttl + 52 node, i.e. the Germany50 scenario's
-# dimensions summed. Neither value appears in the compiled C at all -- the
-# program reads the feature layout from model_desc and n_out from
-# arch_registry -- so they only ever served as Python defaults, and as defaults
-# they silently assumed that topology.
-#
-# Resolved lazily: importing this module must not require a scenario to be
-# configured (the codegen is importable on any host).
 def reference_widths():
     """(n_in, n_out) of the model this repo is configured for."""
     import model_meta as _mm
@@ -94,64 +15,30 @@ def reference_widths():
                                            "weights.json")),
                           topology_config=_mm.load_topology_config())
     return sh["n_in"], sh["n_out"]
-# Output width of the CHECKED-IN model, used only as a default for
-# arch_weight_count(). NOT a constraint: the datapath reads n_out from
-# arch_registry, and the compile-time ceiling is MAX_N_OUT (class_semantics.py).
 T2_N_OUT  = 7
-# Compile-time ceilings for the hidden widths: the eBPF program unrolls its
-# neuron loops up to these bounds (verifier requires a compile-time trip
-# count) and skips the unused tail at runtime via `if (j >= n_h1)` guards.
-# Any model with n_h1 <= T2_MAX_H1 and n_h2 <= T2_MAX_H2 runs on this same
-# compiled program -- raise these and reload once if a wider model shows up.
 T2_MAX_H1 = 8
 T2_MAX_H2 = 8
-
-# Size of the single shared arch_weights block, in int8 slots. MUST stay equal
-# to the MAX_WEIGHT_ENTRIES #define in the eBPF source below (and a power of
-# two: the datapath masks its weight index with MAX_WEIGHT_ENTRIES-1 to keep a
-# runtime-variable index verifier-safe). Every concurrently registered model_id
-# carves a non-overlapping slice out of this one block, so this constant is
-# also the hard cap on concurrent models: 1024 / 319 = 3 for the 65-4-4-7
-# shape. Exported so callers check the cap against the real value instead of
-# re-hardcoding 1024.
 MAX_WEIGHT_ENTRIES = 1024
 
 
 def arch_weight_count(n_h1: int, n_h2: int, n_in: int = None,
                       n_out: int = None, n_hidden: int = 2) -> int:
-    """Flat int8 weight count for an n_in -> n_h1 -> n_h2 -> T2_N_OUT MLP
-    (fc1 weights+bias, fc2 weights+bias, out weights+bias), matching the
-    flat layout load_arch_weights() writes and the eBPF program reads.
-
-    n_in/n_out default to the CONFIGURED model's widths, resolved from the
-    descriptor. They used to default to the literals 65 and 7, so a caller that
-    omitted them got the Germany50 model's block size for whatever model it was
-    actually registering."""
+    """Flat int8 weight count for an n_in -> n_h1 -> n_h2 -> T2_N_OUT MLP (fc1
+    weights+bias, fc2 weights+bias, out weights+bias), matching the flat
+    layout load_arch_weights() writes and the eBPF program reads."""
     if n_in is None or n_out is None:
         _in, _out = reference_widths()
         n_in = _in if n_in is None else n_in
         n_out = _out if n_out is None else n_out
     if n_hidden == 1:
-        # fc1 then straight to the output: no fc2 block at all. The datapath
-        # copies h1 into h2 and registers n_h2 == n_h1, so the output term is
-        # the same expression.
         return (n_in * n_h1 + n_h1) + (n_h1 * n_out + n_out)
-    # Layers beyond the second are n_h2 -> n_h2 (see build_arch_leaf), so each
-    # contributes one square weight matrix plus a bias row. n_hidden=2 leaves
-    # the term at zero and the expression is the original one.
     extra = (n_hidden - 2) * (n_h2 * n_h2 + n_h2)
     return ((n_in * n_h1 + n_h1) + (n_h1 * n_h2 + n_h2) + extra
             + (n_h2 * n_out + n_out))
 
 
 class _LazyWeightCount:
-    """`N_WEIGHTS_T2` as a lazily-evaluated int.
-
-    It was `arch_weight_count(4, 4)` evaluated at import time against the
-    literal 65/7. Resolving it eagerly now would make importing this module
-    require a configured scenario, which would break `--only kernel` on a host
-    with no descriptor. It resolves on first use instead.
-    """
+    """`N_WEIGHTS_T2` as a lazily-evaluated int."""
 
     def __int__(self):
         return arch_weight_count(4, 4)
@@ -188,16 +75,8 @@ class _LazyWeightCount:
 
 N_WEIGHTS_T2 = _LazyWeightCount()
 
-# ---------------------------------------------------------------------------
-# Raw bpf(2) syscall helpers
-# ---------------------------------------------------------------------------
+# --- Raw bpf(2) syscall helpers ---
 
-# Binding libc at import time made this module Linux-only to IMPORT, not just
-# to run -- and the biggest thing it exports is C source text, which is
-# generated offline precisely so the node needs no toolchain, and read by
-# tooling that may run anywhere. Bound lazily: the syscall helpers raise if
-# libc is actually needed and unavailable, which is the point where a caller
-# genuinely needs a kernel.
 _libc = None
 
 
@@ -206,7 +85,7 @@ def _get_libc():
     if _libc is None:
         _libc = ct.CDLL("libc.so.6", use_errno=True)
     return _libc
-_BPF_SYSCALL_NR          = 321   # x86_64
+_BPF_SYSCALL_NR          = 321
 _BPF_MAP_UPDATE_ELEM     = 2
 _BPF_MAP_LOOKUP_ELEM     = 1
 _BPF_OBJ_GET_INFO_BY_FD  = 15
@@ -214,10 +93,7 @@ _BPF_ANY                 = 0
 
 
 class _BpfAttrMapElem(ct.Structure):
-    """
-    union bpf_attr for BPF_MAP_UPDATE/LOOKUP_ELEM.
-    Kernel layout: u32 map_fd + 4-byte pad + u64 key + u64 value + u64 flags.
-    """
+    """union bpf_attr for BPF_MAP_UPDATE/LOOKUP_ELEM."""
     _fields_ = [
         ("map_fd",  ct.c_uint32),
         ("_pad",    ct.c_uint32),
@@ -246,7 +122,7 @@ class _BpfAttrObjInfo(ct.Structure):
 
 
 def _get_map_value_size(map_fd: int) -> int:
-    """Return kernel-reported value_size for a BPF map fd; fallback 8."""
+    """Return kernel-reported value_size for a BPF map fd;"""
     info = _BpfMapInfo()
     attr = _BpfAttrObjInfo(
         bpf_fd   = map_fd,
@@ -262,8 +138,7 @@ def _get_map_value_size(map_fd: int) -> int:
 
 
 def _bpf_map_read_blk(map_fd: int, value_size: int, index: int = 0) -> bytearray:
-    """Read the whole struct-valued arch_weights entry (key `index`) as bytes.
-    Returns a zeroed buffer if the entry cannot be read (fresh map)."""
+    """Read the whole struct-valued arch_weights entry (key `index`) as bytes."""
     key_buf = ct.c_uint32(index)
     val_buf = (ct.c_uint8 * value_size)()
     attr = _BpfAttrMapElem(
@@ -306,8 +181,6 @@ EBPF_TEMPLATE_ARCH_DISPATCHER = r"""
 #include <uapi/linux/udp.h>
 #include <uapi/linux/in.h>
 
-/* Same fallback ebpf_program.py carries: some minimal-header setups do
- * not get IPPROTO_UDP from the includes above. RFC 791 value. */
 #ifndef IPPROTO_UDP
 #define IPPROTO_UDP 17
 #endif
@@ -334,14 +207,9 @@ struct arch_entry {
     __u8  arch_id;
     __u32 weight_offset;
     __u16 scale_factor;
-    /* n_out is the MODEL's output width, read at runtime. It used to be the
-     * compile-time T2_N_OUT=7, which made both the weight layout and the DROP
-     * condition specific to one model. MAX_N_OUT is the separate L1 ceiling. */
     __u8  n_out;
     __u8  n_h1;   /* fc1 output width  (<= T2_MAX_H1), read at runtime */
     __u8  n_h2;   /* fc2 output width  (<= T2_MAX_H2), read at runtime */
-    /* Which of this model's two class_action_t2 banks is live (see
-     * CLASS_ACT_KEY). Committed together with n_out in this one entry. */
     __u8  sem_bank;
 } __attribute__((packed));
 
@@ -351,17 +219,6 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-/* ---- class semantics: class -> action -> logical port --------------------
- * Filled by the control plane from the model descriptor. The datapath does NOT
- * infer an action from a class index: `best_cls >= 6` used to hardcode both the
- * DROP class AND the assumption that classes map onto interfaces one-to-one.
- * Neither held -- the trained DROP class of the checked-in model is 5, and
- * class 6 was never a training target.
- *
- * Sized to MAX_N_OUT (an L1 compile-time ceiling, NOT the model's n_out):
- * entries at or past the model's n_out stay ACT_INVALID, so a class the
- * datapath should never see yields an explicit "invalid" instead of a zeroed
- * entry that would look like a valid action. */
 #define ACT_INVALID 0
 #define ACT_FORWARD 1
 #define ACT_DROP    2
@@ -392,68 +249,21 @@ void ipa_ttl_dec(struct iphdr *iph) {
     iph->ttl--;
 }
 
-/* arch_weights: the WHOLE weight block in ONE struct-valued entry (key 0),
- * so the datapath reads every weight it needs after a SINGLE
- * bpf_map_lookup_elem instead of one helper call per weight byte. This is the
- * same "N lookups -> 1" transformation already applied to the dense feature
- * vectors (link_state / queue_state, see common.py): all the values live in
- * one map entry anyway, so making the entry a struct turns per-weight helper
- * calls into plain pointer reads, which cost the verifier nothing.
- *
- * Measured before this change: ~139 of P2's 147 map lookups per packet were
- * single-byte weight reads (one lookup + one NULL check per weight).
- *
- * __u8 storage (not 'char'): the value is never a BCC leaf type here -- the
- * control plane writes the block through the raw bpf(2) syscall below -- and
- * the eBPF side re-casts each byte to __s8 via AW_W(), exactly like Pipeline
- * 3's WEIGHT() macro. */
 #define MAX_WEIGHT_ENTRIES 1024
 struct aw_blk { __u8 w[MAX_WEIGHT_ENTRIES]; };
 BPF_ARRAY(arch_weights, struct aw_blk, 1);
 
-/* Read weight `i` out of an already-looked-up block. The AND is what makes the
- * variable index verifier-safe: MAX_WEIGHT_ENTRIES is a power of two, so the
- * masked index is provably within the map value's size and needs no per-access
- * bound check. It never actually wraps -- arch_generic_2layer bound-checks the
- * model's whole block ONCE, up front (see the woff + out_b_off check). */
 #define AW_W(blk, i) ((long long)(__s8)((blk)->w[(__u32)(i) & (MAX_WEIGHT_ENTRIES - 1)]))
 
-/* link_state: 6 egress up/down slots (feature [0..5]), held in ONE struct-valued
- * entry (key 0) so the leaf reads the whole vector with a SINGLE lookup instead
- * of 6. Written by the userspace carrier monitor. 1=up, 0=down. */
-/* COMPILED CEILINGS for the dense per-slot features, not deployment values.
- *
- * These were the literals 6 and 4 -- the Germany50 scenario's interface count and
- * its queue count -- written into the struct sizes AND into every loop bound,
- * so the compiled datapath only fit that one network. The consumption loops
- * are already gated by the descriptor's per-feature `sz`, so widening the
- * compiled bound costs a few unrolled iterations and changes no result: slots
- * past the model's real size are skipped, never summed.
- *
- * A deployment whose n_interfaces / n_queues exceeds these must raise the
- * ceiling and recompile -- the control plane checks and says so, instead of
- * silently reading past the vector. See model_meta.MAX_N_IFACES/MAX_N_QUEUES. */
 #define IPA_MAX_IFACES  8
 #define IPA_MAX_QUEUES  8
 struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 
-/* queue_occupancy feature: n_queues occupancy slots in one struct-valued entry
- * (key 0), seeded by queue_state_monitor.py. Present so a descriptor can use the
- * queue_occupancy feature type; unused if the model's descriptor omits it. */
 struct qs_vec { __u32 v[IPA_MAX_QUEUES]; };
 BPF_ARRAY(queue_state, struct qs_vec, 1);
 
-/* Per-model feature descriptor (model_desc registry): which feature types the
- * model uses, their size and starting column in the fc1 input row. Populated by
- * the control plane from model_meta.resolve_descriptor(); read at runtime by
- * arch_generic_2layer to build the IV generically -> different models use
- * different feature subsets/orders WITHOUT recompiling. */
 #define MAX_FEAT 4
-/* `scale` era `_pad`. E' la normalizzazione con cui il modello e' stato
- * addestrato (ttl/30, ttl/16, ...): una proprieta' del MODELLO, quindi va
- * nel descrittore a runtime e non in un #define. Con 0 si ricade sul
- * default compilato, cosi' i descrittori scritti prima restano validi. */
 struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 scale; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
@@ -465,49 +275,12 @@ BPF_PROG_ARRAY(arch_progs, 8);
  * decision here, no output validation -- just resolve the physical action. */
 /* mac_table_t2 is keyed by LOGICAL PORT, not by class. */
 BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
-/* Kernel ingress ifindex -> LOGICAL PORT (1-based; absent means "not one of
- * this node's ports", which contributes nothing).
- *
- * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
- * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
- * kernel and are arbitrary -- 2 and 3 on a freshly booted machine, 207 and 209 on a box
- * that has created a few veths -- so on real hardware the guard
- * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
- * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at
- * compile time as [2, 3, 4, ...], which is the same assumption spelled
- * differently.
- *
- * Which interface realises which logical port is a NODE fact, discovered at
- * runtime, exactly like mac_table. This is that map, on the ingress side.
- */
 BPF_HASH(ingress_port_t2, __u32, __u32, 64);
-/* This node's index in the node one-hot, a single entry written by the control
- * plane at deploy time.
- *
- * The one-hot used to be indexed by ipa->model_id -- the MODEL identifier from
- * the packet header. That is not a node identity: the same packet carries the
- * same model_id along its whole path, so with one registered model every node
- * fired slot 0 and the feature contributed the same constant everywhere. 52 of
- * the 65 inputs, carrying no information.
- *
- * Which node this is, is a fact of the node, resolved when the node exists --
- * exactly like mac_table and ingress_port.
- *
- * A HASH and not an ARRAY, deliberately: a BPF_ARRAY is pre-allocated and
- * zero-filled, so a lookup always succeeds and "nothing installed" reads back
- * as node 0 -- indistinguishable from a real node 0, which is the very defect
- * this map exists to remove. With a hash, absent means absent.
- */
 BPF_HASH(node_id_t2, __u32, __u32, 1);
 
-/* class_action_t2: (model_id, class) -> {action, logical port}.
- *
- * It used to be indexed by class alone, ONE table for every model_id: two
- * models could not give the same class different meanings, and the control
- * plane had to refuse the second one. The key is now the composite
- * (model_id, bank, class), flattened into an ARRAY index -- no hashing, and
- * the lookup is inlined by the verifier exactly like the class-only one was.
- * O(1) in the number of registered models: nothing iterates over them.
+/* class_action_t2: (model_id, bank, class) -> {action, logical port},
+ * flattened into an ARRAY index: one inlined lookup, O(1) in the number of
+ * registered models, and models with different class meanings coexist.
  *
  * Why an index into a separate map and not a cls[] table inside arch_entry
  * (which the datapath already holds): indexing a map value by best_cls is
@@ -534,14 +307,8 @@ BPF_ARRAY(class_action_t2, struct class_act,
 BPF_PERCPU_ARRAY(pkt_stats_t2, __u64, 3);   /* [0]=HIT [1]=MISS [2]=DROP */
 BPF_PERCPU_ARRAY(cls_stats_t2, __u64, MAX_N_OUT);   /* per-class redirect counter */
 
-/* CTR_INC(): real per-packet map-lookup counter, active only when
- * IPA_COUNT_LOOKUPS is #defined before this source (measurement builds --
- * see common.py instrument_map_lookups()). No-op otherwise. */
 #ifdef IPA_COUNT_LOOKUPS
 BPF_PERCPU_ARRAY(lookup_ctr, __u64, 1);
-/* BCC's rewriter refuses table.lookup() calls that appear textually inside
- * a macro expansion -- must be a real function (static inline), not a
- * #define body. */
 static inline __attribute__((always_inline)) void ctr_inc(void) {
     int _lci = 0;
     __u64 *_lcv = lookup_ctr.lookup(&_lci);
@@ -561,12 +328,6 @@ int ipa_switch_template(struct xdp_md *ctx) {
 
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
-    /* Same FIX(#4) Pipeline 1 already applies (see ebpf_program.py): read the
-     * protocol at its absolute RFC 791 offset (byte 9) instead of ip->protocol,
-     * because struct iphdr's ihl:4/version:4 bitfield can be packed differently
-     * by clang against minimal kernel headers, making every
-     * UDP packet fail the check; and derive the UDP header from the real ihl*4
-     * instead of sizeof(struct iphdr), which is wrong when IP options present. */
     __u8 ip_proto = *((__u8 *)ip + 9);
     if (ip_proto != IPPROTO_UDP)  return XDP_PASS;
 
@@ -589,15 +350,8 @@ int ipa_switch_template(struct xdp_md *ctx) {
 """
 
 _ARCH_LEAF_TEMPLATE = r"""
-/* No T2_N_IN / T2_N_OUT here any more. They were 65 and 7 -- the Germany50
- * feature sum and the reference model's class count -- and neither was read by
- * a single line of this program: the input layout comes from model_desc and
- * n_out from arch_registry, both per-model at runtime. A #define nobody reads
- * is still a claim, and this one claimed the datapath only ever runs one
- * topology's model. The real bounds are the ceilings below. */
 #define T2_MAX_H1    8
 #define T2_MAX_H2    8
-/* Must match model_meta.DEFAULT_TTL_SCALE (the checkpoint's initial_ttl). */
 #define T2_TTL_SCALE 30
 #define MAX_N_IN     128
 #define MAX_FEAT     4
@@ -606,13 +360,6 @@ _ARCH_LEAF_TEMPLATE = r"""
 #define FEAT_TTL         0x03
 #define FEAT_NODE_ID     0x04
 #define FEAT_QUEUE_OCC   0x05
-/* ReLU without a conditional jump. As `(x) > 0 ? (x) : 0` it compiled to one
- * jump per neuron, and the verifier walked each on both sides: 1 hidden
- * layer processed 799 563 instructions, 2 layers 417 292, 3 or more hit the
- * 1 000 000 limit (E2BIG). With this, 120 000-137 000 from 1 to 6 layers
- * (ipa/test/diag_verifier.py). x >> 63 is -1 for a negative x and 0
- * otherwise, so x & ~m is x or 0. The empty asm hides m from clang, which
- * would otherwise recognise smax(x, 0) and emit the jump again. */
 static __always_inline long long ipa_relu(long long x) {
     long long m = x >> 63;
     asm volatile("" : "+r"(m));
@@ -647,9 +394,6 @@ struct arch_entry {
     __u8  arch_id;
     __u32 weight_offset;
     __u16 scale_factor;
-    /* n_out is the MODEL's output width, read at runtime. It used to be the
-     * compile-time T2_N_OUT=7, which made both the weight layout and the DROP
-     * condition specific to one model. MAX_N_OUT is the separate L1 ceiling. */
     __u8  n_out;
     __u8  n_h1;
     __u8  n_h2;
@@ -662,17 +406,6 @@ struct fwd_action {
     __u8  dst_mac[6];
 } __attribute__((packed));
 
-/* ---- class semantics: class -> action -> logical port --------------------
- * Filled by the control plane from the model descriptor. The datapath does NOT
- * infer an action from a class index: `best_cls >= 6` used to hardcode both the
- * DROP class AND the assumption that classes map onto interfaces one-to-one.
- * Neither held -- the trained DROP class of the checked-in model is 5, and
- * class 6 was never a training target.
- *
- * Sized to MAX_N_OUT (an L1 compile-time ceiling, NOT the model's n_out):
- * entries at or past the model's n_out stay ACT_INVALID, so a class the
- * datapath should never see yields an explicit "invalid" instead of a zeroed
- * entry that would look like a valid action. */
 #define ACT_INVALID 0
 #define ACT_FORWARD 1
 #define ACT_DROP    2
@@ -707,69 +440,20 @@ void ipa_ttl_dec(struct iphdr *iph) {
 struct aw_blk { __u8 w[MAX_WEIGHT_ENTRIES]; };
 BPF_ARRAY(arch_weights, struct aw_blk, 1);
 #define AW_W(blk, i) ((long long)(__s8)((blk)->w[(__u32)(i) & (MAX_WEIGHT_ENTRIES - 1)]))
-/* COMPILED CEILINGS for the dense per-slot features, not deployment values.
- *
- * These were the literals 6 and 4 -- the Germany50 scenario's interface count and
- * its queue count -- written into the struct sizes AND into every loop bound,
- * so the compiled datapath only fit that one network. The consumption loops
- * are already gated by the descriptor's per-feature `sz`, so widening the
- * compiled bound costs a few unrolled iterations and changes no result: slots
- * past the model's real size are skipped, never summed.
- *
- * A deployment whose n_interfaces / n_queues exceeds these must raise the
- * ceiling and recompile -- the control plane checks and says so, instead of
- * silently reading past the vector. See model_meta.MAX_N_IFACES/MAX_N_QUEUES. */
 #define IPA_MAX_IFACES  8
 #define IPA_MAX_QUEUES  8
 struct ls_vec { __u32 v[IPA_MAX_IFACES]; };
 BPF_ARRAY(link_state, struct ls_vec, 1);
 struct qs_vec { __u32 v[IPA_MAX_QUEUES]; };
 BPF_ARRAY(queue_state, struct qs_vec, 1);
-/* `scale` era `_pad`. E' la normalizzazione con cui il modello e' stato
- * addestrato (ttl/30, ttl/16, ...): una proprieta' del MODELLO, quindi va
- * nel descrittore a runtime e non in un #define. Con 0 si ricade sul
- * default compilato, cosi' i descrittori scritti prima restano validi. */
 struct feat_ent { __u8 code; __u8 size; __u8 col_off; __u8 scale; };
 struct model_desc { __u8 n_feat; __u8 n_in; __u8 _p0; __u8 _p1; struct feat_ent feats[MAX_FEAT]; };
-
 
 BPF_HASH(model_desc, __u8, struct model_desc, 256);
 BPF_HASH(arch_registry, __u8, struct arch_entry, 256);
 /* mac_table_t2 is keyed by LOGICAL PORT, not by class. */
 BPF_ARRAY(mac_table_t2, struct fwd_action, MAX_N_OUT);
-/* Kernel ingress ifindex -> LOGICAL PORT (1-based; absent means "not one of
- * this node's ports", which contributes nothing).
- *
- * The ingress_iface one-hot used to be indexed by ctx->ingress_ifindex
- * DIRECTLY, i.e. by a kernel ifindex. Kernel ifindexes are allocated by the
- * kernel and are arbitrary -- 2 and 3 on a freshly booted machine, 207 and 209 on a box
- * that has created a few veths -- so on real hardware the guard
- * (_raw_iface >= 1 && _raw_iface <= n_interfaces) is false and the trained
- * feature contributes NOTHING. Pipeline 1 had a table for this but baked it at
- * compile time as [2, 3, 4, ...], which is the same assumption spelled
- * differently.
- *
- * Which interface realises which logical port is a NODE fact, discovered at
- * runtime, exactly like mac_table. This is that map, on the ingress side.
- */
 BPF_HASH(ingress_port_t2, __u32, __u32, 64);
-/* This node's index in the node one-hot, a single entry written by the control
- * plane at deploy time.
- *
- * The one-hot used to be indexed by ipa->model_id -- the MODEL identifier from
- * the packet header. That is not a node identity: the same packet carries the
- * same model_id along its whole path, so with one registered model every node
- * fired slot 0 and the feature contributed the same constant everywhere. 52 of
- * the 65 inputs, carrying no information.
- *
- * Which node this is, is a fact of the node, resolved when the node exists --
- * exactly like mac_table and ingress_port.
- *
- * A HASH and not an ARRAY, deliberately: a BPF_ARRAY is pre-allocated and
- * zero-filled, so a lookup always succeeds and "nothing installed" reads back
- * as node 0 -- indistinguishable from a real node 0, which is the very defect
- * this map exists to remove. With a hash, absent means absent.
- */
 BPF_HASH(node_id_t2, __u32, __u32, 1);
 
 /* Same (model_id, bank, class) map as in the dispatcher source. */
@@ -797,20 +481,6 @@ static inline __attribute__((always_inline)) void ctr_inc(void) {
 
 #ifndef IPA_DIV_TRUNC_DEFINED
 #define IPA_DIV_TRUNC_DEFINED
-/* Divisione con TRONCAMENTO VERSO LO ZERO e divisore a runtime.
- *
- * BPF non ha la divisione con segno: clang si ferma con "unsupported signed
- * division, please convert to unsigned div/mod". Finche' il divisore era un
- * #define il compilatore lo trasformava in uno shift e il problema non
- * esisteva; da quando la scala viene dal descrittore il divisore e' una
- * variabile, e la divisione va fatta a mano.
- *
- * Il numeratore E' con segno -- i pesi possono essere negativi -- mentre il
- * divisore e' sempre positivo. Si divide quindi il valore assoluto senza
- * segno e si rimette il segno. Il troncamento verso lo zero non e' un
- * dettaglio: e' esattamente cio' che fa `trunc_div` nel riferimento Python, e
- * le due implementazioni coincidono sui negativi solo se arrotondano allo
- * stesso modo. */
 static __always_inline long long ipa_div_trunc(long long num, __u64 den)
 {
     if (den == 0) den = 1;
@@ -828,7 +498,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end)  return XDP_PASS;
-    /* FIX(#4), same as the dispatcher above: byte-9 protocol read + ihl*4. */
     __u8 ip_proto = *((__u8 *)ip + 9);
     if (ip_proto != IPPROTO_UDP)   return XDP_PASS;
     __u32 _ip_hlen = (((__u8 *)ip)[0] & 0x0fU) << 2U;
@@ -842,19 +511,11 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     struct arch_entry *entry = arch_registry.lookup(&model_id);
     if (!entry) return XDP_PASS;
 
-    /* First row of THIS model's live class_action_t2 bank, taken now so a
-     * single scalar -- not the entry pointer plus model_id -- stays live
-     * until the argmax (measured: +157 instructions the other way). */
     __u32 sem_key0 = CLASS_ACT_KEY(model_id, entry->sem_bank, 0);
     __u32 woff  = entry->weight_offset;
     __u16 scale = entry->scale_factor;
     if (scale == 0) return XDP_PASS;
 
-    /* Hidden widths for THIS model, read at runtime. The neuron loops below
-     * are unrolled to the compiled ceilings T2_MAX_H1/T2_MAX_H2 (verifier
-     * needs a compile-time trip count) but skip/zero any neuron past the
-     * model's actual width -- same program serves any n_h1<=T2_MAX_H1,
-     * n_h2<=T2_MAX_H2 without recompiling. */
     /* Bias multipliers. The weights are stored as round(w_float * scale), so
      * after L layers of products the accumulator carries scale**L while a bias
      * stored the same way carries only scale**1. Each layer's bias therefore
@@ -865,9 +526,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
      * long long, not u32: scale**2 with a 16-bit scale would overflow. */
     long long bias_mul_1 = 1LL;
     long long bias_mul_2 = (long long)scale;
-    /* Layer L's products carry scale**L while a bias stored the same way
-     * carries scale**1, so layer L's bias needs scale**L. The output layer is
-     * layer n_hidden, hence scale to the power of the COMPILED depth. */
     long long bias_mul_3 = /*@BIAS_OUT@*/(long long)scale * (long long)scale;
 
     __u32 n_h1 = entry->n_h1;
@@ -876,74 +534,38 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     __u32 n_out = entry->n_out;
     if (n_out == 0 || n_out > MAX_N_OUT) return XDP_PASS;
 
-    /* Per-model feature descriptor: which feature types the model uses, their
-     * size and starting column in the fc1 input row. n_in (= sum of feature
-     * sizes) is read here and drives the flat weight layout below -> the IV is
-     * built GENERICALLY from the descriptor instead of the old hardcoded
-     * 65-feature layout. Populated by the CP via model_meta.resolve_descriptor. */
     struct model_desc *desc = model_desc.lookup(&model_id);
     if (!desc) return XDP_PASS;
     __u32 n_in = desc->n_in;
     if (n_in == 0 || n_in > MAX_N_IN) return XDP_PASS;
 
-    /* Flat weight layout offsets (relative to woff), sized for THIS model's
-     * n_in + hidden widths -- mirrors arch_weight_count() on the Python side. */
     __u32 fc1_w_off = 0;
     __u32 fc1_b_off = n_in * n_h1;
     __u32 fc2_w_off = fc1_b_off + n_h1;
     __u32 fc2_b_off = fc2_w_off + n_h1 * n_h2;
-    /* out_w_off skips the EXTRA hidden layers (if this leaf was built with
-     * any): each is n_h2 -> n_h2, so weights + bias = n_h2*n_h2 + n_h2. With
-     * no extra layers the term is zero and this is the original expression. */
     __u32 out_w_off = /*@OUT_W_OFF@*/fc2_b_off + n_h2 + 0;
     __u32 out_b_off = out_w_off + n_h2 * n_out;
 
-    /* ONE bound check for this model's whole weight block, replacing the ~139
-     * per-weight `if (idx >= MAX_WEIGHT_ENTRIES) return XDP_PASS` checks that
-     * used to guard every single weight read. out_b_off + n_out is the
-     * highest index the loops below can reach (the fc2/out inner loops run to
-     * the compiled ceiling with a smaller runtime stride, but those overshoots
-     * stay inside the block and are multiplied by a zeroed activation). */
     if (woff + out_b_off + n_out > MAX_WEIGHT_ENTRIES) return XDP_PASS;
 
-    /* Whole weight block in ONE lookup -- every AW_W() below is a plain
-     * pointer read, not a helper call. */
     int _awz = 0;
     struct aw_blk *AW = arch_weights.lookup(&_awz);
     if (!AW) return XDP_PASS;
 
     __u32 _ttl       = ((__u32)ip->ttl) & 0xff;
-    /* Kernel ifindex -> logical port, 1-based. Not the raw ifindex: see
-     * the ingress_port_t2 declaration. 0 when this node has no logical port
-     * on the interface the packet arrived on, which the feature guard below
-     * reads as "no ingress-port bit set". */
     __u32 _raw_iface = 0;
     { __u32 _kif = ctx->ingress_ifindex;
       __u32 *_lp = ingress_port_t2.lookup(&_kif);
       if (_lp) _raw_iface = *_lp; }
-    /* The NODE's own index, not the packet's model_id -- see node_id_t2.
-     * Bounded to a byte on purpose: this used to come from a __u8, and the
-     * verifier needs that bound to reason about the weight column `coff +
-     * _node` inside the unrolled feature loop. 256 is the "unknown" sentinel
-     * -- outside any
-     * valid index, so no bit is set. An index above 255 is refused by the
-     * control plane rather than truncated here. */
     __u32 _node = 0x100U;
     { __u32 _nz = 0; __u32 *_nid = node_id_t2.lookup(&_nz);
       if (_nid && *_nid <= 0xffU) _node = *_nid; }
 
-    /* dense feature vectors, each read once with a SINGLE lookup, reused across
-     * neurons. Sized to the COMPILED CEILINGS, gated per-feature by the
-     * descriptor's size below; the
-     * descriptor's per-feature size gates how many slots actually contribute. */
     long long ls[IPA_MAX_IFACES];
     { int lsz = 0; struct ls_vec *lsp = link_state.lookup(&lsz);
       #pragma unroll
       for (int i = 0; i < IPA_MAX_IFACES; i++)
           ls[i] = lsp ? (long long)(lsp->v[i]) : 0LL; }
-    /* queue_state is only read if the model's descriptor actually declares the
-     * queue_occupancy feature. The default descriptor does not, so this saves
-     * an unconditional lookup on the common path. */
     long long qs[IPA_MAX_QUEUES];
     #pragma unroll
     for (int i = 0; i < IPA_MAX_QUEUES; i++) qs[i] = 0LL;
@@ -961,30 +583,10 @@ int arch_generic_2layer(struct xdp_md *ctx) {
 
     long long h1[T2_MAX_H1];
 
-    /* Feature loop OUTSIDE, neuron loop INSIDE -- the inverse of the obvious
-     * nest, and the same rewrite layer_first in ebpf_modular.py carries. See
-     * the long comment there for the reasoning; in short: a descriptor entry's
-     * code/size/col_off do not depend on the neuron, so with the neuron loop
-     * outside the five-way dispatch on `code` ran T2_MAX_H1 * MAX_FEAT = 32
-     * times per packet and each dense-vector gate 8 * 8 = 64 times, all to
-     * re-derive the same answer. Inverted: 4 dispatches, 8 gates, and inner
-     * neuron loops that are straight-line multiply-accumulate.
-     *
-     * Same terms, same values, different summation order -- and int64 addition
-     * in two's complement is associative and commutative, so each accumulator
-     * ends bit-identical. h1[] becomes the accumulator; it was already live
-     * across the loop, so no state is added. */
     #pragma unroll
     for (int j = 0; j < T2_MAX_H1; j++)
         h1[j] = AW_W(AW, woff + fc1_b_off + j) * bias_mul_1;
 
-    /* Deliberately NOT gated on `j < n_h1` here: neurons past the model's
-     * width are computed and discarded, and zeroed below before anything
-     * reads them. AW_W masks every index into the compiled array, so a weight
-     * row past this model's block is an in-bounds read of another model's
-     * bytes -- meaningless, never observed. Gating instead would put 8
-     * branches in the TTL arm and 64 in the link_state arm, which is the cost
-     * this rewrite removes. */
     #pragma unroll
     for (int f = 0; f < MAX_FEAT; f++) {
         if (f >= desc->n_feat) continue;
@@ -992,14 +594,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         __u32 sz   = desc->feats[f].size;
         __u32 coff = desc->feats[f].col_off;
         if (code == FEAT_TTL) {
-            /* Divided by the training scale: the model was trained on
-             * ttl/initial_ttl in (0,1], not on the raw hop count. See
-             * model_meta.DEFAULT_TTL_SCALE. The PRODUCT is divided --
-             * dividing _ttl itself would collapse it to 0 or 1. */
-            /* La scala viene dal descrittore. Lo zero vuol dire "non
-             * dichiarata" e ricade sul default compilato; il ternario e' anche
-             * cio' che rende ovvia al verificatore l'impossibilita' di una
-             * divisione per zero. */
             __u64 _sc = desc->feats[f].scale ? desc->feats[f].scale
                                               : T2_TTL_SCALE;
             #pragma unroll
@@ -1011,10 +605,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
             for (int i = 0; i < IPA_MAX_IFACES; i++) {
                 if ((__u32)i >= sz) continue;
                 long long x = ls[i];
-                /* The zero skip is kept -- it was `&& ls[i]` before -- but it
-                 * now runs once per interface instead of once per
-                 * (interface, neuron) pair. Adding zero is a no-op either
-                 * way, so skipping or not cannot change the result. */
                 if (!x) continue;
                 #pragma unroll
                 for (int j = 0; j < T2_MAX_H1; j++)
@@ -1031,8 +621,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
                     h1[j] += x * AW_W(AW, woff + fc1_w_off + j * n_in + coff + i);
             }
         } else if (code == FEAT_INGRESS_IF) {
-            /* One-hot: one column, the same for every neuron, so the bound
-             * check happens once rather than once per neuron. */
             if (_raw_iface >= 1 && _raw_iface <= sz) {
                 __u32 c = coff + (_raw_iface - 1);
                 #pragma unroll
@@ -1049,30 +637,14 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         }
     }
 
-    /* ReLU over the real neurons, zero over the rest. The zeroing is not
-     * cosmetic: the fc2 loop below unrolls to T2_MAX_H1 with NO n_h1 gate and
-     * relies on h1[i] == 0 past the model's width. */
     #pragma unroll
     for (int j = 0; j < T2_MAX_H1; j++)
         h1[j] = (j < n_h1) ? ipa_relu(h1[j]) : 0LL;
 
 /*@FC2_BLOCK@*/
 /*@EXTRA_LAYERS@*/
-    /* Same trick: h2[i]==0 for i>=n_h2, so the output loop is always
-     * unrolled to T2_MAX_H2 regardless of this model's actual n_h2. */
-    /* Sentinel must be LOWER than any reachable logit, otherwise a model whose
-     * output logits are ALL below it never updates best_cls and silently
-     * argmaxes to class 0. That is reachable here: h1/h2 are unbounded int64
-     * ReLU accumulations (ttl up to 255 x int8 weights, then two more int8
-     * layers), so |logit| can reach ~1e9 -- far past the old -9999999 (-1e7)
-     * sentinel. It also has to match the Python reference argmax in
-     * verify_prog_run.ref_infer*, which uses a true minimum. LLONG_MIN written
-     * as (-MAX - 1) so the literal itself stays in range. */
     long long best_val = -9223372036854775807LL - 1LL;
     int best_cls = 0;
-    /* Unrolled to the L1 ceiling because the verifier needs a constant trip
-     * count; classes past the model's n_out are skipped. Same shape P3 already
-     * used for its layer widths. */
     #pragma unroll
     for (int k = 0; k < MAX_N_OUT; k++) {
         if ((__u32)k >= n_out) continue;
@@ -1084,10 +656,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         if (acc > best_val) { best_val = acc; best_cls = k; }
     }
 
-    /* (model_id, class) -> action -> logical port, from THIS model's live
-     * bank of class_action_t2 (sem_bank comes from the arch_registry entry
-     * already looked up above). No index arithmetic decides what a class
-     * means, and no other model's rows are reachable from here. */
     if (best_cls < 0 || (__u32)best_cls >= n_out) {
         int mi = 1; __u64 *mv = pkt_stats_t2.lookup(&mi);
         if (mv) *mv += 1;
@@ -1104,9 +672,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
     if (ca->action == ACT_DROP) {
         int di = 2; __u64 *dv = pkt_stats_t2.lookup(&di);
         if (dv) *dv += 1;
-        /* The class was decided; record it. Without this a DROP is visible
-         * only as a pkt_stats counter, and "the model chose the DROP class"
-         * cannot be told apart from "the program never reached argmax". */
         __u64 *dcv = cls_stats_t2.lookup(&_ci);
         if (dcv) *dcv += 1;
         return XDP_DROP;
@@ -1119,17 +684,9 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    /* mac_table_t2 is keyed by LOGICAL PORT: the node decides which interface
-     * realises the port the model asked for. cls_stats_t2 below is keyed by
-     * CLASS. Two index spaces, two variables -- they were one variable named
-     * `cls` holding the port, so the per-class counter was written at a port
-     * index and only looked right because the reference model numbers its
-     * ports the same as its forwarding classes. */
     __u32 port = (__u32)ca->port;
     struct fwd_action *action = mac_table_t2.lookup(&port);
     if (action != NULL && action->ifindex != 0) {
-        /* A hop must not forward a packet whose TTL would reach 0. See the
-         * ipa_ttl_dec() comment: counted as MISS and passed to the kernel. */
         if (ip->ttl <= 1) {
             int ti = 1; __u64 *tv = pkt_stats_t2.lookup(&ti);
             if (tv) *tv += 1;
@@ -1144,7 +701,6 @@ int arch_generic_2layer(struct xdp_md *ctx) {
         __builtin_memcpy(eth->h_dest,   action->dst_mac, 6);
         return bpf_redirect(action->ifindex, 0);
     }
-    /* no mac_table entry for that LOGICAL PORT (link down / not provisioned) */
     int si = 1; __u64 *v = pkt_stats_t2.lookup(&si);
     if (v) *v += 1;
     return XDP_PASS;
@@ -1152,39 +708,9 @@ int arch_generic_2layer(struct xdp_md *ctx) {
 """
 
 
-# ---------------------------------------------------------------------------
-# Compiled depth: how many hidden layers this leaf can run
-# ---------------------------------------------------------------------------
-# P2's genericity is a set of COMPILE-TIME envelopes -- T2_MAX_H1, T2_MAX_H2,
-# MAX_N_IN, MAX_N_OUT -- inside which any model runs with no recompilation.
-# Depth used to be the one dimension that was not an envelope but a constant:
-# the source wrote fc1 and fc2 and stopped, so a 3-hidden-layer model had
-# nowhere to go.
-#
-# build_arch_leaf(n_hidden) makes depth an envelope like the others. It emits
-# (n_hidden - 2) additional dense blocks after fc2, each n_h2 -> n_h2.
-#
-# Two honest limits, both different from P3's:
-#
-#   1. The extra layers are all n_h2 wide. fc1 and fc2 keep independent widths
-#      (n_h1, n_h2) exactly as before, so every existing model -- including the
-#      65-6-5-7 in verify_multi_model -- is unaffected. A model whose layers
-#      have different widths beyond the second does not fit.
-#   2. A leaf built for n_hidden runs models of EXACTLY that depth. Changing
-#      depth means recompiling, which is precisely what P3 does not need. That
-#      is the trade-off the depth axis of bench_scaling.py measures: P2 buys
-#      depth with a recompile and with instructions paid on every packet,
-#      P3 buys it with a tail call.
-#
-# n_hidden=2 reproduces the previous source exactly: the extra-span term is 0,
-# the bias multiplier is scale**2, and no block is inserted.
+# --- Compiled depth: how many hidden layers this leaf can run ---
 T2_MIN_HIDDEN = 1
-
-# The fc1 -> fc2 block, lifted out of the template so a 1-hidden-layer leaf can
-# leave it out. Unchanged from what the source always said.
-_FC2_BLOCK = """    /* h1[i]==0 for i>=n_h1 (set above), so the inner loop can always unroll
-     * to T2_MAX_H1: out-of-range weight reads still get multiplied by 0. */
-    long long h2[T2_MAX_H2];
+_FC2_BLOCK = """    long long h2[T2_MAX_H2];
     #pragma unroll
     for (int j = 0; j < T2_MAX_H2; j++) {
         if (j >= n_h2) { h2[j] = 0LL; continue; }
@@ -1202,7 +728,7 @@ _FC2_BLOCK = """    /* h1[i]==0 for i>=n_h1 (set above), so the inner loop can a
 
 def build_arch_leaf(n_hidden: int = 2) -> str:
     """The arch_generic_2layer leaf source, compiled for `n_hidden` hidden
-    layers. See the comment above for what that does and does not buy."""
+    layers."""
     if n_hidden < T2_MIN_HIDDEN:
         raise ValueError(
             f"build_arch_leaf: n_hidden={n_hidden}, but a leaf needs at least "
@@ -1239,16 +765,6 @@ def build_arch_leaf(n_hidden: int = 2) -> str:
     }}""")
 
     if n_hidden == 1:
-        # One hidden layer: fc1 feeds the output directly. Rather than
-        # templating the output loop -- which reads h2 with stride n_h2 -- fc2
-        # becomes a COPY of h1 into h2 and the control plane registers
-        # n_h2 = n_h1. The output loop then reads the right values with the
-        # right stride, unchanged. No fc2 weights exist, so out_w_off skips
-        # straight past fc1's bias row.
-        #
-        # The copy costs T2_MAX_H2 moves per packet, which is the price of not
-        # having a second variant of the output layer to keep in step with the
-        # first. load_arch_weights enforces the n_h2 == n_h1 half of this.
         fc2_block = """    /* n_hidden == 1: no fc2. h1 is carried into h2 unchanged so the output
      * layer below -- which reads h2 with stride n_h2, and n_h2 == n_h1 for a
      * 1-hidden-layer model -- needs no special case. */
@@ -1270,11 +786,7 @@ def build_arch_leaf(n_hidden: int = 2) -> str:
     return src
 
 
-# The historical name, kept so every existing caller is untouched. It is the
-# 2-hidden-layer leaf, which is byte-for-byte what the source said before
-# depth became a parameter.
 EBPF_ARCH_GENERIC_2LAYER = build_arch_leaf(2)
-
 
 
 def load_arch_weights(bpf_obj, weights_int8: list,
@@ -1283,33 +795,7 @@ def load_arch_weights(bpf_obj, weights_int8: list,
                       n_h1: int = 4, n_h2: int = 4,
                       features: list = None, n_in: int = None,
                       semantics=None, n_hidden: int = 2) -> None:
-    """
-    Populate arch_weights and arch_registry for Pipeline 2.
-
-    n_h1/n_h2 are THIS model's hidden widths (input width from the
-    descriptor and
-    output width n_out is read from the descriptor). They must
-    fit under the compiled ceilings T2_MAX_H1/T2_MAX_H2 -- raises ValueError
-    otherwise rather than silently truncating. Any model with hidden widths
-    within the ceiling runs on the same compiled arch_generic_2layer program;
-    no recompilation needed to change n_h1/n_h2 between models.
-
-    weight_offset lets the caller register several model_id entries in the
-    same arch_weights array without overlapping their weight blocks: call
-    this once per model_id with a distinct, non-overlapping weight_offset
-    (e.g. the running sum of arch_weight_count(n_h1, n_h2) for models already
-    registered -- their sizes may differ). All entries share the same arch_id
-    (arch_generic_2layer is the only compiled shape), so the dispatcher
-    resolves model_id -> (weight_offset, n_h1, n_h2) via arch_registry and
-    tail-calls the same leaf program.
-
-    DOES NOT touch arch_progs.  The caller (setup_template in
-    verify_prog_run.py) is responsible for wiring the tail-call array:
-        leaf_fn = b.load_func("arch_generic_2layer", BPF.XDP)
-        b["arch_progs"][ct.c_int(arch_id)] = ct.c_int(leaf_fn.fd)
-    BCC does not expose loaded programs via bpf_obj[name] -- only maps
-    are accessible that way -- so the fd must come from .load_func().
-    """
+    """Populate arch_weights and arch_registry for Pipeline 2."""
     from ctypes import c_uint8, c_uint32, c_uint16, Structure
 
     if n_h1 <= 0 or n_h1 > T2_MAX_H1 or n_h2 <= 0 or n_h2 > T2_MAX_H2:
@@ -1318,9 +804,6 @@ def load_arch_weights(bpf_obj, weights_int8: list,
             f"T2_MAX_H1={T2_MAX_H1}/T2_MAX_H2={T2_MAX_H2} -- raise the "
             f"ceiling in ebpf_template_arch.py and reload to support it")
 
-    # Resolve the feature descriptor (default 65-feature layout unless a custom
-    # one is passed). n_in drives both the flat weight-block size here and the
-    # runtime IV width read from model_desc -> they stay consistent.
     if features is None:
         from model_meta import derive_shape, DEFAULT_META, load_topology_config
         _sh = derive_shape(dict(DEFAULT_META), topology_config=load_topology_config())
@@ -1329,28 +812,12 @@ def load_arch_weights(bpf_obj, weights_int8: list,
     elif n_in is None:
         n_in = sum(f["size"] for f in features)
 
-    # Class semantics. Required, not derived: inferring DROP as n_out-1 is the
-    # assumption this parameter exists to remove. With no argument the shared
-    # resolver reads the descriptor and announces any fallback.
-    #
-    # The semantics ARE this model's output width. This used to be checked
-    # against reference_widths()[1] -- the configured checkpoint's n_out, 7 --
-    # so P2 refused every model with another class count although the datapath
-    # reads n_out from arch_registry and only bounds it by MAX_N_OUT
-    # (semantics.validate() enforces the same ceiling here). P3 never had the
-    # restriction; the two are now alike.
     if semantics is None:
         from model_meta import descriptor_semantics_or_reference
         semantics = descriptor_semantics_or_reference(reference_widths()[1],
                                                      "Pipeline2")
     semantics.validate()
 
-    # n_hidden MUST match the depth the leaf was compiled for: the datapath
-    # reads a fixed number of blocks out of this flat vector, so a mismatch
-    # does not fail, it silently reads the wrong bytes as weights. There is no
-    # runtime field to check it against -- arch_entry carries widths, not
-    # depth -- so the caller is responsible for passing the same number it
-    # passed to build_arch_leaf().
     if n_hidden == 1 and n_h2 != n_h1:
         raise ValueError(
             f"n_hidden=1 leaves P2 with one hidden layer, and the datapath "
@@ -1374,26 +841,18 @@ def load_arch_weights(bpf_obj, weights_int8: list,
             f"n_h1={n_h1}/n_h2={n_h2} needs {n_weights} weights, "
             f"got only {len(weights_int8)}")
 
-    # arch_weights is ONE struct-valued entry holding the whole 1024-byte weight
-    # block (see the aw_blk declaration in the eBPF source). Registering a model
-    # is therefore a read-modify-write of that single entry -- ONE update syscall
-    # instead of one per weight (was 319 for the 65-4-4-7 model). Read-modify
-    # matters: several model_id's share the block at different weight_offsets,
-    # so writing a fresh buffer would wipe the models registered before this one.
     value_size = _get_map_value_size(map_fd)
-    print(f"[Pipeline2] arch_weights fd={map_fd} block={value_size} bytes")
 
     blk = _bpf_map_read_blk(map_fd, value_size)
     for idx, w in enumerate(weights_int8[:n_weights]):
         blk[weight_offset + idx] = int(w) & 0xFF
     _bpf_map_write_blk(map_fd, blk)
 
-    # Post-load sanity check: read the block back and check weight[0] of this
-    # model's slice survived the round trip.
     v0       = ct.c_int8(_bpf_map_read_blk(map_fd, value_size)[weight_offset]).value
     expected = ct.c_int8(int(weights_int8[0])).value
     ok       = "OK" if v0 == expected else f"MISMATCH got={v0} expected={expected}"
-    print(f"[Pipeline2] arch_weights[{weight_offset}] verify: {ok}")
+    if ok != "OK":
+        print(f"[P2] weights written wrongly: {ok}")
 
     class ArchEntry(Structure):
         _pack_ = 1
@@ -1405,53 +864,26 @@ def load_arch_weights(bpf_obj, weights_int8: list,
                     ("n_h2",           c_uint8),
                     ("sem_bank",       c_uint8)]
 
-    # The per-model feature descriptor BEFORE the registry: the registry
-    # update below is the commit, the one write that makes this model_id
-    # visible to packets, so everything the datapath reads for it must already
-    # be in place. (It used to be written after the commit, which left a
-    # window in which a packet could find the new registry entry with the old,
-    # or an empty, descriptor.)
     load_model_desc(bpf_obj, features, n_in, model_id=model_id)
 
-    # This model's semantics go into its INACTIVE bank first; the registry
-    # update below is the commit: it installs n_out and flips sem_bank in one
-    # BPF_MAP_UPDATE_ELEM. No other model_id's rows are touched.
     bank = load_class_action(bpf_obj, "class_action_t2", "arch_registry",
                              model_id, semantics)
     entry = ArchEntry(arch_id=arch_id, weight_offset=weight_offset,
                       scale_factor=scale, n_out=semantics.n_out,
                       n_h1=n_h1, n_h2=n_h2, sem_bank=bank)
     bpf_obj["arch_registry"][c_uint8(model_id)] = entry
-    print(f"[Pipeline2] arch_registry[{model_id}] = "
-          f"arch_id={arch_id} woff={weight_offset} scale={scale} "
-          f"shape={n_in}-{n_h1}-{n_h2}-{semantics.n_out} weights={n_weights}")
-    print("[Pipeline2] NOTE: arch_progs wiring is caller's responsibility "
-          "(setup_template already does: b['arch_progs'][0]=leaf_fn.fd)")
+    print(f"[P2] model {model_id} registered: shape "
+          f"{n_in}-{n_h1}-{n_h2}-{semantics.n_out}, {n_weights} weights from "
+          f"{weight_offset}, scale {scale}")
 
 
-# Max features per descriptor -- must match MAX_FEAT in the eBPF source.
 T2_MAX_FEAT = 4
 
 
 def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> None:
-    """
-    Populate model_desc[model_id] so arch_generic_2layer builds the input vector
-    GENERICALLY from a per-model descriptor (instead of the old hardcoded
-    65-feature layout). Call once per registered model_id, alongside
-    load_arch_weights().
-
-    features: resolved descriptor (list of {"type","size"}, from
-              model_meta.derive_shape) -- feature types + topology sizes, in the
-              exact order the model was trained on. Its flat (code,size,col_off)
-              form comes from model_meta.resolve_descriptor(); col_off is the
-              feature's starting column in the fc1 input row, so the runtime IV
-              matches the trained weight layout.
-    n_in:     sum of feature sizes (fc1 input width).
-
-    With the default descriptor [link_state, ingress_iface, ttl, node] / n_in=65
-    the registry reproduces the historical layout (link_state cols 0-5, iface
-    6-11, ttl 12, node 13-64) -> byte-compatible with the old fixed program.
-    """
+    """Populate model_desc[model_id] so arch_generic_2layer builds the input
+    vector GENERICALLY from a per-model descriptor (instead of the old
+    hardcoded 65-feature layout)."""
     from ctypes import c_uint8, Structure
     from model_meta import resolve_descriptor
 
@@ -1460,7 +892,7 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
         raise ValueError(
             f"descriptor has {len(ents)} features, exceeds MAX_FEAT={T2_MAX_FEAT} "
             f"(raise MAX_FEAT in ebpf_template_arch.py and reload to support it)")
-    if n_in > 128:  # MAX_N_IN in the eBPF source
+    if n_in > 128:
         raise ValueError(f"n_in={n_in} exceeds MAX_N_IN=128")
 
     class FeatEnt(Structure):
@@ -1474,10 +906,6 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
                     ("_p0", c_uint8), ("_p1", c_uint8),
                     ("feats", FeatEnt * T2_MAX_FEAT)]
 
-    # feat_ent.scale is ONE byte. It used to be written as min(255, scale):
-    # a model trained on ttl/300 would have run with ttl/255, silently. 0 is
-    # kept -- it means "not declared" and the datapath falls back to its
-    # compiled default -- anything else outside the byte is refused.
     for e in ents:
         sc = int(e.get("scale", 0) or 0)
         if not 0 <= sc <= 255:
@@ -1492,13 +920,8 @@ def load_model_desc(bpf_obj, features: list, n_in: int, model_id: int = 0) -> No
                              col_off=e["col_off"],
                              scale=int(e.get("scale", 0) or 0))
     bpf_obj["model_desc"][c_uint8(model_id)] = d
-    print(f"[Pipeline2] model_desc[{model_id}] = n_feat={len(ents)} n_in={n_in} "
-          f"feats={[(e['code'], e['size'], e['col_off'], e.get('scale'))
-                    for e in ents]}")
 
 
-# Must match CLASS_ACT_BANKS / CLASS_ACT_MODELS / CLASS_ACT_KEY in the eBPF
-# sources (P2 and P3 share the layout).
 CLASS_ACT_BANKS = 2
 CLASS_ACT_MODELS = 256
 
@@ -1512,19 +935,7 @@ def class_act_key(model_id: int, bank: int, cls: int) -> int:
 
 def load_class_action(bpf_obj, map_name: str, registry_name: str,
                       model_id: int, semantics) -> int:
-    """Write model_id's class semantics into its inactive class_action bank.
-
-    Shared by P2 (class_action_t2 / arch_registry) and P3 (class_action_t3 /
-    layer_registry) -- the map layout and the ACT_* codes are the same contract
-    in both. Returns the bank the caller must commit as sem_bank in the
-    model's registry entry; until it does, packets keep reading the old bank.
-
-    All MAX_N_OUT rows of the bank are written, those past the model's n_out
-    as ACT_INVALID, so a class the datapath should never produce is rejected
-    explicitly and nothing left by a previous occupant of the bank survives.
-    Only this model_id's rows are written: models with different semantics
-    coexist, each resolved through its own (model_id, class) key.
-    """
+    """Write model_id's class semantics into its inactive class_action bank."""
     from ctypes import c_uint8, c_uint32, Structure
     from class_semantics import MAX_N_OUT
 
@@ -1537,18 +948,16 @@ def load_class_action(bpf_obj, map_name: str, registry_name: str,
         raise ValueError(f"model_id={model_id} outside [0, {CLASS_ACT_MODELS})")
     try:
         live = int(bpf_obj[registry_name][c_uint8(model_id)].sem_bank)
-        bank = (live & 1) ^ 1           # re-registration: the other bank
+        bank = (live & 1) ^ 1
     except KeyError:
-        bank = 0                        # new model_id: no packet reads it yet
+        bank = 0
     tbl = bpf_obj[map_name]
     table = semantics.action_table()
     for cid in range(MAX_N_OUT):
         act, port = table[cid]
         tbl[c_uint32(class_act_key(model_id, bank, cid))] = \
             ClassAct(action=act, port=port, _p0=0, _p1=0)
-    print(f"[class_action] {map_name}[model_id={model_id}, bank={bank}]: "
-          f"n_out={semantics.n_out} drop_class={semantics.drop_class} "
-          f"ports={semantics.logical_ports}")
-    for cid in range(semantics.n_out):
-        print(f"[class_action]   class {cid}: {semantics.classes[cid].describe()}")
+    print(f"     classes of model {model_id}: " + ", ".join(
+        f"{cid} {semantics.classes[cid].describe()}"
+        for cid in range(semantics.n_out)))
     return bank

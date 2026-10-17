@@ -1,29 +1,6 @@
 #!/usr/bin/env python3
-"""
-queue_state_monitor.py  --  seeder for the `queue_occupancy` feature.
-
-`queue_occupancy` is the example of a NEW feature type added to demonstrate
-that the sparse-route feature catalog (model_meta.FEATURE_CATALOG) is
-extensible: a model can declare it in its descriptor and the switch builds
-that slot of the input vector from a dedicated BPF map named `queue_state`
-(index i -> queue i occupancy, an int value the model was trained on),
-exactly like `link_state` but for a different signal.
-
-Unlike link_state (which reads a real kernel signal, /sys/.../carrier), this
-repository has no real per-queue occupancy source, so the values are SYNTHETIC:
-either a fixed seed, a constant, or a slow synthetic sweep. This is enough to
-exercise the datapath end-to-end (the model reads the map, multiplies by its
-compiled-in weights) -- it is not a real telemetry source. In a real
-deployment this module would read actual queue depths (e.g. from tc/qdisc
-stats) and write them here.
-
-Usage (library, started by the deploy scripts when the model's descriptor
-uses queue_occupancy):
-    from queue_state_monitor import init_queue_state, start_monitor_thread
-    init_queue_state(b, size)                 # seed slots at startup
-    stop = start_monitor_thread(b, size)      # background synthetic updates
-    ...
-    stop.set()                                # on shutdown
+"""queue_state_monitor.py -- fills the `queue_state` map read by the
+`queue_occupancy` feature (synthetic values: there is no real queue source).
 """
 
 import random
@@ -40,22 +17,9 @@ def _write_vector(bpf_obj, values) -> None:
     write_vector_map(bpf_obj, QUEUE_STATE_MAP, values)
 
 
-def init_queue_state(bpf_obj, size: int, seed: int = 0) -> list:
-    """Seed the `queue_state` map with `size` synthetic occupancy values.
-    seed=0 -> all zeros (empty queues baseline); otherwise a deterministic
-    pseudo-random vector so runs are reproducible. Returns the values written."""
-    if seed == 0:
-        values = [0] * size
-    else:
-        rng = random.Random(seed)
-        values = [rng.randint(0, 15) for _ in range(size)]
-    _write_vector(bpf_obj, values)
-    return values
-
-
 def update_queue_state(bpf_obj, size: int, t: float) -> list:
     """Write a synthetic occupancy vector (a slow deterministic sweep of `t`),
-    so a running demo shows the feature actually changing. Returns the values."""
+    so a running demo shows the feature actually changing."""
     values = [int(8 + 7 * ((i + t) % 4) / 4.0) for i in range(size)]
     _write_vector(bpf_obj, values)
     return values
@@ -72,8 +36,7 @@ def monitor_loop(bpf_obj, size: int, interval: float = 1.0,
 
 def start_monitor_thread(bpf_obj, size: int, interval: float = 1.0
                          ) -> "threading.Event":
-    """Start monitor_loop in a daemon thread. Returns the stop_event; call
-    stop_event.set() to end the loop."""
+    """Start monitor_loop in a daemon thread."""
     stop_event = threading.Event()
     t = threading.Thread(
         target=monitor_loop,

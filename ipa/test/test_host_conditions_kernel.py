@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
-"""host_conditions sul KERNEL VERO: applica, rilegge dal kernel, misura,
-ripristina, confronta. Serve root; lascia la macchina com'era (e lo verifica).
+"""test_host_conditions_kernel.py -- host_conditions on the real kernel: apply,
+read back, measure, restore, compare. Needs root.
 
-test_host_conditions.py controlla la logica su un /sys finto. Questo controlla
-che il kernel faccia davvero quello che la logica chiede:
-
-  [1] applicare: governor, min = max, stati di idle, uncore, NMI watchdog,
-      IRQ, workqueue riletti da sysfs/procfs dopo la scrittura; AllowedCPUs
-      riletto da systemd; il processo del banco nello scope suo; un processo
-      di user.slice che il kernel lascia girare SOLO sulle CPU del sistema
-  [2] misurare: un ciclo a vuoto pinnato sul DUT, e la frequenza che il DUT
-      ha tenuto davvero, da APERF/MPERF (deve essere quella fissata, +-5%);
-      throttling e SMI nella finestra
-  [3] ripristinare: ogni valore riletto e confrontato con la fotografia presa
-      prima di cominciare
-  [4] un run ucciso con SIGKILL a condizioni applicate: il file di stato
-      resta, e il ripristino da li' riporta la macchina com'era
-  [5] (--bench) bench_bitrate per davvero, un giro corto, e le colonne host_*
-      nel CSV: nessuna finestra disturbata
-
-    sudo python3 ipa/test/test_host_kernel.py
-    sudo python3 ipa/test/test_host_kernel.py --bench     # + pktgen/XDP
+    sudo python3 ipa/test/test_host_conditions_kernel.py [--bench]
 """
 import argparse
 import csv
@@ -53,9 +35,7 @@ def rd(path):
     return HC.read_text(path)
 
 
-# --------------------------------------------------------------------------
-# la fotografia: tutto cio' che il condizionamento puo' toccare
-# --------------------------------------------------------------------------
+# --- the snapshot: everything the conditioning can touch ---
 def snapshot(topo):
     P = HC.Paths()
     s = {}
@@ -82,7 +62,6 @@ def snapshot(topo):
         s[f"unit/{u}"] = v.strip()
     for pid in kthreads():
         comm = rd(f"/proc/{pid}/comm") or ""
-        # irq/*: affinita' effettiva dell'IRQ, la sceglie il kernel
         if not comm.startswith("irq/"):
             s[f"kthread/{pid}/{comm}"] = cpus_allowed(pid)
     return s
@@ -109,15 +88,13 @@ def cpus_allowed(pid):
 
 
 def diff(a, b):
-    # un kthread nato o morto nel frattempo non e' una differenza
     keys = [k for k in set(a) | set(b)
             if not (k.startswith("kthread/") and (k not in a or k not in b))]
     return sorted(k for k in keys if a.get(k) != b.get(k))
 
 
-# --------------------------------------------------------------------------
 def t_apply_measure_restore(topo, roles):
-    print("[1] applicare, e rileggere dal kernel")
+    print("[1] apply, and read back from the kernel")
     before = snapshot(topo)
     host = HC.HostConditioner(topo, roles["dut"], roles["gen"],
                               roles["egress"])
@@ -129,15 +106,15 @@ def t_apply_measure_restore(topo, roles):
                       rd(P.cpu(f"cpu{c}", "cpufreq", "scaling_max_freq")),
                       rd(P.cpu(f"cpu{c}", "cpufreq", "scaling_governor")))
                   for c in bench + host.siblings}
-        check("governor performance e min = max sulle CPU del banco e sui "
-              "fratelli", all(g == "performance" and lo == hi
+        check("performance governor and min = max on the bench CPUs and their "
+              "siblings", all(g == "performance" and lo == hi
                               for lo, hi, g in pinned.values()),
               HC._uniform(pinned))
-        check("nel sysfs min = max = frequenza chiesta",
+        check("in sysfs min = max = requested frequency",
               all(int(pinned[c][1]) == t
                   for c, t in host.requested_khz.items()),
               str(host.requested_khz))
-        check("frequenza misurata all'applicazione su ogni core del banco",
+        check("frequency measured at apply time on every bench core",
               set(host.target_khz) == set(host.requested_khz)
               and host.target_khz != {}, str(host.target_khz))
         deep = [(c, rd(os.path.join(d, "name")))
@@ -146,44 +123,43 @@ def t_apply_measure_restore(topo, roles):
                 if int(rd(os.path.join(d, "latency")) or 0)
                 > int(host.cstate_max_us or 0)
                 and rd(os.path.join(d, "disable")) != "1"]
-        check("stati di idle profondi spenti sulle CPU del banco",
+        check("deep idle states off on the bench CPUs",
               not deep, str(deep))
-        check("NMI watchdog spento", rd("/proc/sys/kernel/nmi_watchdog")
+        check("NMI watchdog off", rd("/proc/sys/kernel/nmi_watchdog")
               == "0")
         hk = set(host.hk)
         cg = rd("/proc/self/cgroup") or ""
-        check("il processo del banco e' in ipa-bench.slice",
+        check("the bench process is in ipa-bench.slice",
               HC.SCOPE_SLICE in cg, cg)
         ok_units = {}
         for u in UNITS:
             _, v, _ = HC.run_cmd(["systemctl", "show", "-p", "AllowedCPUs",
                                   "--value", u])
             ok_units[u] = set(HC.parse_cpu_list(v)) == hk
-        check("AllowedCPUs di init/system/user = CPU del sistema (systemd)",
+        check("AllowedCPUs of init/system/user = system CPUs (systemd)",
               all(ok_units.values()), str(ok_units))
-        # un processo nuovo in user.slice: dove lo lascia girare il kernel?
         r = subprocess.run(
             ["systemd-run", "--quiet", "--wait", "--pipe", "--slice",
              "user.slice", "grep", "Cpus_allowed_list", "/proc/self/status"],
             capture_output=True, text=True)
         allowed = set(HC.parse_cpu_list(r.stdout.split(":", 1)[-1]))
-        check("un processo nuovo di user.slice gira solo sulle CPU del "
-              "sistema", allowed and allowed <= hk,
+        check("a new user.slice process runs only on the system "
+              "CPUs", allowed and allowed <= hk,
               f"{HC.format_cpu_list(allowed)} (rc {r.returncode})")
         moved = [f for f in glob.glob("/proc/irq/*/smp_affinity_list")
                  if set(HC.parse_cpu_list(rd(f) or "")) <= hk]
-        check("IRQ sulle CPU del sistema (quelli spostabili)",
+        check("IRQs on the system CPUs (the movable ones)",
               len(moved) > 0, f"{len(moved)} IRQ")
-        check("workqueue unbound sulle CPU del sistema",
+        check("unbound workqueues on the system CPUs",
               set(HC.parse_cpu_mask(rd(P.sys("devices", "virtual",
                                              "workqueue", "cpumask"))))
               == hk)
 
-        print("[2] misurare: il DUT sotto carico tiene la frequenza fissata?")
+        print("[2] measure: does the loaded DUT hold the fixed frequency?")
         dut = roles["dut"][0]
         mon = HC.HostMonitor(topo, bench, dut=dut,
                              target_khz=host.target_khz)
-        check("MSR leggibili (APERF/MPERF)", mon._fd is not None,
+        check("MSRs readable (APERF/MPERF)", mon._fd is not None,
               mon.msr_note)
         a = mon.mark()
         subprocess.run([sys.executable, "-c",
@@ -194,33 +170,33 @@ def t_apply_measure_restore(topo, roles):
         mon.close()
         tgt = host.target_khz.get(dut)
         req = host.requested_khz.get(dut)
-        check("DUT occupato durante il carico", (cols.get("host_dut_busy_pct")
-                                                 or 0) > 50, str(cols))
+        check("DUT busy during the load", (cols.get("host_dut_busy_pct")
+                                           or 0) > 50, str(cols))
         if tgt:
-            check(f"il DUT tiene la frequenza misurata all'applicazione "
-                  f"({tgt // 1000} MHz, +-5%): e' fissata",
+            check(f"the DUT holds the frequency measured at apply time "
+                  f"({tgt // 1000} MHz, +-5%): it is fixed",
                   cols.get("host_dut_mhz") is not None
                   and abs(cols["host_dut_mhz"] * 1000 - tgt) <= 0.05 * tgt,
-                  f"{cols.get('host_dut_mhz')} MHz misurati ora, "
-                  f"{(req or 0) // 1000} scritti nel sysfs")
-            check("il monitor non segna la finestra come disturbata",
+                  f"{cols.get('host_dut_mhz')} MHz measured now, "
+                  f"{(req or 0) // 1000} written in sysfs")
+            check("the monitor does not mark the window as disturbed",
                   not cols.get("host_disturbed"), str(cols))
-        check("nessun throttling ne' powerclamp nella finestra",
+        check("no throttling nor powerclamp in the window",
               not cols.get("host_throttle_core")
               and not cols.get("host_throttle_pkg")
               and not cols.get("host_powerclamp"), str(cols))
-        print(f"  temperatura {cols.get('host_pkg_temp_c')} C, SMI "
+        print(f"  temperature {cols.get('host_pkg_temp_c')} C, SMI "
               f"{cols.get('host_smi')}")
     finally:
         failed = host.restore()
 
-    print("[3] ripristinare, e rileggere dal kernel")
+    print("[3] restore, and read back from the kernel")
     after = snapshot(topo)
     d = diff(before, after)
-    check("ogni valore com'era prima", not d and not failed,
+    check("every value as it was before", not d and not failed,
           "; ".join(f"{k}: {before.get(k)} -> {after.get(k)}"
                     for k in d[:6]))
-    check("file di stato cancellato", not os.path.exists(HC.Paths().state))
+    check("state file deleted", not os.path.exists(HC.Paths().state))
 
 
 CHILD = r"""
@@ -236,7 +212,7 @@ time.sleep(60)
 
 
 def t_crash(topo, roles):
-    print("[4] un run ucciso con SIGKILL a condizioni applicate")
+    print("[4] a run killed with SIGKILL while conditions are applied")
     before = snapshot(topo)
     src = CHILD % dict(here=HERE, dut=roles["dut"], gen=roles["gen"],
                        egress=roles["egress"])
@@ -253,22 +229,22 @@ def t_crash(topo, roles):
     changed = snapshot(topo) != before
     p.send_signal(signal.SIGKILL)
     p.wait()
-    check("il figlio ha applicato e la macchina e' cambiata",
+    check("the child applied and the machine changed",
           applied and changed)
-    check("dopo SIGKILL il file di stato resta",
+    check("after SIGKILL the state file remains",
           os.path.exists(HC.Paths().state))
     n = HC.recover_stale_state()
     after = snapshot(topo)
     d = diff(before, after)
-    check(f"--restore riporta tutto com'era ({n} impostazioni)", not d,
+    check(f"--restore brings everything back ({n} settings)", not d,
           "; ".join(f"{k}: {before.get(k)} -> {after.get(k)}"
                     for k in d[:6]))
 
 
 def t_bench():
-    print("[5] bench_bitrate per davvero: un giro corto")
+    print("[5] bench_load_curve for real: one short round")
     out = tempfile.mkdtemp(prefix="ipa_bitrate_kernel_")
-    cmd = [sys.executable, os.path.join(HERE, "bench_bitrate.py"),
+    cmd = [sys.executable, os.path.join(HERE, "bench_load_curve.py"),
            "--method", "rxonly,baseline,template", "--rounds", "1",
            "--overhead-reps", "0", "--no-plot", "--out", out]
     rc = subprocess.call(cmd)
@@ -277,36 +253,36 @@ def t_bench():
     if os.path.exists(path):
         with open(path, newline="") as f:
             rows = list(csv.DictReader(f))
-    check("bench_bitrate e' terminato e ha scritto le finestre",
-          rc == 0 and rows, f"rc {rc}, {len(rows)} righe, {out}")
+    check("bench_load_curve finished and wrote the windows",
+          rc == 0 and rows, f"rc {rc}, {len(rows)} rows, {out}")
     if not rows:
         return
-    check("ogni finestra ha le colonne della macchina",
+    check("every window has the machine columns",
           all(r.get("host_dut_mhz") not in (None, "") for r in rows))
     bad = [r for r in rows if r.get("host_disturbed") == "True"]
-    check("nessuna finestra con la macchina disturbata", not bad,
+    check("no window with the machine disturbed", not bad,
           f"{len(bad)}/{len(rows)}")
-    check("il registro al secondo c'e'",
+    check("the per-second log exists",
           os.path.exists(os.path.join(out, "host_monitor.csv")))
-    check("dopo il banco la macchina non ha lo stato applicato",
+    check("after the bench the machine has no applied state",
           not os.path.exists(HC.Paths().state))
-    print(f"  risultati in {out}")
+    print(f"  results in {out}")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--bench", action="store_true",
-                   help="anche un giro corto di bench_bitrate (pktgen + XDP)")
+                   help="also a short round of bench_load_curve (pktgen + XDP)")
     a = p.parse_args()
     if os.geteuid() != 0:
-        sys.exit("serve root: sudo python3 ipa/test/test_host_kernel.py")
+        sys.exit("root needed: sudo python3 ipa/test/test_host_conditions_kernel.py")
     if os.path.exists(HC.Paths().state):
-        sys.exit(f"{HC.Paths().state} esiste: prima sudo python3 "
+        sys.exit(f"{HC.Paths().state} exists: first sudo python3 "
                  f"ipa/test/host_conditions.py --restore")
     topo = HC.Topology.read()
     roles = HC.plan_roles(topo, want_egress=True)
-    print(f"  {topo.summary()}\n  DUT {roles['dut']}, uscita "
-          f"{roles['egress']}, generatore {roles['gen']}")
+    print(f"  {topo.summary()}\n  DUT {roles['dut']}, egress "
+          f"{roles['egress']}, generator {roles['gen']}")
     t_apply_measure_restore(topo, roles)
     t_crash(topo, roles)
     if a.bench:

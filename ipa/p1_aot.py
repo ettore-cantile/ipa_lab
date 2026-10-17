@@ -1,32 +1,6 @@
 #!/usr/bin/env python3
-"""
-p1_aot.py -- Pipeline 1 for the tests and benches: the AOT object, not BCC.
-
-Why
----
-P1 is deployed ONLY as an AOT object: gen_full_c generates libbpf C, clang
-compiles it offline, loader_aot loads it on the node. Until 2026-09-23 every
-P1 test and bench compiled a different program instead -- ebpf_program's BCC
-source, another generator in another dialect -- so every P1 number described
-something no node ever ran. The two were measured side by side and agree
-within noise (claims.md B3), and from then on P1 is tested on the real thing:
-this module is the one way the tests build and load P1.
-
-What it gives
--------------
-  p1_source(...)      libbpf C, same arguments as
-                      ebpf_program.build_combined_hardcoded_source
-  compile_object(src) clang -> .o, cached by content
-  AotObject(o_path)   loader_aot in PIN-ONLY mode: maps AND programs pinned in
-                      bpffs, driven from Python (pinned_maps.PinnedObject);
-                      the pins vanish when this process -- or the loader --
-                      goes away
-  load_p1(...)        all three, returning the same dictionary as
-                      verify_prog_run.setup_hardcoded used to
-  instrument_lookups  the lookup-counting build, in the libbpf dialect
-
-Needs Linux, root, clang, libbpf (the loader is built by
-method4_hardcoded_aot.ensure_loader, like the deploy).
+"""p1_aot.py -- Pipeline 1 for tests and benches: the AOT object, built and
+loaded the way a node loads it (clang offline, loader_aot, pinned maps).
 """
 import atexit
 import hashlib
@@ -45,18 +19,11 @@ for _p in (SHARED_DIR, POC_DIR, os.path.join(SHARED_DIR, "methods")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# The same flags the deploy build uses (method4_hardcoded_aot.py).
 BPF_CFLAGS = ["-O2", "-g", "-target", "bpf", "-D__TARGET_ARCH_x86"]
 
 
 def multiarch_include():
-    """["-I/usr/include/<triplet>"] se esiste, altrimenti [].
-
-    Con -target bpf clang non aggiunge la cartella multiarch di Debian/Ubuntu,
-    dove sta asm/types.h (pacchetto linux-libc-dev): senza, linux/bpf.h non
-    compila ("'asm/types.h' file not found", visto il 2026-09-27 su Ubuntu
-    24.04). Compila solo dove c'e' /usr/include/asm, cioe' con
-    gcc-multilib installato."""
+    """["-I/usr/include/<triplet>"] if it exists, otherwise []."""
     import platform
     d = f"/usr/include/{platform.machine()}-linux-gnu"
     return [f"-I{d}"] if os.path.isdir(os.path.join(d, "asm")) else []
@@ -69,20 +36,18 @@ _PROG_RE = re.compile(r"^int (xdp_\w+)\(struct xdp_md \*ctx\)", re.M)
 
 
 class FdProg:
-    """What a BCC load_func returns, as far as the tests use it: an fd --
-    plus the bpffs path, which common.attach_xdp uses to attach it."""
+    """What a BCC load_func returns, as far as the tests use it."""
 
     def __init__(self, fd, pin_path=None):
         self.fd = fd
         self.pin_path = pin_path
 
 
-# ---------------------------------------------------------------------------
 def p1_source(models, n_interfaces=None, n_nodes=None, hidden_dims=(4, 4),
               features=None, n_out=None, semantics=None, static_node=None,
               static_ports=None):
-    """libbpf C of P1. `models` = [(model_id, weights_int8, scale), ...] --
-    the arguments of build_combined_hardcoded_source, resolved the same way
+    """libbpf C of P1. `models` = [(model_id, weights_int8, scale), ...] -- the
+    arguments of build_combined_hardcoded_source, resolved the same way
     (features None -> the configured model's descriptor)."""
     import model_meta as mm
     from gen_full_c import _emit_arch
@@ -121,12 +86,8 @@ def p1_source(models, n_interfaces=None, n_nodes=None, hidden_dims=(4, 4),
                       static_ports=static_ports, models=entries)
 
 
-# ---------------------------------------------------------------------------
 _LOOKUP_RE = re.compile(r"bpf_map_lookup_elem\(([^()]*)\)")
 _CTR_DECL = """
-/* lookup counter -- measurement build only (p1_aot.instrument_lookups). An
- * ARRAY with an atomic add, not a per-CPU one: pinned_maps reads plain maps,
- * and this build is never the one whose latency is reported. */
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
          __type(key, __u32); __type(value, __u64); } lookup_ctr SEC(".maps");
 static __always_inline void ipa_ctr_inc(void) {
@@ -137,10 +98,7 @@ static __always_inline void ipa_ctr_inc(void) {
 
 
 def instrument_lookups(src):
-    """Count every bpf_map_lookup_elem the program makes: each call becomes
-    `({ ipa_ctr_inc(); bpf_map_lookup_elem(...); })`. The libbpf counterpart
-    of common.instrument_map_lookups (BCC's `.lookup(`); the counter's own
-    lookup is added after the rewrite, so it is not counted."""
+    """Count every bpf_map_lookup_elem the program makes."""
     n = len(_LOOKUP_RE.findall(src))
     out = _LOOKUP_RE.sub(
         lambda m: f"({{ ipa_ctr_inc(); bpf_map_lookup_elem({m.group(1)}); }})",
@@ -149,14 +107,12 @@ def instrument_lookups(src):
     return out[:at] + _CTR_DECL + "\n" + out[at:], n
 
 
-# ---------------------------------------------------------------------------
 _UNCACHED = itertools.count()
 
 
 def compile_object(src, clang="clang", cache=True):
     """clang -> .o, cached by content (same source, same flags -> same object,
-    compiled once). Returns (o_path, compile_seconds; 0.0 when cached).
-    cache=False always runs clang, for the benches that TIME the build."""
+    compiled once)."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     key = hashlib.sha256((src + "\0" + " ".join(BPF_CFLAGS)).encode()).hexdigest()[:24]
     if not cache:
@@ -182,13 +138,7 @@ _PIN_SEQ = [0]
 
 
 class AotObject:
-    """One AOT object, loaded and pinned by loader_aot (PIN-ONLY mode).
-
-    .b         pinned_maps.PinnedObject over its maps
-    .progs     {program name: FdProg}
-    .load_s    the loader's open + load (verifier + JIT), seconds
-    stop()     DETACH -> the loader unpins and exits; also run at exit
-    """
+    """One AOT object, loaded and pinned by loader_aot (PIN-ONLY mode)."""
 
     def __init__(self, o_path, prog_names):
         from pinned_maps import PinnedObject, FwdAction
@@ -200,7 +150,7 @@ class AotObject:
         self.proc = subprocess.Popen([loader, o_path, "--pin-dir", self.pin_dir],
                                      cwd=POC_DIR, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True,
-                                     bufsize=1)   # stderr: the terminal
+                                     bufsize=1)
         self.load_s = None
         seen = []
         for line in self.proc.stdout:
@@ -214,9 +164,6 @@ class AotObject:
             raise RuntimeError(f"loader_aot exited (rc={self.proc.wait()}) "
                                f"before READY; its error is printed above. "
                                f"stdout: {''.join(seen).strip()[-800:]!r}")
-        # Stopped at exit, or as soon as nothing refers to it any more (the
-        # benches load dozens of objects; each is a loader process, pins and
-        # fds). atexit holds a WEAK reference, or it would keep them all.
         ref = weakref.ref(self)
         atexit.register(lambda: ref() is not None and ref().stop())
         self._closed = False
@@ -259,11 +206,7 @@ class AotObject:
 
 
 def load_p1(models, instrument=False, cache=True, **kw):
-    """Generate, compile and load P1; the dictionary setup_hardcoded returns.
-
-    kw: the p1_source arguments (features, n_out, hidden_dims, semantics,
-    static_node, static_ports, n_interfaces, n_nodes). instrument=True builds
-    the lookup-counting object (lookup_ctr) instead of the measured one."""
+    """Generate, compile and load P1;"""
     src = p1_source(models, **kw)
     n_sites = None
     if instrument:
@@ -271,8 +214,6 @@ def load_p1(models, instrument=False, cache=True, **kw):
     o_path, compile_s = compile_object(src, cache=cache)
     names = _PROG_RE.findall(src)
     obj = AotObject(o_path, names)
-    # The maps keep their object alive: whoever still holds `b` (a bench
-    # that returned it, a test that stored it) keeps the loader and the pins.
     obj.b._owner = obj
     model_fns = {}
     for n in names:
@@ -287,8 +228,6 @@ def load_p1(models, instrument=False, cache=True, **kw):
         "progs": {n: p.fd for n, p in obj.progs.items()},
         "cls_stats": obj.b["cls_stats"], "pkt_stats": obj.b["pkt_stats"],
         "pipeline": 1, "owner": obj, "src": src, "o_path": o_path,
-        # Model update on the node = load the prebuilt object (verify + JIT);
-        # clang ran offline, reported separately (0 when the object was cached).
         "t_redirect_s": obj.load_s or 0.0, "t_compile_s": compile_s,
         "t_insert_s": 0.0, "lookup_sites": n_sites,
     }

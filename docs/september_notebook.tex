@@ -82,7 +82,7 @@
 {\color{soft}\large Quaderno di lavoro}\\[1.2cm]
 {\color{accent}\Huge\bfseries Come funziona,\\[0.3cm] e quanto costa}\\[0.9cm]
 {\Large Dal modello al datapath reale}\\[0.3cm]
-{\color{soft}\large misure della campagna del 6 ottobre 2026\\[0.2cm] e della campagna su 91 modelli dell'11--12 ottobre}\\[2.5cm]
+{\color{soft}\large misure su una popolazione di 109 modelli}\\[2.5cm]
 \rule{0.6\linewidth}{0.8pt}\\[0.8cm]
 {\large Progetto \textbf{IPA/eBPF}}\\[0.3cm]
 {\color{soft} inferenza di una rete neurale dentro il kernel, a bordo del pacchetto}
@@ -488,7 +488,7 @@ a che vedere con Germany50:
 \end{center}
 
 Nessuna riga di C scritta a mano cambia fra una riga e l'altra.
-\texttt{test\_fabric.py --sweep}: \textbf{34/34}.
+\texttt{test\_forwarding.py --sweep}: \textbf{34/34}.
 
 % ==================================================================
 \chapter{Il modello non è quello depositato}
@@ -815,7 +815,8 @@ l'interfaccia d'ingresso lo stesso lo mostra la consegna su veth, dove gli
 ingressi che raggiungono ciascuna classe dipendono dalla porta da cui il
 pacchetto entra.
 
-Il prezzo sono due letture di tabella per pacchetto: P1 ne fa 6 in tutto, P3 29.
+Il prezzo sono due letture di tabella per pacchetto: P1.5 ne fa 6 in tutto, P3 da 23 a
+54 secondo il modello.
 In P1 la tabella dell'interfaccia costa meno istruzioni dello \texttt{switch} a
 sei casi che sostituisce: una lettura costa meno di una catena di salti.
 
@@ -914,7 +915,7 @@ numeri qui sotto dicono che la gran parte delle strade viene percorsa per
 intero.
 
 Il verificatore scrive quanti passi ha fatto, se glielo si chiede
-(\texttt{diag\_verifier.py}, statistiche con \texttt{log\_level = 4}, che prova
+(\texttt{check\_verifier\_stats.py}, statistiche con \texttt{log\_level = 4}, che prova
 ogni forma con le due scritture della ReLU). Con il bivio il P1 largo, 3\,486
 istruzioni, arriva al milione: \textbf{287 volte} la sua lunghezza. P2 a
 \emph{uno} strato è già a 799\,563 passi, l'80\% del budget: un margine così
@@ -1025,7 +1026,7 @@ limite è la tabella dei pesi, 1\,024 posti: 37 strati al massimo a larghezza 4,
 
 Il calcolo della rete è identico: i test che confrontano il C di P1 con il
 riferimento Python danno gli stessi logit su ogni modello sintetico
-(\texttt{test\_synth.py}), e \texttt{p1\_c\_eval.py} valuta anche
+(\texttt{test\_synthetic\_models.py}), e \texttt{p1\_c\_eval.py} valuta anche
 \texttt{ipa\_relu} leggendone il corpo. Cambiano invece le istruzioni: circa tre
 per neurone, sempre eseguite, al posto di un salto. Nel banco a pacchetto
 ripetuto un salto sarebbe quasi gratis, perché lo stesso pacchetto passa
@@ -1041,899 +1042,6 @@ vale più che togliere cento istruzioni. E un programma che lavora all'80\% del
 budget di verifica si carica su un kernel e non su un altro: il margine va
 misurato, non presunto.
 \end{lezione}
-
-% ==================================================================
-\chapter{I numeri, e che cosa dicono davvero}
-
-\section{La tabella}
-
-Modello 65-4-4-7, scala 24, \texttt{test\_suite -{}-only kernel}. P1.5 è l'oggetto
-AOT che va sui nodi, quello che i capitoli precedenti chiamano semplicemente P1;
-P1 è la specializzata, presentata nel capitolo seguente, con anche l'indice del
-nodo (7) compilato dentro. Misurato sulla macchina di laboratorio, il core del
-programma fisso a 3\,490~MHz misurati e isolato dal resto (capitolo
-\ref{ch:macchina}).
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrr@{}}
-\toprule
-& \textbf{baseline} & \textbf{P1} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
-\midrule
-istruzioni caricate & 135 & 606 & 1\,019 & 15\,089 & 12\,288 \\
-salti fra programmi & 0 & 1 & 1 & 1 & 3 \\
-letture di tabella  & 3 & 5 & 6 & 11 & 29 \\
-memoria delle tabelle & 1\,960 B & 4\,196 B & 4\,196 B & 147\,624 B & 177\,452 B \\
-latenza (minimo di 7) & 14 ns & 46 ns & 52 ns & 194 ns & 318 ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Il \emph{baseline} è un programma che analizza il pacchetto e lo rimanda fuori
-senza alcuna inferenza: è il pavimento contro cui si legge tutto il resto.
-
-P1 costa 6~ns meno di P1.5: senza l'indice del nodo da leggere sparisce lo
-switch sui 52 nodi (413 istruzioni) e una lettura di tabella. La memoria delle
-tabelle comprende le copie per core dei contatori (22 CPU), per questo la
-baseline occupa 1\,960 byte: i contatori per core evitano gli incrementi
-atomici.
-
-Tutte le colonne vengono dalla \textbf{stessa esecuzione}, sulla stessa
-macchina, nello stesso minuto.
-
-\section{Primo risultato: la dimensione non predice la velocità}
-
-\begin{lezione}
-\textbf{P3 ha il 19\% di istruzioni in meno di P2 ed è il 64\% più lento.}
-
-Il motivo sta nelle due righe centrali: tre salti fra programmi invece di uno, e
-ventinove letture di tabella per pacchetto invece di undici.
-\end{lezione}
-
-Il conteggio delle istruzioni misura quanto è \emph{grande} il programma
-caricato, non quanto \emph{lavoro} fa per pacchetto. In questo regime a dominare
-sono le letture di memoria e i salti, non l'aritmetica.
-
-\subsection*{Perché P2 è più grande, pur essendo più veloce}
-
-Le due cose hanno la stessa causa: \textbf{P3 non tiene la rete intera in un
-programma}.
-
-\begin{center}
-\begin{tikzpicture}[
-  box/.style={draw=rule,fill=boxbg,rounded corners=2pt,minimum height=7mm,
-              inner sep=4pt,font=\scriptsize,align=center},
-  arr/.style={-{Stealth[length=4pt]},draw=soft,thick},
-  lp/.style={-{Stealth[length=4pt]},draw=accent,thick}
-]
-\node[box,draw=accent] (p2) {\textbf{P2} --- un programma solo\\[1pt]
-  strato 1 \;+\; strato 2 \;+\; uscita\\[1pt]
-  \emph{tutti srotolati insieme: 15\,048}};
-\node[box,below=7mm of p2,draw=good] (p3a) {\textbf{P3} --- primo strato: 10\,475};
-\node[box,below=4mm of p3a,draw=good] (p3b) {strato denso generico: 1\,676\\[1pt]
-  \emph{UNA copia, eseguita DUE volte}};
-\draw[lp] (p3a) -- (p3b);
-\draw[lp] (p3b.east) -- ++(9mm,0) |- node[right,font=\scriptsize,pos=0.25] {salto} (p3b.north east);
-\end{tikzpicture}
-\end{center}
-
-P3 srotola \textbf{un} solo strato denso generico e ci rientra, con un salto fra
-programmi, a ogni passo della rete. Così la \emph{profondità} del modello non
-costa dimensione: un modello a sei strati gira sullo stesso identico binario.
-P2 deve srotolarli tutti, perché è un programma solo.
-
-Quel riuso è esattamente ciò che P3 paga in latenza: ogni rientro è un salto più
-le letture che servono a ricostruire il contesto perduto. Il salto in sé costa
-quasi niente --- misurato da solo, \textbf{un nanosecondo} --- quindi quello che
-pesa sono le letture.
-
-\begin{lezione}
-La stessa scelta di progetto spiega \emph{entrambi} i numeri: P3 è più piccolo
-\textbf{perché} riusa un pezzo, ed è più lento \textbf{perché} riusarlo costa
-delle letture ogni volta.
-\end{lezione}
-
-\section{Secondo risultato: quanto valgono le latenze assolute}
-
-Ogni cifra di latenza in tabella è il \textbf{minimo di sette misure}
-indipendenti. Guardando come sono distribuite quelle sette, dentro la singola
-esecuzione:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrr@{}}
-\toprule
-& baseline & P1 & P1.5 & P2 & P3 \\
-\midrule
-minimo   & 14 ns & 46 ns & 52 ns & 194 ns & 318 ns \\
-mediana  & 15 ns & 47 ns & 52 ns & 195 ns & 324 ns \\
-massimo  & 15 ns & 47 ns & 52 ns & 196 ns & 327 ns \\
-\midrule
-dispersione & 7\% & 2\% & 0\% & 1\% & 3\% \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-La dispersione sta fra lo 0 e il 7\%: su 14~ns un nanosecondo è il 7\%. È il
-risultato del condizionamento della macchina (capitolo \ref{ch:macchina}):
-frequenza fissa e misurata, stati di sonno profondi spenti, il core del
-programma lasciato solo.
-
-\begin{lezione}
-Le cifre assolute valgono \textbf{a quella frequenza}: il core del banco è fisso
-a 3,5~GHz, su un P-core. A un'altra frequenza cambiano quasi in proporzione; i
-\textbf{rapporti} fra le pipeline no. Su un core di tipo diverso cambiano anche
-i rapporti (capitolo \ref{ch:reale}).
-\end{lezione}
-
-\subsection*{Un caso in cui la regola è servita}
-
-Sull'asse dei nodi dell'analisi parametrica (capitolo seguente), P1.5 passa da
-731 a 1\,673 istruzioni fra 10 e 100 nodi, e la latenza resta a 45--47~ns in
-tutti e cinque i punti. E il tetto sulle code di P3, portato da 1 a 8, aggiunge
-3\,525 istruzioni al primo strato (da 7\,003 a 10\,528) senza cambiare niente
-di ciò che gira: il modello depositato non dichiara la feature delle code,
-quindi quel ramo non viene mai eseguito.
-
-\begin{lezione}
-Una metrica che si sposta del 50\% senza che cambi nulla di ciò che gira
-\textbf{non è una misura di costo}. Il numero di istruzioni va letto come
-"quanto è grande il binario", mai come "quanto lavora".
-\end{lezione}
-
-\section{Terzo risultato: la genericità ha un costo di verifica}
-
-P2 serve qualsiasi modello che stia sotto certi tetti dichiarati a priori
-(numero massimo di neuroni, di ingressi, di feature). È il suo pregio: non
-ricompila mai.
-
-Il conto però lo paga il verificatore del kernel, che percorre ogni cammino del
-corpo srotolato. Con i tetti larghi il kernel si arrende:
-
-\begin{lstlisting}
-processed 1000001 insns (limit 1000000) ... total_states 13864
-\end{lstlisting}
-
-Da notare: il programma è lungo circa 14\,900 istruzioni, \textbf{ampiamente
-dentro} il limite di dimensione. Quello che finisce è la \emph{complessità di
-verifica}, che è un limite diverso e cresce col \textbf{prodotto} dei tetti:
-\[
-  \text{costo di verifica} \;\sim\; H_{\max} \times F_{\max} \times N_{\max} .
-\]
-
-È lo stesso limite che una ReLU con il bivio farebbe toccare a P2 già a tre
-strati nascosti, e a P1 oltre qualche centinaio di pesi (capitolo
-\ref{ch:relu}).
-
-\begin{lezione}
-È la misura concreta di quanto un programma "generico" possa esserlo. La
-genericità di P2 non è gratis: si paga in stati del verificatore, e il tetto si
-tocca con numeri ragionevoli.
-\end{lezione}
-
-\section{Quarto risultato: togliere il compilatore dal nodo}
-
-P1 scrive i pesi \emph{dentro} il codice come numeri letterali. È ciò che la
-rende veloce --- il compilatore può far sparire le moltiplicazioni per zero e
-trasformare in scorrimenti quelle per potenze di due --- ma ogni volta che il
-modello cambia bisogna ricompilare.
-
-Per questo la P1 si compila \emph{prima}, su una macchina qualunque, e al nodo
-si spedisce l'oggetto già pronto. Al momento del deploy il nodo apre il file e lo carica,
-senza compilatore:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lr@{}}
-\toprule
-\textbf{oggetto precompilato (AOT)} & \\
-\midrule
-compilazione, una volta, fuori dal nodo & 78 ms \\
-messa in servizio sul nodo (apri, verifica, JIT) & \textbf{1,06 ms} \\
-istruzioni & 1\,019 \\
-latenza per pacchetto & 52 ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\begin{lezione}
-Il nodo non ha bisogno di un compilatore, e il costo per pacchetto è lo
-stesso di tutte le altre misure: \textbf{ogni cifra di P1 in questo quaderno è
-dell'oggetto AOT}. La riduzione fatta dal compilatore sui pesi letterali resta
-dentro l'oggetto.
-\end{lezione}
-
-Vale solo quando i modelli sono noti in anticipo, che è l'ipotesi sotto cui P1
-esiste.
-
-\section{Che cosa questi numeri non dicono}
-
-\texttt{BPF\_PROG\_TEST\_RUN} esegue il programma in un ciclo sullo stesso
-buffer. Niente scheda di rete, niente driver, nessuna allocazione, nessuna
-pressione di cache da traffico vero.
-
-Il valore in "milioni di pacchetti al secondo" è semplicemente $1/\text{latenza}$:
-un \textbf{picco teorico}, non un throughput retto. Per quello serve traffico
-vero, generato a ritmo, e la misura di quanti pacchetti si perdono (capitolo
-\ref{ch:reale}).
-
-% ==================================================================
-\chapter{Come cresce il costo}
-
-\section{La domanda}
-
-Fin qui tutto è misurato su \emph{un} modello e \emph{una} topologia. La domanda
-che manca è come cambia il costo quando la rete o il modello diventano più
-grandi --- e soprattutto se le pipeline hanno \textbf{pendenze diverse}.
-
-Se le pendenze fossero uguali, averne più di una sarebbe un esercizio. Non lo
-sono, ed è questo il capitolo che lo mostra.
-
-Le pipeline confrontate sono \textbf{quattro}, e formano una scala di
-\emph{quanto si sa quando il programma viene compilato}:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lll@{}}
-\toprule
-& \textbf{compilato dentro} & \textbf{un binario per} \\
-\midrule
-P1 specializzata & pesi \emph{e} indice di questo nodo & \textbf{nodo} \\
-P1.5 hardcoded   & pesi; il nodo si legge a runtime   & modello \\
-P2 template      & solo i soffitti                    & tutto \\
-P3 modular       & anche la profondità è a runtime    & tutto \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-La P1.5 è quella che i capitoli precedenti chiamano semplicemente P1: la
-\emph{disposizione} delle feature è scritta nel codice, ma l'indice del nodo no.
-La P1 specializzata congela anche quello.
-
-\section{Come è impostata la misura}
-
-Sette assi, e su ciascuno si muove \textbf{una sola} variabile: tutto il resto
-resta fermo, così una curva si può attribuire a quello che c'è scritto sull'asse
-delle ascisse e a nient'altro.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lll@{}}
-\toprule
-\textbf{asse} & \textbf{valori} & \textbf{si ferma perché} \\
-\midrule
-nodi della rete    & 10, 25, 52, 75, 100 & il tetto sugli ingressi è 128 \\
-hidden layer       & da 1 a 6            & --- \\
-a parametri fermi  & da 1 a 5 strati, 592 pesi & --- \\
-neuroni per layer  & 2, 4, 6, 8          & il tetto compilato è 8 \\
-composizione dell'IV & 4 varianti        & 0, 1 o 2 one-hot \\
-pesi a zero        & 0\%\ ... 90\%       & --- \\
-porte presenti     & da 2 a 6            & --- \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Tre accortezze che cambiano i risultati, non solo la forma:
-
-\begin{itemize}
-\item \textbf{Ogni misura in un processo separato.} P1 può far abortire il
-      compilatore in modo non recuperabile; e un rifiuto del verificatore è un
-      \emph{dato}, non un guasto dello strumento.
-\item \textbf{I pesi vengono da un sacchetto fisso}, e un modello più grande
-      \emph{estende} quello più piccolo invece di sostituirne tutti i pesi:
-      in P1 il numero di istruzioni dipende dai valori dei pesi, e cambiarli
-      tutti a ogni punto mescolerebbe il loro effetto con quello dell'asse.
-\item \textbf{Un allarme automatico sulle misure sporche}: se una pipeline ha
-      lo stesso identico programma e la latenza varia più del doppio lungo
-      l'asse, lo scarto è la macchina e lo strumento lo dice.
-\end{itemize}
-
-\section{Profondità: chi paga in spazio e chi in tempo}
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_depth_insns.pdf}
-\end{center}
-
-\begin{lezione}
-\textbf{P3 ha la stessa dimensione da uno a sei strati}: 12\,288 istruzioni in
-ogni punto. \textbf{P2 cresce} di circa 870 istruzioni per strato, da 14\,604 a
-18\,937.
-\end{lezione}
-
-P3 srotola \emph{un} solo strato denso generico e ci rientra a ogni passo della
-rete, quindi la profondità non entra nel programma. P2 deve srotolarli tutti,
-perché è un programma solo; ci riesce fino a venti strati grazie alla ReLU
-senza bivio (capitolo \ref{ch:relu}).
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_depth_latency.pdf}
-\end{center}
-
-\begin{lezione}
-\textbf{E P3 lo paga in tempo: circa 53 nanosecondi per strato} (260 $\to$ 524~ns
-da uno a sei strati), a istruzioni identiche. \textbf{P2 ne paga circa 26}
-(171 $\to$ 300~ns): lo strato in più è codice in linea, niente salti e niente
-letture per ricostruire il contesto. Le due P1 crescono di circa 6~ns per strato
-(33 $\to$ 61 la specializzata, 40 $\to$ 67 la P1.5). Sul traffico vero lo stesso
-andamento: P3 circa 60~ns per strato (capitolo \ref{ch:reale}).
-\end{lezione}
-
-Le due figure hanno la \emph{stessa} causa vista dai due lati. P3 è più piccolo
-\textbf{perché} riusa un pezzo, ed è più lento \textbf{perché} riusarlo costa
-un salto e delle letture ogni volta. È il compromesso della modularità, ridotto
-a due numeri. La differenza vera sulla profondità resta un'altra: P3 cambia
-profondità senza ricompilare, P2 deve ricompilare il programma.
-
-\section{Aggiornare il modello: millisecondi per tutte}
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_depth_update.pdf}
-\end{center}
-
-\begin{lezione}
-Con P1 costruita come oggetto precompilato, installare un modello nuovo su un
-nodo già in servizio costa \textbf{0,4--2,2 millisecondi} in P1 --- il nodo apre
-e carica un file pronto --- e \textbf{10--12 millisecondi} in P2 e P3, che
-scrivono in una tabella (pesi e semantica delle classi). Di questi, circa 9~ms
-sono la lettura dai file del modello del significato delle classi, che questo
-banco fa dentro il tempo misurato: le scritture nel kernel costano 0,2--1~ms
-(capitolo~\ref{ch:cambio}).
-
-Contando anche il lavoro di P1 fuori dal nodo --- generare il C, compilarlo con
-clang --- si sta fra 57 e 121~ms. P2 e P3 compilano con BCC una volta sola,
-all'avvio del nodo (1,2--1,8~s), e mai più.
-\end{lezione}
-
-La differenza che resta fra le pipeline non è quindi il tempo di aggiornamento,
-ma \emph{dove} serve il compilatore: P1 ne vuole uno per ogni modello nuovo, su
-qualche macchina; P2 e P3 no.
-
-\section{Larga o profonda? Dipende da chi la esegue}
-
-Dato un numero di parametri da spendere, conviene metterli in \emph{un} layer
-largo o in \emph{molti} stretti? È una domanda che si fa di solito parlando del
-modello, come se la risposta fosse una proprietà della rete neurale. Qui non lo
-è.
-
-Cinque forme, tutte con lo stesso budget --- 592 pesi, con uno scarto del 2\%\
---- disposto in modo diverso: da un solo strato da otto neuroni a cinque strati
-stretti.
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_isoparam_latency.pdf}
-\end{center}
-
-\begin{lezione}
-A parità di parametri le due versioni hardcoded cambiano poco e non in modo
-monotono (54--68~ns la specializzata, 62--72 la P1.5). P2 perde il \textbf{53\%}
-da uno a cinque strati (175 $\to$ 268~ns), P3 il \textbf{73\%} (284 $\to$ 490~ns).
-Sul traffico vero P2 +35\% e P3 +60\%, con il costo fisso del nodo in più.
-
-La stessa scelta di architettura costa poco o costa molto, a seconda della
-pipeline su cui finisce.
-\end{lezione}
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_isoparam_insns.pdf}
-\end{center}
-
-P3 ha la riga \textbf{perfettamente orizzontale} --- 12\,288 istruzioni a tutti e
-cinque i punti --- e perde comunque il 73\%\ di velocità.
-
-\begin{lezione}
-\textbf{Dimensione costante e tempo crescente} è la firma di un costo di
-transizione, non di calcolo. In P3 si vede allo stato puro: ciò che cresce non è
-il lavoro, è il numero di volte che il programma deve rientrare in sé stesso.
-\end{lezione}
-
-\subsection*{Con budget diversi, e ingressi diversi}
-
-Il banco dedicato (\texttt{bench\_depth\_vs\_width}) prova tre budget e quattro
-vettori d'ingresso, sulla sola P1:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-& \textbf{larga} & \textbf{2 strati} & \textbf{4 strati} & \textbf{8 strati} \\
-\midrule
-\multicolumn{5}{@{}l}{\emph{$\sim$300 pesi}} \\
-ingresso con due one-hot (65 valori) & 39 ns & 44 & 48 & 62 \quad($+59\%$) \\
-ingresso denso (11 valori)           & 93 ns & 90 & 85 & 83 \quad($-11\%$) \\
-\addlinespace
-\multicolumn{5}{@{}l}{\emph{$\sim$1\,200 pesi}} \\
-ingresso con due one-hot (65 valori) & 105 ns & 145 & 165 & 211 \quad($+101\%$) \\
-ingresso denso (11 valori)           & \emph{stack} & \emph{stack} & 330 & 295 \quad($-11\%$) \\
-\bottomrule
-\end{tabular}\\[2pt]
-{\footnotesize\color{soft} P1 come oggetto AOT.
-\emph{stack}: clang non compila, la forma chiede più dei 512 byte di stack di eBPF.}
-\end{center}
-
-Con un ingresso \textbf{grande e dominato da una one-hot} --- il caso di IPA, 52
-dei 65 valori --- allargare batte approfondire, e a 1\,200 pesi la rete a otto
-strati costa il doppio di quella larga. Con un ingresso \textbf{piccolo e
-denso} vince la rete profonda: più veloce dell'11\% a 300 pesi e anche più
-piccola (1\,323 contro 1\,490 istruzioni). Il motivo: una one-hot larga costa poco per pacchetto,
-perché il datapath ne legge \emph{una colonna sola}; un ingresso denso invece fa
-moltiplicare le letture per la larghezza del primo strato.
-
-\subsection*{Il limite di P1 è lo stack}
-
-Con la ReLU senza bivio (capitolo \ref{ch:relu}) il verificatore accetta tutto il
-tier da $\sim$1\,200 pesi sull'ingresso di IPA. Il limite che resta non è del
-verificatore: lo \textbf{stack} di eBPF, 512 byte. Con l'ingresso denso a 1\,200
-pesi la forma larga (un solo strato da 63 neuroni) e quella a due strati da 26
-chiedono più spazio per i valori intermedi di quanto il programma ne abbia, e
-clang si ferma prima di produrre l'oggetto. A $\sim$4\,700 pesi succede a tutte
-le forme.
-
-\begin{lezione}
-La frase giusta non è "le reti larghe sono preferibili a quelle profonde". È:
-\emph{con un ingresso dominato da feature one-hot, allargare batte
-approfondire; con un ingresso piccolo e denso vince la rete profonda; e oltre
-qualche centinaio di pesi, in P1, è la forma larga a esaurire per prima lo
-stack.}
-\end{lezione}
-
-\section{Congelare il nodo: conviene?}
-
-L'indice del nodo è una \textbf{costante del deployment}: un nodo non cambia di
-posto. Il codice però lo legge a runtime, e per farlo porta uno switch con un
-caso per ogni nodo della rete --- 52 casi per Germany50, di cui ne esegue
-\emph{uno}.
-
-Congelandolo a tempo di generazione lo switch sparisce, e con lui la lettura
-della tabella. Restano quattro numeri costanti, che il compilatore può piegare
-dentro al conto.
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_nodes_insns_log.pdf}
-\end{center}
-
-\begin{lezione}
-La taglia della rete entra nel programma \textbf{solo} nella P1.5, che passa da
-731 a 1\,673 istruzioni fra 10 e 100 nodi.
-
-Congelando il nodo quella dipendenza \textbf{sparisce}: la riga della
-specializzata è piatta, fra 602 e 618 a qualunque taglia.
-\end{lezione}
-
-(La scala è logaritmica: in lineare le due righe P1 resterebbero schiacciate
-contro le quindicimila di P2.)
-
-\subsection*{E la velocità}
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrr@{}}
-\toprule
-\textbf{nodi} & 10 & 25 & 52 & 75 & 100 \\
-\midrule
-P1 specializzata & 40 & 40 & 41 & 42 & 39 ns \\
-P1.5 hardcoded   & 46 & 45 & 46 & 47 & 46 ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-La specializzata è più veloce di 4--7~ns, l'11--15\%, a ogni taglia: la lettura
-della tabella del nodo e lo switch costano poco, ma si vedono. Entrambe sono
-piatte: a runtime lo switch è un salto indicizzato, qualunque sia il numero dei
-casi.
-
-\begin{lezione}
-Il motivo per cui la \emph{dimensione} crolla e il \emph{tempo} cala poco è lo
-stesso: lo switch ha 52 casi ma ne esegue uno. Quelle 208 assegnazioni sono
-compilate per eseguirne quattro. Toglierle libera molto \textbf{spazio} e un po'
-di \textbf{tempo}.
-\end{lezione}
-
-\subsection*{Il controllo, e perché ci si può fidare}
-
-Come si fa a essere sicuri che il divario venga davvero dalla one-hot del nodo e
-non da qualcos'altro? Si prende un vettore d'ingresso che la feature \emph{non}
-la contiene:
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_descriptor_insns.pdf}
-\end{center}
-
-Nelle due composizioni senza la feature \texttt{node} le due P1 sono
-\textbf{identiche alla cifra} (611 e 611; 604 e 604). In quelle che ce l'hanno,
-divergono. Il divario è tutto lì e nient'altro.
-
-C'è poi una verifica che viene prima di ogni numero. Congelare il nodo significa
-scegliere \emph{una colonna} della matrice dei pesi al momento di generare il
-codice: sceglierne una sbagliata darebbe un programma più piccolo, più veloce, e
-che calcola \textbf{un altro modello}. Ottanta casi, dieci valori di TTL per otto
-configurazioni di link: la versione congelata decide sempre la stessa classe di
-quella che legge il nodo dalla tabella.
-
-\subsection*{I due vantaggi non si sommano}
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrr@{}}
-\toprule
-\textbf{pesi a zero} & 0\%\ & 25\%\ & 50\%\ & 75\%\ & 90\%\ \\
-\midrule
-P1 specializzata & 618 & 564 & 484 & 401 & \textbf{243} \\
-P1.5 hardcoded   & 1\,045 & 923 & 840 & 672 & \textbf{337} \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Al 90\%\ di zeri il divario scende da 427 a 94 istruzioni. Sparsità e nodo congelato sono
-\textbf{due strade alla stessa riduzione}: se i pesi sono già quasi tutti zero,
-il compilatore cancella lo switch da solo e non resta niente da congelare.
-
-\subsection*{Le quattro risposte in una figura}
-
-\begin{center}
-\includegraphics[width=\textwidth]{figures/duel_p1_vs_p15.pdf}
-\end{center}
-
-Qui ci sono solo le due P1: in tutte le altre figure P2 e P3 stanno un ordine di
-grandezza più su e schiacciano questo confronto sul fondo del grafico. La
-dimensione crolla e smette di dipendere dalla rete; il codice nativo crolla ancora
-di più (2\,692 byte contro 8\,325 a cento nodi); la velocità migliora di poco; e
-con i pesi sparsi le due curve si toccano.
-
-\subsection*{Il verdetto}
-
-\begin{lezione}
-Congelare il nodo \textbf{non è soprattutto un'ottimizzazione di velocità}. È ciò
-che rende la pipeline hardcoded \emph{praticabile su una rete grande}.
-
-Lo switch della P1.5 cresce col numero di nodi moltiplicato per la larghezza del
-primo strato. Su una topologia da 500 nodi con 8 neuroni sarebbero quattromila
-assegnazioni srotolate, e c'è una taglia oltre la quale quel programma non si
-carica più. La specializzata non ci arriva mai.
-
-Il prezzo è \textbf{un binario per nodo}: 52 compilazioni (circa 70~ms ciascuna)
-e 52 installazioni.
-\end{lezione}
-
-\section{Congelare quali porte esistono}
-
-La sezione precedente congela \emph{dove} il nodo si trova. Questa congela
-\emph{quante interfacce ha}.
-
-Il modello riserva sei colonne per \texttt{link\_state} perché sei è il grado
-del nodo più connesso della rete. Ma su un nodo di grado 3 le tre colonne
-restanti non sono link caduti: dietro non c'è alcuna interfaccia. Valgono zero,
-sempre.
-
-\begin{lezione}
-Non si congela il \textbf{valore} della feature, si congela la sua
-\textbf{struttura}. Se un link sia su o giù resta letto a runtime; quello che
-diventa noto alla compilazione è \emph{quali posizioni possono esistere}.
-\end{lezione}
-
-Il generatore non emette le colonne che restano fuori. Il termine che sparisce è
-$\texttt{link\_state}[i] \cdot w[j][i]$ con $\texttt{link\_state}[i]$ nullo: la
-somma è fra interi a 64 bit, quindi togliere un addendo nullo non cambia un bit.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrr@{}}
-\toprule
-\textbf{porte presenti} & 2 & 3 & 4 & 5 & 6 \\
-\midrule
-istruzioni eBPF & \textbf{534} & 554 & 570 & 594 & 618 \\
-latenza         & 37 & 38 & 39 & 39 & 40 ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\textbf{Circa 21 istruzioni per porta}, in modo lineare, e \textbf{3~ns} fra grado
-6 e grado 2, con la latenza che sale in modo monotono. Diversamente dal nodo, qui le
-moltiplicazioni tolte vengono eseguite davvero a ogni pacchetto, e la misura le
-vede: circa un nanosecondo per porta.
-
-Le altre tre pipeline, che non specializzano niente, restano ferme lungo l'asse
-(1\,045, 15\,089 e 12\,288 istruzioni, latenze piatte): la pendenza della
-specializzata viene dalle porte e da nient'altro.
-
-\subsection*{Il controllo, che è servito davvero}
-
-Ottanta casi --- dieci valori di TTL per otto configurazioni di link
-realizzabili --- danno la stessa classe fra la versione specializzata e quella a
-larghezza piena. Ma quel numero, da solo, non dimostra niente: se quelle colonne
-non spostassero mai la decisione, «le due versioni concordano» sarebbe vero anche
-per una specializzazione \textbf{sbagliata}. Serve un controllo al contrario:
-accendere uno slot che sul nodo non esiste, e pretendere che a quel punto le due
-divergano. Su alcuni pesi quel controllo resta muto --- una colonna contribuisce
-$1 \cdot w$ a un accumulatore che ne somma 65 --- e il banco cerca fra più semi
-finché non morde: 29 divergenze.
-
-\begin{lezione}
-Un test che passa anche quando la sua ipotesi è violata non sta verificando
-l'ipotesi.
-\end{lezione}
-
-\section{Due larghezze, due risposte opposte}
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_nodes_insns.pdf}
-\end{center}
-
-La taglia della \emph{rete} entra nel programma solo in P1.5: è lo switch della
-one-hot che si srotola. P2 e P3 restano alla cifra esatta a ogni punto.
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_nodes_latency.pdf}
-\end{center}
-
-\textbf{Piatte tutte.} Cento nodi costano quanto dieci: una one-hot ha un solo
-uno, quindi il datapath legge \emph{una sola colonna di pesi} qualunque sia la
-larghezza del vettore.
-
-Allargare i layer \emph{nascosti}, invece:
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_width_latency.pdf}
-\end{center}
-
-Da 2 a 8 neuroni: P1 specializzata 26 $\to$ 68~ns, P1.5 34 $\to$ 75, P2 178 $\to$
-216, P3 280 $\to$ 386. Sul traffico vero P1 104 $\to$ 145 e P3 391 $\to$ 496~ns
-di CPU per pacchetto (capitolo \ref{ch:reale}).
-
-\begin{lezione}
-\textbf{La rete può crescere quanto vuole; il modello no.}
-\end{lezione}
-
-\section{I pesi contano, ma solo per una delle tre}
-
-\begin{center}
-\includegraphics[width=0.92\textwidth]{figures/scaling_sparsity_insns_log.pdf}
-\end{center}
-
-\begin{lezione}
-Con il 90\%\ dei pesi a zero, P1.5 passa da 1\,045 a \textbf{337 istruzioni} e
-da 45 a 25~ns. P2 e P3 non si muovono di una istruzione, e di un paio di
-nanosecondi al massimo. Sul traffico vero P1.5 scende da 120 a 106~ns di CPU,
-P2 e P3 restano fermi.
-\end{lezione}
-
-P1 scrive i pesi nel codice come numeri, quindi il compilatore vede una
-moltiplicazione per zero e la cancella. Per P2 e P3 uno zero è un byte in una
-tabella come un altro. È l'unico asse su cui dimensione e tempo scendono
-insieme.
-
-\section{Che cosa questi grafici non dicono}
-
-\begin{itemize}
-\item Sono tutti \texttt{BPF\_PROG\_TEST\_RUN}: il programma, non il nodo sotto
-      traffico. Gli stessi assi sotto traffico vero sono nel capitolo
-      \ref{ch:reale}.
-\item Oltre circa 115 nodi non si va senza alzare un tetto compilato e
-      \textbf{rimisurare}.
-\item Che i \emph{pesi}, a forma fissa, possano decidere se P1 si carica è
-      possibile (il codice generato dipende dai valori), ma variando il solo seme
-      dei pesi non è stato misurato. Con la ReLU senza bivio il verificatore ha
-      molto margine (capitolo \ref{ch:relu}), quindi è poco probabile.
-\end{itemize}
-
-% ==================================================================
-\chapter{Il costo del programma, misurato da solo}
-\label{ch:programma}
-% ==================================================================
-
-Prima di mettere un programma in una rete conviene sapere quanto costa da solo.
-Qui lo strumento è \texttt{BPF\_PROG\_TEST\_RUN}: il kernel esegue il programma
-su un pacchetto preparato, in un ciclo, senza schede di rete, code o altri
-programmi di mezzo. È come cronometrare un cassiere mentre batte sempre lo
-stesso scontrino: misura il gesto, non la fila. La fila è l'argomento del
-capitolo \ref{ch:reale}.
-
-% ------------------------------------------------------------------
-\section{La campagna sulle architetture}
-
-Per rispondere a \emph{come cresce il costo quando il modello cresce} servono
-più modelli misurati con la stessa metodologia: quattro assi, un solo parametro
-che si muove per asse, minimo su sette prove.
-
-\begin{center}
-\small
-\begin{tabular}{@{}llp{7.1cm}@{}}
-\toprule
-\textbf{Asse} & \textbf{Valori} & \textbf{Che cosa muove} \\
-\midrule
-\texttt{iv\_dense}   & $n_{in}$ 5, 9, 13, 17 &
-  colonne d'ingresso tutte \emph{dense}: ognuna è letta da una mappa e
-  moltiplicata \\
-\texttt{iv\_onehot}  & $n_{in}$ 16, 32, 65 &
-  colonne d'ingresso in una \emph{one-hot} \\
-\texttt{width\_camp} & 65-$v$-$v$-7, $v$ 4, 8, 16, 32 &
-  neuroni per strato nascosto \\
-\texttt{depth\_camp} & 65-8$\ldots$8-7, 1--4 strati &
-  profondità, a larghezza fissa 8 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection*{I muri, tutti dichiarati}
-
-\textbf{Larghezza 16 e 32 su Pipeline 2 e 3.} I soffitti compilati valgono 8. E
-Pipeline~3 non rifiuta il caricamento: risponde \texttt{XDP\_PASS} a runtime.
-Una cella a larghezza 16 \emph{si caricherebbe, girerebbe, e restituirebbe una
-latenza} --- di un programma che non calcola niente. Il banco controlla i
-soffitti \emph{prima} di compilare e segna la cella \textsc{rifiutato}.
-
-\textbf{Larghezza 32 su Pipeline 1.} La compilazione con clang fallisce (lo
-stack di eBPF non basta). Ogni cella gira nel proprio sottoprocesso: la cella
-esce \textsc{crash} e lo sweep continua. P1 a larghezza 16 carica (166--171~ns),
-e P2 carica tutti i punti di \texttt{depth\_camp}, grazie alla ReLU senza bivio
-(capitolo \ref{ch:relu}).
-
-% ------------------------------------------------------------------
-\section{Il problema: le MAC nominali non predicono la latenza}
-
-Il modo naturale di mettere in relazione complessità e tempo è contare le
-moltiplicazioni-accumulo dalla forma del modello: $n_{in} \times h_1$ per il
-primo strato, e così via. Fatto così, non funziona: con le MAC nominali
-sull'asse delle ascisse la retta spiega il 63\% della varianza per la P1
-specializzata, il 24\% per P2 e il 10\% per P3.
-
-Il sintomo più chiaro sta sull'asse \texttt{iv\_onehot}, dove il vettore
-d'ingresso quadruplica:
-
-\begin{center}
-\small
-\begin{tabular}{@{}rrrrrr@{}}
-\toprule
-$n_{in}$ & \textbf{pesi} & \textbf{p1\_static} & \textbf{hardcoded} &
-\textbf{template} & \textbf{modular} \\
-\midrule
-16 & 271 & 65 ns & 65 ns & 169 ns & 361 ns \\
-32 & 399 & 63 ns & 63 ns & 168 ns & 364 ns \\
-65 & 663 & 64 ns & 64 ns & 170 ns & 367 ns \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-$n_{in}$ per quattro, pesi per 2,4, e la latenza \textbf{non si muove su
-nessuna delle quattro}. Le istruzioni di Pipeline~1 intanto salgono da 1\,099 a
-1\,587: la taglia statica cresce, il percorso eseguito no.
-
-\section{La soluzione: contare le MAC che vengono eseguite}
-
-La causa è nel datapath, ed è una riga sola. Il ramo che tratta una feature
-one-hot è questo:
-
-\begin{lstlisting}[language=C]
-} else if (code == FEAT_INGRESS_IF) {
-    if (_raw_iface >= 1 && _raw_iface <= sz) {
-        __u32 c = coff + (_raw_iface - 1);
-        for (int j = 0; j < ML1_MAX_H1; j++)
-            out[j] += LW_W(LW, woff + j * n_in + c);
-    }
-}
-\end{lstlisting}
-
-Una one-hot occupa \texttt{sz} colonne nella matrice dei pesi, ma nel datapath
-ne attiva \emph{una}: il costo è $h_1$ addizioni, e non dipende da
-\texttt{sz}. Contarla come $sz \times h_1$ moltiplicazioni sovrastima, e di
-quanto dipende da quanta one-hot c'è nell'ingresso --- cioè cambia da asse ad
-asse.
-
-Il banco calcola quindi due colonne: \texttt{macs}, nominali, e
-\texttt{macs\_eff}, che conta le one-hot per quello che eseguono. Con la
-seconda sull'asse delle ascisse:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-& \multicolumn{2}{c}{\textbf{MAC eseguite}} &
-  \multicolumn{2}{c}{\textbf{MAC nominali}} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}
-\textbf{Pipeline} & \textbf{ns/MAC} & \textbf{$r^2$} &
-\textbf{ns/MAC} & \textbf{$r^2$} \\
-\midrule
-p1\_static & 0,287 & \textbf{0,99} & 0,071 & 0,63 \\
-hardcoded  & 0,292 & \textbf{0,98} & 0,076 & 0,69 \\
-template   & 0,574 & 0,71          & 0,092 & 0,24 \\
-modular    & 1,195 & \textbf{0,92} & 0,106 & 0,10 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Per Pipeline~3 si passa da $r^2 = 0{,}10$ a $r^2 = 0{,}92$, e
-\texttt{p1\_static} da $0{,}63$ a $0{,}99$. Quattro assi costruiti in modi
-diversi collassano sulla stessa retta, una per pipeline. P2 si ferma a
-$r^2 = 0{,}71$: ha un costo fisso grande rispetto alla pendenza, e il suo
-residuo più grande sta sull'asse della larghezza, dove i neuroni oltre la
-larghezza del modello vengono calcolati comunque fino al soffitto compilato.
-
-\begin{lezione}
-\textbf{Il costo per MAC eseguita è una proprietà misurabile della pipeline}:
-circa 0,29~ns quando i pesi sono compilati come letterali, circa 1,2~ns quando
-vengono letti da una tabella (P3). Un fattore $4{,}2\times$: il prezzo della
-genericità espresso in una costante invece che in un aneddoto.
-\end{lezione}
-
-Il pavimento della \texttt{baseline}, che di MAC ne esegue zero, sta a 14--15~ns: è il costo del framework XDP che ogni pipeline paga prima di moltiplicare
-qualunque cosa.
-
-% ------------------------------------------------------------------
-\section{Due banchi, lo stesso programma, lo stesso numero}
-
-I due banchi a \texttt{BPF\_PROG\_TEST\_RUN} misurano lo stesso programma, e
-devono dare lo stesso numero. Sul modello 65-4-4-7:
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-\textbf{Pipeline} & \textbf{\texttt{test\_suite}} & \textbf{campagna} &
-\textbf{scarto} \\
-\midrule
-baseline   &  14 ns &  14 ns & $0\%$ \\
-hardcoded  &  52 ns &  45 ns & $-13\%$ \\
-template   & 194 ns & 187 ns & $-4\%$ \\
-modular    & 318 ns & 308 ns & $-3\%$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Concordano entro qualche nanosecondo, e i programmi non sono identici:
-\texttt{test\_suite} usa i pesi veri del modello (1\,019 istruzioni per P1), la
-campagna pesi sintetici a sparsità nulla (1\,045).
-
-\subsection*{Il dettaglio che lo rende vero: un pacchetto nuovo ogni 200 giri}
-
-Il kernel, dentro \texttt{BPF\_PROG\_TEST\_RUN}, non ripristina il pacchetto fra
-una ripetizione e l'altra. Il datapath decrementa il TTL: riusando lo stesso
-pacchetto, dopo una quarantina di esecuzioni il TTL resterebbe inchiodato a~1, e
-da lì in poi ogni ripetizione prenderebbe il ramo
-
-\begin{lstlisting}[language=C]
-if (ip->ttl <= 1) { /* ... */ return XDP_PASS; }
-\end{lstlisting}
-
-che sta \textbf{dopo} l'inferenza --- il modello girerebbe comunque, e le curve
-scalerebbero in modo regolare --- ma salta la coda di inoltro: decremento,
-checksum, contatori, \texttt{mac\_table}, \texttt{bpf\_redirect}. Tutti i banchi
-rinfrescano quindi il pacchetto ogni 200 esecuzioni partendo da TTL~255
-($255 - 200 = 55$): nessuna ripetizione arriva alla scadenza.
-
-\begin{lezione}
-Un difetto che lascia il modello girare è il più difficile da vedere: le curve
-restano belle. Si vede solo confrontando due banchi che devono dare lo stesso
-numero.
-\end{lezione}
-
-% ------------------------------------------------------------------
-\section{Il programma sul percorso vero: tre marcature}
-
-Con traffico vero si può cronometrare il programma \emph{dentro} il percorso:
-il dispatcher marca $T_1$ all'ingresso, il programma marca $T_2$ subito prima di
-inoltrare, il contatore all'altro capo marca $T_3$.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrr@{}}
-\toprule
-& \textbf{baseline} & \textbf{P1} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
-\midrule
-$T_2-T_1$ (il programma) & 26 ns & 60 & 69 & 216 & 331 \\
-$T_3-T_2$ (redirect, veth, ricezione) & 206 & 207 & 208 & 218 & 222 \\
-$T_3-T_1$ a 50\,000 pacchetti/s & 221 & 259 & 274 & 442 & 609 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Con \texttt{xdp\_gen}, nodo su un P-core. $T_2-T_1$ è piatto sul carico, da 0,5
-a 3 milioni di pacchetti al secondo; $T_3-T_2$ è un costo comune di circa
-210~ns che non dipende dalla pipeline; $T_3-T_1$ a basso carico è la latenza
-minima dall'arrivo alla ripartenza. Sopra la baseline il solo programma costa
-+34 / +43 / +190 / +305~ns. Su un E-core $T_2-T_1$ vale 28 / 72 / 84 / 266 /
-434~ns e $T_3-T_2$ circa 245. La versione strumentata aggiunge due letture
-dell'orologio per pacchetto: se qualcosa, questi numeri sono gonfiati. E il
-throughput di questa versione non è una capacità: l'uscita resta sullo stesso
-core del nodo.
 
 % ==================================================================
 \chapter{Il test reale: quanto costa un pacchetto al nodo}
@@ -2078,7 +1186,7 @@ là. I pacchetti partono a distanza regolare, non a raffiche: una raffica da 256
 riempirebbe da sola la coda e farebbe perdere pacchetti sotto capacità. Nello
 stesso istante il programma scrive nel pacchetto un timbro con l'ora di partenza,
 e il nodo successivo misura il ritardo. Il ritmo è esatto fino a circa 11 milioni
-di pacchetti al secondo (a 12 ne parte il 98\%).
+di pacchetti al secondo.
 
 \subsection*{L'alternativa: \texttt{pktgen}}
 
@@ -2118,17 +1226,16 @@ Per questo:
   \item \textbf{Il core del nodo non dorme mai.} Gli stati di sonno profondi sono
         spenti: il risveglio dal più profondo costa 310 microsecondi, più dei 170
         che la coda concede. Sotto capacità il nodo non respinge niente.
-  \item \textbf{Frequenza fissa e misurata}: 3\,472--3\,507~MHz sul core del nodo
-        durante ogni misura di traffico (2\,500 sul LP E-core), letta dai
-        contatori del processore.
+  \item \textbf{Frequenza fissa e misurata}: 3\,500~MHz sul core del nodo
+        (2\,500 sul LP E-core), letta dai contatori del processore durante ogni
+        misura.
   \item \textbf{Generatore e nodo su core separati}, quindi il generatore non è
         dentro la misura: il ritmo a cui il nodo satura è quello del nodo.
 \end{itemize}
 
-Il risultato si vede ripetendo: cinque giri allo stesso punto danno lo stesso
-inoltro in genere entro lo 0,1\%, al massimo entro il 6\% vicino al punto in cui
-la pipeline smette di reggere; la stessa pipeline misurata in quattro modi
-diversi nella stessa sessione dà lo stesso costo entro il 2\%.
+Il risultato si vede ripetendo: i tre giri di una misura differiscono
+dell'1,3\,\% in mediana, e la stessa misura rifatta in un'altra sessione
+dell'1,8\,\% in mediana, al più del 7\,\%.
 
 \section{I limiti del test, con esempi}
 \label{sec:limiti}
@@ -2141,15 +1248,13 @@ e quali no.
 
 Se il nodo è più veloce di quanto il generatore riesca a produrre, il banco
 misura il generatore. Un thread di \texttt{xdp\_gen} offre circa 19 milioni di
-pacchetti al secondo a massima spinta, circa 12 a ritmo fissato e circa 9 a ritmo
-fissato quando i pacchetti vengono inoltrati: per questo su un core
-\texttt{rxonly} non arriva mai al suo limite, la baseline ci arriva appena, e
-sulle curve del bit rate la baseline non lo raggiunge (da 9 milioni perde l'1\%
-con il nodo al 60\%: è il banco, e il test lo riconosce dall'occupazione del
-nodo). Aggiungere thread
-sembra la soluzione, ma più thread che scrivono nella \emph{stessa} coda si
-intralciano, e rallentano anche il nodo che la svuota: è la
-sezione~\ref{sec:scrittore}.
+pacchetti al secondo a massima spinta, meno a ritmo fissato e meno ancora quando
+i pacchetti vengono inoltrati: per questo su un P-core \texttt{rxonly} non arriva
+mai al suo limite, e il suo tempo di CPU è indicativo. Il banco lo riconosce
+dall'occupazione del nodo: un nodo che perde pacchetti lavorando meno del 90\%
+del tempo non è limitato dal programma. Aggiungere thread sembra la soluzione,
+ma più thread che scrivono nella \emph{stessa} coda si intralciano, e rallentano
+anche il nodo che la svuota: è la sezione~\ref{sec:scrittore}.
 
 \subsection*{2. Contare all'uscita può sottostimare il nodo}
 
@@ -2192,108 +1297,106 @@ stesso per tutte, e si sottrae.
 
 In una misura tutti i pacchetti sono uguali: stesso modello, stesso TTL, stessa
 classe decisa. Il processore impara in fretta un flusso così (il predittore dei
-salti, la cache), e un traffico misto costerebbe un po' di più. Le classi si
-misurano una alla volta, ed è così che si è visto che scartare costa più che
-inoltrare.
+salti, la cache). Per questo la campagna misura anche un traffico con un TTL
+diverso a ogni pacchetto, e quindi classi diverse: costa come il pacchetto fisso,
+0 [$-6$--4]\,\%. Le classi si misurano anche una alla volta, ed è così che si
+vede che scartare costa più che inoltrare.
 
 \subsection*{5. Il ritardo a basso carico contiene il generatore}
 
 \texttt{xdp\_gen} spedisce a lotti di 256 frame, e il nodo viene svegliato a fine
 lotto: a basso carico un pacchetto può aspettare fino a una dozzina di
-microsecondi prima che il nodo lo veda, e la mediana del ritardo, 17--19~µs sul
-P-core, contiene quell'attesa. Lotti più piccoli la tolgono, ma il generatore
+microsecondi prima che il nodo lo veda, e la mediana del ritardo contiene
+quell'attesa. Lotti più piccoli la tolgono, ma il generatore
 regge ritmi più bassi. Il salto del ritardo a coda piena, che è ciò che il test
 cerca, non cambia.
 
 \subsection*{6. Il punto esatto in cui comincia la perdita è instabile}
 
 Al confine fra ``regge'' e ``perde'' basta un'esitazione di pochi microsecondi per
-perdere un pacchetto: lo stesso punto, ripetuto, varia fino al 6\%, mentre la
-saturazione varia di 1--3\%. Si citano quindi la saturazione e i gradini della
+perdere un pacchetto: lo stesso punto, ripetuto, varia molto più della
+saturazione. Si citano quindi la saturazione e i gradini della
 scala, non il confine esatto.
 
 \subsection*{7. Il portatile scalda}
 
-Oltre 3,5~GHz non regge una misura intera, e anche a 3,5 capita che il
-processore nel suo insieme tocchi per un attimo la soglia di temperatura, di
-solito mentre clang compila sugli altri core. Il banco lo registra e conta le
-finestre disturbate (anche il funzionamento a batteria è un disturbo): nelle
-misure di traffico di questo capitolo nessuna finestra ha avuto throttling, e
-il core del nodo è rimasto a 3\,500~MHz.
+Oltre 3,5~GHz non regge una misura intera, e anche a 3,5 il processore nel
+suo insieme tocca la soglia di temperatura circa una volta al minuto: lo decide
+il firmware. Il banco registra ogni evento e conta le finestre disturbate (anche
+il funzionamento a batteria è un disturbo); come la campagna tratta le misure
+colpite lo dice il capitolo~\ref{ch:popolazione}.
 
 \section{Il risultato: quanto regge il nodo}
 
 Con \texttt{xdp\_gen}, un core del nodo (un P-core a 3,5~GHz), pacchetti da 64
-byte, tre giri:
+byte, tre giri, sui 109 modelli della popolazione
+(capitolo~\ref{ch:popolazione}), mediana [minimo--massimo]:
 
 \begin{center}
 \small
-\begin{tabular}{@{}lrrrrrr@{}}
+\begin{tabular}{@{}lrrrrr@{}}
 \toprule
-\textbf{Pipeline} & \textbf{Mpps} & \textbf{ns per pacchetto} & \textbf{sopra la baseline}
-& \textbf{cicli} & \textbf{istruzioni} & \textbf{IPC} \\
+\textbf{Pipeline} & \textbf{Mpps} & \textbf{ns per pacchetto} & \textbf{costo della rete}
+& \textbf{istruzioni} & \textbf{IPC} \\
 \midrule
-solo ricezione (\texttt{rxonly}) & 19,47 & $\approx 41$ & --- & 161 & 384 & 2,4 \\
-baseline (nessuna rete)  & 15,27 & 66 & --- & 225 & 606 & 2,7 \\
-P1 statica               & 8,56 & 117 & $+51$ ns & 402 & 1\,220 & 3,0 \\
-P1.5 (hardcoded)         & 8,04 & 124 & $+58$ ns & 432 & 1\,426 & 3,3 \\
-P2 (template)            & 3,45 & 290 & $+224$ ns & 1\,013 & 4\,556 & 4,5 \\
-P3 (modular)             & 2,36 & 425 & $+359$ ns & 1\,483 & 6\,573 & 4,4 \\
+solo ricezione (\texttt{rxonly}) & 19,3 & 40 & --- & 383 & 2,5 \\
+baseline (nessuna rete) & 15,0 [14,5--15,4] & 66 [63--69] & --- & 606 & 2,6 \\
+P1 statica  & 8,4 [4,5--11,7] & 119 [85--221] & 53 [19--155] & 1\,168 & 2,9 \\
+P1.5        & 8,0 [4,5--11,6] & 124 [86--222] & 58 [19--156] & 1\,349 & 3,2 \\
+P2          & 3,4 [2,0--5,1]  & 292 [196--512] & 226 [129--446] & 4\,578 & 4,5 \\
+P3          & 2,1 [1,1--3,3]  & 487 [307--918] & 421 [240--852] & 7\,620 & 4,5 \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} Nodo occupato al 100\% (79\% per \texttt{rxonly}, che
-non satura: il suo valore è indicativo). La baseline satura appena: il
-generatore ne offre 15,3 milioni al secondo. Cicli e istruzioni sono per
-pacchetto, dai contatori hardware del core del nodo.}
+{\footnotesize\color{soft} P2: 103 modelli (gli altri 6 superano il suo tetto sui
+pesi). \texttt{rxonly} è una misura sola, senza modello, e non satura: il suo
+valore è indicativo. Costo della rete = ns per pacchetto meno la baseline dello
+stesso run. Istruzioni e IPC per pacchetto, mediane, dai contatori hardware del
+core del nodo.}
 \end{center}
 
 \begin{lezione}
 La \textbf{baseline} riceve, legge l'intestazione, decrementa il TTL e inoltra.
 Tutto ciò che le pipeline aggiungono sopra è \textbf{il costo della rete
-neurale}: circa 50--60~ns quando i pesi sono scritti nel programma (P1, P1.5),
-circa 225~ns quando la forma della rete è letta da una tabella (P2), circa 360~ns
-quando anche la profondità lo è (P3).
+neurale}: in mediana circa 50--60~ns quando i pesi sono scritti nel programma
+(P1, P1.5), circa 225~ns quando la forma della rete è letta da una tabella (P2),
+circa 420~ns quando anche la profondità lo è (P3).
 \end{lezione}
 
 Come si legge la colonna dei nanosecondi, con un esempio. La baseline regge
-15,27 milioni di pacchetti al secondo, cioè spende $10^9 / 15{,}27 \cdot 10^6 =
-66$~ns per pacchetto; P2 ne regge 3,45 milioni, cioè 290~ns. La differenza, $290
-- 66 = 224$~ns, è il tempo che P2 spende a eseguire la rete neurale: tutto il
-resto --- ricevere, leggere l'intestazione, inoltrare --- lo fanno tutte e due
-allo stesso modo. I cicli confermano: a 3,5~GHz 66~ns sono 231 cicli, e il
-contatore ne conta 225. P3 varia più delle altre fra una misura e l'altra: lo
-stesso modello dà 416--445~ns nella stessa giornata.
+15 milioni di pacchetti al secondo, cioè spende $10^9 / 15 \cdot 10^6 \approx
+66$~ns per pacchetto; un modello che P2 regge a 3,4 milioni costa 292~ns. La
+differenza, circa 226~ns, è il tempo che P2 spende a eseguire la rete neurale:
+tutto il resto --- ricevere, leggere l'intestazione, inoltrare --- lo fanno tutte
+e due allo stesso modo. Il nodo lavora il 100\% del tempo, e i cicli per
+pacchetto dei contatori, divisi per 3,5~GHz, ritrovano il tempo di CPU.
 
 Le istruzioni per pacchetto dicono un'altra cosa che il programma da solo non
-dice: P3 \emph{esegue} più istruzioni di P2 (6\,573 contro 4\,556), pur
-caricandone di meno. E l'IPC delle pipeline con i pesi in tabella è alto, oltre
-4: è aritmetica in fila, senza bivi, che il core esegue molte istruzioni per
-volta.
+dice: P3 \emph{esegue} più istruzioni di P2 (7\,620 contro 4\,578 in mediana), pur
+caricandone di meno, su 103 modelli su 103. E l'IPC delle pipeline con i pesi in
+tabella è alto, oltre 4: è aritmetica in fila, senza bivi, che il core esegue
+molte istruzioni per volta.
 
-E sotto la capacità? Sulle curve del bit rate (sezione~\ref{sec:bitrate}), finché
-il traffico resta sotto la capacità di una pipeline \textbf{nessun pacchetto
-viene respinto} (al massimo lo 0,05\%). Un nodo sotto la sua capacità consegna
-tutto.
+E sotto la capacità? Sulle curve a traffico crescente (sezione~\ref{sec:bitrate}),
+finché il traffico resta sotto la capacità di una pipeline il nodo inoltra tutto
+ciò che riceve. Un nodo sotto la sua capacità consegna tutto.
 
 \subsection*{P1 e P1.5 si separano}
 
-8,56 contro 8,04 milioni al secondo: congelare il nodo vale circa 7 nanosecondi
-sul percorso vero ($117$ contro $124$~ns per pacchetto), e 206 istruzioni in meno
-per pacchetto. Piccolo, ma fuori dal rumore.
+Congelare il nodo vale poco ma si vede: in mediana 119 contro 124~ns per
+pacchetto, e la rete di P1.5 costa 1,11 [0,93--1,68] volte quella di P1, più di
+P1 su 89 modelli su 109.
 
 \subsection*{Da che cosa il costo non dipende}
 
 \begin{itemize}
-  \item \textbf{La taglia del pacchetto non conta}: a 64, 512 e 1\,514 byte il costo
-        è lo stesso entro l'1\%. Il nodo guarda solo l'intestazione.
-  \item \textbf{La porta d'uscita conta poco}: le cinque classi che inoltrano costano
-        uguale entro il 2--3\% per P1, P1.5 e P3, entro il 12\% per P2.
-  \item \textbf{Scartare costa di più che inoltrare}: la classe DROP costa circa
-        50~ns in più delle altre (P1 166 contro 118--120, P1.5 176 contro
-        124--127, P3 467 contro 416--426). Quando il pacchetto viene scartato la
-        sua pagina di memoria si restituisce sul core del nodo; quando viene
-        inoltrato, su quello del nodo successivo. È un effetto del banco, non
-        della pipeline.
+  \item \textbf{La taglia del pacchetto non conta}: fra 64 e 1\,514 byte il costo
+        cambia di 1,2 [0,3--3,1]\,\%. Il nodo guarda solo l'intestazione.
+  \item \textbf{La porta d'uscita non conta}: le classi che inoltrano costano
+        uguale, 0 [0--9]\,\% fra la più cara e la meno cara.
+  \item \textbf{Scartare costa di più che inoltrare}: 51 [17--63]~ns in più.
+        Quando il pacchetto viene scartato la sua pagina di memoria si restituisce
+        sul core del nodo; quando viene inoltrato, su quello del nodo successivo.
+        È un effetto del banco, non della pipeline.
 \end{itemize}
 
 \section{Uno scrittore per coda}
@@ -2354,10 +1457,9 @@ programma XDP nell'aggancio nativo: è come è fatto XDP, non un limite di quest
 progetto. I modi di averne più di uno sono tutti catene. Quello standard è
 \texttt{libxdp}, che aggancia un programma \emph{dispatcher} con alcuni posti
 liberi e ci inserisce gli altri; quello usato qui è il salto fra programmi
-(\emph{tail call}) che le pipeline già usano, senza dipendenze in più. Il salto in
-più costa da $-3$ a $+2$~ns, dentro la variazione fra le ripetizioni: il kernel
-tiene il tempo di ogni programma attaccato, e lo si misura con e senza il
-contatore davanti.
+(\emph{tail call}) che le pipeline già usano, senza dipendenze in più. Il costo
+del salto in più si misura: il kernel tiene il tempo di ogni programma attaccato,
+e il banco lo legge con e senza il contatore davanti.
 
 Così si hanno tre conteggi per ogni valore di traffico: \textbf{inviati} (dal
 generatore), \textbf{ricevuti} (dal programma 1) e \textbf{inoltrati} (arrivati
@@ -2367,78 +1469,30 @@ programma; ricevuti meno inoltrati quella \emph{dopo}. Un terzo metodo,
 stesso ritmo, e separa il collo del programma da quello del banco.
 
 Il banco misura sedici valori di traffico, da 0,5 a 12 milioni di pacchetti al
-secondo (da 0,26 a 6,1~Gbit/s a pacchetti da 64 byte), cinque giri ciascuno. Il
+secondo (da 0,26 a 6,1~Gbit/s a pacchetti da 64 byte), tre giri ciascuno. Il
 ritardo è quello di tutto il percorso: dal timbro che \texttt{xdp\_gen} scrive nel
 pacchetto quando lo spedisce all'arrivo al nodo successivo.
 
-\subsection*{Ricevuti e inoltrati}
+\subsection*{Il risultato}
 
-\begin{center}
-\includegraphics[width=\textwidth]{figures/bitrate_pps.pdf}
-\end{center}
-
-Ogni pannello ha tre curve. Finché il nodo regge sono sovrapposte: tutto ciò
-che si invia viene ricevuto e inoltrato. Oltre il suo limite la linea grigia
-(inviati) continua a salire e le altre due si fermano \textbf{insieme}, alla
-capacità della pipeline: 8,66 milioni al secondo per P1, 8,17 per P1.5, 3,45 per
-P2, 2,37 per P3, la stessa cifra del test di saturazione (8,56, 8,04, 3,45 e 2,36)
-entro il 2\%; al ginocchio il nodo lavora il 99,5--100\% del tempo. La baseline è
-un caso a parte: da 9 milioni al secondo perde circa l'1,3\%, ma con il nodo al
-60\%. Il nodo ha tempo libero, quindi il limite è del banco: quando i pacchetti
-vengono inoltrati \texttt{xdp\_gen} non ne manda più di circa 9 milioni al
-secondo. La capacità della baseline resta quella del test di saturazione, 15,3
-milioni. Che ricevuti e inoltrati restino sovrapposte è la risposta alla
-domanda: \textbf{il programma rilancia tutto ciò che riceve}, e ciò che manca
+Sei modelli della popolazione, dal più leggero al più pesante, sul P-core e
+sull'E-core: 48 curve. Ognuna sale lungo la diagonale finché il nodo regge ---
+tutto ciò che si invia viene ricevuto e inoltrato --- poi si ferma alla capacità
+della pipeline: il massimo inoltrato sta a \textbf{0,98 [0,88--1,03]} della
+capacità misurata a massima spinta sullo stesso modello sul P-core, e a
+\textbf{0,99 [0,94--1,03]} sull'E-core. Oltre la capacità i pacchetti si perdono
+\textbf{prima del programma}, alla coda d'ingresso: la quota persa prima di XDP
+è 1,000 in mediana. Il programma rilancia tutto ciò che riceve, e ciò che manca
 non è mai entrato.
 
-\begin{center}
-\includegraphics[width=\textwidth]{figures/bitrate_loss.pdf}
-\end{center}
-
-La stessa cosa come perdita: la curva dei persi prima di XDP sale, quella dei
-persi dentro la pipeline o all'uscita resta a zero, al massimo lo 0,04\% degli
-inviati. Il solo contatore non perde fino a 11 milioni al secondo: la perdita
-delle pipeline non è della ricezione ma del programma.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-\textbf{Pipeline} & \textbf{pulita fino a} & \textbf{perde da} & \textbf{inoltro massimo} \\
-\midrule
-baseline   & 4,05 Gbit/s & ---$^*$ & 9,02$^*$ M/s \\
-P1 statica & 4,04 & 4,56 & 8,66 \\
-P1.5       & 4,08 & 4,56 & 8,17 \\
-P2         & 1,54 & 1,79 & 3,45 \\
-P3         & 1,02 & 1,28 & 2,37 \\
-\bottomrule
-\end{tabular}\\[2pt]
-{\footnotesize\color{soft} pacchetti da 64 byte; bit rate misurato sul collegamento; nodo su un P-core.
-$^*$ baseline: oltre 8 M/s il limite è del banco, non del programma}
-\end{center}
-
-Le prime due colonne sono \textbf{gradini}, non soglie esatte: ``pulita fino a
-1,54, perde da 1,79'' vuol dire che la perdita comincia da qualche parte fra i
-due. Esempio: P2 inoltra al massimo 3,45 milioni di pacchetti al secondo, cioè
-$3{,}45\cdot10^6 \times 64 \times 8 \approx 1{,}77$~Gbit/s, proprio fra i due
-gradini.
-
-\subsection*{Il ritardo}
-
-\begin{center}
-\includegraphics[width=\textwidth]{figures/bitrate_latency.pdf}
-\end{center}
-
 Il ritardo fa quello che la domanda prevede: resta di qualche decina di
-microsecondi finché il nodo regge, poi \textbf{salta} esattamente dove la pipeline
-comincia a perdere (marcatori vuoti), e da lì resta piatto. Il salto è la coda
-d'ingresso che si riempie: 256 posti davanti a un programma che serve un
-pacchetto ogni 117~ns (P1), 124 (P1.5), 290 (P2) o 425 (P3) fanno 30, 32, 74 e
-109 microsecondi di attesa; le curve si fermano a circa 35, 36, 82 e 122~µs, e il
-resto è il percorso fino al nodo successivo. La baseline non riempie mai la
-coda. Oltre, la coda non può crescere: è piena, e ciò che arriva in più viene
-respinto. Il ritardo si ferma e cresce la perdita. A basso carico la mediana
-contiene l'attesa nel generatore (sezione~\ref{sec:limiti}, punto 5).
+microsecondi finché il nodo regge, poi salta dove la pipeline comincia a
+perdere. Il salto è la coda d'ingresso che si riempie: 256 posti davanti a un
+programma che serve un pacchetto ogni 487~ns (P3, in mediana) fanno circa
+125~microsecondi di attesa, più il percorso fino al nodo successivo. Oltre, la
+coda non può crescere: è piena, e ciò che arriva in più viene respinto. Il
+ritardo si ferma e cresce la perdita. A basso carico la mediana contiene
+l'attesa nel generatore (sezione~\ref{sec:limiti}, punto 5).
 
 \subsection*{Perché il collo di bottiglia è il programma}
 
@@ -2451,12 +1505,12 @@ all'ingresso è quindi il segno di un nodo più lento del traffico, e il nodo è
 suo programma.
 
 Resta da escludere che il limite sia la sola ricezione, che gira sullo stesso
-core. Lo dice \texttt{rxonly}, il contatore da solo: fino a 11 milioni di
-pacchetti al secondo \textbf{non perde niente}, perché la sola ricezione regge
-circa 19 milioni. Al traffico più alto P1 perde il 7\%, P1.5 il 9\%, P2 il 63\%,
-P3 il 76\%: la perdita è del programma, e cresce con il suo costo. L'uscita invece
-non limita: dopo il programma si perde lo 0,04\% al massimo, ed è rumore di
-lettura.
+core. Lo dice \texttt{rxonly}, il contatore da solo: la sola ricezione regge
+circa 19 milioni di pacchetti al secondo, più di quanto le pipeline arrivino a
+inoltrare. Fa eccezione P1 sui modelli più leggeri, che regge oltre 9 milioni al
+secondo: lì comincia a perdere anche l'uscita (la quota persa prima di XDP scende
+fino a 0,69, il massimo inoltrato fino a 0,88 della capacità). È il limite del
+cavo virtuale e del core d'uscita, non della rete neurale.
 
 Due precisazioni. Per la baseline il ``programma'' è quasi solo lettura
 dell'intestazione e redirect: il suo limite è il costo fisso di un nodo XDP, non
@@ -2478,34 +1532,16 @@ sceglie la coda d'uscita dal numero del core che inoltra, e con una coda sola i
 due core del nodo scriverebbero nello stesso anello, svuotato da un solo core
 del nodo successivo (l'esempio della sezione~\ref{sec:limiti}, punto 2).
 
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrrr@{}}
-\toprule
-& \multicolumn{3}{c}{\textbf{P-core}} & \multicolumn{3}{c}{\textbf{E-core}} \\
-\cmidrule(lr){2-4}\cmidrule(lr){5-7}
-\textbf{Programma} & \textbf{1 core} & \textbf{2 core} & \textbf{del doppio}
-& \textbf{1 core} & \textbf{2 core} & \textbf{del doppio} \\
-\midrule
-baseline & 15,27 & 29,11 & 95\%  & 9,39 & 19,09 & 102\% \\
-P1       & 8,56  & 17,46 & 102\% & 6,35 & 12,74 & 100\% \\
-P1.5     & 8,04  & 16,19 & 101\% & 5,84 & 11,71 & 100\% \\
-P2       & 3,45  & 6,63  & 96\%  & 2,83 & 5,60  & 99\% \\
-P3       & 2,36  & 4,60  & 98\%  & 1,94 & 3,84  & 99\% \\
-\bottomrule
-\end{tabular}\\[2pt]
-{\footnotesize\color{soft} Milioni di pacchetti elaborati al secondo,
-alimentatore. Due P-core: 6 e 8, uscite su 3 e 5. Due E-core: 12 e 16, uno per
-modulo, uscite su 6 e 8.}
-\end{center}
-
-Con due core ogni programma elabora il doppio (95--102\%): il secondo core non
-rallenta il primo, e il costo per core è quello di un core solo entro una decina
-di nanosecondi. Per un nodo con $N$ code vale quindi $N$ volte la capacità
-misurata su un core, finché generatore e scheda reggono.
+Sugli 8 modelli del sottoinsieme, dal più leggero al più pesante, due core
+elaborano il \textbf{99 [94--103]\,\%} del doppio di uno sul P-core e il
+\textbf{99 [98--101]\,\%} sull'E-core (due E-core, uno per modulo), su 40 coppie
+modello-pipeline per core. Un core e due core sono misure di sessioni diverse,
+ciascuna con il suo rumore: i valori sopra il 100\,\% sono quello, non un
+guadagno. Il secondo core non rallenta il primo, e per un nodo con $N$ code vale
+$N$ volte la capacità misurata su un core, finché generatore e scheda reggono.
 
 \begin{lezione}
-Per tutte e cinque la perdita è \textbf{all'ingresso}: il collo di bottiglia è il
+Per tutte le pipeline la perdita è \textbf{all'ingresso}: il collo di bottiglia è il
 programma eBPF, non la trasmissione, e la sola ricezione non perde affatto. Il
 ritardo cresce fino a una perdita, come previsto, e si ferma al livello della coda
 piena.
@@ -2528,143 +1564,35 @@ numero di cicli per pacchetto. Il LP E-core gira al suo massimo, 2,5~GHz. Gli
 altri tre core del modulo dell'E-core restano a riposo: dividono con lui cache e
 frequenza.
 
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrrr@{}}
-\toprule
-& \multicolumn{3}{c}{\textbf{milioni di pacchetti/s}} & \textbf{E/P} &
-\textbf{istruzioni} & \textbf{IPC} \\
-\cmidrule(lr){2-4}
-\textbf{Pipeline} & \textbf{P-core} & \textbf{E-core} & \textbf{LP E-core} & &
-\textbf{per pacchetto} & \textbf{P / E / LP E} \\
-\midrule
-baseline & 15,27 & 9,39 & 3,29$^*$ & 0,61 & 606     & 2,7 / 1,7 / 0,8 \\
-P1       & 8,56  & 6,35 & 3,10     & 0,74 & 1\,220  & 3,0 / 2,3 / 1,5 \\
-P1.5     & 8,04  & 5,84 & 2,91     & 0,73 & 1\,426  & 3,3 / 2,4 / 1,7 \\
-P2       & 3,45  & 2,83 & 1,57     & 0,82 & 4\,556  & 4,5 / 3,7 / 2,9 \\
-P3       & 2,36  & 1,94 & 1,10     & 0,82 & 6\,573  & 4,4 / 3,7 / 2,9 \\
-\bottomrule
-\end{tabular}\\[2pt]
-{\footnotesize\color{soft} Tre giri, alimentatore, 64 byte. Le istruzioni per
-pacchetto sono le stesse sui tre tipi di core entro il 2\%. $^*$ Sul LP E-core
-la baseline non satura (nodo al 93\%): il generatore non riesce a offrire di
-più, e la cifra è un limite inferiore.}
-\end{center}
-
 \begin{lezione}
-Il codice eseguito è lo stesso su ogni core: \textbf{cambia l'IPC}, cioè quante
-istruzioni il core completa per ciclo. E non cambia allo stesso modo per tutte
-le pipeline.
+Il codice eseguito è lo stesso su ogni core: le istruzioni per pacchetto
+differiscono al più dello 0,3\,\% fra P-core ed E-core e dello 0,7\,\% sul LP
+E-core. \textbf{Cambia l'IPC}, cioè quante istruzioni il core completa per ciclo.
+E non cambia allo stesso modo per tutte le pipeline.
 \end{lezione}
 
 L'E-core rallenta soprattutto la \textbf{parte fissa} del nodo: ricevere il
 pacchetto dalla coda, inoltrarlo, restituire la pagina. È lavoro del kernel, con
-salti e accessi alla memoria, e l'E-core lo fa a IPC 1,7 invece di 2,7: la
-baseline costa 106~ns invece di 66, il 60\% in più. L'aritmetica della rete
-neurale, invece, è una fila di moltiplicazioni senza bivi, e l'E-core la esegue
-quasi altrettanto bene (IPC 3,7 contro 4,4 per P3): l'inferenza di P3 sopra la
-baseline costa 409~ns invece di 359, solo il 14\% in più. Per questo il rapporto
-di capacità sale con il peso della pipeline: 0,61 per la baseline, 0,82 per P2
-e P3.
+salti e accessi alla memoria, e l'E-core lo fa a IPC 1,7 invece di 2,6: la
+baseline costa 106~ns invece di 66, con 1,56 [1,50--1,61] volte i cicli.
+L'aritmetica della rete neurale, invece, è una fila di moltiplicazioni senza
+bivi, e l'E-core la esegue quasi altrettanto bene: i cicli della sola rete
+costano da 0,95 (P1) a 1,13 (P3) volte quelli del P-core, in mediana. Per questo
+il rapporto di capacità E/P sale con il peso della pipeline: 0,63 per la
+baseline, 0,76 per P1, 0,82--0,83 per P2 e P3.
 
 Il LP E-core paga anche la memoria: sta fuori dalla L3, e i pacchetti scritti
-dal generatore gli arrivano da lontano, con 14--19 mancate dell'ultimo livello
-di cache per pacchetto (zero sugli altri core). Fra la frequenza più bassa e
-l'IPC più basso regge dal 36 al 47\% del P-core sulle pipeline.
-
-\begin{prima}[Esempio: la saturazione sull'E-core]
-Le curve del bit rate sull'E-core hanno la stessa forma di quelle del P-core:
-inoltro pieno fino alla capacità, poi piatto, perdita sempre all'ingresso. Il
-ginocchio sta più in basso: 6,2 milioni al secondo per P1, 5,8 per P1.5, 2,8 per
-P2, 1,9 per P3. E a coda piena il ritardo è più lungo, perché ogni pacchetto
-costa di più: 45~µs per P1, 148 per P3.
-\end{prima}
-
-\section{Gli assi sotto traffico vero}
-\label{sec:assireali}
-
-Le analisi del capitolo sul costo che cresce --- larghezza, profondità, pesi
-fermi, pesi a zero --- sono fatte con il programma da solo. Lo stesso banco di
-questo capitolo le rifà con traffico vero: diciotto modelli sintetici, uno per
-punto, con lo stesso descrittore del modello depositato, sul P-core e
-sull'E-core.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrrr@{}}
-\toprule
-\textbf{strati da 4 neuroni} & 1 & 2 & 3 & 4 & 5 & 6 \\
-\midrule
-P1   & 113 & 116 & 119 & 124 & 125 & 132 \\
-P1.5 & 121 & 128 & 131 & 132 & 134 & 138 \\
-P2   & 264 & 287 & 329 & 344 & 368 & 396 \\
-P3   & 351 & 421 & 486 & 545 & 595 & 652 \\
-\midrule
-P3, istruzioni per pacchetto & 5\,488 & 6\,576 & 7\,663 & 8\,759 & 9\,856 & 10\,952 \\
-\bottomrule
-\end{tabular}\\[2pt]
-{\footnotesize\color{soft} Nanosecondi di CPU per pacchetto, nodo su un P-core;
-la baseline resta a 64--67~ns in ogni punto.}
-\end{center}
-
-Gli andamenti sono quelli del programma da solo, più il costo fisso del nodo.
-P3 paga circa 60~ns per strato, e i contatori hardware dicono perché: ogni
-strato aggiunge \textbf{esattamente 1\,096 istruzioni eseguite}, su P-core e su
-E-core. Sono le letture che ricostruiscono il contesto a ogni rientro, sempre le
-stesse. A pesi fermi P2 sale del 35\% e P3 del 60\% da uno a cinque strati,
-mentre le P1 restano fra 125 e 135~ns; con il 90\% dei pesi a zero P1 passa da
-113 a 95~ns e P1.5 da 120 a 106, mentre P2 e P3 non si muovono, con le stesse
-istruzioni. Sull'E-core ogni punto costa il 20--35\% in più.
-
-\paragraph{La sola rete neurale.} Il tempo di CPU contiene anche il costo fisso
-del nodo. Per isolare la rete neurale si usano le tre marcature della build
-strumentata: T2$-$T1, meno la stessa misura della baseline, con il traffico a
-0,3 e 0,6 milioni di pacchetti al secondo. Il \textbf{minimo} per finestra,
-cioè il pacchetto che trova tutto in cache, coincide con il programma da solo:
-P3 da 1 a 6 strati 262 $\rightarrow$ 508~ns contro 246 $\rightarrow$ 510. La
-\textbf{media}, il costo tipico, sta sopra di 10--40~ns per P1 e P1.5 e di
-40--110~ns per P2 e P3 (P3 a 6 strati 610~ns), con gli stessi andamenti su
-ogni asse; sull'E-core lo scarto è circa doppio. Sul modello depositato la
-media sopra la baseline (P1 44, P2 229, P3 364~ns) coincide con il tempo di CPU
-meno la baseline (51, 224, 359): due misure indipendenti dello stesso costo.
-
-\begin{center}
-\small
-\begin{tabular}{@{}lrrrrrr@{}}
-\toprule
-\textbf{strati da 4 neuroni} & 1 & 2 & 3 & 4 & 5 & 6 \\
-\midrule
-P2, da solo      & 157 & 179 & 206 & 227 & 256 & 286 \\
-P2, media T2$-$T1 & 214 & 252 & 264 & 267 & 324 & 356 \\
-P3, da solo      & 246 & 303 & 356 & 408 & 453 & 510 \\
-P3, media T2$-$T1 & 322 & 348 & 436 & 509 & 560 & 610 \\
-\bottomrule
-\end{tabular}\\[2pt]
-{\footnotesize\color{soft} Nanosecondi di rete neurale per pacchetto (baseline
-sottratta), nodo su un P-core. Da solo: \texttt{BPF\_PROG\_TEST\_RUN}, minimo
-su 7 prove.}
-\end{center}
-
-\paragraph{La rete e l'ingresso.} Con una rete diversa per punto, da 10 a 100
-nodi, il costo della rete neurale (tempo di CPU meno la baseline) resta piatto
-su tutte le pipeline: P1 45--52~ns, P2 221--237, P3 351--366, con le stesse
-istruzioni eseguite. Lo stesso per una one-hot d'ingresso da 16 a 65 colonne;
-gli ingressi densi invece costano (da 5 a 17 colonne P3 sale di 72~ns). Contando
-le moltiplicazioni davvero eseguite, ingressi densi, one-hot e larghezza cadono
-su una retta: circa 0,2~ns per moltiplicazione con i pesi compilati e 0,7~ns
-per P3 ($r^2$ 0,71--0,94); P2 no, perché il suo costo di partenza cambia con
-la composizione dell'ingresso.
+dal generatore gli arrivano da lontano, con 13--21 mancate dell'ultimo livello
+di cache per pacchetto. Fra la frequenza più bassa e l'IPC più basso regge
+0,43 [0,32--0,53] volte il P-core sulle pipeline. Le cifre modello per modello
+sono nel capitolo~\ref{ch:popolazione}.
 
 \section{Che cosa questo numero non dice}
 
-I limiti del banco sono nella sezione \ref{sec:limiti}. Uno in più riguarda il
-modello:
+I limiti del banco sono nella sezione \ref{sec:limiti}. Uno in più riguarda i
+core:
 
 \begin{itemize}
-  \item \textbf{Modelli sintetici sugli assi.} Sul traffico vero il modello
-        depositato è misurato in ogni configurazione; le variazioni di forma
-        (sezione~\ref{sec:assireali}) usano modelli sintetici con lo stesso
-        descrittore, un giro di tre misure per punto.
   \item \textbf{Due tipi di core lenti, a una frequenza.} L'E-core è misurato a
         3,5~GHz, non al suo massimo di 3,8; il LP E-core solo al suo massimo.
 \end{itemize}
@@ -2736,7 +1664,7 @@ durata di un banco, e le riporta com'erano alla fine.
 Ogni valore si salva \emph{prima} di cambiarlo, in un file in memoria. A fine run
 --- anche con Ctrl-C o un errore --- si riscrive tutto all'indietro; un run ucciso
 lascia il file, e il run successivo ripristina per primo. Un test sul kernel vero
-(\texttt{test\_host\_kernel.py}, 25 controlli) applica le condizioni, le rilegge
+(\texttt{test\_host\_conditions\_kernel.py}, 25 controlli) applica le condizioni, le rilegge
 dal kernel, verifica che un processo del desktop giri solo sulle CPU del sistema,
 misura la frequenza sotto carico, ripristina e confronta la macchina valore per
 valore con com'era --- anche dopo aver ucciso il processo a condizioni applicate.
@@ -2759,42 +1687,22 @@ coincidono entro 10~MHz.
 \end{lezione}
 
 Se il monitor si fidasse del numero scritto, a 1,4~GHz marcherebbe come
-disturbate 38 finestre su 39. La frequenza di riferimento è quindi quella
+disturbate quasi tutte le finestre. La frequenza di riferimento è quindi quella
 \textbf{misurata} all'avvio, su ogni core del banco; il numero scritto resta
 accanto, per confronto.
 
 \section{Quale frequenza}
 
-Più alta la frequenza, più alto il throughput --- finché il portatile regge. La
-risposta si è misurata, con un giro corto di \texttt{bench\_bitrate} per frequenza
-e due run completi di cinque minuti:
-
-\begin{center}
-\small
-\begin{tabular}{@{}ll@{}}
-\toprule
-\textbf{frequenza vera} & \textbf{macchina} \\
-\midrule
-2,0--3,5 GHz, 30 s & pulita \\
-4,0 GHz, 30 s & pulita \\
-4,5 GHz, 30 s & throttling su 28 finestre su 39 \\
-4,0 GHz, run completo & fino a 98~°C, il core del nodo in throttling \\
-3,5 GHz, run completo & massimo 85~°C, una finestra disturbata su 390 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-A 4,5~GHz il throughput smette di crescere: il chip si difende. A 4~GHz un run
-corto è pulito, uno da cinque minuti porta il processore a 98~°C e il core del
-nodo stesso in throttling. \textbf{3,5~GHz} è la frequenza più alta che la
-macchina regge per un run intero, ed è la frequenza di default del banco.
+Più alta la frequenza, più alto il throughput --- finché il portatile regge. A
+4,5~GHz il throughput smette di crescere, perché il chip si difende; a 4~GHz un
+run di qualche minuto porta il processore vicino ai 100~°C e il core del nodo
+stesso in throttling. \textbf{3,5~GHz} è la frequenza più alta che la macchina
+regge per un run intero, ed è la frequenza di default del banco.
 
 \begin{lezione}
-La frequenza pesa quasi in proporzione, ma non del tutto: da 3 a 4~GHz il
-throughput sale del 23\% invece del 33\%, perché la cache condivisa e la memoria
-non accelerano con il core. Quello che non si muove è il \textbf{rapporto fra
-pipeline}. Le cifre assolute si citano con la loro frequenza, e con il tipo di
-core (sezione~\ref{sec:corelenti}).
+La frequenza pesa quasi in proporzione, ma non del tutto, perché la cache
+condivisa e la memoria non accelerano con il core. Le cifre assolute si citano
+con la loro frequenza, e con il tipo di core (sezione~\ref{sec:corelenti}).
 \end{lezione}
 
 \section{Il risultato: misure che si ripetono}
@@ -2803,30 +1711,32 @@ core (sezione~\ref{sec:corelenti}).
 \small
 \begin{tabular}{@{}lr@{}}
 \toprule
-\textbf{banco} & \textbf{variazione} \\
+\textbf{che cosa si ripete} & \textbf{variazione} \\
 \midrule
-programma da solo (\texttt{test\_suite}, fra sette prove) & 0--7\% \\
-throughput a saturazione, quattro misure diverse della stessa sessione & entro il 2\% \\
-inoltro allo stesso punto della curva (fra cinque giri) & in genere 0,1\% \\
+i tre giri di una misura ((massimo $-$ minimo) / mediana) & 1,3\,\% in mediana \\
+il nodo senza rete, in 109 sessioni diverse (P-core) & 1,1\,\% in mediana, al più 5\,\% \\
+stesso modello e stessa versione, due sessioni (30 coppie) & 1,8\,\% in mediana, al più 7\,\% \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-E i pacchetti respinti con il nodo sotto capacità sono \textbf{zero}: il core del
-nodo non dorme, e nessun altro lavoro gli viene dato.
+Una differenza sotto il 5\,\% fra misure di sessioni diverse non è una
+differenza. E i pacchetti respinti con il nodo sotto capacità sono
+\textbf{zero}: il core del nodo non dorme, e nessun altro lavoro gli viene dato.
 
 \section{Come si rifà tutto}
 
-Uno script rifà ogni misura di questo quaderno, nelle stesse condizioni, in circa
-un'ora. CSV, condizioni della macchina e registri vanno in
-\texttt{results/campagna\_<data>/}, con una sintesi delle tabelle; i grafici del
-quaderno si rigenerano in \texttt{docs/figures/}:
+Due script rifanno ogni misura di questo quaderno, nelle stesse condizioni:
 
 \begin{lstlisting}
-bash ipa/test/remeasure_campagna.sh        # tutto: traffico su P-, E-, LP E-core, assi, kernel
-bash ipa/test/remeasure_campagna.sh pcore  # solo una parte
-bash ipa/test/remeasure_all.sh             # solo programma, correttezza, analisi parametrica
+bash ipa/test/run_kernel_checks.sh        # tutto cio' che non usa traffico vero (~20 min)
+bash ipa/test/run_population_campaign.sh  # la campagna sulla popolazione (~4 h 30)
 \end{lstlisting}
+
+Il primo scrive CSV e registri in \texttt{results/kernel\_<data>/} e i grafici in
+\texttt{docs/figures/}; il secondo scrive in \texttt{results/popolazione\_<data>/},
+con le condizioni della macchina accanto a ogni misura e la sintesi in
+\texttt{sintesi.md}.
 
 % ==================================================================
 \chapter{Altri modelli, altre reti}
@@ -2939,11 +1849,11 @@ usa lo stesso checkpoint per la strada generica, e il risultato è identico
 (sezione~\ref{sec:stradanuova}).
 
 \begin{lstlisting}
-sudo python3 ipa/test/test_suite.py --only kernel --model synth:deep
-sudo python3 ipa/test/test_fabric.py --model synth:small
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp --model synth:deep
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
-     --model ipa/synth/traffic/depth_3
+sudo python3 ipa/test/test_weights_and_metrics.py --only kernel --model synth:deep
+sudo python3 ipa/test/test_forwarding.py --model synth:small
+sudo python3 ipa/test/bench_capacity.py --mode compare --generator xdp --model synth:deep
+sudo python3 ipa/test/bench_capacity.py --mode compare --generator xdp \
+     --model ipa/synth/population/m000_ipa17_h2_o3
 \end{lstlisting}
 Senza \texttt{--topology} viene scelta la rete compatibile (Germany50 se lo è).
 
@@ -2990,10 +1900,10 @@ inoltro, lo scrive nella mappa e lo stampa:
 \begin{lstlisting}
 traffico di large con link_state=00111000, TTL 32 -> classe 4 (FORWARD)
 \end{lstlisting}
-Se nessuno stato dei link porta a un inoltro, la pipeline non si misura. Fra i
-modelli degli assi sotto traffico (sezione~\ref{sec:assireali}) tre, con il
-seme comune, decidevano lo scarto in tutti i 64 stati: il generatore dei modelli
-fa lo stesso controllo e, in quei casi, passa al seme successivo.
+Se nessuno stato dei link porta a un inoltro, la pipeline non si misura. Il
+generatore della popolazione fa lo stesso controllo: un seme il cui modello
+scarta il pacchetto di prova in ogni stato dei link si scarta, e si passa al
+successivo (capitolo~\ref{ch:popolazione}).
 
 \section{La prova che la strada generica non cambia niente}
 \label{sec:stradanuova}
@@ -3016,53 +1926,9 @@ E la correttezza sui modelli nuovi:
   \item suite kernel su nove modelli: tutto PASS.
 \end{itemize}
 
-\section{I risultati}
-
-Nel kernel, con \texttt{BPF\_PROG\_TEST\_RUN}, nanosecondi per pacchetto
-(minimo su sette prove; baseline 14--15~ns ovunque):
-
-\begin{center}
-\small
-\begin{tabular}{@{}llrrrr@{}}
-\toprule
-\textbf{Modello} & \textbf{forma} & \textbf{P1} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
-\midrule
-checkpoint & 65-4-4-7   & 46 & 51 & 197 & 318 \\
-ipa\_like  & 65-4-4-7   & 47 & 51 & 194 & 309 \\
-ipa\_ttl16 & 65-4-4-7   & 40 & 46 & 197 & 310 \\
-sparse     & 65-4-4-7   & 31 & 38 & 197 & 314 \\
-deep       & 65-4-4-4-7 & 52 & 56 & 226 & 375 \\
-small      & 15-4-4     & 30 & 37 & 139 & 226 \\
-mixed      & 18-6-5     & 36 & 43 & 155 & 257 \\
-ones       & 11-2-3     & 23 & 28 & 129 & 217 \\
-large      & 117-8-8-9  & 71 & 76 & --- & --- \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Tre cose si leggono subito.
-\begin{itemize}
-  \item \textbf{P2 e P3 costano per la forma, P1 per i valori dei pesi.}
-        Checkpoint, \texttt{ipa\_like}, \texttt{ipa\_ttl16} e \texttt{sparse}
-        hanno la stessa forma: P2 e P3 costano uguale per tutti (194--197 e
-        309--318~ns), mentre P1 va da 31~ns (\texttt{sparse}, pesi a zero tolti
-        in compilazione) a 47.
-  \item \textbf{Uno strato in più costa a P2 e P3}: \texttt{deep} ha uno strato
-        più del checkpoint e costa +29~ns su P2, +57~ns su P3, +6~ns su P1.
-  \item \textbf{Ingressi più piccoli abbassano P2 e P3} di 40--100~ns: il primo
-        strato, che è il più largo, scorre meno colonne.
-\end{itemize}
-
-Sul traffico vero gli stessi effetti --- profondità, larghezza, pesi a zero ---
-sono misurati sugli assi, con diciotto modelli sintetici dal descrittore del
-checkpoint (sezione~\ref{sec:assireali}).
-
-\begin{lezione}
-Il confronto fra le pipeline non è una proprietà del checkpoint: su nove
-modelli l'ordine P1 $<$ P1.5 $<$ P2 $<$ P3 resta lo stesso, e i costi si spostano
-come ci si aspetta dalla forma. La profondità pesa su P2 e P3, l'ampiezza
-dell'ingresso su tutte, e su P1 più che altrove.
-\end{lezione}
+Quanto costano modelli diversi non lo dicono questi nove modelli, ma la
+popolazione di 109 del capitolo~\ref{ch:popolazione}, misurata con questa stessa
+strada generica.
 
 \section{Che cosa non fa}
 
@@ -3080,15 +1946,15 @@ dell'ingresso su tutte, e su P1 più che altrove.
 
 Una misura su un modello dice quanto costa \emph{quel} modello. La domanda della
 tesi è un'altra: quanto costa ciascuna delle quattro pipeline, con qualunque
-modello ragionevole le si dia. Per rispondere, ogni test delle slide gira qui su
-una \textbf{popolazione di 91 modelli sintetici}, e ogni conclusione ha una di
+modello ragionevole le si dia. Per rispondere, ogni banco gira qui su una
+\textbf{popolazione di 109 modelli sintetici}, e ogni conclusione ha una di
 queste quattro forme:
 
 \begin{itemize}
   \item un \textbf{intervallo}: la mediana sulla popolazione e, fra parentesi
         quadre, il minimo e il massimo, dal modello più leggero al più pesante;
   \item un \textbf{conteggio}: su quanti modelli un'affermazione regge
-        (``85 modelli su 85'');
+        (``103 modelli su 103'');
   \item una \textbf{legge}: costo $= a + b \times \text{MAC eseguite} + c \times
         \text{strati}$, stimata con i minimi quadrati su tutti i modelli densi,
         con l'errore che fa su modelli lasciati fuori dalla stima;
@@ -3098,8 +1964,8 @@ queste quattro forme:
 
 \begin{lezione}
 In questo capitolo nessuna cifra è di un modello solo. Le cifre vengono da
-\texttt{results/popolazione\_2026-10/}, raccolte l'11--12 ottobre 2026, e le
-tira \texttt{population\_report.py}.
+\texttt{results/popolazione\_2026-10/}, e le tira
+\texttt{report\_population.py}.
 \end{lezione}
 
 \section{La popolazione}
@@ -3139,11 +2005,11 @@ feature dense (stato dei link, occupazione delle code, TTL) e le one-hot
 \texttt{ipa17}, \texttt{ipa65}, \texttt{ipa117} e \texttt{mixed33} miste, con
 reti da 10, 24, 52 e 100 nodi.
 
-La famiglia \emph{strati} sta in fondo al manifesto (\texttt{m091}--\texttt{m108})
-e ha una sezione sua; le cifre delle altre sezioni sono sui primi 91 modelli.
-Sei di questi superano il tetto sui pesi di P2 (\texttt{MAX\_WEIGHT\_ENTRIES}):
-restano nella popolazione, e per P2 le cifre sono su 85 modelli. Le altre
-pipeline li eseguono tutti.
+La famiglia \emph{strati} sta in fondo al manifesto (\texttt{m091}--\texttt{m108}):
+entra in ogni intervallo, ha una sezione sua, e resta fuori dalla stima della
+legge di costo, che la usa come prova. Sei modelli superano il tetto sui pesi di
+P2 (\texttt{MAX\_WEIGHT\_ENTRIES}): restano nella popolazione, e per P2 le cifre
+sono su 103 modelli. Le altre pipeline li eseguono tutti.
 
 I test lunghi girano su sottoinsiemi scelti dal modello più leggero al più
 pesante: 6 modelli per le curve a traffico crescente e per le taglie del
@@ -3152,8 +2018,8 @@ misti.
 
 \section{Come si misura, e quanto è pulito il dato}
 
-Tutto lo fa \texttt{ipa/test/remeasure\_popolazione.sh}, con lo stesso disegno
-dei core delle altre campagne: cambia solo il core del nodo (P-core cpu6,
+Tutto lo fa \texttt{ipa/test/run\_population\_campaign.sh}, con il disegno del
+capitolo~\ref{ch:reale}: cambia solo il core del nodo (P-core cpu6,
 E-core cpu12, LP E-core cpu20), il generatore e l'uscita restano su P-core, i
 core del banco a 3,5~GHz (2,5 il LP E-core).
 
@@ -3173,13 +2039,15 @@ core del banco a 3,5~GHz (2,5 il LP E-core).
                     crescente, due core \\
 \texttt{classi}, \texttt{mix}, \texttt{taglie} & una sessione per classe, TTL diversi
                     a ogni pacchetto, 64/512/1\,514 byte \\
+\texttt{solo}     & il programma da solo, le letture di tabella e i salti per
+                    pacchetto, installare un modello (sezione~\ref{sec:pop-solo}) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 La campagna dura 3~h~54~min e riprende da dove si è fermata: una misura il cui
 CSV c'è già si salta. Ogni misura scrive accanto ai numeri le condizioni della
-macchina, e \texttt{population\_report.py} lascia fuori da ogni intervallo e da
+macchina, e \texttt{report\_population.py} lascia fuori da ogni intervallo e da
 ogni legge quelle in cui la macchina non è rimasta nelle condizioni dichiarate
 o che il controllo di validità del banco ha bocciato; le elenca in
 \texttt{escluse.csv}, e \texttt{POP\_RIFAI\_DISTURBATE=1} le rifà.
@@ -3203,8 +2071,8 @@ Alla fine: \textbf{2 misure fuori su 580}, e 12 tenute senza i giri colpiti
 \section{Correttezza}
 
 Su ogni modello il riferimento intero e il programma eBPF decidono la stessa
-classe, pacchetto per pacchetto: \textbf{P1 su 91 modelli su 91, P2 su 85 su
-85, P3 su 91 su 91}. I 6 modelli fuori da P2 sono quelli oltre il suo tetto sui
+classe, pacchetto per pacchetto: \textbf{P1 su 109 modelli su 109, P2 su 103
+su 103, P3 su 109 su 109}. I 6 modelli fuori da P2 sono quelli oltre il suo tetto sui
 pesi: un limite della pipeline, non un errore.
 
 \section{Il costo del nodo}
@@ -3216,32 +2084,32 @@ pesi: un limite della pipeline, non un errore.
 & \textbf{baseline} & \textbf{P1 statica} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
 \multicolumn{6}{@{}l}{\emph{P-core, 64 byte, nodo saturo: mediana [minimo--massimo]}} \\
-ns di CPU per pacchetto & 67 & 119 & 126 & 291 & 486 \\
- & [64--69] & [85--221] & [86--222] & [196--512] & [307--918] \\
-costo della rete (ns) & --- & 52 & 59 & 225 & 420 \\
+ns di CPU per pacchetto & 66 & 119 & 124 & 292 & 487 \\
+ & [63--69] & [85--221] & [86--222] & [196--512] & [307--918] \\
+costo della rete (ns) & --- & 53 & 58 & 226 & 421 \\
  & & [19--155] & [19--156] & [129--446] & [240--852] \\
 milioni di pacchetti al secondo & 15,0 & 8,4 & 8,0 & 3,4 & 2,1 \\
- & [14,5--15,3] & [4,5--11,7] & [4,5--11,6] & [2,0--5,1] & [1,1--3,3] \\
-istruzioni eseguite per pacchetto & 606 & 1\,162 & 1\,346 & 4\,578 & 7\,575 \\
-istruzioni caricate & 135 & 624 & 961 & 16\,813 & 12\,288 \\
-istruzioni per ciclo & 2,6 & 2,9 & 3,2 & 4,5 & 4,4 \\
+ & [14,5--15,4] & [4,5--11,7] & [4,5--11,6] & [2,0--5,1] & [1,1--3,3] \\
+istruzioni eseguite per pacchetto & 606 & 1\,168 & 1\,349 & 4\,578 & 7\,620 \\
+istruzioni caricate & 135 & 650 & 961 & 16\,813 & 12\,288 \\
+istruzioni per ciclo & 2,6 & 2,9 & 3,2 & 4,5 & 4,5 \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} 91 modelli (P2: 85). Ricevere costa 40~ns (rxonly), leggere
+{\footnotesize\color{soft} 109 modelli (P2: 103). Ricevere costa 40~ns (rxonly), leggere
 l'intestazione e inoltrare altri 27: la baseline, uguale con ogni modello.}
 \end{center}
 
 Modello per modello, sopra la baseline:
 \begin{itemize}
-  \item \textbf{P1 $\leq$ P2 $\leq$ P3 su 85 modelli su 85};
-  \item rendere configurabile la forma (P2) costa \textbf{4,3 [2,7--12,8] volte} P1,
+  \item \textbf{P1 $\leq$ P2 $\leq$ P3 su 103 modelli su 103};
+  \item rendere configurabile la forma (P2) costa \textbf{4,4 [2,7--12,8] volte} P1,
         anche la profondità (P3) \textbf{7,8 [4,9--24,6] volte}; P3 costa 1,9 [1,4--2,3]
         volte P2; P1.5 costa 1,1 [0,9--1,7] volte P1. I rapporti più alti vengono
         dai modelli più piccoli, dove P1 costa poche decine di ns;
-  \item P2 carica più istruzioni di P3 ma ne esegue meno su 85 modelli su 85: la
+  \item P2 carica più istruzioni di P3 ma ne esegue meno su 103 modelli su 103: la
         dimensione del programma non ordina le pipeline per lavoro. Dentro una
         pipeline la dimensione ordina bene i modelli per P1 (correlazione di
-        rango 0,98), meno per P1.5 (0,90) e P2 (0,77); P3 ha la stessa dimensione,
+        rango 0,98), meno per P1.5 (0,90) e P2 (0,79); P3 ha la stessa dimensione,
         12\,288 istruzioni, con ogni modello.
 \end{itemize}
 
@@ -3253,11 +2121,11 @@ Modello per modello, sopra la baseline:
 \toprule
 \textbf{E-core rispetto al P-core} & \textbf{baseline} & \textbf{P1 statica} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
-capacità E/P & 0,63 & 0,77 & 0,76 & 0,82 & 0,83 \\
- & [0,61--0,66] & [0,70--0,91] & [0,68--0,88] & [0,77--0,87] & [0,72--0,89] \\
-istruzioni per ciclo E/P & 0,65 & 0,79 & 0,78 & 0,84 & 0,84 \\
-cicli della rete E/P & --- & 0,94 & 0,99 & 1,10 & 1,13 \\
- & & [0,55--1,17] & [0,59--1,34] & [1,02--1,18] & [1,05--1,40] \\
+capacità E/P & 0,63 & 0,76 & 0,75 & 0,82 & 0,83 \\
+ & [0,61--0,66] & [0,69--0,91] & [0,68--0,88] & [0,77--0,87] & [0,72--0,89] \\
+istruzioni per ciclo E/P & 0,65 & 0,78 & 0,77 & 0,84 & 0,84 \\
+cicli della rete E/P & --- & 0,95 & 1,01 & 1,09 & 1,13 \\
+ & & [0,55--1,20] & [0,59--1,34] & [1,02--1,18] & [1,05--1,40] \\
 \midrule
 \textbf{LP E-core rispetto al P-core} & & & & & \\
 capacità LP/P (14 modelli) & 0,26 & 0,35 & 0,35 & 0,45 & 0,48 \\
@@ -3268,7 +2136,7 @@ capacità LP/P (14 modelli) & 0,26 & 0,35 & 0,35 & 0,45 & 0,48 \\
 
 \begin{itemize}
   \item \textbf{Le istruzioni per pacchetto non dipendono dal core}: fra P-core ed
-        E-core differiscono al più dello 0,3\,\% su 91 modelli, sul LP E-core al
+        E-core differiscono al più dello 0,3\,\% su 108 modelli, sul LP E-core al
         più dello 0,7\,\% sulle pipeline.
   \item \textbf{L'E-core rallenta il nodo, non la rete}: la parte fissa (i cicli
         della baseline) passa da 231 a 360 cicli, 1,56 [1,50--1,61] volte, su ogni
@@ -3276,9 +2144,8 @@ capacità LP/P (14 modelli) & 0,26 & 0,35 & 0,35 & 0,45 & 0,48 \\
         E/P sale con il peso della pipeline: più tempo nella rete, meno conta il
         core.
   \item \textbf{Il LP E-core paga anche la memoria}: sta fuori dalla L3 e ha
-        14--19 mancate dell'ultimo livello di cache per pacchetto (zero su P-core
-        ed E-core). Con IPC 1,0--3,0 e 2,5~GHz regge dal 32 al 53\,\% del P-core
-        sulle pipeline.
+        13--21 mancate dell'ultimo livello di cache per pacchetto. A 2,5~GHz
+        regge dal 32 al 53\,\% del P-core sulle pipeline.
 \end{itemize}
 
 \section{Sotto traffico crescente, e con due core}
@@ -3309,7 +2176,8 @@ entro il rumore}.
 \section{Il programma, il trasporto, e due modi di misurare la rete}
 
 Con i tre orologi ($T_1$ all'ingresso, $T_2$ prima di inoltrare, $T_3$ all'arrivo
-al nodo successivo):
+al nodo successivo), sui 91 modelli che li misurano (la famiglia \emph{strati} è
+misurata senza):
 \begin{itemize}
   \item \textbf{il trasporto} $T_3-T_2$ (redirect, cavo virtuale, ricezione) è
         187--221~ns sul P-core e 226--274 sull'E-core, su ogni modello; fra la
@@ -3332,13 +2200,13 @@ baseline. Il loro rapporto, modello per modello:
 \textbf{traffico leggero / nodo saturo} & \textbf{P1 statica} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
 P-core & 0,77 [0,48--1,02] & 0,83 [0,50--1,02] & 1,03 [0,94--1,09] & 1,02 [0,94--1,11] \\
-E-core & 1,27 [0,34--2,73] & 1,22 [0,30--2,52] & 1,08 [0,93--1,35] & 1,07 [0,82--1,13] \\
+E-core & 1,26 [0,34--2,73] & 1,22 [0,30--2,52] & 1,08 [0,93--1,35] & 1,07 [0,82--1,13] \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 Per \textbf{P2 e P3 le due misure coincidono} su ogni modello. Per P1 e P1.5 no:
-la loro rete costa poche decine di ns sopra una baseline di circa 67, e la
+la loro rete costa poche decine di ns sopra una baseline di circa 66, e la
 differenza fra due misure grandi è rumorosa. Il loro costo della rete si cita
 con il metodo che lo ha misurato; quello di riferimento è il tempo di CPU a nodo
 saturo, il costo che il nodo paga davvero.
@@ -3415,7 +2283,7 @@ costo per pacchetto passa dallo user space: le mappe si leggono dentro il kernel
 (\texttt{bpf\_map\_lookup\_elem}, che per le mappe array il verifier di solito
 sostituisce con un calcolo di indirizzo), e lo user space le scrive solo quando
 installa un modello. Le letture e i salti si contano
-(sezione~\ref{sec:pop-solo}): P3 fa 35 [23--54] letture di tabella per
+(sezione~\ref{sec:pop-solo}): P3 fa 36 [23--54] letture di tabella per
 pacchetto, circa 6 in più per strato, e un salto per strato. Quanto dei 46~ns per
 strato sia il salto e quanto le letture, la campagna non lo separa.
 
@@ -3437,7 +2305,7 @@ per ogni profondità; P3 ne ha 12\,288 con ogni modello.
         rete larga e poco profonda; con le specializzate la forma si sceglie per
         l'accuratezza.
   \item \textbf{Larghezza.} Da 2 a 8 neuroni per strato la rete sale su tutte (in
-        mediana P1 da 37 a 90~ns, P3 da 389 a 537): un neurone in più è lavoro a
+        mediana P1 da 31 a 84~ns, P3 da 347 a 516): un neurone in più è lavoro a
         ogni pacchetto. La legge lo conta nelle MAC.
   \item \textbf{Taglia della rete.} Sui 56 modelli con l'identità del nodo in
         ingresso (reti da 10 a 100 nodi), lo scarto dalla legge non cresce con i
@@ -3509,8 +2377,7 @@ costo di uno strato dipende dalla sua forma, e il codice dice come.
 
 Scritta con questi termini, la legge delle istruzioni ha un costo fisso per
 composizione, uno per strato, e uno per neurone e per moltiplicazione degli
-strati dopo il primo. Stimata su tutti i modelli densi, vecchi e nuovi (101; 95
-per P2):
+strati dopo il primo. Stimata su tutti i modelli densi (101; 95 per P2):
 
 \begin{center}
 \small
@@ -3550,12 +2417,12 @@ di questa famiglia, che non usa per la stima, sbaglia il tempo sul P-core del
 \section{Il programma da solo, e il cambio di modello}
 \label{sec:pop-solo}
 
-La sezione \texttt{solo} della campagna (\texttt{bench\_solo.py}) carica ogni
+La sezione \texttt{solo} della campagna (\texttt{bench\_program\_alone.py}) carica ogni
 modello in ogni pipeline con lo stesso costruttore dei banchi sotto traffico, e
 lo esegue con \texttt{BPF\_PROG\_TEST\_RUN} sul pacchetto e con gli ingressi del
 traffico: TTL 32, il nodo e la porta del fabric, lo stato dei link che fa
 inoltrare il modello. Ogni misura ha inoltrato il pacchetto in tutte le
-esecuzioni; 2 misure su 91 sono fuori perché la macchina era disturbata.
+esecuzioni; una misura è fuori perché la macchina era disturbata.
 
 \begin{center}
 \small
@@ -3563,24 +2430,24 @@ esecuzioni; 2 misure su 91 sono fuori perché la macchina era disturbata.
 \toprule
 & \textbf{baseline} & \textbf{P1 statica} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
-letture di tabella per pacchetto & 3 & 5 [4--5] & 6 [5--6] & 12 [11--12] & 35 [23--54] \\
+letture di tabella per pacchetto & 3 & 5 [4--5] & 6 [5--6] & 12 [11--12] & 36 [23--54] \\
 salti fra programmi per pacchetto & 0 & 1 & 1 & 1 & 1 per strato \\
 installare un modello (ms) & --- & 0,6 [0,3--1,5] & 0,9 [0,3--5,6] & 0,3 [0,2--0,4] & 0,3 [0,2--0,5] \\
-generare e compilare P1 (ms) & --- & 49 [34--114] & 61 [34--181] & --- & --- \\
-compilare il programma generico (s) & --- & --- & --- & 1,6 [1,5--1,7] & 1,2 [1,2--1,2] \\
+generare e compilare P1 (ms) & --- & 50 [34--114] & 61 [34--181] & --- & --- \\
+compilare il programma generico (s) & --- & --- & --- & 1,6 [1,4--1,7] & 1,2 [1,2--1,2] \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} Mediana [minimo--massimo] su 89 modelli (P2: 83). Installare =
+{\footnotesize\color{soft} Mediana [minimo--massimo] su 108 modelli (P2: 102). Installare =
 un modello nuovo su un nodo in servizio: per P1 caricare l'oggetto compilato
 (verifier e JIT), per P2 e P3 scrivere le tabelle. Generare e compilare P1 si fa
-fuori dal nodo, con clang senza cache, su 91 modelli.}
+fuori dal nodo, con clang senza cache, su 109 modelli.}
 \end{center}
 
 \begin{itemize}
   \item \textbf{La configurabilità si conta.} Le letture di tabella per pacchetto
         crescono da P1 a P3, e per P3 crescono con la profondità: circa 6 letture
-        in più per strato. I salti fra programmi di P3 sono uno per strato su 89
-        modelli su 89. È la struttura che la legge di costo vede nel termine per
+        in più per strato. I salti fra programmi di P3 sono uno per strato su 108
+        modelli su 108. È la struttura che la legge di costo vede nel termine per
         strato.
   \item \textbf{Cambiare modello costa millisecondi o meno a tutte}, su ogni
         modello: sul nodo al più 6~ms. La differenza fra le pipeline è dove serve
@@ -3590,9 +2457,13 @@ fuori dal nodo, con clang senza cache, su 91 modelli.}
   \item \textbf{Il programma da solo, a chiamate singole}, costa per P2 e P3 quanto
         sotto traffico o poco di più: la rete a nodo saturo sta a 0,94 [0,77--1,10]
         e 0,91 [0,84--0,97] volte la rete da sola. Ogni esecuzione è una chiamata
-        al kernel, che raffredda cache e predittori come fa il traffico. Il
-        programma in un ciclo caldo, senza nulla in mezzo, la popolazione non lo
-        misura.
+        al kernel, che raffredda cache e predittori come fa il traffico.
+  \item \textbf{Il programma da solo, in un ciclo caldo} (blocchi di esecuzioni
+        in cui il TTL che scende non cambia la classe decisa): coincide con il
+        pacchetto più veloce a traffico leggero (da 0,95 a 1,04 volte), e il nodo
+        saturo costa 1,08 (P2) e 1,11 (P3) volte il ciclo caldo, 1,28--1,33 volte
+        per P1.5 e P1, la cui rete è piccola rispetto a quello che il traffico
+        sposta in cache.
 \end{itemize}
 
 \section{Il resto è solido}
@@ -3617,11 +2488,11 @@ Sui sottoinsiemi, dal modello più leggero al più pesante:
 \textbf{Affermazione} & \textbf{sulla popolazione} \\
 \midrule
 \endhead
-Tutte le pipeline decidono come il riferimento intero & P1 91/91, P2 85/85, P3 91/91 \\
-P2 ha un tetto sui pesi che le altre non hanno & 6 modelli su 91 fuori da P2 \\
-P1 $\leq$ P2 $\leq$ P3 nel costo della rete & 85/85 \\
-Rendere configurabile la forma costa più volte P1 & P2/P1 4,3 [2,7--12,8], P3/P1 7,8 [4,9--24,6] \\
-P2 è il programma più grande ma P3 esegue di più & 85/85 \\
+Tutte le pipeline decidono come il riferimento intero & P1 109/109, P2 103/103, P3 109/109 \\
+P2 ha un tetto sui pesi che le altre non hanno & 6 modelli su 109 fuori da P2 \\
+P1 $\leq$ P2 $\leq$ P3 nel costo della rete & 103/103 \\
+Rendere configurabile la forma costa più volte P1 & P2/P1 4,4 [2,7--12,8], P3/P1 7,8 [4,9--24,6] \\
+P2 è il programma più grande ma P3 esegue di più & 103/103 \\
 Le istruzioni per pacchetto non dipendono dal core & entro 0,3\,\% (P/E), 0,7\,\% (LP) \\
 L'E-core rallenta soprattutto la parte fissa & cicli fissi E/P 1,56 [1,50--1,61] \\
 Il LP E-core regge un terzo--metà del P-core & 0,32--0,53 sulle pipeline \\
@@ -3638,8 +2509,9 @@ A pari pesi la profondità si paga solo con P2 e P3 & +48\,\% e +63\,\% da 1 a 5
 La taglia della rete non costa & $\leq$ 0,03~ns per nodo \\
 I pesi a zero aiutano solo P1 e P1.5 & 0,44 e 0,62 del previsto al 90\,\% \\
 I pesi estratti contano poco & variazione $\leq$ 6\,\% (P3 2\,\%) \\
-Le letture di tabella crescono da P1 a P3, e con gli strati & 5, 6, 12, 35 [23--54]; +6 per strato \\
-P3 salta una volta per strato & 89/89 \\
+Le letture di tabella crescono da P1 a P3, e con gli strati & 5, 6, 12, 36 [23--54]; +6 per strato \\
+P3 salta una volta per strato & 108/108 \\
+Sotto carico P2 e P3 costano poco più del ciclo caldo & 1,08 e 1,11 volte \\
 Cambiare modello costa millisecondi o meno sul nodo & $\leq$ 6~ms; P1 compila fuori in 34--181~ms \\
 Taglia del pacchetto, porta, TTL non contano & 1,2\,\%, 0\,\%, 0\,\% in mediana \\
 \bottomrule
@@ -3651,9 +2523,8 @@ Taglia del pacchetto, porta, TTL non contano & 1,2\,\%, 0\,\%, 0\,\% in mediana 
 \begin{itemize}
   \item \textbf{I modelli sono sintetici}: coprono forme, composizioni e pesi, non
         l'accuratezza di un modello addestrato.
-  \item \textbf{Il programma in un ciclo caldo non è misurato sulla popolazione}:
-        il programma da solo è misurato a chiamate singole, che non tengono
-        cache e predittori caldi fra un'esecuzione e l'altra.
+  \item \textbf{Il ciclo caldo vale solo dove il TTL lo permette}: si misura sui
+        modelli in cui almeno 10 esecuzioni di fila decidono la stessa classe.
   \item \textbf{Le letture di tabella e i salti si contano, ma non si separano nel
         tempo}: quanto dei circa 46~ns per strato di P3 sia il salto e quanto le
         letture, la campagna non lo dice.
@@ -3666,16 +2537,16 @@ Taglia del pacchetto, porta, TTL non contano & 1,2\,\%, 0\,\%, 0\,\% in mediana 
 
 \begin{lstlisting}
 cd ~/Scrivania/ipa_lab
-CAMPAGNA=results/popolazione_2026-10 bash ipa/test/remeasure_popolazione.sh
+CAMPAGNA=results/popolazione_2026-10 bash ipa/test/run_population_campaign.sh
 # prova breve, due modelli in tutte le sezioni
-CAMPAGNA=results/prova_pop POP_SOLO="m000 m037" bash ipa/test/remeasure_popolazione.sh
+CAMPAGNA=results/prova_pop POP_SOLO="m000 m037" bash ipa/test/run_population_campaign.sh
 # una famiglia aggiunta in fondo (strati): si misurano solo i modelli nuovi
-CAMPAGNA=results/popolazione_2026-10 POP_T2=0 bash ipa/test/remeasure_popolazione.sh genera corretto pop solo
+CAMPAGNA=results/popolazione_2026-10 POP_T2=0 bash ipa/test/run_population_campaign.sh genera corretto pop solo
 # rifare solo cio' che il report ha lasciato fuori
-CAMPAGNA=results/popolazione_2026-10 POP_RIFAI_DISTURBATE=1 bash ipa/test/remeasure_popolazione.sh
+CAMPAGNA=results/popolazione_2026-10 POP_RIFAI_DISTURBATE=1 bash ipa/test/run_population_campaign.sh
 # la sintesi e la figura di questo capitolo
-python3 ipa/test/population_report.py results/popolazione_2026-10 > sintesi.md
-python3 ipa/test/popolazione.py results/popolazione_2026-10 --figura
+python3 ipa/test/report_population.py results/popolazione_2026-10 > sintesi.md
+python3 ipa/test/report_population_facts.py results/popolazione_2026-10 --figura
 \end{lstlisting}
 
 % ==================================================================
@@ -3718,12 +2589,12 @@ catena (il dispatcher, il primo strato, gli strati successivi) rilegge il regist
 
 \section{Il problema}
 
-Cambiare il modello A con il modello B voleva dire riscrivere le tabelle di A con
-i dati di B, \textbf{allo stesso \texttt{model\_id}}, una tabella alla volta: i
-pesi, poi le forme, poi la semantica, poi il registro, e infine la descrizione
-degli ingressi. Solo la semantica era protetta: si scrive nel banco libero, e la
-scrittura del registro scambia i banchi in un colpo solo. Tutto il resto cambiava
-sotto i piedi dei pacchetti.
+Il modo diretto di cambiare il modello A con il modello B è riscrivere le
+tabelle di A con i dati di B, \textbf{allo stesso \texttt{model\_id}}, una
+tabella alla volta: i pesi, poi le forme, poi la semantica, poi il registro. Solo
+la semantica è protetta: si scrive nel banco libero, e la scrittura del registro
+scambia i banchi in un colpo solo. Tutto il resto cambia sotto i piedi dei
+pacchetti.
 
 \begin{prima}[Un esempio]
 A ha 17 ingressi, 2 neuroni e 3 classi; B ha gli stessi ingressi, 8 neuroni e 7
@@ -3735,21 +2606,17 @@ rinuncia e passa il pacchetto al kernel senza decidere; se stanno insieme per
 caso, decide con un modello che non esiste, e nessun controllo se ne accorge.
 \end{prima}
 
-C'era anche un errore d'ordine: la descrizione degli ingressi veniva scritta
-\emph{dopo} il registro, quindi anche un modello installato sotto un id nuovo era
-visibile per un istante con la descrizione vecchia, o vuota.
-
 \section{La soluzione}
 
-Nessuna riga del programma eBPF cambia: cambia il modo in cui il piano di
-controllo scrive le tabelle (\texttt{ipa/test/pipeline\_setup.py},
+Il programma eBPF non c'entra: conta il modo in cui il piano di controllo
+scrive le tabelle (\texttt{ipa/test/pipeline\_setup.py},
 \texttt{ipa/ebpf\_template\_arch.py}, \texttt{ipa/ebpf\_modular.py}).
 
 \begin{enumerate}
-  \item \textbf{Il registro per ultimo.} In P2 e in P3 la descrizione degli
-        ingressi si scrive prima del registro. Il registro diventa davvero
-        l'ultima scrittura: finché non c'è, il modello non esiste; quando c'è,
-        tutto il resto è già al suo posto.
+  \item \textbf{Il registro per ultimo.} In P2 e in P3 pesi, forme, semantica e
+        descrizione degli ingressi si scrivono prima del registro, che è l'ultima
+        scrittura: finché non c'è, il modello non esiste; quando c'è, tutto il
+        resto è già al suo posto.
   \item \textbf{Mai riscrivere un modello in uso} (\emph{make-before-break}):
         \begin{itemize}
           \item \texttt{install\_model} mette B sotto un \texttt{model\_id}
@@ -3773,17 +2640,16 @@ installa il nuovo accanto al vecchio, si sposta il traffico, si toglie il vecchi
 Ogni pacchetto vede un modello intero.
 \end{lezione}
 
-\textbf{I limiti.} A e B devono stare insieme nel blocco dei pesi: in P2 (1\,024
-posti) il modello nuovo può avere circa metà del blocco, ed è il caso di 63
-modelli della popolazione su 91; in P3 (2\,048 posti) di 85 su 91. Per i modelli
-più grandi \texttt{install\_model} si rifiuta, e il cambio richiede una breve
+\textbf{I limiti.} A e B devono stare insieme nel blocco dei pesi (1\,024 posti
+in P2, 2\,048 in P3): il modello nuovo può occupare al più quello che il vecchio
+lascia libero. Per i modelli più grandi \texttt{install\_model} si rifiuta, e il cambio richiede una breve
 interruzione. In P2 il modello nuovo deve avere anche la stessa profondità del
 programma compilato: una profondità diversa richiede un altro programma, non solo
 le tabelle.
 
 \section{La prova}
 
-\texttt{ipa/test/verify\_model\_swap.py} cambia modello migliaia di volte mentre il
+\texttt{ipa/test/check\_model\_swap.py} cambia modello migliaia di volte mentre il
 programma lavora senza sosta. Un thread, su un core, esegue il programma un
 pacchetto alla volta (\texttt{BPF\_PROG\_TEST\_RUN}, con gli ingressi del
 traffico); un altro, su un altro core, cambia il modello per 3 secondi. I modelli
@@ -3813,8 +2679,8 @@ P3 & make-before-break & 3\,147 & 549\,402 & \textbf{0} \\
         stavano insieme, e il programma li ha passati al kernel senza decidere.
         Su un nodo vero non avrebbero seguito la decisione della rete. È lo
         0,03\,\% dei pacchetti, con un cambio ogni 0,3~ms: su un nodo vero i cambi
-        sono rari, ma il rischio c'è a ogni cambio. E 60 è un minimo, perché la
-        prova girava già con l'ordine corretto delle scritture.
+        sono rari, ma il rischio c'è a ogni cambio. E la prova scrive già il
+        registro per ultimo: senza, la finestra sarebbe più larga.
   \item \textbf{In P2 la riscrittura allo stesso id non ha mostrato pacchetti
         misti}, ma questo non la rende sicura: la finestra fra i pesi e il
         registro esiste, ed è solo più stretta; e un modello misto può dare per
@@ -3825,9 +2691,9 @@ P3 & make-before-break & 3\,147 & 549\,402 & \textbf{0} \\
         prima che il vecchio sparisca.
 \end{itemize}
 
-I test del kernel che registrano i modelli passano con l'ordine nuovo delle
+I test del kernel che registrano i modelli passano con questo ordine delle
 scritture: \texttt{test\_model\_source --kernel} 110/110,
-\texttt{verify\_per\_model\_semantics} 53/53.
+\texttt{check\_semantics\_per\_model} 53/53.
 
 \section{Quanto costa installare un modello}
 
@@ -3836,13 +2702,12 @@ programma: la prima costa 0,62~ms in P2 e 1,11~ms in P3, la seconda e la terza
 circa 0,2~ms. La prima paga il piano di controllo che si prepara (gli oggetti
 delle tabelle, i moduli Python); la scrittura nel kernel è la stessa.
 
-\begin{prima}[I 10--12 ms]
-Il banco degli assi (\texttt{bench\_scaling}) misura 10--12~ms per installare un
-modello in P2 e P3. Quel banco chiama la registrazione senza passarle il
-significato delle classi, e la funzione lo ricava leggendo i file del modello
-dentro il tempo misurato: 9,3~ms la prima volta, 0,1~ms le successive. Le
-scritture nel kernel costano 0,2--1~ms; i 10--12~ms sono quasi tutti lettura di
-file.
+\begin{prima}[Il tempo di \texttt{bench\_scaling}]
+Il banco degli assi (\texttt{bench\_scaling}) misura un tempo più lungo per
+installare un modello in P2 e P3. Quel banco chiama la registrazione senza
+passarle il significato delle classi, e la funzione lo ricava leggendo i file del
+modello dentro il tempo misurato: quel tempo è quasi tutto lettura di file, non
+scrittura nel kernel.
 \end{prima}
 
 \section{Che cosa non dice}
@@ -3855,16 +2720,16 @@ file.
   \item \textbf{P1 e P1.5 non sono nella prova}: cambiano modello sostituendo il
         programma intero, e il kernel garantisce che un pacchetto ne esegua uno
         o l'altro.
-  \item \textbf{I modelli che non stanno due volte nel blocco dei pesi} (28 su 91
-        per P2, 6 su 91 per P3) richiedono ancora un'interruzione.
+  \item \textbf{I modelli che non stanno due volte nel blocco dei pesi}
+        richiedono un'interruzione.
 \end{itemize}
 
 \section{Come rifarla}
 
 \begin{lstlisting}
-sudo python3 ipa/test/verify_model_swap.py --out results/popolazione_2026-10/cambio_modello
+sudo python3 ipa/test/check_model_swap.py --out results/popolazione_2026-10/cambio_modello
 sudo python3 ipa/test/test_model_source.py --kernel
-sudo python3 ipa/test/verify_per_model_semantics.py
+sudo python3 ipa/test/check_semantics_per_model.py
 \end{lstlisting}
 
 % ==================================================================
@@ -3879,49 +2744,49 @@ sudo python3 ipa/test/verify_per_model_semantics.py
 & \textbf{baseline} & \textbf{P1 statica} & \textbf{P1.5} & \textbf{P2} & \textbf{P3} \\
 \midrule
 \multicolumn{6}{@{}l}{\emph{Il nodo su traffico vero, un P-core (capitolo \ref{ch:reale}), 64 byte}} \\
-milioni di pacchetti al secondo & 15,27 & 8,56 & 8,04 & 3,45 & 2,36 \\
-ns di CPU per pacchetto & 66 & 117 & 124 & 290 & 425 \\
-costo della rete (sopra la baseline) & --- & 51 ns & 58 ns & 224 ns & 359 ns \\
-istruzioni eseguite per pacchetto & 606 & 1\,220 & 1\,426 & 4\,556 & 6\,573 \\
-istruzioni per ciclo & 2,7 & 3,0 & 3,3 & 4,5 & 4,4 \\
-pulita fino a (bit rate) & $\geq$ 4,05 & 4,04 & 4,08 & 1,54 & 1,02 Gbit/s \\
+milioni di pacchetti al secondo & 15,0 & 8,4 & 8,0 & 3,4 & 2,1 \\
+ns di CPU per pacchetto & 66 & 119 & 124 & 292 & 487 \\
+costo della rete (sopra la baseline) & --- & 53 ns & 58 ns & 226 ns & 421 ns \\
+istruzioni eseguite per pacchetto & 606 & 1\,168 & 1\,349 & 4\,578 & 7\,620 \\
+istruzioni per ciclo & 2,6 & 2,9 & 3,2 & 4,5 & 4,5 \\
 \addlinespace
 \multicolumn{6}{@{}l}{\emph{Lo stesso nodo su un E-core e su un LP E-core}} \\
-milioni di pacchetti al secondo, E-core & 9,39 & 6,35 & 5,84 & 2,83 & 1,94 \\
-\quad rispetto al P-core & 0,61 & 0,74 & 0,73 & 0,82 & 0,82 \\
-milioni di pacchetti al secondo, LP E-core & $\geq$ 3,29 & 3,10 & 2,91 & 1,57 & 1,10 \\
+milioni di pacchetti al secondo, E-core & 9,4 & 6,4 & 6,0 & 2,8 & 1,7 \\
+\quad rispetto al P-core & 0,63 & 0,76 & 0,75 & 0,82 & 0,83 \\
+LP E-core rispetto al P-core & 0,26 & 0,35 & 0,35 & 0,45 & 0,48 \\
 \addlinespace
 \multicolumn{6}{@{}l}{\emph{Il solo programma}} \\
-$T_2-T_1$ sul percorso vero (minimo) & 26 ns & 60 ns & 69 ns & 216 ns & 331 ns \\
-\texttt{BPF\_PROG\_TEST\_RUN}, pesi del modello & 14 ns & 46 ns & 52 ns & 194 ns & 318 ns \\
-istruzioni del programma caricato & 135 & 606 & 1\,019 & 15\,089 & 12\,288 \\
+$T_2-T_1$ sul percorso vero (minimo) & 27 ns & 64 ns & 70 ns & 229 ns & 391 ns \\
+la rete da sola, in un ciclo caldo & --- & 42 ns & 48 ns & 214 ns & 381 ns \\
+istruzioni del programma caricato & 135 & 650 & 961 & 16\,813 & 12\,288 \\
+letture di tabella per pacchetto & 3 & 5 & 6 & 12 & 36 \\
 \addlinespace
 \multicolumn{6}{@{}l}{\emph{Cambiare modello su un nodo in servizio}} \\
-caricare sul nodo & --- & \multicolumn{2}{c}{0,4--2,2 ms (AOT)} & \multicolumn{2}{c}{0,2--1 ms (10--12 con la lettura dei file)} \\
-anche generare e compilare & --- & \multicolumn{2}{c}{57--121 ms} & \multicolumn{2}{c}{non serve} \\
+caricare sul nodo & --- & 0,6 ms & 0,9 ms & 0,3 ms & 0,3 ms \\
+anche generare e compilare & --- & 50 ms & 61 ms & \multicolumn{2}{c}{non serve} \\
 serve un compilatore sul nodo? & --- & \multicolumn{2}{c}{no (compilato prima)} & \multicolumn{2}{c}{no} \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize\color{soft} Campagna del 6 ottobre (\texttt{results/campagna\_2026-10-06/}),
-core del banco a 3,5~GHz (2,5 il LP E-core). Il bit rate si misura su una griglia di
-valori: ``pulita fino a'' è l'ultimo punto della griglia senza perdite, non la
-capacità esatta.}
+{\footnotesize\color{soft} Mediane sulla popolazione (\texttt{results/popolazione\_2026-10/}):
+109 modelli sul P-core (P2: 103), 108 sull'E-core, 14 sul LP E-core, 91 con i tre
+orologi; core del banco a 3,5~GHz (2,5 il LP E-core).}
 \end{center}
 
 \begin{lezione}
 In quattro righe:
 \begin{enumerate}
-  \item \textbf{Scrivere i pesi nel programma costa circa 50--60~ns per
-        pacchetto sul nodo; leggerli da una tabella 225--360~ns.} È il prezzo della
-        configurabilità.
-  \item \textbf{Con l'oggetto precompilato, cambiare modello costa pochi
-        millisecondi per tutte le pipeline}. Il vantaggio residuo di P2 e P3 è non
-        dover compilare niente, da nessuna parte.
-  \item \textbf{Congelare anche il nodo (P1 statica) vale poco ma si vede}: circa
-        7~ns sul percorso vero, 5--7~ns sul solo programma, e la dimensione non
-        dipende più dalla taglia della rete.
+  \item \textbf{Scrivere i pesi nel programma costa in mediana 50--60~ns per
+        pacchetto sul nodo; leggerli da una tabella 225--420~ns.} È il prezzo
+        della configurabilità, e si stima dalla forma del modello con la legge di
+        costo, con qualche punto percentuale di errore.
+  \item \textbf{Con l'oggetto precompilato, cambiare modello costa meno di un
+        millisecondo in mediana per tutte le pipeline}. Il vantaggio residuo di
+        P2 e P3 è non dover compilare niente, da nessuna parte.
+  \item \textbf{Congelare anche il nodo (P1 statica) vale poco ma si vede}: la
+        rete di P1.5 costa 1,11 volte quella di P1 in mediana, di più su 89 modelli
+        su 109, e la dimensione di P1 non dipende più dalla taglia della rete.
   \item \textbf{Su un core lento il codice è lo stesso, l'IPC no}: un E-core regge
-        dal 61\% (baseline) all'82\% (P2, P3) del P-core, perché rallenta
+        dal 63\% (baseline) all'82--83\% (P2, P3) del P-core, perché rallenta
         soprattutto la parte fissa del nodo e poco l'aritmetica della rete.
 \end{enumerate}
 \end{lezione}
@@ -3932,20 +2797,21 @@ In quattro righe:
 \begin{itemize}
 \item \textbf{Il costo del nodo di baseline e \texttt{rxonly}} con pacchetti
       grezzi: con un thread per coda il generatore non le satura sul P-core, e
-      più thread intralciano la coda (sezione~\ref{sec:scrittore}); sul LP E-core
-      il generatore non satura nemmeno la baseline. Serve un generatore più
-      veloce su un solo scrittore, o una scheda vera.
-\item \textbf{Tre marcature e latenza minima su modelli diversi}: solo col
-      checkpoint (capitolo \ref{ch:modelli}).
+      più thread intralciano la coda (sezione~\ref{sec:scrittore}). Serve un
+      generatore più veloce su un solo scrittore, o una scheda vera.
+\item \textbf{Il ritardo end-to-end sulla popolazione}: le curve a traffico
+      crescente lo registrano, ma la sintesi non lo riassume.
+\item \textbf{Altre frequenze}: tutte le misure sono a 3,5~GHz (2,5 il LP E-core).
 \item \textbf{Gli E-core al loro massimo}, 3,8~GHz: misurati solo a 3,5.
 \item \textbf{Hardware vero}: una scheda di rete con XDP nativo e una seconda
       macchina, per un numero che non sia di un cavo virtuale.
 \item \textbf{Il tetto sull'uscita di P2}: lo strato finale è srotolato a 32
       classi per un modello che ne ha 7. Abbassarlo ridurrebbe il programma ma
       \emph{restringe l'insieme dei modelli rappresentabili}.
-\item \textbf{I salti fra programmi di P3}: tre per pacchetto, ed è lì (con le
-      letture che li accompagnano, 1\,096 istruzioni per strato) che sta la
-      latenza.
+\item \textbf{I salti fra programmi di P3}: uno per strato, da 2 a 7 per
+      pacchetto sulla popolazione, ed è lì (con le letture che li accompagnano,
+      circa 690 istruzioni fisse per strato) che sta la latenza. Quanto sia il
+      salto e quanto le letture non è separato.
 \item \textbf{La profondità massima di P2} fra 20 e 37 strati: il punto esatto in
       cui clang si ferma non è misurato.
 \item \textbf{Isolamento dal boot}: i core del banco sono isolati a sistema acceso;
@@ -3983,31 +2849,33 @@ sudo python3 ipa/test/host_conditions.py --restore
 
 # le condizioni verificate: su un /sys finto, e sul kernel vero
 python3 ipa/test/test_host_conditions.py
-sudo python3 ipa/test/test_host_kernel.py --bench
+sudo python3 ipa/test/test_host_conditions_kernel.py --bench
 
-# tutte le misure del quaderno (circa un'ora)
-bash ipa/test/remeasure_campagna.sh
+# tutte le misure senza traffico vero (circa 20 minuti)
+bash ipa/test/run_kernel_checks.sh
+# la campagna sulla popolazione
+bash ipa/test/run_population_campaign.sh
 \end{lstlisting}
 
 \section{Correttezza: il modello fa quello che deve}
 
 \begin{lstlisting}
-python3 ipa/test/test_suite.py
+python3 ipa/test/test_weights_and_metrics.py
 python3 ipa/test/test_class_semantics.py
-python3 ipa/test/test_synth.py
-python3 ipa/test/verify_synth_kernel.py --all --dry-run
+python3 ipa/test/test_synthetic_models.py
+python3 ipa/test/check_kernel_vs_reference.py --all --dry-run
 \end{lstlisting}
 
 \section{Kernel: si carica, e quanto costa}
 
 \begin{lstlisting}
 sudo python3 ipa/test/host_conditions.py --run -- \
-     python3 ipa/test/test_suite.py --only kernel
-sudo python3 ipa/test/verify_multi_model.py
-sudo python3 ipa/test/verify_per_model_semantics.py
-sudo python3 ipa/test/verify_synth_kernel.py --all --n 300
-sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p2
-sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p3
+     python3 ipa/test/test_weights_and_metrics.py --only kernel
+sudo python3 ipa/test/check_multi_model.py
+sudo python3 ipa/test/check_semantics_per_model.py
+sudo python3 ipa/test/check_kernel_vs_reference.py --all --n 300
+sudo python3 ipa/test/check_kernel_vs_reference.py --all --n 300 --pipeline p2
+sudo python3 ipa/test/check_kernel_vs_reference.py --all --n 300 --pipeline p3
 \end{lstlisting}
 
 \section{Altri modelli, altre reti}
@@ -4016,17 +2884,16 @@ sudo python3 ipa/test/verify_synth_kernel.py --all --n 300 --pipeline p3
 python3 ipa/test/test_model_source.py
 sudo python3 ipa/test/test_model_source.py --kernel
 sudo python3 ipa/test/host_conditions.py --run -- \
-     python3 ipa/test/test_suite.py --only kernel --model synth:deep
-sudo python3 ipa/test/test_fabric.py --model synth:small -q
-python3 ipa/test/traffic_models.py          # i modelli degli assi sotto traffico
+     python3 ipa/test/test_weights_and_metrics.py --only kernel --model synth:deep
+sudo python3 ipa/test/test_forwarding.py --model synth:small -q
 \end{lstlisting}
 
 \section{Datapath reale: il pacchetto attraversa davvero}
 
 \begin{lstlisting}
-sudo python3 ipa/test/test_fabric.py
-sudo python3 ipa/test/test_fabric.py --method aot
-sudo python3 ipa/test/test_fabric.py --sweep
+sudo python3 ipa/test/test_forwarding.py
+sudo python3 ipa/test/test_forwarding.py --method aot
+sudo python3 ipa/test/test_forwarding.py --sweep
 sudo python3 ipa/test/netns_fabric.py --cleanup
 \end{lstlisting}
 
@@ -4047,40 +2914,40 @@ sudo python3 ipa/test/host_conditions.py --run -- \
 \section{Il test reale}
 
 \begin{lstlisting}
-# tutto il traffico: P-core, E-core, LP E-core, assi; poi la sintesi
-bash ipa/test/remeasure_campagna.sh pcore ecore lpe assi
-python3 ipa/test/campaign_report.py results/campagna_2026-10-06
+# tutto il traffico sulla popolazione, poi la sintesi
+bash ipa/test/run_population_campaign.sh
+python3 ipa/test/report_population.py results/popolazione_2026-10 > sintesi.md
 
 # capacita' a un core: nodo su un P-core (6) o su un E-core (12)
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
+sudo python3 ipa/test/bench_capacity.py --mode compare --generator xdp \
      --rounds 3 --gen-cpus 10 --dut-cpus 6 --egress-cpu 8 --out results/pcore
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
+sudo python3 ipa/test/bench_capacity.py --mode compare --generator xdp \
      --rounds 3 --gen-cpus 10 --dut-cpus 12 --egress-cpu 8 --out results/ecore
 
 # il bit rate crescente: latenza, ricevuti, inoltrati, dove si perde
-sudo python3 ipa/test/bench_bitrate.py --generator xdp --gen-cpus 10 \
+sudo python3 ipa/test/bench_load_curve.py --generator xdp --gen-cpus 10 \
      --dut-cpus 6 --egress-cpu 8 --out results/bitrate
-python3 ipa/test/bench_bitrate.py --report results/bitrate
+python3 ipa/test/bench_load_curve.py --report results/bitrate
 
 # le tre marcature T1/T2/T3 su una scala di rate
-sudo python3 ipa/test/bench_throughput.py --mode rates --generator xdp \
+sudo python3 ipa/test/bench_capacity.py --mode rates --generator xdp \
      --gen-cpus 10 --dut-cpus 6 --frames 64 --rounds 3 --rates 0.05,0.5,1,1.5,2,2.5,3
 
 # per classe e per taglia
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
+sudo python3 ipa/test/bench_capacity.py --mode compare --generator xdp \
      --gen-cpus 10 --dut-cpus 6 --egress-cpu 8 --per-class --rounds 3
-sudo python3 ipa/test/bench_throughput.py --mode compare --generator xdp \
+sudo python3 ipa/test/bench_capacity.py --mode compare --generator xdp \
      --gen-cpus 10 --dut-cpus 6 --egress-cpu 8 --frames 64,512,1514 --rounds 3
 
 # i contatori hardware, a mano
 sudo python3 ipa/test/hw_counters.py --cpu 6,12,20 --seconds 1
 
 # la finestra di misura e le formule, verificate senza kernel
-python3 ipa/test/test_steady_window.py
-python3 ipa/test/test_bitrate_math.py
+python3 ipa/test/test_capacity_window.py
+python3 ipa/test/test_load_curve_math.py
 
 # se un run si interrompe e lascia il generatore configurato
-sudo python3 ipa/test/bench_throughput.py --cleanup
+sudo python3 ipa/test/bench_capacity.py --cleanup
 \end{lstlisting}
 
 \begin{prima}[Come si legge l'uscita]
@@ -4099,10 +2966,10 @@ riportate, non scartate.
 \section{Costi specifici e oggetto precompilato}
 
 \begin{lstlisting}
-sudo python3 ipa/test/bench_tailcall_overhead.py
+sudo python3 ipa/test/bench_tail_call.py
 python3 ipa/methods/method4_hardcoded_aot.py --build-only   # build, come utente
 sudo python3 ipa/methods/method4_hardcoded_aot.py           # verifica e bench
-sudo python3 ipa/test/diag_verifier.py                      # statistiche del verificatore
+sudo python3 ipa/test/check_verifier_stats.py                      # statistiche del verificatore
 \end{lstlisting}
 
 \section{L'ordine consigliato}
@@ -4112,12 +2979,13 @@ Partendo da zero su una macchina nuova:
 \begin{enumerate}
 \item \texttt{python3 ipa/test/host\_conditions.py --show} --- com'è fatta la
       macchina, e dove andrebbe il banco?
-\item \texttt{python3 ipa/test/test\_synth.py} --- il C generato per P1 calcola il modello? (\texttt{test\_suite.py}, che controlla estrazione dei pesi e quantizzazione, richiede PyTorch)
-\item \texttt{sudo python3 ipa/test/test\_host\_kernel.py} --- le condizioni si
-      mettono e si tolgono davvero?
-\item \texttt{sudo python3 ipa/test/test\_fabric.py} --- il pacchetto attraversa
-      davvero?
-\item \texttt{bash ipa/test/remeasure\_campagna.sh} --- tutti i numeri.
+\item \texttt{python3 ipa/test/test\_synthetic\_models.py} --- il C generato per P1 calcola il modello? (\texttt{test\_weights\_and\_metrics.py}, che controlla estrazione dei pesi e quantizzazione, richiede PyTorch)
+\item \texttt{sudo python3 ipa/test/test\_host\_conditions\_kernel.py} --- le
+      condizioni si mettono e si tolgono davvero?
+\item \texttt{sudo python3 ipa/test/test\_forwarding.py} --- il pacchetto
+      attraversa davvero?
+\item \texttt{bash ipa/test/run\_kernel\_checks.sh} --- tutte le verifiche nel kernel.
+\item \texttt{bash ipa/test/run\_population\_campaign.sh} --- tutti i numeri.
 \end{enumerate}
 
 \end{document}

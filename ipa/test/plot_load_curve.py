@@ -1,51 +1,27 @@
 #!/usr/bin/env python3
-"""
-plot_bitrate.py -- i grafici del test al crescere del bit rate, dal CSV.
+"""plot_load_curve.py -- charts of bench_load_curve from its CSV: latency,
+packets sent / received / forwarded, loss, against the offered rate.
 
-Legge <dir>/bitrate.csv (la sintesi di bench_bitrate.py: mediana fra i giri,
-min/max, collo di bottiglia) e scrive in <dir>, per ogni taglia di frame:
-
-  bitrate_latency   latenza end-to-end contro bit rate inviato: mediana (p50)
-                    e 99-esimo percentile, una linea per pipeline. Marcatore
-                    vuoto = a quel rate la pipeline perde (collo != nessuna).
-  bitrate_pps       un pannello per metodo: inviati, ricevuti da XDP e
-                    inoltrati, in Mpps. Dove le curve si separano si perde, e
-                    la curva che si stacca dice dove.
-  bitrate_loss      un pannello per pipeline: perdita prima di XDP, nella
-                    pipeline, e il pavimento del solo contatore (rxonly).
-
-Nessun numero viene prodotto qui: si disegna solo cio' che il CSV contiene.
-Gira ovunque ci sia matplotlib, anche senza root, BCC o kernel Linux:
-
-    python3 ipa/test/plot_bitrate.py results/bitrate
+    python3 ipa/test/plot_load_curve.py <results dir>
 """
 import csv
 import os
 import sys
 
-# Stessi colori e marcatori di bench_scaling.STYLE, cosi' una pipeline ha lo
-# stesso aspetto in tutte le figure della tesi. Le quattro tinte passano il
-# validatore della guida sui vicini (linee); il verde sta sotto 3:1 sul
-# bianco, quindi legenda e marcatori sono obbligatori e il CSV fa da tabella.
-# La baseline e' il riferimento, non una serie: grigio neutro.
 PIPE = {
-    "baseline":  dict(color="#7f8c8d", marker="x", label="baseline (nessuna rete)"),
-    "p1_static": dict(color="#8e44ad", marker="D", label="P1 specializzata"),
+    "baseline":  dict(color="#7f8c8d", marker="x", label="baseline (no network)"),
+    "p1_static": dict(color="#8e44ad", marker="D", label="P1 static"),
     "hardcoded": dict(color="#c0392b", marker="o", label="P1.5 hardcoded"),
     "template":  dict(color="#2980b9", marker="s", label="P2 template"),
     "modular":   dict(color="#27ae60", marker="^", label="P3 modular"),
 }
-TITLE = {"rxonly": "rxonly (solo contatore)", **{k: v["label"]
-                                                  for k, v in PIPE.items()}}
+TITLE = {"rxonly": "rxonly (counter only)", **{k: v["label"]
+                                               for k, v in PIPE.items()}}
 ORDER = ("rxonly", "baseline", "p1_static", "hardcoded", "template", "modular")
-
-# Gli stadi del percorso (figure 2 e 3): slot 1 e 2 della palette di
-# riferimento, validati anche su tutte le coppie.
-C_RX = "#2a78d6"            # ricevuti da XDP / perdita prima di XDP
-C_FWD = "#eb6834"           # inoltrati / perdita nella pipeline
-C_REF = "#8b8a85"           # inviati, pavimento rxonly: riferimento neutro
+C_RX = "#2a78d6"
+C_FWD = "#eb6834"
+C_REF = "#8b8a85"
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e6e5e1"
-
 NUMERIC_SKIP = {"method", "bottleneck"}
 
 
@@ -89,8 +65,7 @@ def _series(rows, method, ykey):
 
 
 def _bench(r):
-    """Perdita col nodo non saturo: del banco, non del programma
-    (bench_bitrate.LABEL_BENCH)."""
+    """Loss with the node not saturated."""
     return str(r.get("bottleneck") or "").startswith("banco")
 
 
@@ -100,9 +75,8 @@ def _lossy(r):
 
 
 def _onset(rows, method):
-    """Il rate da cui TUTTI i rate piu' alti perdono (come
-    bench_bitrate.onsets): una riga in perdita seguita da righe pulite e' una
-    finestra disturbata, non l'inizio della perdita."""
+    """The rate from which ALL higher rates lose (as
+    bench_load_curve.onsets)."""
     pts = sorted((r for r in rows if r["method"] == method),
                  key=lambda r: r["rate_requested_pps"])
     lossy = [_lossy(r) or _bench(r) for r in pts]
@@ -124,9 +98,9 @@ def fig_latency(plt, rows, frame, out_dir, suffix):
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), sharey=True)
     ymin, ymax = None, None
     drawn = []
-    for ax, key, title in ((axes[0], "e2e_latency_p50_us", "mediana (p50)"),
+    for ax, key, title in ((axes[0], "e2e_latency_p50_us", "median (p50)"),
                            (axes[1], "e2e_latency_p99_us",
-                            "99-esimo percentile (p99)")):
+                            "99th percentile (p99)")):
         _style(ax)
         for m in ORDER:
             if m not in PIPE:
@@ -148,7 +122,7 @@ def fig_latency(plt, rows, frame, out_dir, suffix):
             if m not in drawn:
                 drawn.append(m)
         ax.set_title(title, fontsize=10, color=INK, loc="left")
-        ax.set_xlabel("bit rate inviato (Gbit/s)")
+        ax.set_xlabel("offered bit rate (Gbit/s)")
     if not drawn:
         plt.close(fig)
         return []
@@ -164,16 +138,16 @@ def fig_latency(plt, rows, frame, out_dir, suffix):
                for m in drawn]
     handles.append(Line2D([0], [0], color=INK2, marker="o", linestyle="none",
                           markerfacecolor="white", markersize=6,
-                          label="marcatore vuoto: a quel rate si perde"))
+                          label="empty marker: loss at that rate"))
     fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
                fontsize=8, bbox_to_anchor=(0.5, 1.08), labelcolor=INK)
-    fig.suptitle(f"Latenza end-to-end contro bit rate inviato — frame {frame} B",
+    fig.suptitle(f"End-to-end latency against offered bit rate — frame {frame} B",
                  fontsize=11, color=INK, x=0.01, ha="left", y=1.14)
-    stamp = ("Timbro di xdp_gen all'invio -> nodo successivo, nessuna "
-             "correzione" if GENERATOR == "xdp" else
-             "Timbro di pktgen -> nodo successivo, corretto per l'attesa di "
-             "pktgen")
-    fig.text(0.01, -0.04, f"{stamp}; mediana fra i giri. Scala logaritmica.",
+    stamp = ("xdp_gen timestamp at send -> next node, no "
+             "correction" if GENERATOR == "xdp" else
+             "pktgen timestamp -> next node, corrected for pktgen's "
+             "wait")
+    fig.text(0.01, -0.04, f"{stamp}; median over rounds. Log scale.",
              fontsize=7.5, color=INK2, ha="left")
     paths = _save(fig, out_dir, f"bitrate_latency{suffix}")
     plt.close(fig)
@@ -199,9 +173,6 @@ def fig_pps(plt, rows, frame, out_dir, suffix):
     fig, axes = _panels(plt, len(methods))
     xmax = max((r["bitrate_sent_gbps"] for r in rows
                 if r.get("bitrate_sent_gbps") is not None), default=1.0)
-    # Ricevuti e inoltrati coincidono finche' l'uscita non perde: i ricevuti
-    # sono una traccia larga SOTTO, gli inoltrati una linea sottile SOPRA,
-    # cosi' restano visibili tutte e due anche sovrapposte.
     for ax, m in zip(axes, methods):
         _style(ax)
         for key, color, z, lw, mk in (("sent_pps", C_REF, 1, 1.2, None),
@@ -225,32 +196,32 @@ def fig_pps(plt, rows, frame, out_dir, suffix):
             x = on["bitrate_sent_gbps"]
             ax.axvline(x, color=INK2, linewidth=0.8, zorder=0)
             right = x > 0.75 * xmax
-            what = "limite del banco" if _bench(on) else "perde da qui"
+            what = "bench limit" if _bench(on) else "loses from here"
             ax.text(x, 0.98, (f"{what} " if right else f" {what}"),
                     transform=ax.get_xaxis_transform(), fontsize=7,
                     color=INK2, va="top", ha=("right" if right else "left"))
         ax.set_title(TITLE.get(m, m), fontsize=9, color=INK, loc="left")
     for ax in axes:
         if ax.get_subplotspec().is_last_row():
-            ax.set_xlabel("bit rate inviato (Gbit/s)")
+            ax.set_xlabel("offered bit rate (Gbit/s)")
         if ax.get_subplotspec().is_first_col():
             ax.set_ylabel("Mpps")
     handles = [Line2D([0], [0], color=C_REF, linewidth=1.2,
-                      label="inviati dal generatore"),
+                      label="sent by the generator"),
                Line2D([0], [0], color=C_RX, linewidth=3.4, marker="o",
-                      markersize=6, label="ricevuti da XDP (programma 1)"),
+                      markersize=6, label="received by XDP (program 1)"),
                Line2D([0], [0], color=C_FWD, linewidth=1.6, marker="o",
-                      markersize=3.5, label="inoltrati (arrivati al nodo "
-                                            "successivo)")]
+                      markersize=3.5, label="forwarded (reached the next "
+                                            "node)")]
     fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
                fontsize=8, bbox_to_anchor=(0.5, 1.02), labelcolor=INK)
-    fig.suptitle(f"Pacchetti al secondo contro bit rate inviato — frame "
+    fig.suptitle(f"Packets per second against offered bit rate — frame "
                  f"{frame} B", fontsize=11, color=INK, x=0.01, ha="left",
                  y=1.07)
-    fig.text(0.01, -0.02, "Inviati sopra i ricevuti: si perde prima di XDP "
-             "(coda d'ingresso piena, collo il programma o la ricezione). "
-             "Ricevuti sopra gli inoltrati: si perde dopo XDP (uscita, collo "
-             "trasmissivo) o il modello scarta. Barre: min-max fra i giri.",
+    fig.text(0.01, -0.02, "Sent above received: loss before XDP "
+             "(ingress queue full, bottleneck the program or reception). "
+             "Received above forwarded: loss after XDP (egress, "
+             "transmission bottleneck) or the model drops. Bars: min-max over rounds.",
              fontsize=7.5, color=INK2, ha="left", wrap=True)
     fig.tight_layout()
     paths = _save(fig, out_dir, f"bitrate_pps{suffix}")
@@ -281,30 +252,29 @@ def fig_loss(plt, rows, frame, out_dir, suffix):
         ax.set_title(TITLE.get(m, m), fontsize=9, color=INK, loc="left")
     for ax in axes:
         if ax.get_subplotspec().is_last_row():
-            ax.set_xlabel("bit rate inviato (Gbit/s)")
+            ax.set_xlabel("offered bit rate (Gbit/s)")
         if ax.get_subplotspec().is_first_col():
-            ax.set_ylabel("% degli inviati")
+            ax.set_ylabel("% of sent")
     handles = [Line2D([0], [0], color=C_RX, linewidth=2, marker="o",
-                      markersize=4, label="persi prima di XDP"),
+                      markersize=4, label="lost before XDP"),
                Line2D([0], [0], color=C_FWD, linewidth=2, marker="o",
-                      markersize=4, label="persi nella pipeline (uscita + "
-                                          "decisioni)"),
+                      markersize=4, label="lost in the pipeline (egress + "
+                                          "decisions)"),
                Line2D([0], [0], color=C_REF, linewidth=1.2,
-                      label="solo contatore (rxonly), prima di XDP")]
+                      label="counter only (rxonly), before XDP")]
     fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
                fontsize=8, bbox_to_anchor=(0.5, 1.02), labelcolor=INK)
-    fig.suptitle(f"Perdita contro bit rate inviato — frame {frame} B",
+    fig.suptitle(f"Loss against offered bit rate — frame {frame} B",
                  fontsize=11, color=INK, x=0.01, ha="left", y=1.07)
-    fig.text(0.01, -0.02, "La perdita prima di XDP oltre quella del solo "
-             "contatore e' del programma; quella dopo XDP e' trasmissiva. "
-             "Mediana fra i giri.", fontsize=7.5, color=INK2, ha="left")
+    fig.text(0.01, -0.02, "Loss before XDP beyond the counter-only one "
+             "is the program's; loss after XDP is the transmission's. "
+             "Median over rounds.", fontsize=7.5, color=INK2, ha="left")
     fig.tight_layout()
     paths = _save(fig, out_dir, f"bitrate_loss{suffix}")
     plt.close(fig)
     return paths
 
 
-# Il generatore del run (da env.csv): cambia la didascalia della latenza.
 GENERATOR = "pktgen"
 
 
@@ -320,7 +290,7 @@ def _generator_of(out_dir):
 
 
 def plot_all(out_dir):
-    """Tutte le figure per tutte le taglie di frame; restituisce i file."""
+    """Every figure for every frame size."""
     global GENERATOR
     GENERATOR = _generator_of(out_dir)
     import matplotlib
@@ -335,16 +305,16 @@ def plot_all(out_dir):
         for fn in (fig_latency, fig_pps, fig_loss):
             written += fn(plt, fr, frame, out_dir, suffix)
     for p in written:
-        print(f"  scritto {p}")
+        print(f"  written {p}")
     return written
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
-        sys.exit("uso: plot_bitrate.py <cartella con bitrate.csv>")
+        sys.exit("usage: plot_load_curve.py <directory with bitrate.csv>")
     if not os.path.exists(os.path.join(argv[0], "bitrate.csv")):
-        sys.exit(f"{argv[0]}: manca bitrate.csv (lo scrive bench_bitrate.py)")
+        sys.exit(f"{argv[0]}: bitrate.csv missing (written by bench_load_curve.py)")
     plot_all(argv[0])
     return 0
 

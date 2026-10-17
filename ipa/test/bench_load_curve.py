@@ -1,223 +1,12 @@
 #!/usr/bin/env python3
-"""
-bench_bitrate.py -- il test al crescere del BIT RATE offerto: ritardo
-end-to-end, pacchetti che il programma XDP riceve, pacchetti che rilancia, e
-dove comincia la perdita.
+"""bench_load_curve.py -- the node under growing traffic.
 
---------------------------------------------------------------------------
-LA DOMANDA
---------------------------------------------------------------------------
-La richiesta: grafico in funzione del bit rate inviato. La coda si
-riempie, il tempo end-to-end cresce fino a una perdita. Se si perde all'uscita
-del programma il collo di bottiglia e' trasmissivo, se si perde all'ingresso
-e' il programma eBPF. Contare quanti pacchetti il programma riceve e quanti ne
-rilancia: due programmi eBPF sullo stesso XDP, uno conta soltanto, l'altro
-contiene la pipeline.
+The offered rate grows step by step; for each step the bench measures the
+end-to-end delay, the packets the XDP program receives and forwards, and where
+loss starts (before the program = the program is the bottleneck). Needs root.
 
-Come si legge su XDP. Il programma gira dall'inizio alla fine su ogni
-pacchetto, dentro il poll NAPI (run-to-completion): non ha una coda sua, e ogni
-pacchetto che entra esce con un verdetto. Se il programma e' lento si riempie
-la coda che sta DAVANTI a lui -- il ring di ricezione dell'interfaccia; su
-veth il ptr_ring, 256 descrittori per coda -- e quindi, al crescere del rate:
-
-  1. il ritardo end-to-end cresce (attesa in quella coda);
-  2. poi la coda trabocca e i pacchetti si perdono PRIMA di XDP.
-
-  perdita prima di XDP  -> collo di bottiglia del programma. Oppure della
-                           ricezione che glielo porta: per separarli c'e' il
-                           riferimento `rxonly`, il solo contatore allo stesso
-                           rate. Se il solo contatore non perde e la pipeline
-                           si', la differenza e' il programma.
-  perdita dopo XDP      -> il programma ha deciso l'inoltro ma il pacchetto
-                           non arriva al nodo successivo: redirect o coda
-                           d'uscita, cioe' collo di bottiglia trasmissivo.
-
-"Il programma riceve ma non riesce a rilanciare" non esiste come coda interna:
-fra ricevuti e rilanciati ci sono solo le DECISIONI del modello (classe DROP,
-MISS) e i fallimenti dell'uscita, e il test li conta separatamente.
-
---------------------------------------------------------------------------
-IL BANCO: quello di bench_throughput, non uno nuovo
---------------------------------------------------------------------------
-Stesso fabric veth (netns_fabric), stesso generatore (xdp_gen per default,
-pktgen con --generator pktgen; vedi CON XDP_GEN), stessa finestra stazionaria (Generator.steady), stesse
-pipeline caricate da build_pipeline -- gli oggetti di produzione, NON le build
-strumentate di `--mode rates`: nessuna riga del loro codice cambia. Il modulo
-usa bench_throughput come libreria e non lo modifica.
-
-    xdp_gen (cpu gen) --veth ipatg0p->ipatg0--> [XDP: contatore -> pipeline]
-        --bpf_redirect--> ipaN --veth--> ipaNp [XDP: contatore d'uscita]
-
---------------------------------------------------------------------------
-I DUE PROGRAMMI SULLO STESSO HOOK
---------------------------------------------------------------------------
-Un'interfaccia porta UN programma XDP (modo nativo). Due programmi sullo
-stesso hook si ottengono in catena, con la tail call che il progetto usa gia'
-(P1 dispatcher -> modello, P2 -> architettura, P3 -> strati):
-
-  programma 1  xdp_ing_count, attaccato all'hook. ing_count[0] += 1 su una
-               mappa PER-CPU (niente atomiche, niente contesa), poi
-               bpf_tail_call(ing_next[0]). Se la tail call non parte,
-               ing_count[1] += 1 e XDP_DROP: un contatore che non deve mai
-               muoversi, e che si controlla a ogni finestra.
-  programma 2  la pipeline, cioe' il suo programma d'ingresso (dispatcher)
-               messo in ing_next[0]. Stesso ctx: ingress_ifindex, pacchetto e
-               metadati sono quelli che avrebbe visto attaccata da sola.
-
-La tail call richiede programmi compatibili: stesso tipo, stesso JIT e, nei
-kernel recenti, stesso expected_attach_type -- che BCC lascia a 0 e libbpf
-mette a BPF_XDP. Il contatore viene percio' caricato dallo STESSO caricatore
-della pipeline che precede:
-
-  baseline, P2, P3   oggetto BCC a parte (ING_COUNTER_BCC)
-  P1, P1.5           dentro lo stesso oggetto AOT (ING_COUNTER_LIBBPF,
-                     aggiunto in coda al sorgente, come fa gia' la build
-                     strumentata _instrument_aot_latency): stesso clang, stesso
-                     loader_aot, stessi attributi. I programmi della pipeline
-                     nell'oggetto restano quelli di produzione.
-  rxonly             il contatore da solo, slot vuoto: conta e scarta. E' il
-                     tetto della ricezione allo stesso rate.
-
-Il costo del contatore non si suppone: la fase finale porta ogni pipeline a
-rate massimo con e senza catena e legge dal kernel il tempo del programma
-attaccato (kernel.bpf_stats_enabled, run_time_ns / run_cnt: con la catena e'
-contatore + pipeline, senza e' la pipeline). Accanto resta la stima dal
-throughput, che dice quanto rallenta il nodo ma e' molto piu' rumorosa: la si
-tiene per confronto (bitrate_overhead.csv).
-
---------------------------------------------------------------------------
-DOVE SI CONTA, E COME SI LEGGE
---------------------------------------------------------------------------
-  inviati     pktgen: pkts-sofar (accettati dal veth) + errors (respinti a
-              coda d'ingresso piena). Letti dal file /proc/net/pktgen/<ist>.
-  RX XDP      ing_count[0], programma 1, somma sulle CPU.
-  decisioni   pkt_stats[0..2] della pipeline (HIT = inoltro deciso, MISS,
-              DROP), i contatori che la pipeline ha gia'.
-  inoltrati   rx_count sul nodo successivo: il programma d'uscita
-              (xdp_rx_lat, al posto dello stub XDP_PASS del fabric) conta ogni
-              pacchetto che ARRIVA. bpf_redirect da solo non garantisce la
-              trasmissione: si conta dopo.
-
-Tutti i contatori sono cumulativi e non si azzerano. Ogni punto e' UNA
-finestra stazionaria: pktgen parte, si aspetta che tutte le istanze
-trasmettano, si leggono TUTTI i contatori (lettura sotto i 3 ms, rifatta se
-piu' lunga), si aspettano `--duration` secondi, si rileggono, si ferma pktgen.
-I valori della riga sono le DIFFERENZE fra le due letture, e la durata e'
-l'intervallo fra i loro istanti medi (duration_s). Avvio, assestamento e coda
-finale restano fuori per costruzione.
-
---------------------------------------------------------------------------
-PERDITE (in pacchetti; le percentuali sono sugli INVIATI e si sommano)
---------------------------------------------------------------------------
-  loss_before_xdp  = inviati - RX_XDP
-                   = respinti (errors di pktgen) + persi fra veth e XDP
-  loss_in_pipeline = RX_XDP - inoltrati
-                   = decisioni (MISS + DROP)
-                   + perdita all'uscita (HIT - inoltrati)
-                   + residuo (RX_XDP - HIT - MISS - DROP, atteso ~0)
-  packets_lost     = inviati - inoltrati = le due sopra
-
-Il residuo non e' zero esatto perche' i contatori si leggono uno dopo
-l'altro: lo sfasamento si annulla fra le due letture ma non del tutto.
-
---------------------------------------------------------------------------
-BIT RATE
---------------------------------------------------------------------------
-  bitrate_sent_bps = inviati / duration_s * frame * 8
-
-`frame` e' il pkt_size di pktgen, cioe' il frame senza FCS: sono i byte che
-attraversano il veth (L2). bitrate_sent_l1_gbps aggiunge i 24 byte che una
-Ethernet vera spende per frame (FCS 4, preambolo 8, IFG 12), solo come
-riferimento. Il rate CHIESTO fissa il `delay` di pktgen; l'asse dei grafici e'
-quello MISURATO, perche' sopra il tetto del generatore i due divergono
-(gen_limited).
-
-Senza --bitrates si usano i punti in pps della scala a 64 byte anche per le
-altre taglie: il costo del nodo e' per pacchetto, non per byte.
-
---------------------------------------------------------------------------
-LATENZA END-TO-END
---------------------------------------------------------------------------
-pktgen scrive gia' in ogni pacchetto, subito dopo l'intestazione UDP, la sua
-intestazione (magic 0xbe9be955, seq, tv_sec, tv_usec): l'istante in cui ha
-costruito il pacchetto, CLOCK_REALTIME in microsecondi. Il programma d'uscita
-lo legge e lo confronta con il proprio orologio:
-
-  lat_us = floor((bpf_ktime_get_ns() + off) / 1000) - (tv_sec*1e6 + tv_usec)
-
-  off  = CLOCK_REALTIME - CLOCK_MONOTONIC, letto da Python prima di ogni
-         punto e scritto in lat_ctl[1] (bpf_ktime_get_ns e' il monotono)
-  risoluzione 1 us: entrambi gli istanti sono troncati al microsecondo, quindi
-  l'errore su un campione sta in (-1, +1) us e sulla media si annulla
-
-Il percorso misurato e' tutto il nodo: accodamento sul veth d'ingresso,
-ATTESA IN CODA, i due programmi, redirect, accodamento d'uscita, ricezione del
-nodo successivo. E' la cifra che cresce quando la coda si riempie; T3-T1 di
-`--mode rates` parte invece dall'ingresso del programma e l'attesa in coda non
-la vede.
-
-La correzione che serve. pktgen timbra il pacchetto e POI aspetta il momento
-di trasmetterlo (spin() fino a next_tx, net/core/pktgen.c): il timbro precede
-la trasmissione di quell'attesa, che a rate basso e' quasi tutto il `delay`
-(~10 us a 0,2 Mpps). pktgen la accumula nel suo contatore `idle`; la media per
-pacchetto, Delta(idle) / inviati nella finestra, si sottrae da ogni statistica
-(e2e_spin_correction_us). I valori non corretti restano nel CSV
-(e2e_latency_p50_raw_us).
-
-Campionamento: si cronometra un arrivo ogni `mask+1` (contatore per-CPU degli
-arrivi, prima di toccare il pacchetto), con mask = potenza di 2 tale da
-restare vicino a --lat-samples campioni per finestra: ad alto rate il costo
-sul percorso misurato e' ~1/64 di pacchetto. Il contatore dei pacchetti invece
-conta tutto, sempre. I campioni si registrano da quando la finestra comincia
-(lat_ctl[0], aperto alla prima lettura) a quando pktgen e' fermo e la coda
-svuotata: stessi rate, qualche ms in piu' della finestra dei conteggi. La
-prima versione chiudeva il cancello a meta' finestra contata dal primo
-tentativo di lettura, e una prima lettura rifatta per piu' di mezza finestra
-(visto nella sonda del 2026-09-26: 5 750 campioni su 12 307 inoltrati) lo
-chiudeva prima del tempo.
-
-Istogramma a due passi: celle da 1 us fino a 1024 us, poi da 64 us fino a
-65 536 us, piu' il trabocco. Con la coda d'ingresso piena il p99 puo' salire
-verso il millisecondo, e una sola scala da 1 us fino a 4 ms rischiava di
-tagliarlo.
-
---------------------------------------------------------------------------
-USCITE (in --out)
---------------------------------------------------------------------------
-  bitrate_raw.csv       una riga per (pipeline, rate, giro): tutti i conteggi
-  bitrate.csv           mediana fra i giri, collo di bottiglia per riga
-  bitrate_overhead.csv  costo del contatore per pipeline: ns con e senza
-                        catena, e la differenza (le finestre in *_raw.csv)
-  env.csv               condizioni della macchina e del run
-  bitrate_*.png/.pdf    i grafici (plot_bitrate.py, se c'e' matplotlib)
-
---------------------------------------------------------------------------
-USO
---------------------------------------------------------------------------
-    sudo python3 ipa/test/bench_bitrate.py --gen-cpus 10 --dut-cpus 6 \\
-        --out results/bitrate_xdp                       # xdp_gen, 0,5-8 Mpps
-    sudo python3 ipa/test/bench_bitrate.py --generator pktgen --bitrates 0.5,1,1.5,2,2.5 \\
-        --method rxonly,baseline,p1_static,template --rounds 5 --out results/bitrate
-    python3 ipa/test/plot_bitrate.py results/bitrate      # i grafici, anche altrove
-
-Serve Linux, root, BCC, clang (per P1/P1.5) e, solo con --generator pktgen,
-il modulo pktgen.
-
---------------------------------------------------------------------------
-CON XDP_GEN (il default dal 2026-10-02)
---------------------------------------------------------------------------
-Frame XDP grezzi invece degli skb di pktgen: niente copia di headroom sul DUT,
-come da una NIC con XDP nativo. La cadenza e il timbro li fa il programma
-generatore (xdp_gen.py: un frame all'istante previsto, gli altri giri
-scartati; intestazione pktgen scritta all'invio, quindi nessuna correzione
-per l'attesa). Un thread per coda d'ingresso (senza --gen-cpus, uno per CPU
-del DUT); senza scala, XDP_RATES_MPPS. Cadenza precisa fino a ~8 Mpps
-per thread: su un core baseline, P1 e rxonly non arrivano al loro limite.
---xdp-batch fissa il lotto del test_run: a fine lotto il redirect sveglia il
-DUT, e con 256 un frame puo' aspettare nel generatore fino a ~12 us, che il
-ritardo a basso carico conta (16-19 us contro 4-6 con 32). Con 32 la cadenza
-regge solo fino a ~2,5 Mpps. Le colonne napi_* e gen_* sono la diagnostica
-che ha trovato la pausa di ogni chiamata test_run.
+    sudo python3 ipa/test/bench_load_curve.py --generator xdp --rates 0.5,1,2,4 \\
+        --model <dir> --out <dir>
 """
 import argparse
 import contextlib
@@ -238,94 +27,45 @@ for _p in (SHARED, HERE):
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
-# La scala di default con xdp_gen, in Mpps: fino a dove la cadenza di un
-# thread e' esatta (~11-12 Mpps, docs/testing.md
-# §11.4).
 XDP_RATES_MPPS = (0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 
-# La scala fissa di ripiego, in Gbit/s a 64 byte, se la calibrazione non
-# riesce. Il default e' la scala CALIBRATA (auto_rates): le capacita'
-# dipendono dalla frequenza fissata (--freq) e dai core, e una scala fissa o
-# si ferma prima della saturazione o spreca meta' dei punti sopra.
 DEFAULT_BITRATES_GBPS = (0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0,
                          2.5, 3.0)
-# La scala calibrata: frazioni del tetto di RICEZIONE misurato all'inizio del
-# run (rxonly a massima spinta, cioe' il massimo che il DUT riceve senza fare
-# altro). Fitta dove stanno i ginocchi delle pipeline -- P3 intorno al 40%
-# del tetto, la baseline verso il 90% -- e oltre il tetto per vedere la
-# saturazione. I punti che il generatore non raggiunge si fermano al suo
-# tetto.
 AUTO_FRACTIONS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
                   1.1, 1.25)
 AUTO_CALIB_WINDOWS = 3
 AUTO_STEP_PPS = 1000
 DEFAULT_FRAME = 64
-ETH_L1_OVERHEAD = 24            # FCS 4 + preambolo/SFD 8 + IFG 12
-# Cinque giri e non tre: al primo run (2026-09-26) lo stesso punto e' uscito
-# con 58% / 0,2% / 7,7% di perdita nei tre giri, e con tre la mediana e' il
-# valore di mezzo di due finestre disturbate su tre.
+ETH_L1_OVERHEAD = 24
 DEFAULT_ROUNDS = 5
-# Soglia per dire "qui si perde", in punti percentuali degli inviati: si
-# confronta la pipeline con rxonly allo stesso rate e si chiede che la
-# differenza superi la soglia.
-#
-# Con i core del banco isolati, a frequenza fissa e senza C6/C10, il solo
-# contatore (rxonly) non respinge niente sotto capacita': 0,1, come
-# bench_throughput. Se rxonly mostra comunque un pavimento, la sottrazione lo
-# toglie; se oscilla, lo dice la colonna rxonly_loss_before_xdp_pct, e la
-# soglia si alza a mano (--loss-threshold).
 DEFAULT_LOSS_THRESHOLD = 0.1
-GEN_LIMITED_FRACTION = 0.95     # sotto il 95% del chiesto: tetto del generatore
-# Sopra il 105% del chiesto il generatore ha RECUPERATO: pktgen, se il suo
-# thread e' stato fermato, trasmette di fila fino a rimettersi in orario
-# (next_tx avanza di `delay` per pacchetto), cioe' una raffica a velocita'
-# piena che riempie la coda d'ingresso a qualunque rate medio. Visto al
-# primo run: 1,831 Mpps inviati su 1,465 chiesti. La finestra resta, marcata.
+GEN_LIMITED_FRACTION = 0.95
 GEN_BURST_FRACTION = 1.05
-
-# L'istogramma della latenza, a due passi: celle da 1 us fino a LAT_FINE_US,
-# poi da 2^LAT_STEP_SHIFT us fino a LAT_MAX_US, poi una cella di trabocco.
 LAT_FINE_US = 1024
-LAT_STEP_SHIFT = 6              # 64 us
+LAT_STEP_SHIFT = 6
 LAT_MAX_US = 65536
 LAT_CELLS = LAT_FINE_US + ((LAT_MAX_US - LAT_FINE_US) >> LAT_STEP_SHIFT)
-LAT_TARGET_SAMPLES = 20000      # campioni di latenza per finestra, circa
-PKTGEN_HDR_OFF = 14 + 20 + 8    # eth + IPv4 senza opzioni + UDP
-# Il costo del contatore si legge dalle statistiche BPF del kernel
-# (run_time_ns / run_cnt del programma attaccato), non dal throughput: al
-# primo run tre finestre per variante davano +34..+56 ns con uno scarto fra
-# le finestre di centinaia di ns (p1_static "catena" 775 poi 483 ns).
+LAT_TARGET_SAMPLES = 20000
+PKTGEN_HDR_OFF = 14 + 20 + 8
 OVERHEAD_REPS = 5
 BPF_STATS_KNOB = "/proc/sys/kernel/bpf_stats_enabled"
 SANITY_PPS = 100_000
 SANITY_S = 0.1
 DRAIN_S = 0.05
-
 REFERENCE = "rxonly"
 PIPELINES = ("baseline", "p1_static", "hardcoded", "template", "modular")
 AOT_METHODS = ("p1_static", "hardcoded")
-
 LABEL_NONE = "nessuna"
 LABEL_PROG = "ingresso: programma eBPF"
 LABEL_IN_UNSPLIT = "ingresso: programma o ricezione (manca rxonly)"
 LABEL_OUT = "uscita: trasmissivo"
 LABEL_BENCH = "banco: nodo non saturo"
-# Sotto questa occupazione del thread NAPI del DUT (napi_run_pct, mediana dei
-# giri) una perdita all'ingresso non e' del programma: il nodo ha tempo libero
-# e la coda trabocca per altro (lotto del generatore piu' grande dello spazio
-# libero nella coda, generatore frenato dall'inoltro). Misurato il
-# 2026-10-02: baseline a 9-12 Mpps con il nodo al 59-61%, perdita prima di
-# XDP ~1%; P1 e P1.5 alla loro capacita' al 99,6-99,9%.
 NAPI_SATURATED_PCT = 90.0
 LABEL_REF = "riferimento"
 
-# ==========================================================================
-# I PROGRAMMI
-# ==========================================================================
-# Programma 1, dialetto BCC: precede baseline, P2, P3 e fa da rxonly.
+# --- the programs ---
 ING_COUNTER_BCC = r"""
 #include <uapi/linux/bpf.h>
-/* 0 = pacchetti entrati in XDP, 1 = tail call non partita (atteso 0) */
 BPF_PERCPU_ARRAY(ing_count, __u64, 2);
 BPF_PROG_ARRAY(ing_next, 1);
 
@@ -335,8 +75,6 @@ int xdp_ing_count(struct xdp_md *ctx) {
     if (v)
         *v += 1;
     ing_next.call(ctx, 0);
-    /* qui solo se la tail call non e' partita: slot vuoto (rxonly) o
-     * programma incompatibile */
     int km = 1;
     __u64 *m = ing_count.lookup(&km);
     if (m)
@@ -345,11 +83,7 @@ int xdp_ing_count(struct xdp_md *ctx) {
 }
 """
 
-# Programma 1, dialetto libbpf: aggiunto IN CODA al sorgente AOT di P1/P1.5,
-# che include gia' linux/bpf.h e bpf/bpf_helpers.h. Stesso testo, stesse
-# mappe, stessi nomi: il lettore Python non distingue i due.
 ING_COUNTER_LIBBPF = r"""
-/* ---- bench_bitrate: programma 1 della coppia, il contatore d'ingresso ---- */
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 2);
          __type(key, __u32); __type(value, __u64); } ing_count SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_PROG_ARRAY); __uint(max_entries, 1);
@@ -370,10 +104,6 @@ int xdp_ing_count(struct xdp_md *ctx) {
 }
 """
 
-# Il nodo successivo: conta ogni arrivo e, a cancello aperto, cronometra un
-# arrivo ogni mask+1 con il timbro di pktgen. La scelta si fa sul contatore
-# degli arrivi, PRIMA di leggere il pacchetto: i pacchetti non cronometrati
-# costano due lookup e un AND, non la lettura dell'intestazione.
 EGRESS_LAT_BCC = r"""
 #include <uapi/linux/bpf.h>
 
@@ -384,14 +114,8 @@ EGRESS_LAT_BCC = r"""
 #define PG_OFF %(off)d
 
 BPF_PERCPU_ARRAY(rx_count, __u64, 1);
-/* 0 = cancello (1 = registra), 1 = CLOCK_REALTIME - CLOCK_MONOTONIC in ns,
- * 2 = maschera di campionamento sul contatore degli arrivi */
 BPF_ARRAY(lat_ctl, __u64, 3);
-/* 0 campioni, 1 somma us, 2 minimo us + 1 (0 = nessuno), 3 massimo us,
- * 4 timbro nel futuro (orologi disallineati), 5 senza intestazione pktgen */
 BPF_PERCPU_ARRAY(lat_acc, __u64, 6);
-/* celle 0..LAT_FINE_US-1: 1 us ciascuna; poi 2^LAT_STEP_SHIFT us fino a
- * LAT_MAX_US; cella LAT_CELLS = oltre */
 BPF_PERCPU_ARRAY(lat_hist, __u64, LAT_CELLS + 1);
 
 int xdp_rx_lat(struct xdp_md *ctx) {
@@ -472,25 +196,20 @@ int xdp_rx_lat(struct xdp_md *ctx) {
 """ % {"fine": LAT_FINE_US, "shift": LAT_STEP_SHIFT, "maxus": LAT_MAX_US,
        "cells": LAT_CELLS, "off": PKTGEN_HDR_OFF}
 
-# ==========================================================================
-# CONTI (funzioni pure: test_bitrate_math.py le verifica senza kernel)
-# ==========================================================================
+# --- arithmetic (pure functions: test_load_curve_math.py checks them without a kernel) ---
 def pps_for_gbps(gbps, frame):
-    """Pacchetti al secondo che fanno `gbps` Gbit/s di frame da `frame` byte."""
+    """Packets per second that make `gbps` Gbit/s of `frame`-byte frames."""
     return gbps * 1e9 / (frame * 8)
 
 
 def gbps_of(pps, frame, l1=False):
-    """Gbit/s di `pps` frame da `frame` byte; l1 aggiunge FCS, preambolo, IFG."""
+    """Gbit/s di `pps` frame da `frame` byte;"""
     return pps * (frame + (ETH_L1_OVERHEAD if l1 else 0)) * 8 / 1e9
 
 
 def auto_rates(rx_ceiling_pps, gen_ceiling_pps=None,
                fractions=AUTO_FRACTIONS, step=AUTO_STEP_PPS):
-    """La scala calibrata, in pps: `fractions` del tetto di ricezione,
-    arrotondate a `step`. Un punto oltre il tetto del generatore (il 95% di
-    quanto offre a massima spinta: sopra, il chiesto non si ottiene piu')
-    diventa quel tetto. Ordinata, senza doppioni, senza zeri."""
+    """La scala calibrata, in pps."""
     if not rx_ceiling_pps or rx_ceiling_pps <= 0:
         return []
     cap = (gen_ceiling_pps * GEN_LIMITED_FRACTION
@@ -506,10 +225,7 @@ def auto_rates(rx_ceiling_pps, gen_ceiling_pps=None,
 
 
 def sample_mask(rate_pps, window_s, target=LAT_TARGET_SAMPLES):
-    """Maschera sul seq di pktgen: si cronometra un pacchetto ogni mask+1.
-
-    Potenza di 2 perche' il filtro nel programma e' un AND; la piu' piccola
-    che non superi di molto `target` campioni nella finestra. Zero = tutti."""
+    """Mask on pktgen's seq."""
     expected = max(0.0, float(rate_pps) * float(window_s))
     if target <= 0 or expected <= target:
         return 0
@@ -524,8 +240,8 @@ def pct(part, whole):
 
 
 def lat_cell(us):
-    """La cella dell'istogramma per `us` microsecondi, come la calcola il
-    programma d'uscita."""
+    """The histogram cell for `us` microseconds, as the egress program
+    computes it."""
     us = int(us)
     if us < LAT_FINE_US:
         return us
@@ -535,8 +251,7 @@ def lat_cell(us):
 
 
 def lat_cell_value(i):
-    """I microsecondi che la cella i rappresenta: esatti sotto LAT_FINE_US, il
-    centro della cella sopra; la cella di trabocco vale il suo bordo."""
+    """The microseconds cell i represents."""
     if i < LAT_FINE_US:
         return float(i)
     if i < LAT_CELLS:
@@ -546,9 +261,7 @@ def lat_cell_value(i):
 
 
 def hist_percentile(hist, q):
-    """Il quantile q dall'istogramma (l'ultima cella e' il trabocco).
-    Restituisce (valore_us, tagliato): tagliato vero se il quantile cade nel
-    trabocco, e allora il valore e' il bordo dell'istogramma."""
+    """Quantile q from the histogram (the last cell is the overflow)."""
     n = sum(hist)
     if n <= 0:
         return None, False
@@ -562,16 +275,15 @@ def hist_percentile(hist, q):
 
 
 def spin_per_packet_us(idle_us, attempts):
-    """Attesa media di pktgen fra timbro e trasmissione, per pacchetto."""
+    """Mean pktgen wait between timestamp and transmission, per packet."""
     if idle_us is None or not attempts:
         return None
     return max(0.0, float(idle_us) / float(attempts))
 
 
 def latency_stats(lat, spin_us, mask):
-    """Statistiche della latenza end-to-end di UNA finestra, corrette per
-    l'attesa di pktgen. `lat`: n, total_us, min_us, max_us, neg, nostamp,
-    hist (le celle, trabocco compreso)."""
+    """End-to-end latency statistics of ONE window, corrected for pktgen's
+    wait."""
     hist = lat.get("hist") or []
     n = int(lat.get("n") or 0)
     out = dict(e2e_samples=n, e2e_sample_every=int(mask) + 1,
@@ -607,10 +319,7 @@ def latency_stats(lat, spin_us, mask):
 
 
 def napi_sched(pids):
-    """Statistiche di scheduling cumulative dei thread NAPI del DUT: tempo
-    in esecuzione e in attesa della CPU (ns, /proc/<pid>/schedstat), cambi di
-    contesto volontari (il thread va a dormire: coda vuota o NAPI completata)
-    e involontari (qualcun altro prende il core)."""
+    """Cumulative scheduling statistics of the DUT's NAPI threads."""
     out = dict(napi_run_ns=0, napi_wait_ns=0, napi_vol_cs=0, napi_invol_cs=0)
     for pid in pids:
         try:
@@ -630,11 +339,8 @@ def napi_sched(pids):
 
 
 def hw_row(B, plan, run):
-    """Istruzioni, cicli e IPC per pacchetto della finestra
-    (hw_counters.per_packet). Denominatore: i pacchetti che il contatore
-    davanti alla pipeline ha visto, cioe' tutti quelli che il nodo ha
-    elaborato. Hanno senso dove il nodo e' saturo: sotto, i cicli contano
-    anche l'attesa in POLL fra un pacchetto e l'altro."""
+    """Instructions, cycles and IPC per packet of the window
+    (hw_counters.per_packet)."""
     import hw_counters as HW
     d = run.dut or {}
     pkts = d.get("rx_xdp") or 0
@@ -644,8 +350,8 @@ def hw_row(B, plan, run):
 
 
 def diag_columns(d, secs, sent):
-    """Le colonne diagnostiche di una finestra dalle differenze dei contatori
-    di napi_sched e XdpGen.diag (assenti: colonne vuote)."""
+    """The diagnostic columns of a window, from the napi_sched and XdpGen.diag
+    counter differences."""
     ns = secs * 1e9
     out = {}
     if "napi_run_ns" in d:
@@ -668,12 +374,7 @@ def diag_columns(d, secs, sent):
 
 def window_row(method, frame, rnd, rate_req_pps, delay_ns, gen_threads, secs,
                wall_s, tx, rejected, d, lat, mask, idle_ok=True, host=None):
-    """Una finestra stazionaria -> una riga. `d` sono le DIFFERENZE dei
-    contatori fra le due letture: rx_xdp, tail_miss, fwd, idle_us e, per le
-    pipeline, hit/miss/drop. Il riferimento rxonly non ha pipeline ne'
-    uscita: i suoi campi di inoltro restano vuoti invece di valere zero.
-    `host`: le colonne host_* della macchina attorno alla finestra
-    (host_conditions.host_columns), o None."""
+    """One steady window -> one row."""
     secs = secs if secs and secs > 0 else 1e-9
     sent = int(tx) + int(rejected)
     rx = int(d["rx_xdp"])
@@ -730,7 +431,6 @@ def window_row(method, frame, rnd, rate_req_pps, delay_ns, gen_threads, secs,
             unaccounted_in_pipeline=rx - (hit + miss + drop))
     spin = spin_per_packet_us(d.get("idle_us"), sent) if idle_ok else None
     if ref:
-        # nessun pacchetto arriva all'uscita: niente latenza end-to-end
         row.update(latency_stats({}, spin, mask))
     else:
         row.update(latency_stats(lat, spin, mask))
@@ -739,7 +439,6 @@ def window_row(method, frame, rnd, rate_req_pps, delay_ns, gen_threads, secs,
     return row
 
 
-# Le colonne che la sintesi porta come mediana fra i giri.
 MEDIAN_KEYS = (
     "bitrate_requested_gbps", "bitrate_sent_gbps", "bitrate_sent_l1_gbps",
     "sent_pps", "rx_pps", "forwarded_pps", "rx_gbps", "forwarded_gbps",
@@ -766,11 +465,8 @@ def _median(vals):
 
 
 def classify(row, floor_pct, threshold=DEFAULT_LOSS_THRESHOLD):
-    """Il collo di bottiglia di UNA riga di sintesi, secondo la regola
-    ingresso/uscita, con il pavimento della ricezione tolto.
-
-    floor_pct: la perdita prima di XDP del solo contatore (rxonly) allo stesso
-    rate, o None se rxonly non e' stato misurato."""
+    """The bottleneck of ONE summary row, by the ingress/egress rule, with
+    the reception floor removed."""
     if row.get("reference"):
         return LABEL_REF
     before = row.get("loss_before_xdp_pct") or 0.0
@@ -787,8 +483,8 @@ def classify(row, floor_pct, threshold=DEFAULT_LOSS_THRESHOLD):
 
 
 def summarise(rows, threshold=DEFAULT_LOSS_THRESHOLD):
-    """Mediana fra i giri per (pipeline, frame, rate chiesto), poi il collo
-    di bottiglia di ogni riga contro rxonly allo stesso rate."""
+    """Median over rounds per (pipeline, frame, requested rate), then the
+    bottleneck of every row against rxonly at the same rate."""
     groups = {}
     for r in rows:
         groups.setdefault((r["method"], r["frame"], r["rate_requested_pps"]),
@@ -801,9 +497,6 @@ def summarise(rows, threshold=DEFAULT_LOSS_THRESHOLD):
                  gen_limited_rounds=sum(bool(r.get("gen_limited"))
                                         for r in rs),
                  gen_burst_rounds=sum(bool(r.get("gen_burst")) for r in rs),
-                 # Giri in cui la macchina non era nelle condizioni
-                 # dichiarate (throttling, frequenza fuori target, ...):
-                 # contati e riportati, come le raffiche, non scartati.
                  host_disturbed_rounds=sum(bool(r.get("host_disturbed"))
                                            for r in rs),
                  e2e_percentile_clipped=any(r.get("e2e_percentile_clipped")
@@ -832,14 +525,7 @@ def summarise(rows, threshold=DEFAULT_LOSS_THRESHOLD):
 
 
 def onsets(summary):
-    """Per pipeline e frame: da che rate si perde, e con che collo.
-
-    L'inizio e' il rate piu' basso da cui TUTTI i rate piu' alti perdono: una
-    riga in perdita seguita da righe pulite e' una finestra disturbata (core
-    interrotto, raffica del generatore), non la capacita' della pipeline. Al
-    primo run la baseline "perdeva" a 0,25 Gbit/s e non a 0,5: con la regola
-    del primo rate in perdita l'inizio sarebbe stato 0,25. Le righe cosi'
-    restano elencate come sporadiche. Il riferimento resta fuori."""
+    """Per pipeline e frame."""
     per = {}
     for s in summary:
         if s["reference"]:
@@ -869,15 +555,7 @@ def onsets(summary):
 
 
 class Probe:
-    """La lettura che Generator.steady fa alle due marcature della finestra.
-
-    Oltre a restituire i contatori cumulativi apre il cancello della latenza
-    alla prima chiamata, cioe' quando la finestra comincia. Non lo chiude: lo
-    chiude chi ha aperto la finestra, a pktgen fermo e coda svuotata. Una
-    chiusura a tempo ("la prima chiamata dopo meta' finestra") scattava anche
-    su una PRIMA lettura rifatta a lungo -- Generator._snapshot rifa' le
-    letture piu' lente di 3 ms -- e la sonda del primo run ha cronometrato
-    cosi' 5 750 pacchetti su 12 307."""
+    """The read Generator.steady does at the two marks of the window."""
 
     def __init__(self, read_counters, set_gate):
         self.read = read_counters
@@ -892,8 +570,8 @@ class Probe:
 
 
 def prog_stats(fd):
-    """(run_time_ns, run_cnt) di un programma BPF dal suo fdinfo, o
-    (None, None). Si muovono solo con kernel.bpf_stats_enabled=1."""
+    """(run_time_ns, run_cnt) of a BPF program from its fdinfo, or (None,
+    None)."""
     t = c = None
     try:
         with open(f"/proc/self/fdinfo/{fd}") as f:
@@ -910,8 +588,7 @@ def prog_stats(fd):
 
 
 def set_bpf_stats(value):
-    """Scrive kernel.bpf_stats_enabled; il valore di prima, o None se non si
-    puo'."""
+    """Writes kernel.bpf_stats_enabled."""
     try:
         with open(BPF_STATS_KNOB) as f:
             old = f.read().strip()
@@ -923,7 +600,7 @@ def set_bpf_stats(value):
 
 
 def per_run_ns(before, after):
-    """ns per esecuzione del programma fra due letture di prog_stats."""
+    """ns per program run between two prog_stats reads."""
     (t0, c0), (t1, c1) = before, after
     if None in (t0, c0, t1, c1) or c1 <= c0:
         return None
@@ -934,14 +611,13 @@ _IDLE_RE = re.compile(r"idle:\s*(\d+)us")
 
 
 def parse_idle_us(text):
-    """Il contatore `idle` (us) dalla sezione Current di un device pktgen."""
+    """The `idle` counter (us) from the Current section of a pktgen device."""
     m = _IDLE_RE.search(text)
     return int(m.group(1)) if m else None
 
 
 def realtime_minus_monotonic_ns(tries=7):
-    """(CLOCK_REALTIME - CLOCK_MONOTONIC in ns, incertezza in ns): la lettura
-    col panino piu' stretto fra `tries`."""
+    """(CLOCK_REALTIME - CLOCK_MONOTONIC in ns, uncertainty in ns)."""
     best = None
     for _ in range(tries):
         m1 = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
@@ -953,7 +629,7 @@ def realtime_minus_monotonic_ns(tries=7):
 
 
 def _percpu_total(tab, key):
-    """Somma sulle CPU di una cella per-CPU, BCC o mappa fissata (AOT)."""
+    """Sum over CPUs of a per-CPU cell, BCC or pinned map (AOT)."""
     v = tab[ct.c_int(key)]
     if isinstance(v, int):
         return v
@@ -963,11 +639,9 @@ def _percpu_total(tab, key):
         return int(getattr(v, "value", v))
 
 
-# ==========================================================================
-# CARICAMENTO
-# ==========================================================================
+# --- loading ---
 def _bcc_counter(target_fd):
-    """Il programma 1 in un oggetto BCC suo, con la pipeline nello slot."""
+    """Program 1 in its own BCC object, with the pipeline in the slot."""
     from bcc import BPF
     b = BPF(text=ING_COUNTER_BCC)
     fn = b.load_func("xdp_ing_count", BPF.XDP)
@@ -976,19 +650,16 @@ def _bcc_counter(target_fd):
             b["ing_next"][ct.c_int(0)] = ct.c_int(target_fd)
         except Exception as e:
             raise RuntimeError(
-                f"il kernel rifiuta la pipeline come destinazione della tail "
-                f"call ({e}): tipo, JIT o expected_attach_type diversi fra "
-                f"contatore e pipeline") from e
+                f"the kernel refuses the pipeline as tail call target "
+                f"({e}): type, JIT or expected_attach_type differ between "
+                f"counter and pipeline") from e
     return b, fn
 
 
 @contextlib.contextmanager
 def _counter_in_aot_object():
-    """build_pipeline carica P1/P1.5 con p1_aot.load_p1, che compila
-    p1_source(...): per la durata del blocco il sorgente porta in coda il
-    programma 1. Tutto il resto -- compilazione, loader_aot, mappe fissate,
-    cablaggio sul fabric, alias del model_id di pktgen -- resta quello di
-    build_pipeline, riga per riga."""
+    """build_pipeline loads P1/P1.5 with p1_aot.load_p1, which compiles
+    p1_source(...)."""
     import p1_aot
     orig = p1_aot.p1_source
 
@@ -1003,7 +674,7 @@ def _counter_in_aot_object():
 
 
 def load_method(B, method, model_path, fab, sem):
-    """(setup della pipeline o None, contatore d'ingresso) per un metodo."""
+    """(pipeline setup or None, ingress counter) for a method."""
     if method == REFERENCE:
         b, fn = _bcc_counter(None)
         return None, dict(b=b, fn=fn, tab=b["ing_count"], kind="bcc")
@@ -1014,8 +685,8 @@ def load_method(B, method, model_path, fab, sem):
         fn = getattr(owner, "progs", {}).get("xdp_ing_count")
         if fn is None:
             raise RuntimeError(
-                f"{method}: l'oggetto AOT non contiene xdp_ing_count -- il "
-                f"sorgente non e' passato da p1_aot.p1_source?")
+                f"{method}: the AOT object does not contain xdp_ing_count -- "
+                f"did the source not go through p1_aot.p1_source?")
         setup["b"]["ing_next"][ct.c_int(0)] = ct.c_int(setup["disp"].fd)
         return setup, dict(b=setup["b"], fn=fn, tab=setup["b"]["ing_count"],
                            kind="aot")
@@ -1025,8 +696,7 @@ def load_method(B, method, model_path, fab, sem):
 
 
 def attach_egress(B, fab):
-    """Il programma d'uscita su ogni peer, al posto dello stub XDP_PASS: e'
-    anche cio' che rende possibile il redirect nel veth (vedi netns_fabric)."""
+    """The egress program on every peer, in place of the XDP_PASS stub."""
     from bcc import BPF
     from common import attach_xdp
     b = BPF(text=EGRESS_LAT_BCC)
@@ -1039,7 +709,7 @@ def attach_egress(B, fab):
                 attach_xdp(b, fn, peer)
             attached.append(peer)
         except Exception as e:
-            B.warn(f"contatore d'uscita non agganciato a {peer}: {e}")
+            B.warn(f"egress counter not attached to {peer}: {e}")
     return b, attached
 
 
@@ -1056,8 +726,7 @@ def read_latency(acc, hist_tab):
 
 
 def zero_latency(acc, hist_tab, lat=None):
-    """Azzera accumulatori e istogramma. Delle celle dell'istogramma solo
-    quelle lette diverse da zero: le altre lo sono gia'."""
+    """Resets accumulators and histogram."""
     for i in range(6):
         del acc[ct.c_int(i)]
     idx = (range(LAT_CELLS + 1) if lat is None else
@@ -1078,21 +747,17 @@ def pktgen_idle_us(B, names):
 
 
 def calibrate_scale(B, window, use, alive, frame):
-    """La scala calibrata, prima dello sweep: AUTO_CALIB_WINDOWS finestre a
-    massima spinta sul riferimento (rxonly, il solo contatore; senza, il primo
-    metodo vivo) danno il tetto di ricezione R e quello del generatore G, e
-    la scala e' auto_rates(R, G). `window` e `use` sono quelli di
-    run_bitrate. Restituisce (rate in pps, descrizione per env.csv)."""
+    """The calibrated scale, before the sweep."""
     ref = REFERENCE if REFERENCE in alive else alive[0]
-    print(f"\n{YELLOW} Calibrazione della scala: {ref} a massima spinta, "
-          f"{AUTO_CALIB_WINDOWS} finestre{NC}")
+    print(f"\n{YELLOW} Scale calibration: {ref} at full load, "
+          f"{AUTO_CALIB_WINDOWS} windows{NC}")
     use(ref)
     rx_best = sent_best = 0.0
     for _ in range(AUTO_CALIB_WINDOWS):
         try:
             run, _, _, _ = window(ref, frame, 0, 0, timed=False)
         except B.PktgenEmptyRun as e:
-            B.warn(f"finestra di calibrazione scartata ({e})")
+            B.warn(f"calibration window discarded ({e})")
             continue
         if not run.window or run.window <= 0:
             continue
@@ -1102,45 +767,28 @@ def calibrate_scale(B, window, use, alive, frame):
     rates = auto_rates(rx_best, sent_best)
     if not rates:
         return [], "calibrazione fallita"
-    B.info(f"tetto di ricezione ({ref}): {rx_best / 1e6:.3f} Mpps = "
-           f"{gbps_of(rx_best, frame):.3f} Gbit/s a {frame} B; il generatore "
-           f"offre fino a {sent_best / 1e6:.3f} Mpps")
+    B.info(f"reception ceiling ({ref}): {rx_best / 1e6:.3f} Mpps = "
+           f"{gbps_of(rx_best, frame):.3f} Gbit/s at {frame} B; the generator "
+           f"offers up to {sent_best / 1e6:.3f} Mpps")
     if sent_best < 1.1 * rx_best:
-        B.warn("il generatore supera appena il tetto di ricezione: la parte "
-               "satura della curva sara' corta (--threads per averne di piu')")
+        B.warn("the generator barely exceeds the reception ceiling: the "
+               "saturated part of the curve will be short (--threads for more)")
     B.info("scala: " + ", ".join(f"{gbps_of(r, frame):.3f}" for r in rates)
            + f" Gbit/s a {frame} B")
-    desc = (f"calibrata: {len(rates)} punti, da {AUTO_FRACTIONS[0]} a "
-            f"{AUTO_FRACTIONS[-1]} volte il tetto di ricezione di {ref} "
+    desc = (f"calibrated: {len(rates)} points, from {AUTO_FRACTIONS[0]} to "
+            f"{AUTO_FRACTIONS[-1]} times the reception ceiling of {ref} "
             f"({rx_best / 1e6:.3f} Mpps = {gbps_of(rx_best, frame):.3f} "
-            f"Gbit/s a {frame} B), generatore {sent_best / 1e6:.3f} Mpps; "
+            f"Gbit/s at {frame} B), generator {sent_best / 1e6:.3f} Mpps; "
             f"pps " + ",".join(str(r) for r in rates))
     return rates, desc
 
 
-# ==========================================================================
-# IL RUN
-# ==========================================================================
+# --- IL RUN ---
 def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 window_s, lat_target=LAT_TARGET_SAMPLES, egress_cpu=None,
                 overhead_reps=OVERHEAD_REPS, save=None, hostmon=None,
                 generator="pktgen", xdp_batch=None):
-    """Tutte le pipeline, stesso fabric e stesso generatore, a rate crescente.
-    Restituisce (righe grezze, righe del costo del contatore, note).
-
-    `rates_of(frame)` da' i rate in pps; None = scala calibrata (auto_rates)
-    sul tetto di ricezione misurato qui, dopo la sonda.
-
-    `save(raw, over)`, se c'e', si chiama dopo OGNI finestra: un run da mezz'ora
-    interrotto al giro 6 lascia su disco i giri 1-6, invece di niente.
-
-    `hostmon`: host_conditions.HostMonitor. Legge la macchina prima che
-    pktgen parta e dopo che si e' fermato -- mai durante: le letture di MSR
-    sono IPI verso il DUT -- e ogni riga porta le colonne host_*.
-
-    `generator`: "pktgen" (skb, `delay` di pktgen, correzione per la sua
-    attesa) o "xdp" (xdp_gen: frame XDP grezzi, cadenza e timbro nel
-    programma generatore, nessuna correzione)."""
+    """Every pipeline, same fabric and same generator, at growing rate."""
     from netns_fabric import NetnsFabric
     from common import attach_xdp
 
@@ -1149,25 +797,25 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
     with NetnsFabric(n_ports=len(sem.logical_ports), verbose=False) as fab:
         eg_b, peers = attach_egress(B, fab)
         if not peers:
-            raise RuntimeError("nessun contatore d'uscita agganciato: senza, "
-                               "gli inoltrati non si contano")
+            raise RuntimeError("no egress counter attached: without it, "
+                               "forwarded packets are not counted")
         ctl, acc, hist_tab = eg_b["lat_ctl"], eg_b["lat_acc"], eg_b["lat_hist"]
         rx_tab = eg_b["rx_count"]
-        B.info(f"programma d'uscita (conta + latenza) su {len(peers)} peer")
+        B.info(f"egress program (count + latency) on {len(peers)} peers")
 
-        print(f"\n{YELLOW} Fase 1: carico pipeline e contatori d'ingresso "
-              f"(nessuna misura in corso){NC}")
+        print(f"\n{YELLOW} Phase 1: loading pipelines and ingress counters "
+              f"(no measurement running){NC}")
         loaded = {}
         for m in methods:
             try:
                 loaded[m] = load_method(B, m, model_path, fab, sem)
                 kind = loaded[m][1]["kind"]
-                B.info(f"{m}: " + ("solo contatore (riferimento)"
+                B.info(f"{m}: " + ("counter only (reference)"
                                    if m == REFERENCE else
-                                   f"contatore -> tail call -> pipeline "
-                                   f"({'stesso oggetto AOT' if kind == 'aot' else 'BCC'})"))
+                                   f"counter -> tail call -> pipeline "
+                                   f"({'same AOT object' if kind == 'aot' else 'BCC'})"))
             except Exception as e:
-                B.warn(f"{m}: non caricata, la salto -- "
+                B.warn(f"{m}: not loaded, skipping it -- "
                        f"{type(e).__name__}: {e}")
         if not loaded:
             return raw, over, notes
@@ -1188,7 +836,7 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                         attach_xdp(cnt["b"], cnt["fn"], dev)
 
         idle_ok = [True]
-        dut_napi = []           # pid dei thread NAPI d'ingresso del DUT
+        dut_napi = []
 
         def reader(m, direct=False):
             setup, cnt = loaded[m]
@@ -1207,8 +855,6 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                     ps = setup["pkt_stats"]
                     d.update(hit=B._read_u64(ps, 0), miss=B._read_u64(ps, 1),
                              drop=B._read_u64(ps, 2))
-                # istruzioni e cicli di nodo e uscita (hw_counters), nella
-                # stessa lettura
                 if B.HW_COUNTERS is not None:
                     d.update(B.HW_COUNTERS.read())
                 return d
@@ -1216,9 +862,7 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
 
         def window(m, frame, rate, mask, seconds=None, direct=False,
                    timed=True):
-            """Una finestra stazionaria: (run, latenza, durata totale).
-            timed=False lascia chiuso il cancello: nessun pacchetto
-            cronometrato, il programma d'uscita conta e basta."""
+            """One steady window."""
             off, _ = realtime_minus_monotonic_ns()
             set_ctl(0, 0)
             set_ctl(1, off)
@@ -1231,8 +875,6 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 run = gen.steady(frame, gen.delay_for(rate) if rate else 0,
                                  probe, seconds=seconds)
             except Exception:
-                # Finestra scartata: i campioni gia' registrati non devono
-                # finire in quella dopo.
                 set_ctl(0, 0)
                 time.sleep(DRAIN_S)
                 zero_latency(acc, hist_tab)
@@ -1256,48 +898,44 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                 kw = {"batch_size": xdp_batch} if xdp_batch else {}
                 gen = XdpGen(ing.gen_devs[0], plan, window_s=window_s,
                              **kw).attach()
-                B.info(f"xdp_gen: lotto da {gen.batch_size} frame (il DUT si "
-                       f"sveglia a fine lotto)")
+                B.info(f"xdp_gen: batches of {gen.batch_size} frames (the DUT "
+                       f"wakes up at the end of a batch)")
                 gen.set_stamp(True)
                 B._warn_shared_queues(plan)
-                # Il timbro e' scritto nell'istante in cui il frame parte:
-                # non c'e' attesa da togliere.
                 idle_ok[0] = False
-                notes["idle_correction"] = "non serve"
+                notes["idle_correction"] = "not needed"
             else:
                 gen = B.Generator(ing.gen_devs[:1], plan, window_s=window_s,
                                   warmup_s=0.0, window_mode="steady").attach()
                 if pktgen_idle_us(B, gen.names) is None:
                     idle_ok[0] = False
-                    B.warn("pktgen non espone `idle` in /proc/net/pktgen: la "
-                           "latenza NON e' corretta per l'attesa fra timbro "
-                           "e trasmissione, e a rate basso e' sovrastimata "
-                           "di circa il delay")
+                    B.warn("pktgen does not expose `idle` in /proc/net/pktgen: "
+                           "the latency is NOT corrected for the wait between "
+                           "timestamp and transmission, and at low rate it is "
+                           "overestimated by about the delay")
                 notes["idle_correction"] = idle_ok[0]
 
-            # Il primo attach crea la NAPI; solo dopo si mette in thread.
             use(next(iter(loaded)))
             napi_devs = list(ing.dut_devs)
             placed = B.enable_threaded_napi(napi_devs, plan)
             for dv in napi_devs:
                 dut_napi.extend(int(x) for x in B._napi_threads(dv))
             if placed:
-                B.info("NAPI d'ingresso in thread: " + ", ".join(
+                B.info("threaded ingress NAPI: " + ", ".join(
                     f"{dv}({nt})->cpu{','.join(map(str, cs))}"
                     for dv, nt, cs in placed))
             else:
                 napi_devs = []
-                B.warn("nessun thread NAPI pinnato: generatore e DUT restano "
-                       "sullo stesso core")
+                B.warn("no NAPI thread pinned: generator and DUT stay "
+                       "on the same core")
             if egress_cpu is not None:
                 eplan = B.CpuPlan([], [egress_cpu], B.online_cpus(), [])
                 placed_e = B.enable_threaded_napi(list(peers), eplan)
                 egress_napi = [dv for dv, _, _ in placed_e]
-                B.info(f"uscita in thread su cpu{egress_cpu}: "
+                B.info(f"threaded egress on cpu{egress_cpu}: "
                        f"{len(egress_napi)} veth")
 
-            # --- sonda: la catena funziona? il timbro c'e'?
-            print(f"\n{YELLOW} Sonda a {SANITY_PPS // 1000} kpps{NC}")
+            print(f"\n{YELLOW} Probe at {SANITY_PPS // 1000} kpps{NC}")
             alive = []
             f0 = frames[0]
             for m in loaded:
@@ -1308,60 +946,58 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                                      lat_target),
                                          seconds=SANITY_S)
                 except B.PktgenEmptyRun as e:
-                    B.warn(f"{m}: sonda senza traffico ({e}), la escludo")
+                    B.warn(f"{m}: probe without traffic ({e}), excluding it")
                     continue
                 d = run.dut
                 problems = []
                 if d["rx_xdp"] <= 0:
-                    problems.append("il contatore d'ingresso non conta")
+                    problems.append("the ingress counter does not count")
                 if m != REFERENCE:
                     if d["tail_miss"]:
-                        problems.append(f"{d['tail_miss']} tail call non "
-                                        f"partite")
+                        problems.append(f"{d['tail_miss']} tail calls not "
+                                        f"taken")
                     if d["hit"] + d["drop"] <= 0:
-                        problems.append("la pipeline non decide (nessun "
+                        problems.append("the pipeline does not decide (no "
                                         "HIT/DROP)")
                     if d["fwd"] <= 0:
-                        problems.append("niente arriva al nodo successivo")
+                        problems.append("nothing reaches the next node")
                 if problems:
-                    B.warn(f"{m}: " + "; ".join(problems) + " -- esclusa")
+                    B.warn(f"{m}: " + "; ".join(problems) + " -- excluded")
                     continue
                 if m != REFERENCE and not lat["n"]:
-                    B.warn(f"{m}: nessun campione di latenza (timbri senza "
-                           f"intestazione pktgen: {lat['nostamp']}, nel "
-                           f"futuro: {lat['neg']}): conteggi validi, latenza "
-                           f"assente")
-                B.ok(f"{m}: RX {d['rx_xdp']}, inoltrati {d['fwd']}, "
-                     f"campioni di latenza {lat['n']}")
+                    B.warn(f"{m}: no latency sample (timestamps without "
+                           f"pktgen header: {lat['nostamp']}, in the "
+                           f"future: {lat['neg']}): counts valid, latency "
+                           f"missing")
+                B.ok(f"{m}: RX {d['rx_xdp']}, forwarded {d['fwd']}, "
+                     f"latency samples {lat['n']}")
                 alive.append(m)
             if not alive:
-                B.warn("nessun metodo ha superato la sonda")
+                B.warn("no method passed the probe")
                 return raw, over, notes
 
-            # --- la scala, se non e' data: calibrata sul tetto di ricezione
             if rates_of is None:
                 rates, calib = calibrate_scale(B, window, use, alive, f0)
                 notes["scala"] = calib
                 if not rates:
                     rates = [int(pps_for_gbps(g, DEFAULT_FRAME))
                              for g in DEFAULT_BITRATES_GBPS]
-                    B.warn("calibrazione fallita: uso la scala fissa di "
-                           "ripiego")
-                    notes["scala"] = "fissa (calibrazione fallita)"
+                    B.warn("calibration failed: using the fixed fallback "
+                           "scale")
+                    notes["scala"] = "fixed (calibration failed)"
 
                 def rates_of(frame, _r=tuple(rates)):
                     return list(_r)
 
-            # --- lo sweep
             npts = rounds * sum(len(rates_of(f)) for f in frames) * len(alive)
             print(f"\n{YELLOW}{'=' * 78}{NC}")
-            print(f"{YELLOW} Fase 2: {rounds} giri x {len(alive)} metodi x "
-                  f"rate crescente, frame {frames} -- {npts} finestre da "
+            print(f"{YELLOW} Phase 2: {rounds} rounds x {len(alive)} methods x "
+                  f"growing rate, frame {frames} -- {npts} windows of "
                   f"{window_s}s{NC}")
             print(f"{YELLOW}{'=' * 78}{NC}")
-            print(f"  {'giro':>4s} {'chiesto':>8s} {'metodo':10s} "
-                  f"{'inviati':>9s} {'RX XDP':>9s} {'inoltr.':>9s} "
-                  f"{'prima%':>7s} {'pipe%':>7s} {'p50us':>7s} {'p99us':>7s}")
+            print(f"  {'round':>5s} {'requested':>9s} {'method':10s} "
+                  f"{'sent':>9s} {'RX XDP':>9s} {'fwd':>9s} "
+                  f"{'before%':>7s} {'pipe%':>7s} {'p50us':>7s} {'p99us':>7s}")
             t_run = time.monotonic()
             done = 0
             for rnd in range(1, rounds + 1):
@@ -1376,9 +1012,9 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                 run, lat, wall, host = window(m, frame, rate,
                                                               mask)
                             except B.PktgenEmptyRun as e:
-                                B.warn(f"giro {rnd} {m} "
+                                B.warn(f"round {rnd} {m} "
                                        f"{gbps_of(rate, frame):.2f} Gbit/s: "
-                                       f"finestra scartata -- {e}")
+                                       f"window discarded -- {e}")
                                 continue
                             row = window_row(
                                 m, frame, rnd, rate,
@@ -1393,25 +1029,18 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                             _print_point(row, done, npts, t_run)
                             if m != REFERENCE and row["tail_call_miss"]:
                                 B.warn(f"{m}: {row['tail_call_miss']} tail "
-                                       f"call non partite in questa finestra")
+                                       f"calls not taken in this window")
 
-            # --- quanto costa il contatore
             pipes = [m for m in alive if m != REFERENCE]
             if overhead_reps > 0 and pipes:
-                print(f"\n{YELLOW} Fase 3: costo del contatore, rate massimo, "
-                      f"{overhead_reps} ripetizioni, con e senza catena{NC}")
-                # Il tempo del programma dal kernel (run_time_ns / run_cnt del
-                # programma ATTACCATO, tail call comprese: girano dentro la
-                # sua esecuzione). Con la catena e' il contatore + la
-                # pipeline, senza e' la pipeline: la differenza e' il
-                # programma 1. Le statistiche aggiungono due letture
-                # dell'orologio per esecuzione, uguali nelle due varianti.
+                print(f"\n{YELLOW} Phase 3: cost of the counter, maximum rate, "
+                      f"{overhead_reps} repetitions, with and without the chain{NC}")
                 old_stats = set_bpf_stats(1)
                 notes["bpf_stats"] = old_stats is not None
                 if old_stats is None:
-                    B.warn("kernel.bpf_stats_enabled non scrivibile: il costo "
-                           "si stima solo dal throughput, molto piu' "
-                           "rumoroso")
+                    B.warn("kernel.bpf_stats_enabled not writable: the cost "
+                           "is estimated only from throughput, much more "
+                           "noisy")
                 try:
                     for rep in range(overhead_reps):
                         for m in pipes:
@@ -1428,7 +1057,7 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                         m, frames[0], 0, 0, direct=direct,
                                         timed=False)
                                 except B.PktgenEmptyRun as e:
-                                    B.warn(f"{m}: finestra scartata ({e})")
+                                    B.warn(f"{m}: window discarded ({e})")
                                     continue
                                 prog = per_run_ns(before, prog_stats(fd))
                                 d = run.dut
@@ -1449,11 +1078,11 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
                                 if save:
                                     save(raw, over)
                                 print(f"  {rep + 1:2d} {m:10s} {var:8s} "
-                                      f"{pps / 1e6:6.3f} Mpps elaborati  "
+                                      f"{pps / 1e6:6.3f} Mpps processed  "
                                       f"{(1e9 / pps if pps else 0):7.1f} ns "
-                                      f"dal throughput, programma "
+                                      f"from throughput, program "
                                       + (f"{prog:6.1f} ns" if prog is not None
-                                         else "n/d"))
+                                         else "n/a"))
                 finally:
                     if old_stats is not None:
                         set_bpf_stats(old_stats)
@@ -1479,26 +1108,26 @@ def run_bitrate(B, methods, model_path, frames, rates_of, plan, rounds,
 
 def _print_point(r, done, total, t0):
     def f(v, spec):
-        return format(v, spec) if v is not None else "n/d"
+        return format(v, spec) if v is not None else "n/a"
 
     el = time.monotonic() - t0
     eta = el / done * (total - done) if done else 0
-    print(f"  {r['round']:4d} {r['bitrate_requested_gbps']:6.2f}G "
+    print(f"  {r['round']:5d} {r['bitrate_requested_gbps']:6.2f}G "
           f"{r['method']:10s} {r['sent_pps'] / 1e6:8.3f}M "
           f"{r['rx_pps'] / 1e6:8.3f}M "
-          f"{(f(r['forwarded_pps'] / 1e6, '8.3f') + 'M') if r['forwarded_pps'] is not None else '     n/d ':>9s} "
+          f"{(f(r['forwarded_pps'] / 1e6, '8.3f') + 'M') if r['forwarded_pps'] is not None else '     n/a ':>9s} "
           f"{f(r['loss_before_xdp_pct'], '7.2f'):>7s} "
           f"{f(r['loss_in_pipeline_pct'], '7.2f'):>7s} "
           f"{f(r['e2e_latency_p50_us'], '7.1f'):>7s} "
           f"{f(r['e2e_latency_p99_us'], '7.1f'):>7s}"
-          + (f" {RED}macchina{NC}" if r.get("host_disturbed") else "")
+          + (f" {RED}machine{NC}" if r.get("host_disturbed") else "")
           + f"  {GREY}[{done}/{total}, ~{eta / 60:.0f} min]{NC}")
 
 
 def summarise_overhead(over):
-    """Per pipeline: mediana con e senza catena, dal tempo del programma
-    (statistiche BPF, la cifra da usare) e dal throughput (quanto il nodo
-    rallenta, ma piu' rumoroso), e le differenze."""
+    """Per pipeline: median with and without the chain, from the program time
+    (BPF statistics, the figure to use) and from throughput (how much the node
+    slows down, but noisier), and the differences."""
     per = {}
     for r in over:
         per.setdefault(r["method"], {}).setdefault(r["variant"], []).append(r)
@@ -1527,11 +1156,11 @@ def summarise_overhead(over):
 
 def print_summary(summary, ons, over_sum, threshold):
     def f(v, spec):
-        return format(v, spec) if v is not None else "n/d"
+        return format(v, spec) if v is not None else "n/a"
 
     print(f"\n{YELLOW}{'=' * 78}{NC}")
-    print(f"{YELLOW} Mediana fra i giri. Perdite in % degli inviati; collo "
-          f"di bottiglia con soglia {threshold}% oltre rxonly{NC}")
+    print(f"{YELLOW} Median over rounds. Losses in % of sent; bottleneck "
+          f"with threshold {threshold}% above rxonly{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}")
     last = None
     for s in summary:
@@ -1539,14 +1168,14 @@ def print_summary(summary, ons, over_sum, threshold):
         if key != last:
             last = key
             print(f"\n  {s['method']} ({s['frame']} B)")
-            print(f"    {'Gbit/s inv.':>11s} {'inviati':>8s} {'RX XDP':>8s} "
-                  f"{'inoltr.':>8s} {'prima%':>7s} {'pipe%':>7s} "
-                  f"{'p50us':>7s} {'p99us':>7s}  collo")
+            print(f"    {'Gbit/s sent':>11s} {'sent':>8s} {'RX XDP':>8s} "
+                  f"{'fwd':>8s} {'before%':>7s} {'pipe%':>7s} "
+                  f"{'p50us':>7s} {'p99us':>7s}  bottleneck")
         gl = ((f" (gen {s['gen_limited_rounds']}/{s['rounds']})"
                if s.get("gen_limited_rounds") else "")
-              + (f" (raffica {s['gen_burst_rounds']}/{s['rounds']})"
+              + (f" (burst {s['gen_burst_rounds']}/{s['rounds']})"
                  if s.get("gen_burst_rounds") else "")
-              + (f" (macchina disturbata {s['host_disturbed_rounds']}/"
+              + (f" (machine disturbed {s['host_disturbed_rounds']}/"
                  f"{s['rounds']})" if s.get("host_disturbed_rounds") else ""))
         print(f"    {f(s['bitrate_sent_gbps'], '11.3f')} "
               f"{f(s['sent_pps'] and s['sent_pps'] / 1e6, '8.3f')} "
@@ -1558,59 +1187,57 @@ def print_summary(summary, ons, over_sum, threshold):
               f"{f(s['e2e_latency_p99_us'], '7.1f'):>7s}  "
               f"{s['bottleneck']}{gl}")
     if ons:
-        print(f"\n{YELLOW} Dove comincia la perdita{NC}")
+        print(f"\n{YELLOW} Where the loss starts{NC}")
         for o in ons:
             lc, fl, lo = o["last_clean"], o["first_loss"], o["lowest"]
             hi = o["highest"]
             cap = o["max_forwarded_pps"]
             head = f"  {o['method']:10s} ({o['frame']} B): "
             if fl is None:
-                print(head + f"nessuna perdita attribuibile fino a "
+                print(head + f"no attributable loss up to "
                       f"{f(hi['bitrate_sent_gbps'] if hi else None, '.3f')}"
-                      f" Gbit/s inviati, il rate piu' alto misurato; "
-                      f"inoltrati al massimo {f(cap and cap / 1e6, '.3f')} "
+                      f" Gbit/s sent, the highest rate measured; "
+                      f"forwarded at most {f(cap and cap / 1e6, '.3f')} "
                       f"Mpps")
                 if o.get("max_abs_pipeline_loss_pct") is not None:
-                    print(" " * len(head) + "perdita dopo XDP: al massimo "
-                          f"{o['max_abs_pipeline_loss_pct']:.2f}% degli "
-                          f"inviati")
+                    print(" " * len(head) + "loss after XDP: at most "
+                          f"{o['max_abs_pipeline_loss_pct']:.2f}% of "
+                          f"sent")
                 continue
-            print(head + f"pulita fino a "
+            print(head + f"clean up to "
                   f"{f(lc['bitrate_sent_gbps'] if lc else None, '.3f')} "
-                  f"Gbit/s, perde da {f(fl['bitrate_sent_gbps'], '.3f')} "
-                  f"Gbit/s in su ({f(fl['sent_pps'] / 1e6, '.3f')} Mpps "
-                  f"inviati) -> {fl['bottleneck']}. Latenza p50 "
-                  f"{f(lo['e2e_latency_p50_us'], '.1f')} us al rate piu' "
-                  f"basso, {f(lc['e2e_latency_p50_us'] if lc else None, '.1f')}"
-                  f" us all'ultimo pulito, "
-                  f"{f(fl['e2e_latency_p50_us'], '.1f')} us al primo con "
-                  f"perdita. Inoltrati al massimo "
+                  f"Gbit/s, loses from {f(fl['bitrate_sent_gbps'], '.3f')} "
+                  f"Gbit/s up ({f(fl['sent_pps'] / 1e6, '.3f')} Mpps "
+                  f"sent) -> {fl['bottleneck']}. Latency p50 "
+                  f"{f(lo['e2e_latency_p50_us'], '.1f')} us at the lowest "
+                  f"rate, {f(lc['e2e_latency_p50_us'] if lc else None, '.1f')}"
+                  f" us at the last clean one, "
+                  f"{f(fl['e2e_latency_p50_us'], '.1f')} us at the first with "
+                  f"loss. Forwarded at most "
                   f"{f(cap and cap / 1e6, '.3f')} Mpps")
             if o.get("sporadic"):
-                print(" " * len(head) + "perdite sporadiche sotto l'inizio "
-                      "(finestre disturbate, non capacita'): " + ", ".join(
+                print(" " * len(head) + "sporadic losses below the onset "
+                      "(disturbed windows, not capacity): " + ", ".join(
                           f"{f(s['bitrate_sent_gbps'], '.2f')} Gbit/s"
                           for s in o["sporadic"]))
             if o.get("max_abs_pipeline_loss_pct") is not None:
-                print(" " * len(head) + "perdita dopo XDP: al massimo "
-                      f"{o['max_abs_pipeline_loss_pct']:.2f}% degli inviati")
+                print(" " * len(head) + "loss after XDP: at most "
+                      f"{o['max_abs_pipeline_loss_pct']:.2f}% of sent")
     if over_sum:
-        print(f"\n{YELLOW} Costo del contatore (mediana, rate massimo){NC}")
+        print(f"\n{YELLOW} Cost of the counter (median, maximum rate){NC}")
         for o in over_sum:
-            print(f"  {o['method']:10s} programma: catena "
-                  f"{f(o['prog_chain_ns'], '.1f')} ns, diretta "
-                  f"{f(o['prog_direct_ns'], '.1f')} ns, contatore "
+            print(f"  {o['method']:10s} program: chain "
+                  f"{f(o['prog_chain_ns'], '.1f')} ns, direct "
+                  f"{f(o['prog_direct_ns'], '.1f')} ns, counter "
                   f"{f(o['prog_overhead_ns'], '+.1f')} ns  |  throughput: "
-                  f"{f(o['cost_overhead_ns'], '+.1f')} ns (scarto fra le "
-                  f"finestre {f(o['cost_spread_chain_ns'], '.0f')} / "
+                  f"{f(o['cost_overhead_ns'], '+.1f')} ns (spread between "
+                  f"windows {f(o['cost_spread_chain_ns'], '.0f')} / "
                   f"{f(o['cost_spread_direct_ns'], '.0f')} ns)")
 
 
 def save_csv(path, rows):
-    """Come bench_throughput._write_csv (unione delle chiavi), ma senza
-    stampare e scrivendo su un file temporaneo poi rinominato: si chiama dopo
-    ogni finestra, e un'interruzione a meta' scrittura non deve lasciare un CSV
-    troncato al posto di quello buono."""
+    """Like bench_capacity._write_csv (union of the keys), but without printing
+    and writing to a temporary file then renamed."""
     cols = []
     for r in rows:
         for k in r:
@@ -1626,24 +1253,21 @@ def save_csv(path, rows):
 
 
 def report_from_csv(out_dir, threshold=DEFAULT_LOSS_THRESHOLD):
-    """Il riepilogo di un run gia' fatto, dai suoi CSV grezzi: serve quando
-    l'uscita del terminale e' andata persa o troncata, e per rileggere un run
-    vecchio con le regole di adesso (le sintesi si ricalcolano, i conteggi
-    grezzi restano quelli misurati)."""
-    from plot_bitrate import read_summary
+    """The summary of a run already done, from its raw CSVs."""
+    from plot_load_curve import read_summary
     path = os.path.join(out_dir, "bitrate_raw.csv")
     if not os.path.exists(path):
-        sys.exit(f"{out_dir}: manca bitrate_raw.csv")
+        sys.exit(f"{out_dir}: bitrate_raw.csv missing")
     raw = read_summary(path)
     opath = os.path.join(out_dir, "bitrate_overhead_raw.csv")
     over = read_summary(opath) if os.path.exists(opath) else []
     summary = summarise(raw, threshold)
-    print(f"  {len(raw)} finestre da {path}; giri per punto: "
+    print(f"  {len(raw)} windows from {path}; rounds per point: "
           f"{sorted({s['rounds'] for s in summary})}")
     burst = sum(bool(r.get("gen_burst")) for r in raw)
     limited = sum(bool(r.get("gen_limited")) for r in raw)
-    print(f"  finestre con raffica del generatore: {burst}, con generatore "
-          f"sotto il chiesto: {limited}")
+    print(f"  windows with a generator burst: {burst}, with the generator "
+          f"below the requested rate: {limited}")
     print_summary(summary, onsets(summary), summarise_overhead(over),
                   threshold)
     return 0
@@ -1653,15 +1277,15 @@ def _parse_list(spec, what):
     try:
         vals = [float(x) for x in spec.split(",") if x.strip()]
     except ValueError:
-        sys.exit(f"{what}: attesi numeri separati da virgola, ricevuto "
+        sys.exit(f"{what}: comma-separated numbers expected, got "
                  f"{spec!r}")
     if not vals or min(vals) <= 0:
-        sys.exit(f"{what}: servono valori positivi")
+        sys.exit(f"{what}: positive values needed")
     return sorted(vals)
 
 
 def _env_value(out_dir, key):
-    """Un valore dall'env.csv di un run gia' fatto, o None."""
+    """A value from the env.csv of a run already done, or None."""
     path = os.path.join(out_dir, "env.csv")
     try:
         with open(path, newline="", encoding="utf-8") as f:
@@ -1684,85 +1308,78 @@ def main(argv=None):
         description=__doc__.strip().split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--method", default="all",
-                   help="all (default: rxonly e le cinque pipeline) oppure "
-                        "una lista, es. rxonly,baseline,p1_static")
+                   help="all (default: rxonly and the five pipelines) or "
+                        "a list, e.g. rxonly,baseline,p1_static")
     r = p.add_mutually_exclusive_group()
-    r.add_argument("--bitrates", default=None, metavar="LISTA|auto",
-                   help="bit rate da offrire in Gbit/s (L2, byte del frame), "
-                        "separati da virgola. Default auto: la scala "
-                        "calibrata sul tetto di ricezione misurato all'inizio "
-                        "(frazioni " + ",".join(str(x) for x in AUTO_FRACTIONS)
+    r.add_argument("--bitrates", default=None, metavar="LIST|auto",
+                   help="bit rates to offer in Gbit/s (L2, frame bytes), "
+                        "comma-separated. Default auto: the scale "
+                        "calibrated on the reception ceiling measured at the "
+                        "start (fractions " + ",".join(str(x) for x in AUTO_FRACTIONS)
                         + ")")
-    r.add_argument("--rates", default=None, metavar="LISTA",
-                   help="in alternativa, rate in Mpps")
+    r.add_argument("--rates", default=None, metavar="LIST",
+                   help="alternatively, rates in Mpps")
     p.add_argument("--frames", default=str(DEFAULT_FRAME),
-                   help="taglie di frame in byte (pkt_size di pktgen, senza "
+                   help="frame sizes in bytes (pktgen pkt_size, without "
                         "FCS), default 64")
     p.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS,
-                   help="giri completi: ogni giro misura tutti i metodi a "
-                        "tutti i rate; si riporta la mediana")
+                   help="full rounds: every round measures every method at "
+                        "every rate; the median is reported")
     p.add_argument("--duration", type=float, default=None, metavar="S",
-                   help="durata della finestra stazionaria (default quella "
-                        "di bench_throughput, 0.3 s)")
+                   help="length of the steady window (default the one "
+                        "of bench_capacity, 0.3 s)")
     p.add_argument("--lat-samples", type=int, default=LAT_TARGET_SAMPLES,
-                   help="campioni di latenza per finestra, circa (0 = ogni "
-                        "pacchetto)")
+                   help="latency samples per window, roughly (0 = every "
+                        "packet)")
     p.add_argument("--loss-threshold", type=float, default=None,
                    metavar="PCT",
-                   help="perdita in punti %% degli inviati, oltre quella di "
-                        "rxonly allo stesso rate, da cui una riga si dice "
-                        f"'in perdita'. Default {DEFAULT_LOSS_THRESHOLD}; con "
-                        f"--report quella scritta nell'env.csv del run")
+                   help="loss in %% points of sent, above that of "
+                        "rxonly at the same rate, from which a row is called "
+                        f"'lossy'. Default {DEFAULT_LOSS_THRESHOLD}; with "
+                        f"--report the one written in the run's env.csv")
     p.add_argument("--overhead-reps", type=int, default=OVERHEAD_REPS,
-                   help="ripetizioni della misura del costo del contatore "
-                        "(0 la salta)")
-    p.add_argument("--gen-cpus", default=None, metavar="LISTA")
-    p.add_argument("--dut-cpus", default=None, metavar="LISTA")
+                   help="repetitions of the counter cost measurement "
+                        "(0 skips it)")
+    p.add_argument("--gen-cpus", default=None, metavar="LIST")
+    p.add_argument("--dut-cpus", default=None, metavar="LIST")
     p.add_argument("--threads", type=int, default=None, metavar="N")
     p.add_argument("--allow-cpu0", action="store_true")
     p.add_argument("--egress-cpu", default="auto", metavar="N|auto|none",
-                   help="NAPI dei veth d'uscita (il nodo successivo) in thread "
-                        "sulla CPU N. auto (default): un core fisico suo "
-                        "scelto dal piano, se ne resta uno; none: la "
-                        "ricezione del nodo successivo gira sulla CPU del DUT "
-                        "(il comportamento fino al 2026-09-26, dove una "
-                        "perdita all'uscita era improbabile per costruzione)")
+                   help="NAPI of the egress veths (the next node) threaded "
+                        "on CPU N. auto (default): a physical core of its "
+                        "own chosen by the plan, if one is left; none: the "
+                        "next node's reception runs on the DUT CPU")
     p.add_argument("--dut-queues", default="auto", metavar="N|auto|gen",
-                   help="code d'ingresso del DUT: auto (default) una per CPU "
-                        "del DUT; gen una per thread generatore (storico). "
-                        "Vedi bench_throughput.DUT_QUEUES")
+                   help="DUT ingress queues: auto (default) one per DUT "
+                        "CPU; gen one per generator thread. "
+                        "See bench_capacity.DUT_QUEUES")
     p.add_argument("--generator", choices=("pktgen", "xdp"), default="xdp",
-                   help="xdp (default): xdp_gen, frame XDP grezzi come da una "
-                        "NIC con XDP nativo, cadenza e timbro nel programma "
-                        "generatore. Un thread per coda d'ingresso: senza "
-                        "--gen-cpus ne' --threads, uno per CPU del DUT; "
-                        "senza scala, i rate di XDP_RATES_MPPS (la cadenza "
-                        "regge fino a ~11-12 Mpps per thread). pktgen: skb, con "
-                        "la copia di headroom sul DUT")
+                   help="xdp (default): xdp_gen, raw XDP frames as from a "
+                        "NIC with native XDP, pacing and timestamp in the "
+                        "generator program. One thread per ingress queue: "
+                        "without --gen-cpus or --threads, one per DUT CPU; "
+                        "without a scale, the rates of XDP_RATES_MPPS (pacing "
+                        "holds up to ~11-12 Mpps per thread). pktgen: skb, with "
+                        "the headroom copy on the DUT")
     p.add_argument("--xdp-batch", type=int, default=None, metavar="N",
-                   help="con --generator xdp: frame per lotto del test_run "
-                        "(1-256, default 256). A fine lotto il redirect "
-                        "sveglia il DUT; un lotto piu' piccolo lo sveglia piu' "
-                        "spesso ma rimpicciolisce la page_pool")
-    p.add_argument("--out", default=None, help="cartella dei risultati")
+                   help="with --generator xdp: frames per test_run batch "
+                        "(1-256, default 256). At the end of a batch the redirect "
+                        "wakes the DUT; a smaller batch wakes it more "
+                        "often but shrinks the page_pool")
+    p.add_argument("--out", default=None, help="results folder")
     p.add_argument("--no-plot", action="store_true",
-                   help="non disegnare i grafici a fine run")
+                   help="do not draw the charts at the end of the run")
     p.add_argument("--cleanup", action="store_true",
-                   help="rimuovi un fabric rimasto da un run interrotto")
+                   help="remove a fabric left over by an interrupted run")
     p.add_argument("--report", default=None, metavar="DIR",
-                   help="niente misure: rilegge bitrate_raw.csv (e "
-                        "bitrate_overhead_raw.csv) da DIR e ristampa "
-                        "riepilogo, inizio della perdita e costo del "
-                        "contatore con le regole attuali. Non serve root.")
+                   help="no measurement: re-read bitrate_raw.csv (and "
+                        "bitrate_overhead_raw.csv) from DIR and print again "
+                        "summary, loss onset and counter cost with the "
+                        "current rules. No root needed.")
     HC.add_args(p)
     import model_under_test as MUT
     MUT.add_args(p)
     a = p.parse_args(argv)
-    # --out e --report sono rispetto alla cartella da cui si lancia. Sotto,
-    # main() si sposta in ipa/ (come bench_throughput): fino al 2026-09-26
-    # `--out results/bitrate` finiva cosi' in ipa/results/bitrate, mentre la
-    # riga "scritto results/bitrate/..." faceva credere il contrario, e
-    # `--report results/bitrate` dalla radice non trovava niente.
     out_dir = os.path.abspath(a.out) if a.out else None
 
     if a.report:
@@ -1775,20 +1392,18 @@ def main(argv=None):
                 thr = DEFAULT_LOSS_THRESHOLD
         return report_from_csv(rdir, thr)
     if sys.platform != "linux":
-        sys.exit(f"serve Linux, non {sys.platform}")
+        sys.exit(f"Linux needed, not {sys.platform}")
     if os.geteuid() != 0:
-        sys.exit("serve root: sudo python3 ipa/test/bench_bitrate.py")
+        sys.exit("root needed: sudo python3 ipa/test/bench_load_curve.py")
     HC.check_args(a)
-    # Il modello e lo scenario: senza, il checkpoint per la strada di sempre.
-    # build_pipeline e class_semantics (bench_throughput) li seguono da soli.
     MUT.select(a.model, a.topology)
     a.egress_cpu = HC.parse_egress(a.egress_cpu)
     if a.loss_threshold is None:
         a.loss_threshold = DEFAULT_LOSS_THRESHOLD
         threshold_why = "default"
     else:
-        threshold_why = "data a mano"
-    import bench_throughput as B
+        threshold_why = "set by hand"
+    import bench_capacity as B
     os.chdir(B.SHARED_DIR)
     if a.cleanup:
         from netns_fabric import cleanup
@@ -1799,8 +1414,8 @@ def main(argv=None):
             B.pg_reset()
         return 0
     if a.generator == "pktgen" and not B.pg_available():
-        sys.exit(f"{B.PKTGEN_DIR} non c'e' e `modprobe pktgen` non l'ha "
-                 f"creato: questo kernel non ha il modulo.")
+        sys.exit(f"{B.PKTGEN_DIR} does not exist and `modprobe pktgen` did "
+                 f"not create it: this kernel lacks the module.")
     if B.pg_available():
         B.pg_reset()
 
@@ -1808,21 +1423,18 @@ def main(argv=None):
                else [m.strip() for m in a.method.split(",") if m.strip()])
     bad = [m for m in methods if m not in (REFERENCE,) + PIPELINES]
     if bad:
-        sys.exit(f"--method: sconosciuti {bad}; validi: all, {REFERENCE}, "
+        sys.exit(f"--method: unknown {bad}; valid: all, {REFERENCE}, "
                  f"{', '.join(PIPELINES)}")
     frames = [int(x) for x in _parse_list(a.frames, "--frames")]
     if a.generator == "xdp" and not a.rates and not a.bitrates:
-        # La scala calibrata sul tetto di ricezione con xdp_gen andrebbe a
-        # ~19 Mpps, oltre la cadenza di un thread: si usa la scala fissa.
         a.rates = ",".join(f"{x:g}" for x in XDP_RATES_MPPS)
     if a.generator == "xdp" and a.gen_cpus is None and a.threads is None:
-        # uno scrittore per coda (docs/testing.md §10.3)
         a.threads = len(B.parse_cpu_list(a.dut_cpus) or [None])
     scale_spec = (a.bitrates or "auto").strip().lower() if not a.rates \
         else "rates"
     if scale_spec == "auto":
-        rates_of = None                 # calibrata in run_bitrate
-        scale_desc = "auto (calibrata sul tetto di ricezione all'inizio)"
+        rates_of = None
+        scale_desc = "auto (calibrated on the reception ceiling at the start)"
     elif scale_spec == "rates":
         mpps = _parse_list(a.rates, "--rates")
 
@@ -1842,10 +1454,10 @@ def main(argv=None):
     plan.describe()
     if isinstance(a.egress_cpu, int):
         if a.egress_cpu in plan.dut or a.egress_cpu in plan.gen:
-            sys.exit(f"--egress-cpu {a.egress_cpu} e' gia' del generatore o "
-                     f"del DUT")
+            sys.exit(f"--egress-cpu {a.egress_cpu} already belongs to the "
+                     f"generator or the DUT")
         if a.egress_cpu not in B.online_cpus():
-            sys.exit(f"--egress-cpu {a.egress_cpu}: CPU non online")
+            sys.exit(f"--egress-cpu {a.egress_cpu}: CPU not online")
     B.DUT_QUEUES = B.parse_dut_queues(a.dut_queues, plan)
 
     import model_meta as mm
@@ -1861,15 +1473,15 @@ def main(argv=None):
         env = B.capture_env(envargs, plan, methods, frames)
         env += [("scala", scale_desc),
                 ("soglia_perdita_origine", threshold_why),
-                ("latenza", "timbro pktgen -> contatore del nodo successivo, "
-                            "celle da 1 us, corretta per l'attesa di pktgen"
+                ("latenza", "pktgen timestamp -> next node's counter, "
+                            "1 us cells, corrected for pktgen's wait"
                  if a.generator == "pktgen" else
-                 "timbro di xdp_gen all'invio (formato pktgen) -> contatore "
-                 "del nodo successivo, celle da 1 us, nessuna correzione"),
+                 "xdp_gen timestamp at send (pktgen format) -> next "
+                 "node's counter, 1 us cells, no correction"),
 
                 ("latenza_campioni_per_finestra", a.lat_samples),
-                ("contatore_ingresso", "programma 1 (per-CPU) -> tail call -> "
-                                       "pipeline di produzione")]
+                ("contatore_ingresso", "program 1 (per-CPU) -> tail call -> "
+                                       "production pipeline")]
         if a.generator == "xdp":
             env.append(("xdp_lotto", a.xdp_batch or "256 (default)"))
         env += list(extra)
@@ -1887,8 +1499,8 @@ def main(argv=None):
     def body(hostmon):
         B.print_env(env_now())
         if out_dir:
-            B.info(f"risultati in {out_dir} (bitrate_raw.csv aggiornato dopo "
-                   f"ogni finestra; host_monitor.csv: la macchina al secondo)")
+            B.info(f"results in {out_dir} (bitrate_raw.csv updated after "
+                   f"every window; host_monitor.csv: the machine per second)")
         t0 = time.monotonic()
         try:
             raw, over, notes = run_bitrate(
@@ -1903,18 +1515,18 @@ def main(argv=None):
         ons = onsets(summary)
         over_sum = summarise_overhead(over)
         print_summary(summary, ons, over_sum, a.loss_threshold)
-        print(f"\n  durata del run: {(time.monotonic() - t0) / 60:.1f} min")
+        print(f"\n  run length: {(time.monotonic() - t0) / 60:.1f} min")
         rc = 0 if raw else 1
         if any(r["tail_call_miss"] for r in raw if not r["reference"]):
-            B.warn("tail call non partite in qualche finestra: quei pacchetti "
-                   "sono entrati nel contatore e non nella pipeline")
+            B.warn("tail calls not taken in some window: those packets "
+                   "entered the counter and not the pipeline")
             rc = 1
         disturbed = sum(bool(r.get("host_disturbed")) for r in raw)
         if disturbed:
-            B.warn(f"{disturbed} finestre su {len(raw)} con la macchina fuori "
-                   f"dalle condizioni dichiarate (colonna host_disturbed: "
-                   f"throttling, frequenza del DUT fuori target, powerclamp, "
-                   f"batteria)")
+            B.warn(f"{disturbed} windows out of {len(raw)} with the machine "
+                   f"outside the declared conditions (host_disturbed column: "
+                   f"throttling, DUT frequency off target, powerclamp, "
+                   f"battery)")
         if out_dir and raw:
             os.makedirs(out_dir, exist_ok=True)
             B._write_csv(os.path.join(out_dir, "bitrate_raw.csv"), raw)
@@ -1928,27 +1540,23 @@ def main(argv=None):
                 ("scala_usata", notes.get("scala", scale_desc)),
                 ("finestre_macchina_disturbata", f"{disturbed}/{len(raw)}"),
                 ("correzione_attesa_pktgen",
-                 "non serve (xdp_gen timbra all'invio)"
-                 if notes.get("idle_correction") == "non serve" else
-                 "si" if notes.get("idle_correction") else "NO: idle assente"),
+                 "not needed (xdp_gen timestamps at send)"
+                 if notes.get("idle_correction") == "not needed" else
+                 "yes" if notes.get("idle_correction") else "NO: idle missing"),
                 ("costo_contatore_da",
-                 "statistiche BPF del kernel + throughput"
-                 if notes.get("bpf_stats") else "solo throughput"),
+                 "kernel BPF statistics + throughput"
+                 if notes.get("bpf_stats") else "throughput only"),
                 ("durata_run_min", round((time.monotonic() - t0) / 60, 1))]))
             if not a.no_plot:
                 try:
-                    import plot_bitrate
-                    plot_bitrate.plot_all(out_dir)
+                    import plot_load_curve
+                    plot_load_curve.plot_all(out_dir)
                 except ImportError as e:
-                    B.warn(f"grafici non disegnati ({e}): "
-                           f"python3 ipa/test/plot_bitrate.py {out_dir}")
+                    B.warn(f"charts not drawn ({e}): "
+                           f"python3 ipa/test/plot_load_curve.py {out_dir}")
             B._give_back(out_dir)
         return rc
 
-    # Le condizioni della macchina si applicano dopo il piano (servono i
-    # ruoli) e prima di qualunque misura, e si ripristinano comunque vada.
-    # Tutto il run sta dentro, CSV ed env.csv compresi: env.csv registra la
-    # macchina com'era mentre misurava, non dopo il ripristino.
     return B.conditioned(a, plan, body, out_dir)
 
 if __name__ == "__main__":

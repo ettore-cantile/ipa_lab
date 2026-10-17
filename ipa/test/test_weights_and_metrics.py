@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
-"""
-test_suite.py — weight extraction, quantization, and the in-kernel metrics
-=========================================================================
+"""test_weights_and_metrics.py -- weight extraction, quantization, and the metrics
+of the programs in the kernel.
 
-Available suites (--only):
-  extract  : extract_weights.py / weights.json / dequant consistency
-  quant    : argmax accuracy vs scale_factor (the PTQ trade-off), on the
-             integer arithmetic P2/P3 run
-  kernel   : IN-KERNEL metrics via BPF_PROG_TEST_RUN -- eBPF instruction count,
-             per-packet latency, map lookups, map memory, + the real dispatch
-             gate. Requires Linux + BCC + root; elsewhere it is skipped
-             gracefully (does not fail the run).
-  all      : every suite (default)
-
-Whether the datapath computes the model is checked elsewhere, on the real
-programs: test_synth.py (the P1 C, from its text), verify_synth_kernel.py (all
-three pipelines in the kernel), test_fabric.py (packets out of the right port).
+Suites (--only): extract, quant, kernel (root), all.
 
 Usage:
-  python3 ipa/test/test_suite.py                       # every suite (kernel skipped without BCC)
-  python3 ipa/test/test_suite.py --only quant --samples 200
-  sudo python3 ipa/test/test_suite.py --only kernel    # kernel metrics (root)
+    python3 ipa/test/test_weights_and_metrics.py
+    sudo python3 ipa/test/test_weights_and_metrics.py --only kernel
 """
 
 import argparse
@@ -28,17 +14,11 @@ import time
 import sys
 import os
 
-# Lives in ipa/test/; pipeline modules (ebpf_program, extract_weights, ...)
-# and the .pt/.json data files live one level up in ipa/.
 _TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
 SHARED_DIR = os.path.dirname(_TEST_DIR)
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 
-# torch is optional at import time: `--only kernel` never touches a torch
-# model (it drives verify_prog_run.py / BCC directly), so it must keep working
-# on nodes that don't have torch installed. main() hard-fails
-# with a clear error only if a suite that actually needs torch is requested.
 try:
     import torch
     import torch.nn as nn
@@ -49,27 +29,8 @@ except ImportError:
 
 import numpy as np
 
-# Reference architecture: RESOLVED FROM THE DESCRIPTOR, not written here.
-#
-# This block used to hold `N_INTERFACES = 6`, `N_NODES = 22`, `HIDDEN_DIM = 32`,
-# `INPUT_SIZE = 35`, `OUTPUT_SIZE = 7` -- a shape that exists in no pipeline.
-# The checkpoint is 65-4-4-7, so `_load_default_model`'s guard
-#     if li == INPUT_SIZE and lh == HIDDEN_DIM
-# read `65 == 35 and 4 == 32` and was UNSATISFIABLE: the checkpoint was loaded,
-# discarded, and four of the six suites ran random weights on a 35-32-32-7
-# model instead. Worse, the class semantics printed alongside them came out
-# drop_class=6 while the real model's is 5.
-#
-# Everything now comes from model_meta (features -> n_in, declared n_out,
-# declared hidden_dims), so the "default" architecture IS the descriptor's
-# architecture and the guard can actually hold.
 def reference_shape() -> dict:
-    """{n_in, n_out, hidden_dims} for the model this repo is configured for.
-
-    Resolved once per call from model_meta.json + the topology config. No
-    module-level constants: a constant here is a scenario assumption frozen at
-    import time, which is exactly what went wrong.
-    """
+    """{n_in, n_out, hidden_dims} for the model this repo is configured for."""
     import model_meta as _mm
     shape = _mm.derive_shape(_mm.load_model_meta(
                                  os.path.join(SHARED_DIR, "weights.json")),
@@ -88,13 +49,7 @@ def info(msg): print(f"  {YELLOW}[INFO]{NC} {msg}")
 
 
 def suite_semantics(n_out: int):
-    """Semantics for a model of width `n_out`, from the descriptor if it fits.
-
-    model_meta.json is the authority when its n_out matches. Otherwise the
-    reference FORWARD.../DROP-last layout is returned AND announced, because a
-    guess that is printed can be contradicted by the reader; a guess that is
-    silent (the old behaviour) cannot.
-    """
+    """Semantics for a model of width `n_out`, from the descriptor if it fits."""
     from class_semantics import ClassSemantics
     try:
         import model_meta as _mm
@@ -114,18 +69,7 @@ def suite_semantics(n_out: int):
 
 
 def decode_nexthop(argmax_idx: int, semantics=None) -> str:
-    """Render a predicted class, keeping class / action / port distinct.
-
-    The previous body was `if argmax_idx == 0: return "DROP"` followed by
-    `eth{argmax_idx - 1}` -- an abandoned convention (DROP=0, ports shifted by
-    one) that no other part of the system used, so class 2 was printed as
-    "eth1" while the datapath forwarded it out port 2. It never entered an
-    assertion, so nothing failed; the logs were simply wrong.
-
-    With `semantics` the output is the full chain. Without it, the class index
-    is printed as an index and NOT decorated with an interface name -- refusing
-    to guess is the point.
-    """
+    """Render a predicted class, keeping class / action / port distinct."""
     if semantics is not None:
         from class_semantics import format_decision
         return format_decision(argmax_idx, semantics)
@@ -134,12 +78,7 @@ def decode_nexthop(argmax_idx: int, semantics=None) -> str:
 
 if TORCH_AVAILABLE:
     class FRRModel(nn.Module):
-        """Two-hidden-layer MLP matching the pipelines' shape family.
-
-        The defaults come from the DESCRIPTOR, resolved at construction time,
-        not from module constants fixed at import time. `FRRModel()` therefore
-        builds the architecture this repo is actually configured for.
-        """
+        """Two-hidden-layer MLP matching the pipelines' shape family."""
 
         def __init__(self, input_size=None, hidden_dim=None, output_size=None):
             if input_size is None or hidden_dim is None or output_size is None:
@@ -157,7 +96,6 @@ if TORCH_AVAILABLE:
             x = F.relu(self.fc2(x))
             return self.out(x)
 
-
     def load_pt_dynamic(path: str) -> tuple:
         state = torch.load(path, map_location='cpu', weights_only=True)
         w1_shape  = state['fc1.weight'].shape
@@ -172,19 +110,6 @@ if TORCH_AVAILABLE:
         )
         model.load_state_dict(state)
         return model, inferred_input, inferred_hidden, inferred_output
-
-
-    def fresh_like(model: "nn.Module") -> "FRRModel":
-        """A newly initialised model of the SAME shape as `model`.
-
-        The "weight update" tests used a bare `FRRModel()`, which was a
-        different architecture from the one under test whenever the two
-        disagreed. Deriving the shape from the model keeps an update test an
-        update test instead of a silent architecture swap.
-        """
-        return FRRModel(input_size=model.fc1.in_features,
-                        hidden_dim=model.fc1.out_features,
-                        output_size=model.out.out_features)
 
 
     def compute_scale(model: "nn.Module") -> int:
@@ -243,11 +168,6 @@ class Method2_Template:
         h2 = np.maximum(0, W2 @ h1 + b2)
         return W3 @ h2 + b3
 
-    def update_weights(self, new_model) -> float:
-        t0 = time.perf_counter()
-        self._load(new_model)
-        return time.perf_counter() - t0
-
 
 class Method3_Modular:
     def __init__(self, model: "FRRModel"):
@@ -294,11 +214,6 @@ class Method3_Modular:
         h1 = np.maximum(0, self._layer(0, x, self.hidden))
         h2 = np.maximum(0, self._layer(1, h1, self.hidden))
         return self._layer(2, h2, self.output)
-
-    def update_weights(self, new_model, layer_idx=None) -> float:
-        t0 = time.perf_counter()
-        self._load(new_model, layer_idx)
-        return time.perf_counter() - t0
 
 
 class Method2_FixedScale(Method2_Template):
@@ -348,12 +263,7 @@ class Method3_FixedScale(Method3_Modular):
 
 
 def _feature_groups(n_in: int):
-    """[(kind, size)] for the descriptor's features, truncated/padded to n_in.
-
-    Read from model_meta's FEATURE_CATALOG so the generated vector respects
-    each feature's STRUCTURE (a one-hot gets exactly one 1, a dense_vector gets
-    per-slot 0/1, a scalar gets a normalised value). Cached per n_in.
-    """
+    """[(kind, size)] for the descriptor's features, truncated/padded to n_in."""
     if n_in in _FEATURE_GROUPS_CACHE:
         return _FEATURE_GROUPS_CACHE[n_in]
     import model_meta as _mm
@@ -364,9 +274,6 @@ def _feature_groups(n_in: int):
         groups = [(_mm.FEATURE_CATALOG[f["type"]]["kind"], f["size"])
                   for f in shape["features"]]
         if sum(g[1] for g in groups) != n_in:
-            # A model of a different width than the descriptor (the alt-arch
-            # sweeps). No structure is known for it, so say so by treating the
-            # whole vector as one dense block rather than inventing groups.
             groups = [("dense_vector_map", n_in)]
     except Exception:
         groups = [("dense_vector_map", n_in)]
@@ -378,14 +285,7 @@ _FEATURE_GROUPS_CACHE = {}
 
 
 def make_input(input_size=None):
-    """A random input vector that respects the descriptor's feature structure.
-
-    Was: 6 link_state bits + 6 iface one-hot + 1 ttl + 22 node one-hot, i.e.
-    `N_INTERFACES`/`N_NODES` frozen at import time, zero-padded or truncated to
-    whatever width the caller asked for. Padding a 35-wide vector out to 65
-    fed the model 30 structural zeros where the node one-hot belongs, so no
-    generated input ever exercised the node feature at all.
-    """
+    """A random input vector that respects the descriptor's feature structure."""
     if input_size is None:
         input_size = reference_shape()["n_in"]
     parts = []
@@ -395,7 +295,7 @@ def make_input(input_size=None):
             v[np.random.randint(0, size)] = 1.0
         elif kind == "scalar":
             v = np.random.uniform(0.0, 1.0, size).astype(np.float32)
-        else:                                    # dense_vector_map
+        else:
             v = np.random.randint(0, 2, size).astype(np.float32)
         parts.append(v)
     base = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
@@ -415,7 +315,7 @@ def _banner(passed, total):
     color = GREEN if passed == total else RED
     print(f"{color} Result: {passed}/{total} tests passed{NC}")
     if passed < total:
-        print(f"{RED} Controlla i messaggi [FAIL] sopra{NC}")
+        print(f"{RED} Check the [FAIL] messages above{NC}")
     print(f"{YELLOW}{'='*52}{NC}\n")
 
 
@@ -517,17 +417,6 @@ def suite_extract(model_path):
     return passed == total
 
 
-# Candidate int8 scales. A scale is REPRESENTABLE for a given model only while
-# scale * max|w| <= 127; past that, weights saturate at +-127 and the error is
-# dominated by clamping, not by rounding. The sweep keeps the saturating scales
-# in the table (they show the cliff) but excludes them from the assertions:
-# asserting "error decreases as scale increases" across a clamping boundary is
-# asserting something false.
-#
-# This used to be a bare list of six scales with no notion of representability,
-# which passed only because the suite was secretly running a random
-# 35-32-32-7 model whose max|w| ~ 0.2 made every scale up to 512 valid. The
-# real checkpoint has max|w| = 5.1, so only scales up to 24 are representable.
 SCALE_CANDIDATES = [8, 16, 32, 64, 128, 256, 512]
 
 
@@ -560,13 +449,7 @@ def _evaluate_scale(model, scale, inputs, n_samples):
 
 
 def suite_quant(model, n_samples=200, model_path=None):
-    """`model` is the checkpoint main() loaded.
-
-    The old body re-loaded the .pt itself when `--model` was given and fell
-    back to a random `FRRModel()` otherwise, so the DEFAULT run measured
-    quantisation error on random weights. Quantisation error depends entirely
-    on the weight distribution, so that number described nothing.
-    """
+    """`model` is the checkpoint main() loaded."""
     print(f"\n{YELLOW}=== SUITE quant — argmax accuracy vs scale_factor ==={NC}\n")
     torch.manual_seed(42)
     np.random.seed(42)
@@ -613,7 +496,6 @@ def suite_quant(model, n_samples=200, model_path=None):
         passed += 1
     else:
         errs = [results[sf][0] for sf in rep_scales]
-        # Monotone non-increasing, with a small slack for sampling noise.
         bad = [(rep_scales[i], errs[i], rep_scales[i + 1], errs[i + 1])
                for i in range(len(errs) - 1) if errs[i + 1] > errs[i] + 1e-3]
         if not bad:
@@ -647,21 +529,6 @@ def suite_quant(model, n_samples=200, model_path=None):
         passed += 1
     else:
         fail(f"compute_scale accuracy ({opt_acc2:.1f}%) < avg ({avg_acc2:.1f}%)")
-    # Test D used to assert `max_err <= H / scale`, which is not a bound on
-    # this quantity at all: no dependence on the input width or magnitude, and
-    # none on how the error compounds across layers. It passed only because the
-    # suite was secretly running a random 35-32-32-7 model at scale 512.
-    #
-    # Two replacements were tried and rejected before this one:
-    #   - a propagated worst case (product of layer row sums): mathematically
-    #     valid but ~1.5e3 against a measured 5.2, so passing it proves nothing;
-    #   - a flat "<= 5% of the output range": an invented constant, and scale=8
-    #     lands at 5.1%, so the threshold decides the verdict, not the model.
-    #
-    # What the datapath actually depends on is ONE scale -- the one the control
-    # plane picks -- and only through the ARGMAX, since that is all that reaches
-    # a forwarding decision. So that is what is asserted. The other scales stay
-    # in the table above as the sensitivity curve.
     print(f"\n{YELLOW}[Test D] argmax accuracy at the scale the control plane "
           f"selects{NC}")
     total += 1
@@ -695,71 +562,37 @@ def suite_quant(model, n_samples=200, model_path=None):
     return passed == total
 
 
-# Every map a pipeline declares, summed by map_bytes() from the kernel's own
-# BPF_OBJ_GET_INFO_BY_FD. A name absent from a given pipeline is skipped by the
-# try/except at the call site, so one list covers all three.
-#
-# This list was previously INCOMPLETE, and since the lookup failure is silently
-# swallowed, the omissions did not show up as errors -- they just made the
-# reported footprint smaller than the real one. Missing were: model_progs
-# (P1's 256-slot BPF_PROG_ARRAY, the single largest P1 map), queue_state and
-# model_desc (P2 and P3), and layer_shapes (P3's 512-entry map). Keep this list
-# in sync with the BPF_* declarations in the three eBPF sources.
 _PIPELINE_MAP_NAMES = [
-    # shared inputs: link_state (egress up/down) and queue_state (synthetic)
     "link_state", "queue_state",
-    # shared per-model descriptor registry (P2 + P3)
     "model_desc",
-    # P1 hardcoded (no weight map -- weights are C literals)
     "pkt_stats", "cls_stats", "mac_table", "model_progs",
-    # P2 template
     "arch_weights", "arch_registry", "arch_progs", "class_action_t2",
     "mac_table_t2", "pkt_stats_t2", "cls_stats_t2",
-    # P3 modular
     "layer_weights", "layer_registry", "layer_shapes", "layer_chain",
     "scratch_acts", "scratch_meta", "class_action_t3",
     "mac_table_t3", "pkt_stats_t3", "cls_stats_t3",
 ]
 
 
-# TTL sweeps start at 2, not 1: a forwarding hop now decrements the TTL and
-# refuses to forward a packet whose TTL would reach 0 (see ipa_ttl_dec in the
-# eBPF sources). TTL=1 is therefore a legitimate NON-forward, and including it
-# in a sweep that asserts 'the packet was redirected' would fail by design.
-# TTL=1 is covered separately by the dedicated expiry test.
 def verify_alt_architectures(ttl_min=2, ttl_max=6):
-    """
-    Everything above this point in suite_kernel() exercises exactly ONE
-    architecture (the checked-in 65-4-4-7 model) across the 3 pipelines --
-    a real risk of a design-space claim ("P1/P2/P3 handle arbitrary shapes")
-    going untested. This closes that gap:
-      - P1 hardcoded: two SEPARATELY COMPILED programs with DIFFERENT depths
-        ((8,) one hidden layer, (4,4,4) three hidden layers -- exercising the
-        variable-depth generalization), same default feature descriptor,
-        random synthetic weights, checked against the generalized
-        ref_infer_sparse() (handles any hidden_dims length).
-      - P2 template / P3 modular: delegates to verify_multi_model.py's
-        existing alt-shape checks (65-6-5-7 for P2, 65-5-6-4-7 for P3,
-        registered ALONGSIDE the real model in the SAME compiled object --
-        the actual "multi-model concurrent" claim, not just routing).
-    Returns True iff every alt-architecture check passes.
-    """
+    """Everything above this point in suite_kernel() exercises exactly ONE
+    architecture (the checked-in 65-4-4-7 model) across the 3 pipelines -- a
+    real risk of a design-space claim ("P1/P2/P3 handle arbitrary shapes")
+    going untested."""
     import ctypes as ct
     import random as _random
-    import verify_prog_run as V
+    import check_pipelines as V
     import model_meta as mm
     import p1_aot
     from common import write_vector_map
 
-    print(f"\n{YELLOW}--- Architetture alternative (non solo 65-4-4-7) ---{NC}")
+    print(f"\n{YELLOW}--- Other architectures (not only 65-4-4-7) ---{NC}")
     all_ok = True
 
-    # --- P1 hardcoded: variable depth, same descriptor -------------------
     shape = mm.derive_shape({"n_interfaces": 6, "n_nodes": 52,
                              "n_out": reference_shape()["n_out"]})
     features, n_out, n_in = shape["features"], shape["n_out"], shape["n_in"]
 
-    # link_state width from the resolved descriptor, not a literal 6.
     _ls_size = next((f["size"] for f in features if f["type"] == "link_state"), 0)
 
     def n_weights(dims):
@@ -770,12 +603,8 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
         rng = _random.Random(seed)
         weights = [rng.randint(-30, 30) for _ in range(n_weights(dims))]
         scale = 24
-        # ONE semantics object feeds both the generated switch and the
-        # expectations below, so the test cannot pass by agreeing with itself
-        # about a convention the datapath does not implement.
         alt_sem = suite_semantics(n_out)
         try:
-            # The AOT object, as P1 is deployed (p1_aot).
             aot = p1_aot.load_p1([(0, weights, scale)], features=features,
                                  n_out=n_out, hidden_dims=dims,
                                  semantics=alt_sem)
@@ -795,11 +624,6 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
             ref_cls, ref_val = V.ref_infer_sparse(
                 weights, features, dims, n_out, ttl, model_id=0,
                 map_values={"link_state": [1] * _ls_size},
-                # No ingress_port entry is installed for these alt-arch
-                # programs, so the datapath resolves no logical port and the
-                # ingress_iface one-hot stays empty. The reference must say the
-                # same thing, or the two disagree about a feature neither is
-                # exercising.
                 ingress_port=0, scale=scale)
             frame = V.build_frame_sparse(model_id=0, ttl=ttl, scale=scale, n_in=n_in, n_out=n_out)
             for i in range(3):
@@ -810,10 +634,6 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
                 except Exception:
                     pass
             retval, _ = V.prog_test_run(disp_fn.fd, frame, repeat=1)
-            # Expectation from the DECLARED action. The old `ref_cls <
-            # n_out - 1` scored a FORWARD expectation against the checked-in
-            # model's DROP class 5 and a DROP expectation against its untrained
-            # class 6 -- exactly backwards on both.
             _act = alt_sem.action_of(ref_cls)
             if _act == "FORWARD":
                 got = V._read_u64(cs, ref_cls)
@@ -823,7 +643,7 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
                 good = (retval == 1) and got > 0
             else:
                 got = V._read_u64(cs, ref_cls)
-                good = (retval == 2) and got > 0   # UNUSED -> XDP_PASS
+                good = (retval == 2) and got > 0
             passed += good
             failed += not good
         if failed == 0:
@@ -832,9 +652,8 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
             fail(f"hardcoded alt-arch {shape_str}: {failed}/{passed + failed} FAIL")
             all_ok = False
 
-    # --- P2 template / P3 modular: delegate to verify_multi_model.py -----
     try:
-        import verify_multi_model as VMM
+        import check_multi_model as VMM
         t_ok = VMM.test_template()
         m_ok = VMM.test_modular()
         (ok if t_ok else fail)(f"template alt-arch (65-6-5-7, concurrent w/ 65-4-4-7): "
@@ -849,13 +668,6 @@ def verify_alt_architectures(ttl_min=2, ttl_max=6):
     return all_ok
 
 
-# TTL sweeps start at 2, not 1: a forwarding hop now decrements the TTL and
-# refuses to forward a packet whose TTL would reach 0 (see ipa_ttl_dec in the
-# eBPF sources). TTL=1 is therefore a legitimate NON-forward, and including it
-# in a sweep that asserts 'the packet was redirected' would fail by design.
-# TTL=1 is covered separately by the dedicated expiry test.
-# A suite that could not run here (no root, no Linux, no BCC): truthy, so it
-# does not fail the run, but reported as SKIP and not as PASS.
 SKIPPED = "skip"
 
 
@@ -863,37 +675,30 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     print(f"\n{YELLOW}=== SUITE kernel — BPF_PROG_TEST_RUN (instructions, latency, throughput, CPU) ==={NC}\n")
     if not sys.platform.startswith("linux"):
         info(f"kernel suite skipped: platform {sys.platform} (needs Linux).")
-        info("Run on a Linux host: sudo python3 ipa/test/test_suite.py --only kernel")
+        info("Run on a Linux host: sudo python3 ipa/test/test_weights_and_metrics.py --only kernel")
         return SKIPPED
     if os.geteuid() != 0:
-        # Checked up front: without root BCC reports a generic "Failed to
-        # compile BPF module", which the per-pipeline permission check below
-        # cannot tell apart from a real failure.
         info("kernel suite skipped: needs root (loads XDP programs).")
-        info("Run: sudo python3 ipa/test/test_suite.py --only kernel")
+        info("Run: sudo python3 ipa/test/test_weights_and_metrics.py --only kernel")
         return SKIPPED
     try:
-        import verify_prog_run as V
+        import check_pipelines as V
     except Exception as e:
-        info(f"kernel suite skipped: BCC/verify_prog_run not importable ({e}).")
-        info("Needs Linux + BCC + root: sudo python3 ipa/test/test_suite.py --only kernel")
+        info(f"kernel suite skipped: BCC/check_pipelines not importable ({e}).")
+        info("Needs Linux + BCC + root: sudo python3 ipa/test/test_weights_and_metrics.py --only kernel")
         return SKIPPED
     mp = model_path or V.MODEL_PT
     mut = V._mut()
     if mut is not None:
         import model_under_test as MUT
         c = V.ref_infer(None, mut.scale, V.BENCH_TTL, 0)[0]
-        info(f"modello sotto test: {mut.name} ({mut.shape}); al TTL del banco "
-             f"({V.BENCH_TTL}, link tutti su) decide la classe {c}, "
-             f"{mut.semantics.action_of(c)}: la latenza e' quella di quel "
-             f"percorso")
+        info(f"model under test: {mut.name} ({mut.shape}); at the bench TTL "
+             f"({V.BENCH_TTL}, every link up) it decides class {c}, "
+             f"{mut.semantics.action_of(c)}: the latency is that of this "
+             f"path")
     methods = [
-        ("baseline",  V.setup_baseline,  0),   # reference floor: parse + redirect, NO inference
-        # P1 specialised: weights AND node index compiled in, one binary per
-        # node. The same AOT object as P1.5 with the node frozen (node 7).
+        ("baseline",  V.setup_baseline,  0),
         ("p1_static", V.setup_p1_static, 1),
-        # P1.5 as DEPLOYED: the AOT object (gen_full_c + loader_aot, through
-        # p1_aot). Until 2026-09-29 this was the only P1 in the table.
         ("hardcoded", V.setup_hardcoded, 1),
         ("template",  V.setup_template,  2),
         ("modular",   V.setup_modular,   3),
@@ -906,8 +711,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         try:
             setup = setup_fn(0, mp)
         except PS.NotApplicable as e:
-            # A compiled ceiling of this pipeline, not a failure of it.
-            info(f"{name}: NON APPLICABILE a questo modello ({e})")
+            info(f"{name}: NOT APPLICABLE to this model ({e})")
             not_applicable.add(name)
             continue
         except PermissionError:
@@ -932,9 +736,6 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
                 per_prog.append((pname, ic))
         disp_fd = setup["disp"].fd
         try:
-            # Warm-up, chunked for the same reason as the measurement below:
-            # the packet is mutated, so one long repeat would just exercise the
-            # TTL-expired path and leave the counters dirty.
             V.prog_test_run_bench(disp_fd,
                                   lambda: V.build_frame(0, V.BENCH_TTL, setup["scale"]),
                                   1000, max_chunks=2)
@@ -942,43 +743,6 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
             fail(f"{name}: BPF_PROG_TEST_RUN failed ({e})")
             all_ok = False
             continue
-        # A SINGLE BPF_PROG_TEST_RUN sample is not trustworthy: system noise
-        # (scheduler preemption, interrupts, an unrelated process on the same
-        # host) is ONE-SIDED -- it can only slow a trial down, never speed one
-        # up below the true cost -- which is exactly why this table's
-        # throughput used to look wildly different run to run (e.g. hardcoded
-        # swinging 10-25 Mpps, baseline 10-50 Mpps). MIN across `trials`
-        # independent measurements is the standard fix for this (same
-        # reasoning as hyperfine / Google Benchmark, and the same fix already
-        # applied in bench_depth_vs_width.py after it hit the identical issue).
-        #
-        # NOTE on the baseline's role: it is by far the cheapest program here
-        # (129 instructions), and correspondingly the NOISIEST in relative
-        # terms -- across runs its (max-min)/min has been ~112% against 31-38%
-        # for the three pipelines. Its minimum therefore needs MORE trials than
-        # theirs to settle, which is why a "latency normalized on the baseline"
-        # column was removed from the reported table: dividing every pipeline
-        # by the least stable measurement propagates that instability to the
-        # whole column. Report absolute latency plus the machine, and use the
-        # baseline as a qualitative floor.
-        #
-        # There used to be a "CPU (%)" column here, computed as the process's
-        # (utime+stime) over the wall time of this loop. It has been REMOVED,
-        # deliberately -- do not re-add it. All the work happens inside a
-        # blocking bpf_prog_test_run() syscall, so that ratio does not measure
-        # how much CPU the eBPF program costs; it measures how much of the wall
-        # time the scheduler left this single thread on-CPU. It came out
-        # non-monotonic (template below both baseline and hardcoded despite
-        # costing 4x the latency) and non-reproducible across runs (59% then
-        # 47% for the same pipeline), i.e. it reported system interference, not
-        # a property of the pipeline. Per-pipeline CPU cost is already captured
-        # by the latency and instruction columns.
-        # Chunked: the datapath mutates the packet (TTL decrement) and
-        # BPF_PROG_TEST_RUN does NOT restore the buffer between repetitions, so
-        # a single repeat=50000 would spend ~99.5% of its runs on the
-        # TTL-expired short-circuit and report that as the pipeline's latency.
-        # prog_test_run_bench() re-supplies a pristine TTL=255 frame every 200
-        # runs, keeping every measured run on the real inference path.
         samples = []
         w0  = time.perf_counter()
         _mk = lambda: V.build_frame(0, V.BENCH_TTL, setup["scale"])
@@ -989,22 +753,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         samples.sort()
         lat_min, lat_p50, lat_max = samples[0], samples[trials // 2], samples[-1]
         lat_ns  = float(lat_min) if lat_min else (wall * 1e9 / (repeat * trials))
-        # NOT a measured throughput. This is 1/latency: the rate a single core
-        # would reach IF packets were processed strictly back-to-back with no
-        # I/O, no queueing and no loss -- and, under BPF_PROG_TEST_RUN, without
-        # bpf_redirect ever executing, which is the most expensive part of the
-        # real forwarding path. It is an upper bound derived from the latency
-        # column, useful for comparing the three pipelines against each other,
-        # and NOT comparable with the zero-loss throughput figures reported in
-        # the literature (RFC 2544), which are measured with real traffic.
-        # See docs/testing.md §10 for the throughput measured on real traffic.
         mpps    = (1000.0 / lat_ns) if lat_ns > 0 else 0.0
-        # Sum the kernel's own view of every map this pipeline declares. A name
-        # this pipeline does not have raises and is skipped -- that is expected,
-        # one list covers all three. Record WHICH maps were counted so the total
-        # is auditable: the previous version swallowed the misses with no record,
-        # which is how four maps stayed missing from the reported footprint
-        # without anyone noticing (see _PIPELINE_MAP_NAMES).
         mem = 0
         mem_parts = []
         for mname in _PIPELINE_MAP_NAMES:
@@ -1048,9 +797,6 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
     line(f"Latency (ns/pkt, min of {trials})", "lat", lambda v: f"{v:.1f}")
     line("  ...p50",                 "lat_p50", lambda v: f"{v:.1f}")
     line("  ...max",                 "lat_max", lambda v: f"{v:.1f}")
-    # Relative spread makes explicit which row is a reliable measurement and
-    # which is not: the cheaper the program, the wider its spread, and the
-    # baseline is consistently the worst of the four.
     line("  ...spread (max-min)/min %", "spread", lambda v: f"{v:.0f}%")
     line("Inference rate (Mpps, 1/latency)", "mpps", lambda v: f"{v:.3f}")
     print("  " + "-" * (32 + 16 * len(rows)))
@@ -1069,7 +815,7 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
         print()
         for name, _, _ in methods:
             if name == "baseline" or name in not_applicable:
-                continue   # baseline has no inference to verify (pure parse+redirect)
+                continue
             try:
                 failed = V.run(name, 0, mp, ttl_min, ttl_max, repeat=1000)
                 if failed == 0:
@@ -1081,10 +827,6 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
                 fail(f"dispatch {name}: error ({e})")
                 all_ok = False
 
-        # A forwarding hop must behave like a router towards the TTL: decrement
-        # it, fix the IP checksum, and refuse to forward a packet whose TTL
-        # would reach 0. Checked against the packet the program really produced,
-        # so a missing checksum fix cannot pass unnoticed.
         print()
         for name, _, _ in methods:
             if name == "baseline" or name in not_applicable:
@@ -1102,9 +844,6 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
                 fail(f"TTL handling {name}: error ({e})")
                 all_ok = False
 
-        # link_state is a live routing input: a link going down must be able to
-        # reroute the packet (change the argmax egress class). Probe Pipeline 1
-        # over all TTL x egress combinations.
         print()
         try:
             changes, tested = V.probe_link_down(mp, 0, ttl_min, ttl_max)
@@ -1112,10 +851,8 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
                 sample = ", ".join(f"TTL{t}:link{k} {u}->{d}" for t, k, u, d in changes[:6])
                 ok(f"link_state reroute: {len(changes)}/{tested} link-down cases change egress  [{sample}]")
             elif mut is not None:
-                # "the model never reroutes" is a property of the trained
-                # checkpoint worth failing on; of a synthetic model it is not.
-                info(f"link_state reroute: 0/{tested} casi cambiano classe con "
-                     f"{mut.name} (proprieta' del modello, non del datapath)")
+                info(f"link_state reroute: 0/{tested} cases change class with "
+                     f"{mut.name} (a property of the model, not of the datapath)")
             else:
                 fail(f"link_state reroute: 0/{tested} link-down cases changed the egress class "
                      f"(feature wired but the model never reroutes on failure for TTL {ttl_min}-{ttl_max})")
@@ -1124,16 +861,10 @@ def suite_kernel(model_path=None, repeat=50000, ttl_min=2, ttl_max=6, verify=Tru
             fail(f"link_state reroute probe: error ({e})")
             all_ok = False
 
-        # Everything above tests ONE architecture (65-4-4-7). Prove the
-        # design-space claim ("arbitrary depth/width per pipeline") actually
-        # holds in the kernel, not just in the Python generator.
         try:
             if mut is not None:
-                # Fixed shapes of their own (65-8-7, 65-6-5-7 next to the
-                # checkpoint, ...): they test the pipelines, not the model
-                # under test, and run with no --model.
-                info("architetture alternative: saltate con --model "
-                     "(usano forme proprie; girano senza --model)")
+                info("other architectures: skipped with --model "
+                     "(they use their own shapes; they run without --model)")
                 alt_ok = True
             else:
                 alt_ok = verify_alt_architectures(ttl_min, ttl_max)
@@ -1154,16 +885,7 @@ def default_checkpoint() -> str:
 
 
 def _load_default_model(model_arg):
-    """The model the torch suites run on: the checkpoint, whatever its shape.
-
-    The previous body compared the checkpoint's shape against the module
-    constants and DISCARDED it on mismatch, keeping a random `FRRModel()`.
-    With INPUT_SIZE=35/HIDDEN_DIM=32 against a 65-4-4-7 checkpoint the guard
-    could never hold, so the suites always ran random weights on an
-    architecture no pipeline implements. There is no shape gate any more: the
-    suites are shape-agnostic (every one of them reads I/H/O off the model),
-    so a checkpoint of any shape is simply used.
-    """
+    """The model the torch suites run on."""
     torch.manual_seed(42)
     np.random.seed(42)
     pt_path = model_arg or default_checkpoint()
@@ -1202,16 +924,12 @@ def main():
     all_suites = ['extract', 'quant', 'kernel']
     which = all_suites if args.only == 'all' else [args.only]
     if mut is not None and not mut.reference:
-        # extract/quant check the trained checkpoint's .pt: its extraction and
-        # its quantisation. A synthetic model has no .pt to extract from.
         skipped = [s_ for s_ in which if s_ != 'kernel']
         if skipped:
-            print(f"{YELLOW}[INFO]{NC} {', '.join(skipped)}: riguardano il "
-                  f"checkpoint addestrato, non {mut.name} -- saltate")
+            print(f"{YELLOW}[INFO]{NC} {', '.join(skipped)}: they concern the "
+                  f"trained checkpoint, not {mut.name} -- skipped")
         which = [s_ for s_ in which if s_ == 'kernel']
     if mut is not None:
-        # The model travels through $IPA_MODEL now; the path argument below is
-        # the checkpoint's own (or unused), never the reference string.
         args.model = None
     needs_torch = any(s != 'kernel' for s in which)
     if needs_torch and not TORCH_AVAILABLE:

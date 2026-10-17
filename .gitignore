@@ -17,7 +17,7 @@ ipa/poc_aot/nn_aot_arch.o
 ipa/poc_aot/loader_aot
 
 # Generated synthetic scenarios. `make_scenario.py --preset all` rewrites every
-# one of these byte-identically (seed 20260916); test_synth.py generates its own
+# one of these byte-identically (seed 20260916); test_synthetic_models.py generates its own
 # into temp dirs and never reads this tree. 42 files / 4.4 MB of pure output.
 ipa/synth/scenarios/
 ipa/synth/traffic/
@@ -31,10 +31,10 @@ docs/*.log
 docs/*.out
 docs/*.toc
 
-# results/ keeps one folder per measurement campaign (remeasure_campagna.sh):
+# results/ keeps one folder per measurement campaign (run_population_campaign.sh):
 # the CSV files and the campaign summary (sintesi.md). Plots, logs and reports
-# are regenerated from the CSVs (bench_scaling.py --plot, plot_bitrate.py,
-# campaign_report.py); the plots the docs use live in docs/figures/.
+# are regenerated from the CSVs (bench_scaling.py --plot, plot_load_curve.py,
+# table_helpers.py); the plots the docs use live in docs/figures/.
 results/**/*
 !results/**/
 !results/**/*.csv

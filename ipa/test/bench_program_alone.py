@@ -1,51 +1,10 @@
 #!/usr/bin/env python3
-"""
-bench_solo.py -- il programma da solo, per UN modello qualunque.
+"""bench_program_alone.py -- the program alone (BPF_PROG_TEST_RUN), for one model.
 
-    sudo python3 ipa/test/host_conditions.py --run --env results/x -- \\
-        python3 ipa/test/bench_solo.py --model ipa/synth/population/m037_... \\
-        --topology ipa/synth/population/m037_... --out results/x
+For each pipeline: latency of a single run and in a warm loop, table lookups
+and tail calls per packet, time to build the pipeline and to install a model.
 
-Per ogni pipeline (baseline, P1 statica, P1.5, P2, P3) il modello si carica
-con pipeline_setup.build, lo stesso costruttore dei banchi sotto traffico, e
-si misura cio' che il traffico non misura:
-
-  lat_ns      il programma da solo (BPF_PROG_TEST_RUN), sul pacchetto e
-              con gli ingressi del traffico: minimo su --trials misure,
-              ciascuna la mediana di --calls esecuzioni singole
-  lat_hot     lo stesso programma in un ciclo caldo: blocchi di hot_k
-              esecuzioni di fila (il tempo medio del blocco, minimo fra i
-              blocchi e le prove). hot_k e' il piu' lungo blocco, al massimo
-              31, in cui il TTL che scende da 32 non cambia la classe decisa
-              (riferimento Python): il programma resta sulla strada del
-              traffico, con cache e predittori caldi
-  fwd_pct     quota di esecuzioni inoltrate (XDP_REDIRECT): deve essere 100,
-              o il programma ha preso un'altra strada di quella misurata
-              sotto traffico
-  build_ms    caricare la pipeline da zero: per P1 generare il C, compilarlo
-              e caricarlo; per P2 e P3 compilare il programma generico, una
-              volta sola all'avvio del nodo
-  update_ms   installare un modello su un nodo gia' in servizio: per P1
-              caricare l'oggetto compilato (verifier + JIT), per P2 e P3
-              scrivere le tabelle di un modello nuovo
-  lookups     letture di mappa per pacchetto, dalla build strumentata
-  n_tail      salti fra programmi per pacchetto (P3: uno per strato)
-  insns       istruzioni dei programmi caricati
-
-Il pacchetto e gli ingressi sono quelli del traffico, non quelli di
-bench_scaling: TTL 32 come il generatore, il nodo e la porta del fabric, e lo
-stato dei link che fa INOLTRARE il modello (bench_throughput.
-_forwarding_inputs). Con il TTL 255 di bench_scaling un modello su quattro
-della popolazione decideva di scartare, e il programma da solo misurava la
-strada dello scarto. Ma il kernel non ripristina il pacchetto fra una
-ripetizione e l'altra e il datapath decrementa il TTL: quindi niente blocchi
-da 200, ogni esecuzione e' una chiamata con repeat=1. Il tempo di una
-chiamata singola contiene anche la lettura dell'orologio del kernel, uguale
-per tutte le pipeline: sparisce nella differenza con la baseline.
-
-Scrive solo.csv in --out. bench_scaling misura le stesse colonne, ma su
-modelli che costruisce da se' lungo i suoi assi; qui il modello e' una
-cartella (model_population.py, synth, o il checkpoint).
+    sudo python3 ipa/test/bench_program_alone.py --model <dir> --topology <dir> --out <dir>
 """
 import argparse
 import csv
@@ -61,7 +20,7 @@ for _p in (SHARED_DIR, _TEST_DIR):
         sys.path.insert(0, _p)
 
 PIPES = ("baseline", "p1_static", "hardcoded", "template", "modular")
-LOOKUP_CALLS = 100        # esecuzioni contate per le letture di tabella
+LOOKUP_CALLS = 100
 COLS = ["method", "esito", "lat_ns", "lat_min", "lat_max", "lat_hot",
         "hot_k", "retval", "fwd_pct",
         "build_ms", "update_ms", "lookups", "n_tail", "insns", "jited",
@@ -78,17 +37,16 @@ XDP_REDIRECT = 4
 
 
 def _where(PS, model):
-    """Il nodo e la porta d'ingresso del fabric, per questo modello."""
-    import test_fabric as TF
+    """The fabric's node and ingress port, for this model."""
+    import test_forwarding as TF
     return (PS.node_index_for(model, TF.FABRIC_NODE_INDEX),
             PS.ingress_slot_for(model, TF.FABRIC_INGRESS_SLOT))
 
 
 def _prepare(PS, setup, model):
-    """Gli ingressi del traffico: nodo, porta, e lo stato dei link che fa
-    inoltrare il modello (lo stesso che sceglie bench_throughput)."""
-    import bench_throughput as BT
-    import verify_prog_run as V
+    """The traffic inputs."""
+    import bench_capacity as BT
+    import check_pipelines as V
     node, slot = _where(PS, model)
     PS.set_node(setup, node)
     PS.set_ingress(setup, V.TEST_RUN_DEFAULT_INGRESS_IFINDEX, slot)
@@ -100,11 +58,10 @@ def _prepare(PS, setup, model):
 
 
 def _hot_k(PS, model, inputs, kmax=31):
-    """Quante esecuzioni di fila (TTL 32, 31, ...) decidono la stessa classe
-    della prima: il blocco piu' lungo del ciclo caldo. 31 al massimo: a TTL
-    1 il datapath prende il ramo di scadenza."""
-    import bench_throughput as BT
-    if inputs is None:                       # la baseline non ha modello
+    """How many consecutive runs (TTL 32, 31, ...) decide the same class as
+    the first."""
+    import bench_capacity as BT
+    if inputs is None:
         return kmax
     ls, q, c = inputs
     node, slot = _where(PS, model)
@@ -120,10 +77,10 @@ def _hot_k(PS, model, inputs, kmax=31):
 
 
 def _sample_hot(fd, model, k, chunks, trials):
-    """Minimo, fra prove e blocchi, del tempo medio di un blocco di k
-    esecuzioni di fila; e se ogni blocco ha inoltrato."""
-    import bench_throughput as BT
-    from verify_prog_run import prog_test_run
+    """Minimum, over trials and blocks, of the mean time of a block of k
+    consecutive runs."""
+    import bench_capacity as BT
+    from check_pipelines import prog_test_run
     if k < 2:
         return None, None
     frame = _frame(model, BT.TRAFFIC_TTL)
@@ -140,16 +97,13 @@ def _sample_hot(fd, model, k, chunks, trials):
 
 
 def _sample(fd, model, calls, trials):
-    """(lat, minimo, massimo, retval piu' frequente, % inoltrate): per ogni
-    prova la mediana di `calls` esecuzioni singole, poi il minimo fra le
-    prove -- come il minimo delle medie di bench_scaling, ma senza che il
-    TTL scenda fra un'esecuzione e l'altra."""
+    """(lat, minimum, maximum, most frequent retval, % forwarded)."""
     import collections
     import statistics as st
-    import bench_throughput as BT
-    from verify_prog_run import prog_test_run
+    import bench_capacity as BT
+    from check_pipelines import prog_test_run
     frame = _frame(model, BT.TRAFFIC_TTL)
-    for _ in range(200):                       # scalda
+    for _ in range(200):
         prog_test_run(fd, frame, repeat=1)
     meds, lo, hi, rets = [], None, None, collections.Counter()
     for _ in range(trials):
@@ -169,16 +123,15 @@ def _sample(fd, model, calls, trials):
 
 
 def _frame(model, ttl):
-    from verify_prog_run import build_frame_sparse
+    from check_pipelines import build_frame_sparse
     return build_frame_sparse(model_id=0, ttl=ttl, scale=model.scale,
                               n_in=model.n_in, n_out=model.n_out)
 
 
 def _lookups(PS, pipeline, model):
-    """Letture di mappa per pacchetto: la build strumentata, un contatore
-    per-CPU (BCC) o un array con somma atomica (l'oggetto AOT di P1)."""
-    import bench_throughput as BT
-    from verify_prog_run import prog_test_run
+    """Map lookups per packet."""
+    import bench_capacity as BT
+    from check_pipelines import prog_test_run
     try:
         node, _ = _where(PS, model)
         s = PS.build(pipeline, model, node_index=node, instrument=True)
@@ -190,14 +143,14 @@ def _lookups(PS, pipeline, model):
             ctr[ct.c_int(0)] = ct.c_ulonglong(0)
         else:
             ctr[ct.c_int(0)] = ctr.Leaf()
-        for _ in range(LOOKUP_CALLS):         # TTL fermo: una alla volta
+        for _ in range(LOOKUP_CALLS):
             prog_test_run(s["disp"].fd, frame, repeat=1)
         if aot:
             tot = int.from_bytes(ctr[ct.c_int(0)], "little")
         else:
             tot = sum(int(v) for v in ctr[ct.c_int(0)])
         return tot / float(LOOKUP_CALLS)
-    except Exception as e:      # una colonna in piu': non perde la riga
+    except Exception as e:
         print(f"[lookups] {pipeline}: {type(e).__name__}: {str(e)[:90]}",
               file=sys.stderr)
         return None
@@ -215,13 +168,11 @@ def one(pipeline, model, calls, trials):
         return dict(row, esito="N/A", detail=str(e)[:160])
     try:
         inputs = _prepare(PS, setup, model)
-    except PS.NotApplicable as e:      # nessuno stato dei link inoltra
+    except PS.NotApplicable as e:
         return dict(row, esito="N/A", detail=str(e)[:160])
     if pipeline in ("p1_static", "hardcoded"):
-        # il caricatore del nodo: open + load dell'oggetto gia' compilato
         update_ms = setup.get("t_redirect_s", 0.0) * 1000.0
     elif pipeline in ("template", "modular"):
-        # un modello nuovo su un nodo in servizio = le sue tabelle
         _, update_ms = _timed(lambda: PS.register_model_id(setup, 1, model))
     else:
         update_ms = 0.0
@@ -231,7 +182,7 @@ def one(pipeline, model, calls, trials):
     k = _hot_k(PS, model, inputs)
     hot, hot_fwd = _sample_hot(setup["disp"].fd, model, k, 50, trials)
     if hot is not None and not hot_fwd:
-        hot = None                     # un blocco non ha inoltrato: fuori
+        hot = None
     return dict(row, esito="OK", lat_ns=lat, lat_min=lo, lat_max=hi,
                 lat_hot=hot, hot_k=k,
                 retval=retval, fwd_pct=round(fwd, 1),
@@ -241,9 +192,7 @@ def one(pipeline, model, calls, trials):
 
 
 def compile_times(model, rounds=3):
-    """Generare il C di P1 e compilarlo con clang, senza cache: cio' che
-    costa un modello nuovo per P1, su una macchina qualunque fuori dal nodo.
-    Minimo su `rounds`. Niente kernel, niente root."""
+    """Generate P1's C and compile it with clang, without cache."""
     import p1_aot
     import pipeline_setup as PS
     node, _ = _where(PS, model)
@@ -277,10 +226,10 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--method", default=",".join(PIPES))
     p.add_argument("--compila", action="store_true",
-                   help="solo generare e compilare P1 (niente kernel, niente "
-                        "root): scrive compila.csv")
+                   help="only generate and compile P1 (no kernel, no "
+                        "root): writes compila.csv")
     p.add_argument("--calls", type=int, default=1000,
-                   help="esecuzioni singole per prova (default 1000)")
+                   help="single runs per trial (default 1000)")
     p.add_argument("--trials", type=int, default=7)
     a = p.parse_args(argv)
     import model_under_test as MUT
@@ -296,7 +245,7 @@ def main(argv=None):
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-        print(f"  {rows}\n  scritto {path}")
+        print(f"  {rows}\n  written {path}")
         return 0
     rows = []
     for pl in a.method.split(","):
@@ -307,7 +256,7 @@ def main(argv=None):
                      detail=f"{type(e).__name__}: {str(e)[:150]}")
         rows.append(r)
         print(f"  {pl:10s} {r.get('esito'):6s} "
-              f"{r.get('lat_ns', '-')!s:>8} ns  inoltrati "
+              f"{r.get('lat_ns', '-')!s:>8} ns  forwarded "
               f"{r.get('fwd_pct', '-')!s:>5} %  lookups "
               f"{r.get('lookups', '-')!s:>6}  update "
               f"{r.get('update_ms', '-')!s:>8} ms  {r.get('detail', '')}")
@@ -317,8 +266,7 @@ def main(argv=None):
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in COLS})
-    print(f"  scritto {path}")
-    # rc 1 solo se una pipeline applicabile non e' stata misurata
+    print(f"  written {path}")
     return 1 if any(r.get("esito") == "errore" for r in rows) else 0
 
 

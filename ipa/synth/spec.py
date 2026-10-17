@@ -1,40 +1,5 @@
-"""
-spec.py -- feature semantics and model descriptors for synthetic scenarios.
-
-The point of this package is to make the three eBPF pipelines testable WITHOUT
-the reference checkpoint. Everything here is generated from a declared seed,
-so a scenario is reproducible from its descriptor alone.
-
-Feature semantics, not uniform noise
-------------------------------------
-A feature is not "a slot that holds a number". It has a kind, a value domain, a
-width, an encoding and a position in the flat input vector, and a generator that
-respects all of them. Sampling every slot from one uniform distribution would
-produce input vectors the datapath can never see -- several one-hot slots hot at
-once, a TTL of 200 in a model trained on 30 -- and a pipeline that agrees with a
-reference on impossible inputs has not been tested on the real ones.
-
-Four kinds are supported:
-
-  real     a value in [lo, hi] that the MODEL was trained on as a float, but
-           which the DATAPATH carries as an integer divided by `scale`. This is
-           exactly the TTL case: trained on ttl/30 in (0,1], transported as the
-           raw hop count with the product divided by 30. `scale` is therefore
-           part of the feature's semantics, not an implementation detail.
-  integer  a value in [lo, hi] used as-is, scale 1.
-  binary   a width-n vector of 0/1, independently sampled, with an optional
-           minimum number of ones (link_state: a node with every link down is
-           not a scenario worth generating).
-  onehot   a width-n vector with exactly one 1. The datapath reads the active
-           index and selects a single weight, so generating two hot slots would
-           exercise a path that cannot occur.
-
-Layout
-------
-Features occupy contiguous column ranges in declaration order, which is the
-order the model was trained on. `col_off` is the running sum of widths -- the
-same convention model_meta.resolve_descriptor uses, so a descriptor produced
-here drops straight into the P2/P3 control planes.
+"""spec.py -- feature semantics (kind, domain, width, encoding) and model
+descriptors for synthetic scenarios.
 """
 
 from dataclasses import dataclass, field
@@ -51,11 +16,11 @@ class FeatureSpec:
     name: str
     kind: str
     size: int = 1
-    lo: float = 0.0            # real/integer: inclusive lower bound
-    hi: float = 1.0            # real/integer: inclusive upper bound
-    scale: int = 1             # real: divisor the datapath applies to the product
-    min_ones: int = 0          # binary: minimum number of 1s per sample
-    code: int = 0              # on-wire feature code (model_meta.FEATURE_CODE)
+    lo: float = 0.0
+    hi: float = 1.0
+    scale: int = 1
+    min_ones: int = 0
+    code: int = 0
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -77,10 +42,8 @@ class FeatureSpec:
         if self.scale < 1:
             raise ValueError(f"{self.name}: scale must be >= 1")
 
-    # -- what the datapath sees, per column ---------------------------------
     def column_scale(self) -> List[int]:
-        """Divisor applied to each of this feature's columns. Only `real`
-        features carry one; see the module docstring."""
+        """Divisor applied to each of this feature's columns."""
         return [self.scale] * self.size
 
     def describe(self) -> str:
@@ -122,17 +85,15 @@ class FeatureSet:
         return out
 
     def column_scales(self) -> List[int]:
-        """Per-column divisors for the whole input vector. Index-aligned with a
-        generated vector, so a reference implementation can apply them without
-        knowing anything about features."""
+        """Per-column divisors for the whole input vector."""
         out = []
         for f in self.features:
             out += f.column_scale()
         return out
 
     def descriptor(self) -> List[dict]:
-        """Flat (code, size, col_off) form, the shape the P2/P3 registries want.
-        Mirrors model_meta.resolve_descriptor so the two are interchangeable."""
+        """Flat (code, size, col_off) form, the shape the P2/P3 registries
+        want."""
         return [{"code": f.code, "size": f.size, "col_off": off, "name": f.name,
                  "kind": f.kind, "scale": f.scale}
                 for f, off in zip(self.features, self.offsets())]
@@ -154,20 +115,11 @@ class FeatureSet:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# The IPA feature set, rebuilt from the declared semantics rather than copied.
-# Kept here so a synthetic scenario can be compared against the real layout
-# without importing anything that depends on the checkpoint.
-# ---------------------------------------------------------------------------
+# --- The IPA feature set, rebuilt from the declared semantics rather than copied. ---
 def ipa_feature_set(n_interfaces: int = 6, n_nodes: int = 52,
                     initial_ttl: int = 30) -> FeatureSet:
     """The [link_state, ingress_iface, ttl, node] layout the checked-in model
-    was trained on, expressed in this package's vocabulary.
-
-    link_state is `binary` with min_ones=1: a node with every egress down has
-    no decision to make, and the trained data never contains that case.
-    ttl is `real`, not `integer` -- the model saw ttl/initial_ttl in (0,1].
-    """
+    was trained on, expressed in this package's vocabulary."""
     return FeatureSet([
         FeatureSpec("link_state", "binary", size=n_interfaces, min_ones=1, code=0x01),
         FeatureSpec("ingress_iface", "onehot", size=n_interfaces, code=0x02),
@@ -185,36 +137,14 @@ class ModelSpec:
     n_out: int
     hidden: List[int] = field(default_factory=list)
     activation: str = "relu"
-    quant: str = "int8"            # "int8" (symmetric, no zero point) or "float"
+    quant: str = "int8"
     seed: int = 0
-    weight_init: str = "uniform"   # "uniform" | "normal" | "sparse" | "ones"
-    # Index of the DROP class. None means "let the generator pick the last
-    # class", which it then ANNOUNCES -- a generated model is free to choose its
-    # own layout, but the choice has to be visible, because "DROP is the last
-    # class" silently assumed everywhere is what this work removed.
+    weight_init: str = "uniform"
     drop_class: Optional[int] = None
-    max_abs: float = 5.0           # target max|w|; see the note below
-    # weight_init "sparse": the fraction of weights (not biases) set to zero.
-    # 0.7 is what the `sparse` preset has always used.
+    max_abs: float = 5.0
     sparsity: float = 0.7
 
-    # max_abs exists because the int8 scale is derived from it:
-    # scale = int(127 / max|w|), and the scale is the quantisation step.
-    # Textbook initialisation (1/sqrt(fan_in)) gives max|w| ~ 0.5 on a 4-wide
-    # layer, hence scale ~254: a step ten times finer than the supplied
-    # checkpoint's (max|w| = 5.1, scale = 24). Measured on ipa_like, 1000
-    # inputs: float/int8 argmax agreement 100.0% at max_abs 0.5, 98.6% at 5.0.
-    # The default matches the checkpoint's magnitude, so the pipelines are
-    # tested with the quantisation error the real model has; set it
-    # explicitly to study the quantisation itself.
-    #
-    # This comment used to say the opposite -- that a large scale wrecks the
-    # model, below 1% agreement. That was the old synth reference, which left
-    # the bias of layer l unscaled, a scheme no pipeline runs (see
-    # synth/reference.py). Under the datapath's scheme a larger scale only
-    # makes the step finer.
-
-    ACTIVATIONS = ("relu",)        # the datapath implements ReLU only
+    ACTIVATIONS = ("relu",)
     QUANT = ("int8", "float")
     INITS = ("uniform", "normal", "sparse", "ones")
 
@@ -252,7 +182,8 @@ class ModelSpec:
 
     @property
     def layer_dims(self) -> List[tuple]:
-        """[(n_in, n_out), ...] per layer -- the form load_modular_weights wants."""
+        """[(n_in, n_out), ...] per layer -- the form load_modular_weights
+        wants."""
         s = self.layer_sizes
         return [(s[i], s[i + 1]) for i in range(len(s) - 1)]
 

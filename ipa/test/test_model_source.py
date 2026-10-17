@@ -1,37 +1,12 @@
 #!/usr/bin/env python3
 """
-test_model_source.py -- models, scenarios and their compatibility.
+test_model_source.py -- models, network scenarios and their compatibility.
 
-Userspace only: no root, no BCC, no kernel. Checks model_source.py (one loader
-for the checkpoint, the synthetic presets and the descriptor fixtures),
-pipeline_limits.py (which pipeline can run which shape) and the scenarios
-under topologies/.
-
-What is checked
----------------
-  loading        every reference resolves, with the shape, weight count and
-                 class semantics its own files declare -- the checkpoint's
-                 DROP 5 / class 6 UNUSED, a synthetic model's drop_class.
-  checkpoint     the int8 weights and scale are the ones every bench measures
-                 (weights.json, weights_float.json's scale_factor).
-  compatibility  the scenario x model matrix: a model runs on a network only
-                 if every feature width equals the network's dimension and
-                 the ttl scale equals its initial TTL. Includes the case that
-                 motivated it: a node one-hot of 52 on a 30-node network.
-  scenarios      a network over the compiled ceilings, or missing a required
-                 dimension, is refused with the reason.
-  pipelines      the P2/P3 ceilings; verify_synth_kernel.fuori_limiti
-                 answers through them (it had its own copy until 2026-09-29).
-  errors         unknown references, a missing checkpoint, a fixture without
-                 a network, a weight file of the wrong length.
-  kernel         (--kernel, root) every scenario x compatible model x
-                 pipeline, loaded by pipeline_setup: random inputs through
-                 the real dispatcher with BPF_PROG_TEST_RUN, under model_id 0
-                 and under 190 (the id pktgen writes), class compared with
-                 the reference. The baseline has no model: it must redirect.
+No root. Every model reference loads with the shape and class semantics its
+files declare; a model runs on a network only if feature widths and TTL match.
 
     python3 ipa/test/test_model_source.py
-    sudo python3 ipa/test/test_model_source.py --kernel [--n 40]
+    sudo python3 ipa/test/test_model_source.py --kernel
 """
 import argparse
 import contextlib
@@ -49,8 +24,8 @@ for _p in (SHARED_DIR, _TEST_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import model_source as ms          # noqa: E402
-import pipeline_limits as pl       # noqa: E402
+import model_source as ms  # noqa: E402
+import pipeline_limits as pl  # noqa: E402
 
 GREEN, RED, YELLOW, NC = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
 _n_pass = _n_fail = 0
@@ -59,7 +34,6 @@ PRESETS = ("ipa_like", "small", "large", "deep", "mixed", "sparse", "ones",
            "ipa_ttl16")
 FIXTURE = os.path.join(_TEST_DIR, "fixtures", "sparse_hetero_11")
 
-# shape, weight count, DROP class -- from each model's own files
 EXPECTED = {
     "checkpoint":      ("65-4-4-7", 319, 5),
     "synth:ipa_like":  ("65-4-4-7", 319, 6),
@@ -72,7 +46,6 @@ EXPECTED = {
     "synth:ipa_ttl16": ("65-4-4-7", 319, 6),
 }
 
-# scenario -> the models that run on it
 MATRIX = {
     "germany50":       {"germany50", "ipa_like", "deep", "sparse",
                         "sparse_hetero_11"},
@@ -106,7 +79,7 @@ def raises(fn, needle, msg):
         fn()
     except ms.ModelError as e:
         return check(needle in str(e), f"{msg}: {e}")
-    fail(f"{msg}: nessun errore")
+    fail(f"{msg}: no error")
     return False
 
 
@@ -118,45 +91,44 @@ def _write_topology(root, name, cfg):
     return d
 
 
-# ---------------------------------------------------------------------------
 def t_loading():
-    print(f"\n{YELLOW}[1] Ogni riferimento si carica con la forma dichiarata{NC}")
+    print(f"\n{YELLOW}[1] Every reference loads with the declared shape{NC}")
     for ref, (shape, nw, drop) in EXPECTED.items():
         m = ms.load_model(ref)
         check(m.shape == shape and len(m.weights) == nw
               and m.semantics.drop_class == drop,
-              f"{ref:16s} {m.shape}, {len(m.weights)} pesi, DROP {m.semantics.drop_class}")
+              f"{ref:16s} {m.shape}, {len(m.weights)} weights, DROP {m.semantics.drop_class}")
 
 
 def t_checkpoint():
-    print(f"\n{YELLOW}[2] Il checkpoint e' quello che i banchi misurano{NC}")
+    print(f"\n{YELLOW}[2] The checkpoint is the one the benches measure{NC}")
     m = ms.load_model("checkpoint")
     with open(os.path.join(SHARED_DIR, "weights.json")) as f:
         wj = json.load(f)
     with open(os.path.join(SHARED_DIR, "weights_float.json")) as f:
         scale = json.load(f)["scale_factor"]
-    check(m.weights == wj, "pesi int8 identici a weights.json")
-    check(m.scale == scale, f"scala {m.scale} == scale_factor di weights_float.json")
-    check(m.reference and m.name == "germany50", "e' il riferimento, addestrato su germany50")
+    check(m.weights == wj, "int8 weights identical to weights.json")
+    check(m.scale == scale, f"scale {m.scale} == scale_factor of weights_float.json")
+    check(m.reference and m.name == "germany50", "it is the reference, trained on germany50")
     sem = m.semantics
     check(sem.action_of(5) == "DROP" and sem.action_of(6) == "UNUSED"
           and sem.logical_ports == [0, 1, 2, 3, 4],
-          "semantica dal descrittore: FORWARD 0-4, DROP 5, UNUSED 6")
-    check(m.feature("ttl")["scale"] == 30, "ttl diviso per 30 (normalize_by)")
+          "semantics from the descriptor: FORWARD 0-4, DROP 5, UNUSED 6")
+    check(m.feature("ttl")["scale"] == 30, "ttl divided by 30 (normalize_by)")
 
 
 def t_synth_semantics():
-    print(f"\n{YELLOW}[3] Un modello sintetico usa la SUA semantica{NC}")
+    print(f"\n{YELLOW}[3] A synthetic model uses ITS OWN semantics{NC}")
     m = ms.load_model("synth:ipa_like")
     sem = m.semantics
     check(sem.action_of(6) == "DROP" and sem.action_of(5) == "FORWARD",
-          "ipa_like: DROP 6 come dichiara model.json, non il DROP 5 del checkpoint")
-    check(sem.logical_ports == list(range(6)), "sei porte logiche, 0-5")
+          "ipa_like: DROP 6 as model.json declares, not the checkpoint's DROP 5")
+    check(sem.logical_ports == list(range(6)), "six logical ports, 0-5")
     s = ms.semantics_with_drop(5, 2)
     check([s.action_of(c) for c in range(5)] ==
           ["FORWARD", "FORWARD", "DROP", "FORWARD", "FORWARD"]
           and [s.port_of(c) for c in (0, 1, 3, 4)] == [0, 1, 2, 3],
-          "DROP in mezzo: le porte restano consecutive nell'ordine delle classi")
+          "DROP in the middle: ports stay consecutive in class order")
 
 
 def _all_models(topo):
@@ -171,9 +143,9 @@ def _all_models(topo):
 
 
 def t_matrix():
-    print(f"\n{YELLOW}[4] Scenari x modelli{NC}")
+    print(f"\n{YELLOW}[4] Scenarios x models{NC}")
     check(set(ms.list_topologies()) >= set(MATRIX),
-          f"scenari presenti: {', '.join(ms.list_topologies())}")
+          f"scenarios present: {', '.join(ms.list_topologies())}")
     for name, expected in MATRIX.items():
         topo = ms.load_topology(name)
         fits = {n for n, m in _all_models(topo).items()
@@ -182,48 +154,48 @@ def t_matrix():
 
 
 def t_mismatch_reasons(root):
-    print(f"\n{YELLOW}[5] Il motivo dell'esclusione e' leggibile{NC}")
-    d = _write_topology(root, "rete30", {"n_interfaces": 6, "n_nodes": 30,
-                                         "n_queues": 4, "initial_ttl": 30})
+    print(f"\n{YELLOW}[5] The reason for an exclusion is readable{NC}")
+    d = _write_topology(root, "net30", {"n_interfaces": 6, "n_nodes": 30,
+                                        "n_queues": 4, "initial_ttl": 30})
     topo = ms.load_topology(d)
     why = ms.mismatches(ms.load_model("checkpoint"), topo)
-    check(why == ["nodi: il modello ne vuole 52, la rete ne ha 30"],
-          f"one-hot a 52 su una rete da 30 nodi: {why}")
+    check(why == ["nodes: the model wants 52, the network has 30"],
+          f"one-hot of 52 on a 30-node network: {why}")
     why = ms.mismatches(ms.load_model("synth:ipa_ttl16"),
                         ms.load_topology("germany50"))
-    check(why == ["TTL iniziale: il modello ne vuole 16, la rete ne ha 30"],
-          f"ipa_ttl16 su germany50: {why}")
+    check(why == ["initial TTL: the model wants 16, the network has 30"],
+          f"ipa_ttl16 on germany50: {why}")
     d = _write_topology(root, "senzattl", {"n_interfaces": 6, "n_nodes": 52})
     why = ms.mismatches(ms.load_model("checkpoint"), ms.load_topology(d))
-    check(any("TTL iniziale" in w for w in why),
-          "una rete che non dichiara il TTL iniziale non e' data per buona")
+    check(any("initial TTL" in w for w in why),
+          "a network that does not declare the initial TTL is not taken as valid")
 
 
 def t_scenarios(root):
-    print(f"\n{YELLOW}[6] Scenari fuori dai limiti compilati{NC}")
-    d = _write_topology(root, "nove", {"n_interfaces": 9, "n_nodes": 10})
+    print(f"\n{YELLOW}[6] Scenarios outside the compiled ceilings{NC}")
+    d = _write_topology(root, "nine", {"n_interfaces": 9, "n_nodes": 10})
     raises(lambda: ms.load_topology(d), "above the compiled ceiling",
-           "9 interfacce")
+           "9 interfaces")
     d = _write_topology(root, "code", {"n_interfaces": 4, "n_nodes": 10,
                                        "n_queues": 9})
     raises(lambda: ms.load_topology(d), "above the compiled ceiling", "9 code")
-    d = _write_topology(root, "mezza", {"n_interfaces": 4})
-    raises(lambda: ms.load_topology(d), "missing", "manca n_nodes")
-    raises(lambda: ms.load_topology("non_esiste"), "disponibili",
-           "nome sconosciuto")
+    d = _write_topology(root, "half", {"n_interfaces": 4})
+    raises(lambda: ms.load_topology(d), "missing", "n_nodes missing")
+    raises(lambda: ms.load_topology("non_esiste"), "available",
+           "unknown name")
     g = ms.load_topology("germany50")
     check((g["n_interfaces"], g["n_nodes"], g["n_queues"], g["initial_ttl"])
           == (6, 52, 4, 30), "germany50: 6 / 52 / 4 / TTL 30")
 
 
 def t_pipelines():
-    print(f"\n{YELLOW}[7] Limiti delle pipeline{NC}")
+    print(f"\n{YELLOW}[7] Pipeline limits{NC}")
     cases = [
         ([4, 4], 65, 7, None, None),
         ([4, 4, 4], 65, 7, None, None),
         ([8, 8], 117, 9, "MAX_WEIGHT_ENTRIES", "ML1_MAX_H1"),
         ([9, 9], 65, 7, "T2_MAX_H1", "ML1_MAX_H1"),
-        ([4, 4, 6], 65, 7, "oltre il secondo", None),
+        ([4, 4, 6], 65, 7, "beyond the second", None),
         ([4] * 16, 65, 7, None, "LAYER_CHAIN_SIZE"),
         ([4], 200, 7, "MAX_N_IN", "MAX_N_IN"),
     ]
@@ -236,14 +208,14 @@ def t_pipelines():
               f"{shape:18s} P2: {w2 or 'ok'} | P3: {w3 or 'ok'}")
     check(pl.why_not("hardcoded", [16, 16], 65, 7) is None
           and pl.why_not("p1_static", [4] * 30, 65, 7) is None,
-          "P1 e P1.5: nessun tetto di forma")
+          "P1 and P1.5: no shape ceiling")
     check(pl.why_not("baseline", [99], 999, 99) is None,
-          "baseline: nessun modello, nessun limite")
+          "baseline: no model, no limit")
 
 
 def t_agrees_with_synth_kernel():
-    print(f"\n{YELLOW}[8] verify_synth_kernel usa questi limiti{NC}")
-    import verify_synth_kernel as VSK
+    print(f"\n{YELLOW}[8] check_kernel_vs_reference uses these limits{NC}")
+    import check_kernel_vs_reference as VSK
     for name in PRESETS:
         m = ms.load_model(f"synth:{name}")
         model = {"arch": {"hidden": m.hidden, "n_in": m.n_in,
@@ -252,30 +224,30 @@ def t_agrees_with_synth_kernel():
             old = VSK.fuori_limiti(pipe, model)
             new = pl.why_not(key, m.hidden, m.n_in, m.n_out)
             check(old == new,
-                  f"{name:10s} {pipe}: {new or 'ammesso'}")
+                  f"{name:10s} {pipe}: {new or 'allowed'}")
 
 
 def t_errors(root):
-    print(f"\n{YELLOW}[9] Errori comprensibili{NC}")
-    raises(lambda: ms.load_model("synth:nope"), "sconosciuto", "preset inesistente")
-    raises(lambda: ms.load_model("pippo"), "non riconosciuto", "riferimento ignoto")
+    print(f"\n{YELLOW}[9] Readable errors{NC}")
+    raises(lambda: ms.load_model("synth:nope"), "unknown", "missing preset")
+    raises(lambda: ms.load_model("pippo"), "not recognised", "unknown reference")
     raises(lambda: ms.load_model("checkpoint:/tmp/non_esiste.pt"),
-           "non trovato", "checkpoint mancante")
-    raises(lambda: ms.load_model(FIXTURE), "serve lo scenario",
-           "fixture senza rete")
-    bad = os.path.join(root, "corto")
+           "not found", "missing checkpoint")
+    raises(lambda: ms.load_model(FIXTURE), "the scenario is needed",
+           "fixture without a network")
+    bad = os.path.join(root, "short")
     shutil.copytree(ms.load_model("synth:small").path, bad)
     with open(os.path.join(bad, "weights.json")) as f:
         w = json.load(f)
     with open(os.path.join(bad, "weights.json"), "w") as f:
         json.dump(w[:-1], f)
-    raises(lambda: ms.load_model(bad), "ne vuole 84", "un peso in meno")
+    raises(lambda: ms.load_model(bad), "needs 84", "one weight missing")
 
 
 def t_kernel(n_cases):
-    print(f"\n{YELLOW}[10] Nel kernel: ogni scenario, ogni modello, ogni pipeline{NC}")
+    print(f"\n{YELLOW}[10] In the kernel: every scenario, every model, every pipeline{NC}")
     import pipeline_setup as PS
-    import verify_prog_run as V
+    import check_pipelines as V
     from common import write_vector_map
     kif = V.TEST_RUN_DEFAULT_INGRESS_IFINDEX
     n_na = 0
@@ -289,7 +261,7 @@ def t_kernel(n_cases):
             ttl_max = int(topo.get("initial_ttl", 30))
             for pipe in pl.PIPELINES:
                 label = f"{scen}/{m.name}/{pipe}"
-                chatter = io.StringIO()   # the control planes' prints
+                chatter = io.StringIO()
                 try:
                     with contextlib.redirect_stdout(chatter):
                         setup = PS.build(pipe, m, node_index=node)
@@ -324,26 +296,26 @@ def t_kernel(n_cases):
                                 if V._read_u64(setup["cls_stats"], c) > 0), -1)
                     good += (got == want)
                 if not check(good == n_cases,
-                             f"{label:40s} {good}/{n_cases} decisioni come "
-                             f"il riferimento"):
+                             f"{label:40s} {good}/{n_cases} decisions like "
+                             f"the reference"):
                     print(chatter.getvalue())
                 owner = setup.get("owner")
                 if owner is not None:
                     owner.stop()
     if n_na:
-        print(f"  {YELLOW}[INFO]{NC} {n_na} combinazioni non applicabili "
-              f"(limiti delle pipeline), non contate come esiti")
+        print(f"  {YELLOW}[INFO]{NC} {n_na} combinations not applicable "
+              f"(pipeline limits), not counted as outcomes")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--kernel", action="store_true",
-                    help="anche il controllo nel kernel (root, BCC)")
+                    help="also the check in the kernel (root, BCC)")
     ap.add_argument("--n", type=int, default=40,
-                    help="ingressi per combinazione nel controllo kernel")
+                    help="inputs per combination in the kernel check")
     args = ap.parse_args()
     if args.kernel and os.geteuid() != 0:
-        print(f"{RED}--kernel carica programmi eBPF: serve root{NC} "
+        print(f"{RED}--kernel loads eBPF programs: root needed{NC} "
               f"(sudo python3 ipa/test/test_model_source.py --kernel)")
         return 2
     print(f"{YELLOW}=== model_source / pipeline_limits / topologies ==={NC}")

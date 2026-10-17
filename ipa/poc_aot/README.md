@@ -4,8 +4,8 @@
 
 Pipeline 1 (hardcoded) bakes the model weights as **C literals** in the eBPF
 source. Compiled with BCC, i.e. clang at runtime on the node, every new or
-modified model would trigger a full recompile on the node: ~75 ms of clang
-against ~1 ms of kernel load (verifier + JIT).
+modified model would trigger a full recompile on the node: tens of ms of clang
+against under a millisecond of kernel load (verifier + JIT).
 Retraining the same 65-4-4-7 model changes only 319 integers, yet the whole
 program is compiled from scratch, and the node needs a compiler.
 
@@ -23,14 +23,16 @@ a model that re-parses, the same topology the tests measure. This object *is*
 Pipeline 1 everywhere: every P1 number in `docs/` comes from it, through
 `ipa/p1_aot.py`.
 
-## Measured (2026-09-28, `docs/testing.md` §4 and Results)
+## Measured (population campaign, `results/popolazione_2026-10/`)
 
-| | |
-|---|---|
-| offline build (clang → `.o`) | 75.8 ms, once, on the build machine |
-| deploy on the node (open + verify + JIT) | **1.12 ms** |
-| xlated instructions | 1 064 (dispatch 29 + model 1 035) |
-| latency (forwarding path, retval 4) | **51 ns/pkt** at 3.5 GHz, as in `test_suite --only kernel` (52) |
+Median [min–max] over the 109 models of the population, P-core at 3.5 GHz:
+
+| | P1 (node frozen) | P1.5 (node from a map) |
+|---|---|---|
+| offline build (generate C + clang → `.o`), on the build machine | 50 [34–114] ms | 61 [34–181] ms |
+| install on a running node (open + verify + JIT) | **0.6 [0.3–1.5] ms** | 0.9 [0.3–5.6] ms |
+| loaded instructions | 650 [239–2 315] | 961 [282–4 313] |
+| neural network cost under traffic (CPU time minus baseline) | **53 [19–155] ns/pkt** | 58 [19–156] ns/pkt |
 
 ## Files
 
@@ -74,11 +76,12 @@ user: files created by root under `ipa/poc_aot/` make a later user build fail.
 
 1. **`[deploy]` total** — runtime open+load of the prebuilt `.o`, no clang.
 2. **`[perf]`** — xlated insns / latency / throughput on the dispatcher, same
-   methodology as `test_suite --only kernel` (frame refreshed every 200 runs
+   methodology as `test_weights_and_metrics --only kernel` (frame refreshed every 200 runs
    from TTL 255, minimum of the chunk averages).
 
 ## Limit
 
-Around ~1 200 weights the object is rejected by the kernel verifier
-(`processed 1000001 insns (limit 1000000)`, `E2BIG`) for every shape but the
-deepest one: see `docs/testing.md` §6.
+The verifier is not the limit: the ReLU is branchless (`ipa_relu`), so the
+verifier walks one path per neuron. Above roughly a thousand weights clang
+stops on the 512-byte eBPF stack, and the wide shape reaches it first (more
+intermediate values live at once): see `docs/testing.md` §6.

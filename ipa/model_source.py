@@ -1,27 +1,8 @@
-"""
-model_source.py -- one loader for every model a test or a bench can run.
+"""model_source.py -- one loader for every model a test or a bench can run.
 
-A model reference is one of:
-
-    checkpoint              the configured, trained checkpoint (the default)
-    checkpoint:<file.pt>    another trained checkpoint; its model_meta.json
-                            sits next to it and must carry `trained_on`
-    synth:<preset>          a synthetic preset of ipa/synth (ipa_like, deep,
-                            ...), generated into ipa/synth/scenarios/<preset>
-                            the first time it is asked for
-    <directory>             a generated synthetic model (model.json) or a
-                            descriptor fixture (model_meta.json + weights.json)
-
-and whatever it is, load_model() returns the same Model: int8 weights, the
-quantisation scale, the resolved feature descriptor (type, size, scale per
-feature), the hidden widths, the class semantics, and -- derived from those,
-not declared a second time -- what the model needs from the network it runs
-on (`requires`).
-
-Compatibility with a scenario (a network, topologies/<name>/) is
-`mismatches(model, topology)`: every feature's width must equal the network's
-dimension for it, and the TTL feature's scale must equal the network's
-initial TTL, because the model was trained on ttl / initial_ttl.
+A model reference is `checkpoint`, `checkpoint:<file.pt>`, `synth:<preset>`
+or a directory with a generated model; load_model() returns the same Model in
+every case. mismatches(model, topology) says whether it fits a network.
 """
 import json
 import os
@@ -30,12 +11,10 @@ from typing import List, Optional
 
 SHARED_DIR = os.path.dirname(os.path.abspath(__file__))
 SYNTH_ROOT = os.path.join(SHARED_DIR, "synth", "scenarios")
-
-# Synthetic models name one feature differently from the catalog.
 _SYNTH_NAMES = {"queue_occ": "queue_occupancy"}
 
-DIM_NAMES = {"n_nodes": "nodi", "n_interfaces": "interfacce",
-             "n_queues": "code", "initial_ttl": "TTL iniziale"}
+DIM_NAMES = {"n_nodes": "nodes", "n_interfaces": "interfaces",
+             "n_queues": "queues", "initial_ttl": "initial TTL"}
 
 
 class ModelError(Exception):
@@ -45,16 +24,16 @@ class ModelError(Exception):
 @dataclass
 class Model:
     name: str
-    source: str                   # checkpoint | synth | fixture
-    path: str                     # the .pt, or the model's directory
-    weights: List[int]            # int8, layer by layer: W then b
-    scale: int                    # int8 quantisation scale
-    features: List[dict]          # [{"type", "size", "scale"}], training order
+    source: str
+    path: str
+    weights: List[int]
+    scale: int
+    features: List[dict]
     hidden: List[int]
     n_out: int
-    semantics: object             # class_semantics.ClassSemantics
-    reference: bool = False       # the configured checkpoint itself
-    ref: str = "checkpoint"       # the reference it was loaded from
+    semantics: object
+    reference: bool = False
+    ref: str = "checkpoint"
 
     @property
     def n_in(self) -> int:
@@ -82,10 +61,7 @@ class Model:
 
     @property
     def requires(self) -> dict:
-        """What the network must provide: one entry per dimension a feature
-        reads its width from, plus the initial TTL the ttl feature is scaled
-        by. Raises ModelError if two features disagree (link_state 6 wide and
-        ingress_iface 3 wide cannot both be n_interfaces)."""
+        """What the network must provide."""
         import model_meta as mm
         req = {}
         for f in self.features:
@@ -98,8 +74,8 @@ class Model:
                 continue
             if key in req and req[key] != val:
                 raise ModelError(
-                    f"{self.name}: le feature chiedono {key}={req[key]} e "
-                    f"{key}={val} insieme")
+                    f"{self.name}: the features ask for {key}={req[key]} and "
+                    f"{key}={val} together")
             req[key] = val
         return req
 
@@ -107,16 +83,14 @@ class Model:
         feats = ", ".join(f"{f['type']} {f['size']}"
                           + (f" /{f['scale']}" if f['type'] == 'ttl' else "")
                           for f in self.features)
-        return (f"{self.shape}, {self.weight_count} pesi, scala {self.scale}, "
-                f"{len(self.hidden)} strati nascosti, ingressi [{feats}], "
-                f"DROP = classe {self.semantics.drop_class}")
+        return (f"{self.shape}, {self.weight_count} weights, scale {self.scale}, "
+                f"{len(self.hidden)} hidden layers, inputs [{feats}], "
+                f"DROP = class {self.semantics.drop_class}")
 
 
-# --------------------------------------------------------------------------
-# compatibility with a network
-# --------------------------------------------------------------------------
+# --- compatibility with a network ---
 def mismatches(model: Model, topology: dict) -> List[str]:
-    """Why `model` cannot run on `topology`; empty when it can."""
+    """Why `model` cannot run on `topology`;"""
     try:
         req = model.requires
     except ModelError as e:
@@ -125,17 +99,15 @@ def mismatches(model: Model, topology: dict) -> List[str]:
     for key, val in req.items():
         have = topology.get(key)
         if have is None:
-            out.append(f"la rete non dichiara {DIM_NAMES[key]} "
-                       f"(il modello ne vuole {val})")
+            out.append(f"the network does not declare {DIM_NAMES[key]} "
+                       f"(the model wants {val})")
         elif int(have) != int(val):
-            out.append(f"{DIM_NAMES[key]}: il modello ne vuole {val}, "
-                       f"la rete ne ha {have}")
+            out.append(f"{DIM_NAMES[key]}: the model wants {val}, "
+                       f"the network has {have}")
     return out
 
 
-# --------------------------------------------------------------------------
-# scenarios: the networks under topologies/
-# --------------------------------------------------------------------------
+# --- scenarios: the networks under topologies/ ---
 TOPOLOGY_ROOT = os.path.join(os.path.dirname(SHARED_DIR), "topologies")
 TOPOLOGY_FILE = "topology_config.json"
 
@@ -148,9 +120,9 @@ def topology_path(name_or_path: str) -> str:
     elif not os.path.exists(p):
         p = os.path.join(TOPOLOGY_ROOT, name_or_path, TOPOLOGY_FILE)
     if not os.path.exists(p):
-        raise ModelError(f"scenario {name_or_path!r} non trovato "
-                         f"(cercato {p}); disponibili: "
-                         f"{', '.join(list_topologies()) or 'nessuno'}")
+        raise ModelError(f"scenario {name_or_path!r} not found "
+                         f"(looked in {p}); available: "
+                         f"{', '.join(list_topologies()) or 'none'}")
     return p
 
 
@@ -163,10 +135,7 @@ def list_topologies() -> List[str]:
 
 
 def load_topology(name_or_path: str) -> dict:
-    """A scenario's dimensions: n_interfaces, n_nodes, n_queues (if
-    declared), initial_ttl (if declared), plus `topology` and `_path`.
-    Raises ModelError if the network exceeds what the datapath is compiled
-    for (model_meta.check_topology_fits)."""
+    """A scenario's dimensions."""
     import model_meta as mm
     p = topology_path(name_or_path)
     with open(p) as f:
@@ -185,15 +154,10 @@ def load_topology(name_or_path: str) -> dict:
     return cfg
 
 
-# --------------------------------------------------------------------------
-# loading
-# --------------------------------------------------------------------------
+# --- loading ---
 def load_model(ref: Optional[str] = None, topology: Optional[dict] = None,
                quiet: bool = True) -> Model:
-    """Resolve a reference (see the module docstring) into a Model.
-
-    `topology` is needed only by descriptor fixtures, whose feature widths
-    come from the network instead of being written in the model."""
+    """Resolve a reference (see the module docstring) into a Model."""
     ref = (ref or "checkpoint").strip()
     if ref == "checkpoint":
         m = _load_checkpoint(None)
@@ -209,9 +173,9 @@ def load_model(ref: Optional[str] = None, topology: Optional[dict] = None,
             m = _load_fixture(path, topology)
         else:
             raise ModelError(
-                f"riferimento {ref!r} non riconosciuto: usa checkpoint, "
-                f"checkpoint:<file.pt>, synth:<preset> o una cartella con "
-                f"model.json o model_meta.json")
+                f"reference {ref!r} not recognised: use checkpoint, "
+                f"checkpoint:<file.pt>, synth:<preset> or a directory with "
+                f"model.json or model_meta.json")
     m.ref = ref
     return m
 
@@ -219,17 +183,16 @@ def load_model(ref: Optional[str] = None, topology: Optional[dict] = None,
 def _semantics_from_meta(meta: dict, n_out: int, who: str):
     from class_semantics import ClassSemantics
     if not meta.get("class_semantics"):
-        raise ModelError(f"{who}: il descrittore non dichiara class_semantics")
+        raise ModelError(f"{who}: the descriptor does not declare class_semantics")
     sem = ClassSemantics.from_json(meta)
     if sem.n_out != n_out:
-        raise ModelError(f"{who}: class_semantics per n_out={sem.n_out}, "
-                         f"il modello ne ha {n_out}")
+        raise ModelError(f"{who}: class_semantics for n_out={sem.n_out}, "
+                         f"the model has {n_out}")
     return sem
 
 
 def semantics_with_drop(n_out: int, drop_class: int):
-    """FORWARD on every class but `drop_class`, ports in class order: the
-    layout a synthetic model declares with its drop_class."""
+    """FORWARD on every class but `drop_class`, ports in class order."""
     from class_semantics import ClassSemantics, ClassSpec
     classes, port = {}, 0
     for c in range(n_out):
@@ -247,12 +210,12 @@ def _load_checkpoint(pt_path):
     pt = os.path.abspath(pt_path) if pt_path else default
     is_ref = os.path.abspath(pt) == os.path.abspath(default)
     if not os.path.exists(pt) and not is_ref:
-        raise ModelError(f"checkpoint {pt} non trovato")
+        raise ModelError(f"checkpoint {pt} not found")
     meta = mm.load_model_meta(pt)
     t = meta.get("trained_on") or {}
     if not all(k in t for k in mm.TOPOLOGY_KEYS_REQUIRED):
-        raise ModelError(f"{pt}: il model_meta.json accanto non ha `trained_on` "
-                         f"con {list(mm.TOPOLOGY_KEYS_REQUIRED)}")
+        raise ModelError(f"{pt}: the model_meta.json next to it has no `trained_on` "
+                         f"with {list(mm.TOPOLOGY_KEYS_REQUIRED)}")
     topo = {k: int(t[k]) for k in mm.TOPOLOGY_KEYS if k in t}
     shape = mm.derive_shape(meta, topology_config=topo)
     ttl_scale = int(meta.get("inputs", {}).get("ttl", {}).get(
@@ -264,9 +227,6 @@ def _load_checkpoint(pt_path):
     hidden = [int(h) for h in shape["hidden_dims"]]
     n_out = int(shape["n_out"])
     if is_ref:
-        # The configured checkpoint: the int8 weights and scale the whole
-        # repository measures (weights.json / weights_float.json), whether or
-        # not torch is importable -- the same pair verify_prog_run loads.
         from extract_weights import extract_weights_int8
         import warnings
         with warnings.catch_warnings():
@@ -287,19 +247,17 @@ def _load_checkpoint(pt_path):
 
 
 def _quantise_checkpoint(pt, topo, hidden, n_out):
-    """int8 weights of a checkpoint other than the configured one. Needs
-    torch: weights.json holds the configured model only, and falling back
-    to it would measure the wrong network under the right name."""
+    """int8 weights of a checkpoint other than the configured one."""
     if len(hidden) != 2 or hidden[0] != hidden[1]:
-        raise ModelError(f"{pt}: FastRerouteMLP ha due strati nascosti uguali, "
-                         f"il descrittore dice {hidden}")
+        raise ModelError(f"{pt}: FastRerouteMLP has two equal hidden layers, "
+                         f"the descriptor says {hidden}")
     try:
         import torch
         from FRR_model import FastRerouteMLP
     except ImportError:
         raise ModelError(
-            f"{pt}: serve torch per leggere un checkpoint diverso da quello "
-            f"configurato, e questo interprete non lo vede. Sotto sudo: "
+            f"{pt}: torch is needed to read a checkpoint other than the "
+            f"configured one, and this interpreter cannot see it. Under sudo: "
             f"PYTHONPATH=$(python3 -m site --user-site)")
     m = FastRerouteMLP(n_interfaces=topo["n_interfaces"],
                        n_nodes=topo["n_nodes"], hidden_dim=hidden[0],
@@ -313,7 +271,7 @@ def _quantise_checkpoint(pt, topo, hidden, n_out):
 def _load_synth_preset(name, quiet=True):
     from synth.generate import PRESETS
     if name not in PRESETS:
-        raise ModelError(f"preset sintetico {name!r} sconosciuto: "
+        raise ModelError(f"unknown synthetic preset {name!r}: "
                          f"{', '.join(PRESETS)}")
     d = os.path.join(SYNTH_ROOT, name)
     if not os.path.exists(os.path.join(d, "model.json")):
@@ -349,9 +307,7 @@ def _load_synth_dir(d):
 
 
 def _load_fixture(d, topology):
-    """A descriptor fixture (ipa/test/fixtures/...): features named in
-    model_meta.json, widths from the network. Without a network the widths
-    are unknown, and a guess would be the Germany50 one."""
+    """A descriptor fixture (ipa/test/fixtures/...)."""
     import model_meta as mm
     with open(os.path.join(d, "model_meta.json")) as f:
         meta = json.load(f)
@@ -359,8 +315,8 @@ def _load_fixture(d, topology):
         wi = json.load(f)
     wi = wi["weights"] if isinstance(wi, dict) else wi
     if topology is None:
-        raise ModelError(f"{d}: le larghezze degli ingressi vengono dalla "
-                         f"rete; serve lo scenario")
+        raise ModelError(f"{d}: the input widths come from the "
+                         f"network; the scenario is needed")
     topo = {k: int(topology[k]) for k in mm.TOPOLOGY_KEYS if k in topology}
     try:
         shape = mm.derive_shape(meta, topology_config=topo)
@@ -381,5 +337,5 @@ def _load_fixture(d, topology):
 def _check_count(m: Model):
     if len(m.weights) != m.weight_count:
         raise ModelError(
-            f"{m.name}: {len(m.weights)} pesi, la forma {m.shape} ne vuole "
+            f"{m.name}: {len(m.weights)} weights, the shape {m.shape} needs "
             f"{m.weight_count}")

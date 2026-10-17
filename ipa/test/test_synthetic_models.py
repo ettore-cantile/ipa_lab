@@ -1,45 +1,8 @@
 #!/usr/bin/env python3
-"""
-test_synth.py -- verify the synthetic scenario generator and its artefacts.
+"""test_synthetic_models.py -- the synthetic model generator: dimensions, weights,
+feature order, quantisation, and P1's C code against the reference. No root.
 
-Userspace only by default: no root, no BCC, no kernel, no torch required. The
-eBPF half is opt-in (`--kernel`) because it needs Linux + BCC + root.
-
-What is actually checked
-------------------------
-  dimensions      n_in from the feature widths == first layer's n_in; the flat
-                  weight list length == sum(n_in*n_out + n_out); split_layers
-                  consumes it exactly.
-  weights         the flat list survives a round trip through nn.Linear, and
-                  torch's forward agrees with the pure-Python float reference.
-  feature order   column offsets are the running sum of widths, the descriptor
-                  agrees with model_meta.resolve_descriptor's convention, and a
-                  reloaded scenario reproduces the same layout.
-  quantisation    the scale matches extract_weights' formula exactly, the
-                  scheme is symmetric with zero_point 0, dequantisation error
-                  is bounded by the step size, and with no column divided the
-                  int8 logits are EXACTLY scale**L times the dequantised
-                  model's (exact rational arithmetic, independent of both
-                  forward passes).
-  independence    no generated artefact contains the checkpoint's weights or
-                  filename, and the generated weights differ from it.
-  determinism     same seed -> byte-identical artefacts; different seed ->
-                  different weights.
-  reference vs C  synth.reference.forward_int8 against the C that P1
-                  compiles, logit for logit: a hand-computed case, then every
-                  preset through P1.5 and P1 with the node frozen. The C is
-                  evaluated from its text by p1_c_eval (C integer rules, no
-                  kernel), so two implementations that are each consistent
-                  cannot drift apart unnoticed -- which is what happened to
-                  the bias scaling until 2026-09-23.
-  P2/P3 scale     the control planes write each feature's DECLARED scale into
-                  feat_ent.scale (ttl 16 stays 16), and refuse one that does
-                  not fit the byte instead of truncating it. Whether the
-                  kernel then divides by it is verify_synth_kernel's job
-                  (--pipeline p2|p3, with its negative control).
-
-    python3 ipa/test/test_synth.py
-    sudo python3 ipa/test/test_synth.py --kernel
+    python3 ipa/test/test_synthetic_models.py
 """
 
 import argparse
@@ -56,8 +19,8 @@ SHARED_DIR = os.path.dirname(_TEST_DIR)
 if SHARED_DIR not in sys.path:
     sys.path.insert(0, SHARED_DIR)
 
-from synth import reference as ref                                    # noqa: E402
-from synth.spec import FeatureSet, FeatureSpec                        # noqa: E402
+from synth import reference as ref  # noqa: E402
+from synth.spec import FeatureSet, FeatureSpec  # noqa: E402
 from synth.generate import (generate_scenario, load_scenario, preset,  # noqa: E402
                             make_weights, make_inputs, check_inputs,
                             build_torch_model, PRESETS)
@@ -87,7 +50,6 @@ def check(cond, msg):
     return cond
 
 
-# ---------------------------------------------------------------------------
 def t_feature_semantics():
     print(f"\n{YELLOW}[1] Feature semantics honoured by the generator{NC}")
     fset = FeatureSet([
@@ -107,7 +69,6 @@ def t_feature_semantics():
           "real: float view == carrier / scale")
     check(fset.column_scales() == [1]*5 + [1]*7 + [1] + [30],
           "column scales: only the real feature carries a divisor")
-    # the anti-requirement: not uniform noise
     oh = [tuple(v[5:12]) for v in ints]
     check(len(set(oh)) > 1 and all(sum(o) == 1 for o in oh),
           "one-hot varies across samples yet never has two slots hot")
@@ -162,8 +123,7 @@ def t_weight_roundtrip():
 
 
 def _exact_forward(weights, dims, x):
-    """ReLU MLP in exact rational arithmetic: the dequantised model as
-    mathematics defines it, with no rounding anywhere."""
+    """ReLU MLP in exact rational arithmetic."""
     acts = [Fraction(v) for v in x]
     layers = ref.split_layers(weights, dims)
     for li, (w, b) in enumerate(layers):
@@ -186,7 +146,6 @@ def t_quantisation():
     check(all(-128 <= v <= 127 for v in wi), "every value inside int8 range")
     check(clamped == 0, f"no weight clamped ({clamped})")
 
-    # symmetric, no zero point: w == 0 must map to exactly 0
     zeros = [i for i, x in enumerate(wf) if x == 0.0]
     check(all(wi[i] == 0 for i in zeros) if zeros else True,
           f"symmetric scheme: float 0 -> int8 0 (zero_point = 0, {len(zeros)} zeros)")
@@ -202,11 +161,6 @@ def t_quantisation():
     for line in ref.bias_scale_report(m.layer_dims, scale):
         print(f"    {line.strip()}")
 
-    # The identity the scheme exists for. With no column divided, the integer
-    # network computes EXACTLY scale**L times what the dequantised network
-    # (weights w_int8 / scale) computes -- if and only if every bias carries
-    # the right power of the scale. Checked against an exact rational forward
-    # written here, not against either forward pass under test.
     fset = FeatureSet([FeatureSpec("bin", "binary", size=5),
                        FeatureSpec("oh", "onehot", size=4),
                        FeatureSpec("i", "integer", lo=0, hi=15)])
@@ -256,10 +210,6 @@ def t_artifacts_and_determinism(root):
     check(mspec.features.offsets() == m.features.offsets(),
           f"reloaded column offsets match {m.features.offsets()}")
 
-    # Expectations reproduce from the artefacts alone. On its own this is
-    # circular -- the same function wrote them, and it passed while that
-    # function and the datapath disagreed on every bias past layer 1. [8]
-    # checks the function against the C.
     cs = inputs["col_scales"]
     bad = 0
     for xi, e in zip(inputs["vectors"], expected["int8"]):
@@ -273,7 +223,6 @@ def t_artifacts_and_determinism(root):
           f"({expected.get('int8_scheme')!r})")
     info(f"float/int8 argmax agreement: {100*expected['quant_agreement']:.1f}%")
 
-    # A scenario written by the old reference must be refused, not compared.
     d3 = os.path.join(root, "mixed_stale")
     shutil.copytree(d1, d3)
     with open(os.path.join(d3, "expected.json")) as f:
@@ -286,8 +235,7 @@ def t_artifacts_and_determinism(root):
         refused = False
     except ValueError:
         refused = True
-    check(refused, "load_scenario refuses an expected.json without int8_scheme "
-                   "(written before 2026-09-23)")
+    check(refused, "load_scenario refuses an expected.json without int8_scheme")
 
 
 def t_descriptor_convention():
@@ -343,14 +291,8 @@ def t_independence(root):
               "descriptor declares its synthetic provenance")
 
 
-# ---------------------------------------------------------------------------
 def _datapath_state(feats, xi):
-    """What P1 must read to build the input vector `xi`: dense-map contents,
-    packet TTL, logical ingress port (0 = none) and node index (None = none).
-
-    The inverse of verify_synth_kernel.vettore_intero. A vector the datapath
-    cannot build -- two ingress ports hot, a non-binary one-hot -- is refused
-    rather than approximated: comparing on it would test nothing real."""
+    """What P1 must read to build the input vector `xi`."""
     import model_meta as mm
     maps, ttl, port, node, o = {}, 64, 0, None, 0
     for f in feats:
@@ -375,9 +317,7 @@ def _datapath_state(feats, xi):
 
 
 def _corners(feats, xi):
-    """Inputs a packet can carry and the sampler never draws: TTL 255, no
-    ingress port, every link down, no node configured, a queue reading with
-    the top bit of its u32 set (a sign-extension bug would flip it)."""
+    """Inputs a packet can carry and the sampler never draws."""
     out, o = [], 0
     for f in feats:
         t, n = f["type"], f["size"]
@@ -404,20 +344,15 @@ def t_reference_vs_p1_source(root):
         from ebpf_program import build_combined_hardcoded_source
         from class_semantics import ClassSemantics
         from p1_c_eval import P1Program
-        from verify_synth_kernel import descrittore
+        from check_kernel_vs_reference import descrittore
         sys.path.insert(0, os.path.join(SHARED_DIR, "poc_aot"))
         from gen_full_c import _emit_arch
     except Exception as e:
-        # Pure Python, all in the repo: failing to import is a failure, not a
-        # skip -- a check that quietly does not run is how this gap stayed open.
         fail(f"P1 generator or evaluator not importable "
              f"({type(e).__name__}: {e})")
         return
 
     def p1_source(wi, scale, feats, hidden, n_out, static_node=None):
-        # The class dispatch after the argmax is not evaluated, so any valid
-        # semantics will do; this one is stated rather than defaulted, which
-        # keeps the generator from printing its reference-layout warning.
         sem = ClassSemantics.forward_then_drop(n_out - 1, drop_class=n_out - 1,
                                                n_out=n_out)
         return build_combined_hardcoded_source(
@@ -426,9 +361,6 @@ def t_reference_vs_p1_source(root):
 
     def aot_program(wi, scale, feats, hidden, n_out, static_node=None,
                     static_ports=None, models=None, func="xdp_model"):
-        # The AOT object is what P1 actually DEPLOYS, and gen_full_c is a
-        # second generator, separate from ebpf_program: it kept the catalogue
-        # TTL scale for days after the BCC one was fixed. Checked the same way.
         sem = ClassSemantics.forward_then_drop(n_out - 1, drop_class=n_out - 1,
                                                n_out=n_out)
         shape = {"features": feats, "n_out": n_out, "hidden_dims": list(hidden),
@@ -438,12 +370,6 @@ def t_reference_vs_p1_source(root):
                                     static_ports=static_ports, models=models),
                          func=func)
 
-    # (a) The minimal case, by hand. One input, one hidden neuron, two
-    # outputs; scale 10, weights W1=[1] b1=[0] | W2=[3, 0] b2=[0, 1].
-    #   h    = relu(1*1 + 0)             = 1
-    #   out0 = 1*3 + 0 * 10**1           = 3
-    #   out1 = 1*0 + 1 * 10**1           = 10   -> class 1
-    # Float view, weights / 10: out = [0.03, 0.1], times 10**2 = [3, 10].
     wi, s, dims = [1, 0, 3, 0, 0, 1], 10, [(1, 1), (1, 2)]
     hand = [3, 10]
     src = p1_source(wi, s, [{"type": "link_state", "size": 1, "scale": 1}], [1], 2)
@@ -459,11 +385,10 @@ def t_reference_vs_p1_source(root):
     check(all(abs(a * s ** 2 - b) < 1e-9 for a, b in zip(lf, hand)),
           f"minimal case: float logits {[round(v, 6) for v in lf]} x scale^2 "
           f"== {hand}")
-    # The comparison must be able to fail, from either side.
     old = ref.forward_int8(wi, dims, [1], [1], scale=1)
     check(old == [3, 1] and old != c["logits"],
-          "negative control, Python side: the call generate.py made until "
-          "2026-09-23 (no scale, bias not rescaled) gives [3, 1] and is caught")
+          "negative control, Python side: the reference without scale (bias "
+          "not rescaled) gives [3, 1] and is caught")
     lit = "h1_0 * 0LL + 10LL;"
     if src.count(lit) == 1:
         cb = P1Program(src.replace(lit, "h1_0 * 0LL + 1LL;")).run(
@@ -475,11 +400,7 @@ def t_reference_vs_p1_source(root):
         fail(f"negative control, C side: {lit!r} not found once in the "
              f"generated source -- the generator's output changed")
 
-    # (b) Every preset. The scenario's own vectors, their corners, through
-    # P1.5 (node read from the node_id map), P1 with the node frozen at the
-    # first and last column, and the AOT object (node from its node_id map).
-    # Logits must be IDENTICAL, not just the argmax.
-    kif = 7          # any ifindex: P1 must resolve it through ingress_port
+    kif = 7
     for name in PRESETS:
         d = os.path.join(root, f"p1src_{name}")
         generate_scenario(preset(name), d, n_inputs=100)
@@ -523,8 +444,6 @@ def t_reference_vs_p1_source(root):
                 if got["logits"] != want or got["cls"] != ref.argmax(want):
                     bad += 1
                     example = example or (label, xi, want, got["logits"])
-                # expected.json itself, straight against the C, on the
-                # vectors it was written for
                 if label == "P1.5" and vi < len(base):
                     stored += got["logits"] == expected["int8"][vi]["logits"]
         check(bad == 0 and stored == len(base),
@@ -535,9 +454,6 @@ def t_reference_vs_p1_source(root):
         if example:
             label, xi, want, have = example
             info(f"  first mismatch ({label}): x={xi} reference={want} C={have}")
-    # (c) What P1 tests need from the AOT generator beyond one P1.5 model:
-    # frozen ports (a node of degree < n_interfaces) and several models in
-    # one object. Checked on ipa_like against the reference.
     m = preset("ipa_like")
     wq, sc, _ = ref.quantize(make_weights(m))
     feats = descrittore(m.to_json())
@@ -553,7 +469,7 @@ def t_reference_vs_p1_source(root):
         x[off["node"]:off["node"] + 52] = [int(k == node) for k in range(52)]
         for i in range(6):
             if i not in live:
-                x[off["link_state"] + i] = 0      # no interface there
+                x[off["link_state"] + i] = 0
         maps, ttl, port, _ = _datapath_state(feats, x)
         maps["ingress_port"] = {kif: port} if port else {}
         bad += prog.run(ttl, maps, ingress_ifindex=kif)["logits"] != \
@@ -577,12 +493,11 @@ def t_reference_vs_p1_source(root):
     check(bad == 0, f"AOT with two models in one object (ids 0 and 3): "
                     f"{tried - bad}/{tried} identical logits")
     info("not covered here: clang, the verifier, the JIT, the packet path "
-         "around the inference -- sudo python3 ipa/test/verify_synth_kernel.py --all")
+         "around the inference -- sudo python3 ipa/test/check_kernel_vs_reference.py --all")
 
 
 class _FakeTable(dict):
-    """A BCC table stand-in keyed by the ctypes key's value: enough for the
-    control plane's `bpf_obj[name][c_uint8(k)] = struct` writes."""
+    """A BCC table stand-in keyed by the ctypes key's value."""
 
     def __setitem__(self, k, v):
         super().__setitem__(getattr(k, "value", k), v)
@@ -598,7 +513,7 @@ def t_p2p3_scale_control_plane():
     try:
         import ebpf_template_arch as A
         import ebpf_modular as M
-        from verify_synth_kernel import descrittore
+        from check_kernel_vs_reference import descrittore
     except Exception as e:
         fail(f"P2/P3 control planes not importable ({type(e).__name__}: {e})")
         return
@@ -622,12 +537,6 @@ def t_p2p3_scale_control_plane():
         check(refused, f"{label}: a scale of 300 is refused, not written as "
                        f"255 (feat_ent.scale is one byte)")
 
-    # class_action_t2/_t3 is keyed by (model_id, bank, class) now. Two models
-    # with different semantics must both be accepted, each written into its
-    # own rows only; re-registering a model must write its OTHER bank and
-    # leave the live one -- and every other model -- untouched until the
-    # registry entry commits the flip. The kernel side (packets selecting
-    # either model in one program) is verify_per_model_semantics.py.
     from types import SimpleNamespace
     from class_semantics import ClassSemantics, MAX_N_OUT
     sem7 = ClassSemantics.forward_then_drop(5, drop_class=5, n_out=7)
@@ -656,7 +565,6 @@ def t_p2p3_scale_control_plane():
           "and model 1 are untouched until the registry commits the flip")
 
 
-# ---------------------------------------------------------------------------
 def t_kernel(root):
     """Run one synthetic scenario through the real pipelines."""
     print(f"\n{YELLOW}[10] Synthetic model through P1 / P2 / P3 (needs root; "
@@ -665,14 +573,13 @@ def t_kernel(root):
         info("needs Linux + root -- kernel section skipped")
         return
 
-    m = preset("ipa_like")            # shape-compatible with all three pipelines
+    m = preset("ipa_like")
     d = os.path.join(root, "kern")
     generate_scenario(m, d, n_inputs=64)
     mspec, wf, wi, scale, inputs, expected = load_scenario(d)
     info(f"scenario {mspec.name} {mspec.shape_str}, scale={scale}, "
          f"{len(inputs['vectors'])} vectors")
 
-    # P1: the AOT object on the generated weights, loaded by loader_aot
     try:
         import p1_aot
         p1_aot.load_p1([(0, wi, scale)])["owner"].stop()
@@ -680,9 +587,6 @@ def t_kernel(root):
     except Exception as e:
         fail(f"P1: {e}")
 
-    # P2 / P3: the weight blocks are shape-compatible, so the existing loaders
-    # take the synthetic weights unchanged -- which is the point of reusing the
-    # repo's artefact format.
     for label, mod, fn in (
             ("P2", "ebpf_template_arch", "load_arch_weights"),
             ("P3", "ebpf_modular", "load_modular_weights")):
@@ -693,19 +597,13 @@ def t_kernel(root):
         except Exception as e:
             fail(f"{label}: {e}")
 
-    # Questo blocco prova la COMPILAZIONE, non l'equivalenza numerica: che i
-    # pesi sintetici passino il verificatore non dice niente su quale classe il
-    # programma poi sceglie. Il rimando qui diceva "verify_prog_run --weights",
-    # un'opzione che non e' mai esistita, e la distinzione andava quindi presa
-    # sulla fiducia. Adesso il test c'e' e si chiama per nome.
-    info("equivalenza NUMERICA sui pesi sintetici (float / int8 Python / eBPF): "
-         "sudo python3 ipa/test/verify_synth_kernel.py --all "
+    info("NUMERICAL equivalence on the synthetic weights (float / int8 Python / eBPF): "
+         "sudo python3 ipa/test/check_kernel_vs_reference.py --all "
          "[--pipeline p2|p3]")
-    info("  ...oppure, senza kernel, le sole vie Python: "
-         "python3 ipa/test/verify_synth_kernel.py --all --dry-run")
+    info("  ...or, without a kernel, the Python paths only: "
+         "python3 ipa/test/check_kernel_vs_reference.py --all --dry-run")
 
 
-# ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)

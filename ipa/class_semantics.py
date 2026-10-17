@@ -1,47 +1,7 @@
-"""
-class_semantics.py -- what each model output class MEANS.
+"""class_semantics.py -- what each output class of a model means.
 
-The problem this replaces
-------------------------
-Until now the meaning of an output class was inferred from its index. Four
-mutually inconsistent conventions coexisted in the tree:
-
-  dataset.py      DROP = max(label) + 1        -> 5 for the germany50 dataset
-  train.py        DROP = n_interfaces + 1      -> 7, dead code (no -1 survives
-                                                  load_dataset), and 7 is not
-                                                  even a valid index of a
-                                                  7-class output
-  the datapath    DROP = n_out - 1             -> 6, and hardcoded as `>= 6`
-                                                  in P2/P3
-  decode_nexthop  DROP = 0, ports shifted by 1 -> abandoned, still printing
-
-Measured consequence on the checked-in model: 92.3% of the rows the dataset
-labels DROP make the model emit class 5, which the datapath then treats as
-"forward out logical port 5". The DROP decision was never honoured, and
-XDP_DROP was dead code because class 6 never wins the argmax.
-
-The model here
---------------
-A class index carries NO meaning by itself. Every valid class gets an explicit
-action:
-
-  FORWARD(port)  send the packet out a LOGICAL PORT. Not an ifindex, not an
-                 interface name, and not necessarily equal to the class index:
-                 ports may be non-consecutive and in any order.
-  DROP           discard the packet in the datapath.
-  UNUSED         a class the model can emit but that carries no action -- e.g.
-                 an output the training data never labelled. Counted, never
-                 forwarded. Making this explicit is the point: such a class
-                 used to be silently repurposed as DROP.
-
-`drop_class` is OPTIONAL. A model with no DROP class is legitimate, and must
-not have one invented for it.
-
-Three separate layers, never conflated:
-
-  L1  compile-time ceilings          MAX_N_OUT, MAX_LOGICAL_PORTS (engine)
-  L2  this file + the descriptor     n_out, class semantics       (model)
-  L3  node_config.py                 logical port -> ifindex/MAC  (node)
+A model declares, for every class, an action: FORWARD on a logical port, DROP,
+or UNUSED. The pipelines never infer the action from the class index.
 """
 
 import json
@@ -49,17 +9,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-# --- L1: engine ceilings. NOT the model's n_out. -------------------------
-# Compiled into the eBPF programs, which need constant loop bounds and a
-# fixed-size class_action map. A model with n_out above the ceiling is refused
-# at load time, never silently truncated.
 MAX_N_OUT = 32
 MAX_LOGICAL_PORTS = 32
-
-# Action codes. These travel to the datapath in the class_action BPF map, so
-# the values are part of the kernel/userspace contract -- keep them in sync
-# with the ACT_* defines in the eBPF sources.
-ACT_INVALID = 0      # class out of range, or no semantics registered
+ACT_INVALID = 0
 ACT_FORWARD = 1
 ACT_DROP    = 2
 ACT_UNUSED  = 3
@@ -70,18 +22,14 @@ ACTION_CODES = {v: k for k, v in ACTION_NAMES.items()}
 
 
 class SemanticsError(ValueError):
-    """Raised when a descriptor's class semantics are inconsistent.
-
-    Always raised, never warned: a model whose class meanings cannot be
-    established must not reach a datapath that will then guess.
-    """
+    """Raised when a descriptor's class semantics are inconsistent."""
 
 
 @dataclass
 class ClassSpec:
     """One output class."""
-    action: str                      # "FORWARD" | "DROP" | "UNUSED"
-    port: Optional[int] = None       # logical port, FORWARD only
+    action: str
+    port: Optional[int] = None
 
     def __post_init__(self):
         self.action = self.action.upper()
@@ -120,7 +68,6 @@ class ClassSemantics:
         self.classes = {int(k): v for k, v in self.classes.items()}
         self.validate()
 
-    # -- validation --------------------------------------------------------
     def validate(self):
         """Every check the descriptor must survive before it can be used."""
         if not isinstance(self.n_out, int) or self.n_out < 1:
@@ -131,8 +78,6 @@ class ClassSemantics:
                 f"MAX_N_OUT={MAX_N_OUT}. Raise the ceiling in class_semantics.py "
                 f"AND the matching #define in the eBPF sources, then reload.")
 
-        # every class in range, none missing, none duplicated. A dict cannot
-        # hold duplicates, so the real check is coverage and range.
         for cid in self.classes:
             if not (0 <= cid < self.n_out):
                 raise SemanticsError(
@@ -144,7 +89,6 @@ class ClassSemantics:
                 f"model can emit needs one -- declare it UNUSED if it carries no "
                 f"action, rather than leaving it to be inferred.")
 
-        # drop_class must agree with the map, in both directions
         drops = sorted(c for c, s in self.classes.items() if s.action == "DROP")
         if self.drop_class is not None:
             if not (0 <= self.drop_class < self.n_out):
@@ -164,21 +108,16 @@ class ClassSemantics:
             raise SemanticsError(
                 f"drop_class={self.drop_class} but no class has action DROP")
 
-        # logical ports: no two FORWARD classes may claim the same port, or the
-        # mapping class -> port stops being a function of the packet's decision
         ports = [s.port for s in self.classes.values() if s.action == "FORWARD"]
         dup = sorted({p for p in ports if ports.count(p) > 1})
         if dup:
             raise SemanticsError(f"logical port(s) {dup} claimed by more than one class")
         if not ports:
-            # legitimate (a pure classifier), but worth refusing in a forwarding
-            # datapath: nothing could ever be forwarded.
             raise SemanticsError(
                 "no class has action FORWARD -- this model can never forward "
                 "a packet. If that is intended, the datapath is the wrong "
                 "consumer for it.")
 
-    # -- queries -----------------------------------------------------------
     @property
     def forward_classes(self) -> List[int]:
         return sorted(c for c, s in self.classes.items() if s.action == "FORWARD")
@@ -193,8 +132,7 @@ class ClassSemantics:
 
     @property
     def n_logical_ports(self) -> int:
-        """How many distinct ports the model can select. NOT n_out, and not the
-        node's interface count."""
+        """How many distinct ports the model can select."""
         return len(self.logical_ports)
 
     def action_of(self, cls: int) -> str:
@@ -206,12 +144,9 @@ class ClassSemantics:
         s = self.classes.get(cls)
         return s.port if s and s.action == "FORWARD" else None
 
-    # -- the datapath's view ----------------------------------------------
     def action_table(self) -> List[tuple]:
         """(action_code, port) per class index 0..MAX_N_OUT-1, for the
-        class_action BPF map. Classes past n_out are ACT_INVALID, so a datapath
-        reading a class it should never see gets an explicit "invalid" rather
-        than a stale or zeroed entry that looks like a valid action."""
+        class_action BPF map."""
         out = []
         for cid in range(MAX_N_OUT):
             s = self.classes.get(cid)
@@ -221,7 +156,6 @@ class ClassSemantics:
                 out.append((s.code, s.port if s.action == "FORWARD" else 0))
         return out
 
-    # -- serialisation -----------------------------------------------------
     def to_json(self) -> dict:
         return {
             "n_out": self.n_out,
@@ -248,18 +182,12 @@ class ClassSemantics:
         return ClassSemantics(n_out=int(d["n_out"]), classes=classes,
                               drop_class=d.get("drop_class"))
 
-    # -- constructors for common shapes -----------------------------------
     @staticmethod
     def forward_then_drop(n_ports: int, drop_class: Optional[int] = None,
                           n_out: Optional[int] = None,
                           ports: Optional[List[int]] = None) -> "ClassSemantics":
         """Classes 0..n_ports-1 forward to ports (default: identity), then an
-        optional DROP class, then UNUSED for anything remaining.
-
-        A convenience for the common layout, NOT a default: the caller states
-        n_ports and drop_class explicitly. `ports` allows a non-identity and
-        non-consecutive class -> port mapping.
-        """
+        optional DROP class, then UNUSED."""
         ports = list(range(n_ports)) if ports is None else list(ports)
         if len(ports) != n_ports:
             raise SemanticsError(f"ports has {len(ports)} entries, expected {n_ports}")
@@ -277,7 +205,6 @@ class ClassSemantics:
             classes.setdefault(c, ClassSpec("UNUSED"))
         return ClassSemantics(n_out=n_out, classes=classes, drop_class=drop_class)
 
-    # -- human-readable ----------------------------------------------------
     def summary(self) -> str:
         lines = [f"  n_out = {self.n_out}, "
                  f"drop_class = {self.drop_class if self.drop_class is not None else 'none'}, "
@@ -289,12 +216,7 @@ class ClassSemantics:
 
 def format_decision(cls: int, sem: ClassSemantics, ifindex: Optional[int] = None,
                      iface: Optional[str] = None) -> str:
-    """One-line log of a decision, keeping the four levels distinct.
-
-    Replaces decode_nexthop, which printed an interface name derived straight
-    from the class index -- so class 2 was reported as "eth1" under a
-    convention (DROP=0, ports shifted) that no other part of the system used.
-    """
+    """One-line log of a decision, keeping the four levels distinct."""
     act = sem.action_of(cls)
     out = f"class={cls} action={act}"
     if act == "FORWARD":
@@ -305,7 +227,3 @@ def format_decision(cls: int, sem: ClassSemantics, ifindex: Optional[int] = None
             out += f" iface={iface}"
     return out
 
-
-def load_from_file(path: str) -> ClassSemantics:
-    with open(path) as f:
-        return ClassSemantics.from_json(json.load(f))

@@ -1,36 +1,11 @@
 #!/usr/bin/env python3
-"""population_report.py -- le conclusioni su una POPOLAZIONE di modelli.
+"""report_population.py -- the conclusions of a population campaign, in markdown.
 
-    python3 ipa/test/population_report.py results/popolazione_<data> > sintesi.md
-    python3 ipa/test/population_report.py results/campagna_2026-10-10     # assi
+Every row is a range over the models, a cost law fitted on all of them, or a
+claim with the number of models it holds on. Measurements disturbed by the
+machine are left out (or kept without the disturbed rounds).
 
-campaign_report.py fa le tabelle di un modello alla volta. Qui nessun numero
-e' di un modello: ogni riga e' un intervallo sulla popolazione (minimo, 10°
-percentile, mediana, 90°, massimo), una legge stimata su tutti i modelli
-(minimi quadrati, con l'errore che fa su modelli che non ha visto), o
-un'affermazione con il numero di modelli su cui regge ("P3 esegue piu'
-istruzioni di P2: 91/91").
-
-Legge, se ci sono (remeasure_popolazione.sh):
-    population.csv                         il manifesto (model_population.py)
-    corretto/corretto.csv                  equivalenza riferimento / eBPF
-    rif_<P|E|L>core/compare.csv            rxonly e baseline senza modello
-    pop_<P|E>core/<id>/compare.csv         massima spinta, ogni modello
-    pop_<P|E>core/<id>/prog_size.csv       programmi caricati
-    pop_<P|E>core/<id>/rates/rates_raw.csv T2-T1 a traffico leggero
-    lpe/<id>/compare.csv                   LP E-core, sottoinsieme
-    carico_<P|E>core/<id>/bitrate.csv      curve al crescere del rate
-    core2_<P|E>core/<id>/compare.csv       due core
-    classi/<id>/per_class.csv              una sessione per classe
-    mix/<id>/compare.csv                   TTL misti
-    taglie/<id>/compare.csv                64 / 512 / 1514 byte
-
-Senza population.csv, ma con le cartelle assi_<P|E>core/ di una campagna di
-ottobre, tratta i punti degli assi come una popolazione (i modelli vengono da
-ipa/synth/traffic, rigenerati con traffic_models.py se mancano). Sono modelli
-costruiti attorno al checkpoint, quindi meno generali; la sintesi lo dice.
-
-Niente root, niente BCC: si rifa' a mano su una campagna gia' raccolta.
+    python3 ipa/test/report_population.py results/popolazione_2026-10 > sintesi.md
 """
 import csv
 import json
@@ -46,21 +21,17 @@ for _p in (_SHARED, _TEST_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import campaign_report as CR  # noqa: E402
+import table_helpers as CR  # noqa: E402
 
 PIPES = ("p1_static", "hardcoded", "template", "modular")
 NAME = CR.NAME
 CORE_LABEL = {"P": "P-core", "E": "E-core", "L": "LP E-core"}
-# blocco minimo del ciclo caldo di bench_solo per usarne la misura
 HOT_MIN_K = 10
-# giri puliti che ogni punto di una curva disturbata deve conservare (su 3)
 MIN_CLEAN_ROUNDS = 2
 read_csv, num, fmt, table = CR.read_csv, CR.num, CR.fmt, CR.table
 
 
-# --------------------------------------------------------------------------
-# statistica senza dipendenze
-# --------------------------------------------------------------------------
+# --- statistics without dependencies ---
 def quant(xs, q):
     xs = sorted(xs)
     if not xs:
@@ -71,7 +42,7 @@ def quant(xs, q):
 
 
 def spread(xs, spec=".0f"):
-    """'mediana [min–max]'."""
+    """'median [min–max]'."""
     xs = [x for x in xs if x is not None]
     if not xs:
         return "-"
@@ -118,13 +89,11 @@ def spearman(xs, ys):
 
 
 def ols(X, y):
-    """Minimi quadrati con intercetta. X: lista di righe (senza la colonna
-    dell'intercetta). (coefficienti [b0, b1, ...], r2) o None."""
+    """Least squares with intercept."""
     n, k = len(X), (len(X[0]) if X else 0) + 1
     if n <= k:
         return None
     A = [[1.0] + [float(v) for v in row] for row in X]
-    # equazioni normali, eliminazione di Gauss con pivot parziale
     M = [[sum(A[r][i] * A[r][j] for r in range(n)) for j in range(k)]
          + [sum(A[r][i] * y[r] for r in range(n))] for i in range(k)]
     for c in range(k):
@@ -150,9 +119,8 @@ def predict(beta, row):
 
 
 def loo_error(X, y):
-    """Errore relativo mediano e al 90° percentile (%) su modelli lasciati
-    fuori dalla stima, uno alla volta: quanto la legge sbaglia su un modello
-    che non ha visto."""
+    """Median and 90th-percentile relative error (%) on models left out of
+    the fit, one at a time."""
     errs = []
     for i in range(len(X)):
         f = ols(X[:i] + X[i + 1:], y[:i] + y[i + 1:])
@@ -163,50 +131,38 @@ def loo_error(X, y):
 
 
 def count(pred_list):
-    """'k/n' di una lista di booleani (None = non decidibile, fuori)."""
+    """'k/n' of a list of booleans (None = not decidable, left out)."""
     v = [p for p in pred_list if p is not None]
     return f"{sum(v)}/{len(v)}" if v else "-"
 
 
-# --------------------------------------------------------------------------
-# lettura
-# --------------------------------------------------------------------------
+# --- reading ---
 def unusable(d):
-    """Perche' la misura nella cartella `d` non entra nelle conclusioni, o
-    None. Due motivi, scritti dal banco stesso: il controllo di validita' di
-    bench_throughput l'ha bocciata (throughput_report.md), o la macchina non e'
-    rimasta nelle condizioni dichiarate (run_disturbed in env.csv: throttling,
-    powerclamp, batteria, frequenza del nodo fuori target)."""
+    """Why the measurement in folder `d` is left out of the conclusions, or
+    None."""
     try:
         with open(os.path.join(d, "throughput_report.md"),
                   encoding="utf-8") as f:
             if "RUN BOCCIATO" in f.read():
-                return "bocciata"
+                return "rejected"
     except OSError:
         pass
     try:
         with open(os.path.join(d, "env.csv"), encoding="utf-8") as f:
             if any(ln.strip() == "run_disturbed,True" for ln in f):
-                return "disturbata"
+                return "disturbed"
     except OSError:
         pass
     return None
 
 
-# Un giro di bench_throughput --mode compare: la finestra di misura
-# (`secs`) finisce DRAIN_S prima di t_wall. host_monitor.csv registra la
-# macchina una volta al secondo, con l'ora al secondo intero: un evento cade
-# fra due righe, e l'ora della prima riga e' nota a meno di un secondo.
-# Margine attorno a ogni evento, per parte.
 COMPARE_DRAIN_S = 0.05
 EVENT_MARGIN_S = 1.0
 
 
 def _throttle_events(d, day):
-    """Gli intervalli [inizio, fine] (secondi epoch) in cui il registro della
-    macchina ha visto un throttling, o None se il disturbo non e' solo
-    throttling (powerclamp, raffreddamento passivo, batteria, frequenza del
-    nodo fuori target: lo dice env.csv, e allora il run resta fuori)."""
+    """The [start, end] intervals (epoch seconds) in which the machine log saw
+    throttling, or None if the disturbance was not only throttling."""
     import datetime as dt
     env = {}
     for r in csv.reader(open(os.path.join(d, "env.csv"), encoding="utf-8")):
@@ -238,12 +194,8 @@ def _throttle_events(d, day):
 
 
 def salvage_compare(d):
-    """(righe di compare.csv ricalcolate dai soli giri puliti di
-    compare_raw.csv, quei giri, (giri tolti, giri)): un run dura ~30 s, un
-    evento di throttling (~1 al minuto su questo portatile) ne tocca uno o
-    due giri, non il run. Ogni (pipeline, taglia, fase) deve conservare
-    almeno MIN_CLEAN_ROUNDS giri; le mediane sono quelle del banco
-    (run_compare), sugli stessi campi. None se non si puo'."""
+    """(compare.csv rows recomputed from the clean rounds of compare_raw.csv
+    only, those rounds, (rounds removed, rounds))."""
     import datetime as dt
     raw = read_csv(os.path.join(d, "compare_raw.csv"))
     rows = read_csv(os.path.join(d, "compare.csv"))
@@ -278,16 +230,15 @@ def salvage_compare(d):
 
 
 class Campaign:
-    """Tutto cio' che il report usa, indicizzato per modello."""
+    """Everything the report uses, indexed by model."""
 
     def __init__(self, base):
         self.base = base
-        self.legacy = False
-        self.seen = set()          # cartelle di misura lette
-        self.excluded = {}         # cartella relativa -> motivo
-        self.salvaged = {}         # misura -> (giri/finestre tolti, totale)
-        self.models = {}           # id -> riga del manifesto
-        self.core_dir = {}         # "P"/"E" -> cartella della popolazione
+        self.seen = set()
+        self.excluded = {}
+        self.salvaged = {}
+        self.models = {}
+        self.core_dir = {}
         man = os.path.join(base, "population.csv")
         if os.path.exists(man):
             for r in read_csv(man):
@@ -296,20 +247,16 @@ class Campaign:
                 d = os.path.join(base, f"pop_{k}core")
                 if os.path.isdir(d):
                     self.core_dir[k] = d
-        else:
-            self._legacy()
-        self.sat = {}              # (core, id) -> {metodo: riga saturazione}
-        self.size = {}             # id -> {metodo: istruzioni caricate}
-        self.t2 = {}               # (core, id) -> {metodo: (min, media)}
-        self.xport = {}            # (core, id) -> {metodo: T3-T2 medio}
+        self.sat = {}
+        self.size = {}
+        self.t2 = {}
+        self.xport = {}
         for k, d in self.core_dir.items():
             for mid in self.models:
-                sub = os.path.join(d, self.models[mid].get("_sub", mid))
+                sub = os.path.join(d, mid)
                 s = CR.saturation(self.read(sub, "compare.csv"))
                 if s:
                     self.sat[(k, mid)] = s
-                # la dimensione caricata non dipende da come e' andata la
-                # macchina: si tiene anche da un run disturbato
                 ps = read_csv(os.path.join(sub, "prog_size.csv"))
                 if ps and mid not in self.size:
                     self.size[mid] = {r["method"]: num(r["xlated_insns"])
@@ -326,16 +273,14 @@ class Campaign:
                 self.sat[("L", mid)] = s
 
     def read(self, d, name):
-        """Il CSV `name` della misura in `d`, o [] se la misura non entra
-        nelle conclusioni (unusable): resta contata in self.excluded. Una
-        misura a massima spinta disturbata SOLO da throttling si ricalcola
-        dai giri che l'evento non ha toccato (salvage_compare)."""
+        """The CSV `name` of the measurement in `d`, or [] if the measurement
+        is left out of the conclusions (unusable)."""
         if not os.path.exists(os.path.join(d, name)):
             return []
         rel = os.path.relpath(d, self.base)
         self.seen.add(rel)
         why = unusable(d)
-        if why == "disturbata" and name in ("compare.csv", "compare_raw.csv"):
+        if why == "disturbed" and name in ("compare.csv", "compare_raw.csv"):
             got = salvage_compare(d)
             if got:
                 rows, clean, self.salvaged[rel] = got
@@ -346,13 +291,7 @@ class Campaign:
         return read_csv(os.path.join(d, name))
 
     def read_bitrate(self, d):
-        """Le righe di sintesi di una curva al crescere del rate. Una curva
-        dura ~160 s e un evento della macchina (throttling di pacchetto, ~1
-        ogni 60-80 s su questo portatile) ne tocca una finestra di un giro,
-        non la curva: da un run disturbato la sintesi si ricalcola dalle sole
-        finestre pulite di bitrate_raw.csv, con la stessa summarise del
-        banco. La curva resta se ogni punto conserva almeno
-        MIN_CLEAN_ROUNDS giri; altrimenti e' fuori come le altre."""
+        """The summary rows of a growing-rate curve."""
         if not os.path.exists(os.path.join(d, "bitrate.csv")):
             return []
         rel = os.path.relpath(d, self.base)
@@ -361,9 +300,9 @@ class Campaign:
         if why is None:
             return read_csv(os.path.join(d, "bitrate.csv"))
         raw_path = os.path.join(d, "bitrate_raw.csv")
-        if why == "disturbata" and os.path.exists(raw_path):
-            import bench_bitrate as BB
-            import plot_bitrate as PB
+        if why == "disturbed" and os.path.exists(raw_path):
+            import bench_load_curve as BB
+            import plot_load_curve as PB
             raw = PB.read_summary(raw_path)
             clean = [r for r in raw if str(r.get("host_disturbed")) != "True"]
             pts = {}
@@ -374,55 +313,11 @@ class Campaign:
                 pts[(r["method"], r["frame"], r["rate_requested_pps"])] += 1
             if pts and min(pts.values()) >= MIN_CLEAN_ROUNDS:
                 self.salvaged[rel] = (len(raw) - len(clean), len(raw))
-                # come le righe lette da bitrate.csv: i booleani in testo
                 return [{k: str(v) if isinstance(v, bool) else v
                          for k, v in s.items()}
                         for s in BB.summarise(clean)]
         self.excluded[rel] = why
         return []
-
-    def _legacy(self):
-        """Gli assi di una campagna di ottobre come popolazione."""
-        import model_population as MP
-        from synth.spec import ModelSpec
-        tm_root = os.path.join(_SHARED, "synth", "traffic")
-        for k in ("P", "E"):
-            d = os.path.join(self.base, f"assi_{k}core")
-            if os.path.isdir(d):
-                self.core_dir[k] = d
-        if not self.core_dir:
-            return
-        self.legacy = True
-        subs = set()
-        for d in self.core_dir.values():
-            subs |= {s for s in os.listdir(d)
-                     if s != "checkpoint" and os.path.isdir(os.path.join(d, s))}
-        if subs and not all(os.path.exists(os.path.join(tm_root, s,
-                                                        "model.json"))
-                            for s in subs):
-            import contextlib
-            import io
-            import traffic_models as TM
-            with contextlib.redirect_stdout(io.StringIO()):
-                TM.generate()
-        for s in sorted(subs):
-            mdir = os.path.join(tm_root, s)
-            try:
-                with open(os.path.join(mdir, "model.json")) as f:
-                    mj = json.load(f)
-                with open(os.path.join(mdir, "weights.json")) as f:
-                    wi = json.load(f)
-            except OSError:
-                continue
-            spec = ModelSpec.from_json(mj)
-            r = dict(id=s, _sub=s, family=s.rsplit("_", 1)[0],
-                     layout="+".join(f"{f.name}{f.size if f.size > 1 else ''}"
-                                     for f in spec.features.features),
-                     seed=mj.get("seed"), init=mj.get("weight_init"),
-                     sparsity=mj.get("sparsity", 0.0), group="")
-            r.update(MP.describe(spec, wi))
-            r["no_template"] = ""
-            self.models[s] = r
 
     def _t2(self, rates_dir):
         rr = self.read(rates_dir, "rates_raw.csv")
@@ -435,9 +330,6 @@ class Campaign:
                     if num(r.get("pipe_avg_ns"))]
             if mins and avgs:
                 out[m] = (st.median(mins), st.median(avgs))
-            # T3-T2: il minimo e' il trasporto senza attesa; la media
-            # contiene anche la coda (l'uscita gira sul core del nodo) e
-            # cresce col rate, quindi si tiene rate per rate
             xmin = [num(r.get("xport_min_ns")) for r in pts
                     if num(r.get("xport_min_ns"))]
             if xmin:
@@ -450,7 +342,6 @@ class Campaign:
                             {q: st.median(v) for q, v in avg.items()})
         return out, xport
 
-    # -- grandezze per modello ---------------------------------------------
     def val(self, core, mid, method, key):
         r = self.sat.get((core, mid), {}).get(method)
         if not r:
@@ -462,8 +353,7 @@ class Campaign:
                           "llc": "llc_miss_pkt"}.get(key, key)))
 
     def nn(self, core, mid, method, key="ns"):
-        """La parte della rete neurale: la pipeline meno la baseline dello
-        stesso run (stesso caricamento del fabric, stessa sessione)."""
+        """The neural network part."""
         a = self.val(core, mid, method, key)
         b = self.val(core, mid, "baseline", key)
         return a - b if a is not None and b is not None else None
@@ -490,10 +380,8 @@ class Campaign:
                 r.get("init"), str(r.get("sparsity")))
 
 
-# --------------------------------------------------------------------------
-# sezioni
-# --------------------------------------------------------------------------
-SUMS = []      # (affermazione, conteggio o intervallo) per "Le somme"
+# --- sections ---
+SUMS = []
 
 
 def claim(text, evidence):
@@ -501,54 +389,44 @@ def claim(text, evidence):
 
 
 def sec_population(c):
-    L = ["## La popolazione", ""]
+    L = ["## The population", ""]
     ms = list(c.models.values())
-    if c.legacy:
-        L += ["**Attenzione: popolazione degli assi.** Questi modelli sono gli "
-              "assi parametrici della campagna, costruiti variando UN "
-              "parametro alla volta attorno al 65-4-4-7 e (quasi) tutti con "
-              "lo stesso seme: una prima indicazione, non la generalita' "
-              "che dara' remeasure_popolazione.sh.", ""]
-        uniq = {c.identity(m) for m in c.models}
-        L += [f"{len(ms)} punti, {len(uniq)} modelli distinti (lo stesso "
-              f"65-4-4-7 compare in piu' assi).", ""]
     fams = {}
     for r in ms:
         fams[r.get("family", "-")] = fams.get(r.get("family", "-"), 0) + 1
-    L.append("Per famiglia: " + ", ".join(f"{k} {v}" for k, v in fams.items())
+    L.append("By family: " + ", ".join(f"{k} {v}" for k, v in fams.items())
              + ".")
     L.append("")
 
     def rng(key, spec=".0f"):
         v = [num(r.get(key)) for r in ms if num(r.get(key)) is not None]
         return f"{fmt(min(v), spec)}–{fmt(max(v), spec)}" if v else "-"
-    L += [table(["grandezza", "intervallo"], [
-        ["ingressi (n_in)", rng("n_in")], ["strati nascosti", rng("depth")],
-        ["neuroni per strato (max)", rng("width_max")],
-        ["uscite", rng("n_out")], ["pesi", rng("weights")],
-        ["MAC dalla forma", rng("mac_shape")],
-        ["MAC eseguite", rng("mac_exec")],
-        ["feature one-hot", rng("onehot_feat")],
-        ["colonne dense", rng("dense_cols")],
-        ["pesi a zero (frazione)", rng("zero_frac", ".2f")]]), ""]
+    L += [table(["quantity", "range"], [
+        ["inputs (n_in)", rng("n_in")], ["hidden layers", rng("depth")],
+        ["neurons per layer (max)", rng("width_max")],
+        ["outputs", rng("n_out")], ["weights", rng("weights")],
+        ["MACs from the shape", rng("mac_shape")],
+        ["executed MACs", rng("mac_exec")],
+        ["one-hot features", rng("onehot_feat")],
+        ["dense columns", rng("dense_cols")],
+        ["zero weights (fraction)", rng("zero_frac", ".2f")]]), ""]
     lays = sorted({r.get("layout") for r in ms})
-    if not c.legacy:
-        depths = sorted({int(num(r["depth"])) for r in ms})
-        rows = []
-        for lay in lays:
-            rows.append([lay] + [str(sum(1 for r in ms if r["layout"] == lay
-                                         and int(num(r["depth"])) == d))
-                                 for d in depths])
-        L += ["Modelli per composizione dell'ingresso e profondita':", "",
-              table(["composizione"] + [f"{d} strati" for d in depths], rows),
-              ""]
+    depths = sorted({int(num(r["depth"])) for r in ms})
+    rows = []
+    for lay in lays:
+        rows.append([lay] + [str(sum(1 for r in ms if r["layout"] == lay
+                                     and int(num(r["depth"])) == d))
+                             for d in depths])
+    L += ["Models per input layout and depth:", "",
+          table(["layout"] + [f"{d} layers" for d in depths], rows),
+          ""]
     nop2 = [r["id"] for r in ms if r.get("no_template")]
     if nop2:
-        L += [f"P2 non sa eseguire {len(nop2)} modelli su {len(ms)} "
-              f"(MAX_WEIGHT_ENTRIES): {', '.join(nop2)}. Le altre pipeline "
-              f"li eseguono tutti.", ""]
-        claim("P2 ha un tetto sui pesi che le altre pipeline non hanno",
-              f"{len(nop2)}/{len(ms)} modelli fuori da P2")
+        L += [f"P2 cannot run {len(nop2)} models out of {len(ms)} "
+              f"(MAX_WEIGHT_ENTRIES): {', '.join(nop2)}. The other pipelines "
+              f"run them all.", ""]
+        claim("P2 has a weight ceiling the other pipelines do not have",
+              f"{len(nop2)}/{len(ms)} models outside P2")
     missing = []
     for k in c.core_dir:
         miss = [m for m in c.models if (k, m) not in c.sat]
@@ -556,7 +434,7 @@ def sec_population(c):
             missing.append(f"{CORE_LABEL[k]}: {len(miss)} ({', '.join(miss[:12])}"
                            f"{' ...' if len(miss) > 12 else ''})")
     if missing:
-        L += ["Modelli senza misura a massima spinta (vedi i log): "
+        L += ["Models without a full-load measurement (see the logs): "
               + "; ".join(missing) + ".", ""]
     return L
 
@@ -574,16 +452,16 @@ def sec_correct(c):
         err = [r["id"] for r in rs if r["esito"] not in ("OK", "NO", "N/A")]
         out.append([lab, str(ok), str(len(no)), str(na), str(len(err)),
                     ", ".join(no + err) or "-"])
-        claim(f"{lab} decide esattamente come il riferimento intero",
-              f"{ok}/{ok + len(no)} modelli"
-              + (f" ({len(err)} non conclusi)" if err else ""))
-    return ["## Correttezza su ogni modello", "",
-            "Riferimento intero contro eBPF (verify_synth_kernel, "
-            "BPF_PROG_TEST_RUN, 200 ingressi per modello): deve coincidere al "
-            "100%. P1.5 non e' in questo controllo (verify_synth_kernel "
-            "prova P1 con il nodo congelato, P2 e P3).", "",
-            table(["pipeline", "OK", "NO", "non applicabile", "errore",
-                   "quali"], out), ""]
+        claim(f"{lab} decides exactly like the integer reference",
+              f"{ok}/{ok + len(no)} models"
+              + (f" ({len(err)} not concluded)" if err else ""))
+    return ["## Correctness on every model", "",
+            "Integer reference against eBPF (check_kernel_vs_reference, "
+            "BPF_PROG_TEST_RUN, 200 inputs per model): it must match "
+            "100%. P1.5 is not in this check (check_kernel_vs_reference "
+            "tests P1 with the frozen node, P2 and P3).", "",
+            table(["pipeline", "OK", "NO", "not applicable", "error",
+                   "which"], out), ""]
 
 
 def sec_reference(c):
@@ -600,17 +478,17 @@ def sec_reference(c):
                              fmt(num(r.get("ipc")), ".2f")])
     if not rows:
         return []
-    return ["## Il nodo senza rete neurale", "",
-            "Ricevere (rxonly) e ricevere + inoltrare (baseline) non "
-            "dipendono dal modello: una misura per tipo di core.", "",
-            table(["core", "programma", "Mpps", "ns CPU", "istr/pk", "IPC"],
+    return ["## The node without a neural network", "",
+            "Receiving (rxonly) and receiving + forwarding (baseline) do not "
+            "depend on the model: one measurement per core type.", "",
+            table(["core", "program", "Mpps", "ns CPU", "ins/pk", "IPC"],
                   rows), ""]
 
 
 def sec_cost(c):
-    L = ["## Quanto costa la rete neurale, su tutta la popolazione", "",
-         "ns per pacchetto della sola rete neurale: tempo di CPU a nodo "
-         "saturo meno la baseline dello stesso run. n = modelli misurati.",
+    L = ["## What the neural network costs, over the whole population", "",
+         "ns per packet of the neural network alone: CPU time with the node "
+         "saturated minus the baseline of the same run. n = models measured.",
          ""]
     for k in c.core_dir:
         rows = []
@@ -618,28 +496,28 @@ def sec_cost(c):
             ids = c.ids(k, m)
             rows.append([NAME[m]] + five([c.nn(k, i, m) for i in ids]))
         L += [f"**{CORE_LABEL[k]}**", "",
-              table(["pipeline", "n", "min", "10°", "mediana", "90°", "max"],
+              table(["pipeline", "n", "min", "10th", "median", "90th", "max"],
                     rows), ""]
         rows = []
         for m in ("baseline",) + PIPES:
             ids = c.ids(k, m)
             rows.append([NAME[m]] + five([c.val(k, i, m, "mpps")
                                           for i in ids], ".2f"))
-        L += [f"Capacita' del nodo, milioni di pacchetti al secondo per core "
+        L += [f"Node capacity, million packets per second per core "
               f"({CORE_LABEL[k]}):", "",
-              table(["pipeline", "n", "min", "10°", "mediana", "90°", "max"],
+              table(["pipeline", "n", "min", "10th", "median", "90th", "max"],
                     rows), ""]
         if k == "P":
             for m in PIPES:
                 v = [c.nn(k, i, m) for i in c.ids(k, m)]
                 if v:
-                    claim(f"rete neurale {NAME[m]}, ns per pacchetto (P-core)",
+                    claim(f"neural network {NAME[m]}, ns per packet (P-core)",
                           spread(v))
     return L
 
 
 def sec_order(c):
-    L = ["## L'ordine fra le pipeline regge su ogni modello?", ""]
+    L = ["## Does the order between pipelines hold on every model?", ""]
     pairs = [("hardcoded", "p1_static"), ("template", "p1_static"),
              ("modular", "p1_static"), ("modular", "template"),
              ("template", "hardcoded")]
@@ -657,18 +535,18 @@ def sec_order(c):
                 if all(c.nn(k, i, m) is not None for m in PIPES)]
         mono = [c.nn(k, i, "p1_static") <= c.nn(k, i, "template")
                 <= c.nn(k, i, "modular") for i in full]
-        L += [f"**{CORE_LABEL[k]}** — rapporto fra i costi della rete "
-              f"neurale, mediana [min–max] sui modelli, e su quanti la "
-              f"prima costa piu' della seconda:", "",
-              table(["confronto", "rapporto", "la prima costa di piu'"], rows),
-              "", f"P1 ≤ P2 ≤ P3 su {count(mono)} modelli.", ""]
+        L += [f"**{CORE_LABEL[k]}** — ratio between the neural network "
+              f"costs, median [min–max] over the models, and on how many the "
+              f"first costs more than the second:", "",
+              table(["comparison", "ratio", "the first costs more"], rows),
+              "", f"P1 ≤ P2 ≤ P3 on {count(mono)} models.", ""]
         if k == "P":
-            claim("P1 ≤ P2 ≤ P3 nel costo della rete neurale (P-core)",
+            claim("P1 ≤ P2 ≤ P3 in neural network cost (P-core)",
                   count(mono))
             for a, b in pairs[1:4]:
                 ids = [i for i in c.models if c.nn(k, i, a) and c.nn(k, i, b)
                        and c.nn(k, i, b) > 0]
-                claim(f"{NAME[a]} costa {NAME[b]} per",
+                claim(f"{NAME[a]} costs {NAME[b]} times",
                       spread([c.nn(k, i, a) / c.nn(k, i, b) for i in ids],
                              ".1f"))
     return L
@@ -676,17 +554,13 @@ def sec_order(c):
 
 def sec_size(c):
     if not c.size:
-        if c.legacy:
-            return ["## Istruzioni caricate contro eseguite", "",
-                    "Questa campagna non registrava i programmi caricati "
-                    "(prog_size.csv nasce con remeasure_popolazione.sh).", ""]
         return []
-    L = ["## Istruzioni caricate contro eseguite", "",
-         "Caricate = istruzioni dei programmi della pipeline, contate dal "
-         "kernel al caricamento (prog_census). Eseguite = istruzioni per "
-         "pacchetto dai contatori hardware, meno la baseline: la sola rete "
-         "neurale. ρ = correlazione di rango fra le due sulla popolazione "
-         "(1 = la dimensione ordina i modelli come il lavoro).", ""]
+    L = ["## Loaded against executed instructions", "",
+         "Loaded = instructions of the pipeline's programs, counted by the "
+         "kernel at load time (prog_census). Executed = instructions per "
+         "packet from the hardware counters, minus the baseline: the neural "
+         "network alone. ρ = rank correlation between the two over the population "
+         "(1 = size orders the models like the work).", ""]
     rows = []
     for m in PIPES:
         ids = [i for i in c.models if c.size.get(i, {}).get(m)
@@ -697,9 +571,9 @@ def sec_size(c):
         rows.append([NAME[m], str(len(ids)), spread(ld), spread(ex),
                      fmt(rho, ".2f")])
         if rho is not None:
-            claim(f"la dimensione di {NAME[m]} predice il suo lavoro "
-                  f"(ρ di rango)", f"{rho:.2f} su {len(ids)} modelli")
-    L += [table(["pipeline", "n", "caricate", "eseguite (rete)", "ρ"], rows),
+            claim(f"the size of {NAME[m]} predicts its work "
+                  f"(rank ρ)", f"{rho:.2f} over {len(ids)} models")
+    L += [table(["pipeline", "n", "loaded", "executed (network)", "ρ"], rows),
           ""]
     ids = [i for i in c.models if all(c.size.get(i, {}).get(m)
                                       for m in ("template", "modular"))
@@ -710,10 +584,10 @@ def sec_size(c):
         works = [c.nn("P", i, "modular", "instr")
                  > c.nn("P", i, "template", "instr") for i in ids]
         both = [b and w for b, w in zip(bigger, works)]
-        L += [f"P2 piu' grande di P3: {count(bigger)}; P3 esegue piu' di P2: "
-              f"{count(works)}; tutte e due insieme (la dimensione ordina "
-              f"al contrario del lavoro): {count(both)}.", ""]
-        claim("P2 e' il programma piu' grande ma P3 esegue di piu'",
+        L += [f"P2 larger than P3: {count(bigger)}; P3 executes more than P2: "
+              f"{count(works)}; both together (size orders "
+              f"opposite to the work): {count(both)}.", ""]
+        claim("P2 is the largest program but P3 executes more",
               count(both))
     return L
 
@@ -734,23 +608,23 @@ def sec_instr_cores(c):
           for i in c.models for m in PIPES
           if c.val("L", i, m, "instr") and c.val("P", i, m, "instr")]
     if allr:
-        claim("stesse istruzioni per pacchetto su P-core ed E-core",
-              f"differenza massima {max(allr):.1f}% su "
-              f"{len(allr)} coppie modello-pipeline")
+        claim("same instructions per packet on P-core and E-core",
+              f"maximum difference {max(allr):.1f}% over "
+              f"{len(allr)} model-pipeline pairs")
     if lr:
-        claim("stesse istruzioni anche sul LP E-core",
-              f"differenza massima {max(lr):.1f}% su {len(lr)} coppie")
-    return ["## Le istruzioni per pacchetto non dipendono dal core", "",
-            "|E/P − 1| delle istruzioni per pacchetto, in %, su ogni modello:",
-            "", table(["pipeline", "n", "mediana %", "massimo %"], rows), ""] \
-        + ([f"LP E-core contro P-core: massimo {max(lr):.1f}% su {len(lr)} "
-            f"coppie.", ""] if lr else [])
+        claim("same instructions on the LP E-core too",
+              f"maximum difference {max(lr):.1f}% over {len(lr)} pairs")
+    return ["## Instructions per packet do not depend on the core", "",
+            "|E/P − 1| of the instructions per packet, in %, on every model:",
+            "", table(["pipeline", "n", "median %", "maximum %"], rows), ""] \
+        + ([f"LP E-core against P-core: maximum {max(lr):.1f}% over {len(lr)} "
+            f"pairs.", ""] if lr else [])
 
 
 def sec_cores(c):
     if "E" not in c.core_dir:
         return []
-    L = ["## Che cosa cambia su un core piu' lento", ""]
+    L = ["## What changes on a slower core", ""]
     rows = []
     for m in ("baseline",) + PIPES:
         ids = [i for i in c.models if c.val("P", i, m, "mpps")
@@ -761,10 +635,9 @@ def sec_cores(c):
                if c.val("E", i, m, "ipc") and c.val("P", i, m, "ipc")]
         rows.append([NAME[m], str(len(ids)), spread(cap, ".2f"),
                      spread(ipc, ".2f")])
-    L += ["Capacita' e IPC dell'E-core in rapporto al P-core (stessa "
-          "frequenza, 3,5 GHz), mediana [min–max] sui modelli:", "",
-          table(["pipeline", "n", "capacita' E/P", "IPC E/P"], rows), ""]
-    # parte fissa contro rete neurale, in cicli
+    L += ["E-core capacity and IPC relative to the P-core (same "
+          "frequency, 3.5 GHz), median [min–max] over the models:", "",
+          table(["pipeline", "n", "capacity E/P", "IPC E/P"], rows), ""]
     fixed = [c.val("E", i, "baseline", "cycles") / c.val("P", i, "baseline",
                                                          "cycles")
              for i in c.models if c.val("E", i, "baseline", "cycles")
@@ -782,19 +655,18 @@ def sec_cores(c):
             tot = c.val("P", i, m, "cycles")
             share_x.append(c.nn("P", i, m, "cycles") / tot)
             ratio_y.append(c.val("E", i, m, "mpps") / c.val("P", i, m, "mpps"))
-    L += [f"Cicli per pacchetto E/P: parte fissa del nodo (baseline) "
-          f"{spread(fixed, '.2f')}; rete neurale:", "",
-          table(["pipeline", "n", "cicli della rete E/P"], rows), ""]
+    L += [f"Cycles per packet E/P: fixed part of the node (baseline) "
+          f"{spread(fixed, '.2f')}; neural network:", "",
+          table(["pipeline", "n", "network cycles E/P"], rows), ""]
     rho = spearman(share_x, ratio_y)
     if rho is not None:
-        L += [f"Piu' la rete neurale pesa sul pacchetto, meno conta il core: "
-              f"ρ di rango fra la quota di cicli della rete (P-core) e la "
-              f"capacita' E/P = {rho:.2f} su {len(share_x)} coppie "
-              f"modello-pipeline.", ""]
-        claim("l'E-core perde soprattutto nella parte fissa del nodo",
-              f"cicli fissi E/P {spread(fixed, '.2f')}; ρ(quota rete, "
-              f"capacita' E/P) = {rho:.2f}")
-    # LP E-core
+        L += [f"The more the neural network weighs on the packet, the less the "
+              f"core matters: rank ρ between the network's cycle share (P-core) "
+              f"and the E/P capacity = {rho:.2f} over {len(share_x)} "
+              f"model-pipeline pairs.", ""]
+        claim("the E-core loses mostly in the node's fixed part",
+              f"fixed cycles E/P {spread(fixed, '.2f')}; ρ(network share, "
+              f"capacity E/P) = {rho:.2f}")
     lids = [i for i in c.models if ("L", i) in c.sat]
     if lids:
         rows = []
@@ -807,23 +679,23 @@ def sec_cores(c):
                                 ".2f"),
                          spread([c.val("L", i, m, "llc") for i in ids],
                                 ".1f")])
-        L += [f"LP E-core (2,5 GHz), {len(lids)} modelli dal piu' leggero al "
-              f"piu' pesante:", "",
-              table(["pipeline", "n", "capacita' LP/P", "mancate LLC/pk"],
+        L += [f"LP E-core (2.5 GHz), {len(lids)} models from the lightest to "
+              f"the heaviest:", "",
+              table(["pipeline", "n", "capacity LP/P", "LLC misses/pk"],
                     rows), ""]
         caps = [c.val("L", i, m, "mpps") / c.val("P", i, m, "mpps")
                 for i in lids for m in PIPES
                 if c.val("L", i, m, "mpps") and c.val("P", i, m, "mpps")]
         if caps:
-            claim("capacita' del LP E-core rispetto al P-core",
+            claim("LP E-core capacity relative to the P-core",
                   spread(caps, ".2f"))
     return L
 
 
 FEATS = {
-    "MAC eseguite + strati": ("mac_exec", "n_layers"),
-    "MAC dalla forma + strati": ("mac_shape", "n_layers"),
-    "MAC eseguite non nulle + strati": ("mac_exec_nz", "n_layers"),
+    "executed MACs + layers": ("mac_exec", "n_layers"),
+    "shape MACs + layers": ("mac_shape", "n_layers"),
+    "executed non-zero MACs + layers": ("mac_exec_nz", "n_layers"),
 }
 
 
@@ -852,83 +724,81 @@ def _fit_rows(c, k, key, stat=None, families=None):
 
 
 def sec_law(c):
-    L = ["## Una legge di costo, stimata su tutti i modelli", "",
-         "costo della rete = a + b × MAC + c × strati (minimi quadrati sulla "
-         "popolazione). Errore = errore relativo su un modello lasciato fuori "
-         "dalla stima (mediana e 90° percentile, %): quanto la legge sbaglia "
-         "su un modello che non ha visto. Le MAC eseguite contano una one-hot "
-         "come una colonna sola; le non nulle tolgono i pesi a zero.", ""]
-    # la legge si stima sui modelli densi: i pesi a zero hanno la loro
-    # sezione, che la confronta con questa
-    fam = ("width", "depth", "isoparam", "nodes", "iv_dense", "iv_onehot")         if c.legacy else ("base", "replica", "imbuto")
+    L = ["## A cost law, fitted on every model", "",
+         "network cost = a + b × MAC + c × layers (least squares over the "
+         "population). Error = relative error on a model left out of the "
+         "fit (median and 90th percentile, %): how wrong the law is "
+         "on a model it has not seen. Executed MACs count a one-hot "
+         "as a single column; the non-zero ones remove zero weights.", ""]
+    fam = ("base", "replica", "imbuto")
     LAWS = {}
     for k in c.core_dir:
         rows, laws = _fit_rows(c, k, "ns", families=fam)
         LAWS[k] = laws
         if rows:
-            L += [f"**ns per pacchetto, {CORE_LABEL[k]}**", "",
-                  table(["pipeline", "variabili", "n", "a (ns)",
-                         "b (ns/MAC)", "c (ns/strato)", "r²", "errore 50°",
-                         "errore 90°"], rows), ""]
+            L += [f"**ns per packet, {CORE_LABEL[k]}**", "",
+                  table(["pipeline", "variables", "n", "a (ns)",
+                         "b (ns/MAC)", "c (ns/layer)", "r²", "error 50th",
+                         "error 90th"], rows), ""]
         rows, ilaws = _fit_rows(c, k, "instr", families=fam)
         if rows and k == "P":
-            L += ["**istruzioni per pacchetto, P-core** (stessa forma: "
-                  "b in istruzioni per MAC, c per strato)", "",
-                  table(["pipeline", "variabili", "n", "a", "b", "c", "r²",
-                         "errore 50°", "errore 90°"], rows), ""]
+            L += ["**instructions per packet, P-core** (same form: "
+                  "b in instructions per MAC, c per layer)", "",
+                  table(["pipeline", "variables", "n", "a", "b", "c", "r²",
+                         "error 50th", "error 90th"], rows), ""]
             parts = [f"{NAME[m]} {d[lab][0][2]:.0f} (r² {d[lab][1]:.2f})"
                      for m, d in ilaws.items()
-                     for lab in ("MAC eseguite + strati",) if lab in d]
+                     for lab in ("executed MACs + layers",) if lab in d]
             if parts:
-                claim("istruzioni eseguite per strato in piu' (legge, "
+                claim("instructions executed per extra layer (law, "
                       "P-core)", ", ".join(parts))
     if c.size:
         def loaded(k, i, m, key):
             return c.size.get(i, {}).get(m)
         rows, slaws = _fit_rows(c, None, None, stat=loaded, families=fam)
         if rows:
-            L += ["**istruzioni caricate** (dimensione dei programmi, stessa "
-                  "forma: b per MAC, c per strato)", "",
-                  table(["pipeline", "variabili", "n", "a", "b", "c", "r²",
-                         "errore 50°", "errore 90°"], rows), ""]
+            L += ["**loaded instructions** (program size, same "
+                  "form: b per MAC, c per layer)", "",
+                  table(["pipeline", "variables", "n", "a", "b", "c", "r²",
+                         "error 50th", "error 90th"], rows), ""]
         parts = []
         for m in PIPES:
             v = [c.size[i][m] for i in c.models if c.size.get(i, {}).get(m)]
-            d = slaws.get(m, {}).get("MAC eseguite + strati")
+            d = slaws.get(m, {}).get("executed MACs + layers")
             if v and min(v) == max(v):
-                parts.append(f"{NAME[m]} sempre {v[0]:.0f}")
+                parts.append(f"{NAME[m]} always {v[0]:.0f}")
             elif d:
                 parts.append(f"{NAME[m]} {d[0][2]:+.0f} (r² {d[1]:.2f})")
         if parts:
-            claim("istruzioni caricate per strato in piu' (legge)",
+            claim("loaded instructions per extra layer (law)",
                   ", ".join(parts))
     if c.t2:
         def t2s(k, i, m, key):
             return c.nn_t2(k, i, m)
         rows, _ = _fit_rows(c, "P", None, stat=t2s, families=fam)
         if rows:
-            L += ["**ns per pacchetto a traffico leggero (media T2−T1 meno "
-                  "la baseline), P-core**", "",
-                  table(["pipeline", "variabili", "n", "a (ns)", "b (ns/MAC)",
-                         "c (ns/strato)", "r²", "errore 50°", "errore 90°"],
+            L += ["**ns per packet at light traffic (mean T2−T1 minus "
+                  "the baseline), P-core**", "",
+                  table(["pipeline", "variables", "n", "a (ns)", "b (ns/MAC)",
+                         "c (ns/layer)", "r²", "error 50th", "error 90th"],
                         rows), ""]
     best = LAWS.get("P", {})
     for m, d in best.items():
-        lab = "MAC eseguite + strati"
+        lab = "executed MACs + layers"
         if lab in d:
             beta, r2, e50, n = d[lab]
-            claim(f"legge di {NAME[m]} (P-core)",
+            claim(f"law of {NAME[m]} (P-core)",
                   f"{beta[0]:.0f} ns + {beta[1]:.2f} ns/MAC + "
-                  f"{beta[2]:.0f} ns/strato; r² {r2:.2f}, errore mediano "
-                  f"{fmt(e50, '.0f')}% su modelli non visti (n={n})")
+                  f"{beta[2]:.0f} ns/layer; r² {r2:.2f}, median error "
+                  f"{fmt(e50, '.0f')}% on unseen models (n={n})")
     if best:
         better = [m for m, d in best.items()
-                  if "MAC eseguite + strati" in d
-                  and "MAC dalla forma + strati" in d
-                  and d["MAC eseguite + strati"][1]
-                  > d["MAC dalla forma + strati"][1]]
-        claim("contare le MAC eseguite spiega il costo meglio della forma",
-              f"{len(better)}/{len(best)} pipeline")
+                  if "executed MACs + layers" in d
+                  and "shape MACs + layers" in d
+                  and d["executed MACs + layers"][1]
+                  > d["shape MACs + layers"][1]]
+        claim("counting executed MACs explains the cost better than the shape",
+              f"{len(better)}/{len(best)} pipelines")
     return L, LAWS
 
 
@@ -954,16 +824,15 @@ def sec_replicas(c, laws):
                 else:
                     line.append("-")
             rows.append(line)
-        L += ["## Quanto conta il seme dei pesi", "",
-              "Stessa forma, semi diversi (uno con pesi normali): ns di rete "
-              "neurale, media ± coefficiente di variazione, P-core.", "",
-              table(["gruppo", "modello", "semi"]
+        L += ["## How much the weight seed matters", "",
+              "Same shape, different seeds (one with normal weights): ns of "
+              "neural network, mean ± coefficient of variation, P-core.", "",
+              table(["group", "model", "seeds"]
                     + [NAME[m] for m in PIPES], rows), ""]
         worst = {m: max(v) for m, v in cvs.items() if v}
         if worst:
-            claim("a parita' di forma, i pesi cambiano il costo di",
+            claim("with the same shape, the weights change the cost by",
                   ", ".join(f"{NAME[m]} ≤{v:.0f}%" for m, v in worst.items()))
-    # ripetibilita': lo stesso modello misurato in piu' punti
     same = {}
     for i in c.models:
         same.setdefault(c.identity(i), []).append(i)
@@ -976,18 +845,17 @@ def sec_replicas(c, laws):
                 xs = [c.nn("P", i, m) for i in v if c.nn("P", i, m)]
                 line.append(f"{min(xs):.0f}–{max(xs):.0f}" if xs else "-")
             rows.append(line)
-        L += ["## Lo stesso modello misurato piu' volte", "",
-              "Stessa forma, stessi pesi, cartelle diverse: la dispersione "
-              "della misura, non del modello (ns di rete neurale, P-core).",
-              "", table(["cartelle"] + [NAME[m] for m in PIPES], rows), ""]
+        L += ["## The same model measured several times", "",
+              "Same shape, same weights, different folders: the spread "
+              "of the measurement, not of the model (ns of neural network, P-core).",
+              "", table(["folders"] + [NAME[m] for m in PIPES], rows), ""]
     return L
 
 
 def sec_sparsity(c, laws):
     ids = [i for i, r in c.models.items()
            if num(r.get("zero_frac")) is not None
-           and (r.get("family") == "sparsita"
-                or (c.legacy and i.startswith("sparsity_")))]
+           and r.get("family") == "sparsita"]
     law = laws.get("P", {})
     if not ids or not law:
         return []
@@ -998,7 +866,7 @@ def sec_sparsity(c, laws):
         line = [i, f"{num(r['zero_frac']) * 100:.0f}%"]
         for m in PIPES:
             meas = c.nn("P", i, m)
-            d = law.get(m, {}).get("MAC eseguite + strati")
+            d = law.get(m, {}).get("executed MACs + layers")
             if meas is None or d is None:
                 line.append("-")
                 continue
@@ -1008,36 +876,33 @@ def sec_sparsity(c, laws):
             line.append(f"{meas:.0f} ({meas / pred:.2f})" if pred else
                         f"{meas:.0f}")
         rows.append(line)
-    out = ["## Pesi a zero", "",
-           "ns di rete neurale misurati e, fra parentesi, il rapporto con la "
-           "legge stimata sui modelli densi (1 = la sparsita' non cambia "
-           "niente, < 1 = il modello dimagrisce):", "",
-           table(["modello", "pesi a zero"] + [NAME[m] for m in PIPES], rows),
+    out = ["## Zero weights", "",
+           "Measured ns of neural network and, in brackets, the ratio to the "
+           "law fitted on the dense models (1 = sparsity changes "
+           "nothing, < 1 = the model gets lighter):", "",
+           table(["model", "zero weights"] + [NAME[m] for m in PIPES], rows),
            ""]
     hi = {m: [r for z, r in v if z >= 0.5 and r] for m, v in ratios.items()}
     if any(hi.values()):
-        claim("con ≥50% di pesi a zero, misurato / previsto dalla legge densa",
+        claim("with ≥50% zero weights, measured / predicted by the dense law",
               ", ".join(f"{NAME[m]} {spread(v, '.2f')}"
                         for m, v in hi.items() if v))
     return out
 
 
 def sec_shape(c):
-    """Larga o profonda: famiglia imbuto (o asse isoparam)."""
-    if c.legacy:
-        groups = {"ipa65": [i for i in c.models if i.startswith("isoparam_")]}
-    else:
-        groups = {}
-        for i, r in c.models.items():
-            if r.get("family") == "imbuto":
-                groups.setdefault(r["layout"], []).append(i)
+    """Wide or deep: the imbuto family."""
+    groups = {}
+    for i, r in c.models.items():
+        if r.get("family") == "imbuto":
+            groups.setdefault(r["layout"], []).append(i)
     if not any(groups.values()):
         return []
-    L = ["## Larga o profonda, a parita' di pesi", "",
-         "Cinque forme per composizione, a pari pesi dentro ognuna (~600 "
-         "con ipa65, ~210-270 con dense17; a 4-5 strati le MAC eseguite "
-         "crescono del 16-43 %), da 1 a 5 strati: ns di rete neurale "
-         "con 1 strato → con 5, e la pendenza per strato (minimi quadrati), "
+    L = ["## Wide or deep, with the same weights", "",
+         "Five shapes per layout, with the same weights within each (~600 "
+         "with ipa65, ~210-270 with dense17; at 4-5 layers the executed MACs "
+         "grow by 16-43 %), from 1 to 5 layers: ns of neural network "
+         "with 1 layer → with 5, and the slope per layer (least squares), "
          "P-core.", ""]
     rows, slopes = [], {m: [] for m in PIPES}
     for lay, ids in groups.items():
@@ -1052,10 +917,10 @@ def sec_shape(c):
             rows.append([lay, NAME[m], f"{pts[0][1]:.0f} → {pts[-1][1]:.0f}",
                          f"{(pts[-1][1] / pts[0][1] - 1) * 100:+.0f}%",
                          f"{f[0]:.0f}"])
-    L += [table(["composizione", "pipeline", "1 → 5 strati", "variazione",
-                 "ns per strato"], rows), ""]
+    L += [table(["layout", "pipeline", "1 → 5 layers", "change",
+                 "ns per layer"], rows), ""]
     if any(slopes.values()):
-        claim("a parita' di pesi, ogni strato in piu' costa (ns, P-core)",
+        claim("with the same weights, every extra layer costs (ns, P-core)",
               ", ".join(f"{NAME[m]} {spread(v)}" for m, v in slopes.items()
                         if v))
     return L
@@ -1074,16 +939,14 @@ def sec_light(c):
                   if c.nn_t2(k, i, m)]
             rows.append([CORE_LABEL[k], NAME[m], str(len(ids)),
                          spread(avg, ".2f"), spread(mn, ".2f")])
-    L = ["## Traffico leggero contro nodo saturo", "",
-         "A traffico leggero (T2−T1, sotto la capacita') contro a nodo "
-         "saturo (tempo di CPU), sempre la sola rete neurale. media/saturo "
-         "≈ 1 vuol dire che il costo di un pacchetto non dipende dal carico; "
-         "minimo/media dice quanto costa il pacchetto che trova cache e "
-         "predittori caldi rispetto a quello tipico.", "",
-         table(["core", "pipeline", "n", "media leggero / saturo",
-                "minimo / media"], rows), ""]
-    # Per pipeline, mai mescolate: P2 e P3 stanno attorno a 1, P1 e P1.5 no
-    # (sotto il P-core, sopra sull'E-core), e una sola cifra le nasconderebbe.
+    L = ["## Light traffic against a saturated node", "",
+         "At light traffic (T2−T1, below capacity) against a saturated "
+         "node (CPU time), always the neural network alone. mean/saturated "
+         "≈ 1 means the cost of a packet does not depend on the load; "
+         "minimum/mean says how much the packet that finds warm caches and "
+         "predictors costs compared with the typical one.", "",
+         table(["core", "pipeline", "n", "light mean / saturated",
+                "minimum / mean"], rows), ""]
     for k in c.core_dir:
         parts = []
         for m in PIPES:
@@ -1092,17 +955,15 @@ def sec_light(c):
             if v:
                 parts.append(f"{NAME[m]} {spread(v, '.2f')}")
         if parts:
-            claim(f"costo a traffico leggero / costo a nodo saturo "
+            claim(f"cost at light traffic / cost with a saturated node "
                   f"({CORE_LABEL[k]})", ", ".join(parts))
     return L + sec_transport(c)
 
 
 def sec_transport(c):
-    """T3-T2: redirect, cavo virtuale e ricezione al nodo successivo, dalla
-    stessa misura a tre orologi. Il minimo e' il trasporto senza attesa; la
-    media aggiunge la coda, perche' in questa misura l'uscita gira sul core
-    del nodo, e cresce col rate. Che non dipenda dalla pipeline lo si
-    verifica su ogni modello: differenza fra la piu' cara e la meno cara."""
+    """T3-T2: redirect, virtual cable and reception at the next node, from the
+    same three-clock measurement. The minimum is the transport without
+    waiting; the mean adds the queue and grows with the rate."""
     rows, mins, gap = [], {}, []
     for k in c.core_dir:
         for m in ("baseline",) + PIPES:
@@ -1124,18 +985,18 @@ def sec_transport(c):
                 gap.append((max(x) / min(x) - 1) * 100)
     if not rows:
         return []
-    claim("il trasporto (T3−T2 minimo, senza attesa) e' un costo comune, ns",
+    claim("the transport (minimum T3−T2, no waiting) is a common cost, ns",
           ", ".join(f"{CORE_LABEL[k]} {spread(v)}" for k, v in mins.items()))
     if gap:
-        claim("il trasporto non dipende dalla pipeline",
-              f"differenza fra la piu' cara e la meno cara {spread(gap)}% "
-              f"su {len(gap)} modelli-core")
-    return ["## Il trasporto verso il nodo successivo", "",
-            "T3−T2 (redirect, cavo virtuale, ricezione) dalla misura a tre "
-            "orologi, ns. Il minimo e' il trasporto senza attesa. La media "
-            "contiene anche la coda: qui l'uscita gira sul core del nodo, e "
-            "la media cresce col rate.", "",
-            table(["core", "programma", "n", "minimo", "media per rate"],
+        claim("the transport does not depend on the pipeline",
+              f"difference between the most and least expensive {spread(gap)}% "
+              f"over {len(gap)} model-cores")
+    return ["## The transport to the next node", "",
+            "T3−T2 (redirect, virtual cable, reception) from the three-clock "
+            "measurement, ns. The minimum is the transport without waiting. The mean "
+            "also contains the queue: here the egress runs on the node core, and "
+            "the mean grows with the rate.", "",
+            table(["core", "program", "n", "minimum", "mean per rate"],
                   rows), ""]
 
 
@@ -1157,9 +1018,6 @@ def sec_load_curves(c):
                 if cap:
                     agree.append(mx / cap)
                 pts = [r for r in br if r.get("method") == m]
-                # due contatori letti in istanti diversi: una differenza
-                # appena negativa e' zero, non una perdita negativa (dava
-                # quote sopra 1)
                 lost = [max(0, num(r.get("loss_before_xdp")) or 0)
                         for r in pts]
                 inpipe = [max(0, num(r.get("loss_in_pipeline")) or 0)
@@ -1173,18 +1031,18 @@ def sec_load_curves(c):
     if not rows:
         return []
     if agree:
-        claim("il massimo inoltrato al crescere del rate coincide con la "
-              "capacita' a massima spinta (entro il rumore fra sessioni)",
-              f"rapporto {spread(agree, '.2f')} su {len(agree)} curve")
+        claim("the maximum forwarded under growing rate matches the "
+              "full-load capacity (within the noise between sessions)",
+              f"ratio {spread(agree, '.2f')} over {len(agree)} curves")
     if ingress:
-        claim("oltre la capacita' si perde prima del programma, alla coda",
-              f"quota persa prima di XDP {spread(ingress, '.3f')}")
-    return ["## Al crescere del traffico", "",
-            "Ginocchio = rate chiesto piu' alto senza perdite; massimo "
-            "inoltrato contro la capacita' misurata a massima spinta sullo "
-            "stesso modello.", "",
-            table(["core", "modello", "pipeline", "ginocchio Mpps",
-                   "max inoltrati", "capacita'", "collo"], rows), ""]
+        claim("above capacity packets are lost before the program, in the queue",
+              f"share lost before XDP {spread(ingress, '.3f')}")
+    return ["## Under growing traffic", "",
+            "Knee = highest requested rate without loss; maximum "
+            "forwarded against the capacity measured at full load on the "
+            "same model.", "",
+            table(["core", "model", "pipeline", "knee Mpps",
+                   "max forwarded", "capacity", "bottleneck"], rows), ""]
 
 
 def sec_two_cores(c):
@@ -1204,13 +1062,11 @@ def sec_two_cores(c):
                                  f"{CR.node_mpps(two[m]):.2f}", f"{s:.0f}"])
     if not rows:
         return []
-    # un core e due core vengono da sessioni diverse: un valore sopra 100
-    # e' rumore di misura (sec_noise), non un guadagno
-    claim("due core reggono il doppio di uno (entro il rumore fra sessioni)",
-          f"{spread(scal)}% del doppio su {len(scal)} coppie")
-    return ["## Due core del nodo", "",
-            table(["core", "modello", "pipeline", "1 core", "2 core",
-                   "% del doppio"], rows), ""]
+    claim("two cores carry twice one core (within the noise between sessions)",
+          f"{spread(scal)}% of double over {len(scal)} pairs")
+    return ["## Two node cores", "",
+            table(["core", "model", "pipeline", "1 core", "2 cores",
+                   "% of double"], rows), ""]
 
 
 def sec_classes(c):
@@ -1239,16 +1095,16 @@ def sec_classes(c):
                          fmt(ex)])
     if not rows:
         return []
-    claim("le classi che inoltrano costano uguale",
-          f"differenza fra la piu' cara e la meno cara {spread(fwd_spread)}%")
+    claim("the forwarding classes cost the same",
+          f"difference between the most and least expensive {spread(fwd_spread)}%")
     if drop_extra:
-        claim("scartare costa in piu' (effetto del banco: la memoria del "
-              "pacchetto si libera sul nodo)", f"{spread(drop_extra)} ns")
-    return ["## Classi diverse", "",
-            "Una sessione per classe decisa: differenza fra la classe che "
-            "inoltra piu' cara e la meno cara, e quanto costa in piu' "
-            "scartare (ns, mediana delle classi).", "",
-            table(["modello", "pipeline", "classi FORWARD", "spread FORWARD",
+        claim("dropping costs more (a bench effect: the packet memory is "
+              "freed on the node)", f"{spread(drop_extra)} ns")
+    return ["## Different classes", "",
+            "One session per decided class: difference between the most and "
+            "least expensive forwarding class, and how much more "
+            "dropping costs (ns, median over the classes).", "",
+            table(["model", "pipeline", "FORWARD classes", "FORWARD spread",
                    "DROP − FORWARD ns"], rows), ""]
 
 
@@ -1268,13 +1124,13 @@ def sec_mix(c):
                              f"{(v / fixed - 1) * 100:+.0f}%"])
     if not rows:
         return []
-    claim("TTL diversi pacchetto per pacchetto contro pacchetto fisso",
-          f"{spread(rel)}% sul tempo del nodo")
-    return ["## Pacchetti tutti uguali contro pacchetti diversi", "",
-            "TTL diversi a ogni pacchetto (2–31): il modello decide classi "
-            "diverse, compreso lo scarto. ns di CPU per pacchetto contro il "
-            "pacchetto fisso dello stesso modello.", "",
-            table(["modello", "pipeline", "fisso", "TTL misti", "Δ"], rows),
+    claim("a different TTL per packet against a fixed packet",
+          f"{spread(rel)}% on the node time")
+    return ["## Identical packets against different packets", "",
+            "A different TTL for every packet (2–31): the model decides different "
+            "classes, drop included. ns of CPU per packet against the "
+            "fixed packet of the same model.", "",
+            table(["model", "pipeline", "fixed", "mixed TTL", "Δ"], rows),
             ""]
 
 
@@ -1293,25 +1149,20 @@ def sec_frames(c):
                 var.append((max(v) / min(v) - 1) * 100)
     if not var:
         return []
-    claim("la taglia del pacchetto non cambia il costo",
-          f"differenza fra 64 e 1514 byte {spread(var, '.1f')}% "
-          f"({len(var)} coppie)")
-    return ["## Taglia del pacchetto", "",
-            f"Differenza fra la taglia piu' cara e la meno cara, per modello "
-            f"e pipeline: {spread(var, '.1f')}% su {len(var)} coppie.", ""]
+    claim("the packet size does not change the cost",
+          f"difference between 64 and 1514 bytes {spread(var, '.1f')}% "
+          f"({len(var)} pairs)")
+    return ["## Packet size", "",
+            f"Difference between the most and least expensive size, per model "
+            f"and pipeline: {spread(var, '.1f')}% over {len(var)} pairs.", ""]
 
 
 def sec_solo(c):
-    """Il programma da solo (bench_solo.py, BPF_PROG_TEST_RUN), su ogni
-    modello: la sua latenza contro il traffico, il tempo per installare un
-    modello, le letture di tabella e i salti per pacchetto."""
+    """The program alone (bench_program_alone.py, BPF_PROG_TEST_RUN), on
+    every model."""
     root = os.path.join(c.base, "solo")
     if not os.path.isdir(root):
         return []
-    # Una misura vale solo se il programma ha preso la strada del traffico:
-    # inoltrato in (quasi) ogni esecuzione. Un solo.csv senza fwd_pct viene
-    # da bench_solo con il pacchetto di bench_scaling (TTL 255), dove un
-    # modello su quattro scartava: non si usa.
     solo, off = {}, []
     for mid in c.models:
         rows = c.read(os.path.join(root, mid), "solo.csv")
@@ -1330,17 +1181,13 @@ def sec_solo(c):
         return num(solo.get(mid, {}).get(m, {}).get(key))
 
     def nn(mid, m, key="lat_ns"):
-        """La sola rete da sola: la pipeline meno la baseline dello stesso
-        modello. Con key="lat_hot" il ciclo caldo, solo dove il blocco
-        e' lungo almeno HOT_MIN_K esecuzioni per entrambe."""
+        """The network alone, by itself."""
         if key == "lat_hot" and any((v(mid, x, "hot_k") or 0) < HOT_MIN_K
                                     for x in (m, "baseline")):
             return None
         a, b = v(mid, m, key), v(mid, "baseline", key)
         return a - b if a is not None and b is not None else None
 
-    # generare il C di P1 e compilarlo (bench_solo.py --compila, senza
-    # kernel): un modello nuovo per P1 costa questo, fuori dal nodo
     comp = {}
     for mid in c.models:
         for r in read_csv(os.path.join(c.base, "compila", mid,
@@ -1366,8 +1213,6 @@ def sec_solo(c):
                      spread(tail)])
         if m == "baseline":
             continue
-        # sotto traffico (media T2-T1 a traffico leggero, minimo, e tempo
-        # di CPU a nodo saturo, tutti meno la baseline) / da solo
         light[m] = [c.nn_t2("P", i, m) / nn(i, m) for i in solo
                     if nn(i, m) and c.nn_t2("P", i, m) is not None]
         sat[m] = [c.nn("P", i, m) / nn(i, m) for i in solo
@@ -1381,26 +1226,26 @@ def sec_solo(c):
         upd.append((m, up))
         lk.append((m, look))
     if off:
-        claim("programma da solo fuori dalla strada del traffico (non "
-              "inoltrato)", f"{len(off)} misure modello-pipeline")
-    L = ["## Il programma da solo", "",
-         "bench_solo.py su ogni modello, P-core: latenza da solo "
-         "(BPF_PROG_TEST_RUN, minimo su 7 misure), e la sola rete (meno la "
-         "baseline dello stesso modello); build = caricare la pipeline da "
-         "zero; installare = un modello nuovo su un nodo in servizio (P1: "
-         "caricare l'oggetto compilato; P2, P3: scrivere le tabelle); "
-         "letture di tabella e salti per pacchetto. Pacchetto e ingressi "
-         "sono quelli del traffico (TTL 32, stato dei link che inoltra); "
-         "una misura che non ha inoltrato resta fuori"
+        claim("program alone off the traffic path (not "
+              "forwarded)", f"{len(off)} model-pipeline measurements")
+    L = ["## The program alone", "",
+         "bench_program_alone.py on every model, P-core: latency alone "
+         "(BPF_PROG_TEST_RUN, minimum of 7 measurements), and the network alone "
+         "(minus the baseline of the same model); build = loading the pipeline "
+         "from scratch; install = a new model on a running node (P1: "
+         "loading the compiled object; P2, P3: writing the tables); "
+         "table lookups and tail calls per packet. Packet and inputs "
+         "are those of the traffic (TTL 32, link state that forwards); "
+         "a measurement that did not forward is left out"
          + (f" ({len(off)}: {', '.join(off[:12])}"
             + (" ..." if len(off) > 12 else "") + ")" if off else "")
          + ".", "",
-         table(["pipeline", "n", "chiamata singola ns", "rete ns",
-                "rete, ciclo caldo ns", "build ms", "generare e compilare "
-                "P1 ms", "installare ms", "letture", "salti"], rows), "",
-         f"Ciclo caldo: blocchi di esecuzioni di fila finche' il TTL che "
-         f"scende non cambia la classe decisa; si usa solo dove il blocco e' "
-         f"lungo almeno {HOT_MIN_K} esecuzioni.", ""]
+         table(["pipeline", "n", "single call ns", "network ns",
+                "network, warm loop ns", "build ms", "generate and compile "
+                "P1 ms", "install ms", "lookups", "tail calls"], rows), "",
+         f"Warm loop: blocks of consecutive runs as long as the decreasing TTL "
+         f"does not change the decided class; used only where the block is "
+         f"at least {HOT_MIN_K} runs long.", ""]
     rows2 = []
     for m in PIPES:
         if light.get(m) or sat.get(m):
@@ -1409,55 +1254,49 @@ def sec_solo(c):
                           spread(sat.get(m, []), ".2f"),
                           spread(light.get(m, []), ".2f")])
     if rows2:
-        L += ["La sola rete sotto traffico divisa per la sola rete da sola, "
-              "modello per modello:", "",
-              table(["pipeline", "nodo saturo / ciclo caldo",
-                     "traffico leggero, minimo / ciclo caldo",
-                     "nodo saturo / chiamata singola",
-                     "traffico leggero, media / chiamata singola"], rows2), ""]
+        L += ["The network alone under traffic divided by the network alone by itself, "
+              "model by model:", "",
+              table(["pipeline", "saturated node / warm loop",
+                     "light traffic, minimum / warm loop",
+                     "saturated node / single call",
+                     "light traffic, mean / single call"], rows2), ""]
         if any(hot_sat.values()):
-            claim("la rete a nodo saturo / la rete da sola in un ciclo caldo "
+            claim("the network with a saturated node / the network alone in a warm loop "
                   "(P-core)",
                   ", ".join(f"{NAME[m]} {spread(hot_sat[m], '.2f')}"
                             for m in PIPES if hot_sat.get(m)))
-            claim("il pacchetto piu' veloce sotto traffico / il ciclo caldo",
+            claim("the fastest packet under traffic / the warm loop",
                   ", ".join(f"{NAME[m]} {spread(hot_light[m], '.2f')}"
                             for m in PIPES if hot_light.get(m)))
         else:
-            # misure di bench_solo senza ciclo caldo: il confronto e' con la
-            # chiamata singola, che non e' il programma in cache
-            claim("la rete a nodo saturo / la rete da sola a chiamate "
-                  "singole (P-core)",
+            claim("the network with a saturated node / the network alone with single "
+                  "calls (P-core)",
                   ", ".join(f"{NAME[m]} {spread(sat[m], '.2f')}"
                             for m in PIPES if sat.get(m)))
     if comp:
-        claim("generare e compilare P1 per un modello nuovo (fuori dal "
-              "nodo), ms", ", ".join(f"{NAME[m]} {spread(v_, '.0f')}"
+        claim("generating and compiling P1 for a new model (off the "
+              "node), ms", ", ".join(f"{NAME[m]} {spread(v_, '.0f')}"
                                     for m, v_ in comp.items()))
-    claim("installare un modello su un nodo in servizio, ms",
+    claim("installing a model on a running node, ms",
           ", ".join(f"{NAME[m]} {spread(u, '.1f')}" for m, u in upd if
                     any(x is not None for x in u)))
-    claim("letture di tabella per pacchetto",
+    claim("table lookups per packet",
           ", ".join(f"{NAME[m]} {spread(x, '.0f')}" for m, x in lk if
                     any(y is not None for y in x)))
-    # P3: letture e salti contro gli strati
     pts = [(num(c.models[i]["n_layers"]), v(i, "modular", "lookups"),
             v(i, "modular", "n_tail")) for i in solo]
     pts = [p for p in pts if p[1] is not None]
     if len(pts) > 3:
         f = CR._fit([p[0] for p in pts], [p[1] for p in pts])
         same = sum(1 for p in pts if p[2] == p[0])
-        claim("P3: letture di tabella e salti crescono con gli strati",
-              f"+{f[0]:.1f} letture per strato; salti = strati su "
-              f"{same}/{len(pts)} modelli")
+        claim("P3: table lookups and tail calls grow with the layers",
+              f"+{f[0]:.1f} lookups per layer; tail calls = layers on "
+              f"{same}/{len(pts)} models")
     return L
 
 
 def noise(c):
-    """Quanto varia la stessa misura: dentro una misura (i giri), fra sessioni
-    con lo stesso programma (il nodo senza rete, in ogni sessione `pop`), e
-    fra sessioni con lo stesso modello e la stessa versione (le taglie a 64
-    byte contro `pop`). In % del valore; liste, per spread() e quant()."""
+    """How much the same measurement varies."""
     within, base, same = [], {}, []
     for k, d in c.core_dir.items():
         for i in c.models:
@@ -1488,81 +1327,75 @@ def noise(c):
 
 
 def sec_noise(c):
-    """Il rumore di misura: la soglia sotto cui una differenza non e' una
-    differenza. Due misure di sessioni diverse (un core contro due, il
-    massimo di una curva contro la capacita') possono dare un rapporto
-    sopra 1 anche dove fisicamente non puo' esserlo."""
+    """The measurement noise."""
     n = noise(c)
     if not (n["within"] or n["same"]):
         return []
-    L = ["## Quanto varia la stessa misura", "",
-         "Variazione in % del valore: mediana, 90° percentile, massimo. Una "
-         "differenza dentro la variazione fra sessioni non e' una differenza; "
-         "un rapporto fra due misure di sessioni diverse puo' superare 1 per "
-         "questo solo motivo.", ""]
+    L = ["## How much the same measurement varies", "",
+         "Variation in % of the value: median, 90th percentile, maximum. A "
+         "difference within the variation between sessions is not a difference; "
+         "a ratio between two measurements from different sessions can exceed 1 "
+         "for this reason alone.", ""]
     rows = []
     if n["within"]:
-        rows.append(["i giri di una misura ((max − min) / mediana)",
+        rows.append(["the rounds of one measurement ((max − min) / median)",
                      str(len(n["within"])), fmt(quant(n["within"], .5), ".1f"),
                      fmt(quant(n["within"], .9), ".1f"),
                      fmt(max(n["within"]), ".1f")])
     for k, v in n["base"].items():
-        rows.append([f"il nodo senza rete in sessioni diverse, {CORE_LABEL[k]}",
+        rows.append([f"the node without a network in different sessions, {CORE_LABEL[k]}",
                      str(len(v)), fmt(quant(v, .5), ".1f"),
                      fmt(quant(v, .9), ".1f"), fmt(max(v), ".1f")])
     if n["same"]:
-        rows.append(["stesso modello e versione, due sessioni",
+        rows.append(["same model and version, two sessions",
                      str(len(n["same"])), fmt(quant(n["same"], .5), ".1f"),
                      fmt(quant(n["same"], .9), ".1f"),
                      fmt(max(n["same"]), ".1f")])
-        claim("la stessa misura rifatta in un'altra sessione cambia di",
-              f"{quant(n['same'], .5):.1f} % in mediana, "
-              f"{quant(n['same'], .9):.1f} % al 90° percentile, "
-              f"{max(n['same']):.1f} % al massimo ({len(n['same'])} coppie)")
-    L += [table(["che cosa", "n", "mediana %", "90° %", "max %"], rows), ""]
+        claim("the same measurement repeated in another session changes by",
+              f"{quant(n['same'], .5):.1f} % median, "
+              f"{quant(n['same'], .9):.1f} % at the 90th percentile, "
+              f"{max(n['same']):.1f} % at most ({len(n['same'])} pairs)")
+    L += [table(["what", "n", "median %", "90th %", "max %"], rows), ""]
     return L
 
 
 def sec_excluded(c):
-    """Le misure lasciate fuori da ogni cifra, e perche'. Dopo tutte le altre
-    sezioni: i sottoinsiemi si leggono sezione per sezione. L'elenco va anche
-    in escluse.csv accanto ai risultati: POP_RIFAI_DISTURBATE=1
-    remeasure_popolazione.sh rifa' esattamente quelle."""
+    """The measurements left out of every figure, and why."""
     if not c.seen:
         return []
     try:
         with open(os.path.join(c.base, "escluse.csv"), "w", newline="",
                   encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["cartella", "motivo"])
+            w.writerow(["folder", "reason"])
             w.writerows(sorted(c.excluded.items()))
     except OSError:
         pass
-    claim("misure fuori dalle conclusioni (disturbate o bocciate)",
+    claim("measurements left out of the conclusions (disturbed or rejected)",
           f"{len(c.excluded)}/{len(c.seen)}")
     if c.salvaged:
         out = sum(a for a, _ in c.salvaged.values())
         tot = sum(b for _, b in c.salvaged.values())
-        claim("misure disturbate tenute senza i giri colpiti",
-              f"{len(c.salvaged)} misure, {out}/{tot} giri o finestre tolti")
+        claim("disturbed measurements kept without the affected rounds",
+              f"{len(c.salvaged)} measurements, {out}/{tot} rounds or windows removed")
     if not c.excluded and not c.salvaged:
         return []
     by = {}
     for rel, why in sorted(c.excluded.items()):
         by.setdefault(why, []).append(rel)
-    L = ["## Misure fuori dalle conclusioni", "",
-         "Non entrano in nessun intervallo ne' in nessuna legge. disturbata = "
-         "la macchina non e' rimasta nelle condizioni dichiarate (run_disturbed "
-         "in env.csv); bocciata = il controllo di validita' del banco l'ha "
-         "respinta (throughput_report.md). Si rifanno con POP_RIFAI_DISTURBATE=1 "
-         "remeasure_popolazione.sh.", ""]
+    L = ["## Measurements left out of the conclusions", "",
+         "They enter no range and no law. disturbed = "
+         "the machine did not stay in the declared conditions (run_disturbed "
+         "in env.csv); rejected = the bench's validity check rejected it "
+         "(throughput_report.md). They are redone with POP_RIFAI_DISTURBATE=1 "
+         "run_population_campaign.sh.", ""]
     for why, rels in by.items():
         L += [f"**{why}** ({len(rels)}): " + ", ".join(rels), ""]
     if c.salvaged:
-        L += [f"**misure tenute senza i giri disturbati** (curve: ogni punto, "
-              f"massima spinta: ogni pipeline, con almeno {MIN_CLEAN_ROUNDS} "
-              f"giri puliti; massima spinta solo se il disturbo e' throttling, "
-              f"tolti i giri entro {EVENT_MARGIN_S:g} s da un evento): "
+        L += [f"**measurements kept without the disturbed rounds** (curves: every point, "
+              f"full load: every pipeline, with at least {MIN_CLEAN_ROUNDS} "
+              f"clean rounds; full load only if the disturbance is throttling, "
+              f"removing the rounds within {EVENT_MARGIN_S:g} s of an event): "
               + ", ".join(f"{rel} ({a}/{b})"
                           for rel, (a, b) in sorted(c.salvaged.items())), ""]
     return L
@@ -1571,10 +1404,10 @@ def sec_excluded(c):
 def sec_sums():
     if not SUMS:
         return []
-    return ["## Le somme", "",
-            "Ogni riga e' un'affermazione e la sua prova sulla popolazione: "
-            "su quanti modelli regge, o l'intervallo che copre.", "",
-            table(["affermazione", "sulla popolazione"],
+    return ["## The claims", "",
+            "Every row is a claim and its evidence over the population: "
+            "on how many models it holds, or the range it covers.", "",
+            table(["claim", "over the population"],
                   [[a, b] for a, b in SUMS]), ""]
 
 
@@ -1584,7 +1417,7 @@ def main(argv=None):
         sys.exit(__doc__.split("\n\n")[0])
     c = Campaign(argv[0])
     if not c.models:
-        sys.exit(f"{argv[0]}: ne' population.csv ne' assi_<P|E>core")
+        sys.exit(f"{argv[0]}: population.csv missing")
     body = []
     body += sec_population(c)
     body += sec_correct(c)
@@ -1613,7 +1446,7 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding="utf-8")
     except (AttributeError, ValueError):
         pass
-    out = [f"# Sintesi sulla popolazione: {title}", ""] + sec_sums() + body
+    out = [f"# Population summary: {title}", ""] + sec_sums() + body
     print("\n".join(out))
 
 

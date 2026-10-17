@@ -1,98 +1,11 @@
 #!/usr/bin/env python3
-"""
-host_conditions.py -- le condizioni della macchina mentre i banchi misurano:
-chi gira dove, a che frequenza, con quali stati di idle, e che cosa e'
-successo alla macchina durante ogni finestra.
+"""host_conditions.py -- the machine conditions while a bench measures.
 
---------------------------------------------------------------------------
-PERCHE'
---------------------------------------------------------------------------
-Un banco che misura nanosecondi per pacchetto deve decidere su che core
-gira, a che frequenza e che cosa gli gira accanto; lasciato al sistema, il
-numero misura il sistema. Qui va deciso con cura, perche' la macchina di
-laboratorio (Ubuntu 24.04) e' un portatile con un processore IBRIDO (Intel
-Core Ultra 7 155H, Lenovo IdeaPad Slim 5):
+Pins the bench to chosen cores, fixes their frequency, disables deep idle
+states, moves everything else to other cores, records throttling and
+frequency during every window, and restores the machine at the end.
 
-  P-core   0-11   6 core fisici con SMT -- coppie 0/5, 1/2, 3/4, 6/7, 8/9,
-                  10/11 -- base 1,4 GHz, turbo 4,5 GHz (4,8 su 1-4)
-  E-core   12-19  8 core, base 0,9 GHz, turbo 3,8 GHz
-  LP E     20-21  2 core fuori dalla L3, turbo 2,5 GHz
-
-Lasciata a se' stessa, questa macchina mette il DUT dove capita (anche su un
-E-core), fa girare desktop e browser sul fratello SMT del DUT, cambia
-frequenza fra 0,4 e 4,8 GHz secondo carico e temperatura, e addormenta i
-core in C10, da cui il risveglio costa 310 us: piu' di quanto il ring del
-veth (256 descrittori) copra a 1 Mpps. E scalda: il 2026-09-27, a desktop
-quasi fermo, un solo P-core salito a 4,5-4,8 GHz ha portato il pacchetto da
-51 a 99 C in due secondi, e dopo 41 minuti di uptime i P-core 1 e 3 contavano
-gia' 7 251 e 12 729 eventi di throttling termico.
-
---------------------------------------------------------------------------
-COSA FA (tutto reversibile, tutto riportato in env.csv)
---------------------------------------------------------------------------
-  ruoli       DUT, uscita e generatore su P-core fisici DISTINTI, un thread
-              per core; il fratello SMT di ognuno resta a riposo; il core
-              della CPU 0 resta al sistema (plan_roles).
-  frequenza   sui core del banco e sui loro fratelli: governor performance e
-              min = max, 3500 MHz per default (DEFAULT_FREQ: la piu' alta
-              che il portatile regge per un run intero), e poi MISURATA con
-              APERF/MPERF, perche' il numero nel sysfs non sempre e' la
-              frequenza vera. --freq.
-  sistema     le CPU del sistema (desktop, browser, il processo del banco)
-              con un tetto di frequenza, default 2,5 GHz: il loro turbo
-              scalderebbe il pacchetto fino al throttling, e il throttling
-              del pacchetto rallenta anche i core del banco. --system-max-mhz.
-  uncore      min = max (default il massimo): la L3 e l'anello, su cui i
-              pacchetti passano dal generatore al DUT, non cambiano velocita'
-              a meta' misura. --uncore.
-  idle        sulle CPU del banco si spengono gli stati di idle con uscita
-              piu' lenta di --cstate-max-us (default 1 us: restano POLL e
-              C1E, la soglia del profilo latency-performance di tuned).
-  isolamento  user.slice, system.slice e init.scope confinati sulle CPU del
-              sistema (AllowedCPUs di systemd, --runtime); sulle stesse CPU
-              gli IRQ, le workqueue unbound e i kernel thread spostabili. Il
-              processo del banco passa prima in uno scope suo, fuori da
-              user.slice: senza, il confinamento lo porterebbe via dalle CPU
-              su cui deve pinnare i propri thread (xdp_gen).
-  profilo     power-profiles-daemon su "performance" (limiti di potenza e
-              ventole della piattaforma).
-  watchdog    NMI watchdog spento: un NMI ogni ~10 s su ogni CPU.
-
-Durante il run, HostMonitor legge: eventi di throttling termico (core e
-pacchetto), temperatura, frequenza REALE del DUT da APERF/MPERF, SMI,
-powerclamp, alimentazione. Per finestra (bench_bitrate, colonne host_*) e per
-l'intero run (env.csv); in piu' un registro al secondo in host_monitor.csv,
-scritto da un processo a parte perche' non contenda il GIL al banco.
-
-NON fa: isolcpus / nohz_full / rcu_nocbs (parametri di boot, servono un
-riavvio: vedi docs/testing.md), non tocca il turbo globale, non spegne SMT.
-
---------------------------------------------------------------------------
-IL RIPRISTINO
---------------------------------------------------------------------------
-Ogni valore si legge e si salva PRIMA di cambiarlo, in
-/run/ipa-bench/host_state.json, riscritto a ogni modifica. A fine run --
-anche con Ctrl-C, SIGTERM, SIGHUP o un'eccezione -- si riscrive tutto in
-ordine inverso e il file si cancella. Un run ucciso con SIGKILL lascia il
-file: il run successivo lo trova e ripristina per primo, oppure
-
-    sudo python3 ipa/test/host_conditions.py --restore
-
-/run sta in memoria: al riavvio sparisce il file e, comunque, ogni modifica
-(sono tutte runtime).
-
---------------------------------------------------------------------------
-USO
---------------------------------------------------------------------------
-    python3 ipa/test/host_conditions.py --show        # niente root
-    sudo python3 ipa/test/host_conditions.py --restore
-    # un comando qualunque sul core del DUT, a condizioni applicate
-    # (per esempio i banchi BPF_PROG_TEST_RUN, che girano nel processo):
-    sudo python3 ipa/test/host_conditions.py --run -- \\
-        python3 ipa/test/test_suite.py --only kernel
-
-bench_throughput e bench_bitrate lo usano da soli; --no-tune non tocca la
-macchina, ma le condizioni vengono lette e scritte in env.csv lo stesso.
+    sudo python3 ipa/test/host_conditions.py --run -- python3 ipa/test/<bench>.py ...
 """
 import argparse
 import atexit
@@ -111,8 +24,7 @@ GREEN, RED, YELLOW, GREY, NC = (
 
 
 def _say(line):
-    """print che non solleva: il ripristino gira anche quando il terminale
-    e' gia' chiuso (SIGHUP), e un EIO su una print non deve fermarlo a meta'."""
+    """print that never raises."""
     try:
         print(line, flush=True)
     except (OSError, ValueError):
@@ -137,58 +49,28 @@ def note(m):
 
 STATE_REL = ("run", "ipa-bench", "host_state.json")
 SCOPE_SLICE = "ipa-bench.slice"
-# Le unita' di systemd che si confinano: tutto cio' che non e' kernel e non e'
-# il banco. machine.slice c'e' solo se systemd-machined ha qualcosa avviato.
 CONFINED_UNITS = ("init.scope", "system.slice", "user.slice", "machine.slice")
-
-# La frequenza fissa dei core del banco. Scelta sul portatile di laboratorio
-# (Core Ultra 7 155H) il 2026-09-27 con run completi di bench_bitrate, 5 giri,
-# 6 metodi, circa 5 minuti: a 4000 MHz 11 finestre su 260 in throttling
-# termico, DUT compreso, pacchetto fino a 98 C; a 3500 MHz 1 su 390 (2 eventi
-# di pacchetto), massimo 85 C, dispersione fra i giri 0,4-2%. "base" (1400 nel
-# sysfs) dava ~2000 MHz misurati: vedi _step_measure_freq. Oltre il massimo di
-# un core, la frequenza si taglia al suo massimo.
 DEFAULT_FREQ = "3500"
-# Il tetto delle CPU del SISTEMA (desktop, browser, il processo del banco)
-# durante il run. Misurato il 2026-09-27: un solo P-core che sale a 4,5-4,8
-# GHz porta il pacchetto da 51 a 99 C in due secondi, con un centinaio di
-# eventi di throttling. Il throttling del pacchetto rallenta anche i core del
-# banco, che hanno la frequenza fissata ma stanno sullo stesso silicio. A 2,5
-# GHz il desktop resta usabile e nessun core fa da punto caldo.
 DEFAULT_SYSTEM_MAX_MHZ = 2500
 DEFAULT_UNCORE = "max"
 DEFAULT_CSTATE_MAX_US = 1
 DEFAULT_PROFILE = "performance"
-# Thread del generatore quando nessuno li chiede. Tre portano la sola
-# ricezione in saturazione a 3,5 GHz (circa 6 Mpps offerti contro 4,4
-# ricevuti); tutti i thread scrivono sulla stessa coda del DUT (vedi
-# bench_throughput.ingress_queues).
 DEFAULT_GEN_THREADS = 3
 MIN_GEN_THREADS = 2
-# Oltre questo scarto la frequenza misurata sul DUT non e' quella fissata.
 FREQ_TOLERANCE = 0.05
-# Sotto questa occupazione APERF/MPERF misura troppo poco lavoro per dire
-# qualcosa sulla frequenza.
 FREQ_CHECK_MIN_BUSY_PCT = 20.0
-# Durata del carico con cui si misura la frequenza di ogni core del banco.
 MEASURE_S = 0.3
-
 MSR_TSC, MSR_MPERF, MSR_APERF, MSR_SMI_COUNT = 0x10, 0xE7, 0xE8, 0x34
 PF_KTHREAD = 0x00200000
 PF_NO_SETAFFINITY = 0x04000000
-
 KIND_RANK = {"P": 0, "-": 0, "E": 1, "?": 1, "LPE": 2}
 KIND_NAME = {"P": "P-core", "E": "E-core", "LPE": "LP E-core", "-": "core",
              "?": "core"}
 
 
-# ==========================================================================
-# LETTURA E SCRITTURA, rispetto a una radice
-# ==========================================================================
+# --- reading and writing, relative to a root ---
 class Paths:
-    """Dove leggere e scrivere. La radice e' "/" sulla macchina; i test la
-    puntano a un albero finto, per verificare applicazione e ripristino senza
-    root e senza toccare niente di vero."""
+    """Where to read and write."""
 
     def __init__(self, root="/"):
         self.root = root
@@ -233,8 +115,7 @@ def _int(text, default=None):
 
 
 def run_cmd(argv, timeout=15):
-    """(codice, stdout, stderr), mai un'eccezione: un comando assente e' un
-    codice 127, come nella shell."""
+    """(code, stdout, stderr), never an exception."""
     try:
         r = subprocess.run(argv, capture_output=True, text=True,
                            timeout=timeout)
@@ -255,11 +136,9 @@ def pid_alive(pid):
     return True
 
 
-# ==========================================================================
-# LISTE DI CPU: i due formati del kernel
-# ==========================================================================
+# --- CPU lists: the kernel's two formats ---
 def parse_cpu_list(spec):
-    """"0,5,12-21" -> [0, 5, 12, ..., 21]. Stringa vuota o None -> []."""
+    """"0,5,12-21" -> [0, 5, 12, ..., 21]."""
     if spec is None:
         return []
     out = set()
@@ -270,7 +149,7 @@ def parse_cpu_list(spec):
             a, _, b = part.partition("-")
             lo, hi = int(a), int(b)
             if hi < lo:
-                raise ValueError(f"intervallo rovesciato: {part!r}")
+                raise ValueError(f"reversed range: {part!r}")
             out.update(range(lo, hi + 1))
         else:
             out.add(int(part))
@@ -278,8 +157,7 @@ def parse_cpu_list(spec):
 
 
 def format_cpu_list(cpus):
-    """[0, 5, 12, 13, 14] -> "0,5,12-14": il formato di *_list nel kernel e
-    di AllowedCPUs in systemd."""
+    """[0, 5, 12, 13, 14] -> "0,5,12-14"."""
     cpus = sorted(set(int(c) for c in cpus))
     if not cpus:
         return ""
@@ -295,8 +173,7 @@ def format_cpu_list(cpus):
 
 
 def cpu_mask_hex(cpus):
-    """Maschera esadecimale nel formato delle bitmap del kernel: gruppi da 32
-    bit separati da virgole, il piu' significativo per primo."""
+    """Hex mask in the kernel bitmap format."""
     mask = 0
     for c in cpus:
         mask |= 1 << int(c)
@@ -315,17 +192,10 @@ def parse_cpu_mask(text):
     return [i for i in range(mask.bit_length()) if (mask >> i) & 1]
 
 
-# ==========================================================================
-# TOPOLOGIA
-# ==========================================================================
+# --- topology ---
 class Topology:
-    """Le CPU online, il core fisico di ognuna (i fratelli SMT), il tipo di
-    core e le frequenze. Tutto dal sysfs, niente root.
-
-    Tipo: "P" / "E" / "LPE" su un Intel ibrido (/sys/devices/cpu_core e
-    cpu_atom, i due PMU), "-" su una macchina non ibrida. I LP E-core di
-    Meteor Lake sono gli E-core senza L3: stanno sul tile SoC, fuori dalla
-    cache condivisa con il resto."""
+    """The online CPUs, the physical core of each (SMT siblings), the core
+    type and the frequencies."""
 
     def __init__(self, online, cpus, hybrid):
         self.online = sorted(online)
@@ -359,9 +229,6 @@ class Topology:
                    or parse_cpu_list(rd("topology", "core_cpus_list"))
                    or [c])
             sib = tuple(s for s in sib if s in online) or (c,)
-            # Il modulo: le CPU che dividono la L2. Su un P-core e' il core
-            # (i due fratelli SMT); sugli E-core di Meteor Lake sono i 4 core
-            # del modulo, che dividono anche il dominio di frequenza.
             l2 = tuple(s for s in parse_cpu_list(
                 rd("cache", "index2", "shared_cpu_list")) if s in online)
             cluster = tuple(sorted(set(l2) | set(sib))) if c in l2 else sib
@@ -389,9 +256,7 @@ class Topology:
 
     @property
     def structured(self):
-        """C'e' una scelta da fare: core di tipi diversi, o fratelli SMT.
-        Su una macchina piatta (niente SMT, un tipo di core solo) no, e il
-        piano semplice di bench_throughput resta quello giusto."""
+        """There is a choice to make."""
         return self.hybrid or self.smt
 
     def core(self, cpu):
@@ -401,9 +266,7 @@ class Topology:
         return [s for s in self.core(cpu) if s != cpu]
 
     def cluster(self, cpu):
-        """Le CPU che dividono la L2 con `cpu` (lei compresa): il core
-        fisico su un P-core, il modulo di 4 su un E-core. Senza
-        l'informazione nel sysfs, il core."""
+        """The CPUs sharing the L2 with `cpu` (itself included)."""
         if cpu not in self.cpus:
             return (cpu,)
         return self.cpus[cpu].get("cluster") or self.core(cpu)
@@ -412,7 +275,7 @@ class Topology:
         return self.cpus.get(cpu, {}).get("kind", "?")
 
     def cores(self):
-        """I core fisici, come tuple dei loro thread, per prima CPU."""
+        """The physical cores, as tuples of their threads, by first CPU."""
         return sorted({v["core"] for v in self.cpus.values()},
                       key=lambda t: t[0])
 
@@ -423,16 +286,16 @@ class Topology:
             parts.append(k)
         sib = self.siblings(cpu)
         if sib:
-            parts.append("fratello " + ",".join(str(s) for s in sib))
+            parts.append("sibling " + ",".join(str(s) for s in sib))
         mod = [s for s in self.cluster(cpu) if s != cpu and s not in sib]
         if mod:
-            parts.append("modulo L2 con " + format_cpu_list(mod))
+            parts.append("L2 module with " + format_cpu_list(mod))
         return f"cpu{cpu}" + (f" ({', '.join(parts)})" if parts else "")
 
     def summary(self):
         if not self.hybrid:
-            return (f"{len(self.online)} CPU, "
-                    + ("SMT" if self.smt else "niente SMT") + ", non ibrida")
+            return (f"{len(self.online)} CPUs, "
+                    + ("SMT" if self.smt else "no SMT") + ", not hybrid")
         groups = {}
         for c in self.online:
             groups.setdefault(self.kind(c), []).append(c)
@@ -448,41 +311,13 @@ class Topology:
                          + (" (SMT)" if smt else "")
                          + (f" base {base // 1000}" if base else "")
                          + (f" max {mx // 1000} MHz" if mx else ""))
-        return "ibrida: " + "; ".join(parts)
+        return "hybrid: " + "; ".join(parts)
 
 
-# ==========================================================================
-# I RUOLI
-# ==========================================================================
+# --- roles ---
 def plan_roles(topo, n_gen=None, want_egress=False, allow_cpu0=False,
                exclude=()):
-    """DUT, uscita e generatore su core fisici distinti.
-
-    Regole, in ordine:
-      1. si parte dai core fisici; quello della CPU 0 resta al sistema
-         (timer, RCU, IRQ), con il suo fratello SMT;
-      2. si usano i core del tipo piu' veloce presente (P-core); un thread per
-         core, il fratello resta a riposo -- due thread sullo stesso core
-         fisico si dividono pipeline, cache L1/L2 e banda, e il costo per
-         pacchetto dell'uno dipenderebbe dal lavoro dell'altro;
-      3. il DUT prende il primo;
-      4. l'uscita (il nodo successivo) un core suo, se ne resta uno dopo aver
-         garantito il generatore: MIN_GEN_THREADS, o i thread chiesti;
-      5. il generatore i successivi, DEFAULT_GEN_THREADS se non si chiede
-         altro; sugli E-core solo se i P-core non bastano, e lo si dice;
-         mai sui LP E-core.
-
-    Fra i P-core vengono prima quelli con il turbo PIU' BASSO. A frequenza
-    fissata si equivalgono; in turbo no, e i "preferiti" (1-4 su questa
-    macchina, 4,8 GHz invece di 4,5) sono quelli su cui lo scheduler mette i
-    picchi e che vanno in throttling: il 2026-09-27, a desktop quasi fermo,
-    migliaia di eventi su 1 e 3, 26 su 6, zero su 8 e 10. Il DUT, che e' cio'
-    che si misura, va dove la macchina e' piu' calma.
-
-    `exclude`: CPU gia' assegnate altrove (un --egress-cpu esplicito): il
-    loro core fisico resta fuori.
-
-    Restituisce dict(dut=[cpu], gen=[cpu...], egress=cpu|None, notes=[...])."""
+    """DUT, egress and generator on distinct physical cores."""
     notes = []
     ex = set(exclude)
     cores = [c for c in topo.cores()
@@ -490,8 +325,8 @@ def plan_roles(topo, n_gen=None, want_egress=False, allow_cpu0=False,
     if not cores:
         cores = [c for c in topo.cores() if not (set(c) & ex)] \
             or list(topo.cores())
-        notes.append("nessun core fuori da quello della CPU 0: lo uso lo "
-                     "stesso")
+        notes.append("no core outside CPU 0's: using it "
+                     "anyway")
 
     def rank(core):
         return KIND_RANK.get(topo.kind(core[0]), 1)
@@ -504,7 +339,7 @@ def plan_roles(topo, n_gen=None, want_egress=False, allow_cpu0=False,
                   key=lambda c: (turbo(c), c[0]))
     slow = [c for c in cores if best < rank(c) < KIND_RANK["LPE"]]
     if best > KIND_RANK["P"]:
-        notes.append("nessun P-core disponibile: il banco gira su core lenti")
+        notes.append("no P-core available: the bench runs on slow cores")
     dut = fast[0]
     rest = list(fast[1:])
     explicit = bool(n_gen) and int(n_gen) > 0
@@ -516,9 +351,9 @@ def plan_roles(topo, n_gen=None, want_egress=False, allow_cpu0=False,
         if len(rest) >= keep_for_gen + 1:
             egress, rest = rest[0], rest[1:]
         else:
-            notes.append(f"nessun {KIND_NAME[topo.kind(dut[0])]} libero per "
-                         f"l'uscita dopo DUT e generatore: l'uscita resta "
-                         f"sulla CPU del DUT (softirq)")
+            notes.append(f"no free {KIND_NAME[topo.kind(dut[0])]} for "
+                         f"the egress after DUT and generator: the egress stays "
+                         f"on the DUT CPU (softirq)")
 
     gen = list(rest[:want])
     if len(gen) < want and (explicit or len(gen) < MIN_GEN_THREADS):
@@ -526,26 +361,26 @@ def plan_roles(topo, n_gen=None, want_egress=False, allow_cpu0=False,
         extra = slow[:need]
         if extra:
             gen += extra
-            notes.append("generatore esteso su core lenti ("
+            notes.append("generator extended to slow cores ("
                          + ", ".join(topo.label(c[0]) for c in extra)
-                         + "): offrono meno pacchetti al secondo, e meno "
-                           "regolari")
+                         + "): they offer fewer packets per second, less "
+                           "regularly")
     if explicit and len(gen) < want:
-        notes.append(f"chiesti {want} thread generatore, ci sono {len(gen)} "
-                     f"core fisici liberi: ne uso {len(gen)}")
+        notes.append(f"{want} generator threads requested, there are {len(gen)} "
+                     f"free physical cores: using {len(gen)}")
     if not gen:
         sib = tuple(s for s in dut if s != dut[0])
         gen = [sib] if sib else [dut]
-        notes.append("nessun core libero per il generatore: condivide il "
-                     "core fisico del DUT, e la cifra assoluta misura la "
-                     "somma dei due")
+        notes.append("no free core for the generator: it shares the "
+                     "DUT's physical core, and the absolute figure measures the "
+                     "sum of the two")
     return dict(dut=[dut[0]], gen=[c[0] for c in gen],
                 egress=(egress[0] if egress else None), notes=notes)
 
 
 def spare_core(topo, used, allow_cpu0=False):
-    """La prima CPU di un core fisico del tipo piu' veloce senza nessun thread
-    in `used`, o None. Serve all'uscita automatica col piano storico."""
+    """The first CPU of a physical core of the fastest type with no thread
+    in `used`, or None."""
     used = set(used)
     cores = [c for c in topo.cores()
              if (allow_cpu0 or 0 not in c) and not (set(c) & used)]
@@ -560,7 +395,7 @@ def spare_core(topo, used, allow_cpu0=False):
 
 
 def egress_cpus(egress):
-    """L'uscita come lista di CPU: None -> [], N -> [N], [N, M] -> [N, M]."""
+    """The egress as a list of CPUs."""
     if egress is None:
         return []
     if isinstance(egress, int):
@@ -569,26 +404,19 @@ def egress_cpus(egress):
 
 
 def idle_siblings(topo, used):
-    """I fratelli SMT dei thread usati, e i compagni di modulo L2 sugli
-    E-core: restano a riposo, fuori da tutto.
-
-    Il modulo degli E-core (4 core, una L2 da 2 MB) divide anche la
-    frequenza: lasciati al sistema, i compagni del DUT ne prenderebbero il
-    tetto (--system-max-mhz) e il carico, e la L2 del DUT si dividerebbe
-    con il desktop. Su un P-core il modulo e' il core: niente cambia."""
+    """The SMT siblings of the used threads, and the L2-module mates on E-cores."""
     used = set(used)
     return sorted({s for c in used for s in topo.cluster(c)} - used)
 
 
 def housekeeping(topo, used):
-    """Le CPU del sistema: tutte, meno quelle del banco e i loro fratelli."""
+    """The system CPUs: all of them, minus the bench ones and their siblings."""
     busy = set(used) | set(idle_siblings(topo, used))
     return [c for c in topo.online if c not in busy]
 
 
 class Roles:
-    """I ruoli di un comando qualunque (--run): stessa forma di
-    bench_throughput.CpuPlan per quello che serve qui."""
+    """The roles of an arbitrary command (--run)."""
 
     def __init__(self, topo, dut, gen=(), egress=None):
         self.topo = topo
@@ -602,9 +430,7 @@ class Roles:
                       | set(egress_cpus(self.egress)))
 
 
-# ==========================================================================
-# LO STATO SALVATO, E IL RIPRISTINO
-# ==========================================================================
+# --- saved state and restore ---
 def load_state(paths):
     txt = read_text(paths.state)
     if not txt:
@@ -620,9 +446,7 @@ def _comm_of(paths, pid):
 
 
 def restore_changes(changes, runner=None, paths=None, setaffinity=None):
-    """Riscrive all'indietro. Ogni voce e' indipendente: un fallimento si
-    conta e si va avanti, perche' un ripristino a meta' e' peggio di uno con
-    una voce mancante. Restituisce [(voce, errore)]."""
+    """Writes back in reverse order."""
     runner = runner or run_cmd
     paths = paths or Paths()
     setaffinity = setaffinity or os.sched_setaffinity
@@ -642,8 +466,6 @@ def restore_changes(changes, runner=None, paths=None, setaffinity=None):
                 if rc:
                     raise OSError(err.strip() or f"powerprofilesctl rc={rc}")
             elif kind == "affinity":
-                # Il pid puo' essere stato riusato: si ripristina solo se e'
-                # ancora lo stesso thread (stesso nome).
                 if _comm_of(paths, ch["pid"]) == ch.get("comm"):
                     setaffinity(int(ch["pid"]), set(parse_cpu_list(ch["old"])))
         except (OSError, ValueError, KeyError) as e:
@@ -653,11 +475,7 @@ def restore_changes(changes, runner=None, paths=None, setaffinity=None):
 
 def recover_stale_state(paths=None, runner=None, alive=None, me=None,
                         setaffinity=None):
-    """Se un run precedente e' morto senza ripristinare, ripristina adesso.
-
-    Solleva RuntimeError se il file appartiene a un processo ancora vivo: due
-    banchi con le condizioni applicate contemporaneamente si ripristinerebbero
-    a vicenda i valori sbagliati. Restituisce le voci ripristinate."""
+    """If a previous run died without restoring, restore now."""
     paths = paths or Paths()
     alive = alive or pid_alive
     data = load_state(paths)
@@ -668,16 +486,16 @@ def recover_stale_state(paths=None, runner=None, alive=None, me=None,
     pid = data.get("pid")
     if pid and pid != me and alive(pid):
         raise RuntimeError(
-            f"le condizioni della macchina sono gia' applicate dal processo "
-            f"{pid} ({paths.state}). Se quel processo non e' un banco: sudo "
+            f"the machine conditions are already applied by process "
+            f"{pid} ({paths.state}). If that process is not a bench: sudo "
             f"python3 ipa/test/host_conditions.py --restore --force")
     changes = data.get("changes", [])
-    warn(f"stato di un run interrotto senza ripristino (pid {pid}, "
-         f"{data.get('started', '?')}): ripristino {len(changes)} "
-         f"impostazioni prima di cominciare")
+    warn(f"state of a run interrupted without restore (pid {pid}, "
+         f"{data.get('started', '?')}): restoring {len(changes)} "
+         f"settings before starting")
     failed = restore_changes(changes, runner, paths, setaffinity)
     for ch, err in failed:
-        warn(f"non ripristinato: {_describe_change(ch)} -- {err}")
+        warn(f"not restored: {_describe_change(ch)} -- {err}")
     os.remove(paths.state)
     return len(changes)
 
@@ -689,14 +507,14 @@ def _describe_change(ch):
     if k == "unit":
         return f"{ch.get('unit')} {ch.get('prop')}={ch.get('old')}"
     if k == "profile":
-        return f"profilo {ch.get('old')}"
+        return f"profile {ch.get('old')}"
     if k == "affinity":
         return f"affinita' di {ch.get('comm')} ({ch.get('pid')}) = {ch.get('old')}"
     return str(ch)
 
 
 def _uniform(values, fmt=str):
-    """{cpu: valore} -> "cpu 1,3,6: v" se tutti uguali, altrimenti per CPU."""
+    """{cpu: value} -> "cpu 1,3,6: v" if all equal, otherwise per CPU."""
     vals = {c: v for c, v in values.items()}
     if not vals:
         return "n/d"
@@ -706,16 +524,9 @@ def _uniform(values, fmt=str):
     return "; ".join(f"cpu{c} {fmt(v)}" for c, v in sorted(vals.items()))
 
 
-# ==========================================================================
-# APPLICARE LE CONDIZIONI
-# ==========================================================================
+# --- applying the conditions ---
 class HostConditioner:
-    """Applica le condizioni del banco e le ripristina. Vedi la docstring del
-    modulo per cosa e perche'; qui il come.
-
-    Ogni modifica passa da _set_file / _record: il valore vecchio si salva
-    nel file di stato PRIMA di scrivere quello nuovo, cosi' un'interruzione
-    in qualunque punto lascia un ripristino completo."""
+    """Applies the bench conditions and restores them."""
 
     def __init__(self, topo, dut, gen=(), egress=None, *, freq=DEFAULT_FREQ,
                  system_max_mhz=DEFAULT_SYSTEM_MAX_MHZ,
@@ -753,7 +564,6 @@ class HostConditioner:
         self._handlers = {}
         self._started = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    # -- stato -----------------------------------------------------------
     def _write_state(self):
         path = self.paths.state
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -774,8 +584,8 @@ class HostConditioner:
             self._write_state()
 
     def _set_file(self, path, new, what=""):
-        """None: il file non c'e'. False: scrittura rifiutata (il valore resta
-        quello di prima). True: il file vale `new`."""
+        """None: the file does not exist. False: write refused (the value stays
+        as before). True: the file holds `new`."""
         old = read_text(path)
         if old is None:
             return None
@@ -792,15 +602,12 @@ class HostConditioner:
         return True
 
     def _remember_file(self, path, what=""):
-        """Salva il valore senza scriverlo: si riscrive al ripristino. Per
-        l'EPP, che il governor performance forza da se' e che il ritorno a
-        powersave deve ritrovare com'era."""
+        """Saves the value without writing it."""
         old = read_text(path)
         if old is not None:
             self._record(dict(kind="file", path=path, old=old, new=None,
                               what=what))
 
-    # -- ciclo di vita -----------------------------------------------------
     def apply(self):
         if self.active:
             return self
@@ -811,13 +618,13 @@ class HostConditioner:
         self._install_signals()
         atexit.register(self.restore)
         _say(f"\n{YELLOW}{'=' * 78}{NC}")
-        _say(f"{YELLOW} Condizioni della macchina (host_conditions){NC}")
+        _say(f"{YELLOW} Machine conditions (host_conditions){NC}")
         _say(f"{YELLOW}{'=' * 78}{NC}")
         try:
             self._check_power()
             self._step_profile()
             if self.isolate and not self.hk:
-                warn("nessuna CPU resta al sistema: isolamento saltato")
+                warn("no CPU left to the system: isolation skipped")
                 self.isolate = False
             if self.isolate:
                 self._step_scope()
@@ -838,16 +645,14 @@ class HostConditioner:
             raise
         for k, v in self.facts:
             note(f"{k:22s} {v}")
-        info(f"{len(self.changes)} impostazioni cambiate, salvate in "
-             f"{self.paths.state}; si ripristinano a fine run")
+        info(f"{len(self.changes)} settings changed, saved in "
+             f"{self.paths.state}; restored at the end of the run")
         return self
 
     def restore(self):
         if not self.active:
             return []
         self.active = False
-        # Un secondo Ctrl-C (o SIGTERM) durante il ripristino lo lascerebbe a
-        # meta': per la sua durata i segnali si ignorano.
         during = {}
         for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             try:
@@ -865,8 +670,6 @@ class HostConditioner:
                 pass
         finally:
             for s, h in during.items():
-                # SIGTERM e SIGHUP tornano a com'erano prima di apply();
-                # SIGINT a com'era prima del ripristino.
                 try:
                     signal.signal(s, self._handlers.get(s, h))
                 except (ValueError, OSError):
@@ -878,9 +681,9 @@ class HostConditioner:
             pass
         if failed:
             for ch, err in failed:
-                warn(f"non ripristinato: {_describe_change(ch)} -- {err}")
-        _say(f"  {GREY}condizioni della macchina ripristinate: {n - len(failed)}"
-             f"/{n} impostazioni{NC}")
+                warn(f"not restored: {_describe_change(ch)} -- {err}")
+        _say(f"  {GREY}machine conditions restored: {n - len(failed)}"
+             f"/{n} settings{NC}")
         return failed
 
     def __enter__(self):
@@ -890,23 +693,21 @@ class HostConditioner:
         self.restore()
 
     def _install_signals(self):
-        """SIGTERM e SIGHUP come Ctrl-C: risalgono come eccezione, e i
-        `finally` del banco (fabric, pktgen, ripristino) girano."""
+        """SIGTERM e SIGHUP come Ctrl-C."""
         def handler(signum, frame):
-            raise KeyboardInterrupt(f"segnale {signum}")
+            raise KeyboardInterrupt(f"signal {signum}")
         for s in (signal.SIGTERM, signal.SIGHUP):
             try:
                 self._handlers[s] = signal.signal(s, handler)
             except (ValueError, OSError):
-                pass            # non dal thread principale: resta atexit
+                pass
 
-    # -- i passi -----------------------------------------------------------
     def _check_power(self):
         on_ac, pct = power_source(self.paths)
         if on_ac is False:
-            warn("il portatile e' a BATTERIA: limiti di potenza e profilo "
-                 "cambiano, e power-profiles-daemon puo' cambiarli a meta' "
-                 "run. Collega l'alimentatore.")
+            warn("the laptop is on BATTERY: power limits and profile "
+                 "change, and power-profiles-daemon may change them in the "
+                 "middle of the run. Plug in the power supply.")
         self.facts.append(("alimentazione", _power_text(on_ac, pct)))
 
     def _ppd_active(self):
@@ -917,7 +718,7 @@ class HostConditioner:
     def _step_profile(self):
         target = self.profile
         if target in (None, "", "keep"):
-            self.facts.append(("profilo", "non toccato"))
+            self.facts.append(("profilo", "not touched"))
             return
         if self._ppd_active():
             rc, cur, _ = self.run(["powerprofilesctl", "get"])
@@ -930,7 +731,7 @@ class HostConditioner:
                     warn(f"powerprofilesctl set {target}: "
                          f"{err.strip() or rc2}")
             _, now, _ = self.run(["powerprofilesctl", "get"])
-            self.facts.append(("profilo", f"{now.strip() or '?'} (era "
+            self.facts.append(("profilo", f"{now.strip() or '?'} (was "
                                           f"{cur or '?'}, power-profiles-daemon)"))
             return
         path = self.paths.sys("firmware", "acpi", "platform_profile")
@@ -938,14 +739,14 @@ class HostConditioner:
             "firmware", "acpi", "platform_profile_choices")) or "").split()
         old = read_text(path)
         if old is None:
-            self.facts.append(("profilo", "platform_profile assente"))
+            self.facts.append(("profilo", "platform_profile missing"))
             return
         if target not in choices:
-            warn(f"profilo {target!r} non fra {choices}: resta {old}")
+            warn(f"profile {target!r} not among {choices}: keeping {old}")
             self.facts.append(("profilo", old))
             return
         self._set_file(path, target, "platform_profile")
-        self.facts.append(("profilo", f"{read_text(path)} (era {old})"))
+        self.facts.append(("profilo", f"{read_text(path)} (was {old})"))
 
     def _cgroup_of_self(self):
         return read_text(self.paths.proc("self", "cgroup")) or ""
@@ -958,13 +759,7 @@ class HostConditioner:
             return [self._getpid()]
 
     def _step_scope(self):
-        """Il processo del banco in uno scope suo, sotto ipa-bench.slice.
-
-        Con StartTransientUnit e PIDs=[noi], come fa `systemd-run --scope`,
-        ma senza rilanciare il processo. Poi tutti i suoi thread sulle CPU
-        del sistema: il banco legge contatori e scrive CSV, e non deve farlo
-        sui core che misura. I thread che servono altrove (xdp_gen) si
-        pinnano da soli, e fuori da user.slice possono ancora farlo."""
+        """The bench process in its own scope, under ipa-bench.slice."""
         me = self._getpid()
         if SCOPE_SLICE not in self._cgroup_of_self():
             unit = f"ipa-bench-{me}-{int(time.time())}.scope"
@@ -983,13 +778,13 @@ class HostConditioner:
                         break
                     time.sleep(0.02)
             if SCOPE_SLICE not in self._cgroup_of_self():
-                warn("il processo del banco non e' passato in uno scope suo "
-                     f"({err.strip() or 'busctl rc=' + str(rc)}): confinare "
-                     "user.slice lo porterebbe via dalle CPU che deve usare. "
-                     "Salto il confinamento dei processi; IRQ, workqueue e "
-                     "kernel thread si spostano lo stesso.")
-                self.facts.append(("isolamento_processi", "no (scope non "
-                                                          "creato)"))
+                warn("the bench process did not move into its own scope "
+                     f"({err.strip() or 'busctl rc=' + str(rc)}): confining "
+                     "user.slice would take it away from the CPUs it must use. "
+                     "Skipping process confinement; IRQs, workqueues and "
+                     "kernel threads are moved anyway.")
+                self.facts.append(("isolamento_processi", "no (scope not "
+                                                          "created)"))
                 return
         self._scoped = True
         hk = set(self.hk)
@@ -1019,18 +814,16 @@ class HostConditioner:
                                    unit, f"AllowedCPUs={hk}"])
             if rc:
                 self._unrecord(ch)
-                warn(f"{unit}: AllowedCPUs rifiutato ({err.strip() or rc})")
+                warn(f"{unit}: AllowedCPUs refused ({err.strip() or rc})")
                 continue
             done.append(unit)
         self.facts.append(("isolamento_processi",
                            f"{', '.join(done)} -> cpu {hk}" if done
-                           else "non applicato"))
+                           else "not applied"))
 
     def _step_kthreads(self):
-        """I kernel thread non legati a una CPU (rcu_preempt, kswapd,
-        khugepaged, kcompactd, ...) sulle CPU del sistema. Quelli per-CPU hanno
-        PF_NO_SETAFFINITY e restano dove sono; napi/* e kpktgend_* li pinna il
-        banco."""
+        """The kernel threads not bound to a CPU (rcu_preempt, kswapd,
+        khugepaged, kcompactd, ...) onto the system CPUs."""
         hk = set(self.hk)
         moved = refused = 0
         try:
@@ -1047,9 +840,6 @@ class HostConditioner:
             if not flags & PF_KTHREAD or flags & PF_NO_SETAFFINITY:
                 continue
             comm = _comm_of(self.paths, pid) or ""
-            # irq/*: il kernel li tiene sull'affinita' EFFETTIVA del loro
-            # IRQ e la ricalcola da se' (visto il 2026-09-27: irq/167-iwlwifi
-            # su cpu10, dopo il ripristino su cpu16). Si spostano con l'IRQ.
             if comm.startswith(("napi/", "kpktgend", "irq/")):
                 continue
             try:
@@ -1068,8 +858,8 @@ class HostConditioner:
                 self._unrecord(ch)
                 refused += 1
         self.facts.append(("isolamento_kthread",
-                           f"{moved} spostati sulle CPU del sistema"
-                           + (f", {refused} rifiutati" if refused else "")))
+                           f"{moved} moved to the system CPUs"
+                           + (f", {refused} refused" if refused else "")))
 
     def _step_irqs(self):
         hk_list = format_cpu_list(self.hk)
@@ -1099,20 +889,20 @@ class HostConditioner:
         self._set_file(os.path.join(base, "default_smp_affinity"),
                        cpu_mask_hex(self.hk), "irq default")
         self.facts.append(("isolamento_irq",
-                           f"{moved} IRQ su cpu {hk_list}"
-                           + (f", {refused} non spostabili (affinita' gestita "
-                              f"dal kernel)" if refused else "")))
+                           f"{moved} IRQs on cpu {hk_list}"
+                           + (f", {refused} not movable (affinity managed "
+                              f"by the kernel)" if refused else "")))
 
     def _step_workqueue(self):
         path = self.paths.sys("devices", "virtual", "workqueue", "cpumask")
         r = self._set_file(path, cpu_mask_hex(self.hk), "workqueue unbound")
         self.facts.append(("isolamento_workqueue",
-                           f"unbound su cpu {format_cpu_list(self.hk)}"
-                           if r else "non applicato"))
+                           f"unbound on cpu {format_cpu_list(self.hk)}"
+                           if r else "not applied"))
 
     def _step_freq(self):
         if self.freq in (None, "", "keep"):
-            self.facts.append(("frequenza", "non toccata"))
+            self.facts.append(("frequenza", "not touched"))
             return
         cpus = sorted(set(self.bench) | set(self.siblings))
         missing, pinned, unpinned = [], {}, []
@@ -1143,8 +933,6 @@ class HostConditioner:
                 self._set_file(f("scaling_governor"), "performance",
                                f"governor cpu{c}")
             if target:
-                # min al minimo, poi max, poi min: ogni scrittura resta
-                # valida (min <= max) qualunque fosse il punto di partenza.
                 if lo:
                     self._set_file(f("scaling_min_freq"), lo, f"min cpu{c}")
                 self._set_file(f("scaling_max_freq"), target, f"max cpu{c}")
@@ -1158,13 +946,9 @@ class HostConditioner:
             else:
                 unpinned.append(c)
         if missing and len(missing) == len(cpus):
-            self.facts.append(("frequenza", "cpufreq assente: non "
-                                            "controllabile"))
+            self.facts.append(("frequenza", "cpufreq missing: not "
+                                            "controllable"))
             return
-        # I limiti sono richieste di QoS: il kernel li applica alla policy in
-        # modo asincrono, e una rilettura immediata puo' restituire quelli
-        # vecchi (visto il 2026-09-27: "400-4800" subito dopo la scrittura,
-        # 1400-1400 un attimo dopo). Si rilegge finche' non si assestano.
         def readback():
             out = {}
             for c in pinned:
@@ -1185,37 +969,27 @@ class HostConditioner:
                 pinned, lambda v: f"performance, {(v[0] or 0) // 1000}-"
                                   f"{(v[1] or 0) // 1000} MHz")))
         if self.freq == "max":
-            self.facts.append(("frequenza", f"performance, turbo libero su "
+            self.facts.append(("frequenza", f"performance, free turbo on "
                                             f"cpu {format_cpu_list(cpus)} "
-                                            f"(non fissata)"))
+                                            f"(not fixed)"))
         if unpinned:
-            warn(f"base_frequency non esposta su cpu "
-                 f"{format_cpu_list(unpinned)}: frequenza non fissata "
-                 f"(usa --freq MHz)")
+            warn(f"base_frequency not exposed on cpu "
+                 f"{format_cpu_list(unpinned)}: frequency not fixed "
+                 f"(use --freq MHz)")
         if missing:
-            warn(f"cpufreq assente su cpu {format_cpu_list(missing)}")
+            warn(f"cpufreq missing on cpu {format_cpu_list(missing)}")
         bad = [c for c, (a, b) in pinned.items()
                if a != b or b != wanted.get(c)] if pinned else []
         if bad:
-            warn(f"frequenza non fissata come chiesto su cpu "
+            warn(f"frequency not fixed as requested on cpu "
                  f"{format_cpu_list(bad)}: " + _uniform(
                      {c: pinned[c] for c in bad},
                      lambda v: f"{(v[0] or 0) // 1000}-{(v[1] or 0) // 1000} "
                                f"MHz"))
 
     def _step_measure_freq(self):
-        """La frequenza che i core del banco tengono DAVVERO, da APERF/MPERF,
-        con un ciclo a vuoto di MEASURE_S secondi pinnato su ciascuno.
-
-        Non ci si fida del numero scritto nel sysfs. Il 2026-09-27, su questo
-        portatile (kernel 6.8, Core Ultra 7 155H), min = max = 1400000 kHz
-        riletti dal kernel davano un DUT fisso a ~2 000 MHz misurati, stabile
-        fra run (2006, 2004, 1997): la frequenza e' FISSATA, ma la
-        corrispondenza fra kHz del sysfs e frequenza vera, sui P-core di
-        questo processore ibrido, non e' quella dichiarata. Da qui in avanti
-        il riferimento (target_khz, che il monitor confronta finestra per
-        finestra) e' la frequenza misurata; quella chiesta resta in
-        requested_khz e in env.csv."""
+        """The frequency the bench cores ACTUALLY hold, from APERF/MPERF,
+        with a busy loop of MEASURE_S seconds pinned on each."""
         self.requested_khz = dict(self.target_khz)
         if not self.target_khz or self.paths.root != "/":
             return
@@ -1226,7 +1000,7 @@ class HostConditioner:
             if mon._fd is None:
                 mon.close()
                 self.facts.append(("frequenza_misurata",
-                                   f"non misurabile ({mon.msr_note})"))
+                                   f"not measurable ({mon.msr_note})"))
                 return
             a = mon.mark()
             try:
@@ -1253,28 +1027,26 @@ class HostConditioner:
             "frequenza_misurata",
             _uniform({c: v // 1000 for c, v in measured.items()},
                      lambda v: f"{v} MHz")
-            + f" (APERF/MPERF, {MEASURE_S} s a pieno carico; richiesta "
+            + f" (APERF/MPERF, {MEASURE_S} s at full load; requested "
               + _uniform({c: v // 1000 for c, v in self.requested_khz.items()},
                          lambda v: f"{v} MHz") + ")"))
         if spread > FREQ_TOLERANCE:
-            warn("i core del banco non tengono la stessa frequenza: "
+            warn("the bench cores do not hold the same frequency: "
                  + ", ".join(f"cpu{c} {v // 1000} MHz"
                              for c, v in sorted(measured.items())))
         off = {c: v for c, v in measured.items()
                if abs(v - self.requested_khz[c])
                > FREQ_TOLERANCE * self.requested_khz[c]}
         if off:
-            info("frequenza reale diversa da quella scritta nel sysfs ("
+            info("real frequency different from the one written in sysfs ("
                  + ", ".join(f"cpu{c}: {self.requested_khz[c] // 1000} "
-                             f"chiesti, {v // 1000} misurati"
+                             f"requested, {v // 1000} measured"
                              for c, v in sorted(off.items()))
-                 + "): e' comunque fissa; il riferimento del monitor e' "
-                   "quella misurata")
+                 + "): it is fixed anyway; the monitor's reference is the "
+                   "measured one")
 
     def _step_system_cap(self):
-        """Tetto di frequenza sulle CPU del sistema: niente turbo li', quindi
-        niente punti caldi che mandino in throttling il pacchetto intero.
-        Governor e minimo restano quelli di prima."""
+        """Frequency cap on the system CPUs."""
         cap = self.system_max_mhz
         if cap in (None, "", "keep") or not self.hk:
             return
@@ -1297,8 +1069,8 @@ class HostConditioner:
                 capped.append(c)
         if capped:
             self.facts.append(("frequenza_sistema",
-                               f"cpu {format_cpu_list(capped)}: massimo "
-                               f"{int(cap)} MHz (niente turbo durante il run)"))
+                               f"cpu {format_cpu_list(capped)}: max "
+                               f"{int(cap)} MHz (no turbo during the run)"))
 
     def _step_uncore(self):
         if self.uncore in (None, "", "keep"):
@@ -1326,13 +1098,13 @@ class HostConditioner:
                            f"uncore min {name}")
             done.append(f"{name} {target // 1000} MHz")
         self.facts.append(("uncore", ", ".join(done) if done
-                           else "non controllabile (intel_uncore_frequency "
-                                "assente)"))
+                           else "not controllable (intel_uncore_frequency "
+                                "missing)"))
 
     def _step_cstates(self):
         lim = self.cstate_max_us
         if lim in (None, "", "keep"):
-            self.facts.append(("idle", "non toccato"))
+            self.facts.append(("idle", "not touched"))
             return
         lim = int(lim)
         off, kept, seen = {}, {}, False
@@ -1359,14 +1131,14 @@ class HostConditioner:
                 else:
                     kept[name] = lat
         if not seen:
-            self.facts.append(("idle", "cpuidle assente (driver none?): "
-                                       "niente da limitare"))
+            self.facts.append(("idle", "cpuidle missing (driver none?): "
+                                       "nothing to limit"))
             return
         self.facts.append(("idle", f"cpu {format_cpu_list(self.bench)}: "
-                           + (("spenti " + ", ".join(
+                           + (("off " + ", ".join(
                                f"{n} ({l} us)" for n, l in off.items()))
-                              if off else "nessuno stato sopra la soglia")
-                           + ("; restano " + ", ".join(kept) if kept else "")))
+                              if off else "no state above the threshold")
+                           + ("; kept " + ", ".join(kept) if kept else "")))
 
     def _step_nmi(self):
         if not self.nmi_off:
@@ -1379,20 +1151,15 @@ class HostConditioner:
                                else "0"))
 
     def env_pairs(self):
-        out = [("condizionamento", "applicato da host_conditions, "
-                                   "ripristinato a fine run")]
+        out = [("condizionamento", "applied by host_conditions, "
+                                   "restored at the end of the run")]
         out += [(f"host_{k}", v) for k, v in self.facts]
         return out
 
 
-# ==========================================================================
-# IL MONITOR
-# ==========================================================================
+# --- IL MONITOR ---
 def power_source(paths=None):
-    """(sulla rete: True/False/None, batteria %: int o None).
-
-    Un caricatore USB-C compare come alimentatore "USB" (ucsi) accanto,
-    o al posto, di quello "Mains" (ACAD): basta che uno dei due sia online."""
+    """(on mains: True/False/None, battery %: int or None)."""
     paths = paths or Paths()
     online, pct = [], None
     for d in sorted(glob.glob(paths.sys("class", "power_supply", "*"))):
@@ -1407,8 +1174,8 @@ def power_source(paths=None):
 
 
 def _power_text(on_ac, pct):
-    src = {True: "rete (AC)", False: "BATTERIA", None: "sconosciuta"}[on_ac]
-    return src + (f", batteria {pct}%" if pct is not None else "")
+    src = {True: "mains (AC)", False: "BATTERY", None: "unknown"}[on_ac]
+    return src + (f", battery {pct}%" if pct is not None else "")
 
 
 def _thermal_zone(paths, typ):
@@ -1419,8 +1186,8 @@ def _thermal_zone(paths, typ):
 
 
 def _coretemp_input(paths, topo, cpu):
-    """Il tempN_input di coretemp per il core fisico di `cpu` (etichetta
-    "Core <core_id>")."""
+    """The coretemp tempN_input of the physical core of `cpu` (label "Core
+    <core_id>")."""
     if topo is None or cpu is None or cpu not in topo.cpus:
         return None
     want = f"Core {topo.cpus[cpu]['core_id']}"
@@ -1446,22 +1213,7 @@ def _max_state(files):
 
 
 def host_columns(a, b, target_khz=None):
-    """Le colonne host_* fra due letture del monitor. Funzione pura: i test la
-    verificano senza MSR e senza sysfs.
-
-      host_throttle_core  eventi di throttling termico dei core osservati
-      host_throttle_pkg   eventi del pacchetto (il massimo fra le CPU: ognuna
-                          li conta dal proprio punto di vista)
-      host_dut_busy_pct   quota del tempo in C0 del DUT (MPERF / TSC)
-      host_dut_mhz        frequenza media del DUT mentre lavorava:
-                          TSC/s x APERF/MPERF, come Bzy_MHz di turbostat
-      host_smi            System Management Interrupt (MSR 0x34): il firmware
-                          ferma TUTTE le CPU, e il kernel non lo vede
-      host_off_target     DUT occupato ma a una frequenza diversa da quella
-                          fissata oltre FREQ_TOLERANCE
-      host_disturbed      throttling, powerclamp, raffreddamento passivo,
-                          batteria o frequenza fuori target: la finestra non
-                          e' stata misurata nelle condizioni dichiarate"""
+    """The host_* columns between two monitor readings."""
     if not a or not b:
         return {}
     dt = b["t"] - a["t"]
@@ -1514,10 +1266,8 @@ def host_columns(a, b, target_khz=None):
 
 
 class HostMonitor:
-    """Letture della macchina attorno alle misure. mark() costa qualche
-    lettura di sysfs e, se c'e' /dev/cpu/N/msr, tre di MSR sul DUT: ognuna e'
-    un IPI verso il DUT, quindi si chiama FUORI dalla finestra (prima che
-    pktgen parta e dopo che si e' fermato), mai durante."""
+    """Machine readings around the measurements. mark() costs a few sysfs
+    reads and, if /dev/cpu/N/msr exists, three MSR reads on the DUT."""
 
     def __init__(self, topo, watch, dut=None, paths=None, target_khz=None,
                  use_msr=True):
@@ -1528,7 +1278,7 @@ class HostMonitor:
                                                 else None)
         self.target_khz = target_khz
         self._fd = None
-        self.msr_note = "non chiesto"
+        self.msr_note = "not requested"
         if use_msr and self.dut is not None:
             self._open_msr()
         self._pkg_zone = _thermal_zone(self.paths, "x86_pkg_temp")
@@ -1546,13 +1296,13 @@ class HostMonitor:
         try:
             fd = os.open(path, os.O_RDONLY)
         except OSError as e:
-            self.msr_note = f"assente ({e.strerror})"
+            self.msr_note = f"missing ({e.strerror})"
             return
         try:
             os.pread(fd, 8, MSR_APERF)
         except OSError as e:
             os.close(fd)
-            self.msr_note = f"illeggibile ({e.strerror})"
+            self.msr_note = f"unreadable ({e.strerror})"
             return
         self._fd = fd
         self.msr_note = f"APERF/MPERF su cpu{self.dut}"
@@ -1595,7 +1345,6 @@ class HostMonitor:
     def delta(self, a, b):
         return host_columns(a, b, self.dut_target_khz)
 
-    # -- l'intero run -------------------------------------------------------
     def start_run(self):
         self._start = self.mark()
         return self._start
@@ -1604,8 +1353,7 @@ class HostMonitor:
         return host_columns(self._start, self.mark(), self.dut_target_khz)
 
     def start_log(self, path, period=1.0):
-        """Il registro al secondo, in un processo a parte: un thread qui
-        contenderebbe il GIL alle letture a tempo del banco."""
+        """The per-second log, in a separate process."""
         self.stop_log()
         argv = [sys.executable, os.path.abspath(__file__), "--log", path,
                 "--period", str(period), "--watch",
@@ -1617,7 +1365,7 @@ class HostMonitor:
                                          close_fds=True)
             self._log_path = path
         except OSError as e:
-            warn(f"registro della macchina non avviato: {e}")
+            warn(f"machine log not started: {e}")
             self._log = None
 
     def stop_log(self):
@@ -1650,9 +1398,7 @@ LOG_COLS = ("tempo", "t_s", "temp_pacchetto_c", "throttle_core",
 
 
 def log_loop(path, watch, period=1.0, paths=None, max_samples=None):
-    """Il corpo di `--log`: una riga ogni `period` secondi finche' il padre
-    e' vivo. Solo sysfs, niente MSR (ogni lettura di MSR e' un IPI verso la
-    CPU letta)."""
+    """The body of `--log`."""
     paths = paths or Paths()
     parent = os.getppid()
     mon = HostMonitor(None, watch, paths=paths, use_msr=False)
@@ -1687,8 +1433,7 @@ def log_loop(path, watch, period=1.0, paths=None, max_samples=None):
 
 
 def summarise_log(path):
-    """Massimi e differenze del registro: che cosa e' successo fra la prima
-    e l'ultima riga."""
+    """Maxima and differences of the log."""
     if not path or not os.path.exists(path):
         return None
     try:
@@ -1722,9 +1467,7 @@ def summarise_log(path):
                 campioni_a_batteria=sum(1 for v in ac if v == 0))
 
 
-# ==========================================================================
-# LE CONDIZIONI, LETTE (anche senza condizionamento)
-# ==========================================================================
+# --- the conditions, as read (also without conditioning) ---
 def _dmi(paths):
     def rd(n):
         return read_text(paths.sys("class", "dmi", "id", n)) or ""
@@ -1743,8 +1486,7 @@ def _microcode(paths):
 
 
 def read_conditions(topo, cpus, paths=None):
-    """Le condizioni delle CPU del banco come sono ADESSO: governor, limiti di
-    frequenza, EPP, stati di idle attivi, throttling cumulato dal boot."""
+    """The conditions of the bench CPUs as they are NOW."""
     paths = paths or Paths()
     gov, lim, epp, idle, thr = {}, {}, {}, {}, {}
     for c in cpus:
@@ -1767,7 +1509,7 @@ def read_conditions(topo, cpus, paths=None):
                 if read_text(os.path.join(s, "disable")) == "0":
                     on.append(read_text(os.path.join(s, "name")) or
                               os.path.basename(s))
-            idle[c] = ",".join(on) or "nessuno"
+            idle[c] = ",".join(on) or "none"
         ct = f("thermal_throttle", "core_throttle_count")
         if ct is not None:
             thr[c] = ct
@@ -1776,11 +1518,7 @@ def read_conditions(topo, cpus, paths=None):
 
 def env_pairs(plan, host=None, monitor=None, paths=None, runner=None,
               log_summary=None):
-    """Le righe di env.csv sulla macchina: chi fa cosa, e in che condizioni.
-
-    `plan`: qualunque oggetto con topo, dut, gen, egress (CpuPlan di
-    bench_throughput, Roles qui). `host`: il HostConditioner, se applicato.
-    `monitor`: il HostMonitor del run, per le differenze dall'inizio."""
+    """The env.csv rows about the machine."""
     paths = paths or Paths()
     runner = runner or run_cmd
     topo = getattr(plan, "topo", None) or Topology.read(paths)
@@ -1800,14 +1538,14 @@ def env_pairs(plan, host=None, monitor=None, paths=None, runner=None,
         add("ruolo_dut", ", ".join(topo.label(c) for c in dut))
         add("ruolo_uscita", ", ".join(topo.label(c)
                                       for c in egress_cpus(egress))
-            if egress is not None else "nessuna CPU sua (softirq sulla CPU del DUT)")
+            if egress is not None else "no CPU of its own (softirq on the DUT CPU)")
         add("ruolo_generatore", ", ".join(topo.label(c) for c in gen))
         add("fratelli_smt_a_riposo",
-            format_cpu_list(idle_siblings(topo, used)) or "nessuno")
+            format_cpu_list(idle_siblings(topo, used)) or "none")
         add("cpu_sistema", format_cpu_list(housekeeping(topo, used)))
     add("intel_pstate", read_text(paths.cpu("intel_pstate", "status")))
     nt = read_text(paths.cpu("intel_pstate", "no_turbo"))
-    add("turbo", {"0": "attivo", "1": "disattivo"}.get(nt, nt))
+    add("turbo", {"0": "on", "1": "off"}.get(nt, nt))
     cond = read_conditions(topo, used, paths)
     add("governor_banco", _uniform(cond["governor"]))
     add("frequenza_banco", _uniform(cond["limiti"]))
@@ -1836,8 +1574,8 @@ def env_pairs(plan, host=None, monitor=None, paths=None, runner=None,
     if host is not None and host.active:
         env += host.env_pairs()
     else:
-        add("condizionamento", "no (--no-tune): condizioni della macchina "
-                               "lasciate com'erano, solo registrate")
+        add("condizionamento", "no (--no-tune): machine conditions "
+                               "left as they were, only recorded")
     if monitor is not None:
         add("msr", monitor.msr_note)
         if monitor._start is not None:
@@ -1853,61 +1591,59 @@ def env_pairs(plan, host=None, monitor=None, paths=None, runner=None,
     return env
 
 
-# ==========================================================================
-# PER I BANCHI: argomenti e costruzione
-# ==========================================================================
+# --- for the benches: arguments and construction ---
 def add_args(parser):
     g = parser.add_argument_group(
-        "condizioni della macchina (host_conditions.py, tutte reversibili)")
+        "machine conditions (host_conditions.py, all reversible)")
     g.add_argument("--no-tune", action="store_true",
-                   help="non toccare la macchina: niente frequenza fissa, "
-                        "idle, isolamento, profilo. Le condizioni vengono "
-                        "comunque lette e scritte in env.csv.")
+                   help="do not touch the machine: no fixed frequency, "
+                        "idle, isolation, profile. The conditions are "
+                        "still read and written to env.csv.")
     g.add_argument("--freq", default=DEFAULT_FREQ, metavar="F",
-                   help=f"frequenza dei core del banco in MHz (default "
-                        f"{DEFAULT_FREQ}: la piu' alta che il portatile di "
-                        f"laboratorio regge per un run intero), base (quella "
-                        f"garantita al TDP), max "
-                        "(governor performance e turbo libero: piu' veloce, "
-                        "meno ripetibile), keep, oppure MHz")
+                   help=f"frequency of the bench cores in MHz (default "
+                        f"{DEFAULT_FREQ}: the highest the lab laptop holds "
+                        f"for a whole run), base (the one guaranteed at "
+                        f"TDP), max "
+                        "(performance governor and free turbo: faster, "
+                        "less repeatable), keep, or MHz")
     g.add_argument("--system-max-mhz", default=str(DEFAULT_SYSTEM_MAX_MHZ),
                    metavar="MHZ",
-                   help=f"tetto di frequenza delle CPU del sistema (desktop, "
-                        f"browser, il processo del banco) durante il run "
-                        f"(default {DEFAULT_SYSTEM_MAX_MHZ}): un core in turbo "
-                        f"scalda il pacchetto fino al throttling. keep per "
-                        f"non toccarle")
+                   help=f"frequency cap of the system CPUs (desktop, "
+                        f"browser, the bench process) during the run "
+                        f"(default {DEFAULT_SYSTEM_MAX_MHZ}): a core in turbo "
+                        f"heats the package up to throttling. keep to "
+                        f"leave them alone")
     g.add_argument("--uncore", default=DEFAULT_UNCORE, metavar="U",
-                   help="frequenza della uncore (L3, anello): max (default), "
-                        "keep, oppure MHz")
+                   help="uncore frequency (L3, ring): max (default), "
+                        "keep, or MHz")
     g.add_argument("--cstate-max-us", default=str(DEFAULT_CSTATE_MAX_US),
                    metavar="US",
-                   help="sulle CPU del banco spegne gli stati di idle con "
-                        "uscita piu' lenta di US microsecondi (default 1: "
-                        "restano POLL e C1E); 0 = solo POLL; keep")
+                   help="on the bench CPUs, disable the idle states with "
+                        "exit slower than US microseconds (default 1: "
+                        "POLL and C1E stay); 0 = POLL only; keep")
     g.add_argument("--profile", default=DEFAULT_PROFILE, metavar="P",
-                   help="profilo di power-profiles-daemon durante il run "
-                        "(default performance), oppure keep")
+                   help="power-profiles-daemon profile during the run "
+                        "(default performance), or keep")
     g.add_argument("--no-isolate", action="store_true",
-                   help="non confinare processi, IRQ, workqueue e kernel "
-                        "thread sulle CPU del sistema")
+                   help="do not confine processes, IRQs, workqueues and kernel "
+                        "threads to the system CPUs")
     g.add_argument("--keep-nmi-watchdog", action="store_true",
-                   help="lascia acceso l'NMI watchdog")
+                   help="leave the NMI watchdog on")
     return g
 
 
 def check_args(a):
-    """Valida i valori che argparse non puo' validare da solo."""
+    """Validates the values argparse cannot validate by itself."""
     def num_or(v, words, what):
         if v in words:
             return v
         try:
             n = int(v)
         except (TypeError, ValueError):
-            sys.exit(f"{what}: atteso {' | '.join(words)} oppure un numero, "
-                     f"ricevuto {v!r}")
+            sys.exit(f"{what}: expected {' | '.join(words)} or a number, "
+                     f"got {v!r}")
         if n < 0:
-            sys.exit(f"{what}: serve un numero non negativo")
+            sys.exit(f"{what}: a non-negative number is needed")
         return str(n)
 
     a.freq = num_or(a.freq, ("base", "max", "keep"), "--freq")
@@ -1919,7 +1655,7 @@ def check_args(a):
 
 
 def from_args(a, plan, **kw):
-    """Il HostConditioner per `plan`, o None con --no-tune. Non applica."""
+    """Il HostConditioner per `plan`, o None con --no-tune."""
     if getattr(a, "no_tune", False):
         return None
     topo = getattr(plan, "topo", None) or Topology.read()
@@ -1933,9 +1669,9 @@ def from_args(a, plan, **kw):
 
 
 def parse_egress(spec):
-    """--egress-cpu: "auto", "none", un numero o una lista (una CPU per coda
-    d'uscita usata, vedi bench_throughput.pin_egress_napi). None = nessuna
-    CPU sua."""
+    """--egress-cpu: "auto", "none", a number or a list (one CPU per egress
+    queue used, see bench_capacity.pin_egress_napi). None = no CPU of its
+    own."""
     if spec is None:
         return None
     s = str(spec).strip().lower()
@@ -1949,14 +1685,12 @@ def parse_egress(spec):
             raise ValueError
         return cpus[0] if len(cpus) == 1 else cpus
     except ValueError:
-        sys.exit(f"--egress-cpu: atteso auto, none, un numero di CPU o una "
-                 f"lista senza ripetizioni, "
-                 f"ricevuto {spec!r}")
+        sys.exit(f"--egress-cpu: expected auto, none, a CPU number or a "
+                 f"list without repetitions, "
+                 f"got {spec!r}")
 
 
-# ==========================================================================
-# DA RIGA DI COMANDO
-# ==========================================================================
+# --- command line ---
 def _toolchain_hints():
     hints = []
     import shutil
@@ -1969,15 +1703,15 @@ def _toolchain_hints():
 
 
 def show(paths=None, allow_cpu0=False):
-    """--show: la topologia, il piano che i banchi userebbero, e le
-    condizioni attuali. Niente root, niente modifiche."""
+    """--show: the topology, the plan the benches would use, and the current
+    conditions. No root, no changes."""
     paths = paths or Paths()
     topo = Topology.read(paths)
-    _say(f"\n{YELLOW}== topologia =={NC}")
+    _say(f"\n{YELLOW}== topology =={NC}")
     _say(f"  {topo.summary()}")
-    _say(f"  {'cpu':>4s} {'tipo':5s} {'core':>9s} {'base':>6s} {'max':>6s} "
-         f"{'governor':12s} {'min-max MHz':>12s} {'epp':22s} idle attivi"
-         f"{'':3s}throttle")
+    _say(f"  {'cpu':>4s} {'type':5s} {'core':>9s} {'base':>6s} {'max':>6s} "
+         f"{'governor':12s} {'min-max MHz':>12s} {'epp':22s} active idle"
+         f"{'':2s}throttle")
     cond = read_conditions(topo, topo.online, paths)
     for c in topo.online:
         v = topo.cpus[c]
@@ -1990,49 +1724,49 @@ def show(paths=None, allow_cpu0=False):
     r = plan_roles(topo, want_egress=True, allow_cpu0=allow_cpu0)
     used = sorted(set(r["dut"]) | set(r["gen"])
                   | ({r["egress"]} if r["egress"] is not None else set()))
-    _say(f"\n{YELLOW}== piano automatico dei banchi =={NC}")
+    _say(f"\n{YELLOW}== automatic bench plan =={NC}")
     _say(f"  DUT ........... {', '.join(topo.label(c) for c in r['dut'])}")
-    _say(f"  uscita ........ " + (topo.label(r["egress"])
-                                  if r["egress"] is not None else "nessuna"))
+    _say(f"  egress ........ " + (topo.label(r["egress"])
+                                  if r["egress"] is not None else "none"))
     _say(f"  generatore .... {', '.join(topo.label(c) for c in r['gen'])}")
-    _say(f"  a riposo ...... {format_cpu_list(idle_siblings(topo, used))}"
-         f"  (fratelli SMT)")
-    _say(f"  sistema ....... {format_cpu_list(housekeeping(topo, used))}")
+    _say(f"  idle .......... {format_cpu_list(idle_siblings(topo, used))}"
+         f"  (SMT siblings)")
+    _say(f"  system ........ {format_cpu_list(housekeeping(topo, used))}")
     for n in r["notes"]:
         warn(n)
-    _say(f"\n{YELLOW}== condizioni attuali (delle CPU del piano) =={NC}")
+    _say(f"\n{YELLOW}== current conditions (of the plan's CPUs) =={NC}")
     for k, v in env_pairs(Roles(topo, r["dut"], r["gen"], r["egress"]),
                           paths=paths):
         if k in ("topologia_cpu",) or k.startswith(("ruolo_", "fratelli_",
                                                     "cpu_sistema")):
-            continue                    # gia' stampati sopra
+            continue
         _say(f"  {GREY}{k:28s}{NC} {v}")
     if os.path.exists(paths.state):
-        warn(f"{paths.state} esiste: un run e' in corso, o e' morto senza "
-             f"ripristinare (sudo python3 {sys.argv[0]} --restore)")
+        warn(f"{paths.state} exists: a run is in progress, or died without "
+             f"restoring (sudo python3 {sys.argv[0]} --restore)")
     hints = _toolchain_hints()
     if hints:
-        warn("manca per P1/P1.5 (oggetto AOT): sudo apt install "
+        warn("missing for P1/P1.5 (AOT object): sudo apt install "
              + " ".join(hints))
     return 0
 
 
 def _run_command(a, cmd):
-    """--run: condizioni applicate, `cmd` sul core del DUT, ripristino."""
+    """--run: conditions applied, `cmd` on the DUT core, restore."""
     if os.geteuid() != 0:
-        sys.exit("--run serve root: sudo python3 ipa/test/host_conditions.py "
-                 "--run -- COMANDO")
+        sys.exit("--run needs root: sudo python3 ipa/test/host_conditions.py "
+                 "--run -- COMMAND")
     if not cmd:
-        sys.exit("--run: manca il comando dopo --")
+        sys.exit("--run: the command after -- is missing")
     topo = Topology.read()
     if a.cpu is not None:
         if a.cpu not in topo.online:
-            sys.exit(f"--cpu {a.cpu}: CPU non online")
+            sys.exit(f"--cpu {a.cpu}: CPU not online")
         dut = a.cpu
     else:
         dut = plan_roles(topo, allow_cpu0=a.allow_cpu0)["dut"][0]
     roles = Roles(topo, [dut])
-    info(f"comando su {topo.label(dut)}: {' '.join(cmd)}")
+    info(f"command on {topo.label(dut)}: {' '.join(cmd)}")
     host = from_args(a, roles)
     if host is not None:
         host.apply()
@@ -2048,17 +1782,16 @@ def _run_command(a, cmd):
         mon.close()
         if host is not None:
             host.restore()
-        _say(f"\n{YELLOW} La macchina durante il comando{NC}")
-        for k, v in cols.items():
-            _say(f"  {GREY}{k:22s}{NC} {v}")
+        _say(f"\n  {GREY}machine during the command: core throttling "
+             f"{cols.get('host_throttle_core')}, package "
+             f"{cols.get('host_throttle_pkg')}; {cols.get('host_dut_mhz')} MHz; "
+             f"{cols.get('host_pkg_temp_c')} C; disturbed: "
+             f"{cols.get('host_disturbed')}{NC}")
         if cols.get("host_disturbed"):
-            warn("il comando NON ha girato nelle condizioni dichiarate "
-                 "(throttling, powerclamp, batteria o frequenza fuori "
-                 "target): vedi le righe sopra")
+            warn("the command did NOT run in the declared conditions "
+                 "(throttling, powerclamp, battery or frequency off "
+                 "target): see the lines above")
         if a.env:
-            # Le stesse colonne, in un env.csv accanto ai risultati del
-            # comando: run_disturbed e' cio' che population_report.py
-            # guarda per lasciare fuori una misura.
             os.makedirs(a.env, exist_ok=True)
             with open(os.path.join(a.env, "env.csv"), "w", newline="") as f:
                 w = csv.writer(f)
@@ -2076,23 +1809,23 @@ def main(argv=None):
         description=__doc__.strip().split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--show", action="store_true",
-                   help="topologia, piano automatico e condizioni attuali "
-                        "(niente root, niente modifiche)")
+                   help="topology, automatic plan and current conditions "
+                        "(no root, no changes)")
     p.add_argument("--restore", action="store_true",
-                   help="ripristina le condizioni lasciate da un run ucciso")
+                   help="restore the conditions left by a killed run")
     p.add_argument("--force", action="store_true",
-                   help="con --restore: anche se il processo che le ha "
-                        "applicate risulta vivo")
+                   help="with --restore: even if the process that applied "
+                        "them is still alive")
     p.add_argument("--run", action="store_true",
-                   help="applica le condizioni, esegue il comando dopo -- sul "
-                        "core del DUT, ripristina")
+                   help="apply the conditions, run the command after -- on "
+                        "the DUT core, restore")
     p.add_argument("--cpu", type=int, default=None,
-                   help="con --run: la CPU del comando (default: il DUT del "
-                        "piano automatico)")
+                   help="with --run: the command's CPU (default: the DUT of "
+                        "the automatic plan)")
     p.add_argument("--allow-cpu0", action="store_true")
     p.add_argument("--env", default=None, metavar="DIR",
-                   help="con --run: scrive in DIR/env.csv che cosa ha fatto "
-                        "la macchina durante il comando (run_disturbed, ...)")
+                   help="with --run: write to DIR/env.csv what the machine "
+                        "did during the command (run_disturbed, ...)")
     p.add_argument("--log", default=None, help=argparse.SUPPRESS)
     p.add_argument("--watch", default="", help=argparse.SUPPRESS)
     p.add_argument("--period", type=float, default=1.0,
@@ -2100,7 +1833,7 @@ def main(argv=None):
     p.add_argument("--root", default="/", help=argparse.SUPPRESS)
     add_args(p)
     p.add_argument("cmd", nargs=argparse.REMAINDER,
-                   help="con --run: il comando, dopo --")
+                   help="with --run: the command, after --")
     a = p.parse_args(argv)
     cmd = list(a.cmd or [])
     if cmd and cmd[0] == "--":
@@ -2113,14 +1846,14 @@ def main(argv=None):
         return 0
     if a.restore:
         if os.geteuid() != 0 and a.root == "/":
-            sys.exit("--restore serve root")
+            sys.exit("--restore needs root")
         data = load_state(paths)
         if data is None:
-            info(f"niente da ripristinare ({paths.state} non c'e')")
+            info(f"nothing to restore ({paths.state} does not exist)")
             return 0
         alive = (lambda pid: False) if a.force else pid_alive
         n = recover_stale_state(paths, alive=alive, me=os.getpid())
-        ok(f"ripristinate {n} impostazioni")
+        ok(f"restored {n} settings")
         return 0
     if a.run:
         check_args(a)

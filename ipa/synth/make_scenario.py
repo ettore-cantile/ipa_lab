@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""
-make_scenario.py -- generate a synthetic scenario's artefacts.
+"""make_scenario.py -- generate a synthetic scenario on disk.
 
     python3 ipa/synth/make_scenario.py --preset ipa_like
     python3 ipa/synth/make_scenario.py --preset all -n 1000
-    python3 ipa/synth/make_scenario.py --n-in-features 6,6,1,52 --n-out 7 \
-                                          --hidden 4,4 --seed 42
-
-Writes into ipa/synth/scenarios/<name>/ by default, reusing the repo's
-existing artefact names so every loader in the tree consumes them unchanged.
 """
 
 import argparse
@@ -20,21 +14,15 @@ _SHARED = os.path.dirname(_HERE)
 if _SHARED not in sys.path:
     sys.path.insert(0, _SHARED)
 
-from synth.spec import FeatureSet, FeatureSpec, ModelSpec        # noqa: E402
-from synth.generate import generate_scenario, preset, PRESETS    # noqa: E402
-from synth import reference as ref                               # noqa: E402
+from synth.spec import FeatureSet, FeatureSpec, ModelSpec  # noqa: E402
+from synth.generate import generate_scenario, preset, PRESETS  # noqa: E402
+from synth import reference as ref  # noqa: E402
 
 DEFAULT_ROOT = os.path.join(_HERE, "scenarios")
 
 
 def _custom_spec(args) -> ModelSpec:
-    """Build a ModelSpec from CLI flags.
-
-    --features takes `name:kind:size[:lo:hi:scale]` entries, so feature
-    semantics stay explicit on the command line too; there is deliberately no
-    "just give me N random features" shortcut, because a feature without a
-    declared kind is the thing this package exists to avoid.
-    """
+    """Build a ModelSpec from CLI flags."""
     feats = []
     for i, spec in enumerate(args.features.split(",")):
         parts = spec.split(":")

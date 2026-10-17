@@ -1,14 +1,5 @@
-"""host_conditions, checked without root and without touching the machine.
-
-The conditioner writes to sysfs, procfs and systemd; here every path points
-into a fake tree that copies THIS laptop (Core Ultra 7 155H: P-cores 0-11 with
-the real SMT pairs 0/5, 1/2, 3/4, 6/7, 8/9, 10/11, E-cores 12-19, LP E-cores
-20-21 without L3), and systemctl / powerprofilesctl / busctl are a fake that
-keeps their state. What can go wrong without anything crashing: the DUT on the
-same physical core as the generator, the desktop confined onto the DUT's
-sibling, a C-state disabled on the wrong CPU, and above all a restore that
-leaves the machine different from how it was found -- so the central check
-is that the tree comes back byte for byte, also after a simulated crash.
+"""test_host_conditions.py -- host_conditions on a fake /sys: pinning, frequency,
+idle states, and a restore that leaves the machine as it was. No root.
 
     python3 ipa/test/test_host_conditions.py
 """
@@ -35,15 +26,13 @@ def check(name, cond, detail=""):
           + (f" -- {detail}" if detail else ""))
 
 
-# --------------------------------------------------------------------------
-# the fake machine
-# --------------------------------------------------------------------------
+# --- the fake machine ---
 MTL_PAIRS = [(0, 5), (1, 2), (3, 4), (6, 7), (8, 9), (10, 11)]
 MTL_CORE_ID = {0: 16, 5: 16, 1: 8, 2: 8, 3: 12, 4: 12, 6: 20, 7: 20, 8: 24,
                9: 24, 10: 28, 11: 28, 12: 0, 13: 1, 14: 2, 15: 3, 16: 4,
                17: 5, 18: 6, 19: 7, 20: 32, 21: 33}
 IDLE = (("POLL", 0), ("C1E", 1), ("C6", 140), ("C10", 310))
-KTHREADS = {  # pid: (comm, flags)
+KTHREADS = {
     2: ("kthreadd", HC.PF_KTHREAD),
     15: ("rcu_preempt", HC.PF_KTHREAD),
     20: ("ksoftirqd/1", HC.PF_KTHREAD | HC.PF_NO_SETAFFINITY),
@@ -75,8 +64,6 @@ def build_mtl(root):
         w(root, f"{d}/topology/physical_package_id", 0)
         if n < 20:
             w(root, f"{d}/cache/index3/shared_cpu_list", "0-19")
-        # L2: il core sui P-core, il modulo di 4 sugli E-core, la coppia sui
-        # LP E-core (come su questa macchina)
         l2 = (sib.get(n, str(n)) if n < 12 else "12-15" if n < 16
               else "16-19" if n < 20 else "20-21")
         w(root, f"{d}/cache/index2/shared_cpu_list", l2)
@@ -138,8 +125,8 @@ def build_mtl(root):
     w(root, "proc/cpuinfo", "processor\t: 0\nmicrocode\t: 0x25")
     for irq in range(6):
         w(root, f"proc/irq/{irq}/smp_affinity_list", "0-21")
-    w(root, "proc/irq/7/smp_affinity_list", "0,5")        # gia' a posto
-    w(root, "proc/irq/9/smp_affinity_list", "0-21")       # gestito dal kernel
+    w(root, "proc/irq/7/smp_affinity_list", "0,5")
+    w(root, "proc/irq/9/smp_affinity_list", "0-21")
     w(root, "proc/irq/default_smp_affinity", "3fffff")
     w(root, "proc/self/cgroup",
       "0::/user.slice/user-1000.slice/session-2.scope")
@@ -152,8 +139,7 @@ def build_mtl(root):
 
 
 def build_flat(root, n=4):
-    """Una macchina piatta: n core, niente SMT, un tipo solo, niente
-    cpufreq ne' cpuidle."""
+    """A flat machine."""
     c = "sys/devices/system/cpu"
     w(root, f"{c}/online", f"0-{n - 1}")
     for i in range(n):
@@ -162,7 +148,7 @@ def build_flat(root, n=4):
 
 
 def build_smt_server(root):
-    """8 core / 16 thread non ibrido, fratelli (i, i+8)."""
+    """8 cores / 16 threads, not hybrid, siblings (i, i+8)."""
     c = "sys/devices/system/cpu"
     w(root, f"{c}/online", "0-15")
     for i in range(16):
@@ -185,7 +171,7 @@ def snapshot(root, skip=("proc/self/cgroup",)):
 
 
 class FakeSystem:
-    """systemctl / powerprofilesctl / busctl, con il loro stato."""
+    """systemctl / powerprofilesctl / busctl, with their state."""
 
     def __init__(self, root):
         self.root = root
@@ -235,7 +221,7 @@ class FakeAffinity:
 
     def set(self, pid, cpus):
         if pid in self.refuse:
-            raise PermissionError("rifiutato")
+            raise PermissionError("refused")
         self.aff[pid] = set(cpus)
 
 
@@ -249,7 +235,7 @@ def conditioner(root, roles, fake, aff, **kw):
 
 
 def simulate_crash(c):
-    """Il processo muore senza ripristinare: niente restore, niente atexit."""
+    """The process dies without restoring."""
     c.active = False
     atexit.unregister(c.restore)
     for s, h in c._handlers.items():
@@ -262,48 +248,46 @@ def cpu_file(root, cpu, *parts):
                                      f"cpu{cpu}", *parts))
 
 
-# --------------------------------------------------------------------------
-# the checks
-# --------------------------------------------------------------------------
+# --- the checks ---
 def t_lists():
-    print("[1] liste e maschere di CPU")
+    print("[1] CPU lists and masks")
     check("parse: '0,5,12-21'",
           HC.parse_cpu_list("0,5,12-21") == [0, 5] + list(range(12, 22)))
-    check("parse: spazi e a capo come separatori",
+    check("parse: spaces and newlines as separators",
           HC.parse_cpu_list("0 5\n7-8") == [0, 5, 7, 8])
-    check("format: ritorno", HC.format_cpu_list([21, 0, 5, 12, 13, 14, 15, 16,
-                                                  17, 18, 19, 20])
+    check("format: round trip", HC.format_cpu_list([21, 0, 5, 12, 13, 14, 15, 16,
+                                                     17, 18, 19, 20])
           == "0,5,12-21")
-    check("maschera di 22 CPU = 3fffff",
+    check("mask of 22 CPUs = 3fffff",
           HC.cpu_mask_hex(range(22)) == "3fffff")
-    check("maschera oltre 32 CPU: gruppi da 32 bit",
+    check("mask beyond 32 CPUs: 32-bit groups",
           HC.cpu_mask_hex([0, 40]) == "100,00000001"
           and HC.parse_cpu_mask("100,00000001") == [0, 40])
-    check("maschera vuota", HC.cpu_mask_hex([]) == "0")
+    check("empty mask", HC.cpu_mask_hex([]) == "0")
     try:
         HC.parse_cpu_list("5-2")
-        check("intervallo rovesciato rifiutato", False)
+        check("reversed range refused", False)
     except ValueError:
-        check("intervallo rovesciato rifiutato", True)
+        check("reversed range refused", True)
 
 
 def t_topology(root):
-    print("[2] topologia di questo portatile")
+    print("[2] topology of this laptop")
     topo = HC.Topology.read(HC.Paths(root))
     kinds = {c: topo.kind(c) for c in topo.online}
-    check("P 0-11, E 12-19, LP E 20-21 (senza L3)",
+    check("P 0-11, E 12-19, LP E 20-21 (no L3)",
           all(kinds[c] == "P" for c in range(12))
           and all(kinds[c] == "E" for c in range(12, 20))
           and kinds[20] == kinds[21] == "LPE", str(kinds))
-    check("ibrida e con SMT", topo.hybrid and topo.smt and topo.structured)
-    check("i fratelli veri: 0 con 5, 1 con 2",
+    check("hybrid and with SMT", topo.hybrid and topo.smt and topo.structured)
+    check("the real siblings: 0 with 5, 1 with 2",
           topo.core(0) == (0, 5) and topo.core(5) == (0, 5)
           and topo.core(1) == (1, 2))
-    check("6 core fisici P, 8 E, 2 LP E: 16 core",
+    check("6 physical P cores, 8 E, 2 LP E: 16 cores",
           len(topo.cores()) == 16)
-    check("etichetta", topo.label(6) == "cpu6 (P, fratello 7)",
+    check("label", topo.label(6) == "cpu6 (P, sibling 7)",
           topo.label(6))
-    check("riassunto", "LP E-core 20-21" in topo.summary()
+    check("summary", "LP E-core 20-21" in topo.summary()
           and "P-core 0-11 (SMT)" in topo.summary(), topo.summary())
 
 
@@ -319,72 +303,72 @@ def roles_ok(topo, r):
 
 
 def t_plan(root, flat, smt):
-    print("[3] i ruoli")
+    print("[3] the roles")
     topo = HC.Topology.read(HC.Paths(root))
     r = HC.plan_roles(topo, want_egress=True)
-    check("DUT su un P-core non preferito (turbo 4,5 GHz): cpu6",
+    check("DUT on a non-preferred P-core (turbo 4.5 GHz): cpu6",
           r["dut"] == [6], str(r))
-    check("uscita cpu8, generatore cpu10, 1, 3", r["egress"] == 8
+    check("egress cpu8, generator cpu10, 1, 3", r["egress"] == 8
           and r["gen"] == [10, 1, 3], str(r))
     used = r["dut"] + r["gen"] + [r["egress"]]
-    check("nessun ruolo sul core della CPU 0 (0 e 5)",
+    check("no role on CPU 0's core (0 and 5)",
           not ({0, 5} & set(used)))
-    check("un thread per core fisico, fratelli a riposo, il resto al "
-          "sistema", roles_ok(topo, r))
-    check("fratelli a riposo 2,4,7,9,11",
+    check("one thread per physical core, siblings idle, the rest to the "
+          "system", roles_ok(topo, r))
+    check("idle siblings 2,4,7,9,11",
           HC.idle_siblings(topo, used) == [2, 4, 7, 9, 11])
-    check("sistema 0,5,12-21",
+    check("system 0,5,12-21",
           HC.format_cpu_list(HC.housekeeping(topo, used)) == "0,5,12-21")
     r = HC.plan_roles(topo)
-    check("senza uscita: generatore 8, 10, 1", r["gen"] == [8, 10, 1]
+    check("without egress: generator 8, 10, 1", r["gen"] == [8, 10, 1]
           and r["egress"] is None, str(r))
     r = HC.plan_roles(topo, n_gen=4, want_egress=True)
-    check("--threads 4 prima dell'uscita: 4 P-core al generatore, uscita "
-          "no (e lo dice)", r["gen"] == [8, 10, 1, 3] and r["egress"] is None
-          and any("uscita" in n for n in r["notes"]), str(r))
+    check("--threads 4 before the egress: 4 P-cores to the generator, no "
+          "egress (and it says so)", r["gen"] == [8, 10, 1, 3] and r["egress"] is None
+          and any("egress" in n for n in r["notes"]), str(r))
     r = HC.plan_roles(topo, n_gen=6)
-    check("--threads 6: esteso sugli E-core (mai sui LP E), e lo dice",
+    check("--threads 6: extended to the E-cores (never to LP E), and it says so",
           r["gen"] == [8, 10, 1, 3, 12, 13]
-          and any("lenti" in n for n in r["notes"]), str(r))
+          and any("slow" in n for n in r["notes"]), str(r))
     used = [12, 16, 10]
-    check("DUT e uscita su E-core: i compagni di modulo L2 a riposo, "
-          "fuori dal sistema",
+    check("DUT and egress on E-cores: the L2-module mates idle, "
+          "out of the system",
           HC.format_cpu_list(HC.idle_siblings(topo, used)) == "11,13-15,17-19"
           and HC.format_cpu_list(HC.housekeeping(topo, used))
           == "0-9,20-21"
-          and topo.label(12) == "cpu12 (E, modulo L2 con 13-15)",
+          and topo.label(12) == "cpu12 (E, L2 module with 13-15)",
           f"{HC.idle_siblings(topo, used)} {topo.label(12)}")
-    check("su un P-core il modulo e' il core",
+    check("on a P-core the module is the core",
           topo.cluster(6) == topo.core(6) == (6, 7))
     r = HC.plan_roles(topo, allow_cpu0=True)
-    check("--allow-cpu0: il core 0/5 torna disponibile",
+    check("--allow-cpu0: core 0/5 available again",
           0 in r["dut"] + r["gen"], str(r))
 
     ft = HC.Topology.read(HC.Paths(flat))
-    check("macchina piatta: niente scelta da fare (structured falso)",
+    check("flat machine: no choice to make (structured false)",
           not ft.structured)
     r = HC.plan_roles(ft, want_egress=True)
-    check("piatta a 4 core: DUT 1, generatore 2,3, niente uscita",
+    check("flat with 4 cores: DUT 1, generator 2,3, no egress",
           r["dut"] == [1] and r["gen"] == [2, 3] and r["egress"] is None,
           str(r))
-    check("piatta: spare_core dopo gen 1,2 e DUT 3 = nessuno",
+    check("flat: spare_core after gen 1,2 and DUT 3 = none",
           HC.spare_core(ft, [1, 2, 3]) is None)
 
     st = HC.Topology.read(HC.Paths(smt))
     r = HC.plan_roles(st, want_egress=True)
-    check("server SMT non ibrido: DUT 1, uscita 2, generatore 3,4,5",
+    check("non-hybrid SMT server: DUT 1, egress 2, generator 3,4,5",
           r["dut"] == [1] and r["egress"] == 2 and r["gen"] == [3, 4, 5],
           str(r))
     used = r["dut"] + r["gen"] + [r["egress"]]
-    check("server SMT: fratelli 9-13 a riposo, sistema 0,6-8,14-15",
+    check("SMT server: siblings 9-13 idle, system 0,6-8,14-15",
           HC.format_cpu_list(HC.idle_siblings(st, used)) == "9-13"
           and HC.format_cpu_list(HC.housekeeping(st, used)) == "0,6-8,14,15"
           .replace("14,15", "14-15"))
-    check("server SMT: ruoli validi", roles_ok(st, r))
+    check("SMT server: valid roles", roles_ok(st, r))
 
 
 def t_apply_restore(root):
-    print("[4] applicare e ripristinare, su un albero finto")
+    print("[4] apply and restore, on a fake tree")
     before = snapshot(root)
     fake = FakeSystem(root)
     topo = HC.Topology.read(HC.Paths(root))
@@ -392,88 +376,88 @@ def t_apply_restore(root):
     aff_before = {k: set(v) for k, v in aff.aff.items()}
     irq9 = os.path.join(root, "proc/irq/9/smp_affinity_list")
     if os.geteuid() != 0:
-        os.chmod(irq9, 0o444)           # un IRQ che il kernel non lascia
-    aff.refuse.add(2)                   # un kthread che rifiuta
+        os.chmod(irq9, 0o444)
+    aff.refuse.add(2)
     r = HC.plan_roles(topo, want_egress=True)
     c = conditioner(root, r, fake, aff)
     c.apply()
     bench = [1, 3, 6, 8, 10]
     sibs = [2, 4, 7, 9, 11]
-    check("governor performance e min = max = 3500 MHz su banco e fratelli",
+    check("performance governor and min = max = 3500 MHz on bench and siblings",
           all(cpu_file(root, n, "cpufreq", "scaling_governor") == "performance"
               and cpu_file(root, n, "cpufreq", "scaling_min_freq") == "3500000"
               and cpu_file(root, n, "cpufreq", "scaling_max_freq") == "3500000"
               for n in bench + sibs))
-    check("target per il monitor sulle CPU del banco",
+    check("monitor target on the bench CPUs",
           c.target_khz == {n: 3500000 for n in bench}, str(c.target_khz))
-    check("CPU del sistema: tetto 2500 MHz, governor invariato",
+    check("system CPUs: 2500 MHz cap, governor unchanged",
           all(cpu_file(root, n, "cpufreq", "scaling_max_freq") == "2500000"
               and cpu_file(root, n, "cpufreq", "scaling_governor")
               == "powersave" for n in [0, 5] + list(range(12, 22))))
-    check("idle: C6 e C10 spenti sulle CPU del banco, POLL e C1E no",
+    check("idle: C6 and C10 off on the bench CPUs, POLL and C1E not",
           all(cpu_file(root, n, "cpuidle", f"state{i}", "disable")
               == ("1" if i >= 2 else "0") for n in bench for i in range(4)))
-    check("idle: i fratelli possono ancora dormire (C10 acceso)",
+    check("idle: the siblings can still sleep (C10 on)",
           all(cpu_file(root, n, "cpuidle", "state3", "disable") == "0"
               for n in sibs))
     unc = os.path.join(root, "sys/devices/system/cpu/intel_uncore_frequency/"
                              "package_00_die_00")
-    check("uncore fissata al massimo",
+    check("uncore fixed at maximum",
           HC.read_text(os.path.join(unc, "min_freq_khz")) == "3300000"
           and HC.read_text(os.path.join(unc, "max_freq_khz")) == "3300000")
-    check("profilo performance via power-profiles-daemon",
+    check("performance profile via power-profiles-daemon",
           fake.profile == "performance")
-    check("user/system/init confinati su 0,5,12-21, machine.slice no",
+    check("user/system/init confined to 0,5,12-21, machine.slice not",
           all(fake.allowed[u] == "0,5,12-21" for u in
               ("init.scope", "system.slice", "user.slice"))
           and fake.allowed["machine.slice"] == "")
-    check("il banco in uno scope suo PRIMA del confinamento",
+    check("the bench in its own scope BEFORE confinement",
           [i for i, a in enumerate(fake.calls) if a[0] == "busctl"][0]
           < [i for i, a in enumerate(fake.calls)
              if a[:2] == ["systemctl", "set-property"]][0])
-    check("i thread del banco sulle CPU del sistema",
+    check("the bench threads on the system CPUs",
           aff.aff[ME] == set(HC.housekeeping(topo, bench)))
     irqs = [HC.read_text(os.path.join(root, f"proc/irq/{i}/smp_affinity_list"))
             for i in range(6)]
-    check("IRQ spostati", all(v == "0,5,12-21" for v in irqs), str(irqs))
-    check("IRQ gia' a posto non toccato",
+    check("IRQs moved", all(v == "0,5,12-21" for v in irqs), str(irqs))
+    check("IRQ already in place not touched",
           HC.read_text(os.path.join(root, "proc/irq/7/smp_affinity_list"))
           == "0,5")
     if os.geteuid() != 0:
-        check("IRQ rifiutato dal kernel: resta com'era e si dice",
+        check("IRQ refused by the kernel: stays as it was, and it is reported",
               HC.read_text(irq9) == "0-21"
-              and "1 non spostabili" in dict(c.facts)["isolamento_irq"],
+              and "1 not movable" in dict(c.facts)["isolamento_irq"],
               dict(c.facts).get("isolamento_irq"))
     hk_mask = HC.cpu_mask_hex(HC.housekeeping(topo, bench))
-    check("default_smp_affinity e workqueue unbound = CPU del sistema",
+    check("default_smp_affinity and unbound workqueues = system CPUs",
           HC.read_text(os.path.join(root, "proc/irq/default_smp_affinity"))
           == hk_mask and HC.read_text(os.path.join(
               root, "sys/devices/virtual/workqueue/cpumask")) == hk_mask)
-    check("kthread: rcu_preempt spostato; per-CPU, napi e processi no; "
-          "rifiuto contato",
+    check("kthreads: rcu_preempt moved; per-CPU, napi and processes not; "
+          "refusal counted",
           aff.aff[15] == set(HC.housekeeping(topo, bench))
           and aff.aff[20] == set(topo.online)
           and aff.aff[30] == set(topo.online)
           and aff.aff[100] == set(topo.online) and aff.aff[2]
           == set(topo.online), str({k: HC.format_cpu_list(v)
                                     for k, v in aff.aff.items()}))
-    check("NMI watchdog spento",
+    check("NMI watchdog off",
           HC.read_text(os.path.join(root, "proc/sys/kernel/nmi_watchdog"))
           == "0")
     state = HC.load_state(HC.Paths(root))
-    check("stato salvato durante il run, con il pid",
+    check("state saved during the run, with the pid",
           state and state["pid"] == ME
           and len(state["changes"]) == len(c.changes))
-    check("EPP ricordato prima del governor (si ripristina dopo)",
+    check("EPP remembered before the governor (restored after)",
           any(ch.get("new") is None and "energy_performance" in ch["path"]
               for ch in state["changes"]))
     env = dict(HC.env_pairs(HC.Roles(topo, r["dut"], r["gen"], r["egress"]),
                             host=c, paths=HC.Paths(root), runner=fake))
-    check("env: ruoli, frequenza fissata, idle, condizionamento",
-          env.get("ruolo_dut") == "cpu6 (P, fratello 7)"
+    check("env: roles, fixed frequency, idle, conditioning",
+          env.get("ruolo_dut") == "cpu6 (P, sibling 7)"
           and "3500-3500 MHz" in env.get("frequenza_banco", "")
           and env.get("idle_banco") == "cpu 1,3,6,8,10: POLL,C1E"
-          and env.get("condizionamento", "").startswith("applicato"),
+          and env.get("condizionamento", "").startswith("applied"),
           str({k: env.get(k) for k in ("ruolo_dut", "frequenza_banco",
                                        "idle_banco", "condizionamento")}))
 
@@ -481,22 +465,22 @@ def t_apply_restore(root):
     after = snapshot(root)
     diff = sorted(k for k in set(before) | set(after)
                   if before.get(k) != after.get(k))
-    check("RIPRISTINO: albero identico byte per byte", not diff
+    check("RESTORE: tree identical byte by byte", not diff
           and not failed, f"{diff[:5]} {failed[:2]}")
-    check("ripristino: profilo e AllowedCPUs come prima",
+    check("restore: profile and AllowedCPUs as before",
           fake.profile == "balanced"
           and all(v == "" for v in fake.allowed.values()))
-    check("ripristino: affinita' dei kthread come prima",
+    check("restore: kthread affinities as before",
           all(aff.aff[k] == aff_before[k] for k in KTHREADS))
-    check("ripristino: file di stato cancellato",
+    check("restore: state file deleted",
           not os.path.exists(HC.Paths(root).state))
-    check("ripristino idempotente", c.restore() == [])
+    check("idempotent restore", c.restore() == [])
     if os.geteuid() != 0:
         os.chmod(irq9, 0o644)
 
 
 def t_crash(root):
-    print("[5] un run ucciso senza ripristino")
+    print("[5] a run killed without restore")
     before = snapshot(root)
     fake = FakeSystem(root)
     topo = HC.Topology.read(HC.Paths(root))
@@ -505,38 +489,38 @@ def t_crash(root):
     c = conditioner(root, r, fake, aff)
     c.apply()
     simulate_crash(c)
-    check("dopo il crash la macchina e' cambiata e lo stato e' su disco",
+    check("after the crash the machine changed and the state is on disk",
           snapshot(root) != before and os.path.exists(HC.Paths(root).state))
     c2 = conditioner(root, r, fake, aff, alive=lambda pid: True,
                      getpid=lambda: ME + 1)
     try:
         c2.apply()
-        check("un altro banco vivo: si rifiuta", False)
+        check("another live bench: refused", False)
         simulate_crash(c2)
     except RuntimeError:
-        check("un altro banco vivo: si rifiuta", True)
+        check("another live bench: refused", True)
     n = HC.recover_stale_state(HC.Paths(root), fake, alive=lambda pid: False,
                                me=1, setaffinity=aff.set)
     after = snapshot(root)
     diff = sorted(k for k in set(before) | set(after)
                   if before.get(k) != after.get(k))
-    check("--restore riporta tutto com'era", n > 0 and not diff
+    check("--restore brings everything back", n > 0 and not diff
           and fake.profile == "balanced", str(diff[:5]))
     c3 = conditioner(root, r, fake, aff, alive=lambda pid: False)
     c3.apply()
     simulate_crash(c3)
     c4 = conditioner(root, r, fake, aff, alive=lambda pid: False)
-    c4.apply()                      # ripristina lo stato vecchio, poi applica
+    c4.apply()
     c4.restore()
     after = snapshot(root)
     diff = sorted(k for k in set(before) | set(after)
                   if before.get(k) != after.get(k))
-    check("il run dopo un crash ripristina prima di applicare", not diff,
+    check("the run after a crash restores before applying", not diff,
           str(diff[:5]))
 
 
 def t_knobs(root):
-    print("[6] le manopole")
+    print("[6] the knobs")
     before = snapshot(root)
     fake = FakeSystem(root)
     topo = HC.Topology.read(HC.Paths(root))
@@ -546,7 +530,7 @@ def t_knobs(root):
                     uncore="keep", cstate_max_us=None, isolate=False,
                     profile="keep", nmi_off=False)
     c.apply()
-    check("tutto keep: nessuna modifica", not c.changes
+    check("everything keep: no change", not c.changes
           and snapshot(root) == before and fake.profile == "balanced")
     c.restore()
     c = conditioner(root, r, fake, aff, freq="base", isolate=False,
@@ -566,22 +550,22 @@ def t_knobs(root):
     c = conditioner(root, r, fake, aff, freq="9999", isolate=False,
                     profile="keep", system_max_mhz="keep")
     c.apply()
-    check("--freq 9999: tagliata al massimo di ogni CPU",
+    check("--freq 9999: capped at each CPU's maximum",
           cpu_file(root, 6, "cpufreq", "scaling_max_freq") == "4500000"
           and cpu_file(root, 1, "cpufreq", "scaling_max_freq") == "4800000")
     c.restore()
     c = conditioner(root, r, fake, aff, freq="max", isolate=False,
                     profile="keep", system_max_mhz="keep", cstate_max_us=0)
     c.apply()
-    check("--freq max: performance, minimo non toccato, nessun target",
+    check("--freq max: performance, minimum untouched, no target",
           cpu_file(root, 6, "cpufreq", "scaling_governor") == "performance"
           and cpu_file(root, 6, "cpufreq", "scaling_min_freq") == "400000"
           and not c.target_khz)
-    check("--cstate-max-us 0: resta solo POLL",
+    check("--cstate-max-us 0: only POLL stays",
           [cpu_file(root, 6, "cpuidle", f"state{i}", "disable")
            for i in range(4)] == ["0", "1", "1", "1"])
     c.restore()
-    check("dopo tutte le prove l'albero e' quello di partenza",
+    check("after every trial the tree is the starting one",
           snapshot(root) == before)
 
     class A:
@@ -590,10 +574,10 @@ def t_knobs(root):
     a.freq, a.system_max_mhz, a.uncore, a.cstate_max_us = "x", "1", "max", "1"
     try:
         HC.check_args(a)
-        check("--freq non valida rifiutata", False)
+        check("invalid --freq refused", False)
     except SystemExit:
-        check("--freq non valida rifiutata", True)
-    check("--egress-cpu: auto, none, numero",
+        check("invalid --freq refused", True)
+    check("--egress-cpu: auto, none, number",
           HC.parse_egress("auto") == "auto" and HC.parse_egress("none") is None
           and HC.parse_egress("8") == 8 and HC.parse_egress(None) is None)
 
@@ -604,106 +588,105 @@ def t_monitor(root):
     a = dict(t=0.0, core_thr={6: 26, 8: 0}, pkg_thr={6: 1006, 8: 1008},
              msr=(0, 0, 0), smi=3, pkg_temp_mc=50000, dut_temp_mc=48000,
              clamp=0, cooling=0, ac=True)
-    # 0,5 s a TSC 3 GHz; DUT occupato al 60% a 1,4 GHz
     b = dict(a, t=0.5, msr=(int(0.5 * 0.6 * 1.4 * GHZ), int(0.5 * 0.6 * 3 * GHZ),
                             int(0.5 * 3 * GHZ)), smi=3, pkg_temp_mc=52000)
     h = HC.host_columns(a, b, 1400000)
-    check("frequenza del DUT da APERF/MPERF: 1400 MHz, occupato 60%",
+    check("DUT frequency from APERF/MPERF: 1400 MHz, 60% busy",
           h["host_dut_mhz"] == 1400 and h["host_dut_busy_pct"] == 60.0, str(h))
-    check("condizioni rispettate: non disturbata",
+    check("conditions respected: not disturbed",
           not h["host_disturbed"] and h["host_throttle_core"] == 0
           and h["host_smi"] == 0 and h["host_pkg_temp_c"] == 52.0)
-    check("frequenza fuori target: disturbata",
+    check("frequency off target: disturbed",
           HC.host_columns(a, b, 2000000)["host_disturbed"])
     idle = dict(b, msr=(int(0.5 * 0.1 * 1.4 * GHZ), int(0.5 * 0.1 * 3 * GHZ),
                         int(0.5 * 3 * GHZ)))
-    check("DUT quasi fermo: la frequenza non si giudica",
+    check("DUT almost idle: the frequency is not judged",
           not HC.host_columns(a, idle, 2000000)["host_off_target"])
     hot = dict(b, core_thr={6: 29, 8: 0})
-    check("throttling di un core: disturbata, eventi contati",
+    check("core throttling: disturbed, events counted",
           HC.host_columns(a, hot)["host_disturbed"]
           and HC.host_columns(a, hot)["host_throttle_core"] == 3)
     pk = dict(b, pkg_thr={6: 1006, 8: 1010})
-    check("throttling del pacchetto: massimo fra le CPU",
+    check("package throttling: maximum over the CPUs",
           HC.host_columns(a, pk)["host_throttle_pkg"] == 2)
-    check("a batteria: disturbata",
+    check("on battery: disturbed",
           HC.host_columns(a, dict(b, ac=False))["host_disturbed"])
-    check("powerclamp attivo: disturbata",
+    check("powerclamp active: disturbed",
           HC.host_columns(a, dict(b, clamp=50))["host_disturbed"])
-    check("letture mancanti: nessuna colonna",
+    check("missing readings: no column",
           HC.host_columns(None, b) == {})
 
     topo = HC.Topology.read(HC.Paths(root))
     m = HC.HostMonitor(topo, [6, 8, 10], dut=6, paths=HC.Paths(root),
                        target_khz={6: 1400000}, use_msr=False)
     x = m.mark()
-    check("mark sul sysfs finto: temperature, throttling, rete",
+    check("mark on the fake sysfs: temperatures, throttling, mains",
           x["pkg_temp_mc"] == 50000 and x["dut_temp_mc"] == 45020
           and x["core_thr"][6] == 26 and x["ac"] is True, str(x))
-    check("target del DUT dal dizionario", m.dut_target_khz == 1400000)
+    check("DUT target from the dictionary", m.dut_target_khz == 1400000)
     log = os.path.join(root, "log.csv")
     HC.log_loop(log, [6, 8], period=0.01, paths=HC.Paths(root),
                 max_samples=2)
     s = HC.summarise_log(log)
-    check("registro: due campioni, temperatura, nessun throttling",
+    check("log: two samples, temperature, no throttling",
           s and s["samples"] == 2 and s["temp_max_c"] == 50.0
           and s["throttle_core"] == 0, str(s))
     with open(log) as f:
         head = f.readline().strip().split(",")
-    check("registro: una colonna di frequenza per CPU osservata",
+    check("log: one frequency column per observed CPU",
           head[-2:] == ["mhz_cpu6", "mhz_cpu8"], str(head))
 
 
 def t_cli(root):
-    print("[8] riga di comando")
+    print("[8] command line")
     p = HC.argparse.ArgumentParser()
     p.add_argument("--run", action="store_true")
     HC.add_args(p)
     p.add_argument("cmd", nargs=HC.argparse.REMAINDER)
     a = p.parse_args(["--run", "--freq", "2000", "--", "python3",
-                      "ipa/test/test_suite.py", "--only", "kernel"])
+                      "ipa/test/test_weights_and_metrics.py", "--only", "kernel"])
     cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
-    check("--run -- COMANDO: le opzioni del comando restano sue",
+    check("--run -- COMMAND: the command's options stay its own",
           a.run and a.freq == "2000"
-          and cmd == ["python3", "ipa/test/test_suite.py", "--only",
+          and cmd == ["python3", "ipa/test/test_weights_and_metrics.py", "--only",
                       "kernel"], str(a.cmd))
     rc = HC.show(HC.Paths(root))
-    check("--show sull'albero finto", rc == 0)
+    check("--show on the fake tree", rc == 0)
 
 
 def t_bench_plan(root, flat):
-    print("[9] bench_throughput: piano CPU e code del DUT")
-    import bench_throughput as B
+    print("[9] bench_capacity: piano CPU e code del DUT")
+    import bench_capacity as B
     topo = HC.Topology.read(HC.Paths(root))
     p = B.plan_cpus(topo=topo, check_pktgen=False)
-    check("senza liste, su questa macchina: DUT 6, generatore 8,10,1",
+    check("without lists, on this machine: DUT 6, generator 8,10,1",
           p.dut == [6] and p.gen == [8, 10, 1] and p.egress is None
           and not p.shared, f"{p.dut} {p.gen} {p.egress}")
-    check("la regola storica avrebbe dato 14 thread pktgen e il DUT sugli E",
+    check("three generator threads, the DUT on a P-core",
           len(p.gen) == 3)
     p = B.plan_cpus(topo=topo, check_pktgen=False, egress_spec="auto")
-    check("--egress-cpu auto: uscita 8, generatore 10,1,3",
+    check("--egress-cpu auto: egress 8, generator 10,1,3",
           p.egress == 8 and p.gen == [10, 1, 3], f"{p.gen} {p.egress}")
-    check("CPU lasciate al sistema = 0,5,12-21, fratelli a riposo a parte",
+    check("CPUs left to the system = 0,5,12-21, idle siblings apart",
           HC.format_cpu_list(p.excluded) == "0,5,12-21"
           and p.idle_siblings == [2, 4, 7, 9, 11], f"{p.excluded}")
     p = B.plan_cpus(topo=topo, check_pktgen=False, egress_spec=8)
-    check("--egress-cpu 8 esplicita: il piano lascia libero il suo core",
+    check("--egress-cpu 8 explicit: the plan leaves its core free",
           p.egress == 8 and not ({8, 9} & set(p.gen + p.dut)),
           f"{p.dut} {p.gen} {p.egress}")
     p = B.plan_cpus(gen_spec="2", dut_spec="1", topo=topo,
                     check_pktgen=False)
-    check("generatore sul fratello SMT del DUT: dichiarato condiviso",
+    check("generator on the DUT's SMT sibling: declared shared",
           p.shared and any("SMT" in n for n in p.notes), str(p.notes))
     p = B.plan_cpus(gen_spec="8,10", dut_spec="6", topo=topo,
                     check_pktgen=False)
-    check("liste esplicite: rispettate", p.gen == [8, 10] and p.dut == [6]
+    check("explicit lists: respected", p.gen == [8, 10] and p.dut == [6]
           and not p.shared)
     ft = HC.Topology.read(HC.Paths(flat))
     p = B.plan_cpus(threads=2, topo=ft, check_pktgen=False,
                     egress_spec="auto")
-    check("piatta a 4 core: la regola semplice (generatore 1,2, DUT 3), "
-          "niente uscita libera", p.gen == [1, 2] and p.dut == [3]
+    check("flat with 4 cores: the simple rule (generator 1,2, DUT 3), "
+          "no free egress", p.gen == [1, 2] and p.dut == [3]
           and p.egress is None, f"{p.gen} {p.dut} {p.egress}")
 
     class P:
@@ -711,17 +694,17 @@ def t_bench_plan(root, flat):
     old = B.DUT_QUEUES
     try:
         B.DUT_QUEUES = None
-        check("code: storico, una per thread generatore",
+        check("queues: one per generator thread",
               B.ingress_queues(P) == (3, 3))
         B.DUT_QUEUES = 1
-        check("code: una sola, tutti i thread pktgen su quella",
+        check("queues: just one, every pktgen thread on it",
               B.ingress_queues(P) == (1, 1))
         B.DUT_QUEUES = 4
-        check("code: piu' del generatore, rx >= tx",
+        check("queues: more than the generator, rx >= tx",
               B.ingress_queues(P) == (3, 4))
     finally:
         B.DUT_QUEUES = old
-    check("--dut-queues auto = CPU del DUT, gen = storico, numero",
+    check("--dut-queues auto = DUT CPUs, gen = one per thread, number",
           B.parse_dut_queues("auto", P) == 1
           and B.parse_dut_queues("gen", P) is None
           and B.parse_dut_queues("2", P) == 2)

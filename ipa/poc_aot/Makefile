@@ -18,7 +18,7 @@
 CLANG    ?= clang
 CC       ?= cc
 # -O2 is what makes clang fold/strength-reduce the literal weights.
-# -I multiarch: con -target bpf clang non trova asm/types.h (linux-libc-dev)
+# -I multiarch: with -target bpf clang does not find asm/types.h (linux-libc-dev)
 MULTIARCH ?= $(shell uname -m)-linux-gnu
 BPF_CFLAGS = -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/$(MULTIARCH)
 

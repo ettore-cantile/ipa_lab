@@ -1,119 +1,13 @@
 #!/usr/bin/env python3
-"""
-bench_scaling.py -- parametric scaling analysis across ALL THREE pipelines.
+"""bench_scaling.py -- how the cost of each pipeline grows with the model.
 
-The question: how does the cost of the datapath change as the network, or the
-model, gets bigger? And -- the part that matters for the design-space argument
--- do the three pipelines have DIFFERENT slopes?
+One variable at a time (nodes of the network, depth, width, weights at zero,
+same weights in different shapes): program size and latency under
+BPF_PROG_TEST_RUN. Needs root.
 
-They do, and the slopes are the whole point of having three of them:
-
-                        P1 hardcoded     P2 template      P3 modular
-  more NODES            grows            flat             flat
-  more LAYERS           grows            needs a rebuild  flat
-  more NEURONS/layer    grows            grows            grows
-  sparser WEIGHTS       shrinks          flat             flat
-  changing the model    ~1.2 s of clang  a map write      a map write
-
-Each cell of that table is a claim this script measures rather than asserts.
-
---------------------------------------------------------------------------
-THREE AXES, one variable each
---------------------------------------------------------------------------
-Exactly one thing moves per axis; everything else is pinned, so a curve can
-be attributed to the variable named on the x axis and nothing else.
-
-  nodes  n_nodes in {10, 25, 52, 75, 100}, hidden (4,4), n_out 7
-         The node one-hot is `n_nodes` wide, so this is the input width:
-         n_in = n_interfaces + n_interfaces + 1 + n_nodes = 13 + n_nodes.
-         52 is Germany50, the checked-in topology. Capped at 100 because
-         MAX_N_IN / ML_MAX_N_IN is 128 in P2 and P3.
-
-  depth  1..6 hidden layers of 4 neurons, n_nodes 52 (n_in 65)
-         Depth is the one dimension P2 does NOT cover at runtime: its widths
-         come from a map, its depth is compiled in. build_arch_leaf(n) emits
-         the extra blocks, so P2 reaches any depth -- by rebuilding. On this
-         axis P2 therefore recompiles at every point and P3 does not, and
-         that difference, not a missing point, is the result.
-
-  width  2, 4, 6, 8 neurons per hidden layer, two hidden layers, n_nodes 52
-         8 is the compiled ceiling in P2 (T2_MAX_H1/H2) and P3 (ML1_MAX_H1,
-         MLH_MAX_H). P1 has no ceiling but is swept over the same values so
-         the three curves are comparable.
-
-  descriptor  the four input-vector compositions of bench_depth_vs_width:
-         0, 1 or 2 one-hot features, and a small (6) vs large (52) one. Same
-         model otherwise. Categorical, so it is drawn as bars.
-
-  sparsity  0, 25, 50, 75, 90 percent of the weights exactly zero, same shape
-         throughout. P1 compiles weights in as literals, so clang deletes a
-         multiply by zero: its instruction count should FALL. P2 and P3 read
-         the same bytes from a map and should not move at all. This is where
-         'the weights are in the code' stops being a description and becomes
-         a number.
-
---------------------------------------------------------------------------
-WHAT IS MEASURED
---------------------------------------------------------------------------
-  insns      xlated instructions, summed over every program the pipeline
-             loads -- the same convention test_suite.py --only kernel uses
-             (dispatcher + leaves), so numbers are comparable with its table.
-  jited      native bytes, same summation.
-  lat_ns     per-packet latency, MIN of TRIALS independent BPF_PROG_TEST_RUN
-             measurements. Min, not mean or median: the noise here is
-             one-sided (an interrupt can only slow a trial down), so the
-             smallest sample is the best estimate of the interference-free
-             cost. Same reasoning as bench_depth_vs_width.py and hyperfine.
-             Ogni misura e' spezzata in chunk da 200 esecuzioni con un frame
-             NUOVO per chunk (prog_test_run_bench, la stessa di test_suite):
-             senza, il TTL si inchioda a 1 e le ripetizioni successive
-             saltano la coda di inoltro. Vedi _sample.
-  update_ms  cost of INSTALLING A NEW MODEL on a node already running. This
-             is the metric where the three pipelines differ in KIND rather
-             than degree, and the two must not be confused:
-               P1  the weights are C literals, so a new model means
-                   generating C and running clang -- order 1.5 s.
-               P2  arch_registry + model_desc + a slice of arch_weights.
-               P3  layer_registry + layer_shapes + model_desc + weights.
-             For P2 and P3 no compiler runs, so this is map writes only.
-  build_ms   cost of compiling and loading the eBPF program ONCE. For P2 and
-             P3 this is paid when the node starts and never again, because
-             the source never mentions the model's shape. For P1 it is the
-             same event as update_ms, by construction -- the program IS the
-             model. Plotting build_ms as if it were the cost of changing a
-             model would make P2 and P3 look MORE expensive than P1, which
-             is backwards: their ~2.5 s compile happens once, P1's ~1.5 s
-             happens on every model.
-  map_bytes  total map memory, per-CPU maps counted per CPU.
-  tail       tail calls executed per packet (P3's grows with depth).
-  nw         number of int8 weights the model has, for reference.
-
---------------------------------------------------------------------------
-WHY EVERY CELL RUNS IN ITS OWN SUBPROCESS
---------------------------------------------------------------------------
-P1 unrolls the whole network into one C function, and past a certain size
-the 512-byte eBPF stack overflows. BCC's LLVM backend reports that with a
-PROCESS-FATAL abort, not a Python exception, so one bad cell would kill the
-whole sweep. Each cell therefore runs in a fresh subprocess (this file
-re-invoked with --_worker) and a crash marks only that cell as CRASHED.
-The same isolation covers a verifier refusal, which is a normal outcome
-here rather than a bug -- see docs/testing.md on P3's complexity budget.
-
---------------------------------------------------------------------------
 USAGE
---------------------------------------------------------------------------
-    sudo python3 ipa/test/bench_scaling.py                  # all three axes
-    sudo python3 ipa/test/bench_scaling.py --axis nodes
-    sudo python3 ipa/test/bench_scaling.py --axis depth --trials 15
-    sudo python3 ipa/test/bench_scaling.py --axis depth --seeds 42,1,2,3,7
-                                             # same axis, 5 weight pools
-    sudo python3 ipa/test/bench_scaling.py --out results/   # CSV per axis
-
-    python3 ipa/test/bench_scaling.py --plot results/       # no root needed
-
-Measuring needs Linux + BCC + root. Plotting reads the CSV and needs only
-matplotlib, so the graphs can be regenerated anywhere, including on the
-machine the thesis is written on.
+    sudo python3 ipa/test/bench_scaling.py --axis depth
+    python3 ipa/test/bench_scaling.py --plot <results dir>
 """
 import os
 import sys
@@ -135,32 +29,13 @@ for _p in (SHARED_DIR, _TEST_DIR):
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
-# Pinned across every sweep: only the axis variable moves.
 N_INTERFACES = 6
 N_OUT = 7
 SCALE = 128
-# Four points on one ladder: how much is known when the program is compiled.
-#
-#   p1_static  weights AND this node's index baked in    -> one binary per NODE
-#   hardcoded  weights baked, node index from a map      -> one binary per MODEL
-#   template   nothing baked but the ceilings            -> one binary
-#   modular    depth read at runtime too                 -> one binary
-#
-# `hardcoded` is the pipeline the rest of this project calls P1; against
-# p1_static it is really a P1.5, because its feature LAYOUT is compiled in but
-# the node index is not. Naming it here would break every existing CSV, so the
-# distinction lives in this comment and in the figures' labels.
 PIPELINES = ("p1_static", "hardcoded", "template", "modular")
-
-# Which node this node is, when the index is frozen at compile time. Any value
-# inside the topology works; 7 is what the fabric test installs, so the two
-# agree by eye. Axes go down to 10 nodes, so 7 is always in range.
 STATIC_NODE = 7
 
-# Input-vector compositions. Imported rather than copied: bench_depth_vs_width
-# already curates this set to separate onehot COUNT from onehot SIZE, and two
-# copies would drift.
-from bench_depth_vs_width import FEATURE_SETS      # noqa: E402
+from bench_depth_vs_width import FEATURE_SETS  # noqa: E402
 DEFAULT_DESCRIPTOR = "default"
 
 
@@ -169,33 +44,7 @@ _POOL_SIZE = 8192
 
 def make_weights(nw, sparsity, seed=42):
     """The first `nw` weights of a fixed pool with a `sparsity` fraction of
-    zeros.
-
-    Why the weights matter at all: P1 writes them into the C source as
-    literals, so clang deletes a multiply by zero outright and turns a multiply
-    by a power of two into a shift. P1's instruction count therefore depends on
-    the VALUES, not only on the shape. P2 and P3 read the same weights from a
-    map, where a zero is a byte like any other. The sparsity axis turns that
-    difference from an argument into a measurement.
-
-    Why a POOL, rather than a fresh vector per shape: exactly because of the
-    above. Drawing an independent vector for each `nw` meant that moving along
-    an axis changed two things at once -- the model's shape AND every one of
-    its weights -- so part of P1's curve was weight noise wearing the x axis's
-    name. Taking a prefix of one pool makes a bigger model an EXTENSION of the
-    smaller one: the weights they share are identical, and only the new ones
-    are new.
-
-    How much this matters is not hypothetical. On the depth axis, the shape
-    (4,4,4,4) with seed 42 is REFUSED by the verifier while seeds 1, 2, 3, 7,
-    123 and 999 all load, at 1 075 to 1 175 instructions -- the same program
-    size, the same architecture, different values. That is a real property of
-    compiling weights in, and it is why this function is written the way it is.
-
-    A prefix holds roughly, not exactly, the requested zero fraction: the pool
-    is shuffled, so any prefix is a random sample of it. The exact count per
-    cell is not the point; holding the weights still while the axis moves
-    is."""
+    zeros."""
     rng = random.Random(seed)
     n_zero = int(round(_POOL_SIZE * sparsity))
     pool = [0] * n_zero + [rng.choice([v for v in range(-100, 101) if v != 0])
@@ -209,191 +58,114 @@ def make_weights(nw, sparsity, seed=42):
             f"numbers with old ones.")
     return pool[:nw]
 
-# One axis = one variable. `cell(v)` returns everything a worker needs, so a
-# new axis is a new entry here and nothing else. `kind` is "num" for an axis
-# whose x is a number (plotted as a curve) or "cat" for one whose values are
-# names (plotted as bars -- a line between two descriptors would imply a
-# gradient that does not exist).
 AXES = {
     "nodes": {
-        "xlabel": "nodi della rete (larghezza della colonna che identifica il nodo)",
+        "xlabel": "network nodes (width of the column identifying the node)",
         "kind": "num",
         "values": [10, 25, 52, 75, 100],
         "cell": lambda v: dict(n_nodes=v, dims=(4, 4)),
-        "note": "n_in = 13 + n_nodes; il modello resta 4-4, cambia solo l'ingresso",
+        "note": "n_in = 13 + n_nodes; the model stays 4-4, only the input changes",
     },
     "depth": {
-        "xlabel": "numero di strati nascosti",
+        "xlabel": "number of hidden layers",
         "kind": "num",
         "values": [1, 2, 3, 4, 5, 6],
         "cell": lambda v: dict(n_nodes=52, dims=tuple([4] * v)),
-        "note": "P2 copre la profondita' RICOMPILANDO (build_arch_leaf), P3 no: "
-                "la ricompilazione E' il confronto",
+        "note": "P2 covers depth by RECOMPILING (build_arch_leaf), P3 does not: "
+                "the recompilation IS the comparison",
     },
     "width": {
-        "xlabel": "neuroni per strato nascosto",
+        "xlabel": "neurons per hidden layer",
         "kind": "num",
         "values": [2, 4, 6, 8],
         "cell": lambda v: dict(n_nodes=52, dims=(v, v)),
-        "note": "8 e' il soffitto compilato di P2 (T2_MAX_H1/H2) e P3 (ML1_MAX_H1)",
+        "note": "8 is the compiled ceiling of P2 (T2_MAX_H1/H2) and P3 (ML1_MAX_H1)",
     },
     "descriptor": {
-        "xlabel": "composizione del vettore d'ingresso",
+        "xlabel": "composition of the input vector",
         "kind": "cat",
         "values": list(FEATURE_SETS),
         "cell": lambda v: dict(n_nodes=52, dims=(4, 4), descriptor=v),
-        "note": "stesso modello 4-4, IV diverse: 0/1/2 one-hot, piccola (6) o grande (52)",
+        "note": "same 4-4 model, different IVs: 0/1/2 one-hot, small (6) or large (52)",
     },
-    # LARGA CONTRO PROFONDA, a parametri comparabili.
-    #
-    # The width and depth axes above answer "what does it cost to widen / to
-    # deepen", and on both of them the parameter count moves with the axis. The
-    # question they cannot answer is the one that matters for choosing an
-    # architecture: GIVEN a parameter budget, is it better spent on one wide
-    # layer or on several narrow ones?
-    #
-    # These five shapes hold the weight count at 592 +/- 2%: 591, 599, 595,
-    # 604, 589. They are a coherent family -- a funnel, h1 >= h, with every
-    # layer after the second the same width, which is also what P2's compiled
-    # leaf requires -- so the only thing that really changes along the axis is
-    # how the same budget is arranged. Every point is inside the compiled
-    # ceilings of P2 and P3 (h <= 8), so all four pipelines can run all five.
-    #
-    # The achieved weight count is printed per cell (the `pesi` column), so
-    # "comparable" is something the reader checks rather than takes on trust.
     "isoparam": {
-        "xlabel": "strati nascosti, a parita' di pesi (~592)",
+        "xlabel": "hidden layers, with the same weights (~592)",
         "kind": "num",
         "values": [1, 2, 3, 4, 5],
         "cell": lambda v: dict(n_nodes=52, dims=ISOPARAM_DIMS[v]),
-        "note": "stesso budget di pesi speso in modi diversi: una layer largo "
-                "contro molti stretti",
+        "note": "same weight budget spent in different ways: one wide layer "
+                "against many narrow ones",
     },
-    # Quante delle n_interfaces porte esistono DAVVERO sul nodo. Non e' una
-    # topologia nuova: e' la cella di sempre (52 nodi, 4-4, descrittore
-    # default) con `static_ports` che varia, quindi n_in, la forma e i PESI
-    # restano identici punto per punto -- cambia solo quante colonne di
-    # link_state P1 specializzata genera.
-    #
-    # Le altre tre pipeline non specializzano, quindi sull'asse restano
-    # piatte: e' il controllo che dice che l'asse di per se' non costa nulla,
-    # e che qualunque pendenza nella colonna p1_static viene da static_ports.
-    #
-    # Su Germany50 i gradi reali vanno da 2 a 5 (88 link, 50 nodi, grado medio
-    # 3,52) e nessun nodo arriva a 6: il modello riserva 6 colonne perche' e'
-    # il massimo della rete, non il grado di chi lo esegue.
     "degree": {
-        "xlabel": "porte realmente presenti sul nodo (su 6 previste)",
+        "xlabel": "ports actually present on the node (out of 6)",
         "kind": "num",
         "values": [2, 3, 4, 5, 6],
-        # LISTA, non set: la cella viaggia in JSON verso il sottoprocesso che
-        # isola ogni misura, e un set non e' serializzabile.
         "cell": lambda v: dict(n_nodes=52, dims=(4, 4),
                                static_ports=list(range(v))),
-        "note": "stesso modello, stessi pesi, stesse colonne di peso: cambia "
-                "solo quante di esse la P1 specializzata genera",
+        "note": "same model, same weights, same weight columns: only how many "
+                "of them the static P1 generates changes",
     },
     "sparsity": {
-        "xlabel": "frazione di pesi esattamente zero",
+        "xlabel": "fraction of weights exactly zero",
         "kind": "num",
         "values": [0.0, 0.25, 0.5, 0.75, 0.9],
         "cell": lambda v: dict(n_nodes=52, dims=(4, 4), sparsity=v),
-        "note": "stessa forma, pesi diversi: P1 li compila come letterali, P2/P3 li leggono da mappa",
+        "note": "same shape, different weights: P1 compiles them as literals, P2/P3 read them from a map",
     },
 
-    # ======================================================================
-    # LA CAMPAGNA: le stesse architetture che il throughput bench deve poi
-    # rimisurare sotto traffico. `campaign: True` le tiene fuori da
-    # `--axis all` (gli assi storici restano quelli, e i loro CSV pure) e le
-    # manda tutte in UN file, results/model_scaling_test_suite.csv.
-    #
-    # Modello di riferimento 65-4-4-7: e' il primo punto di `width_camp`.
-    # ======================================================================
+    # --- the campaign axes ---
 
-    # A, versione che una pendenza ce l'ha davvero.
-    #
-    # n_in = n_interfaces + n_queues + 1, con le due tenute uguali. Ogni
-    # colonna e' letta da una mappa e moltiplicata per h1 pesi, quindi le MAC
-    # nominali e quelle eseguite coincidono. Il soffitto e' 17 e non si supera:
-    # IPA_MAX_IFACES e IPA_MAX_QUEUES valgono 8, MAX_FEAT vale 4 e
-    # _validate_feature_types rifiuta i duplicati, quindi non si possono
-    # impilare piu' letture dense di queste.
     "iv_dense": {
-        "xlabel": "colonne d'ingresso, tutte moltiplicate davvero",
+        "xlabel": "input columns, all actually multiplied",
         "kind": "num",
         "values": [5, 9, 13, 17],
         "cell": lambda v: dict(n_nodes=52, dims=(8, 8), descriptor="iv_dense",
                                n_interfaces=(v - 1) // 2,
                                n_queues=(v - 1) // 2),
         "campaign": True,
-        "note": "n_in = 2k+1 con link_state(k) + queue_occupancy(k) + ttl; "
-                "ogni colonna costa h1 moltiplicazioni. Tetto duro a 17",
+        "note": "n_in = 2k+1 with link_state(k) + queue_occupancy(k) + ttl; "
+                "every column costs h1 multiplications. Hard ceiling at 17",
     },
 
-    # A come richiesta: n_in 16/32/65 a width, depth e n_out fermi.
-    #
-    # Sopra le 17 colonne dense la larghezza PUO' venire solo da una one-hot, e
-    # una one-hot non costa: FEAT_INGRESS_IF indicizza una colonna e fa h1
-    # addizioni, qualunque sia `size`. Previsione, verificabile sul CSV: insns
-    # e pesi salgono, `macs` sale, `macs_eff` no, e la latenza nemmeno. Lo
-    # stesso lo dice gia' result/scaling_nodes.csv, dove n_in va da 23 a 113 e
-    # le quattro latenze restano ferme.
-    #
-    # n_nodes resta 52 e `node` non e' nel descrittore: questo asse muove il
-    # VETTORE D'INGRESSO, non la rete. L'asse `nodes` misura l'altra cosa e
-    # resta separato.
     "iv_onehot": {
-        "xlabel": "colonne d'ingresso, larghezza in una colonna singola",
+        "xlabel": "input columns, width in a single column",
         "kind": "num",
         "values": [16, 32, 65],
         "cell": lambda v: dict(n_nodes=52, dims=(8, 8), descriptor="iv_onehot",
                                n_interfaces=v - 5, n_queues=4),
         "campaign": True,
-        "note": "n_in = k+5 con ingress_iface(k) + ttl + queue_occupancy(4); "
-                "la one-hot costa h1 addizioni comunque sia larga",
+        "note": "n_in = k+5 with ingress_iface(k) + ttl + queue_occupancy(4); "
+                "the one-hot costs h1 additions however wide it is",
     },
 
-    # B. 4 e' il riferimento 65-4-4-7. 16 e 32 sfondano T2_MAX_H1/H2 e
-    # ML1_MAX_H1, quindi su template e modular escono RIFIUTATO senza essere
-    # misurati: i soffitti non si toccano, e una riga misurata la' sarebbe un
-    # programma che risponde XDP_PASS.
     "width_camp": {
-        "xlabel": "neuroni per strato nascosto (campagna)",
+        "xlabel": "neurons per hidden layer (campaign)",
         "kind": "num",
         "values": [4, 8, 16, 32],
         "cell": lambda v: dict(n_nodes=52, dims=(v, v)),
         "campaign": True,
-        "note": "65-v-v-7; sopra 8 solo P1 e p1_static, che non hanno soffitti "
-                "di larghezza",
+        "note": "65-v-v-7; above 8 only P1 and p1_static, which have no width "
+                "ceilings",
     },
 
-    # C. Profondita' a width 8, che e' il massimo che P2 e P3 reggono. L'asse
-    # `depth` storico usa width 4 e arriva a 6: questo e' piu' stretto e piu'
-    # largo, e proprio per questo puo' finire contro il budget di complessita'
-    # del verificatore di P3 sui punti in fondo. Un rifiuto la' e' un dato.
     "depth_camp": {
-        "xlabel": "strati nascosti, 8 neuroni ciascuno (campagna)",
+        "xlabel": "hidden layers, 8 neurons each (campaign)",
         "kind": "num",
         "values": [1, 2, 3, 4],
         "cell": lambda v: dict(n_nodes=52, dims=tuple([8] * v)),
         "campaign": True,
-        "note": "65-8...8-7; P2 ricompila a ogni punto, P3 no -- e a width 8 "
-                "il verificatore di P3 puo' dire di no",
+        "note": "65-8...8-7; P2 recompiles at every point, P3 does not -- and at "
+                "width 8 P3's verifier may refuse",
     },
 }
 
-# Gli assi della campagna, nell'ordine in cui vanno letti.
 CAMPAIGN_AXES = [k for k, v in AXES.items() if v.get("campaign")]
-# Gli storici: quelli che `--axis all` ha sempre percorso.
 LEGACY_AXES = [k for k, v in AXES.items() if not v.get("campaign")]
 CAMPAIGN_CSV = "model_scaling_test_suite.csv"
 
 
 def cell_of(axis, v):
     """Fill an axis cell out with the defaults the worker expects."""
-    # static_ports=None = "tutte le colonne", cioe' il comportamento storico:
-    # ogni asse diverso da `degree` produce lo stesso C di prima e i CSV gia'
-    # raccolti restano confrontabili.
     c = dict(n_nodes=52, dims=(4, 4), descriptor=DEFAULT_DESCRIPTOR,
              sparsity=0.0, static_ports=None,
              n_interfaces=N_INTERFACES, n_queues=N_QUEUES)
@@ -401,40 +173,18 @@ def cell_of(axis, v):
     return c
 
 
-# n_queues is declared even though the default descriptor does not use a
-# queue feature: the `no_onehot` set does, and a descriptor cannot resolve a
-# dimension the topology does not state. Leaving it out made all three
-# pipelines fail that column with
-#   ScenarioError: feature 'queue_occupancy' needs topology dimension 'n_queues'
-# which reads like a pipeline problem and is really a missing line here.
-# 4 is under both compiled ceilings (IPA_MAX_QUEUES is 8 in P2 and in P3).
 N_QUEUES = 4
 
 
-# Larghezza per profondita' a budget costante. Ricavate cercando, dentro i
-# soffitti compilati, la famiglia a imbuto che minimizza lo scarto di pesi.
 ISOPARAM_DIMS = {
-    1: (8,),             # 591 pesi -- tutto in un layer largo
-    2: (8, 4),           # 599
-    3: (8, 3, 3),        # 595
-    4: (7, 5, 5, 5),     # 604
-    5: (7, 4, 4, 4, 4),  # 589 -- lo stesso budget spalmato su cinque
+    1: (8,),
+    2: (8, 4),
+    3: (8, 3, 3),
+    4: (7, 5, 5, 5),
+    5: (7, 4, 4, 4, 4),
 }
 
 
-# Descrittori in piu', vivi solo qui: gli assi IV della campagna hanno bisogno
-# di comporre il vettore d'ingresso in due modi che bench_depth_vs_width non
-# cura. FEATURE_SETS resta intatto, cosi' l'asse `descriptor` continua a
-# spazzare esattamente i quattro di prima.
-#
-#   iv_dense   link_state + queue_occupancy + ttl: OGNI colonna e' una lettura
-#              densa, quindi costa n_in*h1 moltiplicazioni. Soffitto duro a
-#              n_in = 8 + 8 + 1 = 17, vedi IV_DENSE_MAX.
-#   iv_onehot  ingress_iface + ttl + queue_occupancy: la larghezza sta nella
-#              one-hot, che nel kernel costa h1 ADDIZIONI qualunque sia la sua
-#              taglia (l'arm FEAT_INGRESS_IF indicizza una colonna sola). Qui
-#              n_in arriva a 128 ma la latenza non deve muoversi -- ed e' il
-#              motivo per cui i due assi esistono entrambi.
 IV_FEATURE_SETS = {
     "iv_dense":  ["link_state", "queue_occupancy", "ttl"],
     "iv_onehot": ["ingress_iface", "ttl", "queue_occupancy"],
@@ -442,21 +192,11 @@ IV_FEATURE_SETS = {
 DESCRIPTORS = dict(FEATURE_SETS, **IV_FEATURE_SETS)
 
 
-# I soffitti COMPILATI, ricopiati qui per poterli controllare senza caricare
-# nulla. Non sono manopole: cambiarli invalida ogni CSV gia' raccolto, e
-# ebpf_modular.py avverte che sono scogliere e non pendenze. Stanno qui perche'
-# una cella che li sfonda va segnata RIFIUTATA *senza misurarla*: P3 non
-# fallisce il caricamento, risponde XDP_PASS a runtime
-#   if (n_out == 0 || n_out > ML1_MAX_H1) return XDP_PASS;
-# e una misura su quel programma e' una latenza vera di un programma che non
-# calcola niente -- il modo peggiore di rompersi.
-P2_MAX_H   = 8      # T2_MAX_H1 / T2_MAX_H2   in ebpf_template_arch.py
-P3_MAX_H1  = 8      # ML1_MAX_H1              in ebpf_modular.py
-P3_MAX_H   = 8      # MLH_MAX_H               in ebpf_modular.py
-MAX_N_IN   = 128    # MAX_N_IN / ML_MAX_N_IN  in entrambe
-MAX_FEAT   = 4      # MAX_FEAT / ML_MAX_FEAT  in entrambe
-# 8 (link_state) + 8 (queue_occupancy) + 1 (ttl): il piu' largo vettore
-# d'ingresso che si possa fare di sole colonne che costano aritmetica.
+P2_MAX_H   = 8
+P3_MAX_H1  = 8
+P3_MAX_H   = 8
+MAX_N_IN   = 128
+MAX_FEAT   = 4
 IV_DENSE_MAX = 17
 
 
@@ -477,8 +217,7 @@ def build_shape(n_nodes, hidden_dims, descriptor=DEFAULT_DESCRIPTOR,
 
 
 def shape_of(cell):
-    """La forma di UNA cella. `.get` e non `[]`: verify_static e verify_ports
-    si costruiscono la cella a mano e non conoscono le chiavi nuove."""
+    """The shape of ONE cell."""
     return build_shape(cell["n_nodes"], cell["dims"],
                        cell.get("descriptor", DEFAULT_DESCRIPTOR),
                        cell.get("n_interfaces", N_INTERFACES),
@@ -491,23 +230,15 @@ def weight_count(n_in, dims, n_out):
 
 
 def mac_count(n_in, dims, n_out):
-    """MAC NOMINALI: il prodotto riga per colonna di ogni layer, come lo
-    conterebbe chiunque guardando la forma. Senza i bias, che sono addizioni."""
+    """NOMINAL MACs: the row-by-column product of every layer, as anyone
+    would count it from the shape. Without the biases, which are
+    additions."""
     sizes = [n_in] + list(dims) + [n_out]
     return sum(sizes[i - 1] * sizes[i] for i in range(1, len(sizes)))
 
 
 def mac_count_eff(shape, dims, n_out):
-    """MAC REALMENTE ESEGUITE, che sul primo layer non sono le nominali.
-
-    Una feature one-hot occupa `size` colonne della matrice dei pesi, ma nel
-    datapath ne attiva UNA: l'arm FEAT_NODE_ID / FEAT_INGRESS_IF fa h1
-    addizioni e basta, senza guardare `size`. Contarla come size*h1 MAC e' il
-    modo in cui un grafico "MAC contro latenza" finisce per mostrare una retta
-    piatta e sembrare rotto.
-
-    Le colonne dense (link_state, queue_occupancy) e lo scalare ttl contano per
-    quello che sono. I layer dopo il primo sono densi per costruzione."""
+    """MACs ACTUALLY EXECUTED, which on the first layer are not the nominal ones."""
     import model_meta as mm
     h1 = dims[0] if dims else n_out
     primo = 0
@@ -519,13 +250,7 @@ def mac_count_eff(shape, dims, n_out):
 
 
 def ceiling_refusal(pipeline, shape, dims):
-    """Perche' questa cella non si puo' misurare su questa pipeline, o None.
-
-    Gira nel PADRE, prima di aprire il sottoprocesso, cosi' la cella non viene
-    ne' compilata ne' cronometrata. P1 e p1_static non compaiono: srotolano il
-    modello nel C e non hanno soffitti di larghezza -- se sfondano lo fanno
-    sullo stack da 512 byte, che e' un crash del figlio e va gia' nella colonna
-    CRASH."""
+    """Why this cell cannot be measured on this pipeline, or None."""
     n_in, n_out = shape["n_in"], shape["n_out"]
     if pipeline not in ("template", "modular"):
         return None
@@ -551,9 +276,7 @@ def ceiling_refusal(pipeline, shape, dims):
     return None
 
 
-# ==========================================================================
-# WORKERS -- one per pipeline, each running in its own subprocess
-# ==========================================================================
+# --- WORKERS -- one per pipeline, each running in its own subprocess ---
 def _timed(fn):
     t0 = time.perf_counter()
     out = fn()
@@ -561,35 +284,9 @@ def _timed(fn):
 
 
 def _sample(disp_fd, mk_frame, repeat, trials):
-    """MIN of `trials` independent measurements; see the module docstring on
-    why min rather than mean. Returns (min, p50, max, retval).
-
-    Prende una FABBRICA di frame, non un frame, e il motivo e' un difetto che
-    questa funzione si e' portata dietro a lungo.
-
-    Riusava UN pacchetto per tutte le ripetizioni. Ma BPF_PROG_TEST_RUN non
-    ripristina il buffer fra una ripetizione e l'altra, e il datapath
-    decrementa il TTL: dopo una quarantina di esecuzioni restava inchiodato a
-    1, e da li' in poi ogni ripetizione prendeva il ramo
-    `if (ip->ttl <= 1) return XDP_PASS`.
-
-    Quel ramo sta DOPO l'inferenza, quindi il modello girava lo stesso -- ed
-    e' il motivo per cui le curve scalavano in modo regolare invece di
-    risultare piatte, cioe' per cui il difetto non si vedeva. Ma saltava la
-    coda di inoltro: decremento del TTL, checksum, pkt_stats, cls_stats,
-    mac_table, bpf_redirect. Le cifre dicevano "parse + inferenza", non
-    "tutto il percorso", e non erano confrontabili con quelle di test_suite.
-
-    Il difetto riguardava tutti gli assi, non uno: `_sample` e' una sola.
-
-    `prog_test_run_bench` e' la stessa funzione che usa test_suite: rinfresca
-    il frame ogni TEST_RUN_MAX_CHUNK = 200 esecuzioni, e la fabbrica lo
-    consegna con BENCH_TTL = 255. 255 - 200 = 55, quindi nessuna ripetizione
-    arriva alla scadenza. `repeat` resta un bersaglio: la funzione lo limita a
-    TEST_RUN_MAX_CHUNKS chunk, perche' oltre quel punto il minimo delle medie
-    non migliora piu' e le syscall in piu' sono solo tempo di parete."""
-    from verify_prog_run import prog_test_run_bench
-    prog_test_run_bench(disp_fd, mk_frame, 1000, max_chunks=2)   # scalda
+    """MIN of `trials` independent measurements;"""
+    from check_pipelines import prog_test_run_bench
+    prog_test_run_bench(disp_fd, mk_frame, 1000, max_chunks=2)
     samples, retval = [], None
     for _ in range(trials):
         retval, ns = prog_test_run_bench(disp_fd, mk_frame, repeat)
@@ -598,70 +295,43 @@ def _sample(disp_fd, mk_frame, repeat, trials):
     return samples[0], samples[len(samples) // 2], samples[-1], retval
 
 
-# Ripetizioni del conteggio lookup. 200 = TEST_RUN_MAX_CHUNK, e il frame
-# parte da TTL 255 apposta: BPF_PROG_TEST_RUN non ripristina il buffer fra una
-# ripetizione e l'altra e il datapath decrementa il TTL, quindi con un TTL
-# basso le ripetizioni dopo la quarta prendono il ramo di scadenza -- che fa
-# UN LOOKUP IN MENO (niente cls_stats su un non-forward). E' lo stesso
-# inciampo documentato in _count_lookups_defaults; qui il TTL non arriva mai a
-# 1 (255 - 200 = 55).
 LOOKUP_REPEAT = 200
 LOOKUP_TTL = 255
 
 
 def _instrumented(raw):
-    """La stessa sorgente, con ogni `.lookup()` contato."""
+    """The same source, with every `.lookup()` counted."""
     from common import instrument_map_lookups
     return "#define IPA_COUNT_LOOKUPS 1\n" + instrument_map_lookups(raw)
 
 
 def _lookups_safe(build, n_in, n_out):
-    """Lookup di mappa per pacchetto, o None se non si riesce a misurarli.
-
-    `build` restituisce (oggetto BPF, fd del dispatcher) dalla sorgente
-    strumentata. Un fallimento qui non deve perdere la cella: la latenza e le
-    istruzioni sono gia' state misurate sulla build PULITA, e questa e' una
-    colonna in piu'. La strumentazione gonfia il programma, e su P2 puo'
-    benissimo sfondare il limite di taglia -- allora la colonna resta vuota e
-    lo si vede, invece di far sparire la riga."""
-    from verify_prog_run import build_frame_sparse, prog_test_run
+    """Map lookups per packet, or None if they cannot be measured."""
+    from check_pipelines import build_frame_sparse, prog_test_run
     try:
         bb, disp_fd = build()
         frame = build_frame_sparse(model_id=0, ttl=LOOKUP_TTL, scale=SCALE,
                                    n_in=n_in, n_out=n_out)
         ctr = bb["lookup_ctr"]
         if getattr(ctr, "Leaf", None) is None:
-            # P1, oggetto AOT: un ARRAY semplice con somma atomica (p1_aot).
             ctr[ct.c_int(0)] = ct.c_ulonglong(0)
             prog_test_run(disp_fd, frame, repeat=LOOKUP_REPEAT)
             return (int.from_bytes(ctr[ct.c_int(0)], "little")
                     / float(LOOKUP_REPEAT))
-        ctr[ct.c_int(0)] = ctr.Leaf()        # per-CPU, azzerato ovunque
+        ctr[ct.c_int(0)] = ctr.Leaf()
         prog_test_run(disp_fd, frame, repeat=LOOKUP_REPEAT)
         return sum(int(v) for v in ctr[ct.c_int(0)]) / float(LOOKUP_REPEAT)
     except Exception as e:
-        print(f"[lookups] non misurabile: {type(e).__name__}: {str(e)[:90]}",
+        print(f"[lookups] not measurable: {type(e).__name__}: {str(e)[:90]}",
               file=sys.stderr)
         return None
 
 
 def _totals(b, progs):
     """Sum xlated + jited over every loaded program, and map memory over every
-    map, exactly as test_suite.py reports them.
-
-    The map names come from test_suite._PIPELINE_MAP_NAMES rather than a copy
-    kept here. That list carries a warning about staying in sync with the three
-    eBPF sources, and it earned it: it was once incomplete, and because a
-    missing map is silently skipped, the only symptom was a footprint smaller
-    than the truth. A second copy would reintroduce exactly that failure.
-
-    (A BCC `BPF` object has no .items(): it exposes maps through __getitem__
-    and only caches the ones already asked for, so iterating it would have
-    returned whatever happened to have been touched. That is what the first
-    version of this function did, and every cell of the sweep crashed with
-    `AttributeError: 'BPF' object has no attribute 'items'`.)"""
-    from verify_prog_run import prog_insn_count, map_bytes, _nr_cpus
-    from test_suite import _PIPELINE_MAP_NAMES
+    map, exactly as test_weights_and_metrics.py reports them."""
+    from check_pipelines import prog_insn_count, map_bytes, _nr_cpus
+    from test_weights_and_metrics import _PIPELINE_MAP_NAMES
     insns = jited = 0
     per_prog = {}
     for name, fd in progs.items():
@@ -676,20 +346,16 @@ def _totals(b, progs):
         try:
             one = map_bytes(b[mname].map_fd, nr)
         except Exception:
-            continue          # not a map this pipeline declares
+            continue
         mb += one
         counted.append(mname)
     return insns, jited, mb, per_prog, counted
 
 
 def _bench_p1(cell, repeat, trials, static_node=None):
-    # La stessa cella descrive entrambe le pipeline; solo quella specializzata
-    # sfrutta static_ports. Non e' una convenzione da ricordare: il generatore
-    # RIFIUTA static_ports senza static_node, quindi e' la forma che la
-    # chiamata deve avere perche' `hardcoded` resti quello di sempre.
     ports = cell.get("static_ports") if static_node is not None else None
     import p1_aot
-    from verify_prog_run import build_frame_sparse, _seed_link_state
+    from check_pipelines import build_frame_sparse, _seed_link_state
 
     dims = cell["dims"]
     shape = shape_of(cell)
@@ -699,12 +365,6 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
     def _load(strumentata=False):
-        # P1 is the AOT object (p1_aot), as it is deployed. Installing a model
-        # = generating the C, running clang (offline, on a build box) and
-        # loading the object on the node. build_ms times all three, uncached;
-        # update_ms is the NODE's part alone: the loader's open + load
-        # (verifier + JIT). Until 2026-09-23 P1 was measured on BCC, where
-        # clang runs on the node and the two were the same event.
         return p1_aot.load_p1([(0, weights, SCALE)], instrument=strumentata,
                               cache=False, features=shape["features"],
                               n_out=n_out, hidden_dims=tuple(dims),
@@ -719,23 +379,17 @@ def _bench_p1(cell, repeat, trials, static_node=None):
     lookups = None
     if cell.get("lookups"):
         def _ins():
-            # link_state va seminata anche qui: senza, la feature densa legge
-            # una mappa vuota e il percorso non e' quello misurato sopra.
             s2 = _load(True)
             _seed_link_state(s2["b"], 1)
             return s2["b"], s2["disp"].fd
         lookups = _lookups_safe(_ins, n_in, n_out)
-    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
-    from verify_prog_run import BENCH_TTL
+    from check_pipelines import BENCH_TTL
 
     def mk_frame():
         return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
                                   n_in=n_in, n_out=n_out)
 
     lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
-    # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
-    # loop over one buffer, not a rate anything sustained. It is reported
-    # because it is the unit the question is usually asked in.
     mpps = (1000.0 / lo) if lo else 0.0
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
@@ -745,21 +399,14 @@ def _bench_p1(cell, repeat, trials, static_node=None):
 
 
 def _bench_p2(cell, repeat, trials):
-    # Checked BEFORE the imports on purpose: "P2 cannot do this depth" is a
-    # property of P2, not of whether BCC happens to be installed. Behind the
-    # imports, a machine without BCC would report this cell as a crash rather
-    # than as the structural limit it is.
     dims = cell["dims"]
     if len(dims) < 1:
-        raise NotImplementedError("P2 ha almeno un hidden layer")
+        raise NotImplementedError("P2 has at least one hidden layer")
     if len(set(dims[1:])) > 1:
         raise NotImplementedError(
-            f"in P2 i layer oltre il secondo sono larghi n_h2; questa forma "
-            f"chiede larghezze diverse: {dims[1:]}")
+            f"in P2 the layers beyond the second are n_h2 wide; this shape "
+            f"asks for different widths: {dims[1:]}")
     n_hidden = len(dims)
-    # With one hidden layer there is no fc2, and the datapath carries h1 into
-    # h2 unchanged -- so n_h2 must be registered equal to n_h1. See
-    # build_arch_leaf; load_arch_weights refuses any other value.
     n_h1 = dims[0]
     n_h2 = dims[1] if n_hidden >= 2 else dims[0]
 
@@ -767,7 +414,7 @@ def _bench_p2(cell, repeat, trials):
     from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
                                     build_arch_leaf,
                                     load_arch_weights)
-    from verify_prog_run import build_frame_sparse, _seed_link_state
+    from check_pipelines import build_frame_sparse, _seed_link_state
 
     shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
@@ -775,12 +422,6 @@ def _bench_p2(cell, repeat, trials):
     weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
     sparsity_real = weights.count(0) / len(weights) if weights else 0.0
 
-    # The source does not mention the model's WIDTHS anywhere -- that is P2's
-    # claim, and why its instruction count is flat on the nodes and width
-    # axes. DEPTH is different: it is baked in at compile time, so the leaf
-    # is built for this shape's depth. On the depth axis P2 therefore
-    # RECOMPILES at every point while P3 does not, and that is exactly the
-    # comparison being made.
     src = ("#define IPA_ARCH_COMBINED 1\n" + EBPF_TEMPLATE_ARCH_DISPATCHER
            + "\n" + build_arch_leaf(n_hidden))
 
@@ -792,10 +433,6 @@ def _bench_p2(cell, repeat, trials):
         return bb, d, leaf
 
     (b, disp_fn, leaf_fn), build_ms = _timed(_load)
-    # Installing a model in P2 is writing maps -- arch_registry, model_desc
-    # and a slice of arch_weights. No compiler runs. This is the number that
-    # belongs next to P1's build_ms, not P2's own build_ms, which is a
-    # ONE-TIME cost paid when the node starts and never again.
     _, update_ms = _timed(lambda: load_arch_weights(
         b, weights, model_id=0, scale=SCALE,
         n_h1=n_h1, n_h2=n_h2, n_hidden=n_hidden,
@@ -817,17 +454,13 @@ def _bench_p2(cell, repeat, trials):
             _seed_link_state(bb, 1)
             return bb, dd.fd
         lookups = _lookups_safe(_ins, n_in, n_out)
-    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
-    from verify_prog_run import BENCH_TTL
+    from check_pipelines import BENCH_TTL
 
     def mk_frame():
         return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
                                   n_in=n_in, n_out=n_out)
 
     lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
-    # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
-    # loop over one buffer, not a rate anything sustained. It is reported
-    # because it is the unit the question is usually asked in.
     mpps = (1000.0 / lo) if lo else 0.0
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=1, nw=nw,
                 n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
@@ -839,7 +472,7 @@ def _bench_p2(cell, repeat, trials):
 def _bench_p3(cell, repeat, trials):
     from bcc import BPF
     from ebpf_modular import EBPF_MODULAR_FULL, load_modular_weights
-    from verify_prog_run import build_frame_sparse, _seed_link_state
+    from check_pipelines import build_frame_sparse, _seed_link_state
 
     dims = cell["dims"]
     shape = shape_of(cell)
@@ -858,13 +491,11 @@ def _bench_p3(cell, repeat, trials):
         first = bb.load_func("layer_first", BPF.XDP)
         hidden = bb.load_func("layer_hidden", BPF.XDP)
         bb["layer_chain"][ct.c_int(0)] = ct.c_int(first.fd)
-        for i in range(1, 16):                       # LAYER_CHAIN_SIZE
+        for i in range(1, 16):
             bb["layer_chain"][ct.c_int(i)] = ct.c_int(hidden.fd)
         return bb, d, first, hidden
 
     (b, disp_fn, first_fn, hidden_fn), build_ms = _timed(_load)
-    # Same as P2: a model install is a set of map writes -- layer_registry,
-    # layer_shapes, model_desc and a slice of layer_weights. No compiler.
     _, update_ms = _timed(lambda: load_modular_weights(
         b, weights, model_id=0, scale=SCALE,
         layer_dims=layer_dims,
@@ -887,20 +518,14 @@ def _bench_p3(cell, repeat, trials):
             _seed_link_state(bb, 1)
             return bb, dd.fd
         lookups = _lookups_safe(_ins, n_in, n_out)
-    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
-    from verify_prog_run import BENCH_TTL
+    from check_pipelines import BENCH_TTL
 
     def mk_frame():
         return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
                                   n_in=n_in, n_out=n_out)
 
     lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
-    # Throughput is 1/latency and nothing more -- a THEORETICAL peak from a
-    # loop over one buffer, not a rate anything sustained. It is reported
-    # because it is the unit the question is usually asked in.
     mpps = (1000.0 / lo) if lo else 0.0
-    # Tail calls actually executed: dispatcher -> layer_first -> layer_hidden
-    # x (n_layers - 1). NOT the number of distinct programs, which is always 3.
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=len(layer_dims),
                 nw=nw, n_in=n_in, build_ms=build_ms, update_ms=update_ms, lat_ns=lo, lat_p50=med,
                 lat_max=hi, mpps=mpps, retval=retval, per_prog=per_prog,
@@ -909,26 +534,14 @@ def _bench_p3(cell, repeat, trials):
 
 
 def _bench_p1_static(cell, repeat, trials):
-    """P1 with this node's index frozen into the source. The node one-hot
-    switch and the node_id map read both disappear; what is left are n_h1
-    constants clang can fold. The binary is then valid on ONE node."""
+    """P1 with this node's index frozen into the source."""
     return _bench_p1(cell, repeat, trials, static_node=STATIC_NODE)
 
 
 def _bench_baseline(cell, repeat, trials):
-    """Il pavimento: parse, decremento del TTL, redirect. Nessuna inferenza.
-
-    Non dipende dalla cella, ed e' esattamente il punto: da' al grafico
-    "MAC contro latenza" il suo punto a MAC = 0, cioe' quanto del numero di
-    una pipeline e' framework XDP e non modello. Rimisurato a ogni cella
-    apposta: la sua dispersione lungo l'asse dice quanto rumore aveva la
-    macchina mentre le altre quattro venivano misurate.
-
-    Non passa da setup_baseline() perche' quella chiama load_weights() su un
-    .pt, e qui i modelli sono sintetici. Il programma e' lo stesso: la
-    baseline non legge pesi."""
+    """The floor: parse, TTL decrement, redirect. No inference."""
     from bcc import BPF
-    from verify_prog_run import (EBPF_BASELINE, _install_mac_table,
+    from check_pipelines import (EBPF_BASELINE, _install_mac_table,
                                  build_frame_sparse)
     shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
@@ -946,8 +559,7 @@ def _bench_baseline(cell, repeat, trials):
     if cell.get("lookups"):
         lookups = _lookups_safe(
             lambda: (lambda t: (t[0], t[1].fd))(_load(True)), n_in, n_out)
-    # Un pacchetto NUOVO per ogni chunk, non uno riusato: vedi _sample.
-    from verify_prog_run import BENCH_TTL
+    from check_pipelines import BENCH_TTL
 
     def mk_frame():
         return build_frame_sparse(model_id=0, ttl=BENCH_TTL, scale=SCALE,
@@ -955,9 +567,6 @@ def _bench_baseline(cell, repeat, trials):
 
     lo, med, hi, retval = _sample(disp_fn.fd, mk_frame, repeat, trials)
     mpps = (1000.0 / lo) if lo else 0.0
-    # update_ms = 0 e non build_ms: qui non c'e' nessun modello da installare,
-    # e confondere "compilare una volta" con "cambiare modello" e' l'errore
-    # contro cui il docstring del modulo mette in guardia per P1.
     return dict(insns=insns, jited=jited, map_bytes=mb, tail=0, nw=0,
                 n_in=n_in, build_ms=build_ms, update_ms=0.0, lat_ns=lo,
                 lat_p50=med, lat_max=hi, mpps=mpps, retval=retval,
@@ -971,12 +580,7 @@ _BENCH = {"baseline": _bench_baseline,
 
 
 def _worker(pipeline, spec_json):
-    """Runs in the subprocess. Prints exactly one JSON line; that is the
-    parent's only contract with it.
-
-    The cell arrives as JSON rather than as positional arguments: adding an
-    axis then means adding a key, not editing an argv layout in three
-    places."""
+    """Runs in the subprocess."""
     os.chdir(SHARED_DIR)
     spec = json.loads(spec_json)
     repeat, trials = spec.pop("repeat"), spec.pop("trials")
@@ -989,14 +593,6 @@ def _worker(pipeline, spec_json):
     except Exception as e:
         detail = str(e).strip().splitlines()
         msg = f"{type(e).__name__}: {detail[-1][:110] if detail else ''}"
-        # A verifier refusal is a RESULT, not a failure of this script, and it
-        # must not be filed next to a crash. The kernel answers E2BIG both when
-        # a program is genuinely too long AND when the verifier gives up having
-        # processed more than a million instructions -- and BCC turns that into
-        # "Argument list too long" plus a "at most 4096 insns" string whose
-        # 4096 is a stale constant in BCC itself. A program of 1 120
-        # instructions refused with that text hit the COMPLEXITY ceiling, not
-        # the size one; see docs/testing.md on P3's budget for the same trap.
         refused = ("Argument list too long" in msg
                    or "too large" in msg
                    or "Permission denied" in msg)
@@ -1006,11 +602,6 @@ def _worker(pipeline, spec_json):
     return 0
 
 
-# Tetto di tempo per UNA cella. Una cella normale dura da qualche secondo a un
-# paio di minuti (compilazione + prove); senza tetto, un sottoprocesso bloccato
-# fermava l'intera campagna per sempre senza dire niente. Allo scadere si uccide
-# il gruppo di processi della cella -- worker, loader AOT, compilatori -- e la
-# cella esce TIMEOUT. Si alza con IPA_CELL_TIMEOUT_S.
 CELL_TIMEOUT_S = int(os.environ.get("IPA_CELL_TIMEOUT_S", "900"))
 
 
@@ -1018,9 +609,6 @@ def bench_cell(pipeline, cell, repeat, trials):
     """One cell, isolated. A fatal LLVM abort or a verifier refusal kills only
     the child; so does a hang, after CELL_TIMEOUT_S."""
     spec = dict(cell, dims=list(cell["dims"]), repeat=repeat, trials=trials)
-    # Una sessione propria: il loader AOT e clang sono figli del worker, e al
-    # timeout vanno uccisi con lui -- altrimenti tengono aperta la pipe e
-    # l'attesa dell'uscita non finisce comunque.
     proc = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--_worker", pipeline,
          json.dumps(spec)],
@@ -1038,8 +626,8 @@ def bench_cell(pipeline, cell, repeat, trials):
         except subprocess.TimeoutExpired:
             pass
         return {"ok": False, "skipped": False,
-                "detail": f"TIMEOUT dopo {CELL_TIMEOUT_S}s: cella uccisa "
-                          f"(worker e figli)"}
+                "detail": f"TIMEOUT after {CELL_TIMEOUT_S}s: cell killed "
+                          f"(worker and children)"}
 
     rc = proc.returncode
 
@@ -1057,35 +645,24 @@ def bench_cell(pipeline, cell, repeat, trials):
     err = proc.stderr.strip().splitlines()
     return {"ok": False, "skipped": False,
             "detail": (err[-1][:110] if err else
-                       f"exit {proc.returncode} (abort fatale: stack o verifier)")}
+                       f"exit {proc.returncode} (fatal abort: stack or verifier)")}
 
 
-
-# ==========================================================================
-# HEAD TO HEAD: the two P1 variants, on their own scale
-# ==========================================================================
-# Every other figure draws four pipelines, and P2/P3 sit an order of magnitude
-# above the two P1s -- so the comparison between THOSE TWO, which is a question
-# on its own, is squashed into the bottom of the plot. This figure drops the
-# other two and gives the duel the whole canvas.
-#
-# Four panels, because the answer has four parts and they do not all point the
-# same way: size collapses, native code collapses harder, speed barely moves,
-# and with sparse weights the advantage disappears altogether.
+# --- HEAD TO HEAD: the two P1 variants, on their own scale ---
 DUEL_PANELS = [
-    ("nodes", "insns", "nodi della rete", "istruzioni eBPF",
-     "la dipendenza dalla taglia della rete sparisce"),
-    ("nodes", "jited", "nodi della rete", "codice nativo (byte)",
-     "e nel codice generato il divario e' anche piu' largo"),
-    ("width", "lat_ns", "neuroni per strato nascosto", "latenza (ns/pacchetto)",
-     "la velocita', invece, si muove appena"),
-    ("sparsity", "insns", "frazione di pesi a zero", "istruzioni eBPF",
-     "e con pesi sparsi il vantaggio si annulla"),
+    ("nodes", "insns", "network nodes", "eBPF instructions",
+     "the dependence on the network size disappears"),
+    ("nodes", "jited", "network nodes", "native code (bytes)",
+     "and in the generated code the gap is even wider"),
+    ("width", "lat_ns", "neurons per hidden layer", "latency (ns/packet)",
+     "speed, instead, barely moves"),
+    ("sparsity", "insns", "fraction of zero weights", "eBPF instructions",
+     "and with sparse weights the advantage vanishes"),
 ]
 
 
 def plot_duel(in_dir, fmt):
-    """One figure, four panels: P1 specialised against P1.5."""
+    """One figure, four panels."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1116,50 +693,27 @@ def plot_duel(in_dir, fmt):
         ax.set_ylim(bottom=0)
     if not drawn:
         plt.close(fig)
-        print(f"  {GREY}niente da disegnare: mancano i CSV{NC}")
+        print(f"  {GREY}nothing to draw: the CSVs are missing{NC}")
         return 0
     axes.ravel()[0].legend(frameon=False, fontsize=9)
     fig.tight_layout()
     out = os.path.join(in_dir, "duel_p1_vs_p15." + fmt)
     fig.savefig(out, dpi=160)
     plt.close(fig)
-    print(f"  {GREEN}scritto{NC} {out}")
-    print(f"           {GREY}P1 specializzata contro P1.5, sulla loro scala{NC}")
+    print(f"  {GREEN}written{NC} {out}")
+    print(f"           {GREY}static P1 against P1.5, on their own scale{NC}")
     return 1
 
 
-# ==========================================================================
-# SWEEP
-# ==========================================================================
+# --- SWEEP ---
 def _warn_contaminated(rows, factor=2.0):
-    """Say so when a latency cannot be a property of the x axis.
-
-    P2 and P3 compile a source that does not mention the model, so along the
-    nodes, width, descriptor and sparsity axes their program is byte-identical
-    at every point -- same instruction count, same jited size. If the latency
-    of an IDENTICAL program swings by more than `factor` across the axis, the
-    swing is the machine, not the variable on the x axis: another process, CPU
-    frequency, thermal throttling.
-
-    Taking the min of N trials protects against a spike inside a cell. It does
-    nothing when the whole cell was measured during a busy period, which is
-    what this catches. Without it the reader is invited to explain a 3x jump
-    that has no cause in the model."""
+    """Say so when a latency cannot be a property of the x axis."""
     for pipe in PIPELINES:
         groups = {}
         for r in rows:
             if not r.get("lat_ns"):
                 continue
             if r["pipeline"] == pipe:
-                # Grouped by (instructions, TAIL CALLS), not by instructions
-                # alone. P3's program is byte-identical at every depth -- that
-                # is its whole design -- but it executes one more tail call per
-                # layer, so its latency legitimately doubles across the depth
-                # axis. Keyed on instructions only, this check called that real
-                # result contamination, which is the worst thing a check can
-                # do: cry wolf on the finding. Identical code AND identical
-                # hops is what makes a latency swing impossible to attribute to
-                # the x axis.
                 key = (r["insns"], r.get("tail"))
                 groups.setdefault(key, []).append((r["x"], r["lat_ns"]))
         for (insns, tail), pts in groups.items():
@@ -1169,24 +723,18 @@ def _warn_contaminated(rows, factor=2.0):
             lo, hi = min(lats), max(lats)
             if lo > 0 and hi / lo > factor:
                 worst = max(pts, key=lambda p: p[1])
-                print(f"\n  {RED}SOSPETTO{NC} {pipe}: programma identico "
-                      f"({insns} istruzioni, {tail} tail call) a ogni x, "
-                      f"ma la latenza va da {lo:.0f} a {hi:.0f} ns "
+                print(f"\n  {RED}SUSPECT{NC} {pipe}: identical program "
+                      f"({insns} instructions, {tail} tail calls) at every x, "
+                      f"but the latency goes from {lo:.0f} to {hi:.0f} ns "
                       f"({hi / lo:.1f}x).")
-                print(f"  {GREY}Il binario non cambia lungo questo asse, "
-                      f"quindi lo scarto e' la macchina, non la variabile. "
-                      f"Il punto peggiore e' x={worst[0]}. Rimisura a macchina "
-                      f"scarica prima di metterlo in un grafico.{NC}")
+                print(f"  {GREY}The binary does not change along this axis, "
+                      f"so the spread is the machine, not the variable. "
+                      f"The worst point is x={worst[0]}. Measure again on an "
+                      f"idle machine before putting it in a chart.{NC}")
 
 
 def _give_back(path):
-    """Hand a file or directory created under sudo back to the invoking user.
-
-    The measuring run needs root; plotting does not, and the documented next
-    step is to run --plot WITHOUT sudo. Without this, that second command dies
-    with `PermissionError: 'results/scaling_nodes_insns.pdf'`, because root
-    owns the directory the plots go into. Silently ignored when not running
-    under sudo, or if the chown is refused."""
+    """Hand a file or directory created under sudo back to the invoking user."""
     uid = os.environ.get("SUDO_UID")
     gid = os.environ.get("SUDO_GID")
     if not uid or os.name != "posix":
@@ -1197,24 +745,16 @@ def _give_back(path):
         pass
 
 
-
-# ==========================================================================
-# EQUIVALENCE: the specialised P1 must DECIDE the same thing as P1.5
-# ==========================================================================
+# --- EQUIVALENCE: the specialised P1 must DECIDE the same thing as P1.5 ---
 def _build_p1(cell, static_node):
-    """Build and load one P1 variant (the AOT object); returns (maps,
-    dispatcher fd, shape)."""
+    """Build and load one P1 variant (the AOT object);"""
     import p1_aot
-    from verify_prog_run import _install_mac_table
+    from check_pipelines import _install_mac_table
 
     dims = cell["dims"]
     shape = shape_of(cell)
     n_in, n_out = shape["n_in"], shape["n_out"]
     nw = weight_count(n_in, dims, n_out)
-    # `seed` serve al controllo negativo di verify_ports e a --seeds. Una
-    # curva lungo l'asse usa sempre UN seme, altrimenti l'asse cambierebbe due
-    # cose: --seeds misura ogni punto con tutti i semi, e ogni seme resta una
-    # curva a se'.
     weights = make_weights(nw, cell["sparsity"], seed=cell.get("seed", 42))
     setup = p1_aot.load_p1(
         [(0, weights, SCALE)], features=shape["features"],
@@ -1227,17 +767,11 @@ def _build_p1(cell, static_node):
 
 
 def _decide(b, disp_fd, n_in, n_out, ttl, links):
-    """Run ONE packet and report which class fired. Counters are cleared
-    first, so the answer describes this packet and not the run before it."""
-    from verify_prog_run import (prog_test_run, build_frame_sparse,
+    """Run ONE packet and report which class fired."""
+    from check_pipelines import (prog_test_run, build_frame_sparse,
                                  _read_u64)
     from common import write_vector_map
     from stats_maps import zero_counter
-    # Sizes come from the maps, not from literals here. pkt_stats has 3
-    # entries (hit / miss / drop) and cls_stats has n_out; writing range(4)
-    # into the first of them raised `IndexError: Array index out of range`
-    # from BCC, which is the right error for the wrong reason: the number was
-    # never this file's to know.
     for c in range(len(b["cls_stats"])):
         zero_counter(b["cls_stats"], c)
     for k in range(len(b["pkt_stats"])):
@@ -1255,30 +789,20 @@ def _decide(b, disp_fd, n_in, n_out, ttl, links):
 
 
 def verify_static(node=None):
-    """P1 with the node index FROZEN must decide exactly what P1.5 decides
-    with that same index installed in the node_id map.
-
-    This is the check that makes every speed number in the p1_static column
-    mean something. Folding the node one-hot picks ONE column out of the
-    first layer's weight matrix at code-generation time; picking the wrong
-    column produces a program that is smaller, faster, and computes a
-    different model -- and nothing else in this sweep would notice, because
-    the sweep measures cost, not correctness.
-
-    Two programs, the same packets, the same class every time, or it fails."""
+    """P1 with the node index FROZEN must decide exactly what P1.5 decides with
+    that same index installed in the node_id map."""
     node = STATIC_NODE if node is None else node
     cell = cell_of("nodes", 52)
     n_if = N_INTERFACES
 
     b_s, fd_s, shape = _build_p1(cell, static_node=node)
     b_d, fd_d, _ = _build_p1(cell, static_node=None)
-    # P1.5 learns the node at runtime; the frozen build already knows it.
     b_d["node_id"][ct.c_uint(0)] = ct.c_uint(node)
 
     n_in, n_out = shape["n_in"], shape["n_out"]
     print(f"{YELLOW}{'=' * 70}{NC}")
-    print(f"{YELLOW} P1 specializzata (nodo {node} congelato) contro P1.5 "
-          f"(nodo da mappa){NC}")
+    print(f"{YELLOW} static P1 (node {node} frozen) against P1.5 "
+          f"(node from the map){NC}")
     print(f"{YELLOW}{'=' * 70}{NC}\n")
 
     cases = []
@@ -1295,39 +819,26 @@ def verify_static(node=None):
             bad += 1
             if bad <= 6:
                 ls = "".join(map(str, links))
-                print(f"  {RED}DIVERGE{NC} ttl={ttl:2d} link={ls}: "
-                      f"congelata retval={rv_s} classe={cl_s}, "
-                      f"P1.5 retval={rv_d} classe={cl_d}")
+                print(f"  {RED}DIVERGES{NC} ttl={ttl:2d} link={ls}: "
+                      f"frozen retval={rv_s} class={cl_s}, "
+                      f"P1.5 retval={rv_d} class={cl_d}")
 
     n = len(cases)
     if bad:
-        print(f"\n  {RED}{bad}/{n} casi divergono{NC} -- la colonna di pesi "
-              f"congelata NON e' quella del nodo {node}.")
-        print(f"  {GREY}Finche' questo non passa, ogni numero della colonna "
-              f"p1_static misura un modello diverso.{NC}")
+        print(f"\n  {RED}{bad}/{n} cases diverge{NC} -- the frozen weight "
+              f"column is NOT the one of node {node}.")
+        print(f"  {GREY}Until this passes, every number in the p1_static "
+              f"column measures a different model.{NC}")
         return 1
-    print(f"  {GREEN}{n}/{n} casi identici{NC} (ttl 2-11 x 8 pattern di link).")
-    print(f"  {GREY}Congelare il nodo cambia il codice, non la decisione.{NC}")
+    print(f"  {GREEN}{n}/{n} identical cases{NC} (ttl 2-11 x 8 link patterns).")
+    print(f"  {GREY}Freezing the node changes the code, not the decision.{NC}")
     return 0
 
 
 def verify_ports(ports=None, node=None):
-    """La P1 che NON genera le colonne delle porte assenti deve decidere
-    esattamente come la stessa P1 che le genera, purche' quegli slot valgano 0.
-
-    E' il gemello di verify_static, e per la stessa ragione: togliere colonne
-    dal primo layer produce un programma piu' piccolo che calcola un modello
-    diverso, se la colonna tolta non era davvero nulla. Lo sweep misura costo,
-    non correttezza, e non se ne accorgerebbe.
-
-    Le due build differiscono SOLO per static_ports -- il nodo e' congelato in
-    entrambe -- cosi' una divergenza e' attribuibile a questa modifica e a
-    nient'altro.
-
-    Il controllo negativo in fondo e' cio' che rende credibile il resto: se si
-    accende uno slot assente le due DEVONO divergere. Un test che passa anche
-    quando la condizione e' violata non sta verificando la condizione.
-    """
+    """The P1 that does NOT generate the columns of the absent ports must
+    decide exactly like the same P1 that generates them, as long as those
+    slots are 0."""
     node = STATIC_NODE if node is None else node
     n_if = N_INTERFACES
     ports = {0, 1, 4} if ports is None else set(ports)
@@ -1339,17 +850,14 @@ def verify_ports(ports=None, node=None):
 
     n_in, n_out = shape["n_in"], shape["n_out"]
     print(f"{YELLOW}{'=' * 70}{NC}")
-    print(f"{YELLOW} P1 con le sole porte {sorted(ports)} generate, contro P1 "
-          f"a larghezza piena{NC}")
-    print(f"{GREY} slot senza interfaccia su questo nodo: {assenti} "
-          f"-- strutturalmente 0, non link caduti{NC}")
+    print(f"{YELLOW} P1 with only ports {sorted(ports)} generated, against "
+          f"full-width P1{NC}")
+    print(f"{GREY} slots without an interface on this node: {assenti} "
+          f"-- structurally 0, not links down{NC}")
     print(f"{YELLOW}{'=' * 70}{NC}\n")
 
     def mask(v):
-        """Il riferimento vede 0 dove il nodo non ha interfaccia.
-
-        E' la condizione sotto cui l'equivalenza vale, e va imposta qui
-        esplicitamente perche' _seed_link_state semina 1 su ogni slot."""
+        """The reference sees 0 where the node has no interface."""
         return tuple(0 if i in assenti else x for i, x in enumerate(v))
 
     casi = sorted({(ttl, mask([(p >> i) & 1 for i in range(n_if)]))
@@ -1363,38 +871,27 @@ def verify_ports(ports=None, node=None):
             bad += 1
             if bad <= 6:
                 ls = "".join(map(str, links))
-                print(f"  {RED}DIVERGE{NC} ttl={ttl:2d} link={ls}: "
-                      f"specializzata retval={r_s[0]} classe={r_s[1]}, "
-                      f"piena retval={r_f[0]} classe={r_f[1]}")
+                print(f"  {RED}DIVERGES{NC} ttl={ttl:2d} link={ls}: "
+                      f"specialised retval={r_s[0]} class={r_s[1]}, "
+                      f"full retval={r_f[0]} class={r_f[1]}")
 
     n = len(casi)
     if bad:
-        print(f"\n  {RED}{bad}/{n} casi divergono{NC} -- le colonne eliminate "
-              f"NON erano nulle.")
-        print(f"  {GREY}Finche' questo non passa, ogni numero della colonna "
-              f"p1_static sull'asse degree misura un modello diverso.{NC}")
+        print(f"\n  {RED}{bad}/{n} cases diverge{NC} -- the removed columns "
+              f"were NOT zero.")
+        print(f"  {GREY}Until this passes, every number in the p1_static "
+              f"column on the degree axis measures a different model.{NC}")
         return 1
-    print(f"  {GREEN}{n}/{n} casi identici{NC} (ttl 2-11 x "
-          f"{1 << len(ports)} pattern realizzabili).")
+    print(f"  {GREEN}{n}/{n} identical cases{NC} (ttl 2-11 x "
+          f"{1 << len(ports)} realisable patterns).")
 
-    # --- controllo negativo -------------------------------------------------
-    # Senza questo, il blocco sopra e' compatibile con un test che non prova
-    # nulla: se su questi pesi le colonne assenti non spostano mai l'argmax,
-    # allora "le due build concordano" e' vero anche per una build sbagliata.
-    #
-    # Il primo run reale e' finito esattamente li': 80/80 e controllo muto. La
-    # causa e' che una colonna di link_state contribuisce `1 * w` contro un
-    # accumulatore che somma 65 colonne, quindi puo' benissimo non ribaltare
-    # l'argmax. Non e' una proprieta' del codice ma dei PESI, e allora i pesi
-    # si cercano: il seme del pool e' un parametro di make_weights, e cambiarlo
-    # per il CONTROLLO non tocca la misura, che resta sul seme di sempre.
     if not assenti:
-        print(f"  {GREY}Nessuno slot assente: controllo negativo non "
-              f"applicabile.{NC}")
+        print(f"  {GREY}No absent slot: negative check not "
+              f"applicable.{NC}")
         return 0
 
     def morde(seed):
-        """Su questi pesi, accendere uno slot assente cambia la decisione?"""
+        """On these weights, does turning on an absent slot change the decision?"""
         c = dict(cell, seed=seed)
         bs, fs, sh = _build_p1(c, static_node=node)
         bf, ff, _ = _build_p1(dict(c, static_ports=None), static_node=node)
@@ -1413,21 +910,21 @@ def verify_ports(ports=None, node=None):
         visto = morde(seed)
         if visto:
             extra = "" if seed == 42 else f" (pool seed {seed})"
-            print(f"  {GREEN}controllo negativo{NC}: accendendo uno slot "
-                  f"assente le due divergono in {visto} casi{extra} -- la "
-                  f"condizione \"slot assenti a 0\" e' portante, non "
-                  f"decorativa.")
-            print(f"  {GREY}Togliere le colonne cambia il codice, non la "
-                  f"decisione.{NC}")
+            print(f"  {GREEN}negative check{NC}: turning on an absent slot "
+                  f"the two diverge in {visto} cases{extra} -- the "
+                  f"condition \"absent slots at 0\" is load-bearing, not "
+                  f"decorative.")
+            print(f"  {GREY}Removing the columns changes the code, not the "
+                  f"decision.{NC}")
             return 0
 
-    print(f"\n  {RED}controllo negativo MUTO su {len(semi)} insiemi di pesi{NC}: "
-          f"nemmeno accendendo uno slot assente le due build divergono mai.")
-    print(f"  {GREY}Il {n}/{n} qui sopra e' quindi compatibile anche con una "
-          f"specializzazione sbagliata, e non va citato come prova finche' "
-          f"questo non morde. Prova un descrittore con meno colonne (dove "
-          f"link_state pesa di piu' sull'accumulatore) o un modello piu' "
-          f"stretto.{NC}")
+    print(f"\n  {RED}negative check SILENT on {len(semi)} weight sets{NC}: "
+          f"not even turning on an absent slot do the two builds ever diverge.")
+    print(f"  {GREY}The {n}/{n} above is therefore compatible with a wrong "
+          f"specialisation too, and must not be cited as evidence until "
+          f"this bites. Try a descriptor with fewer columns (where "
+          f"link_state weighs more on the accumulator) or a narrower "
+          f"model.{NC}")
     return 1
 
 
@@ -1437,73 +934,49 @@ def _write_csv(path, rows):
         w.writeheader()
         w.writerows(rows)
     _give_back(path)
-    print(f"\n  {GREEN}scritto{NC} {path}  ({len(rows)} righe)")
+    print(f"\n  {GREEN}written{NC} {path}  ({len(rows)} rows)")
 
 
 def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False,
              seeds=None):
-    """Un asse. Restituisce le righe; `write=False` le lascia al chiamante,
-    che e' come i quattro assi della campagna finiscono in un CSV solo.
-
-    `seeds`: misura ogni punto x una volta per seme del pool dei pesi
-    (make_weights), i semi dello stesso punto uno dopo l'altro, cosi' un drift
-    della macchina li colpisce allo stesso modo. Ogni seme resta una curva
-    completa lungo l'asse. Ogni punto x diventa len(seeds) misure, e si vede
-    quanto della curva di P1 / P1.5 dipende dai VALORI dei pesi e quanto dalla
-    variabile sull'asse x. P2 e P3 fanno da controllo: il loro programma non
-    contiene i pesi, quindi istruzioni identiche a ogni seme. Le righe portano
-    la colonna `seed` e vanno in scaling_<asse>_seeds.csv, senza toccare il
-    CSV a seme unico."""
+    """One axis. Returns the rows; `write=False` leaves them to the caller,
+    which is how the four campaign axes end up in one CSV."""
     spec = AXES[axis]
     print(f"\n{YELLOW}{'=' * 78}{NC}")
-    print(f"{YELLOW} asse x: {spec['xlabel']}{NC}")
+    print(f"{YELLOW} x axis: {spec['xlabel']}{NC}")
     print(f"{GREY} {spec['note']}{NC}")
     print(f"{YELLOW}{'=' * 78}{NC}\n")
 
     rows = []
-    hdr = (f"  {'x':>5s} {'pipeline':11s} {'forma':>16s} {'pesi':>6s} "
+    hdr = (f"  {'x':>5s} {'pipeline':11s} {'shape':>16s} {'weights':>7s} "
            f"{'insns':>7s} {'ns':>7s} {'update ms':>10s} {'build ms':>9s} "
-           f"{'mappe B':>8s} {'tail':>4s}")
+           f"{'maps B':>8s} {'tail':>4s}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
 
-    # La baseline e' il pavimento del confronto MAC-contro-latenza, quindi
-    # entra negli assi della campagna. Gli assi storici restano a quattro
-    # pipeline, cosi' i loro CSV conservano le stesse righe di prima.
     pipelines = (("baseline",) + PIPELINES) if spec.get("campaign") else PIPELINES
-    falliti = []      # (x, pipeline, seme) delle celle non misurate
+    falliti = []
 
     for v, seed in [(v, s) for v in spec["values"] for s in (seeds or [None])]:
         cell = cell_of(axis, v)
-        cell["lookups"] = lookups     # viaggia in JSON fino al worker
+        cell["lookups"] = lookups
         if seed is not None:
-            cell["seed"] = seed       # anche questo: lo legge make_weights
-        tag = f" seme {seed}" if seed is not None else ""
+            cell["seed"] = seed
+        tag = f" seed {seed}" if seed is not None else ""
         dims = cell["dims"]
-        # Computed here, not read back from the result: a cell that was
-        # skipped or that crashed has no n_in to report, and printing "?-4-7"
-        # made a structural note look like a broken measurement.
         shape = shape_of(cell)
         n_in = shape["n_in"]
         shape_str = f"{n_in}-{'-'.join(map(str, dims))}-{N_OUT}"
-        # Descrittive della cella, uguali per tutte le pipeline: la forma non
-        # cambia a seconda di chi la esegue. `macs` e `macs_eff` divergono
-        # quando l'ingresso ha one-hot -- vedi mac_count_eff.
         forma = dict(n_out=N_OUT, depth=len(dims),
                      width=(max(dims) if dims else 0),
                      macs=mac_count(n_in, dims, N_OUT),
                      macs_eff=mac_count_eff(shape, dims, N_OUT))
         for pipe in pipelines:
-            # Fuori dai soffitti compilati NON si misura. P3 non rifiuta il
-            # caricamento, risponde XDP_PASS a runtime: la misura uscirebbe
-            # come una latenza plausibile di un programma che non calcola.
             oltre = ceiling_refusal(pipe, shape, dims)
             if oltre:
                 r = {"ok": False, "refused": True,
-                     "detail": f"soffitto compilato: {oltre}"}
+                     "detail": f"compiled ceiling: {oltre}"}
             else:
-                # Una riga PRIMA della cella: e' cio' che dice, in un run di
-                # ore, che il banco sta andando avanti e su quale cella.
                 t_cella = time.time()
                 print(f"  {GREY}[{time.strftime('%H:%M:%S')}] {axis} x={v} "
                       f"{pipe}{tag} ...{NC}", flush=True)
@@ -1513,8 +986,6 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False,
                     print(f"  {GREY}    ... {r.get('detail', 'fallita')} "
                           f"({r['_secs']} s){NC}", flush=True)
             if r.get("ok"):
-                # La baseline non moltiplica niente: `forma` descrive la
-                # cella, non quello che questa pipeline esegue.
                 if pipe == "baseline":
                     r = dict(r)
                     forma_riga = dict(forma, macs=0, macs_eff=0)
@@ -1524,8 +995,6 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False,
                       f"{r['insns']:7d} {r['lat_ns']:7.1f} "
                       f"{r['update_ms']:10.2f} {r['build_ms']:9.1f} "
                       f"{r['map_bytes']:8d} {r['tail']:4d}{tag}")
-                # `seed` solo quando si e' chiesto --seeds: senza, la riga e
-                # quindi il CSV restano identici a quelli gia' raccolti.
                 col_seme = {"seed": seed} if seed is not None else {}
                 rows.append(dict(axis=axis, x=v, pipeline=pipe, **col_seme,
                                  shape=shape_str, **forma_riga, **{
@@ -1535,28 +1004,22 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False,
                                       "build_ms", "update_ms",
                                       "lat_ns", "lat_p50", "lat_max",
                                       "mpps",
-                                      # requested vs achieved: the weights are
-                                      # a prefix of a shuffled pool, so the
-                                      # zero fraction of a short prefix is a
-                                      # sample of the pool's, not equal to it.
-                                      # Recorded so the x label can be checked
-                                      # rather than trusted.
                                       "sparsity_real", "lookups")}))
             else:
                 if r.get("skipped"):
-                    mark = f"{GREY}n/d{NC}"
+                    mark = f"{GREY}n/a{NC}"
                 elif r.get("refused"):
-                    mark = f"{YELLOW}RIFIUTATO{NC}"     # dato, non guasto
+                    mark = f"{YELLOW}REFUSED{NC}"
                 else:
                     mark = f"{RED}CRASH{NC}"
                 print(f"  {str(v):>5s} {pipe:11s} {shape_str:>16s} {'':6s} "
                       f"{mark}{tag} {GREY}{r.get('detail', '')[:90]}{NC}")
-                if str(r.get("detail", "")).startswith("soffitto compilato"):
-                    genere = "soffitto"        # dipende dalla forma, non dal seme
+                if str(r.get("detail", "")).startswith("compiled ceiling"):
+                    genere = "ceiling"
                 elif r.get("refused"):
-                    genere = "verificatore"
+                    genere = "verifier"
                 elif r.get("skipped"):
-                    genere = "n/d"
+                    genere = "n/a"
                 else:
                     genere = "crash"
                 falliti.append((v, pipe, seed, genere))
@@ -1572,22 +1035,18 @@ def run_axis(axis, repeat, trials, out_dir, write=True, lookups=False,
         if rows:
             _write_csv(os.path.join(out_dir, nome), rows)
         else:
-            print(f"\n  {RED}nessuna riga da scrivere per {axis}{NC}")
+            print(f"\n  {RED}no row to write for {axis}{NC}")
     return rows
 
 
 def _summary_seeds(axis, rows, falliti, seeds):
-    """Per ogni (x, pipeline): mediana e intervallo fra i semi.
-
-    Un programma che non si carica con un seme e con un altro si' (claims.md,
-    C4) non e' un guasto del banco: e' un risultato, e il riepilogo lo conta
-    invece di nasconderlo nella mediana."""
+    """For every (x, pipeline)."""
     import statistics
-    print(f"\n{YELLOW} {axis}: {len(seeds)} semi del pool dei pesi "
+    print(f"\n{YELLOW} {axis}: {len(seeds)} seeds of the weight pool "
           f"({', '.join(map(str, seeds))}){NC}")
-    hdr = (f"  {'x':>5s} {'pipeline':11s} {'caricati':>8s} "
-           f"{'insns mediana':>13s} {'[min - max]':>15s} "
-           f"{'ns mediana':>10s} {'[min - max]':>13s}")
+    hdr = (f"  {'x':>5s} {'pipeline':11s} {'loaded':>8s} "
+           f"{'insns median':>13s} {'[min - max]':>15s} "
+           f"{'ns median':>10s} {'[min - max]':>13s}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     xs = []
@@ -1618,89 +1077,59 @@ def _summary_seeds(axis, rows, falliti, seeds):
                 ins_s = f"{'-':>13s} {'':>15s}"
                 lat_s = f"{'-':>10s} {'':>13s}"
             nota = ""
-            for genere in ("verificatore", "crash", "soffitto", "n/d"):
+            for genere in ("verifier", "crash", "ceiling", "n/a"):
                 semi = [str(k[0]) for k in ko if k[1] == genere]
                 if semi:
-                    nota += f"  {RED}{genere}: seme {', '.join(semi)}{NC}"
+                    nota += f"  {RED}{genere}: seed {', '.join(semi)}{NC}"
             print(f"  {str(x):>5s} {pipe:11s} {f'{len(sel)}/{len(sel) + len(ko)}':>8s} "
                   f"{ins_s} {lat_s}{nota}")
 
 
-# ==========================================================================
-# PLOTS -- read the CSV, never re-measure. No root, no BCC.
-# ==========================================================================
-# (colonna, etichetta y, nome file, asse y logaritmico)
-#
-# update_ms is log: P1 sits around 1500 ms and P2/P3 around a millisecond, so
-# on a linear axis the two cheap pipelines collapse onto the zero line and the
-# graph shows one curve instead of three. The whole finding is the DISTANCE
-# between them, which is what a log axis is for.
-# Every (metric, axis) pair this sweep can draw -- 7 metrics x 5 axes = 35
-# figures. Most of them say nothing: map memory does not depend on any axis,
-# build_ms is the same compile every time, and a log twin of a metric whose
-# range is one decade adds no reading.
-#
-# KEEP lists the pairs that carry a result, and it is what gets drawn by
-# default. --all-plots draws the whole matrix, for looking rather than for
-# publishing.
+# --- PLOTS -- read the CSV, never re-measure. No root, no BCC. ---
 PLOTS = [
-    ("insns", "istruzioni del programma", "scaling_{axis}_insns", False),
-    # The log twin exists for one figure only. P1 runs at ~10^3 instructions
-    # and P2/P3 at ~10^4, so on a LINEAR axis P1's curve is pinned to the
-    # bottom and its collapse with sparser weights -- 1 114 to 236, the
-    # sharpest result in the sweep -- is invisible. On a LOG axis that is
-    # plain, but the gaps among P2, P3 and the baseline flatten out. Neither scale
-    # serves both readings, so each figure takes the one that shows what it
-    # is about.
-    ("insns", "istruzioni del programma (scala log)", "scaling_{axis}_insns_log", True),
-    ("lat_ns", "latenza (ns/pacchetto, minimo)", "scaling_{axis}_latency", False),
-    ("lat_ns", "latenza (ns/pacchetto, scala log)", "scaling_{axis}_latency_log", True),
-    ("mpps", "pacchetti al secondo teorici (1 / latenza)", "scaling_{axis}_mpps", False),
-    ("update_ms", "installare un modello nuovo (ms)", "scaling_{axis}_update", True),
-    ("build_ms", "compilare il programma, una volta (ms)", "scaling_{axis}_build", False),
-    ("map_bytes", "memoria delle tabelle (byte)", "scaling_{axis}_maps", False),
+    ("insns", "program instructions", "scaling_{axis}_insns", False),
+    ("insns", "program instructions (log scale)", "scaling_{axis}_insns_log", True),
+    ("lat_ns", "latency (ns/packet, minimum)", "scaling_{axis}_latency", False),
+    ("lat_ns", "latency (ns/packet, log scale)", "scaling_{axis}_latency_log", True),
+    ("mpps", "theoretical packets per second (1 / latency)", "scaling_{axis}_mpps", False),
+    ("update_ms", "installing a new model (ms)", "scaling_{axis}_update", True),
+    ("build_ms", "compiling the program, once (ms)", "scaling_{axis}_build", False),
+    ("map_bytes", "table memory (bytes)", "scaling_{axis}_maps", False),
 ]
 
-# (axis, metric) -> the one-line reading that figure supports. Keeping the
-# claim next to the selection is deliberate: a figure nobody can state a
-# conclusion for does not belong in a thesis, and this list is where that
-# question gets asked.
 KEEP = {
     ("depth", "insns"):
-        "P3 ha la stessa dimensione a ogni profondita': riusa layer_hidden; "
-        "P2 cresce di ~870 istruzioni per strato (fino al 27/9 oltre due strati non caricava)",
+        "P3 has the same size at every depth: it reuses layer_hidden; "
+        "P2 grows by ~870 instructions per layer",
     ("depth", "lat_ns"):
-        "e P3 lo paga in tempo, ~53 ns per layer (P2 ~25): tail call e letture",
+        "and P3 pays it in time, ~53 ns per layer (P2 ~25): tail call and reads",
     ("depth", "update_ms"):
-        "installare un modello: P1 carica un oggetto AOT (~1-2 ms), P2 e P3 "
-        "scrivono in mappa (~10-12 ms)",
+        "installing a model: P1 loads an AOT object, P2 and P3 "
+        "write maps",
     ("nodes", "insns"):
-        "la taglia della rete entra nel programma solo in P1.5; congelando il "
-        "nodo (P1 specializzata) la dipendenza SPARISCE",
-    # Lo stesso dato su scala log: in lineare le due P1 (600-1700) restano
-    # schiacciate contro le ~15 000 di P2, e il confronto fra loro -- che e'
-    # il punto della figura -- non si vede.
+        "the network size enters the program only in P1.5; freezing the "
+        "node (static P1) the dependence DISAPPEARS",
     ("nodes", "insns_log"):
-        "lo stesso, leggibile: P1.5 sale 2,3x fra 10 e 100 nodi, la "
-        "specializzata resta piatta",
+        "the same, readable: P1.5 rises 2.3x between 10 and 100 nodes, the "
+        "static one stays flat",
     ("nodes", "lat_ns"):
-        "ma a runtime non costa a nessuna: la one-hot legge UNA colonna, e lo "
-        "switch ne esegue UN caso",
+        "but at runtime it costs nobody: the one-hot reads ONE column, and "
+        "the switch runs ONE case",
     ("width", "lat_ns"):
-        "allargare i layer NASCOSTI invece si paga, su tutte e quattro",
+        "widening the HIDDEN layers is paid instead, by all four",
     ("sparsity", "insns_log"):
-        "con pesi sparsi P1 crolla e le due P1 CONVERGONO: sparsita' e nodo "
-        "congelato sono due strade alla stessa riduzione, non si sommano",
+        "with sparse weights P1 collapses and the two P1s CONVERGE: sparsity "
+        "and frozen node are two roads to the same reduction, they do not add up",
     ("isoparam", "insns"):
-        "a PARITA' di parametri (~592 pesi): quanto costa in dimensione "
-        "spalmarli su piu' layer invece che su uno largo",
+        "with the SAME parameters (~592 weights): how much spreading them over "
+        "more layers instead of one wide one costs in size",
     ("isoparam", "lat_ns"):
-        "e quanto costa in tempo -- e' qui che si risponde a 'larga o profonda'",
+        "and how much it costs in time -- this answers 'wide or deep'",
     ("isoparam", "mpps"):
-        "lo stesso in throughput teorico, l'unita' in cui la domanda si pone",
+        "the same in theoretical throughput, the unit the question is asked in",
     ("descriptor", "insns"):
-        "il controllo: senza feature 'node' le due P1 sono IDENTICHE, con "
-        "essa divergono -- il divario e' tutto li' e nient'altro",
+        "the control: without the 'node' feature the two P1s are IDENTICAL, "
+        "with it they diverge -- the whole gap is there and nowhere else",
 }
 
 STYLE = {
@@ -1712,22 +1141,16 @@ STYLE = {
 }
 
 
-# Un marcatore per ASSE, non per pipeline: nella figura della campagna il
-# colore dice gia' quale pipeline e', e serve poter vedere se i quattro assi
-# cadono sulla stessa retta oppure no -- che e' l'intera domanda.
 CAMPAIGN_MARKERS = {
-    "iv_dense":   ("o", "IV densa"),
-    "iv_onehot":  ("s", "IV one-hot"),
-    "width_camp": ("D", "larghezza"),
-    "depth_camp": ("^", "profondita'"),
+    "iv_dense":   ("o", "dense IV"),
+    "iv_onehot":  ("s", "one-hot IV"),
+    "width_camp": ("D", "width"),
+    "depth_camp": ("^", "depth"),
 }
 
 
 def _fit(xs, ys):
-    """Minimi quadrati a mano: (pendenza, intercetta, r2).
-
-    Senza numpy di proposito -- sono quattro righe e questo file gira anche
-    dove c'e' solo matplotlib."""
+    """Least squares by hand."""
     n = len(xs)
     if n < 2:
         return None
@@ -1743,20 +1166,7 @@ def _fit(xs, ys):
 
 
 def plot_campaign(in_dir, fmt):
-    """MAC contro latenza, i quattro assi della campagna sovrapposti.
-
-    Disegna la stessa figura due volte, con le MAC NOMINALI e con quelle
-    ESEGUITE. Non e' ridondanza: una feature one-hot occupa `size` colonne
-    della matrice dei pesi ma nel datapath ne attiva una sola, quindi le
-    nominali sovrastimano -- e di quanto dipende da quanta one-hot c'e'
-    nell'ingresso, cioe' cambia da asse ad asse. Il risultato e' che con le
-    nominali i quattro assi NON stanno sulla stessa retta e con le eseguite
-    si'. Mettere solo la seconda vorrebbe dire chiedere al lettore di fidarsi.
-
-    La baseline non entra in nessuna retta: ha 0 MAC su ogni cella, quindi e'
-    una nuvola verticale a x = 0. Va disegnata come pavimento -- il costo del
-    framework XDP che ogni pipeline paga prima di moltiplicare qualunque
-    cosa -- e non come un punto da interpolare."""
+    """MACs against latency, the four campaign axes overlaid."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1764,25 +1174,25 @@ def plot_campaign(in_dir, fmt):
 
     path = os.path.join(in_dir, CAMPAIGN_CSV)
     if not os.path.exists(path):
-        print(f"  {GREY}salto la campagna: {path} non c'e'{NC}")
+        print(f"  {GREY}skipping the campaign: {path} does not exist{NC}")
         return 0
     with open(path, encoding="utf-8") as f:
         rows = [r for r in csv.DictReader(f) if r.get("lat_ns")]
     if not rows:
-        print(f"  {GREY}salto la campagna: CSV vuoto{NC}")
+        print(f"  {GREY}skipping the campaign: empty CSV{NC}")
         return 0
     if "macs_eff" not in rows[0]:
-        print(f"  {GREY}salto la campagna: manca la colonna macs_eff "
-              f"(rimisura per averla){NC}")
+        print(f"  {GREY}skipping the campaign: column macs_eff missing "
+              f"(measure again to get it){NC}")
         return 0
 
     made = 0
     for col, nome, unita, stem in (
-            ("macs_eff", "MAC eseguite per pacchetto", "ns/MAC",
+            ("macs_eff", "MACs executed per packet", "ns/MAC",
              "campaign_macs_eff_latency"),
-            ("macs", "MAC nominali per pacchetto (n_in x h1 + ...)", "ns/MAC",
+            ("macs", "nominal MACs per packet (n_in x h1 + ...)", "ns/MAC",
              "campaign_macs_nominal_latency"),
-            ("insns", "istruzioni del programma", "ns/istruzione",
+            ("insns", "program instructions", "ns/instruction",
              "campaign_insns_latency")):
         fig, ax = plt.subplots(figsize=(6.4, 4.0))
         print(f"\n  {YELLOW}{nome}{NC}")
@@ -1799,19 +1209,14 @@ def plot_campaign(in_dir, fmt):
                         color=STYLE[pipe]["color"], alpha=0.9)
             f = _fit(px, py)
             if not f:
-                # x costante su tutte le celle: non c'e' nessuna retta da
-                # stimare. E' il caso di P3 sulle istruzioni -- 12349 ovunque,
-                # perche' non ricompila mai -- ed e' un RISULTATO, non un
-                # dato mancante. Senza questa voce la figura mostrerebbe una
-                # nuvola di punti senza nome in legenda.
                 if px:
                     ax.plot([], [], marker=STYLE[pipe]["marker"],
                             linestyle="none", color=STYLE[pipe]["color"],
-                            label=f"{STYLE[pipe]['label']}: x costante "
-                                  f"({px[0]:.0f}), nessuna pendenza")
-                    print(f"    {STYLE[pipe]['label']:22s} x costante a "
-                          f"{px[0]:.0f}: {GREY}la latenza varia "
-                          f"{min(py):.0f}-{max(py):.0f} ns a parita' di x{NC}")
+                            label=f"{STYLE[pipe]['label']}: constant x "
+                                  f"({px[0]:.0f}), no slope")
+                    print(f"    {STYLE[pipe]['label']:22s} constant x at "
+                          f"{px[0]:.0f}: {GREY}latency varies "
+                          f"{min(py):.0f}-{max(py):.0f} ns at the same x{NC}")
                 continue
             m, q, r2 = f
             xs = [min(px), max(px)]
@@ -1819,10 +1224,6 @@ def plot_campaign(in_dir, fmt):
                     color=STYLE[pipe]["color"],
                     label=f"{STYLE[pipe]['label']}: {m:.3f} {unita}  "
                           f"(r2 {r2:.2f})")
-            # Il residuo medio PER ASSE: se un asse non sta sulla retta lo si
-            # legge qui invece di indovinarlo dalla figura. Su `depth` ci si
-            # aspetta che non ci stia -- P2 ricompila e P3 aggiunge una tail
-            # call a ogni layer, e ne' l'una ne' l'altra e' una MAC.
             fuori = []
             for axe in CAMPAIGN_MARKERS:
                 res = [abs(float(r["lat_ns"]) - (m * float(r[col]) + q))
@@ -1834,40 +1235,35 @@ def plot_campaign(in_dir, fmt):
             fuori.sort(reverse=True)
             detta = "  ".join(f"{a} {v:.0f}ns" for v, a in fuori)
             print(f"    {STYLE[pipe]['label']:22s} {m:.3f} {unita}  "
-                  f"r2 {r2:.2f}   {GREY}residuo medio: {detta}{NC}")
+                  f"r2 {r2:.2f}   {GREY}mean residual: {detta}{NC}")
 
-        # Il pavimento: la baseline, che di MAC ne fa zero.
         base = [float(r["lat_ns"]) for r in rows if r["pipeline"] == "baseline"]
         if base:
             lo, hi = min(base), max(base)
             ax.axhspan(lo, hi, color=STYLE["baseline"]["color"], alpha=0.18)
             ax.axhline(sum(base) / len(base), linewidth=1.0, linestyle=":",
                        color=STYLE["baseline"]["color"])
-            print(f"    {'baseline (0 MAC)':22s} pavimento {lo:.0f}-{hi:.0f} ns "
-                  f"{GREY}(framework XDP, nessuna inferenza){NC}")
+            print(f"    {'baseline (0 MAC)':22s} floor {lo:.0f}-{hi:.0f} ns "
+                  f"{GREY}(XDP framework, no inference){NC}")
 
         ax.set_xlabel(nome)
-        ax.set_ylabel("latenza (ns/pacchetto, minimo)")
+        ax.set_ylabel("latency (ns/packet, minimum)")
         ax.grid(True, linewidth=0.4, alpha=0.4)
         ax.set_ylim(bottom=0)
         prima = ax.legend(frameon=False, fontsize=7.5, loc="upper left")
-        # Seconda legenda, per i marcatori: quale asse e' quale punto. Senza,
-        # la figura mostra una nuvola e non si puo' dire se un asse devia.
         ax.add_artist(prima)
         ax.legend(handles=[Line2D([], [], marker=mk, linestyle="none",
                                   color="#555555", markersize=6, label=lab)
                            for mk, lab in CAMPAIGN_MARKERS.values()],
-                  fontsize=7.5, loc="lower right", title="asse",
+                  fontsize=7.5, loc="lower right", title="axis",
                   title_fontsize=7.5,
-                  # Riquadro opaco e non trasparente: qui sotto passano le
-                  # rette di P1, e senza sfondo le voci diventano illeggibili.
                   frameon=True, framealpha=0.95, edgecolor="none",
                   facecolor="white")
         fig.tight_layout()
         out = os.path.join(in_dir, stem + "." + fmt)
         fig.savefig(out, dpi=160)
         plt.close(fig)
-        print(f"  {GREEN}scritto{NC} {out}")
+        print(f"  {GREEN}written{NC} {out}")
         made += 1
     return made
 
@@ -1879,36 +1275,27 @@ def plot_axis(axis, in_dir, fmt, draw_all=False):
 
     path = os.path.join(in_dir, f"scaling_{axis}.csv")
     if not os.path.exists(path):
-        print(f"  {GREY}salto {axis}: {path} non c'e'{NC}")
+        print(f"  {GREY}skipping {axis}: {path} does not exist{NC}")
         return 0
     with open(path, encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     if not rows:
-        print(f"  {GREY}salto {axis}: CSV vuoto{NC}")
+        print(f"  {GREY}skipping {axis}: empty CSV{NC}")
         return 0
 
     cat = AXES[axis]["kind"] == "cat"
-    # Categorical x (the descriptor axis) is drawn as grouped bars, not a
-    # curve. A line from "no_onehot" to "big_onehot" would draw a slope
-    # between two names, implying intermediate descriptors that do not exist.
     order = [str(v) for v in AXES[axis]["values"]]
 
     made = 0
     for metric, ylabel, stem, logy in PLOTS:
-        # "insns_log" and "insns" are the same column with different scales;
-        # KEEP is keyed on the figure, not the column.
         fig_key = metric + ("_log" if logy and stem.endswith("_log") else "")
         if not draw_all and (axis, fig_key) not in KEEP:
             continue
         fig, ax = plt.subplots(figsize=(6.2 if cat else 5.6, 3.6))
         drawn = False
         if metric not in rows[0]:
-            # A CSV written by an older version of this script: it simply does
-            # not have this column. Say so and move on -- crashing with a
-            # KeyError would make an out-of-date file look like a broken
-            # plotter, and re-measuring is the fix either way.
-            print(f"  {GREY}salto {metric} per {axis}: colonna assente nel CSV "
-                  f"(rimisura per averla){NC}")
+            print(f"  {GREY}skipping {metric} for {axis}: column missing in the CSV "
+                  f"(measure again to get it){NC}")
             plt.close(fig)
             continue
         for slot, pipe in enumerate(PIPELINES):
@@ -1925,9 +1312,6 @@ def plot_axis(axis, in_dir, fmt, draw_all=False):
             else:
                 pts = sorted((float(k), float(v)) for k, v in vals.items())
                 xs, ys = zip(*pts)
-                # A single point cannot show a slope, so it is drawn as a lone
-                # marker: that is P2 on the depth axis when its compiled layer
-                # ceiling is 2, and the gap IS the result.
                 ax.plot(xs, ys, linestyle="-" if len(xs) > 1 else "none",
                         linewidth=1.6, markersize=6, **STYLE[pipe])
             drawn = True
@@ -1938,9 +1322,6 @@ def plot_axis(axis, in_dir, fmt, draw_all=False):
             ax.set_xticks(range(len(order)))
             ax.set_xticklabels(order, fontsize=8)
         else:
-            # Integer x values get integer ticks. Matplotlib's default put
-            # 1.5 and 2.5 on the hidden-layer axis, and half a layer does not
-            # exist.
             vals = [float(v) for v in AXES[axis]["values"]]
             if all(v == int(v) for v in vals):
                 ax.set_xticks([int(v) for v in vals])
@@ -1949,7 +1330,7 @@ def plot_axis(axis, in_dir, fmt, draw_all=False):
         ax.grid(True, linewidth=0.4, alpha=0.4)
         ax.legend(frameon=False, fontsize=8)
         if logy:
-            ax.set_yscale("log")      # set_ylim(bottom=0) is invalid on a log axis
+            ax.set_yscale("log")
         else:
             ax.set_ylim(bottom=0)
         fig.tight_layout()
@@ -1957,17 +1338,14 @@ def plot_axis(axis, in_dir, fmt, draw_all=False):
         fig.savefig(out, dpi=160)
         plt.close(fig)
         why = KEEP.get((axis, fig_key))
-        print(f"  {GREEN}scritto{NC} {out}")
+        print(f"  {GREEN}written{NC} {out}")
         if why:
             print(f"           {GREY}{why}{NC}")
         made += 1
     return made
 
 
-# ==========================================================================
 def main():
-    # Riga per riga anche dentro `| tee`: senza, Python accumula l'uscita a
-    # blocchi e un run di ore sembra fermo.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(line_buffering=True)
@@ -1978,43 +1356,43 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--axis", choices=list(AXES) + ["all", "campaign"],
                    default="all",
-                   help="`all` = i sette assi storici; `campaign` = le "
-                        "architetture della campagna, tutte in "
+                   help="`all` = the seven main axes; `campaign` = the "
+                        "campaign architectures, all in "
                         + CAMPAIGN_CSV)
     p.add_argument("--repeat", type=int, default=100000,
-                   help="ripetizioni bersaglio per misura; vengono spezzate "
-                        "in chunk da 200 con un frame nuovo ciascuno, e "
-                        "limitate a TEST_RUN_MAX_CHUNKS chunk")
+                   help="target repetitions per measurement; split into "
+                        "chunks of 200 with a new frame each, and "
+                        "limited to TEST_RUN_MAX_CHUNKS chunks")
     p.add_argument("--trials", type=int, default=7,
-                   help="misure indipendenti per cella; si tiene il minimo")
+                   help="independent measurements per cell; the minimum is kept")
     p.add_argument("--lookups", action="store_true",
-                   help="misura anche le letture di mappa per pacchetto. "
-                        "Spento di default: e' una SECONDA compilazione per "
-                        "cella (su P1 ~1,5 s di clang in piu' ognuna), e la "
-                        "build strumentata non e' quella cronometrata")
+                   help="also measure the map lookups per packet. "
+                        "Off by default: it is a SECOND compilation per "
+                        "cell (on P1 ~1.5 s more of clang each), and the "
+                        "instrumented build is not the timed one")
     p.add_argument("--out", default=os.path.join(SHARED_DIR, "..", "results"),
-                   help="dove scrivere i CSV")
+                   help="where to write the CSVs")
     p.add_argument("--plot", metavar="DIR", default=None,
-                   help="non misurare: genera i grafici dai CSV in DIR")
+                   help="do not measure: draw the charts from the CSVs in DIR")
     p.add_argument("--format", default="pdf", choices=["pdf", "png"])
     p.add_argument("--verify", action="store_true",
-                   help="non misurare: verifica che la P1 specializzata decida "
-                        "come la P1.5 con lo stesso nodo installato")
+                   help="do not measure: check that the static P1 decides "
+                        "like P1.5 with the same node installed")
     p.add_argument("--verify-ports", action="store_true", dest="verify_ports",
-                   help="non misurare: verifica che la P1 che non genera le "
-                        "porte assenti decida come quella a larghezza piena")
+                   help="do not measure: check that the P1 that does not "
+                        "generate the absent ports decides like the full-width one")
     p.add_argument("--ports", default=None,
-                   help="porte presenti per --verify-ports, es. '0,1,4' "
+                   help="ports present for --verify-ports, e.g. '0,1,4' "
                         "(default 0,1,4)")
     p.add_argument("--seeds", default=None, metavar="S1,S2,...",
-                   help="ripete l'asse per ogni seme del pool dei pesi, es. "
-                        "'42,1,2,3,7', e scrive scaling_<asse>_seeds.csv con "
-                        "mediana e intervallo per punto. Per la dipendenza di "
-                        "P1/P1.5 dai valori dei pesi; P2/P3 fanno da "
-                        "controllo. Solo con --axis <un asse storico>")
+                   help="repeat the axis for every seed of the weight pool, "
+                        "e.g. '42,1,2,3,7', and write scaling_<axis>_seeds.csv "
+                        "with median and range per point. For the dependence "
+                        "of P1/P1.5 on the weight values; P2/P3 act as "
+                        "control. Only with --axis <one main axis>")
     p.add_argument("--all-plots", action="store_true",
-                   help="disegna tutte le combinazioni metrica x asse, non "
-                        "solo quelle che portano un risultato")
+                   help="draw every metric x axis combination, not only "
+                        "the ones that carry a result")
     p.add_argument("--_worker", nargs=2, help=argparse.SUPPRESS)
     a = p.parse_args()
 
@@ -2024,18 +1402,18 @@ def main():
     if a.plot:
         import importlib.util
         if importlib.util.find_spec("matplotlib") is None:
-            sys.exit("serve matplotlib per i grafici: pip install matplotlib")
+            sys.exit("matplotlib needed for the charts: pip install matplotlib")
         n = sum(plot_axis(ax, a.plot, a.format, a.all_plots)
                 for ax in LEGACY_AXES)
         n += plot_duel(a.plot, a.format)
         n += plot_campaign(a.plot, a.format)
-        print(f"\n{GREEN}{n} grafici{NC} in {a.plot}")
+        print(f"\n{GREEN}{n} charts{NC} in {a.plot}")
         return 0
 
     if sys.platform != "linux":
-        sys.exit(f"la misura richiede Linux, non {sys.platform}")
+        sys.exit(f"the measurement needs Linux, not {sys.platform}")
     if os.geteuid() != 0:
-        sys.exit("serve root: sudo python3 ipa/test/bench_scaling.py")
+        sys.exit("root needed: sudo python3 ipa/test/bench_scaling.py")
 
     if a.verify:
         os.chdir(SHARED_DIR)
@@ -2047,10 +1425,6 @@ def main():
                if a.ports else None)
         return verify_ports(sel)
 
-    # Resolved BEFORE the chdir: a relative --out is relative to where the
-    # USER ran the command, not to ipa/. Resolving it after the chdir put
-    # `--out results/` inside ipa/results/, which is not where anyone typing
-    # that meant it to go.
     out_dir = os.path.abspath(a.out)
     os.chdir(SHARED_DIR)
 
@@ -2058,22 +1432,19 @@ def main():
     if a.seeds:
         semi = [int(x) for x in a.seeds.split(",") if x.strip()]
         if a.axis in ("all", "campaign") or AXES[a.axis].get("campaign"):
-            sys.exit("--seeds vale per UN asse storico alla volta, es. "
+            sys.exit("--seeds applies to ONE main axis at a time, e.g. "
                      "--axis depth --seeds 42,1,2,3,7")
         righe = run_axis(a.axis, a.repeat, a.trials, out_dir,
                          lookups=a.lookups, seeds=semi)
         return 0 if righe else 1
 
     if a.axis == "all":
-        axes = LEGACY_AXES          # invariato: i sette assi di sempre
+        axes = LEGACY_AXES
     elif a.axis == "campaign":
         axes = CAMPAIGN_AXES
     else:
         axes = [a.axis]
 
-    # Gli assi della campagna confluiscono in un file solo, perche' sono
-    # quattro tagli della STESSA domanda e un grafico MAC-contro-latenza li
-    # vuole tutti insieme. Gli altri continuano a scrivere scaling_<asse>.csv.
     campagna = []
     for ax in axes:
         e_campagna = bool(AXES[ax].get("campaign"))
@@ -2087,7 +1458,7 @@ def main():
         _write_csv(os.path.join(out_dir, CAMPAIGN_CSV), campagna)
 
     print(f"\n{YELLOW}{'=' * 78}{NC}")
-    print(" Grafici (non serve root, basta matplotlib):")
+    print(" Charts (no root needed, just matplotlib):")
     print(f"   python3 ipa/test/bench_scaling.py --plot {out_dir}")
     print(f"{YELLOW}{'=' * 78}{NC}")
     return 0

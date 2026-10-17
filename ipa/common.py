@@ -1,14 +1,5 @@
-"""
-common.py - Shared runtime helpers, scenario-independent.
-
-This module used to hard-code the wiring of ONE node: it exported
-INGRESS_IFACE = "eth0" / EGRESS_IFACE = "eth1" / N_WEIGHTS = 319. Those are properties of a deployment and of a
-checkpoint; this module is neither. Which interface a node ingresses on is a
-NODE fact (node_config.py), and the weight count is a MODEL fact
-(model_meta.derive_shape).
-
-What is left here is genuinely shared and scenario-free: BPF map helpers, MAC
-and ifindex resolution, and XDP attach/detach.
+"""common.py -- shared runtime helpers: BPF map helpers, MAC and ifindex
+resolution, XDP attach and detach.
 """
 import json
 import os
@@ -17,24 +8,12 @@ import socket
 import ctypes
 import threading
 import time
-# BPF is used HERE only as the type annotation on attach_xdp/detach_xdp: it is
-# never called in this module. Everything else -- the map installers, the MAC
-# resolution, the node/ingress tables -- is pure userspace logic, and it is
-# where the conventions that the datapath depends on are decided. Importing bcc
-# unconditionally made that logic untestable anywhere without a kernel, root
-# and BCC, which is exactly the layer that most needs a test that runs.
 try:
     from bcc import BPF
 except ImportError:
     BPF = None
 
-# Default ingress interface, overridable by $IPA_IFACE. Not a scenario constant:
-# every entry point also takes --iface, and this only names the interface a
-# bare `run()` attaches to when nothing else says.
 INGRESS_IFACE = os.environ.get("IPA_IFACE", "eth0")
-
-# Fallback destination MAC, used only until ARP resolves the real neighbour
-# (see start_mac_refresh_thread). Was one specific neighbour's address.
 DST_MAC = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
 
 
@@ -43,17 +22,10 @@ def load_weights(path: str) -> list:
         return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# dense_vector feature maps (link_state, queue_state): stored as a SINGLE
-# struct-valued entry `struct {__u32 v[N];}` at key 0, so the datapath reads
-# all N slots with ONE bpf_map_lookup_elem instead of N separate lookups (was
-# 6 for link_state + 4 for queue_occupancy = 10 helper calls per packet).
-# These helpers write that single entry from userspace (the seeders/monitors).
-# ---------------------------------------------------------------------------
+# --- dense_vector feature maps (link_state, queue_state): stored as a SINGLE ---
 def write_vector_map(bpf_obj, map_name: str, values) -> None:
     """Write the per-slot list `values` into the single key-0 entry of a
-    struct-valued dense_vector map. Extra values are ignored, missing slots
-    stay 0."""
+    struct-valued dense_vector map."""
     tbl = bpf_obj[map_name]
     leaf = tbl.Leaf()
     n = len(leaf.v)
@@ -64,7 +36,7 @@ def write_vector_map(bpf_obj, map_name: str, values) -> None:
 
 def set_vector_slot(bpf_obj, map_name: str, idx: int, val: int) -> None:
     """Set one slot of a struct-valued dense_vector map (read-modify-write the
-    key-0 entry). Used e.g. to flip a single link down in tests."""
+    key-0 entry)."""
     tbl = bpf_obj[map_name]
     leaf = tbl[ctypes.c_int(0)]
     leaf.v[idx] = int(val) & 0xFFFFFFFF
@@ -75,28 +47,8 @@ _LOOKUP_CALL_RE = re.compile(r'(\b\w+)\.lookup\(([^()]*)\)')
 
 
 def instrument_map_lookups(src: str) -> str:
-    """
-    Wrap every `<map>.lookup(<key>)` call in `src` with a CTR_INC() counter
-    increment, turning `table.lookup(&key)` into
-    `({ CTR_INC(); table.lookup(&key); })` (a GNU C statement expression --
-    valid wherever the original call was, since its last statement's value
-    becomes the expression's value).
-
-    CTR_INC() is a no-op unless IPA_COUNT_LOOKUPS is #defined before the
-    source is compiled (see the CTR_INC macro in each pipeline's eBPF
-    header) -- so this instrumentation only affects a dedicated measurement
-    build, never the production/performance-measured programs whose
-    instruction counts and latency are already hardware-verified.
-
-    Used by verify_prog_run.count_lookups() to get a REAL per-packet
-    map-lookup count for the design-space metrics table, replacing a
-    stale hand estimate.
-
-    Skips `lookup_ctr.lookup(...)` itself -- that call lives inside the
-    CTR_INC() macro definition; wrapping it would make CTR_INC call
-    itself recursively, which cpp does not expand (leaves a literal
-    "undeclared function CTR_INC" call in the compiled output).
-    """
+    """Wrap every `<map>.lookup(<key>)` in `src` with a CTR_INC() counter
+    increment (active only with IPA_COUNT_LOOKUPS defined)."""
     def _wrap(m):
         table = m.group(1)
         if table == "lookup_ctr":
@@ -106,16 +58,10 @@ def instrument_map_lookups(src: str) -> str:
 
 
 def count_instrumented_sites(src: str) -> dict:
-    """
-    How many `.lookup()` call sites instrument_map_lookups() would wrap, broken
-    down per eBPF function (`int <name>(struct xdp_md *ctx)`), plus a "<header>"
-    bucket for sites outside any function (shared always_inline helpers).
-
-    Diagnostic only: when an instrumented measurement build gets rejected for
-    exceeding the kernel's program-size cap, this says WHERE the added
-    instrumentation weight lands, instead of leaving a bare "program too large".
-    Used by verify_prog_run.count_lookups().
-    """
+    """How many `.lookup()` call sites instrument_map_lookups() would wrap,
+    broken down per eBPF function (`int <name>(struct xdp_md *ctx)`), plus a
+    "<header>" bucket for sites outside any function (shared always_inline
+    helpers)."""
     fn_re = re.compile(r'^\s*int\s+(\w+)\s*\(\s*struct\s+xdp_md', re.M)
     bounds = [(m.start(), m.group(1)) for m in fn_re.finditer(src)]
     out = {}
@@ -142,10 +88,8 @@ def local_mac(iface: str) -> list:
 
 
 def neighbor_mac(iface: str):
-    """Next-hop neighbor MAC on `iface`, resolved from the kernel's ARP
-    table (/proc/net/arp). Returns None if the link hasn't seen any
-    traffic yet (no ARP exchange -> no entry) -- callers should fall back
-    to a default and warn rather than install an unresolved/zero MAC."""
+    """Next-hop neighbor MAC on `iface`, resolved from the kernel's ARP table
+    (/proc/net/arp)."""
     try:
         with open("/proc/net/arp") as f:
             lines = f.readlines()[1:]
@@ -163,24 +107,7 @@ def neighbor_mac(iface: str):
 
 
 def resolve_ifindex(name: str, fallback: str = None):
-    """
-    Resolve `name` -> (resolved_name, ifindex).
-
-    If `name` doesn't exist on this node:
-      - fallback given: fall back to it (with a warning), returning
-        whichever name actually resolved. Appropriate for a secondary/
-        egress lookup (e.g. populating a mac_table entry) where any
-        working interface is an acceptable substitute -- this is exactly
-        what bit the P1 deploy on a node missing eth4/eth5: the
-        ifindex had a fallback already, but the interface NAME used to
-        read /sys/class/net/<name>/address for the MAC did not, and
-        crashed on a nonexistent interface.
-      - fallback is None (default): raise a clear RuntimeError listing
-        the interfaces that DO exist. Appropriate for the ingress/attach
-        target -- silently substituting a different interface there would
-        attach XDP to the wrong link without the caller ever noticing,
-        which is worse than a loud, actionable failure.
-    """
+    """Resolve `name` -> (resolved_name, ifindex)."""
     try:
         return name, socket.if_nametoindex(name)
     except OSError:
@@ -201,37 +128,8 @@ def resolve_ifindex(name: str, fallback: str = None):
             f"Available: {available}. Pass the correct --iface/iface=...")
 
 
-def resolve_egress_mac(iface: str, fallback_dst: list = None):
-    """Real per-interface L2 addressing for a mac_table action:
-      src_mac = this host's own MAC on `iface` (always resolvable)
-      dst_mac = the next-hop neighbor's MAC, from the kernel ARP table
-    Falls back to `fallback_dst` (or the module DST_MAC constant) with a
-    warning if the neighbor hasn't been ARP-resolved yet (idle link --
-    e.g. before any OSPF/IP traffic has crossed it)."""
-    src = local_mac(iface)
-    dst = neighbor_mac(iface)
-    if dst is None:
-        dst = fallback_dst or DST_MAC
-        dst_str = ":".join(f"{b:02x}" for b in dst)
-        print(f"[mac] WARNING: no ARP entry for {iface} yet -- using fallback dst_mac {dst_str}")
-    return src, dst
-
-
 def install_mac_per_port(b, table_name: str, node_cfg, logical_ports: list = None):
-    """Populate `table_name` keyed by LOGICAL PORT, from a resolved NodeConfig.
-
-    mac_table used to be keyed by CLASS, with class k assumed to live on
-    `eth{k}`. Both halves were wrong: a class is not a port (the model states
-    which port each class selects, see class_semantics.py) and a port is not an
-    interface name (the node states that, see node_config.py). This function
-    consumes the node's resolution and writes only ports the node can realise;
-    a port the model may select but the node lacks is left unmapped, so the
-    datapath treats it as unforwardable instead of redirecting somewhere
-    arbitrary.
-
-    Returns {"installed": [(port, iface, ifindex)], "pending": [(port, iface)],
-             "absent": [(port, iface)]}.
-    """
+    """Populate `table_name` keyed by LOGICAL PORT, from a resolved NodeConfig."""
     ports = sorted(node_cfg.bindings) if logical_ports is None else sorted(logical_ports)
     mac = b.get_table(table_name)
     installed, pending, absent = [], [], []
@@ -270,36 +168,9 @@ def install_mac_per_port(b, table_name: str, node_cfg, logical_ports: list = Non
     return {"installed": installed, "pending": pending, "absent": absent}
 
 
-# install_mac_per_class() lived here: it keyed mac_table by CLASS, assuming
-# class k == logical port k == eth{k}. All three equalities are false for the
-# checked-in model (DROP is class 5, class 6 is untrained, ports are a separate
-# index space), it had no callers left after install_mac_per_port() replaced
-# it, and keeping a deprecated shim around only invites the assumption back.
-# Use install_mac_per_port(b, table, node_cfg, logical_ports).
-
-
 def ingress_port_slots(node_cfg, logical_ports: list = None) -> dict:
-    """{ifindex del kernel: slot del one-hot, 1-based} -- la convenzione, sola.
-
-    Estratta perche' due percorsi di deploy devono concordare su di essa: le
-    pipeline BCC, che scrivono la mappa da Python, e il deploy AOT di P1, che
-    la scrive dal loader in C. Due implementazioni della stessa convenzione
-    sono due occasioni di divergere in silenzio, e questa e' una convenzione
-    che quando sbaglia non rompe nulla: fa solo contribuire zero a una feature
-    addestrata.
-
-    Lo slot e' il RANGO della porta fra quelle che il MODELLO puo' scegliere,
-    non il numero di porta. Con porte [0, 2, 7] gli slot sono [1, 2, 3], e
-    restano quelli anche se una di esse manca su questo nodo: la colonna di
-    pesi che lo slot seleziona e' la stessa su ogni nodo, quindi il rango non
-    puo' dipendere da quali interfacce un nodo abbia. Una porta che il modello
-    puo' scegliere ma il nodo non realizza resta semplicemente non mappata.
-
-    Il mapping NON si deduce ordinando gli ifindex: si passa per il nome
-    dell'interfaccia (NodeConfig: porta logica -> nome) e poi per
-    socket.if_nametoindex (nome -> ifindex). Gli ifindex li assegna il kernel
-    e il loro ordine non dice nulla sull'ordine delle porte.
-    """
+    """{kernel ifindex: one-hot slot, 1-based}: the slot is the rank of the
+    port among the node's ports."""
     ports = list(logical_ports) if logical_ports is not None \
         else sorted(node_cfg.port_to_iface)
     out = {}
@@ -312,23 +183,7 @@ def ingress_port_slots(node_cfg, logical_ports: list = None) -> dict:
 
 def install_ingress_port_table(b, map_name: str, node_cfg,
                                logical_ports: list = None) -> dict:
-    """Fill `map_name` with kernel ifindex -> LOGICAL PORT, 1-based.
-
-    The mirror of install_mac_per_port. That one answers "the model chose class
-    k, which interface do I send out of"; this one answers "the packet arrived
-    on interface X, which of my ports is that" -- the question the trained
-    ingress_iface one-hot asks.
-
-    It used to be answered by a compile-time table, [2, 3, 4, ...], i.e. the
-    assumption eth0 == ifindex 2. Kernel ifindexes are assigned by the kernel:
-    2 and 3 on a freshly booted machine, 207 and 209 on a box that has
-    created a few veths. When they do not match, no bit is set and a trained
-    feature contributes nothing -- silently, with every test still green
-    because nothing checked that it contributed anything.
-
-    Values are 1-based because the datapath's guard is `>= 1 && <= size`, so a
-    missing entry (0) reads as "not one of my ports". Returns what was written.
-    """
+    """Fill `map_name` with kernel ifindex -> LOGICAL PORT, 1-based."""
     written = ingress_port_slots(node_cfg, logical_ports)
     for ifx, logical_idx in written.items():
         b[map_name][ctypes.c_uint32(int(ifx))] = ctypes.c_uint32(logical_idx)
@@ -347,26 +202,7 @@ def install_ingress_port_table(b, map_name: str, node_cfg,
 
 
 def resolve_node_index(node_cfg=None, n_nodes: int = None):
-    """This node's index in the node one-hot, or None if it cannot be known.
-
-    Resolution order, loudest first:
-
-      1. $IPA_NODE_ID                    -- explicit, and what tests use
-      2. the topology's name -> index table (node_config.node_index_of)
-      3. None
-
-    Returns None rather than 0 when nothing answers. Zero is a valid node, so
-    defaulting to it would make every unconfigured node claim to be node 0 --
-    which is exactly the defect this replaces: the one-hot used to be indexed
-    by ipa->model_id, so with a single registered model every node fired slot 0
-    and 52 of the 65 inputs carried no information at all.
-
-    NOTE ON MEANING: the index has to match the ordering the model was TRAINED
-    on for the decisions to mean anything about the real network. If the point
-    of a run is to measure the pipeline rather than the routing, any index that
-    varies per node will do -- but then the decisions are arbitrary, and that
-    should be stated wherever the numbers are reported.
-    """
+    """This node's index in the node one-hot, or None if it cannot be known."""
     env = os.environ.get("IPA_NODE_ID")
     if env is not None:
         try:
@@ -393,17 +229,9 @@ def resolve_node_index(node_cfg=None, n_nodes: int = None):
 
 
 def install_node_id(b, map_name: str, node_cfg=None, n_nodes: int = None):
-    """Write this node's index into the single-entry `map_name`.
-
-    Returns the index written, or None if none could be resolved -- in which
-    case the map is left empty and the datapath sets no bit, which is the
-    honest representation of "this node does not know which node it is".
-    """
+    """Write this node's index into the single-entry `map_name`."""
     idx = resolve_node_index(node_cfg, n_nodes)
     if idx is not None and not 0 <= idx <= 254:
-        # The datapath holds this index in a byte-bounded value, because the
-        # verifier needs that bound to reason about the feature loop. Truncating
-        # here would make node 300 silently claim to be node 44.
         raise ValueError(
             f"node index {idx} is outside [0, 254]. The datapath holds this "
             f"in exactly one byte -- the range the verifier needs to keep "
@@ -424,25 +252,10 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
                              interval: float = 5.0):
     """Start a daemon thread that periodically re-reads /proc/net/arp and
     updates mac_table BPF entries that still use the fallback MAC with the
-    real ARP-resolved neighbor MAC as soon as it becomes available.
-
-    This removes the need for manual ARP warmup before launching the pipeline:
-    within `interval` seconds of OSPF/FRR generating the first L3 traffic on
-    a link the real neighbor MAC is detected and the BPF map entry corrected.
-
-    egress_ifaces: list of (cls, iface_name) pairs to watch.
-
-    Ifaces that do not exist on this node (/sys/class/net) are silently
-    skipped: the model may produce classes pointing to eth4/eth5 on nodes
-    that only have eth0-eth3, but those classes already map to MISS in the
-    BPF mac_table (install_mac_per_class leaves them unmapped), so there is
-    nothing to update and retrying them forever would be wasteful.
-    """
+    real ARP-resolved neighbor MAC as soon as it becomes available."""
     mac_tbl = b.get_table(table_name)
     fallback = DST_MAC
 
-    # Filter out ifaces that don't exist on this node — they are already
-    # MISS in the BPF map and will never have an ARP entry to resolve.
     try:
         existing = set(os.listdir("/sys/class/net"))
     except OSError:
@@ -450,24 +263,14 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
     watchlist = [(cls, iface) for cls, iface in egress_ifaces
                  if iface in existing]
 
-    # Print the actual (post-filter) watchlist so the log reflects only the
-    # interfaces that will really be polled (not phantom eth4/eth5 etc.).
     watch_names = [iface for _, iface in watchlist]
     print(f"[mac] MAC refresh thread started for: {watch_names}")
 
     if not watchlist:
-        return None   # nothing to watch
+        return None
 
     def _refresh():
-        # Keep polling for the whole pipeline lifetime instead of exiting once
-        # every class has resolved: an ARP entry can go stale/expire, and the
-        # next hop behind a port can change (link flap, neighbour reboot). A
-        # thread that stopped at first resolution would leave the BPF map
-        # pointing at a dead MAC with no way to notice. Cost is one
-        # /proc/net/arp read per interval, so re-polling forever is cheap.
-        # Writes happen only when the resolved MAC actually differs from what
-        # is already in the map, so the steady state is read-only.
-        current = {}          # cls -> last dst_mac written
+        current = {}
         while True:
             time.sleep(interval)
             for cls, iface in watchlist:
@@ -495,38 +298,19 @@ def start_mac_refresh_thread(b, table_name: str, egress_ifaces: list,
     return t
 
 
-# XDP attach flags, from include/uapi/linux/if_link.h.
-XDP_FLAGS_SKB_MODE = 2      # generic: runs in netif_receive_skb, AFTER the skb
-XDP_FLAGS_DRV_MODE = 4      # native:  runs in the driver, BEFORE the skb exists
-XDP_FLAGS_HW_MODE = 8       # offloaded onto the NIC
+XDP_FLAGS_SKB_MODE = 2
+XDP_FLAGS_DRV_MODE = 4
+XDP_FLAGS_HW_MODE = 8
 
 _MODE_FLAGS = {"native": XDP_FLAGS_DRV_MODE,
                "generic": XDP_FLAGS_SKB_MODE,
                "auto": 0}
 
-# Default attach mode, overridable per call or by $IPA_XDP_MODE.
-#
-# This used to be hardcoded to generic (flags=2), on the grounds that generic
-# "works on every device regardless of driver support". That is a convenience,
-# not a design reason.
-# Generic XDP runs inside netif_receive_skb -- after the kernel has already
-# allocated the sk_buff -- which is later and slower than native XDP and is NOT
-# the path a real deployment takes. Native is the default now; a box that
-# cannot do native has to say so out loud.
 DEFAULT_XDP_MODE = os.environ.get("IPA_XDP_MODE", "native")
 
 
 def xdp_mode_in_effect(iface: str):
-    """Which XDP mode is actually attached to `iface` right now.
-
-    Returns "native", "generic", "offload", or None if nothing is attached.
-
-    Asking the kernel rather than trusting the flags we passed is the whole
-    point: with flags=0 the kernel picks the mode itself and silently falls
-    back to generic, which is exactly how a measurement ends up describing a
-    path nobody deploys. Reads `ip -details link show`, which prints the mode
-    as `xdpgeneric` / `xdpdrv` / `xdpoffload`.
-    """
+    """Which XDP mode is actually attached to `iface` right now."""
     try:
         import subprocess
         out = subprocess.run(["ip", "-details", "link", "show", "dev", iface],
@@ -543,27 +327,7 @@ def xdp_mode_in_effect(iface: str):
 
 
 def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE, mode: str = None):
-    """Attach `fn` to `iface`, defaulting to NATIVE XDP.
-
-    `mode` is "native" (driver mode, the real datapath), "generic" (SKB mode,
-    after the skb is allocated), or "auto" (flags=0: let the kernel choose,
-    which means it may quietly give you generic). Defaults to
-    $IPA_XDP_MODE, else native.
-
-    A native attach that fails does NOT silently become a generic one. Falling
-    back by itself is what makes a number unattributable: the program runs, the
-    counters move, and nothing in the output says the packet took a different
-    path than the one being measured. Ask for "auto" or "generic" explicitly if
-    that is what you want.
-
-    Whatever was requested, the mode actually in effect is read back from the
-    kernel and printed, and a mismatch is reported loudly.
-
-    Raises on failure instead of printing and returning: a swallowed exception
-    let every caller print "Pipeline running" over an interface with nothing
-    attached, leaving the HIT/MISS/DROP counters frozen at 0 with no indication
-    of why. Callers that want to survive a failed attach must catch it.
-    """
+    """Attach `fn` to `iface`, defaulting to NATIVE XDP."""
     mode = (mode or DEFAULT_XDP_MODE).lower()
     if mode not in _MODE_FLAGS:
         raise ValueError(
@@ -607,10 +371,7 @@ def attach_xdp(b: BPF, fn, iface: str = INGRESS_IFACE, mode: str = None):
 
 
 def detach_xdp(b: BPF, iface: str = INGRESS_IFACE, mode: str = None):
-    """Detach, using the same flags the attach used.
-
-    The flags must match: removing a native program with SKB flags fails.
-    """
+    """Detach, using the same flags the attach used."""
     mode = (mode or DEFAULT_XDP_MODE).lower()
     if hasattr(b, "remove_xdp"):
         b.remove_xdp(iface, flags=_MODE_FLAGS.get(mode, 0))
@@ -622,10 +383,6 @@ def detach_xdp(b: BPF, iface: str = INGRESS_IFACE, mode: str = None):
     print(f"[xdp] XDP removed from {iface}")
 
 
-# iproute2 spelling of each mode, for programs that are PINNED rather than
-# held by a BCC object (the AOT object of P1, see pinned_maps and p1_aot):
-# the kernel attach is the same netlink call BCC
-# makes, issued by `ip`, with the program named by its bpffs path.
 _IP_XDP_KEYWORD = {"native": "xdpdrv", "generic": "xdpgeneric", "auto": "xdp"}
 
 

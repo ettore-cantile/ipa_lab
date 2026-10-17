@@ -1,36 +1,6 @@
 #!/usr/bin/env python3
-"""
-gen_full_c.py  --  AOT-literal generator for the recompilation PoC.
-
-Emits the ARCHITECTURE-FAITHFUL, weights-literal libbpf program for Pipeline 1:
-a dispatcher + PROG_ARRAY tail-call + a model that re-parses (the double parse),
-i.e. byte-for-byte the same topology as the BCC hardcoded path
-(ipa_switch_hardcoded -> model_progs.call -> model_<id>). Compiled OFFLINE by
-clang into a .o, it is the "models known a priori" alternative to BCC's
-clang-at-runtime: the datapath node only does open+load at deploy time (~ms, no
-clang), and the weights stay C literals so clang -O2's per-weight strength
-reduction is preserved -> the full literal performance, identical to BCC.
-
-DESCRIPTOR-DRIVEN (universal AOT-literal)
------------------------------------------
-The input vector is built feature-by-feature from a per-model *descriptor*
-(model_meta.FEATURE_CATALOG), exactly like the BCC generator
-(ebpf_program.generate_ebpf_hardcoded) -- the three feature kinds are ported
-here to the libbpf dialect:
-
-    scalar            -> ttl = ip->ttl                       (packet in transit)
-    dense_vector_map  -> ls0..lsN via ONE bpf_map_lookup_elem (link_state / queue_state)
-    onehot            -> a single switch selecting one weight (ingress_iface / node)
-
-so ANY descriptor the BCC path accepts is now also AOT-compilable. With no
-descriptor the default [link_state, ingress_iface, ttl, node] / n_out=6+1 is
-used -> the checked-in 65-4-4-7 program, byte-identical to before.
-
-The loader (loader_aot.c) populates model_progs, seeds the dense-feature maps it
-finds (link_state / queue_state) + mac_table, crafts a UDP/IPA frame and
-BPF_PROG_TEST_RUNs the dispatcher.
-
-Run:  python3 gen_full_c.py [--dump-default]  -> nn_aot_arch.bpf.c
+"""gen_full_c.py -- generates the libbpf C source of Pipeline 1 (weights as
+literals), to be compiled offline by clang into the object the node loads.
 """
 import os
 import sys
@@ -42,48 +12,20 @@ if SHARED_DIR not in sys.path:
 
 import model_meta as _model_meta
 
-# The kernel ifindex -> logical port mapping is NOT compiled in. It used to be
-# DEFAULT_IFINDEX_TABLE = [2, 3, 4, 5, 6, 7], baked into the generated program
-# as a switch, which encodes the assumption eth0 == ifindex 2. Kernel ifindexes
-# are assigned by the kernel and are arbitrary -- 205, 217, 229 on a box that
-# has created a few veths -- so on real hardware no case matched and the
-# trained ingress_iface feature contributed nothing.
-#
-# An AOT program has even less business guessing them than a BCC one: it is
-# compiled on a build machine, possibly months before the node it runs on
-# exists. The mapping is the `ingress_port` map, filled at load time by the
-# loader (or by the Python control plane) from the node's own interfaces.
-
 
 def _lit(v) -> str:
     return str(int(v))
 
 
-# ---------------------------------------------------------------------------
-# Per-kind feature generators -- libbpf dialect. Each returns (preamble_lines,
-# term_fn): the preamble reads the feature value(s) ONCE; term_fn(j) gives the
-# C expression of that feature's contribution to hidden neuron j. Mirrors
-# ebpf_program._gen_feature_* (BCC dialect) one-to-one; the only differences are
-# map access (bpf_map_lookup_elem vs map.lookup) and the u32 map key.
-# ---------------------------------------------------------------------------
+# --- Per-kind feature generators -- libbpf dialect. Each returns (preamble_lines, ---
 _SCALAR_SOURCE = {
     "ttl": ("_ttl", "((__u32)ip->ttl) & 0xff"),
 }
 
 
 def _feat_scalar(feat, offset, n_in, fc1_w, n_h1):
-    """Scalar feature term, divided by the feature's training scale.
-
-    Mirrors ebpf_program._gen_feature_scalar exactly -- the AOT object must
-    compute the same thing as the BCC build or the two Pipeline 1 backends
-    disagree. The division applies to the PRODUCT (dividing the TTL itself
-    would collapse 10..30 onto 0 or 1); see model_meta.DEFAULT_TTL_SCALE.
-    """
+    """Scalar feature term, divided by the feature's training scale."""
     var, expr = _SCALAR_SOURCE[feat["type"]]
-    # The scale the descriptor declares for THIS feature, not the catalogue's
-    # default for its type -- the same rule as ebpf_program's generator. This
-    # read feature_scale(type) after the BCC path had been fixed, so the AOT
-    # object -- P1's only deploy path -- ran a ttl/16 model with ttl/30.
     scale = _model_meta.feature_scale_of(feat)
     pre = [f"    __u32 {var} = {expr};   /* feature '{feat['type']}' (scalar) */"]
     def term(j):
@@ -93,10 +35,7 @@ def _feat_scalar(feat, offset, n_in, fc1_w, n_h1):
 
 
 def _feat_dense_vector(feat, offset, n_in, fc1_w, n_h1, static_ports=None):
-    """Dense vector read from its map with ONE lookup. With static_ports only
-    the columns of ports that exist on the node are generated -- the rule and
-    its conditions are ebpf_program._live_slots, imported rather than copied,
-    so the two P1 backends cannot disagree on which columns are dead."""
+    """Dense vector read from its map with ONE lookup."""
     from ebpf_program import _live_slots
     map_name = _model_meta.FEATURE_CATALOG[feat["type"]]["map"]
     prefix = "ls" if map_name == "link_state" else "qs"
@@ -150,10 +89,7 @@ def _feat_onehot_iface(feat, offset, n_in, fc1_w, n_h1):
 
 
 def _feat_onehot_node(feat, offset, n_in, fc1_w, n_h1, static_index=None):
-    """Node one-hot. static_index=None: read from the node_id map (P1.5, one
-    object for the whole network). static_index=k: frozen at build time (P1,
-    one object per node) -- the switch collapses to n_h1 constants that clang
-    folds. Same two modes, same refusal, as ebpf_program's generator."""
+    """Node one-hot. static_index=None."""
     size = feat["size"]
     if static_index is not None:
         if not (0 <= static_index < size):
@@ -208,11 +144,10 @@ def _gen_feature(feat, offset, n_in, fc1_w, n_h1, static_node=None,
     raise ValueError(f"no C generator for feature type {t!r} (kind {kind!r})")
 
 
-# ---------------------------------------------------------------------------
-# Weight slicing (identical formula to ebpf_program.generate_ebpf_hardcoded).
-# ---------------------------------------------------------------------------
+# --- Weight slicing (identical formula to ebpf_program.generate_ebpf_hardcoded). ---
 def _layer_sizes(shape):
-    """[n_in, h1, ..., hk, n_out] -- hidden depth is whatever hidden_dims holds."""
+    """[n_in, h1, ..., hk, n_out] -- hidden depth is whatever hidden_dims
+    holds."""
     return ([shape["n_in"]] + [int(d) for d in shape["hidden_dims"]]
             + [shape["n_out"]])
 
@@ -224,7 +159,7 @@ def _weight_count(layer_sizes):
 
 def _slices(w, layer_sizes):
     """[(W, B)] per layer. Generic per-layer layout (n_prev*n_cur weights then
-    n_cur biases), which reduces to the historical 2-hidden-layer layout."""
+    n_cur biases)."""
     layers = []
     off = 0
     for i in range(1, len(layer_sizes)):
@@ -254,9 +189,10 @@ _PARSE = """    void *data = (void *)(long)ctx->data;
 
 def _emit_model_body(shape, w, scale: int = 1, semantics=None,
                      static_node=None, static_ports=None) -> list:
-    """IV + MLP + argmax + action body of the tail-called model program (weights
-    as literals). ctx/data/eth/ip/udp/ipa are already parsed by the caller-emitted
-    _PARSE block (the SECOND parse the dispatcher+tail-call architecture forces)."""
+    """IV + MLP + argmax + action body of the tail-called model program
+    (weights as literals). ctx/data/eth/ip/udp/ipa are already parsed by the
+    caller-emitted _PARSE block (the SECOND parse the dispatcher+tail-call
+    architecture forces)."""
     features = shape["features"]
     n_out = shape["n_out"]
     n_in = shape["n_in"]
@@ -273,12 +209,9 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
     n_hidden = len(sizes) - 2
 
     L = []; A = L.append
-    # Same opening comment as ebpf_program's model function: test/p1_c_eval
-    # finds the inference section of either backend by it.
     A("    /* Input vector built locally, features: "
       + ", ".join(f"{f['type']}[{f['size']}]" for f in features) + " */")
 
-    # --- fc1: build the IV feature by feature, in descriptor order ---
     fc1_w, fc1_b = layers[0]
     n_h1 = sizes[1]
     term_fns = []
@@ -291,7 +224,6 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
         term_fns.append(term)
         offset += feat["size"]
 
-    # Zero hidden layers -> the first layer already IS the output layer (no ReLU).
     first = "h1" if n_hidden else "o"
     for j in range(n_h1):
         terms = " + ".join(tf(j) for tf in term_fns)
@@ -299,7 +231,6 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
         A(f"    long long {first}_{j} = "
           + (f"ipa_relu(a1_{j});" if n_hidden else f"a1_{j};"))
 
-    # --- remaining layers: hidden ones with ReLU, output layer without ---
     prev = [f"{first}_{j}" for j in range(n_h1)]
     for li in range(1, len(layers)):
         W, B = layers[li]
@@ -309,13 +240,6 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
         for j in range(n_cur):
             terms = " + ".join(f"{prev[i]} * {_lit(W[j*n_prev+i])}LL"
                                for i in range(n_prev))
-            # Bias scaled into the accumulator's units: the weights are
-            # round(w_float * scale), so this layer's products carry
-            # scale**(li+1) while a bias stored the same way carries scale**1.
-            # Multiplying by scale**li puts them in the same scale. Computed
-            # here, so the object pays nothing at runtime. Mirrors
-            # ebpf_program._gen_dense_layer -- the two Pipeline 1 backends must
-            # compute the same thing.
             bmul = scale ** li
             if is_out:
                 A(f"    long long {pfx}_{j} = {terms} + {_lit(int(B[j]) * bmul)}LL;")
@@ -327,11 +251,6 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
     A("    long long best_val = o_0; int best_cls = 0;")
     for k in range(1, n_out):
         A(f"    if (o_{k} > best_val) {{ best_val = o_{k}; best_cls = {k}; }}")
-    # class -> action -> logical port, GENERATED from the descriptor. Mirrors
-    # ebpf_program._gen_class_dispatch: the two Pipeline 1 backends must emit
-    # the same semantics, or the AOT object and the BCC build disagree.
-    # The previous `best_cls >= n_out - 1` hardcoded both that DROP is the last
-    # class and that a class index is a port index. Neither holds.
     A("    /* --- class -> action -> logical port (from the model descriptor) --- */")
     A("    __u32 _port = 0xffffffffU;")
     A("    switch (best_cls) {")
@@ -341,9 +260,6 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
             A(f"    case {cid}: _port = {spec.port}U; break;"
               f"   /* FORWARD -> logical port {spec.port} */")
         elif spec.action == "DROP":
-            # The class was decided: record it, as the BCC build does, so a
-            # DROP is distinguishable from a program that never reached argmax
-            # and the two P1 backends report the same counters.
             A(f"    case {cid}: {{   /* DROP (declared) */")
             A("        __u32 di = 2; __u64 *dv = bpf_map_lookup_elem(&pkt_stats, &di);")
             A("        if (dv) *dv += 1;")
@@ -401,10 +317,7 @@ def _emit_model_body(shape, w, scale: int = 1, semantics=None,
 
 
 def _emit_maps(shape) -> list:
-    """Map + struct declarations (libbpf dialect). Dense-feature maps are emitted
-    only for the dense_vector_map features present in the descriptor, sized from
-    the topology; the always-on maps (pkt_stats/cls_stats/mac_table/model_progs)
-    are unconditional."""
+    """Map + struct declarations (libbpf dialect)."""
     n_out = shape["n_out"]
     L = []; A = L.append
     for f in shape["features"]:
@@ -414,9 +327,6 @@ def _emit_maps(shape) -> list:
             A("struct %s_vec { __u32 v[%d]; };" % (m, f["size"]))
             A("struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);")
             A("         __type(key, __u32); __type(value, struct %s_vec); } %s SEC(\".maps\");" % (m, m))
-    # Per-CPU: with several receive queues each core increments its own copy,
-    # without an atomic and without fighting over one cache line. Readers sum
-    # the cores (stats_maps.read_counter).
     A("struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 3);")
     A("         __type(key, __u32); __type(value, __u64); } pkt_stats SEC(\".maps\");")
     A("struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, %d);" % n_out)
@@ -432,10 +342,7 @@ def _emit_maps(shape) -> list:
     A("struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64);")
     A("         __type(key, __u32); __type(value, __u32); } ingress_port SEC(\".maps\");")
     A("/* This node's index in the node one-hot, written by the loader at")
-    A(" * attach time. It used to come from ipa->model_id -- the packet's")
-    A(" * MODEL id, which is not a node identity: the same packet carries it")
-    A(" * along its whole path, so every node fired the same slot and 52 of")
-    A(" * the 65 inputs carried nothing.")
+    A(" * attach time (a node fact).")
     A(" *")
     A(" * A HASH, not an ARRAY: an array is pre-allocated and zero-filled, so")
     A(" * a lookup always succeeds and \"not installed\" reads back as node 0.")
@@ -447,17 +354,7 @@ def _emit_maps(shape) -> list:
 
 def _emit_arch(shape, w, scale: int = 1, semantics=None, static_node=None,
                static_ports=None, models=None) -> str:
-    """FULL-PATH, ARCHITECTURE-FAITHFUL literal program: dispatcher +
-    PROG_ARRAY tail-call + model that RE-parses (double parse) -- same topology
-    as the BCC hardcoded path, so BPF_PROG_TEST_RUN on the dispatcher measures
-    the identical per-packet work test_suite --kernel measures.
-
-    One model: `xdp_model`, wired by loader_aot at model_progs[0].
-    models=[(model_id, weights, scale), ...]: one `xdp_model_<id>` each, all
-    sharing descriptor, shape and semantics (as build_combined_hardcoded_source
-    requires for BCC); loader_aot wires each at model_progs[<id>].
-    static_node / static_ports: P1 specialised to one node, see
-    _feat_onehot_node and _feat_dense_vector."""
+    """FULL-PATH, ARCHITECTURE-FAITHFUL literal program."""
     if models is None:
         models = [(None, w, scale)]
     feats_str = ", ".join(f"{f['type']}[{f['size']}]" for f in shape["features"])
@@ -497,7 +394,7 @@ def _emit_arch(shape, w, scale: int = 1, semantics=None, static_node=None,
     A(" * to one jump per neuron, and the verifier walked each on both sides:")
     A(" * a 1x16 model processed 1 000 001 instructions for a 3 486-instruction")
     A(" * program and was refused (E2BIG); this way it processes 5 698")
-    A(" * (ipa/test/diag_verifier.py). a >> 63 is -1 for a negative a and 0")
+    A(" * (ipa/test/check_verifier_stats.py). a >> 63 is -1 for a negative a and 0")
     A(" * otherwise, so a & ~m is a or 0. The empty asm hides m from clang,")
     A(" * which would otherwise recognise smax(a, 0) and emit the jump again. */")
     A("static __always_inline long long ipa_relu(long long a) {")
@@ -508,7 +405,6 @@ def _emit_arch(shape, w, scale: int = 1, semantics=None, static_node=None,
     A("")
     L.extend(_emit_maps(shape))
     A("")
-    # --- model program(s) (tail-call targets): re-parse, then infer ---
     for mid, mw, mscale in models:
         A("SEC(\"xdp\")")
         A("int xdp_model(struct xdp_md *ctx) {" if mid is None
@@ -519,7 +415,6 @@ def _emit_arch(shape, w, scale: int = 1, semantics=None, static_node=None,
                                   static_ports=static_ports))
         A("}")
         A("")
-    # --- dispatcher (entry): parses, tail-calls model_progs[model_id] ---
     A("SEC(\"xdp\")")
     A("int xdp_dispatch(struct xdp_md *ctx) {")
     A(_PARSE)
@@ -533,10 +428,8 @@ def _emit_arch(shape, w, scale: int = 1, semantics=None, static_node=None,
 
 
 def _resolve_shape(model_path=None, meta=None, topology_config=None):
-    """Resolve the shape from a model descriptor + topology, using
-    the SAME model_meta logic as the BCC path. With no meta the default
-    descriptor [link_state, ingress_iface, ttl, node], n_out from it, is
-    used -> the historical 65-4-4-7 shape."""
+    """Resolve the shape from a model descriptor + topology, using the SAME
+    model_meta logic as the BCC path."""
     if meta is None:
         meta = dict(_model_meta.DEFAULT_META)
         if model_path:
@@ -557,12 +450,6 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
     shape = _resolve_shape(model_path, meta, topology_config)
     sizes = _layer_sizes(shape)
     n_weights = _weight_count(sizes)
-    # Weights AND scale from the same function the BCC build uses
-    # (ebpf_program.load_and_generate), so the two P1 backends cannot compile
-    # different numbers. The scale used to be read from ipa/weights_float.json
-    # whatever the checkpoint: right for the checked-in model, which lives
-    # there, and wrong for any other -- load_and_generate reads the file next
-    # to the checkpoint, or derives it from the .pt.
     from ebpf_program import load_and_generate
     _meta = meta if meta is not None else (
         _model_meta.load_model_meta(model_path) if model_path
@@ -573,9 +460,6 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
     if len(w) != n_weights:
         raise SystemExit(f"expected {n_weights} weights for "
                          f"{'-'.join(map(str, sizes))}, got {len(w)}")
-    # Class semantics: declared, not inferred. With no argument the shared
-    # resolver reads the descriptor and announces any fallback, so the AOT
-    # object and the BCC build resolve it identically.
     if semantics is None:
         from model_meta import descriptor_semantics_or_reference
         semantics = descriptor_semantics_or_reference(sizes[-1], "AOT")
@@ -587,14 +471,7 @@ def generate_arch_literal_c(model_path: str = None, meta: dict = None,
 
 
 def generate_meta_header(semantics=None) -> str:
-    """Emit nn_aot_meta.h: the class semantics the loader must seed against.
-
-    loader_aot.c is C with no JSON parser, so it used to seed mac_table for
-    classes 0..n_out-2 -- re-deriving "DROP is the last class" and "class k is
-    a forwarding class" in a third language. It now seeds exactly the LOGICAL
-    PORTS this model can select, generated from the same ClassSemantics object
-    the datapath switch is generated from.
-    """
+    """Emit nn_aot_meta.h: the class semantics the loader must seed against."""
     if semantics is None:
         shape = _resolve_shape()
         from model_meta import descriptor_semantics_or_reference

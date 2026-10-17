@@ -1,41 +1,12 @@
 #!/usr/bin/env python3
-"""
-pinned_maps.py -- drive a PREBUILT BPF object from the existing control plane.
-
-What this is for
-----------------
-Pipeline 1 deploys an AOT object (poc_aot/loader_aot + a .o built offline),
-so there is no BCC `BPF` object on the node -- and every control-plane
-function in the repo (install_mac_per_port, install_ingress_port_table,
-install_node_id, the link-state monitor, the ARP refresh) is written against
-one. Until 2026-09-23 the AOT deploy therefore ran none of them: the loader
-seeded mac_table itself, with ifindex 1 and zero MACs for every port, and no
-monitor ever touched link_state. Every FORWARD decision was redirected to
-`lo` (ifindex 1 in every netns), never to the port the model chose.
-
-The fix is not a second control plane in C. The loader pins the object's maps
-in bpffs, `PinnedObject` presents them with the interface a BCC object has --
-`b[name]` returning something you can index and assign, with `.map_fd` and
-`.Leaf()` -- and the existing Python functions run unchanged, the same ones
-P2 and P3 use. One control plane, two datapath builders.
-
-    from pinned_maps import PinnedObject, FwdAction
-    b = PinnedObject("/sys/fs/bpf/ipa_p1_eth0",
-                     leaf_types={"mac_table": FwdAction,
-                                 "link_state": "u32vec"})
-    install_mac_per_port(b, "mac_table", node_cfg, semantics.logical_ports)
-
-This file was deleted on 2026-09-16 with the bpftool-based P2 experiment it
-was written for; it is restored here for P1. Needs Linux + root.
+"""pinned_maps.py -- drive a prebuilt BPF object through its pinned maps, with the
+same interface as a BCC object, so one control plane serves every pipeline.
 """
 import ctypes as ct
 import os
 import platform
 
-# bpf(2) syscall number. Hardcoded because ctypes has no header to read it
-# from; refused on an architecture it is not listed for rather than guessed.
 _BPF_SYSCALL_NR = {"x86_64": 321, "aarch64": 280}
-
 _BPF_MAP_LOOKUP_ELEM = 1
 _BPF_MAP_UPDATE_ELEM = 2
 _BPF_MAP_DELETE_ELEM = 3
@@ -43,16 +14,12 @@ _BPF_MAP_GET_NEXT_KEY = 4
 _BPF_OBJ_GET = 7
 _BPF_OBJ_GET_INFO_BY_FD = 15
 _BPF_ANY = 0
-
-# BPF_MAP_TYPE_PERCPU_HASH, PERCPU_ARRAY, LRU_PERCPU_HASH, PERCPU_CGROUP_STORAGE
 _PERCPU_TYPES = (5, 6, 10, 21)
-# BPF_MAP_TYPE_ARRAY, PERCPU_ARRAY: every key exists, clear() zeroes them
 _ARRAY_TYPES = (2, 6)
 
 
 def possible_cpus() -> int:
-    """How many per-CPU slots the kernel copies: the POSSIBLE cpus
-    (/sys/devices/system/cpu/possible, e.g. "0-3"), not the online ones."""
+    """How many per-CPU slots the kernel copies."""
     with open("/sys/devices/system/cpu/possible") as f:
         spec = f.read().strip()
     n = 0
@@ -90,7 +57,7 @@ class _AttrObj(ct.Structure):
 
 
 class _AttrMapElem(ct.Structure):
-    """union bpf_attr for MAP_*_ELEM: u32 fd, pad, u64 key, value/next_key, flags."""
+    """union bpf_attr for MAP_*_ELEM."""
     _fields_ = [("map_fd", ct.c_uint32),
                 ("_pad", ct.c_uint32),
                 ("key", ct.c_uint64),
@@ -150,8 +117,7 @@ def map_info(fd: int) -> _MapInfo:
 
 
 def _u32vec(value_size: int):
-    """struct { __u32 v[N]; } sized from the map itself -- the dense feature
-    vectors (link_state, queue_state), whose width is the topology's."""
+    """A struct of N __u32 sized from the map itself (link_state, queue_state)."""
     if value_size % 4:
         raise PinnedMapError(f"value of {value_size} bytes is not a u32 vector")
     return type("U32Vec", (ct.Structure,),
@@ -159,13 +125,7 @@ def _u32vec(value_size: int):
 
 
 class PinnedMap:
-    """One pinned map, indexable the way a BCC table is.
-
-    BCC types a table from the C source. Here there is no compiler in the
-    loop, so sizes come from the kernel (BPF_OBJ_GET_INFO_BY_FD) and keys and
-    values travel as raw bytes of exactly that size. An object of the wrong
-    size raises instead of being truncated or padded into a partial write.
-    """
+    """One pinned map, indexable the way a BCC table is."""
 
     def __init__(self, path: str):
         self.path = path
@@ -176,20 +136,17 @@ class PinnedMap:
         self.value_size = int(info.value_size)
         self.max_entries = int(info.max_entries)
         self.type = int(info.type)
-        # A per-CPU value travels as one slot per POSSIBLE cpu, each rounded
-        # up to 8 bytes -- the kernel's layout for lookup/update on these maps.
         self.percpu = self.type in _PERCPU_TYPES
         self.ncpu = possible_cpus() if self.percpu else 1
         self._stride = ((self.value_size + 7) // 8) * 8 if self.percpu \
             else self.value_size
         self._buf_size = self._stride * self.ncpu
-        self.Leaf = None                          # set by attach_leaf_type()
+        self.Leaf = None
 
     def __repr__(self):
         return (f"<PinnedMap {self.name!r} type={self.type} key={self.key_size} "
                 f"value={self.value_size} @{self.path}>")
 
-    # -- byte marshalling --------------------------------------------------
     def _as_bytes(self, obj, size, what):
         if isinstance(obj, (bytes, bytearray)):
             raw = bytes(obj)
@@ -216,10 +173,9 @@ class PinnedMap:
                             flags=flags)
         return _syscall(cmd, attr)
 
-    # -- mapping interface -------------------------------------------------
     def _value_buf(self, value):
-        """The update buffer. Per-CPU: a list/tuple gives one value per cpu;
-        a single value is written to EVERY cpu (what zeroing needs)."""
+        """The update buffer. Per-CPU: a list/tuple gives one value per cpu; a
+        single value is written to EVERY cpu (what zeroing needs)."""
         if not self.percpu:
             return self._as_bytes(value, self.value_size, "value")
         if isinstance(value, (list, tuple)):
@@ -248,8 +204,8 @@ class PinnedMap:
 
     def __getitem__(self, key):
         """Plain map: the value (Leaf if declared, else raw bytes). Per-CPU
-        map: a list with one value per cpu -- ints for u32/u64 values, as the
-        elements of a BCC per-cpu leaf read back."""
+        map: a list with one value per cpu -- ints for u32/u64 values, as
+        the elements of a BCC per-cpu leaf read back."""
         v = ct.create_string_buffer(self._buf_size)
         if self._elem(_BPF_MAP_LOOKUP_ELEM, key, v, 0) < 0:
             raise KeyError(f"{self.name}: no entry "
@@ -301,9 +257,7 @@ class PinnedMap:
 
     def attach_leaf_type(self, ctype):
         """Declare the value's ctypes layout, so `.Leaf()` works and reads come
-        back structured (per cpu, on a per-CPU map). BCC knows this from the C
-        source; here the caller says it, and a layout of the wrong size is
-        refused."""
+        back structured (per cpu, on a per-CPU map)."""
         if ct.sizeof(ctype) != self.value_size:
             raise PinnedMapError(
                 f"{self.name}: leaf type {ctype.__name__} is "
@@ -314,15 +268,7 @@ class PinnedMap:
 
 
 class PinnedObject:
-    """`b[name]` over a directory of pinned maps, like a BCC BPF object.
-
-    Opens lazily and caches, so a map a given model does not use costs nothing
-    and a missing one is reported when it is asked for, naming the directory.
-
-    leaf_types: {map name: ctypes type, or "u32vec"} -- the value layouts the
-    control plane builds with `.Leaf()`. "u32vec" sizes the vector from the
-    map, so link_state follows the topology without being told its width.
-    """
+    """`b[name]` over a directory of pinned maps, like a BCC BPF object."""
 
     def __init__(self, pin_dir: str, leaf_types: dict = None):
         self.pin_dir = pin_dir

@@ -1,95 +1,13 @@
 #!/usr/bin/env python3
-"""
-verify_synth_kernel.py -- il confronto a TRE VIE, su modelli SINTETICI.
+"""check_kernel_vs_reference.py -- the eBPF pipelines against the reference.
 
-    float (Python)  vs  int8 (Python)  vs  int8 (eBPF, nel kernel)
+On synthetic models, compares float (Python), int8 (Python) and int8 (eBPF in
+the kernel, BPF_PROG_TEST_RUN): the kernel must decide exactly like the integer
+reference. Needs root.
 
---------------------------------------------------------------------------
-PERCHE' ESISTE
---------------------------------------------------------------------------
-Il progetto sapeva gia' fare due confronti, ma su due oggetti diversi:
-
-  * sul modello DEPOSITATO, `test_suite` confronta float e int8 in Python e
-    `verify_prog_run` confronta il programma XDP con un riferimento intero
-    indipendente. Tre vie, un modello solo.
-  * sui modelli SINTETICI, `test_synth --kernel` verificava che i pesi
-    compilassero e che i control plane fossero importabili. Compilazione, non
-    equivalenza numerica.
-
-Restava quindi scoperta proprio l'affermazione che i modelli sintetici servono
-a sostenere: *le pipeline sono corrette indipendentemente dal modello*. Questo
-script chiude quel buco: prende uno scenario sintetico, lo fa girare nel
-kernel, e misura quante decisioni coincidono.
-
---------------------------------------------------------------------------
-LE TRE VIE, E PERCHE' SERVONO TUTTE
---------------------------------------------------------------------------
-Due confronti soli non distinguono due cause diverse di disaccordo:
-
-    float  vs  int8(Python)   ->  errore di QUANTIZZAZIONE
-                                  (il modello a interi decide diversamente
-                                  dal modello a virgola mobile)
-
-    int8(Python) vs int8(eBPF) ->  errore di IMPLEMENTAZIONE
-                                  (il datapath calcola diversamente dal
-                                  riferimento, a parita' di aritmetica)
-
-    float  vs  int8(eBPF)      ->  il totale, che e' quello che vede l'utente
-
-La seconda riga e' quella che interessa al progetto e deve valere **100%**:
-un solo disaccordo li' e' un bug del datapath, non un effetto della
-quantizzazione. La prima riga invece puo' benissimo non essere 100%, ed e' una
-proprieta' del modello e della scala scelta.
-
---------------------------------------------------------------------------
-QUALI INGRESSI, E PERCHE' NON QUELLI DI inputs.json
---------------------------------------------------------------------------
-`inputs.json` contiene 1 000 vettori campionati liberamente. Il datapath pero'
-non accetta un vettore arbitrario: costruisce il suo ingresso dai valori che
-ha sotto mano -- le mappe dense (link_state, queue_state), il TTL del
-pacchetto, la porta d'ingresso risolta, l'indice del nodo. Un one-hot `node`
-diverso a ogni campione vorrebbe dire ricompilare il programma a ogni
-campione.
-
-Quindi qui si campiona nello spazio che il datapath sa DAVVERO esprimere, e si
-costruisce il vettore Python esattamente come lo costruisce lui. E' la stessa
-scelta gia' fatta da `ref_infer_sparse`, di cui questo script riusa il
-costruttore: confrontare due implementazioni su ingressi che una delle due non
-potrebbe mai ricevere non dimostrerebbe niente sulle due.
-
---------------------------------------------------------------------------
-USO
---------------------------------------------------------------------------
-    sudo python3 ipa/test/verify_synth_kernel.py \
-        --scenario ipa/synth/scenarios/ipa_like --n 200
-
-    # tutti gli scenari depositati, pipeline P1
-    sudo python3 ipa/test/verify_synth_kernel.py --all
-
-    # P2 (template) o P3 (modulare): gli scenari che la pipeline non accetta
-    # sono contati a parte come NON APPLICABILI, con il motivo
-    sudo python3 ipa/test/verify_synth_kernel.py --all --pipeline p2
-    sudo python3 ipa/test/verify_synth_kernel.py --all --pipeline p3
-
-Serve Linux, root e BCC.
-
---------------------------------------------------------------------------
-LA SCALA DEL TTL, E COME SI DIMOSTRA CHE P2/P3 LA LEGGONO
---------------------------------------------------------------------------
-P1 compila la scala come letterale. P2 e P3 la leggono a runtime dal campo
-`scale` di `struct feat_ent`, e con 0 ricadono sul #define 30. Un 100% su un
-modello con ttl/16 NON basta a dire che il campo viene letto, per due ragioni
-misurabili, e lo script le misura entrambe:
-
-  1. la scala deve CAMBIARE le decisioni. Per ogni scenario si conta K, i
-     casi in cui il riferimento a scala dichiarata e quello a 30 scelgono
-     classi diverse. Con K = 0 (`ones`, `large`) un 100% e' compatibile anche
-     con un datapath che usa sempre 30, e lo script lo dice.
-  2. controllo negativo, P2/P3 nel kernel: si riscrive `feat_ent.scale` a 30
-     e si ripetono gli stessi pacchetti. L'eBPF deve seguire il riferimento a
-     30 su tutti e staccarsi da quello dichiarato esattamente sui K previsti.
-     Cambia solo quel byte: se le decisioni si spostano, e' quel byte che il
-     kernel sta leggendo.
+Usage:
+    sudo python3 ipa/test/check_kernel_vs_reference.py --all --n 300
+    sudo python3 ipa/test/check_kernel_vs_reference.py --scenario <dir> --pipeline p2
 """
 import os
 import sys
@@ -107,25 +25,7 @@ for _p in (SHARED_DIR, _TEST_DIR):
 GREEN, RED, YELLOW, GREY, NC = (
     "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0;90m", "\033[0m")
 
-# I nomi che gli scenari sintetici usano, tradotti nei tipi del catalogo di
-# model_meta. Tutti coincidono tranne uno: lo scenario `mixed` chiama
-# `queue_occ` quella che il catalogo chiama `queue_occupancy`. Tradurre qui,
-# una volta, evita di sparpagliare il caso speciale nel resto del file.
 NOMI = {"queue_occ": "queue_occupancy"}
-
-# L'ifindex sotto cui il programma vede arrivare il pacchetto.
-#
-# NON si puo' scegliere. `prog_test_run` accetta un parametro
-# `ingress_ifindex` ma la sua docstring dice che e' "accepted for API
-# compatibility but unused": BPF_PROG_TEST_RUN gira senza `ctx_in`, perche' la
-# semantica dei campi di xdp_md per ctx_in non e' portabile fra kernel, e il
-# programma vede quindi l'ifindex del dispositivo di prova del kernel --
-# `TEST_RUN_DEFAULT_INGRESS_IFINDEX`, che su questo kernel vale 1.
-#
-# Costato un giro a vuoto: scrivevo la mappa `ingress_port` alla chiave 100 e
-# passavo `ingress_ifindex=100`, mentre il programma cercava la chiave 1. La
-# riga non aveva alcun effetto, e infatti i tre scenari che dovevano risalire
-# al 100% sono rimasti alla cifra precedente, identica al centesimo.
 
 
 def ok(m):
@@ -144,11 +44,9 @@ def note(m):
     print(f"  {GREY}{m}{NC}")
 
 
-# ==========================================================================
-# Lo scenario sintetico, tradotto in ciò che il generatore eBPF si aspetta
-# ==========================================================================
+# --- the synthetic scenario, translated into what the eBPF generator expects ---
 def carica_scenario(d):
-    """model.json + i due file di pesi. Ritorna tutto ciò che serve dopo."""
+    """model.json + the two weight files."""
     with open(os.path.join(d, "model.json")) as f:
         model = json.load(f)
     with open(os.path.join(d, "weights.json")) as f:
@@ -161,55 +59,25 @@ def carica_scenario(d):
 
 
 def descrittore(model):
-    """Il descrittore dello scenario nel formato di `derive_shape`.
-
-    `p1_aot.p1_source` vuole [{"type", "size"}]; lo scenario
-    scrive [{"name", "size", "kind", ...}]. La traduzione e' solo di nomi --
-    gli offset li ricalcola il generatore, e che coincidano con i suoi lo
-    verifica gia' `test_synth` (prova [6] e [6] descriptor convention)."""
+    """The scenario descriptor in the `derive_shape` format."""
     out = []
     for f in model["descriptor"]:
         t = NOMI.get(f["name"], f["name"])
-        # La scala DICHIARATA dallo scenario viaggia con la feature: da qui
-        # la prendono sia il generatore C sia il riferimento intero, che prima
-        # la ripescavano entrambi dal catalogo ignorando il modello.
         out.append({"type": t, "size": int(f["size"]),
                     "scale": int(f.get("scale", 1) or 1)})
     return out
 
 
-def topologia(feats):
-    """n_interfaces / n_nodes / n_queues dedotti dalle TAGLIE del descrittore.
-
-    Non si inventano: sono esattamente le larghezze che lo scenario ha gia'
-    scelto, e il generatore deve vedere le stesse o costruirebbe mappe di
-    dimensione diversa da quella dei pesi."""
-    per_tipo = {f["type"]: f["size"] for f in feats}
-    return {
-        "n_interfaces": per_tipo.get("link_state",
-                                     per_tipo.get("ingress_iface", 1)),
-        "n_nodes": per_tipo.get("node", 1),
-        "n_queues": per_tipo.get("queue_occupancy", 1),
-    }
-
-
 def dims_strati(model):
-    """[(n_prev, n_cur), ...] dalla forma dichiarata nello scenario."""
+    """[(n_prev, n_cur), ...] from the shape declared in the scenario."""
     a = model["arch"]
     sizes = [int(a["n_in"])] + [int(h) for h in a["hidden"]] + [int(a["n_out"])]
     return [(sizes[i], sizes[i + 1]) for i in range(len(sizes) - 1)]
 
 
-# ==========================================================================
-# Il campionamento: solo ciò che il datapath sa esprimere
-# ==========================================================================
+# --- sampling: only what the datapath can express ---
 def campioni(feats, n, seed, ttl_min=2, ttl_max=30):
-    """`n` ingressi, ognuno come (valori delle mappe dense, porta, ttl).
-
-    Le mappe dense portano interi piccoli e non solo 0/1: il datapath le legge
-    come valori, non come bit, e campionare solo 0/1 lascerebbe non provata
-    meta' dell'aritmetica. La porta include 0, che vuol dire "nessuna porta
-    risolta" ed e' il caso in cui l'one-hot resta tutto a zero."""
+    """`n` inputs, each as (dense map values, port, ttl)."""
     rng = random.Random(seed)
     per_tipo = {f["type"]: f["size"] for f in feats}
     n_if = per_tipo.get("ingress_iface", 0)
@@ -231,11 +99,7 @@ def campioni(feats, n, seed, ttl_min=2, ttl_max=30):
 
 
 def vettore_intero(feats, caso, node_index, scale_ttl):
-    """Il vettore d'ingresso come lo costruisce il datapath.
-
-    Rispecchia `ref_infer_sparse` di verify_prog_run, che a sua volta
-    rispecchia i generatori C per tipo di feature. Tenuto qui separato perche'
-    serve anche alla via float, che non passa da quella funzione."""
+    """The input vector as the datapath builds it."""
     import model_meta as mm
     x = [0] * sum(f["size"] for f in feats)
     o = 0
@@ -259,26 +123,14 @@ def vettore_intero(feats, caso, node_index, scale_ttl):
 
 
 def scale_colonne(model):
-    """Il divisore per colonna, dal descrittore dello scenario.
-
-    Solo le feature `real` ne hanno uno diverso da 1. E' la lista che il
-    riferimento intero applica al PRODOTTO, ed e' anche cio' che trasforma il
-    vettore intero nella sua vista float: le due vie devono partire dallo
-    stesso ingresso, o il confronto misurerebbe la conversione invece del
-    modello.
-
-    Si legge dal descrittore e non da `inputs.json` perche' qui gli ingressi
-    se li campiona questo script -- ma il risultato deve coincidere con i
-    `col_scales` depositati, e `--dry-run` lo verifica."""
+    """The per-column divisor, from the scenario descriptor."""
     out = []
     for f in model["descriptor"]:
         out.extend([int(f.get("scale", 1) or 1)] * int(f["size"]))
     return out
 
 
-# ==========================================================================
-# Le tre vie
-# ==========================================================================
+# --- the three paths ---
 def via_float(wf, layer_dims, x_int, scales):
     from synth import reference as ref
     x_f = [v / s if s else float(v) for v, s in zip(x_int, scales)]
@@ -291,29 +143,14 @@ def logit_int8_python(wi, layer_dims, x_int, scales, scale):
 
 
 def via_int8_python(wi, layer_dims, x_int, scales, scale):
-    """Il riferimento intero puro Python, dal pacchetto `synth`.
-
-    E' la STESSA funzione, con la stessa `scale`, che ha prodotto
-    `expected.json`, quindi questa via e' la verita' di riferimento del modello
-    sintetico, non una seconda opinione. Con la stessa `scale` solo dal
-    2026-09-23: prima generate.py la chiamava senza, e `expected.json` teneva
-    i logit di uno schema con il bias non riscalato che nessuna pipeline
-    esegue (`load_scenario` ora rifiuta quei file). La seconda opinione la da'
-    `via_int8_verify` qui sotto."""
+    """The pure-Python integer reference, from the `synth` package."""
     from synth import reference as ref
     return ref.argmax(logit_int8_python(wi, layer_dims, x_int, scales, scale))
 
 
 def via_int8_verify(wi, feats, model, caso, node_index, scale):
-    """Il riferimento intero dell'altro lato del progetto, per controprova.
-
-    `ref_infer_sparse` e' scritto per verificare il datapath e ricostruisce il
-    vettore d'ingresso per conto suo. Se concorda con `synth.reference` su ogni
-    campione, allora le due meta' del progetto sono d'accordo su che cosa
-    calcola il modello -- ed e' un controllo gratuito che un confronto a tre
-    vie soltanto non farebbe. Vive qui e non nella via principale perche'
-    importa `bcc`."""
-    from verify_prog_run import ref_infer_sparse
+    """The integer reference of the other side of the project, as a cross-check."""
+    from check_pipelines import ref_infer_sparse
     cls, _ = ref_infer_sparse(
         wi, feats, [int(h) for h in model["arch"]["hidden"]],
         int(model["arch"]["n_out"]), caso["ttl"], 0,
@@ -322,21 +159,11 @@ def via_int8_verify(wi, feats, model, caso, node_index, scale):
     return cls
 
 
-# La chiave sotto cui la via kernel scrive `ingress_port`:
-# TEST_RUN_DEFAULT_INGRESS_IFINDEX di verify_prog_run, che qui non si puo'
-# importare perche' importa bcc. Per il sorgente valutato il numero in se' non
-# conta; conta che la chiave letta sia quella scritta, come nel kernel.
 _KIF_SORGENTE = 1
 
 
 def via_sorgente_c(prog, caso, feats):
-    """Il C che P1 compila, valutato dal TESTO con p1_c_eval: logit e classe.
-
-    Gli stessi ingressi della via kernel -- mappe dense, TTL, porta scritta in
-    `ingress_port` anche quando vale 0 -- senza clang, verificatore e JIT. E'
-    la riga che --dry-run puo' dire sull'implementazione: prima, senza kernel,
-    si confrontavano solo le due vie Python, e un generatore che emetteva un
-    moltiplicatore diverso dal riferimento passava inosservato."""
+    """The C that P1 compiles, evaluated from its TEXT with p1_c_eval."""
     maps = dict(caso["mappe"])
     if any(f["type"] == "ingress_iface" for f in feats):
         maps["ingress_port"] = {_KIF_SORGENTE: int(caso["porta"])}
@@ -344,28 +171,17 @@ def via_sorgente_c(prog, caso, feats):
 
 
 def via_ebpf(setup, caso, model, scale):
-    """Un pacchetto attraverso il programma XDP vero, e la classe che ha scelto.
-
-    `repeat=1` non e' prudenza: il programma decrementa il TTL e
-    BPF_PROG_TEST_RUN non ripristina il buffer fra una ripetizione e l'altra,
-    quindi ripetere farebbe scendere il TTL e finirebbe per provare il
-    percorso di scadenza invece della decisione sotto esame."""
-    from verify_prog_run import (build_frame_sparse, prog_test_run,
+    """One packet through the real XDP program, and the class it
+    chose."""
+    from check_pipelines import (build_frame_sparse, prog_test_run,
                                  _reset_stats, _read_u64)
     from common import write_vector_map
 
     for nome, vals in caso["mappe"].items():
         write_vector_map(setup["b"], nome, vals)
 
-    # LA PORTA D'INGRESSO VA DETTA AL KERNEL, non solo al riferimento.
-    #
-    # Prima qui c'era `ingress_ifindex=0` fisso mentre il lato Python usava
-    # `caso["porta"]`, che varia: le due meta' costruivano due vettori
-    # d'ingresso diversi e il confronto misurava quella differenza invece del
-    # datapath. Si vedeva benissimo nei dati -- `mixed`, l'unico scenario
-    # SENZA la feature `ingress_iface`, era anche l'unico al 100%.
     if "ingress_port" in setup:
-        from verify_prog_run import TEST_RUN_DEFAULT_INGRESS_IFINDEX as _KIF
+        from check_pipelines import TEST_RUN_DEFAULT_INGRESS_IFINDEX as _KIF
         setup["ingress_port"][ct.c_uint32(_KIF)] = \
             ct.c_uint32(int(caso["porta"]))
 
@@ -373,15 +189,8 @@ def via_ebpf(setup, caso, model, scale):
     frame = build_frame_sparse(0, caso["ttl"], scale,
                                int(model["arch"]["n_in"]), n_out)
     _reset_stats(setup, n_classes=n_out)
-    # `ingress_ifindex` non viene passato: il parametro esiste ma e' ignorato,
-    # e passarlo darebbe l'impressione di controllare qualcosa che non si
-    # controlla. Quello che si controlla e' la MAPPA, scritta qui sopra.
     prog_test_run(setup["disp"].fd, frame, repeat=1)
 
-    # La classe scelta si legge da cls_stats, che le pipeline scrivono su OGNI
-    # esito -- inoltro, DROP e UNUSED. Prima veniva scritta solo sul percorso
-    # d'inoltro riuscito, e "quale classe ha scelto il modello?" non aveva
-    # risposta quando la risposta era DROP.
     for c in range(n_out):
         if _read_u64(setup["cls_stats"], c) > 0:
             return c
@@ -389,18 +198,11 @@ def via_ebpf(setup, caso, model, scale):
 
 
 class NonApplicabile(Exception):
-    """Lo scenario non entra nei limiti della pipeline scelta. Non e' un
-    fallimento del datapath: e' un modello che quella pipeline rifiuta, e il
-    riepilogo lo conta a parte invece di mescolarlo agli esiti."""
+    """The scenario does not fit the limits of the chosen pipeline."""
 
 
 def fuori_limiti(pipeline, model):
-    """Perche' `pipeline` non puo' eseguire questo modello, oppure None.
-
-    Solo i limiti leggibili senza caricare niente; li tiene
-    ipa/pipeline_limits.py, con i numeri presi dai moduli che compilano i
-    programmi. Il resto lo rifiutano i loader, e anche quel rifiuto diventa
-    NonApplicabile."""
+    """Why `pipeline` cannot run this model, or None."""
     import pipeline_limits
     a = model["arch"]
     return pipeline_limits.why_not(
@@ -409,10 +211,8 @@ def fuori_limiti(pipeline, model):
 
 
 def _costruisci(pipeline, M, node_index):
-    """Una pipeline sul modello dello scenario, con i costruttori comuni
-    (pipeline_setup.build): gli stessi che usano i banchi quando ricevono un
-    modello diverso dal checkpoint. Il rifiuto di un limite compilato resta
-    NonApplicabile."""
+    """A pipeline on the scenario's model, with the common builders
+    (pipeline_setup.build)."""
     import pipeline_setup as PS
     try:
         return PS.build(pipeline, M, node_index=node_index)
@@ -421,9 +221,7 @@ def _costruisci(pipeline, M, node_index):
 
 
 def costruisci_p2(M, node_index):
-    """P2 sui pesi sintetici: dispatcher + foglia compilata per la profondita'
-    dello scenario, pesi e descrittore nelle mappe. Il nodo viene dalla
-    mappa `node_id_t2`: P2 non lo congela mai."""
+    """P2 on the synthetic weights."""
     import pipeline_setup as PS
     from ebpf_template_arch import load_model_desc
     setup = _costruisci("template", M, node_index)
@@ -435,9 +233,7 @@ def costruisci_p2(M, node_index):
 
 
 def costruisci_p3(M, node_index):
-    """P3 sui pesi sintetici: dispatcher, layer_first, layer_hidden e la
-    catena di tail call completa, con gli strati dello scenario. Il nodo
-    viene dalla mappa `node_id_t3`."""
+    """P3 on the synthetic weights."""
     import pipeline_setup as PS
     from ebpf_modular import load_model_desc
     setup = _costruisci("modular", M, node_index)
@@ -449,9 +245,8 @@ def costruisci_p3(M, node_index):
 
 
 def scale_colonne_default(model):
-    """I divisori per colonna che il datapath userebbe se ignorasse la scala
-    dichiarata: quelli del catalogo (ttl 30, tutto il resto 1). E' il
-    riferimento del controllo negativo."""
+    """The per-column divisors the datapath would use if it ignored the
+    declared scale."""
     import model_meta as mm
     out = []
     for f in model["descriptor"]:
@@ -460,17 +255,8 @@ def scale_colonne_default(model):
     return out
 
 
-# ==========================================================================
 def sorgente_p1(M, node_index):
-    """Il sorgente di P1 sui pesi sintetici, con il descrittore dello scenario.
-
-    Una funzione sola per le due vie che lo usano: il kernel lo compila,
-    --dry-run lo valuta dal testo. Devono guardare lo STESSO sorgente, o il
-    confronto senza kernel proverebbe un altro programma: gli argomenti sono
-    quelli che pipeline_setup passa a p1_aot.load_p1.
-
-    E' l'OGGETTO AOT (p1_aot, lo stesso generatore del deploy); fino al
-    2026-09-23 era il sorgente BCC, che su un nodo non va mai."""
+    """P1's source on the synthetic weights, with the scenario descriptor."""
     import p1_aot
     return p1_aot.p1_source(
         [(0, M.weights, M.scale)], hidden_dims=tuple(M.hidden),
@@ -479,11 +265,9 @@ def sorgente_p1(M, node_index):
 
 
 def costruisci_p1(M, node_index):
-    """P1 (l'oggetto AOT) sui pesi sintetici, con il descrittore dello
-    scenario e il nodo congelato, caricato e pinnato da loader_aot."""
+    """P1 (the AOT object) on the synthetic weights, with the scenario
+    descriptor and the frozen node, loaded and pinned by loader_aot."""
     setup = _costruisci("p1_static", M, node_index)
-    # La mappa esiste solo se il descrittore usa `ingress_iface`: gli scenari
-    # che non la dichiarano non la fanno nemmeno generare.
     try:
         setup["ingress_port"] = setup["b"]["ingress_port"]
     except Exception:
@@ -492,24 +276,12 @@ def costruisci_p1(M, node_index):
 
 
 def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
-    """Un scenario, una pipeline. Ritorna {"esito": True/False/None,
-    "scala_provata": bool}; None vuol dire NON APPLICABILE, e scala_provata
-    che lo scenario ha una scala diversa dal default che cambia almeno una
-    decisione, e che (nel kernel, P2/P3) il controllo negativo l'ha vista."""
+    """One scenario, one pipeline."""
     nome = os.path.basename(os.path.abspath(d))
     model, wi, wf = carica_scenario(d)
-    # Lo stesso modello come lo vedono i banchi: pesi, descrittore e la
-    # semantica delle classi che lo scenario DICHIARA (drop_class). Fino al
-    # 2026-09-29 le pipeline ricevevano quella di ipa/model_meta.json quando
-    # n_out coincideva -- DROP 5 per ipa_like, che dichiara DROP 6.
     import model_source as ms
     M = ms.load_model(d)
     feats = descrittore(model)
-    # Il nodo congelato deve stare dentro la larghezza del one-hot di QUESTO
-    # scenario: `ones` ne ha 4, e il 7 di default faceva rifiutare la
-    # generazione. Il generatore ha ragione a rifiutare -- una colonna tutta a
-    # zero sembrerebbe un programma funzionante per un nodo che non esiste --
-    # quindi si sceglie un indice valido invece di insistere.
     larghezza_nodo = next((f["size"] for f in feats if f["type"] == "node"), 0)
     if larghezza_nodo and node_index >= larghezza_nodo:
         node_index = larghezza_nodo - 1
@@ -518,31 +290,19 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
     scales = scale_colonne(model)
 
     print(f"\n{YELLOW}=== {nome}: {model['arch']['shape']}, "
-          f"{len(wi)} pesi, scala {scale} ==={NC}")
-    note(f"descrittore: {[(f['type'], f['size']) for f in feats]}")
+          f"{len(wi)} weights, scale {scale} ==={NC}")
+    note(f"descriptor: {[(f['type'], f['size']) for f in feats]}")
 
-    # I col_scales calcolati dal descrittore devono coincidere con quelli
-    # depositati accanto agli ingressi. Se divergono, ogni confronto piu' sotto
-    # starebbe misurando due conversioni diverse invece di due modelli.
     att = os.path.join(d, "inputs.json")
     if os.path.exists(att):
         with open(att) as f:
             depositati = json.load(f).get("col_scales")
         if depositati is not None and list(depositati) != list(scales):
-            fail(f"col_scales ricalcolati diversi da quelli depositati "
-                 f"({scales[:8]}... contro {list(depositati)[:8]}...)")
+            fail(f"recomputed col_scales differ from the stored ones "
+                 f"({scales[:8]}... against {list(depositati)[:8]}...)")
             return False
-        ok("col_scales ricalcolati dal descrittore == quelli depositati")
+        ok("col_scales recomputed from the descriptor == the stored ones")
 
-    # LA SCALA PER-FEATURE, DA QUANDO IL DATAPATH LA SEGUE.
-    #
-    # Fino al 2026-09-18 i tre datapath fissavano la scala a compile time
-    # (`feature_scale(tipo)` in P1, `T2_TTL_SCALE`/`ML_TTL_SCALE` in P2/P3) e
-    # ignoravano quella dichiarata dal modello: `small` (16), `large` (64) e
-    # `ones` (8) venivano eseguiti con 30. Adesso la scala viaggia nel
-    # descrittore e il campo `scale` di `struct feat_ent` la porta fino al
-    # kernel. Resta utile DIRE quali modelli si discostano dal default, perche'
-    # sono esattamente quelli che il vecchio codice sbagliava.
     import model_meta as _mm
     fuori_default = []
     for f in model["descriptor"]:
@@ -553,14 +313,11 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
             fuori_default.append((t, dichiarata, catalogo))
     if fuori_default:
         for t, dich, cat in fuori_default:
-            info(f"la feature `{t}` usa scala {dich}, diversa dal default del "
-                 f"catalogo ({cat}): il datapath deve seguire il modello")
+            info(f"feature `{t}` uses scale {dich}, different from the "
+                 f"catalogue default ({cat}): the datapath must follow the model")
 
     casi = campioni(feats, n, seed)
     scales_def = scale_colonne_default(model)
-    # K: quante decisioni la scala dichiarata sposta rispetto al default. E'
-    # la misura di quanto questo scenario METTE ALLA PROVA la scala: con K = 0
-    # un datapath che la ignorasse passerebbe lo stesso.
     k_scala = 0
     if fuori_default:
         k_scala = sum(
@@ -568,16 +325,16 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
             != via_int8_python(wi, layer_dims, x, scales_def, scale)
             for x in (vettore_intero(feats, c, node_index, scale) for c in casi))
         if k_scala:
-            ok(f"la scala dichiarata sposta {k_scala}/{len(casi)} decisioni "
-               f"rispetto al default: questo scenario la mette alla prova")
+            ok(f"the declared scale moves {k_scala}/{len(casi)} decisions "
+               f"against the default: this scenario puts it to the test")
         else:
-            info(f"la scala dichiarata sposta 0/{len(casi)} decisioni: con "
-                 f"questi pesi un 100% NON prova che il datapath la applichi")
+            info(f"the declared scale moves 0/{len(casi)} decisions: with "
+                 f"these weights a 100% does NOT prove the datapath applies it")
 
     if pipeline != "p1":
         motivo = fuori_limiti(pipeline, model)
         if motivo:
-            info(f"{pipeline.upper()} NON APPLICABILE: {motivo}")
+            info(f"{pipeline.upper()} NOT APPLICABLE: {motivo}")
             return {"esito": None, "scala_provata": False}
 
     setup = prog = None
@@ -587,20 +344,20 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
         try:
             setup = costruisci(M, node_index)
         except NonApplicabile as e:
-            info(f"{pipeline.upper()} NON APPLICABILE: {e}")
+            info(f"{pipeline.upper()} NOT APPLICABLE: {e}")
             return {"esito": None, "scala_provata": False}
-        dove = "congelato" if pipeline == "p1" else "dalla mappa node_id"
-        ok(f"{pipeline.upper()} compilata e caricata sui pesi sintetici "
-           f"(nodo {node_index}, {dove})")
+        dove = "frozen" if pipeline == "p1" else "from the node_id map"
+        ok(f"{pipeline.upper()} compiled and loaded on the synthetic weights "
+           f"(node {node_index}, {dove})")
     else:
         from p1_c_eval import P1Program
         prog = P1Program(sorgente_p1(M, node_index),
                          func="xdp_model")
-        ok(f"P1 generata sui pesi sintetici e letta da p1_c_eval "
-           f"(nodo congelato: {node_index})")
+        ok(f"P1 generated on the synthetic weights and read by p1_c_eval "
+           f"(frozen node: {node_index})")
         if pipeline != "p1":
-            note(f"{pipeline.upper()} non si valuta senza kernel: in --dry-run "
-                 f"restano le vie Python e il C di P1")
+            note(f"{pipeline.upper()} cannot be evaluated without a kernel: "
+                 f"--dry-run keeps the Python paths and P1's C")
     acc_qf = acc_impl = acc_tot = acc_ref = acc_cat = acc_src = 0
     esempi = []
     for c in casi:
@@ -619,14 +376,6 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
         c_bpf = via_ebpf(setup, c, model, scale)
         acc_qf += (c_float == c_int8)
         acc_ref += (c_int8 == c_ref)
-        # LA RIGA CHE ASSOLVE O CONDANNA IL DATAPATH.
-        #
-        # `ref_infer_sparse` applica la scala del CATALOGO, la stessa che i tre
-        # generatori compilano. Se l'eBPF concorda con lui al 100% mentre
-        # entrambi divergono da `synth.reference` (che usa la scala DICHIARATA
-        # dal modello), allora il datapath non sbaglia un conto: esegue
-        # correttamente una configurazione sbagliata. Sono due difetti diversi
-        # e chiedono due rimedi diversi.
         acc_cat += (c_ref == c_bpf)
         acc_impl += (c_int8 == c_bpf)
         acc_tot += (c_float == c_bpf)
@@ -634,29 +383,27 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
             esempi.append((c, c_int8, c_bpf))
 
     if dry:
-        # Senza kernel restano le due vie Python e il C di P1 valutato dal
-        # sorgente: quello che questo script puo' verificare ovunque.
         n = len(casi)
         print()
-        print(f"  float vs int8 (Python): accordo {100.0*acc_qf/n:.2f}%, "
-              f"disaccordo {100.0*(n-acc_qf)/n:.2f}%  su {n} ingressi")
+        print(f"  float vs int8 (Python): agreement {100.0*acc_qf/n:.2f}%, "
+              f"disagreement {100.0*(n-acc_qf)/n:.2f}%  over {n} inputs")
         if acc_src == n:
-            ok(f"int8 (Python) vs C di P1 (sorgente valutato): {n}/{n} "
-               f"ingressi con logit identici")
+            ok(f"int8 (Python) vs P1's C (evaluated source): {n}/{n} "
+               f"inputs with identical logits")
         else:
-            fail(f"int8 (Python) vs C di P1 (sorgente valutato): logit "
-                 f"diversi su {n - acc_src}/{n}. Il riferimento e il "
-                 f"generatore non calcolano la stessa formula.")
+            fail(f"int8 (Python) vs P1's C (evaluated source): logits "
+                 f"differ on {n - acc_src}/{n}. The reference and the "
+                 f"generator do not compute the same formula.")
             for c, a, b in esempi:
-                note(f"  ttl={c['ttl']} porta={c['porta']} mappe={c['mappe']} "
+                note(f"  ttl={c['ttl']} port={c['porta']} maps={c['mappe']} "
                      f"-> python={a} C={b}")
-        note("modalita' --dry-run: il kernel non e' stato interrogato; il C "
-             "e' valutato dal testo, senza clang, verificatore e JIT")
+        note("--dry-run mode: the kernel was not queried; the C "
+             "is evaluated from its text, without clang, verifier and JIT")
         return {"esito": acc_src == n, "scala_provata": k_scala > 0}
 
     n = len(casi)
     print()
-    print(f"  {'confronto':34s} {'accordo':>9s} {'disaccordo':>11s}")
+    print(f"  {'comparison':34s} {'agreement':>9s} {'disagreement':>12s}")
     print("  " + "-" * 56)
     for etichetta, acc in (
             ("float  vs  int8 (Python)", acc_qf),
@@ -668,54 +415,38 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
               f"{100.0*(n-acc)/n:10.2f}%")
     print()
 
-    # La riga che decide. Le altre due descrivono il modello; questa descrive
-    # il codice, e per il codice l'unico valore accettabile e' 100%.
     if acc_impl == n:
-        ok(f"implementazione: {n}/{n} decisioni identiche fra riferimento "
-           f"intero ed eBPF")
+        ok(f"implementation: {n}/{n} identical decisions between integer "
+           f"reference and eBPF")
     else:
-        # Non si dice "difetto del datapath" e basta. Misurato il
-        # 2026-09-18: un disaccordo del 29% su cinque scenari veniva tutto da
-        # un difetto di QUESTO script, che non comunicava al kernel la porta
-        # d'ingresso, e il messaggio accusava il datapath di un errore di
-        # calcolo che non aveva fatto. Si elencano le cause possibili in
-        # ordine di probabilita', e la prima e' il banco.
-        fail(f"implementazione: {n - acc_impl}/{n} decisioni DIVERSE fra "
-             f"riferimento intero ed eBPF. NON e' quantizzazione. Le cause, "
-             f"in ordine: (1) il banco non passa al kernel un ingresso che il "
-             f"riferimento usa; (2) una scala dichiarata dal modello che il "
-             f"datapath non applica, vedi sopra; (3) un difetto del datapath.")
+        fail(f"implementation: {n - acc_impl}/{n} DIFFERENT decisions between "
+             f"integer reference and eBPF. It is NOT quantization. Causes, "
+             f"in order: (1) the bench does not pass the kernel an input the "
+             f"reference uses; (2) a scale declared by the model that the "
+             f"datapath does not apply, see above; (3) a datapath defect.")
         for c, a, b in esempi:
-            note(f"  ttl={c['ttl']} porta={c['porta']} mappe={c['mappe']} "
+            note(f"  ttl={c['ttl']} port={c['porta']} maps={c['mappe']} "
                  f"-> python={a} ebpf={b}")
     if acc_ref != n and acc_cat == n:
-        # Il caso interessante, e quello che la scheda in claims.md deve
-        # riportare: aritmetica esatta, configurazione sbagliata.
-        ok(f"il datapath e' ESATTO rispetto alla scala che gli e' stata "
-           f"compilata: {n}/{n} decisioni identiche a `ref_infer_sparse`. Il "
-           f"disaccordo con `synth.reference` ({n - acc_ref}/{n}) e' tutto "
-           f"nella scala dichiarata dal modello e mai applicata.")
+        ok(f"the datapath is EXACT with respect to the scale it was "
+           f"compiled with: {n}/{n} decisions identical to `ref_infer_sparse`. "
+           f"The disagreement with `synth.reference` ({n - acc_ref}/{n}) is "
+           f"entirely the scale declared by the model and never applied.")
     elif acc_ref != n:
-        fail(f"le due implementazioni intere di Python non concordano su "
-             f"{n - acc_ref}/{n}, E l'eBPF non concorda con nessuna delle due: "
-             f"qui non basta la scala a spiegare, va indagato")
+        fail(f"the two Python integer implementations disagree on "
+             f"{n - acc_ref}/{n}, AND the eBPF agrees with neither: "
+             f"the scale does not explain it, to be investigated")
     if acc_qf < n:
-        note(f"il {100.0*(n-acc_qf)/n:.1f}% di disaccordo float/int8 e' "
-             f"quantizzazione: proprieta' del modello e della scala, non un "
-             f"difetto")
+        note(f"the {100.0*(n-acc_qf)/n:.1f}% float/int8 disagreement is "
+             f"quantization: a property of the model and the scale, not a "
+             f"defect")
 
-    # IL CONTROLLO NEGATIVO (P2/P3). Si riscrive SOLO il byte `scale` di
-    # feat_ent al default e si ripetono gli stessi pacchetti. Se il kernel
-    # legge quel byte, le decisioni si spostano esattamente sui K casi in cui
-    # le due scale non concordano; se non lo leggesse, non si sposterebbe
-    # niente. P1 la scala la compila come letterale, e non ha un byte da
-    # riscrivere: per P1 la prova e' la riga "implementazione" qui sopra.
     controllo = True
     scala_provata = False
     if pipeline != "p1" and fuori_default:
         if not k_scala:
-            info("controllo negativo non eseguito: K = 0, non distinguerebbe "
-                 "niente")
+            info("negative check not run: K = 0, it would distinguish "
+                 "nothing")
         else:
             import model_meta as _mm2
             feats_def = [dict(f, scale=int(_mm2.feature_scale(f["type"])))
@@ -732,47 +463,26 @@ def confronta(d, n, seed, node_index, dry=False, pipeline="p1"):
             setup["ricarica_desc"](feats)
             if segue_def == n and stacca == k_scala:
                 scala_provata = True
-                ok(f"controllo negativo: con feat_ent.scale riscritto al "
-                   f"default l'eBPF segue il riferimento al default su "
-                   f"{n}/{n} e si stacca da quello dichiarato esattamente sui "
-                   f"{k_scala} casi previsti -- il kernel legge quel byte")
+                ok(f"negative check: with feat_ent.scale rewritten to the "
+                   f"default the eBPF follows the default reference on "
+                   f"{n}/{n} and departs from the declared one exactly on the "
+                   f"{k_scala} expected cases -- the kernel reads that byte")
             else:
                 controllo = False
-                fail(f"controllo negativo: con feat_ent.scale al default "
-                     f"l'eBPF segue quel riferimento su {segue_def}/{n} e si "
-                     f"stacca dal dichiarato su {stacca} casi (attesi "
-                     f"{n}/{n} e {k_scala}). Il datapath non divide per il "
-                     f"byte che il piano di controllo scrive.")
+                fail(f"negative check: with feat_ent.scale at the default "
+                     f"the eBPF follows that reference on {segue_def}/{n} and "
+                     f"departs from the declared one on {stacca} cases "
+                     f"(expected {n}/{n} and {k_scala}). The datapath does not "
+                     f"divide by the byte the control plane writes.")
     elif pipeline == "p1" and fuori_default and k_scala and acc_impl == n:
         scala_provata = True
     esito = acc_impl == n and acc_ref == n and controllo
-    # "Provata" solo se tutto il resto regge: un datapath che usa sempre il
-    # default passa il controllo negativo e fallisce la riga implementazione,
-    # e non ha dimostrato di seguire nessuna scala.
     return {"esito": esito, "scala_provata": scala_provata and esito}
 
 
-# ==========================================================================
-# Gli scenari: presenti o rigenerati, mai pretesi
-# ==========================================================================
+# --- the scenarios: present or regenerated, never assumed ---
 def scenari(base_richiesta=None, n_inputs=64):
-    """Le cartelle degli scenari, generandole se non ci sono.
-
-    `ipa/synth/scenarios/` e' in .gitignore di proposito: sono artefatti
-    rigenerabili, e `make_scenario.py --preset all` li riscrive
-    byte-identici a parita' di seme. Una copia fresca del repository quindi
-    NON li ha, e pretenderli faceva morire questo script con un
-    FileNotFoundError su una macchina perfettamente sana.
-
-    Generarli qui costa qualche secondo, non sporca il repository (si scrive
-    in una cartella temporanea) e toglie di mezzo la domanda "li hai
-    rigenerati?" -- che e' una domanda a cui un test non dovrebbe costringere.
-    """
-    # `n_inputs` basso di proposito: gli ingressi depositati in inputs.json
-    # QUI non si usano -- questo script campiona i propri, fra quelli che il
-    # datapath sa esprimere. Dell'artefatto serve solo `col_scales`, che non
-    # dipende da quanti vettori ci sono dentro. Generarne mille costerebbe una
-    # forward di torch per ciascuno, per poi buttarli.
+    """The scenario folders, generating them if they are missing."""
     import tempfile
     from synth.generate import preset, generate_scenario, PRESETS
 
@@ -781,15 +491,13 @@ def scenari(base_richiesta=None, n_inputs=64):
                       for d in os.listdir(base_richiesta)
                       if os.path.isdir(os.path.join(base_richiesta, d)))
         if dirs:
-            note(f"scenari gia' presenti in {base_richiesta}")
-            # Una cartella generata prima che un preset esistesse non lo ha:
-            # prenderla com'e' vorrebbe dire saltarlo senza dirlo.
+            note(f"scenarios already present in {base_richiesta}")
             presenti = {os.path.basename(x) for x in dirs}
             mancanti = [p for p in PRESETS if p not in presenti]
             if mancanti:
                 base = tempfile.mkdtemp(prefix="ipa_synth_scen_")
-                info(f"preset assenti da quella cartella: {mancanti}; li "
-                     f"genero in {base}")
+                info(f"presets missing from that folder: {mancanti}; "
+                     f"generating them in {base}")
                 for nome in mancanti:
                     d = os.path.join(base, nome)
                     generate_scenario(preset(nome), d, n_inputs=n_inputs)
@@ -797,8 +505,8 @@ def scenari(base_richiesta=None, n_inputs=64):
             return dirs
 
     base = tempfile.mkdtemp(prefix="ipa_synth_scen_")
-    info(f"scenari non presenti: li rigenero in {base} "
-         f"({len(PRESETS)} preset, seme fisso)")
+    info(f"scenarios not present: regenerating them in {base} "
+         f"({len(PRESETS)} presets, fixed seed)")
     dirs = []
     for nome in PRESETS:
         d = os.path.join(base, nome)
@@ -807,50 +515,49 @@ def scenari(base_richiesta=None, n_inputs=64):
     return dirs
 
 
-# ==========================================================================
 def main():
     p = argparse.ArgumentParser(
         description=__doc__.split("USO")[0].strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--scenario", help="cartella di uno scenario sintetico")
+    p.add_argument("--scenario", help="folder of a synthetic scenario")
     p.add_argument("--all", action="store_true",
-                   help="tutti gli scenari in ipa/synth/scenarios/")
+                   help="every scenario in ipa/synth/scenarios/")
     p.add_argument("--n", type=int, default=200,
-                   help="quanti ingressi per scenario (default 200)")
+                   help="inputs per scenario (default 200)")
     p.add_argument("--seed", type=int, default=20260918)
     p.add_argument("--node", type=int, default=7,
-                   help="indice del nodo (P1: congelato nel programma; "
-                        "P2/P3: scritto nella mappa node_id)")
+                   help="node index (P1: frozen in the program; "
+                        "P2/P3: written in the node_id map)")
     p.add_argument("--pipeline", choices=("p1", "p2", "p3"), default="p1",
-                   help="quale pipeline mettere a confronto (default p1)")
+                   help="which pipeline to compare (default p1)")
     p.add_argument("--dry-run", action="store_true",
-                   help="le due vie Python (float contro int8) e il C di P1 "
-                        "valutato dal sorgente (p1_c_eval): non serve ne' "
-                        "Linux ne' root, e verifica ingressi e formula prima "
-                        "di portare il test su una macchina vera")
+                   help="the two Python paths (float against int8) and P1's C "
+                        "evaluated from the source (p1_c_eval): needs neither "
+                        "Linux nor root, and checks inputs and formula before "
+                        "taking the test to a real machine")
     a = p.parse_args()
 
     if not a.dry_run:
         if sys.platform != "linux":
-            sys.exit(f"serve Linux, non {sys.platform} "
-                     f"(oppure --dry-run per le sole vie Python)")
+            sys.exit(f"Linux needed, not {sys.platform} "
+                     f"(or --dry-run for the Python paths only)")
         if os.geteuid() != 0:
-            sys.exit("serve root: sudo python3 ipa/test/verify_synth_kernel.py ...")
+            sys.exit("root needed: sudo python3 ipa/test/check_kernel_vs_reference.py ...")
 
     if a.all:
         dirs = scenari(os.path.join(SHARED_DIR, "synth", "scenarios"))
     elif a.scenario:
         if not os.path.isdir(a.scenario):
-            sys.exit(f"{a.scenario} non esiste. Gli scenari sono artefatti "
-                     f"rigenerabili e non stanno in git: usa --all, che li "
-                     f"genera da solo, oppure "
+            sys.exit(f"{a.scenario} does not exist. The scenarios are "
+                     f"regenerable artefacts not kept in git: use --all, which "
+                     f"generates them, or "
                      f"`python3 ipa/synth/make_scenario.py --preset all`.")
         dirs = [a.scenario]
     else:
-        p.error("serve --scenario DIR oppure --all")
+        p.error("--scenario DIR or --all is needed")
 
     print(f"{YELLOW}{'=' * 74}{NC}")
-    print(f" Confronto a tre vie su modelli SINTETICI: float / int8 Python / "
+    print(f" Three-way comparison on SYNTHETIC models: float / int8 Python / "
           f"eBPF -- pipeline {a.pipeline.upper()}")
     print(f"{YELLOW}{'=' * 74}{NC}")
 
@@ -870,32 +577,28 @@ def main():
     buoni = sum(1 for v in esiti.values() if v)
     na = sum(1 for v in esiti.values() if v is None)
     if na:
-        print(f" {na} scenari NON APPLICABILI a {a.pipeline.upper()} (il "
-              f"motivo e' nel dettaglio sopra): non contano come esiti")
+        print(f" {na} scenarios NOT APPLICABLE to {a.pipeline.upper()} (the "
+              f"reason is in the detail above): not counted as outcomes")
     if a.dry_run:
-        print(f" {buoni}/{len(esiti) - na} scenari in --dry-run con logit identici "
-              f"fra riferimento Python e C di P1 valutato dal sorgente.")
-        print(f" {RED}Il kernel NON e' stato interrogato{NC}: "
-              f"l'equivalenza con eBPF resta da dimostrare, rilancia senza "
-              f"--dry-run su Linux.")
-        note(" L'accordo float/int8 stampato sopra NON e' `quant_agreement` "
-             "di expected.json e non va confrontato con lui: li' gli ingressi "
-             "sono campionati liberamente, qui solo fra quelli che il datapath "
-             "sa esprimere. Ma fino al 2026-09-23 la distanza fra i due numeri "
-             "(0,789 contro 97,7% su ipa_like) veniva quasi tutta da un'altra "
-             "causa: expected.json era calcolato con il bias NON riscalato, "
-             "uno schema che nessuna pipeline esegue. Rigenerato, ipa_like "
-             "vale 0,986.")
+        print(f" {buoni}/{len(esiti) - na} scenarios in --dry-run with identical "
+              f"logits between the Python reference and P1's evaluated C.")
+        print(f" {RED}The kernel was NOT queried{NC}: "
+              f"the equivalence with eBPF remains to be shown, run again "
+              f"without --dry-run on Linux.")
+        note(" The float/int8 agreement printed above is NOT expected.json's "
+             "`quant_agreement` and must not be compared with it: there the "
+             "inputs are sampled freely, here only among those the datapath "
+             "can express.")
     else:
-        print(f" {buoni}/{len(esiti) - na} scenari con equivalenza numerica "
-              f"esatta fra riferimento intero ed eBPF")
+        print(f" {buoni}/{len(esiti) - na} scenarios with exact numerical "
+              f"equivalence between integer reference and eBPF")
     if provata:
-        print(f" scala diversa dal default messa alla prova"
-              f"{' e vista dal kernel' if not a.dry_run and a.pipeline != 'p1' else ''}"
+        print(f" scale different from the default put to the test"
+              f"{' and seen by the kernel' if not a.dry_run and a.pipeline != 'p1' else ''}"
               f": {', '.join(provata)}")
     else:
-        print(f" {RED}nessuno scenario ha messo alla prova una scala diversa "
-              f"dal default{NC}: questo run non dice niente su di essa")
+        print(f" {RED}no scenario put a scale different from the default "
+              f"to the test{NC}: this run says nothing about it")
     for nome, v in esiti.items():
         stato = "N/A" if v is None else ("OK " if v else "NO ")
         print(f"   {stato} {nome}")

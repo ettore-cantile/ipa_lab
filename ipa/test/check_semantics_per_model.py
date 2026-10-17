@@ -1,44 +1,10 @@
 #!/usr/bin/env python3
-"""
-verify_per_model_semantics.py -- class -> action is a property of the MODEL.
+"""check_semantics_per_model.py -- class -> action belongs to each model.
 
-P2 and P3 used to translate the argmax class through ONE class_action table
-shared by every model_id, so two models could not give the same class
-different meanings, and the control plane refused the second one. The table
-is now keyed by (model_id, bank, class): each model owns its rows, and the
-bank that is live is committed in the model's registry entry (arch_registry
-on P2, layer_registry on P3) together with its n_out / n_layers.
+Two models loaded together in P2 or P3 can give the same class different
+meanings, and never see each other's. Needs root.
 
-This file checks that claim on the real programs, through the real dispatcher
-(BPF_PROG_TEST_RUN, full tail-call path), with ONE program loaded per pipeline
-and every model registered into it as data:
-
-  A  single model: every class yields the declared action
-  B  two models, same semantics: both correct
-  C  two models, different semantics, packets alternating between them
-  D  no contamination: A, then B, then A again, also after B is re-registered
-  E  unknown model_id, and a removed one: not processed, never another
-     model's semantics
-  F  different n_out per model: each argmax is bounded by its OWN n_out
-  R  re-registering the same model_id replaces n_out + semantics together
-     (new bank written, then one registry update flips it), and leaves every
-     other model untouched
-
-How the class is controlled. The models are built so that the TTL selects the
-class: the only non-zero input weight reads ttl (scale 30, weight 30, so
-h1 = ttl exactly), it passes through one unit, and output k gets weight 2k and
-bias -(4k + k^2). With scale_factor 1 the logit of class k is then
-c^2 - (c - k)^2 for ttl = c + 2, which peaks at k = c alone. Every class of
-every model is reachable, the argmax is cross-checked against the independent
-Python reference, and a class beyond a model's n_out cannot be produced.
-
-What is observed. FORWARD -> XDP_REDIRECT and the destination MAC the program
-wrote, whose last byte is the logical port (mac_table has a distinct next hop
-per port); DROP -> XDP_DROP; UNUSED -> XDP_PASS with the class counted;
-not processed -> XDP_PASS with no counter moved.
-
-Needs Linux + BCC + root:
-    sudo python3 ipa/test/verify_per_model_semantics.py [--pipeline p2|p3]
+    sudo python3 ipa/test/check_semantics_per_model.py
 """
 import argparse
 import ctypes as ct
@@ -52,16 +18,16 @@ for _dir in (SHARED_DIR, _TEST_DIR):
         sys.path.insert(0, _dir)
 os.chdir(SHARED_DIR)
 
-from class_semantics import ClassSemantics, ClassSpec          # noqa: E402
+from class_semantics import ClassSemantics, ClassSpec  # noqa: E402
 
 GREEN, RED, YELLOW, NC = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
 _n_pass = _n_fail = 0
 
 XDP_DROP, XDP_PASS, XDP_REDIRECT = 1, 2, 4
-MAC_PREFIX = (0x02, 0x00, 0x00, 0x00, 0x00)   # dst MAC = prefix + logical port
+MAC_PREFIX = (0x02, 0x00, 0x00, 0x00, 0x00)
 N_PORTS = 5
-SCALE = 1          # registry scale_factor: bias multipliers scale**L == 1
-TTL_WEIGHT = 30    # == the ttl feature's descriptor scale: h1 = ttl exactly
+SCALE = 1
+TTL_WEIGHT = 30
 MISSING_ID = 9
 
 
@@ -82,9 +48,7 @@ def check(cond, msg):
     return cond
 
 
-# ---------------------------------------------------------------------------
-# Semantics under test
-# ---------------------------------------------------------------------------
+# --- Semantics under test ---
 def _sem(n_out, spec):
     classes = {c: (ClassSpec("FORWARD", a[1]) if a[0] == "F" else
                    ClassSpec("DROP") if a == "D" else ClassSpec("UNUSED"))
@@ -94,11 +58,8 @@ def _sem(n_out, spec):
                           drop_class=drops[0] if drops else None)
 
 
-# A and B disagree on EVERY class; the user-facing example (0 FORWARD / 1 DROP
-# against 0 DROP / 1 FORWARD) is their first two classes.
 SEM_A = _sem(4, [("F", 0), "D", ("F", 2), "U"])
 SEM_B = _sem(4, ["D", ("F", 1), ("F", 3), ("F", 0)])
-# Wider model, the checked-in model's layout: 5 ports, DROP 5, class 6 unused.
 SEM_C = ClassSemantics.forward_then_drop(5, drop_class=5, n_out=7)
 
 
@@ -107,9 +68,7 @@ def expected(sem, cls):
     return (act, sem.port_of(cls) if act == "FORWARD" else None, cls)
 
 
-# ---------------------------------------------------------------------------
-# Models whose argmax is chosen by the TTL
-# ---------------------------------------------------------------------------
+# --- Models whose argmax is chosen by the TTL ---
 def layer_dims(n_out):
     return [(65, 1), (1, 1), (1, n_out)]
 
@@ -121,33 +80,29 @@ def ttl_for(cls):
 def ttl_weights(n_out, ttl_col=12):
     """Flat int8 block for 65-1-1-n_out in the layout both loaders write."""
     w = [0] * (65 * 1 + 1 + 1 * 1 + 1 + 1 * n_out + n_out)
-    w[ttl_col] = TTL_WEIGHT                     # fc1 row 0, ttl column
-    w[65 + 1] = 1                               # fc2 weight [0][0]
+    w[ttl_col] = TTL_WEIGHT
+    w[65 + 1] = 1
     o = 65 + 1 + 1 + 1
     for k in range(n_out):
-        w[o + k] = 2 * k                        # out weight [k][0]
-        w[o + n_out + k] = -(4 * k + k * k)     # out bias [k]
+        w[o + k] = 2 * k
+        w[o + n_out + k] = -(4 * k + k * k)
     return [v & 0xFF for v in w]
 
 
 def ref_class(n_out, ttl):
-    from verify_multi_model import ref_infer_shape
+    from check_multi_model import ref_infer_shape
     return ref_infer_shape(ttl_weights(n_out), layer_dims(n_out), ttl, 0,
                            scale=SCALE)[0]
 
 
-# Every model gets a slice sized for the widest one, so a model_id can be
-# re-registered with another n_out without overlapping its neighbour.
 SLICE = len(ttl_weights(8))
 
 
-# ---------------------------------------------------------------------------
-# One loaded program per pipeline; models are map entries
-# ---------------------------------------------------------------------------
+# --- One loaded program per pipeline; models are map entries ---
 class Harness:
     def __init__(self, pipeline):
         from bcc import BPF
-        from verify_prog_run import _seed_link_state, _FwdAction
+        from check_pipelines import _seed_link_state, _FwdAction
         self.pipeline = pipeline
         if pipeline == "p2":
             from ebpf_template_arch import (EBPF_TEMPLATE_ARCH_DISPATCHER,
@@ -198,8 +153,7 @@ class Harness:
         del self.b[self.registry][ct.c_uint8(model_id)]
 
     def entry(self, model_id):
-        """(n_out, [(action, port)] * 32) as the datapath will read it: the
-        rows of the bank the registry entry currently commits."""
+        """(n_out, [(action, port)] * 32) as the datapath will read it."""
         from ebpf_template_arch import class_act_key
         e = self.b[self.registry][ct.c_uint8(model_id)]
         n_out = (e.n_out if self.pipeline == "p2" else None)
@@ -216,7 +170,7 @@ class Harness:
 
     def observe(self, model_id, ttl):
         """(action, port, class) the program actually produced."""
-        from verify_prog_run import build_frame, prog_test_run_data
+        from check_pipelines import build_frame, prog_test_run_data
         ps0 = [self._u64(self.ps, i) for i in range(3)]
         cs0 = [self._u64(self.cs, i) for i in range(32)]
         rv, _, out = prog_test_run_data(self.disp.fd,
@@ -237,9 +191,8 @@ class Harness:
         return ("OTHER", rv, (dps, fired))
 
 
-# ---------------------------------------------------------------------------
 def sweep(h, model_id, sem, n_classes=None, label=""):
-    """Every class of `sem`, through model_id. True if all as declared."""
+    """Every class of `sem`, through model_id."""
     bad = []
     for c in range(n_classes or sem.n_out):
         t = ttl_for(c)
@@ -255,7 +208,6 @@ def sweep(h, model_id, sem, n_classes=None, label=""):
 
 def run_pipeline(pl):
     print(f"\n{YELLOW}=== {pl.upper()}: per-model class semantics ==={NC}")
-    # The class construction itself, against the independent reference.
     refs = {n: [ref_class(n, ttl_for(c)) for c in range(8)] for n in (4, 7)}
     check(refs[4] == [0, 1, 2, 3, 3, 3, 3, 3]
           and refs[7] == [0, 1, 2, 3, 4, 5, 6, 6],
@@ -296,7 +248,7 @@ def run_pipeline(pl):
     sweep(h, A, SEM_A, label="D: A before B runs: ")
     sweep(h, B, SEM_B, label="D: B: ")
     sweep(h, A, SEM_A, label="D: A after B ran: ")
-    h.register(B, SEM_B, 1)                    # second load of B
+    h.register(B, SEM_B, 1)
     sweep(h, A, SEM_A, label="D: A after B re-registered: ")
     check(h.entry(A)[1] == SEM_A.action_table(),
           "D: A's registry table is still exactly SEM_A")
@@ -316,7 +268,6 @@ def run_pipeline(pl):
     print(f"{YELLOW}[F] different n_out per model{NC}")
     h.register(C, SEM_C, 3)
     sweep(h, C, SEM_C, label="F: C (n_out=7): ")
-    # the same TTLs through A: its argmax cannot leave [0, 4)
     sweep(h, A, SEM_A, n_classes=7, label="F: A (n_out=4) on C's 7 TTLs: ")
     if pl == "p2":
         check(h.entry(A)[0] == 4 and h.entry(C)[0] == 7,
@@ -326,11 +277,11 @@ def run_pipeline(pl):
           "F: classes past each model's own n_out are ACT_INVALID in its table")
 
     print(f"{YELLOW}[R] re-registering the same model_id{NC}")
-    h.register(A, SEM_B, 0)                    # same n_out, new meanings
+    h.register(A, SEM_B, 0)
     sweep(h, A, SEM_B, label="R: A now carries SEM_B: ")
     sweep(h, B, SEM_B, label="R: B untouched: ")
     sweep(h, C, SEM_C, label="R: C untouched: ")
-    h.register(A, SEM_C, 0)                    # new n_out AND new meanings
+    h.register(A, SEM_C, 0)
     n_out_a, tbl_a = h.entry(A)
     check(tbl_a == SEM_C.action_table() and n_out_a in (None, 7),
           "R: one registry entry holds the new n_out and the new table together")

@@ -1,27 +1,7 @@
 #!/usr/bin/env python3
-"""
-bench_tailcall_overhead.py -- isolates the PURE cost of one bpf_tail_call hop,
-decoupled from MLP inference and from the "double parse" the real pipelines
-also pay (see EBPF_BASELINE_TAILCALL's docstring in verify_prog_run.py).
+"""bench_tail_call.py -- the cost of a single bpf_tail_call, alone. Needs root.
 
-Why this exists: the literature on evaluating eBPF/XDP datapaths (e.g. the
-in-kernel-ML papers cited in docs/testing.md, and general XDP performance
-guidance) calls out THREE separable cost components in a tail-call-based
-design: map lookups, the arithmetic itself, and tail-call overhead. testing.md
-already isolates map-lookup cost (the "map lookup / pacchetto" column, via
-CTR_INC instrumentation) and total latency (test_suite --only kernel), but
-nothing isolated tail-call cost on its own until this script: hardcoded's
-77 ns vs baseline's 29 ns bundles tail-call + a second packet parse + the
-MLP together, so it cannot answer "how much of that 48 ns is just the jump".
-
-Uses the same min-of-N methodology as bench_depth_vs_width.py: a single
-BPF_PROG_TEST_RUN sample is not trustworthy (one-sided system noise only
-ever slows a trial down), so MIN across TRIALS independent measurements is
-reported, with median/max for context.
-
-Run on Linux with bcc installed:
-    sudo python3 ipa/test/bench_tailcall_overhead.py
-    sudo python3 ipa/test/bench_tailcall_overhead.py --repeat 5000 --trials 15
+    sudo python3 ipa/test/bench_tail_call.py
 """
 import os
 import sys
@@ -33,7 +13,7 @@ for p in (SHARED_DIR, _TEST_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from verify_prog_run import (
+from check_pipelines import (
     setup_baseline, setup_baseline_tailcall, prog_test_run, build_frame,
 )
 
@@ -41,7 +21,7 @@ from verify_prog_run import (
 def measure(setup, model_id, model_path, ttl, scale, repeat, trials):
     disp = setup["disp"]
     frame = build_frame(model_id, ttl, scale)
-    prog_test_run(disp.fd, frame, repeat=repeat)   # warm-up
+    prog_test_run(disp.fd, frame, repeat=repeat)
     samples = []
     for _ in range(trials):
         retval, ns = prog_test_run(disp.fd, frame, repeat=repeat)
